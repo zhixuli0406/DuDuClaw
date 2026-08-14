@@ -15,6 +15,10 @@ pub mod forward_view;
 pub mod engine;
 pub mod feedback_bus;
 pub mod forced_reflection;
+// Market Belief Loop (design-market-belief-loop-2026-08.md WP1): structured,
+// programmatically-settled beliefs about external subjects — parallel to,
+// and independent of, the task-layer forward model below.
+pub mod belief;
 pub mod metacognition;
 pub mod metrics;
 pub mod outcome;

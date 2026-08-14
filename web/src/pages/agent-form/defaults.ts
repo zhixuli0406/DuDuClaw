@@ -156,6 +156,18 @@ export const DEFAULT_OS_WATCH: {
   max_events_per_min: 60,
 };
 
+/** Belief loop × goal contract gap 2 — default `[research]` form values.
+ *  Prefilled from agents.inspect (`research`) on tab open; only written when
+ *  the operator edits the section. Unlike `[os_watch]`, `agents.inspect`
+ *  always returns concrete values (no "unset" state to distinguish). */
+export const DEFAULT_RESEARCH: {
+  self_study: boolean;
+  self_study_hour: number;
+} = {
+  self_study: false,
+  self_study_hour: 20,
+};
+
 /** ODO — per-agent Odoo override (write-only tab; inspect doesn't return it). */
 export const DEFAULT_ODOO: {
   profile: string;

@@ -106,6 +106,16 @@ export interface AgentDetail extends AgentInfo {
     pty_pool_enabled?: boolean;
     worker_managed?: boolean;
   };
+  /** [research] table — returned by agents.inspect so the automation tab's
+   *  self-study toggle can prefill the agent's own value (belief loop ×
+   *  goal contract gap 2, design-market-belief-loop-2026-08.md §3). Always
+   *  present with concrete values (defaults `self_study: false`,
+   *  `self_study_hour: 20`) — unlike `os_watch`, there is no "unset" state
+   *  to distinguish from a default. */
+  research?: {
+    self_study: boolean;
+    self_study_hour: number;
+  };
 }
 
 export interface VoiceSettings {
@@ -627,6 +637,14 @@ export interface TaskInfo {
   claimed_by?: string | null;
   /** Parsed `goal_state_json`: confirmed_facts / pending_hypotheses. */
   goal_state?: { confirmed_facts?: string[]; pending_hypotheses?: string[] } | null;
+  // ── Goal assignment form v2 (design-market-belief-loop-2026-08.md §6,
+  // G1, 2026-08-14) ─────────────────────────────────────────
+  /** Per-goal wall-clock deadline (RFC3339), when the assign form set a
+   *  `duration_hours`. `null` ⇒ only the global wall-clock budget applies. */
+  deadline_at?: string | null;
+  /** Per-goal risk boundary text the user explicitly typed into the assign
+   *  form. `null` ⇒ the deployment baseline boundary applies instead. */
+  risk_boundary?: string | null;
   // ── W2-3 reverse handoff (E8) ─────────────────────────────
   /** Originating channel of a `/goal` command (e.g. `telegram`), when known.
    *  `null`/absent for tasks not launched from a channel conversation. */
@@ -1122,6 +1140,13 @@ export interface ForwardPredictionRow {
   composite_error: number | null;
   created_at: string;
   settled_at: string | null;
+  /** Compact predicted-vs-actual pair for the list view (v1.59). */
+  expected_outcome?: string | null;
+  observed_outcome?: string | null;
+  expected_artifact?: string | null;
+  observed_artifact?: string | null;
+  /** Task board title resolved server-side; null when the task is gone. */
+  task_title?: string | null;
 }
 
 /** Expected side of one forward-chain round (parsed prediction). */
@@ -1192,6 +1217,53 @@ export interface ForwardStateRow {
   agent_id: string;
   n_samples: number;
   last_updated: string;
+}
+
+/** One belief entry (`belief.recent`) — external-world prediction
+ *  bookkeeping, parallel to the task forward model above. */
+export interface BeliefRow {
+  belief_id: string;
+  agent_id: string;
+  subject: string;
+  horizon: string;
+  /** up | down | flat */
+  direction: string;
+  prob: number;
+  rationale: string | null;
+  ref_value: number | null;
+  predicted_at: string;
+  stats_injected: boolean;
+  realized_value: number | null;
+  realized_direction: string | null;
+  /** hit | miss | flat_band | null (unsettled) */
+  outcome: string | null;
+  brier: number | null;
+  settled_at: string | null;
+  settle_source: string | null;
+  source_goal_id: string | null;
+}
+
+/** Per-subject rollup inside `BeliefStats.per_subject`. */
+export interface BeliefSubjectStat {
+  subject: string;
+  n_settled: number;
+  hits: number;
+  mean_brier: number | null;
+}
+
+/** Per-agent belief calibration stats (`belief.summary`). n<30
+ *  settled ⇒ `insufficient_samples: true` and every derived field is null
+ *  (§0-3 small-sample discipline — never dress up a point estimate). */
+export interface BeliefStats {
+  agent_id: string;
+  n_total: number;
+  n_settled: number;
+  insufficient_samples: boolean;
+  hit_rate: number | null;
+  hit_rate_wilson_low: number | null;
+  mean_brier: number | null;
+  overconfidence: number | null;
+  per_subject: BeliefSubjectStat[];
 }
 
 /** `tasks.timeline` — one goal task's whole loop story. */
@@ -1831,6 +1903,12 @@ export interface AgentUpdateParams {
   capabilities?: AgentCapabilities;
   // v1.39 — OS-native filesystem watch ([os_watch] top-level table)
   os_watch?: OsWatchConfig;
+  // Belief loop × goal contract gap 2 — self-study opt-in ([research] table)
+  research?: {
+    self_study?: boolean;
+    /** Local wall-clock hour (0-23) past which the goal may fire. */
+    self_study_hour?: number;
+  };
   // RT — Runtime ([runtime] section, nested object)
   runtime?: AgentRuntime;
   // EVO — advanced evolution ([evolution.*] fields, nested object)
@@ -4219,6 +4297,16 @@ export const api = {
         states: ForwardStateRow[];
       }>,
   },
+  /** Belief Loop — external-world prediction bookkeeping,
+   *  parallel to `api.forward` above (design-market-belief-loop-2026-08). */
+  belief: {
+    recent: (agentId?: string, limit = 50) =>
+      client.call('belief.recent', { agent_id: agentId ?? '', limit }) as Promise<{
+        beliefs: BeliefRow[];
+      }>,
+    summary: (agentId: string) =>
+      client.call('belief.summary', { agent_id: agentId }) as Promise<{ stats: BeliefStats }>,
+  },
   evolution: {
     status: () =>
       client.call('evolution.status') as Promise<{
@@ -4810,8 +4898,12 @@ export const api = {
       }>,
   },
   tasks: {
-    list: (filters?: { status?: TaskStatus; agent_id?: string; priority?: TaskPriority }) =>
-      client.call('tasks.list', filters ?? {}) as Promise<{ tasks: TaskInfo[] }>,
+    list: (filters?: {
+      status?: TaskStatus;
+      agent_id?: string;
+      priority?: TaskPriority;
+      goal_mode?: boolean;
+    }) => client.call('tasks.list', filters ?? {}) as Promise<{ tasks: TaskInfo[] }>,
     create: (params: TaskCreateParams) =>
       client.call('tasks.create', { ...params }) as Promise<{ task: TaskInfo }>,
     update: (taskId: string, fields: TaskUpdateParams) =>
@@ -4844,6 +4936,20 @@ export const api = {
       acceptance_criteria?: string;
       outcome?: string;
       priority?: TaskPriority;
+      /** Goal assignment form v2: optional wall-clock budget in hours
+       *  (1-720). Omitted / undefined ⇒ the global `[goal_loop]
+       *  wall_clock_hours` default applies. */
+      duration_hours?: number;
+      /** Goal assignment form v2: optional per-goal risk boundary text
+       *  (≤2000 chars). Empty / undefined ⇒ the deployment baseline
+       *  boundary (config `[goal_defaults] baseline_boundary`) applies. */
+      risk_boundary?: string;
+      /** Belief loop × goal contract gap 3
+       *  (design-market-belief-loop-2026-08.md §3): opt into teaching the
+       *  assigned agent to declare structured predictions (`belief_submit` /
+       *  `belief_settle`) about the goal's measurable external indicators,
+       *  folded into the judge's acceptance bar. Default `false`. */
+      require_beliefs?: boolean;
     }) =>
       client.call('tasks.goal_create', { ...params }) as Promise<{
         task: TaskInfo;

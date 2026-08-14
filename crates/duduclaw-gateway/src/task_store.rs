@@ -20,7 +20,7 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      claimed_by, claimed_at, lease_expires_at, depends_on, retry_count, max_retries, \
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
-     source_discord_guild_id";
+     source_discord_guild_id, deadline_at, risk_boundary";
 
 // ── Task row ────────────────────────────────────────────────
 
@@ -145,6 +145,25 @@ pub struct TaskRow {
     /// pruned.
     #[serde(default)]
     pub source_discord_guild_id: Option<String>,
+
+    // ── Goal assignment form v2 (design-market-belief-loop-2026-08.md §6,
+    // G1) ────────────────────────────────────────────────────────────
+    /// Optional per-goal wall-clock deadline (RFC3339), derived from the
+    /// assign form's `duration_hours` at creation time (`now + duration`).
+    /// `None` ⇒ only the global `[goal_loop] wall_clock_hours` budget
+    /// applies. See [`crate::goal_loop::GoalLoopDriver`]'s deadline guard,
+    /// which takes the earlier of this and the global wall clock.
+    #[serde(default)]
+    pub deadline_at: Option<String>,
+    /// Optional per-goal risk boundary text the user explicitly typed into
+    /// the assign form (≤2000 chars, `duduclaw_core::truncate_chars`).
+    /// `None` ⇒ the deployment's baseline boundary
+    /// ([`crate::goal_loop::baseline_boundary`]) applies instead — the
+    /// baseline is intentionally NOT stored here, so an operator changing
+    /// `config.toml [goal_defaults] baseline_boundary` retroactively
+    /// affects every task that never overrode it.
+    #[serde(default)]
+    pub risk_boundary: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -199,6 +218,8 @@ impl TaskRow {
             agent_seconds: 0,
             goal_state_json: None,
             source_discord_guild_id: None,
+            deadline_at: None,
+            risk_boundary: None,
         }
     }
 }
@@ -687,6 +708,10 @@ impl TaskStore {
             ("goal_state_json", "goal_state_json TEXT"),
             // W2-7 deep-link coordinate persistence (v1.55).
             ("source_discord_guild_id", "source_discord_guild_id TEXT"),
+            // Goal assignment form v2 (design-market-belief-loop-2026-08.md
+            // §6, G1, 2026-08-14): per-goal deadline + risk boundary.
+            ("deadline_at", "deadline_at TEXT"),
+            ("risk_boundary", "risk_boundary TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -711,6 +736,19 @@ impl TaskStore {
         agent_id: Option<&str>,
         priority: Option<&str>,
     ) -> Result<Vec<TaskRow>, String> {
+        self.list_tasks_filtered(status, agent_id, priority, None).await
+    }
+
+    /// `list_tasks` plus an optional `goal_mode` predicate, so goal-scoped
+    /// consumers (the `/goals` dashboard page) don't pull the whole board
+    /// over the wire just to keep a handful of rows.
+    pub async fn list_tasks_filtered(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        priority: Option<&str>,
+        goal_mode: Option<bool>,
+    ) -> Result<Vec<TaskRow>, String> {
         let conn = self.conn.lock().await;
         let mut sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE 1=1");
         let mut binds: Vec<String> = Vec::new();
@@ -725,6 +763,9 @@ impl TaskStore {
         if let Some(p) = priority {
             binds.push(p.to_string());
             sql.push_str(&format!(" AND priority = ?{}", binds.len()));
+        }
+        if let Some(g) = goal_mode {
+            sql.push_str(if g { " AND goal_mode = 1" } else { " AND goal_mode = 0" });
         }
         sql.push_str(" ORDER BY updated_at DESC");
 
@@ -760,10 +801,11 @@ impl TaskStore {
                  claimed_by, claimed_at, lease_expires_at, depends_on, retry_count,
                  max_retries, goal_mode, acceptance_criteria, result_summary, judge_feedback,
                  goal_id, lease_renewed_at, source_channel, source_chat_id,
-                 revision_round, diminishing, agent_seconds, source_discord_guild_id)
+                 revision_round, diminishing, agent_seconds, source_discord_guild_id,
+                 deadline_at, risk_boundary)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31, ?32)",
+                     ?29, ?30, ?31, ?32, ?33, ?34)",
             params![
                 row.id,
                 row.title,
@@ -797,6 +839,8 @@ impl TaskStore {
                 row.diminishing as i64,
                 row.agent_seconds,
                 row.source_discord_guild_id,
+                row.deadline_at,
+                row.risk_boundary,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -2601,6 +2645,8 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         agent_seconds: row.get(30)?,
         goal_state_json: row.get(31)?,
         source_discord_guild_id: row.get(32)?,
+        deadline_at: row.get(33)?,
+        risk_boundary: row.get(34)?,
     })
 }
 
@@ -4100,6 +4146,58 @@ mod tests {
         }
         let s2 = TaskStore::open(dir.path()).expect("reopen");
         assert_eq!(s2.get_task("m1").await.unwrap().unwrap().status, "pending");
+    }
+
+    // ── Goal assignment form v2 (design-market-belief-loop-2026-08.md §6,
+    // G1, 2026-08-14) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn deadline_and_risk_boundary_round_trip_through_insert_and_read() {
+        let (store, _dir) = temp_store();
+        let mut t = pending_task("g1");
+        t.deadline_at = Some("2026-08-20T00:00:00Z".to_string());
+        t.risk_boundary = Some("不得動用生產資料庫寫入權限".to_string());
+        store.insert_task(&t).await.unwrap();
+
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.deadline_at.as_deref(), Some("2026-08-20T00:00:00Z"));
+        assert_eq!(got.risk_boundary.as_deref(), Some("不得動用生產資料庫寫入權限"));
+
+        // A task that never sets them stays NULL (baseline applies at the
+        // injection layer, never stored here — see the field doc comments).
+        let bare = store.get_task("m1_never_inserted").await.unwrap();
+        assert!(bare.is_none());
+        let plain = pending_task("g2");
+        store.insert_task(&plain).await.unwrap();
+        let got2 = store.get_task("g2").await.unwrap().unwrap();
+        assert!(got2.deadline_at.is_none());
+        assert!(got2.risk_boundary.is_none());
+    }
+
+    #[tokio::test]
+    async fn deadline_and_risk_boundary_migration_idempotent_and_old_rows_default_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Simulate a pre-goal-form-v2 db: insert a task, close, reopen twice —
+        // the ALTER guard must not error on re-run, and a row inserted before
+        // the columns existed must read back as NULL (never a spurious
+        // default) rather than panicking on a missing column.
+        {
+            let s = TaskStore::open(dir.path()).expect("first open");
+            s.insert_task(&pending_task("old1")).await.unwrap();
+        }
+        {
+            // Re-running the ALTER guard on an already-migrated db must not
+            // error (idempotency across reopens, mirrors
+            // `migration_is_idempotent_across_reopens`).
+            let s2 = TaskStore::open(dir.path()).expect("second open");
+            let t = s2.get_task("old1").await.unwrap().unwrap();
+            assert!(t.deadline_at.is_none());
+            assert!(t.risk_boundary.is_none());
+        }
+        let s3 = TaskStore::open(dir.path()).expect("third open (re-run ALTER again)");
+        let t = s3.get_task("old1").await.unwrap().unwrap();
+        assert!(t.deadline_at.is_none());
+        assert!(t.risk_boundary.is_none());
     }
 
     // ── Iterative Kanban (v1.45) ────────────────────────────

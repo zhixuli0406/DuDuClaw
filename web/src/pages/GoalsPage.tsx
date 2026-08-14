@@ -17,6 +17,7 @@ import { api, type TaskInfo, type GoalTimeline } from '@/lib/api';
 import { timeAgo } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import {
   ActorAvatar,
@@ -24,6 +25,7 @@ import {
   Button,
   Card,
   CardContent,
+  Checkbox,
   CollectionPageState,
   Dialog,
   DialogContent,
@@ -74,6 +76,16 @@ function statusTone(status: string): string {
   }
 }
 
+/** Compact remaining-time label for a FUTURE timestamp ("36h" / "3d") —
+ *  `timeAgo` is past-oriented and would render a future deadline as "now". */
+function timeLeft(iso: string): string {
+  const ms = new Date(iso).getTime() - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return '0h';
+  const hours = Math.round(ms / 3_600_000);
+  if (hours < 48) return `${Math.max(hours, 1)}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
 function GoalStatusBadge({ status }: { status: string }) {
   const intl = useIntl();
   return (
@@ -99,10 +111,27 @@ function CreateGoalDialog({
   const [description, setDescription] = useState('');
   const [criteria, setCriteria] = useState('');
   const [priority, setPriority] = useState('medium');
+  // Goal assignment form v2 (design-market-belief-loop-2026-08.md §6, G1):
+  // both optional — empty duration means "no per-goal deadline" (global
+  // wall-clock applies) and empty risk boundary means "apply baseline"
+  // (local kept as string so the number input can be genuinely empty rather
+  // than coerced to 0).
+  const [durationHours, setDurationHours] = useState('');
+  const [riskBoundary, setRiskBoundary] = useState('');
+  // Belief loop × goal contract gap 3 (design-market-belief-loop-2026-08.md
+  // §3): opt-in that teaches the assigned agent to declare structured
+  // predictions about the goal's measurable indicators.
+  const [requireBeliefs, setRequireBeliefs] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const submit = async () => {
     if (!agentId || !description.trim()) return;
+    const trimmedDuration = durationHours.trim();
+    const parsedDuration = trimmedDuration ? Number(trimmedDuration) : undefined;
+    if (parsedDuration !== undefined && (!Number.isFinite(parsedDuration) || parsedDuration < 1 || parsedDuration > 720)) {
+      toast.error(intl.formatMessage({ id: 'goals.create.durationInvalid' }));
+      return;
+    }
     setSubmitting(true);
     try {
       const result = await api.tasks.goalCreate({
@@ -110,6 +139,9 @@ function CreateGoalDialog({
         description: description.trim(),
         acceptance_criteria: criteria.trim() || undefined,
         priority: priority as 'low' | 'medium' | 'high' | 'urgent',
+        duration_hours: parsedDuration,
+        risk_boundary: riskBoundary.trim() || undefined,
+        require_beliefs: requireBeliefs || undefined,
       });
       toast.success(
         intl.formatMessage({ id: 'goals.create.success' }, { cap: result.iteration_cap }),
@@ -119,6 +151,9 @@ function CreateGoalDialog({
       }
       setDescription('');
       setCriteria('');
+      setDurationHours('');
+      setRiskBoundary('');
+      setRequireBeliefs(false);
       onCreated();
       onClose();
     } catch (e) {
@@ -191,6 +226,41 @@ function CreateGoalDialog({
                 ))}
               </SelectContent>
             </Select>
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">{intl.formatMessage({ id: 'goals.create.duration' })}</label>
+            <Input
+              type="number"
+              min={1}
+              max={720}
+              value={durationHours}
+              placeholder={intl.formatMessage({ id: 'goals.create.durationPlaceholder' })}
+              onChange={(e) => setDurationHours(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">{intl.formatMessage({ id: 'goals.create.riskBoundary' })}</label>
+            <Textarea
+              value={riskBoundary}
+              rows={3}
+              placeholder={intl.formatMessage({ id: 'goals.create.riskBoundaryPlaceholder' })}
+              onChange={(e) => setRiskBoundary(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'goals.create.riskBoundaryHint' })}
+            </p>
+          </div>
+          <div className="space-y-1.5">
+            <label className="flex items-center gap-2 text-sm font-medium text-foreground">
+              <Checkbox
+                checked={requireBeliefs}
+                onCheckedChange={(v) => setRequireBeliefs(v === true)}
+              />
+              {intl.formatMessage({ id: 'goals.create.requireBeliefs' })}
+            </label>
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'goals.create.requireBeliefsHint' })}
+            </p>
           </div>
         </div>
         <DialogFooter>
@@ -387,10 +457,40 @@ function GoalDetailDialog({
                   {intl.formatMessage({ id: 'goals.diminishing' })}
                 </Badge>
               )}
+              {timeline.task.deadline_at && (
+                <Badge
+                  variant="secondary"
+                  className={
+                    new Date(timeline.task.deadline_at).getTime() < Date.now()
+                      ? 'text-rose-600 dark:text-rose-400'
+                      : 'text-muted-foreground'
+                  }
+                >
+                  {new Date(timeline.task.deadline_at).getTime() < Date.now()
+                    ? intl.formatMessage({ id: 'goals.detail.deadlinePast' })
+                    : intl.formatMessage(
+                        { id: 'goals.detail.deadline' },
+                        { when: timeLeft(timeline.task.deadline_at) },
+                      )}
+                </Badge>
+              )}
               <span className="ml-auto font-mono tabular-nums text-muted-foreground">
                 {timeAgo(timeline.task.created_at)}
               </span>
             </div>
+
+            {/* Goal contract v2: per-goal risk boundary (explicit only —
+                baseline application is server-side and not echoed back). */}
+            {timeline.task.risk_boundary && (
+              <div className="rounded-lg bg-secondary px-3 py-2 text-xs">
+                <p className="mb-0.5 font-medium text-foreground">
+                  {intl.formatMessage({ id: 'goals.detail.riskBoundary' })}
+                </p>
+                <p className="whitespace-pre-wrap text-muted-foreground">
+                  {timeline.task.risk_boundary}
+                </p>
+              </div>
+            )}
 
             {/* Acceptance contract + latest result */}
             {timeline.task.acceptance_criteria && (
@@ -653,27 +753,50 @@ export function GoalsPage() {
   const intl = useIntl();
   const errorText = useErrorMessage();
   const connState = useConnectionStore((s) => s.state);
-  const { agents, fetchAgents } = useAgentsStore();
+  const { agents, fetchAgents, loaded: agentsLoaded } = useAgentsStore();
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [searchParams, setSearchParams] = useSearchParams();
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [agentFilter, setAgentFilter] = useState('');
   const detailTask = searchParams.get('task');
 
+  // Non-admins must scope tasks.list to a bound agent (check_agent_filter) —
+  // an unscoped first load would error out. `agents.list` is already
+  // binding-filtered server-side, so its first entry is a valid default scope.
+  useEffect(() => {
+    if (!isAdmin && !agentFilter && agents.length > 0) {
+      setAgentFilter(agents[0].name);
+    }
+  }, [isAdmin, agentFilter, agents]);
+
   const load = useCallback(async () => {
+    if (!isAdmin && !agentFilter) {
+      // Waiting for the default scope above; a non-admin with zero bound
+      // agents will never get one — settle into the empty state instead of
+      // an endless skeleton.
+      if (agentsLoaded && agents.length === 0) setLoading(false);
+      return;
+    }
     try {
-      const r = await api.tasks.list(agentFilter ? { agent_id: agentFilter } : undefined);
+      const r = await api.tasks.list({
+        goal_mode: true,
+        ...(agentFilter ? { agent_id: agentFilter } : {}),
+      });
       setTasks((r.tasks ?? []).filter((t) => t.goal_mode));
+      setLoadError(null);
     } catch (e) {
       console.warn('[api]', e);
+      setLoadError(errorText(e));
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
     } finally {
       setLoading(false);
     }
     // errorText stable; intl from context.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentFilter]);
+  }, [agentFilter, isAdmin, agentsLoaded, agents.length]);
 
   useEffect(() => {
     if (connState === 'authenticated') {
@@ -715,7 +838,10 @@ export function GoalsPage() {
               <SelectValue>{agentLabel}</SelectValue>
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="">{intl.formatMessage({ id: 'foresight.allAgents' })}</SelectItem>
+              {/* Non-admins cannot query unscoped (check_agent_filter) — hide "all". */}
+              {isAdmin && (
+                <SelectItem value="">{intl.formatMessage({ id: 'foresight.allAgents' })}</SelectItem>
+              )}
               {agents.map((a) => (
                 <SelectItem key={a.name} value={a.name}>
                   {a.display_name || a.name}
@@ -732,6 +858,18 @@ export function GoalsPage() {
 
       {loading ? (
         <CollectionPageState state="loading" />
+      ) : loadError ? (
+        <CollectionPageState
+          state="error"
+          icon={Target}
+          title={intl.formatMessage({ id: 'goals.error.title' })}
+          description={loadError}
+          action={
+            <Button variant="outline" size="sm" onClick={() => void load()}>
+              {intl.formatMessage({ id: 'foresight.error.retry' })}
+            </Button>
+          }
+        />
       ) : tasks.length === 0 ? (
         <CollectionPageState
           state="empty"

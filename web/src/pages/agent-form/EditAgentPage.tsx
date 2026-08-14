@@ -77,6 +77,7 @@ import {
   DEFAULT_CONTAINER_ADVANCED,
   DEFAULT_CAPABILITIES,
   DEFAULT_OS_WATCH,
+  DEFAULT_RESEARCH,
   DEFAULT_ODOO,
   DEFAULT_ADVANCED,
 } from './defaults';
@@ -357,6 +358,14 @@ export function EditAgentPage() {
   const osWatchDirtyRef = useRef(false);
   useEffect(() => { osWatchDirtyRef.current = osWatchDirty; }, [osWatchDirty]);
 
+  // Belief loop × goal contract gap 2 — self-study [research] form. Prefilled
+  // from agents.inspect (`research`) alongside caps/os_watch; only written
+  // when the operator edits it.
+  const [research, setResearch] = useState<typeof DEFAULT_RESEARCH>(DEFAULT_RESEARCH);
+  const [researchDirty, setResearchDirty] = useState(false);
+  const researchDirtyRef = useRef(false);
+  useEffect(() => { researchDirtyRef.current = researchDirty; }, [researchDirty]);
+
   // CON — contract form, loaded lazily via contract.get on first tab open
   const [contract, setContract] = useState<ContractConfig>({ must_not: [], must_always: [], max_tool_calls_per_turn: 0 });
   const [contractLoaded, setContractLoaded] = useState(false);
@@ -549,9 +558,12 @@ export function EditAgentPage() {
 
   // CAP — lazily prefill the [capabilities] form (incl. Progent policy rules)
   // from agents.inspect when the 工具與權限 tab first opens. Keeps capsDirty false
-  // so an untouched tab still omits `capabilities` from the update.
+  // so an untouched tab still omits `capabilities` from the update. Also
+  // fires on the 自動化 tab open — the same `agents.inspect` payload carries
+  // `[research]` (belief loop × goal contract gap 2), and that toggle lives
+  // there rather than under 工具與權限.
   useEffect(() => {
-    if (tab !== 'tools' || !agent || capsLoaded) return;
+    if ((tab !== 'tools' && tab !== 'automation') || !agent || capsLoaded) return;
     // Guard both races: (1) cross-agent — if the page switches agents while
     // this inspect is in flight, `cancelled` (set by cleanup) drops the stale
     // result so agent A's policy never lands in agent B's form; (2) operator
@@ -583,6 +595,15 @@ export function EditAgentPage() {
           max_events_per_min: ow.max_events_per_min ?? prev.max_events_per_min,
         }));
       }
+      // Belief loop × goal contract gap 2 — prefill [research]. Always
+      // present with concrete values (no "unset" state), unlike os_watch.
+      const rs = detail.research;
+      if (rs && !researchDirtyRef.current) {
+        setResearch({
+          self_study: rs.self_study,
+          self_study_hour: rs.self_study_hour,
+        });
+      }
       setCapsLoaded(true);
     }).catch((e) => {
       if (cancelled) return;
@@ -609,6 +630,13 @@ export function EditAgentPage() {
     setOsWatchDirty(true);
     markSectionEdit();
     setOsWatch((prev) => ({ ...prev, [key]: value }));
+  }, [markSectionEdit]);
+
+  // Belief loop × goal contract gap 2 — [research] field updater.
+  const updateResearch = useCallback(<K extends keyof typeof DEFAULT_RESEARCH>(key: K, value: (typeof DEFAULT_RESEARCH)[K]) => {
+    setResearchDirty(true);
+    markSectionEdit();
+    setResearch((prev) => ({ ...prev, [key]: value }));
   }, [markSectionEdit]);
 
   // RT — runtime field updater.
@@ -744,6 +772,15 @@ export function EditAgentPage() {
           ignore: osWatch.ignore,
           debounce_ms: osWatch.debounce_ms,
           max_events_per_min: osWatch.max_events_per_min,
+        };
+      }
+
+      // Belief loop × goal contract gap 2 — only include [research] when the
+      // operator edited it.
+      if (researchDirty) {
+        submitForm.research = {
+          self_study: research.self_study,
+          self_study_hour: research.self_study_hour,
         };
       }
 
@@ -1672,6 +1709,27 @@ export function EditAgentPage() {
               <RowNumber label={t('agents.adv.stagnationWindow')} value={adv.stagnation_window_seconds} min={1} onChange={(v) => updateAdv('stagnation_window_seconds', v)} />
               <RowNumber label={t('agents.adv.stagnationThreshold')} value={adv.stagnation_trigger_threshold} min={1} onChange={(v) => updateAdv('stagnation_trigger_threshold', v)} />
               <RowSelect label={t('agents.adv.stagnationAction')} value={adv.stagnation_action} onChange={(v) => updateAdv('stagnation_action', v as 'log_only' | 'suppress')} options={stagnationActionOptions} />
+            </SettingsCard>
+          </SettingsSection>
+
+          {/* Belief loop × goal contract gap 2 — nightly self-study opt-in.
+              design-market-belief-loop-2026-08.md §3 「自主研究」. */}
+          <SettingsSection title={t('agents.research.selfStudy')} description={t('agents.research.selfStudy.desc')}>
+            <SettingsCard>
+              <RowSwitch
+                label={t('agents.research.selfStudyEnabled')}
+                description={t('agents.research.selfStudyEnabled.help')}
+                checked={research.self_study}
+                onChange={(v) => updateResearch('self_study', v)}
+              />
+              <RowNumber
+                label={t('agents.research.selfStudyHour')}
+                description={t('agents.research.selfStudyHour.help')}
+                value={research.self_study_hour}
+                min={0}
+                max={23}
+                onChange={(v) => updateResearch('self_study_hour', v)}
+              />
             </SettingsCard>
           </SettingsSection>
         </SettingsTab>

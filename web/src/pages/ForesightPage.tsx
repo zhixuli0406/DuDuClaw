@@ -10,6 +10,8 @@ import {
   type ForwardChainRound,
   type ForwardCalibration,
   type ForwardStateRow,
+  type BeliefRow,
+  type BeliefStats,
 } from '@/lib/api';
 import { timeAgo } from '@/lib/format';
 import { toast } from '@/lib/toast';
@@ -32,6 +34,10 @@ import {
   SelectContent,
   SelectItem,
   Spinner,
+  Tabs,
+  TabsList,
+  TabsTab,
+  TabsPanel,
   useErrorMessage,
 } from '@/components/mds';
 
@@ -314,6 +320,15 @@ function ChainRoundView({ round }: { round: ForwardChainRound }) {
         ? `${round.observed.calls}${round.observed.errors > 0 ? `（${intl.formatMessage({ id: 'foresight.chain.errors' }, { n: round.observed.errors })}）` : ''}`
         : '—',
     });
+    rows.push({
+      label: t('foresight.chain.artifact'),
+      expected: round.expected
+        ? t(`foresight.artifact.${round.expected.artifact}`, round.expected.artifact)
+        : '—',
+      observed: round.observed
+        ? t(`foresight.artifact.${round.observed.artifact}`, round.observed.artifact)
+        : '—',
+    });
   }
   return (
     <div className="space-y-2 rounded-lg border border-surface-border p-3">
@@ -459,6 +474,238 @@ function ChainDialog({ taskId, onClose }: { taskId: string | null; onClose: () =
   );
 }
 
+/** Predicted/realized direction label — up|down|flat → 看漲/看跌/持平. */
+function directionLabel(intl: ReturnType<typeof useIntl>, direction: string | null): string {
+  if (!direction) return '—';
+  return intl.formatMessage({ id: `belief.direction.${direction}`, defaultMessage: direction });
+}
+
+/** Calibration stats card for the "信念與驗證" tab — honest three-state
+ *  posture (no agent picked / n<30 counts-only / full stats), same spirit
+ *  as `CalibrationCard` above but against the belief store instead
+ *  of the task forward model. */
+function BeliefStatsCard({ agentId, stats }: { agentId: string; stats: BeliefStats | null }) {
+  const intl = useIntl();
+  if (!agentId) {
+    return (
+      <Card data-size="sm">
+        <CardContent className="py-4 text-center text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'belief.stats.selectAgent' })}
+        </CardContent>
+      </Card>
+    );
+  }
+  if (!stats) return null;
+  if (stats.insufficient_samples) {
+    return (
+      <Card data-size="sm">
+        <CardContent className="space-y-2">
+          <h3 className="text-sm font-medium text-foreground">
+            {intl.formatMessage({ id: 'belief.stats.title' })}
+          </h3>
+          <p className="text-sm text-muted-foreground">
+            {intl.formatMessage({ id: 'belief.stats.insufficient' }, { n: stats.n_settled })}
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+  const overPct = stats.overconfidence != null ? Math.round(stats.overconfidence * 100) : null;
+  return (
+    <Card data-size="sm">
+      <CardContent className="space-y-3">
+        <h3 className="text-sm font-medium text-foreground">
+          {intl.formatMessage({ id: 'belief.stats.title' })}
+        </h3>
+        <div className="grid grid-cols-4 gap-2 text-center">
+          <div>
+            <p className="font-mono text-lg tabular-nums text-foreground">{stats.n_settled}</p>
+            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'belief.stats.nSettled' })}</p>
+          </div>
+          <div>
+            <p className="font-mono text-lg tabular-nums text-foreground">
+              {stats.hit_rate_wilson_low != null ? `${Math.round(stats.hit_rate_wilson_low * 100)}%` : '—'}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'belief.stats.hitRateWilson' })}
+            </p>
+          </div>
+          <div>
+            <p className="font-mono text-lg tabular-nums text-foreground">
+              {stats.mean_brier != null ? stats.mean_brier.toFixed(2) : '—'}
+            </p>
+            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'belief.stats.meanBrier' })}</p>
+          </div>
+          <div>
+            <p
+              className={`font-mono text-lg tabular-nums ${
+                overPct != null && overPct > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-foreground'
+              }`}
+            >
+              {overPct != null ? `${overPct > 0 ? '+' : ''}${overPct}%` : '—'}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'belief.stats.overconfidence' })}
+            </p>
+          </div>
+        </div>
+        {stats.per_subject.length > 0 && (
+          <div className="space-y-1 border-t border-surface-border pt-3">
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: 'belief.stats.perSubject' })}
+            </p>
+            {stats.per_subject.map((s) => (
+              <div key={s.subject} className="flex items-center gap-2 text-xs">
+                <span className="w-20 shrink-0 truncate text-foreground">{s.subject}</span>
+                <span className="font-mono tabular-nums text-muted-foreground">
+                  {s.hits}/{s.n_settled}
+                </span>
+                {s.mean_brier != null && (
+                  <span className="ml-auto font-mono tabular-nums text-muted-foreground">
+                    {s.mean_brier.toFixed(2)}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** One belief row: subject · predicted direction+confidence →
+ *  realized direction ✓/✗ (flat_band shows "持平") · Brier · time. */
+function BeliefRowView({ belief }: { belief: BeliefRow }) {
+  const intl = useIntl();
+  const settled = belief.settled_at != null;
+  const isFlatBand = belief.outcome === 'flat_band';
+  const isHit = belief.outcome === 'hit';
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-xs">
+      <span className="font-mono tabular-nums text-muted-foreground">
+        {timeAgo(belief.settled_at ?? belief.predicted_at)}
+      </span>
+      <span className="max-w-[10rem] truncate font-medium text-foreground" title={belief.subject}>
+        {belief.subject}
+      </span>
+      <span className="text-muted-foreground">
+        {directionLabel(intl, belief.direction)} {Math.round(belief.prob * 100)}%
+      </span>
+      <ArrowRight className="size-3 shrink-0 text-muted-foreground" />
+      {!settled ? (
+        <span className="text-muted-foreground">{intl.formatMessage({ id: 'belief.pending' })}</span>
+      ) : isFlatBand ? (
+        <span className="text-muted-foreground">{intl.formatMessage({ id: 'belief.direction.flat' })}</span>
+      ) : (
+        <span className={isHit ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
+          {directionLabel(intl, belief.realized_direction)} {isHit ? '✓' : '✗'}
+        </span>
+      )}
+      {belief.brier != null && (
+        <span className="ml-auto font-mono tabular-nums text-muted-foreground">{belief.brier.toFixed(2)}</span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * BeliefTab — the "信念與驗證" panel: agent-submitted directional
+ * calls (up/down/flat + confidence) about any external subject, recorded
+ * before the fact and settled against the realized value. A separate loop
+ * from the task forward model above (`api.belief.*` / `belief_log`, not
+ * `task_prediction_log`) — dedicated load/loading/error/empty state so it
+ * works independently of whether the "任務預測" tab has any data.
+ */
+function BeliefTab({ agentId }: { agentId: string }) {
+  const intl = useIntl();
+  const errorText = useErrorMessage();
+  const [beliefs, setBeliefs] = useState<BeliefRow[]>([]);
+  const [stats, setStats] = useState<BeliefStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    let alive = true;
+    setLoading(true);
+    let notified = false;
+    const onFailure = (e: unknown) => {
+      console.warn('[api]', e);
+      if (!notified) {
+        notified = true;
+        if (alive) setLoadError(errorText(e));
+      }
+      return null;
+    };
+    Promise.all([
+      api.belief.recent(agentId || undefined, 50).catch(onFailure),
+      // Summary requires an agent_id server-side; skipping it when none is
+      // selected is intentional, not a failure — resolves to `undefined`
+      // (vs. `null` from a real failure) so the two cases stay distinguishable.
+      agentId ? api.belief.summary(agentId).catch(onFailure) : Promise.resolve(undefined),
+    ])
+      .then(([recentRes, summaryRes]) => {
+        if (!alive) return;
+        if (recentRes !== null && summaryRes !== null) setLoadError(null);
+        setBeliefs(recentRes?.beliefs ?? []);
+        setStats(summaryRes ? summaryRes.stats : null);
+      })
+      .finally(() => alive && setLoading(false));
+    return () => {
+      alive = false;
+    };
+    // errorText stable from hook; intl from context.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
+
+  useEffect(() => load(), [load]);
+
+  if (loading) return <CollectionPageState state="loading" />;
+  if (loadError) {
+    return (
+      <CollectionPageState
+        state="error"
+        icon={Radar}
+        title={intl.formatMessage({ id: 'belief.error.title' })}
+        description={loadError}
+        action={
+          <Button variant="outline" size="sm" onClick={() => load()}>
+            {intl.formatMessage({ id: 'foresight.error.retry' })}
+          </Button>
+        }
+      />
+    );
+  }
+  if (beliefs.length === 0) {
+    return (
+      <CollectionPageState
+        state="empty"
+        icon={Radar}
+        title={intl.formatMessage({ id: 'belief.empty.title' })}
+        description={intl.formatMessage({ id: 'belief.empty.desc' })}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <BeliefStatsCard agentId={agentId} stats={stats} />
+      <section className="space-y-2">
+        <h2 className="text-sm font-medium text-foreground">
+          {intl.formatMessage({ id: 'belief.list.title' })}
+        </h2>
+        <Card data-size="sm">
+          <CardContent className="divide-y divide-surface-border">
+            {beliefs.map((b) => (
+              <BeliefRowView key={b.belief_id} belief={b} />
+            ))}
+          </CardContent>
+        </Card>
+      </section>
+    </div>
+  );
+}
+
 export function ForesightPage() {
   const intl = useIntl();
   const errorText = useErrorMessage();
@@ -471,16 +718,22 @@ export function ForesightPage() {
   const [windowScanned, setWindowScanned] = useState(0);
   const [windowCap, setWindowCap] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [chainTask, setChainTask] = useState<string | null>(null);
+  const [tab, setTab] = useState<'predictions' | 'beliefs'>('predictions');
 
   const load = useCallback(() => {
     let alive = true;
     setLoading(true);
     let notified = false;
+    // A failed RPC (e.g. insufficient role — forward.* requires manager) must
+    // render as an error state, never as the same empty state a data-less
+    // agent sees; otherwise permission problems masquerade as "no data".
     const onFailure = (e: unknown) => {
       console.warn('[api]', e);
       if (!notified) {
         notified = true;
+        if (alive) setLoadError(errorText(e));
         toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
       }
       return null;
@@ -491,6 +744,7 @@ export function ForesightPage() {
     ])
       .then(([summary, recent]) => {
         if (!alive) return;
+        if (summary && recent) setLoadError(null);
         setSummaries(summary?.agents ?? []);
         setWindowScanned(summary?.window_scanned ?? 0);
         setWindowCap(summary?.window_cap ?? 0);
@@ -548,123 +802,180 @@ export function ForesightPage() {
         </div>
       </div>
 
-      {loading ? (
-        <CollectionPageState state="loading" />
-      ) : summaries.length === 0 ? (
-        <CollectionPageState
-          state="empty"
-          icon={Radar}
-          title={intl.formatMessage({ id: 'forward.empty.title' })}
-          description={intl.formatMessage({ id: 'foresight.empty.desc' })}
-        />
-      ) : (
-        <>
-          <LoopStrip summaries={summaries} />
+      <Tabs
+        variant="line"
+        value={tab}
+        onValueChange={(v) => setTab(v as 'predictions' | 'beliefs')}
+        className="flex flex-col gap-4"
+      >
+        <TabsList>
+          <TabsTab value="predictions">{intl.formatMessage({ id: 'foresight.tabs.predictions' })}</TabsTab>
+          <TabsTab value="beliefs">{intl.formatMessage({ id: 'foresight.tabs.beliefs' })}</TabsTab>
+        </TabsList>
 
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {summaries.map((s) => (
-              <Card key={s.agent_id} data-size="sm">
-                <CardContent className="space-y-3">
-                  <div className="flex items-center gap-2">
-                    <ActorAvatar actorType="agent" size="sm" name={s.agent_id} />
-                    <h3 className="truncate text-sm font-medium text-foreground">{s.agent_id}</h3>
-                    {s.last_settled_at && (
-                      <span className="ml-auto font-mono text-xs tabular-nums text-muted-foreground">
-                        {timeAgo(s.last_settled_at)}
-                      </span>
-                    )}
-                  </div>
-                  <div className="grid grid-cols-3 gap-2">
-                    <div className="text-center">
-                      <p className="font-mono text-lg font-medium tabular-nums text-foreground">{s.total}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {intl.formatMessage({ id: 'forward.metric.total' })}
-                      </p>
-                    </div>
-                    <div className="text-center">
-                      <p className="font-mono text-lg font-medium tabular-nums text-foreground">{s.settled}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {intl.formatMessage({ id: 'forward.metric.settled' })}
-                      </p>
-                    </div>
-                    <div className="text-center">
-                      <p className="font-mono text-lg font-medium tabular-nums text-foreground">
-                        {s.avg_brier != null ? s.avg_brier.toFixed(2) : '—'}
-                      </p>
-                      <p className="text-xs text-muted-foreground">
-                        {intl.formatMessage({ id: 'forward.metric.brier' })}
-                      </p>
-                    </div>
-                  </div>
-                  <CategoryDistribution categories={s.categories} settled={s.settled} />
-                </CardContent>
-              </Card>
-            ))}
-          </div>
+        <TabsPanel value="predictions" className="space-y-4">
+          {loading ? (
+            <CollectionPageState state="loading" />
+          ) : loadError ? (
+            <CollectionPageState
+              state="error"
+              icon={Radar}
+              title={intl.formatMessage({ id: 'foresight.error.title' })}
+              description={loadError}
+              action={
+                <Button variant="outline" size="sm" onClick={() => load()}>
+                  {intl.formatMessage({ id: 'foresight.error.retry' })}
+                </Button>
+              }
+            />
+          ) : summaries.length === 0 ? (
+            <CollectionPageState
+              state="empty"
+              icon={Radar}
+              title={intl.formatMessage({ id: 'forward.empty.title' })}
+              description={intl.formatMessage({ id: 'foresight.empty.desc' })}
+            />
+          ) : (
+            <>
+              <LoopStrip summaries={summaries} />
 
-          {selectedAgent && (
-            <div className="grid gap-4 lg:grid-cols-2">
-              <CalibrationCard agentId={selectedAgent} />
-              <StatesCard agentId={selectedAgent} />
-            </div>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {summaries.map((s) => (
+                  <Card key={s.agent_id} data-size="sm">
+                    <CardContent className="space-y-3">
+                      <div className="flex items-center gap-2">
+                        <ActorAvatar actorType="agent" size="sm" name={s.agent_id} />
+                        <h3 className="truncate text-sm font-medium text-foreground">{s.agent_id}</h3>
+                        {s.last_settled_at && (
+                          <span className="ml-auto font-mono text-xs tabular-nums text-muted-foreground">
+                            {timeAgo(s.last_settled_at)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <div className="text-center">
+                          <p className="font-mono text-lg font-medium tabular-nums text-foreground">{s.total}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {intl.formatMessage({ id: 'forward.metric.total' })}
+                          </p>
+                        </div>
+                        <div className="text-center">
+                          <p className="font-mono text-lg font-medium tabular-nums text-foreground">{s.settled}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {intl.formatMessage({ id: 'forward.metric.settled' })}
+                          </p>
+                        </div>
+                        <div className="text-center">
+                          <p className="font-mono text-lg font-medium tabular-nums text-foreground">
+                            {s.avg_brier != null ? s.avg_brier.toFixed(2) : '—'}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            {intl.formatMessage({ id: 'forward.metric.brier' })}
+                          </p>
+                        </div>
+                      </div>
+                      <CategoryDistribution categories={s.categories} settled={s.settled} />
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+
+              {selectedAgent && (
+                <div className="grid gap-4 lg:grid-cols-2">
+                  <CalibrationCard agentId={selectedAgent} />
+                  <StatesCard agentId={selectedAgent} />
+                </div>
+              )}
+              {!selectedAgent && <StatesCard agentId="" />}
+
+              {rows.length > 0 && (
+                <section className="space-y-2">
+                  <h2 className="text-sm font-medium text-foreground">
+                    {intl.formatMessage({ id: 'forward.recent.title' })}
+                  </h2>
+                  <Card data-size="sm">
+                    <CardContent className="divide-y divide-surface-border">
+                      {rows.map((r) => {
+                        const label = (id: string | null | undefined, prefix: string) =>
+                          id
+                            ? intl.formatMessage({ id: `${prefix}.${id}`, defaultMessage: id })
+                            : null;
+                        const exp = label(r.expected_outcome, 'foresight.outcome');
+                        const obs = label(r.observed_outcome, 'foresight.outcome');
+                        // accept/accepted etc. share display labels — compare the
+                        // rendered labels, not the raw enum tokens.
+                        const outcomeHit = exp != null && obs != null && exp === obs;
+                        return (
+                          <button
+                            key={r.prediction_id}
+                            type="button"
+                            onClick={() => setChainTask(r.task_id)}
+                            className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 py-2 text-left text-xs hover:bg-secondary/50"
+                          >
+                            <span className="font-mono tabular-nums text-muted-foreground">
+                              {timeAgo(r.settled_at ?? r.created_at)}
+                            </span>
+                            <span className="max-w-[18rem] truncate text-foreground" title={r.task_id}>
+                              {r.task_title || r.task_id.slice(0, 8)} · R{r.round}
+                            </span>
+                            {exp && (
+                              <span className="text-muted-foreground">
+                                {intl.formatMessage(
+                                  { id: 'foresight.recent.pv' },
+                                  { expected: exp, observed: obs ?? intl.formatMessage({ id: 'forward.pending' }) },
+                                )}
+                                {obs != null && (
+                                  <span
+                                    className={
+                                      outcomeHit
+                                        ? 'ml-1 text-emerald-600 dark:text-emerald-400'
+                                        : 'ml-1 text-rose-600 dark:text-rose-400'
+                                    }
+                                  >
+                                    {outcomeHit ? '✓' : '✗'}
+                                  </span>
+                                )}
+                              </span>
+                            )}
+                            <span className={`ml-auto ${categoryTone(r.category)}`}>
+                              {r.settled_at == null
+                                ? intl.formatMessage({ id: 'forward.pending' })
+                                : r.category
+                                  ? intl.formatMessage({
+                                      id: `forward.category.${r.category}`,
+                                      defaultMessage: r.category,
+                                    })
+                                  : '—'}
+                            </span>
+                            {r.brier != null && (
+                              <span className="font-mono tabular-nums text-muted-foreground">
+                                {r.brier.toFixed(2)}
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </CardContent>
+                  </Card>
+                  <p className="text-xs text-muted-foreground">
+                    {intl.formatMessage({ id: 'foresight.recent.hint' })}
+                  </p>
+                </section>
+              )}
+
+              {windowCap > 0 && windowScanned >= windowCap && (
+                <p className="text-xs text-muted-foreground">
+                  {intl.formatMessage({ id: 'forward.window.note' }, { cap: windowCap })}
+                </p>
+              )}
+            </>
           )}
-          {!selectedAgent && <StatesCard agentId="" />}
+        </TabsPanel>
 
-          {rows.length > 0 && (
-            <section className="space-y-2">
-              <h2 className="text-sm font-medium text-foreground">
-                {intl.formatMessage({ id: 'forward.recent.title' })}
-              </h2>
-              <Card data-size="sm">
-                <CardContent className="divide-y divide-surface-border">
-                  {rows.map((r) => (
-                    <button
-                      key={r.prediction_id}
-                      type="button"
-                      onClick={() => setChainTask(r.task_id)}
-                      className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 py-2 text-left text-xs hover:bg-secondary/50"
-                    >
-                      <span className="font-mono tabular-nums text-muted-foreground">
-                        {timeAgo(r.settled_at ?? r.created_at)}
-                      </span>
-                      <span className="truncate text-foreground" title={r.task_id}>
-                        {r.task_id.slice(0, 8)} · R{r.round}
-                      </span>
-                      <span className="text-muted-foreground">
-                        {intl.formatMessage({ id: `forward.source.${r.source}`, defaultMessage: r.source })}
-                      </span>
-                      <span className={`ml-auto ${categoryTone(r.category)}`}>
-                        {r.settled_at == null
-                          ? intl.formatMessage({ id: 'forward.pending' })
-                          : r.category
-                            ? intl.formatMessage({
-                                id: `forward.category.${r.category}`,
-                                defaultMessage: r.category,
-                              })
-                            : '—'}
-                      </span>
-                      {r.brier != null && (
-                        <span className="font-mono tabular-nums text-muted-foreground">
-                          {r.brier.toFixed(2)}
-                        </span>
-                      )}
-                    </button>
-                  ))}
-                </CardContent>
-              </Card>
-              <p className="text-xs text-muted-foreground">
-                {intl.formatMessage({ id: 'foresight.recent.hint' })}
-              </p>
-            </section>
-          )}
-
-          {windowCap > 0 && windowScanned >= windowCap && (
-            <p className="text-xs text-muted-foreground">
-              {intl.formatMessage({ id: 'forward.window.note' }, { cap: windowCap })}
-            </p>
-          )}
-        </>
-      )}
+        <TabsPanel value="beliefs">
+          <BeliefTab agentId={selectedAgent} />
+        </TabsPanel>
+      </Tabs>
 
       <ChainDialog taskId={chainTask} onClose={() => setChainTask(null)} />
     </div>

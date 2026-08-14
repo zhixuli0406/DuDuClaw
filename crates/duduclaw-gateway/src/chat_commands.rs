@@ -11,7 +11,7 @@ use duduclaw_security::safety_word::{SafetyWordAction, SafetyWordScope};
 use tracing::warn;
 
 /// Parsed chat command from user input.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatCommand {
     /// `/status` — show agent name, status, token usage, last active time
     Status,
@@ -70,7 +70,7 @@ pub enum ChatCommand {
 }
 
 /// The three shapes a `/goal` command can take.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GoalCommand {
     /// `/goal` with no args → print usage.
     Usage,
@@ -81,10 +81,18 @@ pub enum GoalCommand {
     /// acceptance criteria. `outcome` is the raw `outcome:` payload (WP2.4) — the
     /// text after `outcome:`, validated into an `OutcomeSpec` at creation time;
     /// `None` when the third segment is absent.
+    ///
+    /// Goal contract v2 (design §6 G1): any `||` segment may also be
+    /// `時限:<N>[h|小時|d|天]` / `duration:<N>…` (per-goal deadline) or
+    /// `邊界:<text>` / `risk:<text>` (per-goal risk boundary; absent ⇒ the
+    /// baseline boundary is applied at injection time, same as the dashboard
+    /// form). Segments are position-independent, mirroring `outcome:`.
     Create {
         description: String,
         acceptance_criteria: Option<String>,
         outcome: Option<String>,
+        duration_hours: Option<f64>,
+        risk_boundary: Option<String>,
     },
 }
 
@@ -109,25 +117,71 @@ fn parse_goal_args(args: Option<&str>) -> GoalCommand {
     }
     // Split off an optional trailing `|| outcome:<spec>` section first (WP2.4).
     let (head, outcome) = split_outcome_section(raw);
-    match head.as_str().split_once("||") {
-        Some((desc, crit)) => {
-            let desc = desc.trim();
-            if desc.is_empty() {
+    // Goal contract v2: pull prefixed `時限:`/`duration:` and `邊界:`/`risk:`
+    // segments out wherever they appear; whatever remains keeps the original
+    // `<desc> [|| <criteria>]` semantics byte-identically.
+    let mut duration_hours: Option<f64> = None;
+    let mut risk_boundary: Option<String> = None;
+    let mut plain: Vec<&str> = Vec::new();
+    for seg in head.split("||") {
+        let seg = seg.trim();
+        if let Some(v) = strip_any_prefix(seg, &["時限:", "時限：", "duration:"]) {
+            duration_hours = parse_duration_hours(v);
+            if duration_hours.is_none() {
+                // Fail closed like a malformed outcome spec: a mistyped
+                // deadline must not silently become part of the description.
                 return GoalCommand::Usage;
             }
-            let crit = crit.trim();
-            GoalCommand::Create {
-                description: desc.to_string(),
-                acceptance_criteria: (!crit.is_empty()).then(|| crit.to_string()),
-                outcome,
+        } else if let Some(v) = strip_any_prefix(seg, &["邊界:", "邊界：", "risk:"]) {
+            let v = v.trim();
+            if !v.is_empty() {
+                risk_boundary = Some(v.to_string());
+            }
+        } else if !seg.is_empty() {
+            plain.push(seg);
+        }
+    }
+    let Some((desc, rest)) = plain.split_first() else {
+        return GoalCommand::Usage;
+    };
+    GoalCommand::Create {
+        description: (*desc).to_string(),
+        acceptance_criteria: rest.first().map(|s| (*s).to_string()),
+        outcome,
+        duration_hours,
+        risk_boundary,
+    }
+}
+
+/// Case-insensitive (ASCII) prefix strip across several accepted spellings.
+/// Uses `get(..)` so a prefix length landing mid-char in `seg` is a clean
+/// no-match, never a byte-boundary panic (coding convention 1).
+fn strip_any_prefix<'a>(seg: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    for p in prefixes {
+        if let Some(head) = seg.get(..p.len()) {
+            if head.eq_ignore_ascii_case(p) {
+                return Some(&seg[p.len()..]);
             }
         }
-        None => GoalCommand::Create {
-            description: head.trim().to_string(),
-            acceptance_criteria: None,
-            outcome,
-        },
     }
+    None
+}
+
+/// Parse `時限:`/`duration:` payloads: `36`, `36h`, `36小時`, `3d`, `3天`
+/// (days ×24). Range-checked 1–720 hours like the dashboard form; anything
+/// else ⇒ `None` (caller fails closed to usage).
+fn parse_duration_hours(v: &str) -> Option<f64> {
+    let v = v.trim();
+    let (num, mult) = if let Some(n) = v.strip_suffix("小時").or_else(|| v.strip_suffix('h')).or_else(|| v.strip_suffix('H')) {
+        (n, 1.0)
+    } else if let Some(n) = v.strip_suffix('天').or_else(|| v.strip_suffix('d')).or_else(|| v.strip_suffix('D')) {
+        (n, 24.0)
+    } else {
+        (v, 1.0)
+    };
+    let hours: f64 = num.trim().parse().ok()?;
+    let hours = hours * mult;
+    (hours.is_finite() && (1.0..=720.0).contains(&hours)).then_some(hours)
 }
 
 /// Split a `/goal` tail into `(head, outcome_spec)` where `head` is everything
@@ -793,8 +847,9 @@ fn goal_usage_text() -> String {
      • `outcome:text`（預設，行為不變）\n\
      • `outcome:json:<JSON Schema>` — 校驗最終回覆裡的 ```json 區塊（object/array/string/number/boolean）\n\
      • `outcome:files:<glob,glob>` — 斷言工作目錄下有對應產出檔（例 `outcome:files:report.docx`）\n\
+     `/goal <目標> || 時限:36h || 邊界:<紅線>` — 任一段可加時限（`36h`／`3天`，逾期回到你手上）與風險邊界（沒給就套基本款：法規／資安／風控／人審紅線）\n\
      `/goal status` — 查看進行中的目標任務\n\n\
-     範例：`/goal 整理這批客戶資料成月報並寄出 || 報表含每月營收圖表 || outcome:files:report.docx`"
+     範例：`/goal 整理這批客戶資料成月報並寄出 || 報表含每月營收圖表 || 時限:2天 || outcome:files:report.docx`"
         .to_string()
 }
 
@@ -811,6 +866,8 @@ async fn handle_goal(
             description,
             acceptance_criteria,
             outcome,
+            duration_hours,
+            risk_boundary,
         } => {
             handle_goal_create(
                 ctx,
@@ -819,6 +876,8 @@ async fn handle_goal(
                 description,
                 acceptance_criteria.as_deref(),
                 outcome.as_deref(),
+                *duration_hours,
+                risk_boundary.as_deref(),
             )
             .await
         }
@@ -834,6 +893,8 @@ async fn handle_goal_create(
     description: &str,
     acceptance_criteria: Option<&str>,
     outcome: Option<&str>,
+    duration_hours: Option<f64>,
+    risk_boundary: Option<&str>,
 ) -> String {
     let store = match crate::task_store::TaskStore::open(&ctx.home_dir) {
         Ok(s) => s,
@@ -864,7 +925,14 @@ async fn handle_goal_create(
     // below so behavior is byte-identical when the planner is off or unhelpful.
     // Skipped entirely when an outcome spec is set: the structured contract
     // applies to one final deliverable, not to each decomposed subtask.
-    if outcome_tag.is_none() && crate::goal_plan::planner_enabled(&ctx.home_dir) {
+    // Also skipped when a per-goal deadline or risk boundary is set: the
+    // contract applies to one task, and decomposed subtasks would not
+    // inherit it (same reasoning as the outcome-spec skip above).
+    if outcome_tag.is_none()
+        && duration_hours.is_none()
+        && risk_boundary.is_none()
+        && crate::goal_plan::planner_enabled(&ctx.home_dir)
+    {
         if let Some(reply) = try_decompose_goal(
             &store,
             &ctx.home_dir,
@@ -895,6 +963,16 @@ async fn handle_goal_create(
     task.status = "todo".to_string();
     task.goal_mode = true;
     task.acceptance_criteria = Some(criteria);
+    // Goal contract v2 (design §6 G1/G3): same semantics as the dashboard
+    // form — deadline computed at creation; boundary stored only when
+    // explicitly given (baseline is applied at injection time instead).
+    if let Some(h) = duration_hours {
+        task.deadline_at = Some(
+            (chrono::Utc::now() + chrono::Duration::seconds((h * 3600.0) as i64)).to_rfc3339(),
+        );
+    }
+    task.risk_boundary =
+        risk_boundary.map(|b| duduclaw_core::truncate_chars(b, 2000));
     // WP2.4: ride the structured outcome spec on the existing comma-separated
     // tags field (base64url, comma-free) — no schema change. `text` specs and
     // the no-spec case leave tags untouched (behaviour unchanged).
@@ -932,6 +1010,16 @@ async fn handle_goal_create(
         msg.push_str(
             "\n📐 已設定結構化產出驗收：交付前會先做零成本自動校驗，未達標會直接退回修正（不浪費驗收判官）。",
         );
+    }
+    if let Some(h) = duration_hours {
+        msg.push_str(&format!(
+            "\n⏱ 時限：{h:.0} 小時內須通過驗收，逾期會回到你手上裁決。"
+        ));
+    }
+    if task.risk_boundary.is_some() {
+        msg.push_str("\n🚧 已設定本目標風險邊界：每輪執行與驗收判官都會以它檢核。");
+    } else {
+        msg.push_str("\n🚧 未指定風險邊界，將套用基本款（法規／資安／風控／人審紅線）。");
     }
     if !enabled {
         msg.push_str(
@@ -1490,6 +1578,8 @@ mod tests {
                 description: "整理客戶資料成報表".to_string(),
                 acceptance_criteria: None,
                 outcome: None,
+                duration_hours: None,
+                risk_boundary: None,
             }))
         );
 
@@ -1500,6 +1590,8 @@ mod tests {
                 description: "做月報".to_string(),
                 acceptance_criteria: Some("含營收圖表並寄出".to_string()),
                 outcome: None,
+                duration_hours: None,
+                risk_boundary: None,
             }))
         );
 
@@ -1510,6 +1602,8 @@ mod tests {
                 description: "做月報".to_string(),
                 acceptance_criteria: None,
                 outcome: None,
+                duration_hours: None,
+                risk_boundary: None,
             }))
         );
 
@@ -1523,6 +1617,8 @@ mod tests {
                 description: "做月報".to_string(),
                 acceptance_criteria: Some("含營收圖表".to_string()),
                 outcome: Some("files:report.docx".to_string()),
+                duration_hours: None,
+                risk_boundary: None,
             }))
         );
 
@@ -1533,6 +1629,8 @@ mod tests {
                 description: "做月報".to_string(),
                 acceptance_criteria: None,
                 outcome: Some("text".to_string()),
+                duration_hours: None,
+                risk_boundary: None,
             }))
         );
 
@@ -1546,7 +1644,42 @@ mod tests {
                 description: "產出設定".to_string(),
                 acceptance_criteria: None,
                 outcome: Some(r#"json:{"type":"object","required":["a||b"]}"#.to_string()),
+                duration_hours: None,
+                risk_boundary: None,
             }))
+        );
+
+        // Goal contract v2: duration + boundary segments, position-independent.
+        assert_eq!(
+            parse_command("/goal 做月報 || 時限:36h || 邊界:不得寄給客戶草稿 || 含營收圖表", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: Some("含營收圖表".to_string()),
+                outcome: None,
+                duration_hours: Some(36.0),
+                risk_boundary: Some("不得寄給客戶草稿".to_string()),
+            }))
+        );
+        // Days multiply ×24; ASCII `duration:`/`risk:` spellings accepted.
+        assert_eq!(
+            parse_command("/goal 做月報 || duration:2天 || risk:no external email", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: None,
+                outcome: None,
+                duration_hours: Some(48.0),
+                risk_boundary: Some("no external email".to_string()),
+            }))
+        );
+        // Malformed / out-of-range duration fails closed to usage, never
+        // silently becoming part of the description.
+        assert_eq!(
+            parse_command("/goal 做月報 || 時限:abc", None),
+            Some(ChatCommand::Goal(GoalCommand::Usage))
+        );
+        assert_eq!(
+            parse_command("/goal 做月報 || 時限:9999h", None),
+            Some(ChatCommand::Goal(GoalCommand::Usage))
         );
 
         // status subcommand (case-insensitive).

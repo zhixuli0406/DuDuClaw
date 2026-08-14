@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+- **信念迴圈（Belief Loop）**：task forward model 之外的第二個預測迴圈——agent 對「外部世界」（任何領域，不限投資）的結構化信念記帳。三個 MCP 工具（`belief_submit`／`belief_settle`／`belief_stats`）寫入 `prediction.db` 新表 `belief_log`；結算為確定性三向 Brier（方向 vs 提交時判斷基準值、可調 flat band 預設 ±0.3%、有 tick 資料時交叉核對申報值、容差 1% 外拒絕結算——agent 不能自報現實）；兩個程式化注入鉤點：目標派工 prompt 附校準統計區塊（<30 筆只給計數不下結論；逐筆記錄 `stats_injected` 供事後 A/B——文獻查無「注入歷史統計會變準」的一手證據，誠實以實驗形態上線）、autopilot tick 喚醒 prompt 附「你申報的方向 vs 現值」一行對照（程式化 diff，源自 arXiv:2605.29463 自由回憶 0% vs 程式化注入 86% 的證據；tick 欄位對映支援 `[belief] tick_subject_map` 顯式設定，慣例 `zXXXX→XXXX` 為 fallback）。統計復用既有 `calibration.rs`（Wilson 下界／proper scoring），不造第二套口徑。儀表板 /foresight 改雙分頁，新增「信念與驗證」分頁（`belief.recent`/`belief.summary` RPC，三態誠實標籤）。設計依 2026-08-14 六路文獻調研（詳 `docs/features/46-belief-loop.md`）。
+- **目標指派表單 v2（per-goal 時長與風險邊界）**：/goals 指派與 `tasks.goal_create` 新增 `duration_hours`（到期未過驗收 → `needs_human`，覆蓋全域 wall-clock 取較早者）與 `risk_boundary`（留空自動套用基本款——法規遵循／資安紅線／不得繞過硬性風控／金流與不可逆動作過人審／對外發言過人審，`[goal_defaults] baseline_boundary` 可客製）；邊界每輪程式化注入派工 prompt 並成為 MAV 判官 safety 面向的檢核基準（違反即退回，fail-closed 不變；底層 ActionGuard/ApprovalBroker/dispatch_guard 護欄照常疊加）。
+- **信念迴圈×目標契約的統一操作面補完**：①設定 → 自動化新增「信念迴圈」卡——持平判定帶（`flat_band_pct`）與 tick 欄位↔主題映射（`tick_subject_map`，一行一對 key=value，前後端同規則驗證）直接在儀表板編輯、寫入即生效；②AI 員工設定新增「自主研究」開關（`agent.toml [research] self_study`/`self_study_hour` 預設 20 點）——當日有信念失準（settled miss）的員工，於設定時間自動獲派一個晚間研究目標（題目＝當日 Brier 最差的主題，每員工每日至多一個，`SelfStudyScheduler` 5 分鐘巡掃、kv 標記＋任務標籤雙重防重）；③指派目標表單新增「要求結構化預測」勾選——伺服器端在目標描述與驗收標準附加信念申報教導段，成績自動進 /foresight 信念與驗證分頁。`/goal` 聊天指令同步支援 `時限:36h`／`3天` 與 `邊界:<紅線>` 段（格式錯誤 fail-closed 退回用法說明）；目標詳情框顯示時限（剩餘/已逾期）與本目標風險邊界。
+- **/foresight 預測列表可讀化**：`forward.recent` 補預測/實際的 outcome 與 artifact 欄位＋任務標題解析；列表顯示「預測 X → 實際 Y ✓/✗」與任務名；詳情對照補「產出形式」列（先前唯一失準維度在頁面上不可見）。
+
+### Changed
+- **派工引擎預設開啟（goal loop 總開關）**：`[dispatch] enabled` 預設由 false 改 true——目標任務管理台與預測驗證頁（v1.58）讓目標迴圈成為一級功能後，「指派了目標卻沒人執行」成為預設體驗的缺陷。閒置成本僅週期性 SQLite 輪詢（驗收判官只在目標真正進入 review 時才花 LLM 呼叫）。同時把引擎的建構/啟動搬上 `respawn_dispatch_engine`（與 goal-loop driver、topology driver 同款 abort+respawn 模式），`system.update_config` 支援 `dispatch.enabled`，儀表板「設定 → 自動化」新增「派工引擎」開關——切換即熱生效（含 forward model 的執行期建構），免重啟。
+
+### Fixed
+- **`/healthz` 納入排程器活性（背景任務層靜默全滅事故）**：cron／heartbeat 排程迴圈每 tick 寫入時戳，`/healthz` 於任一迴圈停擺逾 5 分鐘（或開機後從未啟動）時回 503 並附 `schedulers` 診斷欄位；四個產品 compose 與實驗部署的 healthcheck 由永遠回 "ok" 的 `/health` 改指 `/healthz`——2026-08 實驗容器排程層全滅期間，容器連續多日顯示 healthy。boot 序列補上階段可見標記（channel 啟動前後、HTTP bind 前），排程死亡不再只能靠「log 的缺席」反推。
+- **Google Chat／Teams 通道 client 補上 30s timeout**：兩者是 gateway boot 路徑上僅有的無 timeout 網路 await（token 預取直接 `.await` 在啟動序列上）——OAuth 端點無回應會無限期卡住其後的 heartbeat／cron／tick 啟動。與其他七個通道 client 對齊。
+- **/goals 頁的 goal_mode 過濾下推後端＋非 admin 首載修復**：先前整張任務看板拉回前端再篩（大看板白拉資料），且非 admin 未帶員工篩選時首載直接吃權限錯誤、與空看板不可區分。現在 `tasks.list` 支援 `goal_mode` 參數（SQL 層過濾）；非 admin 自動帶入第一個綁定員工、隱藏「全部員工」選項；載入失敗顯示錯誤狀態（可重試），不再偽裝成空看板。
+- **/foresight 頁權限錯誤與「沒有資料」在 UI 不可區分**：`forward.*` RPC 失敗（如角色不足）先前被吞成空陣列、與零預測的空狀態長得一模一樣。現在顯示帶錯誤訊息的錯誤狀態與重試按鈕。
+
 ## [1.58.0] - 2026-08-14 — 目標任務管理台＋預測與驗證頁＋通道 OTP 修復與設定整合
 
 ### Added
