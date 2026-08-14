@@ -259,3 +259,26 @@ describe('AppSidebar (Multica shell)', () => {
     expect(useCommandPaletteStore.getState().open).toBe(true);
   });
 });
+
+// ── 新功能 chip convention (2026-08-14) ─────────────────────────────────
+import { isNewFeature } from './nav-model';
+
+describe('isNewFeature (新功能 chip expiry)', () => {
+  it('shows while running version is at or below the shipping minor', () => {
+    expect(isNewFeature('1.58.0', '1.57.0')).toBe(true); // pre-release build
+    expect(isNewFeature('1.58.0', '1.58.0')).toBe(true); // the shipping minor
+    expect(isNewFeature('1.58.0', '1.58.3')).toBe(true); // patches never expire it
+    expect(isNewFeature('1.58.0', 'v1.58.1')).toBe(true); // tolerant of v-prefix
+  });
+
+  it('expires on the next minor and stays inert without a tag', () => {
+    expect(isNewFeature('1.58.0', '1.59.0')).toBe(false);
+    expect(isNewFeature('1.58.0', '2.0.0')).toBe(false);
+    expect(isNewFeature(undefined, '1.57.0')).toBe(false);
+  });
+
+  it('keeps the chip when the running version is unknown', () => {
+    expect(isNewFeature('1.58.0', null)).toBe(true);
+    expect(isNewFeature('garbage', '1.57.0')).toBe(false);
+  });
+});

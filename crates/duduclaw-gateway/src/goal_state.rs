@@ -353,6 +353,10 @@ mod tests {
             verdict: Some("rejected".into()),
             judge_feedback: Some(fb.to_string()),
             feedback_class: None,
+            verdict_json: None,
+            dispatch_count: 1,
+            state_hash: None,
+            repeat_streak: None,
         }
     }
 

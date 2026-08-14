@@ -614,6 +614,19 @@ export interface TaskInfo {
   agent_seconds?: number;
   /** Lease deadline (RFC3339); a past value with an in_progress task = stale. */
   lease_expires_at?: string;
+  // ── Goal-loop surface (2026-08-14 /goals page) ────────────
+  /** True for autonomous goal tasks driven by the goal loop. */
+  goal_mode?: boolean;
+  /** Acceptance contract the judge verifies against. */
+  acceptance_criteria?: string | null;
+  /** The current round's submitted result (judge input). */
+  result_summary?: string | null;
+  retry_count?: number;
+  max_retries?: number;
+  /** Worker lease holder, or the human decider after a takeover. */
+  claimed_by?: string | null;
+  /** Parsed `goal_state_json`: confirmed_facts / pending_hypotheses. */
+  goal_state?: { confirmed_facts?: string[]; pending_hypotheses?: string[] } | null;
   // ── W2-3 reverse handoff (E8) ─────────────────────────────
   /** Originating channel of a `/goal` command (e.g. `telegram`), when known.
    *  `null`/absent for tasks not launched from a channel conversation. */
@@ -634,6 +647,13 @@ export interface TaskIteration {
   verdict?: 'accepted' | 'rejected' | 'escalated' | null;
   judge_feedback?: string | null;
   feedback_class?: string | null;
+  /** Per-aspect MAV panel results — null for deterministic rejections and
+   *  rows judged before 2026-08-14. */
+  aspects?: Array<{ name: string; pass: boolean; reason: string }> | null;
+  /** How many times this round was dispatched (stall re-dispatches). */
+  dispatch_count?: number;
+  /** Same-(state, action) repeat streak at dispatch time (≥2 = no progress). */
+  repeat_streak?: number | null;
 }
 
 /** Per-agent flow metrics (Iterative Kanban analytics). */
@@ -1102,6 +1122,99 @@ export interface ForwardPredictionRow {
   composite_error: number | null;
   created_at: string;
   settled_at: string | null;
+}
+
+/** Expected side of one forward-chain round (parsed prediction). */
+export interface ForwardChainExpected {
+  tool_classes: string[];
+  call_band: [number, number];
+  outcome: string;
+  artifact: string;
+  confidence: number;
+}
+
+/** Observed side of one forward-chain round (parsed observation). */
+export interface ForwardChainObserved {
+  tool_classes: string[];
+  calls: number;
+  errors: number;
+  outcome: string;
+  artifact: string;
+  fidelity: string;
+  window_start: string;
+  window_end: string;
+}
+
+/** One round of a task's predict→act→observe→score loop (`forward.chain`). */
+export interface ForwardChainRound {
+  prediction_id: string;
+  task_id: string;
+  agent_id: string;
+  round: number;
+  source: string;
+  state_key: string;
+  created_at: string;
+  settled_at: string | null;
+  expected: ForwardChainExpected | null;
+  observed: ForwardChainObserved | null;
+  fidelity: string | null;
+  category: string | null;
+  composite_error: number | null;
+  brier: number | null;
+  /** Which dimension the prediction missed on — null for legacy rows. */
+  error_breakdown: {
+    tool_set_error: number;
+    volume_error: number;
+    outcome_error: number;
+    outcome_error_applicable: boolean;
+    artifact_error: number;
+  } | null;
+}
+
+/** Query-time calibration verdict for one agent (`forward.calibration`). */
+export interface ForwardCalibration {
+  agent_id: string;
+  n: number;
+  hit_rate: number | null;
+  avg_brier: number | null;
+  brier_skill_score: number | null;
+  reliability: number | null;
+  resolution: number | null;
+  uncertainty: number | null;
+  bins: Array<{ p_mean: number; emp_rate: number; n: number }>;
+  /** supported | candidate | indistinguishable_from_luck */
+  label: string;
+}
+
+/** One learned state bucket (`forward.states`), most-sampled first. */
+export interface ForwardStateRow {
+  state_key: string;
+  agent_id: string;
+  n_samples: number;
+  last_updated: string;
+}
+
+/** `tasks.timeline` — one goal task's whole loop story. */
+export interface GoalTimeline {
+  task: TaskInfo;
+  iterations: TaskIteration[];
+  activity: ActivityEvent[];
+  pending_kickoff: {
+    id: string;
+    summary: string;
+    created_at: string;
+    ttl_seconds: number;
+  } | null;
+  /** Execution transcripts recorded for this task's rounds (durable
+   *  dispatch_runs linkage). */
+  runs: Array<{
+    id: string;
+    round: number | null;
+    status: string;
+    started_at: string;
+    ended_at: string;
+    step_count: number;
+  }>;
 }
 
 export interface EvolutionVersion {
@@ -4092,6 +4205,19 @@ export const api = {
       client.call('forward.recent', { agent_id: agentId ?? '', limit }) as Promise<{
         predictions: ForwardPredictionRow[];
       }>,
+    /** Every round of one task's predict→act→observe→score loop. */
+    chain: (taskId: string) =>
+      client.call('forward.chain', { task_id: taskId }) as Promise<{ rounds: ForwardChainRound[] }>,
+    /** Query-time skill verdict (Brier / Murphy / reliability bins / label). */
+    calibration: (agentId: string) =>
+      client.call('forward.calibration', { agent_id: agentId }) as Promise<{
+        calibration: ForwardCalibration;
+      }>,
+    /** Learned state buckets, most-sampled first. */
+    states: (agentId?: string, limit = 20) =>
+      client.call('forward.states', { agent_id: agentId ?? '', limit }) as Promise<{
+        states: ForwardStateRow[];
+      }>,
   },
   evolution: {
     status: () =>
@@ -4708,6 +4834,34 @@ export const api = {
     // agent_id and see only that agent's slice.
     flowMetrics: (agentId?: string) =>
       client.call('tasks.flow_metrics', agentId ? { agent_id: agentId } : {}) as Promise<FlowMetrics>,
+    // ── Goal-loop management (/goals page, 2026-08-14) ────────
+    /** Assign an autonomous goal from the dashboard — same semantics as the
+     *  channel `/goal` command (goal_mode task, judge loop, needs_human
+     *  escalation). */
+    goalCreate: (params: {
+      agent_id: string;
+      description: string;
+      acceptance_criteria?: string;
+      outcome?: string;
+      priority?: TaskPriority;
+    }) =>
+      client.call('tasks.goal_create', { ...params }) as Promise<{
+        task: TaskInfo;
+        iteration_cap: number;
+        dispatch_enabled: boolean;
+      }>,
+    /** One goal task's whole loop story: rounds, task-scoped activity,
+     *  pending kickoff approval. */
+    timeline: (taskId: string) =>
+      client.call('tasks.timeline', { task_id: taskId }) as Promise<GoalTimeline>,
+    /** needs_human intervention through the SAME path as channel buttons
+     *  (fail-closed, clears stale claim/lease on retry, collapses cards). */
+    goalDecide: (taskId: string, action: 'retry' | 'done' | 'abort' | 'takeover', note?: string) =>
+      client.call('tasks.goal_decide', { task_id: taskId, action, note: note ?? '' }) as Promise<{
+        ok: boolean;
+        message: string;
+        task: TaskInfo | null;
+      }>,
   },
   // U4 co-edited plans — a shared, ordered step list per AI employee that both
   // the user (here) and the agent (plan_get / plan_update_step MCP) edit.

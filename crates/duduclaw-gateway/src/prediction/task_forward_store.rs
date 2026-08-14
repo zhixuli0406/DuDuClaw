@@ -478,6 +478,10 @@ pub(crate) fn init_task_tables(conn: &Connection) -> Result<(), String> {
     // here, and the CREATE TABLE below is then itself a no-op. Either way
     // idempotent — "duplicate column" errors are deliberately swallowed.
     let _ = conn.execute("ALTER TABLE task_prediction_log ADD COLUMN brier_score REAL", []);
+    // 2026-08-14: per-dimension error breakdown — previously the four
+    // sub-errors were computed at settle and immediately discarded, so
+    // "which dimension did the prediction miss" was unanswerable.
+    let _ = conn.execute("ALTER TABLE task_prediction_log ADD COLUMN error_json TEXT", []);
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS task_prediction_log (
@@ -496,7 +500,8 @@ pub(crate) fn init_task_tables(conn: &Connection) -> Result<(), String> {
             category        TEXT,
             created_at      TEXT NOT NULL,
             settled_at      TEXT,
-            brier_score     REAL
+            brier_score     REAL,
+            error_json      TEXT
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_tpl_task_round
             ON task_prediction_log(task_id, round);
@@ -820,17 +825,27 @@ impl TaskForwardModel {
         } else {
             None
         };
+        // Per-dimension breakdown, previously computed-then-discarded.
+        let error_json = serde_json::json!({
+            "tool_set_error": error.tool_set_error,
+            "volume_error": error.volume_error,
+            "outcome_error": error.outcome_error,
+            "outcome_error_applicable": error.outcome_error_applicable,
+            "artifact_error": error.artifact_error,
+            "eligible_for_stats": error.eligible_for_stats,
+        })
+        .to_string();
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
             conn.execute(
                 "UPDATE task_prediction_log
                  SET observation_json = ?1, fidelity = ?2, composite_error = ?3,
-                     category = ?4, settled_at = ?5, brier_score = ?6
+                     category = ?4, settled_at = ?5, brier_score = ?6, error_json = ?8
                  WHERE prediction_id = ?7",
                 params![
                     observation_json, fidelity, composite_error, category, settled_at,
-                    brier_score, prediction_id
+                    brier_score, prediction_id, error_json
                 ],
             )
             .map_err(|e| e.to_string())?;

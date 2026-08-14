@@ -1223,15 +1223,26 @@ impl GoalLoopDriver {
             // re-dispatch will make (see the peek/commit split in the guard
             // above — commit happens once the dispatch decision is final,
             // mirroring the pre-A2 `last_feedback` commit timing).
-            self.visit_graph.commit_dispatch(&task.id, &state_hash).await;
+            let committed_streak = self.visit_graph.commit_dispatch(&task.id, &state_hash).await;
             // Iterative Kanban: open this round in the iteration timeline. Round
             // is the judge-rejection counter + 1 (revision_round is bumped by
             // reject_review), idempotent per round so a stall re-dispatch of the
             // same round adds no duplicate. Best-effort telemetry — a failure
             // here must not break dispatch.
+            // Carries the visit-graph signal of this dispatch (state hash +
+            // the streak `commit_dispatch` just computed) so the round
+            // timeline can show "why no progress" after the fact —
+            // previously that signal was memory-only and vanished on
+            // restart.
             if let Err(e) = self
                 .store
-                .record_iteration_dispatch(&task.id, task.revision_round + 1, &now.to_rfc3339())
+                .record_iteration_dispatch_with_state(
+                    &task.id,
+                    task.revision_round + 1,
+                    &now.to_rfc3339(),
+                    Some(&state_hash),
+                    Some(committed_streak as i64),
+                )
                 .await
             {
                 debug!(task = %task.id, error = %e, "goal loop: iteration dispatch record failed (non-fatal)");

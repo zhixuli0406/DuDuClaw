@@ -5470,6 +5470,18 @@ impl MethodHandler {
                 require_manager!();
                 self.handle_forward_recent(params).await
             }
+            "forward.chain" => {
+                require_manager!();
+                self.handle_forward_chain(params).await
+            }
+            "forward.calibration" => {
+                require_manager!();
+                self.handle_forward_calibration(params).await
+            }
+            "forward.states" => {
+                require_manager!();
+                self.handle_forward_states(params).await
+            }
 
             // ── Playbook (agent-scoped gene-shaped experience entries) ──
             // Read surfaces mirror the `memory.*` H2-fix ACL shape (Viewer);
@@ -5697,6 +5709,9 @@ impl MethodHandler {
             // (like tasks.comments); the aggregate forces non-admins to scope to
             // a bound agent (check_agent_filter) and filters the result to it.
             "tasks.iterations" => self.handle_tasks_iterations(params, ctx).await,
+            "tasks.timeline" => self.handle_tasks_timeline(params, ctx).await,
+            "tasks.goal_decide" => self.handle_tasks_goal_decide(params, ctx).await,
+            "tasks.goal_create" => self.handle_tasks_goal_create(params, ctx).await,
             "tasks.flow_metrics" => {
                 check_agent_filter!(AccessLevel::Viewer);
                 self.handle_tasks_flow_metrics(params).await
@@ -19625,6 +19640,86 @@ impl MethodHandler {
         }
     }
 
+    /// `forward.chain` — every round of one task's predict→act→observe→score
+    /// loop, oldest round first, with the stored prediction/observation JSON
+    /// parsed into typed expected/observed sides. The drill-down the list
+    /// views can't provide (their SELECT deliberately skips the JSON blobs).
+    async fn handle_forward_chain(&self, params: Value) -> WsFrame {
+        let Some(task_id) = params
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+            .map(str::to_string)
+        else {
+            return WsFrame::error_response("", "Missing 'task_id' parameter");
+        };
+        let db_path = self.home_dir.join("prediction.db");
+        let result = tokio::task::spawn_blocking(move || {
+            crate::prediction::forward_view::forward_chain(&db_path, &task_id)
+        })
+        .await;
+        match result {
+            Ok(rounds) => WsFrame::ok_response("", json!({ "rounds": rounds })),
+            Err(e) => WsFrame::error_response("", &format!("forward chain: {e}")),
+        }
+    }
+
+    /// `forward.calibration` — query-time skill verdict for one agent
+    /// (Brier / Murphy decomposition / reliability bins / three-state
+    /// honest label). Nothing precomputed; empty store ⇒ `candidate`.
+    async fn handle_forward_calibration(&self, params: Value) -> WsFrame {
+        let Some(agent_id) = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return WsFrame::error_response("", "Missing 'agent_id' parameter");
+        };
+        if !is_valid_agent_id(&agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        let db_path = self.home_dir.join("prediction.db");
+        let result = tokio::task::spawn_blocking(move || {
+            crate::prediction::forward_view::forward_calibration(&db_path, &agent_id)
+        })
+        .await;
+        match result {
+            Ok(view) => WsFrame::ok_response("", json!({ "calibration": view })),
+            Err(e) => WsFrame::error_response("", &format!("forward calibration: {e}")),
+        }
+    }
+
+    /// `forward.states` — learned state buckets (`task_state_models`),
+    /// most-sampled first. The "what has the world model actually learned"
+    /// surface; previously this table had zero read paths outside the
+    /// prediction engine itself.
+    async fn handle_forward_states(&self, params: Value) -> WsFrame {
+        let agent_filter = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(a) = agent_filter.as_deref() {
+            if !is_valid_agent_id(a) {
+                return WsFrame::error_response("", "Invalid agent_id format");
+            }
+        }
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        let db_path = self.home_dir.join("prediction.db");
+        let result = tokio::task::spawn_blocking(move || {
+            crate::prediction::forward_view::forward_states(&db_path, agent_filter.as_deref(), limit)
+        })
+        .await;
+        match result {
+            Ok(states) => WsFrame::ok_response("", json!({ "states": states })),
+            Err(e) => WsFrame::error_response("", &format!("forward states: {e}")),
+        }
+    }
+
     async fn handle_evolution_telemetry(&self, params: Value) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         let days = params.get("days").and_then(|v| v.as_i64()).unwrap_or(7).clamp(1, 90);
@@ -26982,6 +27077,260 @@ impl MethodHandler {
         }
     }
 
+    /// `tasks.goal_create` — assign an autonomous goal from the dashboard,
+    /// with the SAME semantics as the channel `/goal` command
+    /// (`chat_commands::handle_goal_create`): `goal_mode` task in `todo`,
+    /// acceptance criteria defaulting to the goal text, structured outcome
+    /// spec parsed fail-closed. Differences, both deliberate: `created_by`
+    /// is `goal:dashboard` and there is no source conversation (progress
+    /// and needs_human cards fall back to the agent's `[proactive]` notify
+    /// target, exactly like any channel-less goal). The optional planner
+    /// decomposition is chat-path-only for now. Operator access on the
+    /// target agent.
+    async fn handle_tasks_goal_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "valid agent_id is required");
+        }
+        if let Err(e) = acl::require_agent_access(ctx, agent_id, AccessLevel::Operator) {
+            return WsFrame::error_response("", &e);
+        }
+        let description = params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if description.is_empty() {
+            return WsFrame::error_response("", "description is required");
+        }
+        let description = duduclaw_core::truncate_chars(description, 4000);
+        let acceptance = params
+            .get("acceptance_criteria")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| duduclaw_core::truncate_chars(s, 4000));
+        let priority = match params.get("priority").and_then(|v| v.as_str()) {
+            None | Some("") => "medium",
+            Some(p @ ("low" | "medium" | "high" | "urgent")) => p,
+            Some(other) => {
+                return WsFrame::error_response("", &format!("invalid priority: {other}"))
+            }
+        };
+        // Structured outcome spec: same fail-closed parse as the chat path —
+        // a malformed spec refuses the whole create.
+        let outcome_tag = match params
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(crate::outcome_spec::OutcomeSpec::parse)
+        {
+            Some(Ok(spec)) => spec.to_tag(),
+            Some(Err(e)) => {
+                return WsFrame::error_response("", &format!("outcome 產出驗收格式錯誤：{e}"))
+            }
+            None => None,
+        };
+
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let title = duduclaw_core::truncate_chars(&description, 60);
+        let mut task = crate::task_store::TaskRow::new(
+            task_id.clone(),
+            title,
+            description.clone(),
+            priority.to_string(),
+            agent_id.to_string(),
+            "goal:dashboard".to_string(),
+        );
+        task.status = "todo".to_string();
+        task.goal_mode = true;
+        task.acceptance_criteria =
+            Some(acceptance.unwrap_or_else(|| description.clone()));
+        if let Some(tag) = &outcome_tag {
+            task.tags = tag.clone();
+        }
+        if let Err(e) = store.insert_task(&task).await {
+            return WsFrame::error_response("", &format!("create goal task: {e}"));
+        }
+        let _ = store
+            .append_activity(&crate::task_store::ActivityRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: "goal_loop.created".into(),
+                agent_id: agent_id.to_string(),
+                task_id: Some(task_id.clone()),
+                summary: format!(
+                    "儀表板指派目標任務「{}」",
+                    duduclaw_core::truncate_chars(&description, 60)
+                ),
+                timestamp: Utc::now().to_rfc3339(),
+                metadata: None,
+            })
+            .await;
+        let cap = crate::goal_loop::GoalLoopConfig::from_home(&self.home_dir).iteration_cap;
+        let dispatch_enabled = crate::dispatch_engine::dispatch_engine_enabled(&self.home_dir);
+        WsFrame::ok_response(
+            "",
+            json!({
+                "task": task_row_to_json(&task),
+                "iteration_cap": cap,
+                "dispatch_enabled": dispatch_enabled,
+            }),
+        )
+    }
+
+    /// `tasks.timeline` — one task's whole goal-loop story in a single call:
+    /// the task row (goal fields included), every judge round, the
+    /// task-scoped Activity Feed (kickoff / oscillation / needs_human /
+    /// human decisions — previously only reachable by client-side filtering
+    /// a bounded global window), and any still-pending kickoff approval.
+    /// Read-only aggregation for the `/goals` page; Viewer access.
+    async fn handle_tasks_timeline(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        if task_id.is_empty() {
+            return WsFrame::error_response("", "task_id is required");
+        }
+        let row = match self
+            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+            .await
+        {
+            Ok(r) => r,
+            Err(f) => return f,
+        };
+        let iterations = store.list_iterations(task_id).await.unwrap_or_default();
+        let activity = store
+            .list_activity_for_task(task_id, 500)
+            .await
+            .unwrap_or_default();
+        // A pending kickoff approval is an intervention node the timeline
+        // must show *now* — decided ones already live in the activity feed
+        // (`goal_loop.kickoff_approved` / `kickoff_denied`).
+        let pending_kickoff = match crate::approval::ApprovalBroker::open(&self.home_dir) {
+            Ok(broker) => broker
+                .list_pending(Some(&row.assigned_to))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|r| {
+                    r.action_kind == "goal_kickoff"
+                        && r.payload.get("task_id").and_then(|t| t.as_str()) == Some(task_id)
+                })
+                .map(|r| {
+                    json!({
+                        "id": r.id,
+                        "summary": r.summary,
+                        "created_at": r.created_at,
+                        "ttl_seconds": r.ttl_seconds,
+                    })
+                }),
+            Err(_) => None,
+        };
+        // Durable run ↔ round linkage (dispatch_runs.task_id/round) — lets
+        // the timeline deep-link each round to its execution transcript.
+        let runs: Vec<Value> = crate::run_steps::shared_store(&self.home_dir)
+            .and_then(|s| s.list_dispatch_runs_for_task(task_id, 100).ok())
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": format!("dispatch:{}", r.id),
+                    "round": r.round,
+                    "status": r.status,
+                    "started_at": r.started_at,
+                    "ended_at": r.ended_at,
+                    "step_count": r.step_count,
+                })
+            })
+            .collect();
+        WsFrame::ok_response(
+            "",
+            json!({
+                "task": task_row_to_json(&row),
+                "iterations": iterations.iter().map(task_iteration_to_json).collect::<Vec<_>>(),
+                "activity": activity.iter().map(activity_row_to_json).collect::<Vec<_>>(),
+                "pending_kickoff": pending_kickoff,
+                "runs": runs,
+            }),
+        )
+    }
+
+    /// `tasks.goal_decide` — the dashboard's needs_human intervention
+    /// (`retry` / `done` / `abort` / `takeover`), routed through the SAME
+    /// path as the channel buttons (`goal_notify`), not a bare status
+    /// update: fail-closed `WHERE status='needs_human'`, claim/lease/result
+    /// cleanup on retry, Activity Feed event, channel-card collapse.
+    /// Operator access on the task's agent — the same bar as `tasks.update`.
+    async fn handle_tasks_goal_decide(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        if task_id.is_empty() {
+            return WsFrame::error_response("", "task_id is required");
+        }
+        let act = match params.get("action").and_then(|v| v.as_str()) {
+            Some("retry") => crate::decision_action::DecisionAct::Retry,
+            Some("done") => crate::decision_action::DecisionAct::Done,
+            Some("abort") => crate::decision_action::DecisionAct::Abort,
+            Some("takeover") => crate::decision_action::DecisionAct::Takeover,
+            _ => {
+                return WsFrame::error_response(
+                    "",
+                    "action must be one of retry|done|abort|takeover",
+                )
+            }
+        };
+        let note = params
+            .get("note")
+            .and_then(|v| v.as_str())
+            .map(|s| duduclaw_core::truncate_chars(s.trim(), 2000))
+            .unwrap_or_default();
+        if let Err(f) = self
+            .authorize_task_access(&store, ctx, task_id, AccessLevel::Operator)
+            .await
+        {
+            return f;
+        }
+        let decider = format!("dashboard:{}", ctx.user_id);
+        let decider_name = self.user_display_name(&ctx.user_id).await;
+        match crate::goal_notify::apply_needs_human_from_dashboard(
+            &self.home_dir,
+            &decider,
+            decider_name,
+            task_id,
+            act,
+            &note,
+        )
+        .await
+        {
+            Ok(message) => {
+                let task = store.get_task(task_id).await.ok().flatten();
+                WsFrame::ok_response(
+                    "",
+                    json!({
+                        "ok": true,
+                        "message": message,
+                        "task": task.as_ref().map(task_row_to_json),
+                    }),
+                )
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
     /// Iterative Kanban: per-agent + board flow metrics (first-pass yield, avg
     /// rounds, dual-clock means, review queue depth, WIP limit + 7-day accept
     /// throughput for the Little's-Law wait estimate). Non-admins pass an
@@ -27515,6 +27864,23 @@ impl MethodHandler {
         let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
         let offset = params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
 
+        // Task-scoped mode: every event for one task (chronological), no
+        // global-window washout. Same response shape.
+        if let Some(task_id) = params
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return match store.list_activity_for_task(task_id, limit.max(1)).await {
+                Ok(rows) => {
+                    let total = rows.len() as i64;
+                    let events: Vec<Value> = rows.iter().map(activity_row_to_json).collect();
+                    WsFrame::ok_response("", json!({ "events": events, "total": total }))
+                }
+                Err(e) => WsFrame::error_response("", &format!("list task activity: {e}")),
+            };
+        }
+
         match store
             .list_activity(agent_id, event_type, limit, offset)
             .await
@@ -27704,6 +28070,8 @@ impl MethodHandler {
                 "status": r.status,
                 "step_count": r.step_count,
                 "preview": r.preview_in,
+                "task_id": r.task_id,
+                "round": r.round,
             })
         }));
         runs_json.sort_by(|a, b| {
@@ -30202,6 +30570,20 @@ fn task_row_to_json(r: &TaskRow) -> Value {
         "diminishing": r.diminishing,
         "agent_seconds": r.agent_seconds,
         "lease_expires_at": r.lease_expires_at,
+        // Goal-loop surface (2026-08-14 /goals page): previously none of
+        // these reached the dashboard — the FE had to *guess* goal-ness from
+        // revision_round/status heuristics, and the acceptance contract was
+        // invisible.
+        "goal_mode": r.goal_mode,
+        "acceptance_criteria": r.acceptance_criteria,
+        "result_summary": r.result_summary,
+        "retry_count": r.retry_count,
+        "max_retries": r.max_retries,
+        "claimed_by": r.claimed_by,
+        "goal_state": r
+            .goal_state_json
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok()),
     })
 }
 
@@ -30214,6 +30596,14 @@ fn task_iteration_to_json(r: &TaskIterationRow) -> Value {
         "verdict": r.verdict,
         "judge_feedback": r.judge_feedback,
         "feedback_class": r.feedback_class,
+        // Per-aspect MAV panel results (`[{name, pass, reason}]`) — null for
+        // deterministic rejections and legacy rows.
+        "aspects": r
+            .verdict_json
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "dispatch_count": r.dispatch_count,
+        "repeat_streak": r.repeat_streak,
     })
 }
 

@@ -42,6 +42,8 @@ const CreateAgentPage = lazyPage(() => import('./pages/agent-form/CreateAgentPag
 const EditAgentPage = lazyPage(() => import('./pages/agent-form/EditAgentPage'), 'EditAgentPage');
 const TaskBoardPage = lazyPage(() => import('./pages/TaskBoardPage'), 'TaskBoardPage');
 const PlansPage = lazyPage(() => import('./pages/PlansPage'), 'PlansPage');
+const GoalsPage = lazyPage(() => import('./pages/GoalsPage'), 'GoalsPage');
+const ForesightPage = lazyPage(() => import('./pages/ForesightPage'), 'ForesightPage');
 const ForkPage = lazyPage(() => import('./pages/ForkPage'), 'ForkPage');
 const MarketplacePage = lazyPage(() => import('./pages/MarketplacePage'), 'MarketplacePage');
 const MemoryPage = lazyPage(() => import('./pages/MemoryPage'), 'MemoryPage');
@@ -178,6 +180,8 @@ export function App() {
               {/* ── 工作 ── */}
               <Route path="tasks" element={<TaskBoardPage />} />
               <Route path="tasks/:id" element={<TaskDetailPage />} />
+              <Route path="goals" element={<GoalsPage />} />
+              <Route path="foresight" element={<ForesightPage />} />
               {/* U4 co-edited plans — shared step lists between the user and
                   an AI employee (agent-scoped; the gateway fails closed). */}
               <Route path="plans" element={<PlansPage />} />

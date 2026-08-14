@@ -41,6 +41,8 @@ import {
   Package,
   LogIn,
   Download,
+  Crosshair,
+  Radar as RadarIcon,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -75,7 +77,38 @@ export type NavItem = Gated & {
    * The previous conversation is preserved and stays resumable.
    */
   action?: 'newConversation';
+  /**
+   * CONVENTION (2026-08-14, user directive): every NEW feature page gets
+   * `newIn: '<the release it ships in>'` when its nav item is added —
+   * regardless of whether the row lands in the 一般 or 進階 layer. The
+   * sidebar renders a 「新功能」 chip while the running version is at or
+   * below that release's major.minor ([`isNewFeature`]) and drops it
+   * automatically on the next minor — no manual cleanup pass needed, stale
+   * `newIn` values are inert. Do NOT remove old `newIn` fields; they
+   * self-expire.
+   */
+  newIn?: string;
 };
+
+/**
+ * Whether a `newIn`-tagged nav item should still wear the 「新功能」 chip:
+ * true while the running version's (major, minor) is ≤ the shipping
+ * release's. An unknown running version keeps the chip (a spurious chip is
+ * harmless; a missing one defeats the convention). Patch releases never
+ * expire a chip — only the next minor does.
+ */
+export function isNewFeature(newIn: string | undefined, currentVersion: string | null): boolean {
+  if (!newIn) return false;
+  const parse = (v: string): [number, number] | null => {
+    const m = v.trim().replace(/^v/, '').match(/^(\d+)\.(\d+)/);
+    return m ? [Number(m[1]), Number(m[2])] : null;
+  };
+  const target = parse(newIn);
+  if (!target) return false;
+  const current = currentVersion ? parse(currentVersion) : null;
+  if (!current) return true;
+  return current[0] < target[0] || (current[0] === target[0] && current[1] <= target[1]);
+}
 
 export type NavGroup = {
   /** i18n message id for the group header. */
@@ -247,6 +280,9 @@ export const navGroups: NavGroup[] = [
       { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', ownScope: true },
       // U4 co-edited plans — shared step lists between the user and an AI employee.
       { to: '/plans', icon: ListChecks, label: 'nav.plans', desc: 'nav.plans.desc', ownScope: true },
+      // Goal-loop console (2026-08-14) — assign autonomous goals and intervene
+      // at the human nodes (kickoff approvals, needs_human escalations).
+      { to: '/goals', icon: Crosshair, label: 'nav.goals', desc: 'nav.goals.desc', ownScope: true, newIn: '1.58.0' },
       // G12 run inspector — per-run transcripts (session turns + tool receipts).
       { to: '/runs', icon: ScrollText, label: 'nav.runs', desc: 'nav.runs.desc', ownScope: true },
       // G15 Live Canvas — agent-pushed HTML workspace, sandbox-rendered.
@@ -257,6 +293,9 @@ export const navGroups: NavGroup[] = [
       // G11 Work Timeline — company-level Gantt of every AI staff member's runs.
       { to: '/timeline', icon: ChartGantt, label: 'nav.timeline', desc: 'nav.timeline.desc', minRole: 'manager' },
       { to: '/reports', icon: BarChart3, label: 'nav.reports', desc: 'nav.reports.desc', minRole: 'manager' },
+      // LLM→LWM loop view (2026-08-14) — predict→act→observe→score per task,
+      // with the query-time skill verdict. RPCs are manager-gated.
+      { to: '/foresight', icon: RadarIcon, label: 'nav.foresight', desc: 'nav.foresight.desc', minRole: 'manager', newIn: '1.58.0' },
       // — occasional rows: 低頻, and the only place in the 一般層 where a
       // machine-shaped word (OS) still shows. WP-NAV (2026-08-12) sank them
       // below the oversight pair and put 分支決戰 first of the two: it is
@@ -366,6 +405,10 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   // exactly what follows. 桌寵工作室 stays at the tail — it is desktop-only and
   // was not part of the annotated list.
   '/routines',
+  // 2026-08-14 user directive: the two new loop consoles live on the primary
+  // rail, not folded into 進階 — assigning/monitoring goals is daily work.
+  '/goals',
+  '/foresight',
   '/skills',
   '/memory',
   // AI 員工 back on the primary rail for Personal too (2026-08-04, D11).

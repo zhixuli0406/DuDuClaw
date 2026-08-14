@@ -1282,6 +1282,93 @@ pub(crate) async fn apply_needs_human(
     Ok(format!("{}此目標任務。", verb.label()))
 }
 
+/// Apply a needs_human decision coming from the **dashboard** (the `/goals`
+/// page's inline intervention buttons, RPC `tasks.goal_decide`). Same store
+/// transitions, Activity Feed events and channel-card collapse as the
+/// channel-button path ([`apply_needs_human`]) — one decision path, not two
+/// diverging ones (the pre-2026-08-14 dashboard route through a bare
+/// `tasks.update` left stale claim/lease/`judge_feedback` behind on retry
+/// and had no fail-closed `WHERE status='needs_human'` guard).
+///
+/// Authorization is the caller's job (the RPC layer holds the ACL context);
+/// `decider` is the dashboard identity (`dashboard:<user_id>`), and
+/// `decider_name` the human-readable form for the collapsed card. `note` is
+/// an optional operator instruction — on `retry` it becomes the next
+/// dispatch's `judge_feedback`.
+pub(crate) async fn apply_needs_human_from_dashboard(
+    home_dir: &Path,
+    decider: &str,
+    decider_name: Option<String>,
+    task_id: &str,
+    act: DecisionAct,
+    note: &str,
+) -> Result<String, String> {
+    let verb = crate::decision_notify::settled_verb(DecisionSource::Goal, act);
+    let store = TaskStore::open(home_dir).map_err(|e| format!("開啟任務資料庫失敗：{e}"))?;
+    let task = store.get_task(task_id).await.map_err(|e| e.to_string())?;
+    let Some(task) = task else {
+        return Err("找不到此任務".into());
+    };
+
+    if act == DecisionAct::Takeover {
+        let changed = store
+            .claim_needs_human(task_id, decider)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !changed {
+            return Ok("此任務已不在待人工決定狀態（可能已由他人決定）。".into());
+        }
+        let summary = format!("人工接手目標任務「{}」（來自儀表板）", task.title);
+        append_activity(
+            &store,
+            "goal_loop.human_decision.takeover",
+            &task.assigned_to,
+            Some(task_id),
+            &summary,
+        )
+        .await;
+        spawn_dashboard_collapse(
+            home_dir.to_path_buf(),
+            task_id.to_string(),
+            task.title.clone(),
+            task.assigned_to.clone(),
+            decider_name,
+            verb,
+        );
+        return Ok("已接手此目標任務，自動重試已停止。".into());
+    }
+
+    let decision = match act {
+        DecisionAct::Retry => "retry",
+        DecisionAct::Done => "done",
+        DecisionAct::Abort => "abort",
+        _ => return Err("不支援的動作".into()),
+    };
+    let changed = store
+        .resolve_needs_human(task_id, decision, note)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !changed {
+        return Ok("此任務已被處理過（可能已由他人決定或狀態已改變）。".into());
+    }
+    let event = match act {
+        DecisionAct::Retry => "goal_loop.human_decision.retry",
+        DecisionAct::Done => "goal_loop.human_decision.done",
+        _ => "goal_loop.human_decision.abort",
+    };
+    let summary = format!("人工{}目標任務「{}」（來自儀表板）", verb.label(), task.title);
+    append_activity(&store, event, &task.assigned_to, Some(task_id), &summary).await;
+    spawn_dashboard_collapse(
+        home_dir.to_path_buf(),
+        task_id.to_string(),
+        task.title.clone(),
+        task.assigned_to.clone(),
+        decider_name,
+        verb,
+    );
+    Ok(format!("{}此目標任務。", verb.label()))
+}
+
 /// Spawn a best-effort, fire-and-forget attempt to retire a settled
 /// needs_human task's channel cards. Detached so a slow or unreachable
 /// channel API can never delay or fail the decision that already landed.
@@ -1527,6 +1614,87 @@ mod tests {
             "alice".into(),
             "goal:telegram".into(),
         )
+    }
+
+    /// Dashboard needs_human decision must behave exactly like the channel
+    /// path: fail-closed from `needs_human` only, retry clears claim/lease/
+    /// result and carries the operator note as next-round feedback, and an
+    /// Activity Feed event lands.
+    #[tokio::test]
+    async fn dashboard_decide_matches_channel_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = mk_task("g1");
+        t.status = "needs_human".into();
+        t.goal_mode = true;
+        t.claimed_by = Some("worker".into());
+        t.result_summary = Some("half done".into());
+        t.judge_feedback = Some("old feedback".into());
+        store.insert_task(&t).await.unwrap();
+
+        let msg = apply_needs_human_from_dashboard(
+            dir.path(),
+            "dashboard:u1",
+            Some("Louis".into()),
+            "g1",
+            DecisionAct::Retry,
+            "改用月報格式",
+        )
+        .await
+        .unwrap();
+        assert!(!msg.is_empty());
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "pending");
+        assert_eq!(got.claimed_by, None, "retry must clear the stale claim");
+        assert_eq!(got.result_summary, None);
+        assert_eq!(got.judge_feedback.as_deref(), Some("改用月報格式"));
+        let acts = store.list_activity_for_task("g1", 10).await.unwrap();
+        assert!(acts
+            .iter()
+            .any(|a| a.event_type == "goal_loop.human_decision.retry"));
+
+        // Second decision on an already-resolved task: polite no-op message,
+        // no state change (fail-closed WHERE status='needs_human').
+        let msg2 = apply_needs_human_from_dashboard(
+            dir.path(),
+            "dashboard:u1",
+            None,
+            "g1",
+            DecisionAct::Abort,
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(msg2.contains("已被處理過"));
+        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "pending");
+    }
+
+    #[tokio::test]
+    async fn dashboard_takeover_claims_without_status_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = mk_task("g2");
+        t.status = "needs_human".into();
+        t.goal_mode = true;
+        store.insert_task(&t).await.unwrap();
+
+        apply_needs_human_from_dashboard(
+            dir.path(),
+            "dashboard:u9",
+            None,
+            "g2",
+            DecisionAct::Takeover,
+            "",
+        )
+        .await
+        .unwrap();
+        let got = store.get_task("g2").await.unwrap().unwrap();
+        assert_eq!(got.status, "needs_human", "takeover parks, never resolves");
+        assert_eq!(got.claimed_by.as_deref(), Some("dashboard:u9"));
+        let acts = store.list_activity_for_task("g2", 10).await.unwrap();
+        assert!(acts
+            .iter()
+            .any(|a| a.event_type == "goal_loop.human_decision.takeover"));
     }
 
     #[test]

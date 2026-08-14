@@ -181,6 +181,12 @@ impl Drop for LeaseRenewalGuard {
 pub struct AcceptanceVerdict {
     pub passed: bool,
     pub feedback: String,
+    /// Structured per-aspect panel results (`[{name, pass, reason}]`) when
+    /// the verdict came from the MAV panel — `None` for legacy single-judge
+    /// replies and deterministic rejections. Persisted to
+    /// `task_iterations.verdict_json` so the round timeline can show which
+    /// aspect failed instead of one flattened string.
+    pub aspects: Option<serde_json::Value>,
 }
 
 /// Pluggable acceptance judge for goal mode. Injected by the gateway so the
@@ -479,9 +485,15 @@ fn extract_panel_json(raw: &str, aspects: &[&str]) -> Option<serde_json::Value> 
 fn synthesize_panel(val: &serde_json::Value, aspects: &[&str]) -> AcceptanceVerdict {
     let mut fails: Vec<String> = Vec::new();
     let mut pass_notes: Vec<String> = Vec::new();
+    let mut aspect_rows: Vec<serde_json::Value> = Vec::new();
     for name in aspects.iter().copied() {
         match val.get(name) {
-            None => fails.push(format!("[{name}] aspect missing from panel reply")),
+            None => {
+                fails.push(format!("[{name}] aspect missing from panel reply"));
+                aspect_rows.push(serde_json::json!({
+                    "name": name, "pass": false, "reason": "aspect missing from panel reply",
+                }));
+            }
             Some(aspect) => {
                 let reason = aspect
                     .get("reason")
@@ -493,18 +505,31 @@ fn synthesize_panel(val: &serde_json::Value, aspects: &[&str]) -> AcceptanceVerd
                         if !reason.is_empty() {
                             pass_notes.push(format!("[{name}] {reason}"));
                         }
+                        aspect_rows.push(serde_json::json!({
+                            "name": name, "pass": true, "reason": reason,
+                        }));
                     }
                     Some(false) => {
                         let r = if reason.is_empty() { "failed" } else { reason };
                         fails.push(format!("[{name}] {r}"));
+                        aspect_rows.push(serde_json::json!({
+                            "name": name, "pass": false, "reason": r,
+                        }));
                     }
                     // Missing/invalid `pass` ⇒ fail-closed.
-                    None => fails.push(format!("[{name}] missing or non-boolean `pass` field")),
+                    None => {
+                        fails.push(format!("[{name}] missing or non-boolean `pass` field"));
+                        aspect_rows.push(serde_json::json!({
+                            "name": name, "pass": false,
+                            "reason": "missing or non-boolean `pass` field",
+                        }));
+                    }
                 }
             }
         }
     }
 
+    let aspects_json = Some(serde_json::Value::Array(aspect_rows));
     if fails.is_empty() {
         let feedback = if pass_notes.is_empty() {
             "all aspects passed".to_string()
@@ -514,11 +539,13 @@ fn synthesize_panel(val: &serde_json::Value, aspects: &[&str]) -> AcceptanceVerd
         AcceptanceVerdict {
             passed: true,
             feedback,
+            aspects: aspects_json,
         }
     } else {
         AcceptanceVerdict {
             passed: false,
             feedback: fails.join("; "),
+            aspects: aspects_json,
         }
     }
 }
@@ -550,7 +577,7 @@ pub fn parse_verdict(raw: &str) -> AcceptanceVerdict {
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|t| t == "PASS");
     let passed = has_pass && !has_fail;
-    AcceptanceVerdict { passed, feedback }
+    AcceptanceVerdict { passed, feedback, aspects: None }
 }
 
 // ── WP4 GroundEval: judge-side tool_activity evidence (arXiv:2606.22737) ──
@@ -1261,7 +1288,13 @@ impl DispatchEngine {
             if observed_outcome.is_none() {
                 match judge.judge(&criteria, &task_desc, &result).await {
                     Ok(v) if v.passed => {
-                        self.store.accept_review(&task.id, &v.feedback).await?;
+                        let verdict_json = v
+                            .aspects
+                            .as_ref()
+                            .and_then(|a| serde_json::to_string(a).ok());
+                        self.store
+                            .accept_review_with_verdict(&task.id, &v.feedback, verdict_json.as_deref())
+                            .await?;
                         // WP3 (PORTICO): task phase closed → auto-revoke its grants.
                         self.revoke_task_grants(&task.id).await;
                         info!(task = %task.id, "goal-mode 驗收通過 → done");
@@ -1270,9 +1303,18 @@ impl DispatchEngine {
                         judge_feedback_for_settle = Some(v.feedback.clone());
                     }
                     Ok(v) => {
+                        let verdict_json = v
+                            .aspects
+                            .as_ref()
+                            .and_then(|a| serde_json::to_string(a).ok());
                         let status = self
                             .store
-                            .reject_review(&task.id, &v.feedback, self.soft_cap)
+                            .reject_review_with_verdict(
+                                &task.id,
+                                &v.feedback,
+                                self.soft_cap,
+                                verdict_json.as_deref(),
+                            )
                             .await?;
                         // WP3 (PORTICO): a rejection re-opens the loop for a retry,
                         // but the review phase closed — revoke so the retry must
@@ -2033,6 +2075,7 @@ mod tests {
             outcome: Ok(AcceptanceVerdict {
                 passed: true,
                 feedback: "ok".into(),
+                aspects: None,
             }),
         });
         let engine = DispatchEngine::new(store.clone(), Some(judge));
@@ -2051,6 +2094,7 @@ mod tests {
             outcome: Ok(AcceptanceVerdict {
                 passed: false,
                 feedback: "nope".into(),
+                aspects: None,
             }),
         });
         let engine = DispatchEngine::new(store.clone(), Some(judge));
@@ -2168,6 +2212,7 @@ mod tests {
             verdict: AcceptanceVerdict {
                 passed: true,
                 feedback: "would have passed".into(),
+                aspects: None,
             },
         });
         let engine =
@@ -2213,6 +2258,7 @@ mod tests {
             verdict: AcceptanceVerdict {
                 passed: true,
                 feedback: "x".into(),
+                aspects: None,
             },
         });
         let engine =
@@ -2246,6 +2292,7 @@ mod tests {
             verdict: AcceptanceVerdict {
                 passed: true,
                 feedback: "ok".into(),
+                aspects: None,
             },
         });
         let engine =
@@ -2280,6 +2327,7 @@ mod tests {
             outcome: Ok(AcceptanceVerdict {
                 passed: true,
                 feedback: "ok".into(),
+                aspects: None,
             }),
         });
         let engine =
@@ -2418,6 +2466,7 @@ mod tests {
             outcome: Ok(AcceptanceVerdict {
                 passed: true,
                 feedback: "ok".into(),
+                aspects: None,
             }),
         });
         let engine = DispatchEngine::new(store.clone(), Some(judge))
@@ -2470,6 +2519,7 @@ mod tests {
             outcome: Ok(AcceptanceVerdict {
                 passed: true,
                 feedback: "ok".into(),
+                aspects: None,
             }),
         });
         let engine = DispatchEngine::new(store.clone(), Some(judge))
@@ -3175,6 +3225,7 @@ mod tests {
             outcome: Ok(AcceptanceVerdict {
                 passed: true,
                 feedback: "should never be reached".into(),
+                aspects: None,
             }),
             captured_task: std::sync::Mutex::new(None),
         });
@@ -3233,6 +3284,7 @@ mod tests {
             outcome: Ok(AcceptanceVerdict {
                 passed: true,
                 feedback: "ok".into(),
+                aspects: None,
             }),
             captured_task: std::sync::Mutex::new(None),
         });
@@ -3267,6 +3319,7 @@ mod tests {
             outcome: Ok(AcceptanceVerdict {
                 passed: true,
                 feedback: "ok".into(),
+                aspects: None,
             }),
             captured_task: std::sync::Mutex::new(None),
         });
@@ -3301,6 +3354,7 @@ mod tests {
             outcome: Ok(AcceptanceVerdict {
                 passed: true,
                 feedback: "ok".into(),
+                aspects: None,
             }),
         });
         let engine =
