@@ -56,6 +56,7 @@ import {
   personalPrimaryItems,
   staffEntry,
   type NavItem,
+  isNewFeature,
 } from './nav-model';
 import { isTauri } from '@/lib/gateway-picker';
 import { EditionBadge } from './EditionBadge';
@@ -96,6 +97,10 @@ function NavRow({ item, count, collapsed }: { item: NavItem; count: number; coll
   const intl = useIntl();
   const Icon = item.icon;
   const label = intl.formatMessage({ id: item.label });
+  // 新功能 chip (2026-08-14 convention): shown while the running version is
+  // at or below the release the page shipped in; self-expires next minor.
+  const version = useSystemStore((s) => s.status?.version ?? null);
+  const showNew = isNewFeature(item.newIn, version);
   const navClass = useNavClass(collapsed);
   const startNew = useConversationsStore((s) => s.startNew);
   // Action rows (新對話) run their side effect before the NavLink navigates, so
@@ -132,6 +137,11 @@ function NavRow({ item, count, collapsed }: { item: NavItem; count: number; coll
         {!collapsed && (
           <>
             <span className="min-w-0 flex-1 truncate">{label}</span>
+            {showNew && (
+              <span className="shrink-0 rounded-full bg-brand/15 px-1.5 py-px text-[10px] font-medium text-brand">
+                {intl.formatMessage({ id: 'nav.badge.new' })}
+              </span>
+            )}
             {count > 0 && (
               <SidebarMenuBadge
                 className="rounded-full bg-brand px-1.5 font-medium text-brand-foreground"

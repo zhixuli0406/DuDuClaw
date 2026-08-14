@@ -163,9 +163,9 @@ async fn native_evidence_reaches_grounding_and_tool_activity_without_breaking_a3
         .with_forward_model(forward_model.clone());
 
     let judge = CapturingJudge::new(vec![
-        Ok(AcceptanceVerdict { passed: false, feedback: "round 1 not good enough".into() }),
-        Ok(AcceptanceVerdict { passed: false, feedback: "round 2 still missing X".into() }),
-        Ok(AcceptanceVerdict { passed: true, feedback: "round 3 accepted".into() }),
+        Ok(AcceptanceVerdict { passed: false, feedback: "round 1 not good enough".into(), aspects: None }),
+        Ok(AcceptanceVerdict { passed: false, feedback: "round 2 still missing X".into(), aspects: None }),
+        Ok(AcceptanceVerdict { passed: true, feedback: "round 3 accepted".into(), aspects: None }),
     ]);
     let dispatch_engine = DispatchEngine::new(store.clone(), Some(judge.clone()))
         .with_home_dir(dir.path().to_path_buf())

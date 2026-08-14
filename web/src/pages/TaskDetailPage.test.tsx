@@ -123,16 +123,21 @@ describe('TaskDetailPage — 等你決定 (WP-A §2-6)', () => {
     expect(screen.getAllByRole('button', { name: 'Mark complete' })).toHaveLength(1);
   });
 
-  it('writes `pending` for 重試 — the status the generic picker could never reach', async () => {
+  it('routes 重試 through tasks.goal_decide — the same fail-closed path as the channel buttons', async () => {
     const user = userEvent.setup();
     renderAt('task-aaaa1111');
     await user.click(screen.getByRole('button', { name: 'Retry' }));
     await waitFor(() =>
-      expect(mockWsClient.call).toHaveBeenCalledWith('tasks.update', {
+      expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_decide', {
         task_id: 'task-aaaa1111',
-        status: 'pending',
+        action: 'retry',
+        note: '',
       }),
     );
+    // Never the bare status write (2026-08-14: that route left stale
+    // claim/lease behind and leaked the old judge feedback into the next round).
+    const updates = mockWsClient.call.mock.calls.filter((c) => c[0] === 'tasks.update');
+    expect(updates).toHaveLength(0);
   });
 
   it('leaves an ordinary task alone (guard is not a blanket freeze)', () => {

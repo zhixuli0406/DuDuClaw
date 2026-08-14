@@ -227,6 +227,15 @@ pub struct TaskIterationRow {
     pub judge_feedback: Option<String>,
     /// P3 (reserved): ODC injection-source label for the defect.
     pub feedback_class: Option<String>,
+    /// Per-aspect MAV panel results as JSON `[{name, pass, reason}]` —
+    /// `None` for deterministic (pre-judge) rejections and legacy rows.
+    pub verdict_json: Option<String>,
+    /// How many times this round was dispatched (stall re-dispatches).
+    pub dispatch_count: i64,
+    /// Goal-state hash at dispatch time (visit-graph signal), when known.
+    pub state_hash: Option<String>,
+    /// Same-(state, action) repeat streak observed at dispatch time.
+    pub repeat_streak: Option<i64>,
 }
 
 /// Per-agent slice of [`FlowMetrics`] (Iterative Kanban analytics, P2).
@@ -566,7 +575,40 @@ impl TaskStore {
              CREATE INDEX IF NOT EXISTS idx_task_iterations_task
                  ON task_iterations(task_id, round);",
         )
-        .map_err(|e| format!("init iteration schema: {e}"))
+        .map_err(|e| format!("init iteration schema: {e}"))?;
+
+        // 2026-08-14 additive columns (audit-debt cleanup, same idempotent
+        // pattern as `add_dispatch_columns`):
+        // - verdict_json: per-aspect MAV panel results — previously flattened
+        //   into one feedback string before persistence, so the timeline
+        //   could never show "correctness ✓ / completeness ✗ / safety ✓".
+        // - dispatch_count: how many times this round was actually dispatched
+        //   (stall re-dispatches) — previously memory-only in the driver.
+        // - state_hash / repeat_streak: the visit-graph oscillation signal at
+        //   dispatch time — previously in-memory only, invisible after the
+        //   fact.
+        let existing: HashSet<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(task_iterations)")
+                .map_err(|e| format!("pragma iteration table_info: {e}"))?;
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| format!("query iteration table_info: {e}"))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|e| format!("collect iteration table_info: {e}"))?
+        };
+        let migrations: &[(&str, &str)] = &[
+            ("verdict_json", "verdict_json TEXT"),
+            ("dispatch_count", "dispatch_count INTEGER NOT NULL DEFAULT 1"),
+            ("state_hash", "state_hash TEXT"),
+            ("repeat_streak", "repeat_streak INTEGER"),
+        ];
+        for (col, ddl) in migrations {
+            if !existing.contains(*col) {
+                conn.execute(&format!("ALTER TABLE task_iterations ADD COLUMN {ddl}"), [])
+                    .map_err(|e| format!("add iteration column {col}: {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// U4: idempotent plan schema. New tables only (`CREATE TABLE IF NOT
@@ -1381,6 +1423,17 @@ impl TaskStore {
 
     /// Goal-mode acceptance passed: promote a `review` task to `done`.
     pub async fn accept_review(&self, id: &str, feedback: &str) -> Result<bool, String> {
+        self.accept_review_with_verdict(id, feedback, None).await
+    }
+
+    /// [`Self::accept_review`] carrying the structured per-aspect panel
+    /// verdict (`[{name, pass, reason}]` JSON) for the round timeline.
+    pub async fn accept_review_with_verdict(
+        &self,
+        id: &str,
+        feedback: &str,
+        verdict_json: Option<&str>,
+    ) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
         let n = conn
@@ -1393,7 +1446,7 @@ impl TaskStore {
             .map_err(|e| format!("accept review: {e}"))?;
         if n == 1 {
             // Iterative Kanban: seal the current round's verdict.
-            iter_verdict_conn(&conn, id, "accepted", feedback, &now)?;
+            iter_verdict_conn(&conn, id, "accepted", feedback, verdict_json, &now)?;
         }
         Ok(n == 1)
     }
@@ -1412,6 +1465,19 @@ impl TaskStore {
         id: &str,
         feedback: &str,
         soft_cap: i64,
+    ) -> Result<String, String> {
+        self.reject_review_with_verdict(id, feedback, soft_cap, None).await
+    }
+
+    /// [`Self::reject_review`] carrying the structured per-aspect panel
+    /// verdict for the round timeline (`None` for deterministic pre-judge
+    /// rejections, which have no panel).
+    pub async fn reject_review_with_verdict(
+        &self,
+        id: &str,
+        feedback: &str,
+        soft_cap: i64,
+        verdict_json: Option<&str>,
     ) -> Result<String, String> {
         let row = match self.get_task(id).await? {
             Some(r) => r,
@@ -1435,7 +1501,7 @@ impl TaskStore {
                 )
                 .map_err(|e| format!("reject review (revising): {e}"))?;
             if n == 1 {
-                iter_verdict_conn(&conn, id, "rejected", feedback, &now)?;
+                iter_verdict_conn(&conn, id, "rejected", feedback, verdict_json, &now)?;
             }
             Ok("revising".to_string())
         } else {
@@ -1448,7 +1514,7 @@ impl TaskStore {
                 )
                 .map_err(|e| format!("reject review (escalate): {e}"))?;
             if n == 1 {
-                iter_verdict_conn(&conn, id, "escalated", feedback, &now)?;
+                iter_verdict_conn(&conn, id, "escalated", feedback, verdict_json, &now)?;
             }
             Ok("needs_human".to_string())
         }
@@ -1643,8 +1709,25 @@ impl TaskStore {
         round: i64,
         now: &str,
     ) -> Result<(), String> {
+        self.record_iteration_dispatch_with_state(task_id, round, now, None, None)
+            .await
+    }
+
+    /// Dispatch record carrying the visit-graph signal of the moment: the
+    /// goal-state hash and the same-(state, action) repeat streak. A stall
+    /// re-dispatch of an already-open round increments `dispatch_count`
+    /// (previously that count lived only in the driver's memory) and
+    /// refreshes the state signal.
+    pub async fn record_iteration_dispatch_with_state(
+        &self,
+        task_id: &str,
+        round: i64,
+        now: &str,
+        state_hash: Option<&str>,
+        repeat_streak: Option<i64>,
+    ) -> Result<(), String> {
         let conn = self.conn.lock().await;
-        iter_dispatch_conn(&conn, task_id, round, now)
+        iter_dispatch_conn(&conn, task_id, round, now, state_hash, repeat_streak)
     }
 
     /// All iteration rows for a task, oldest round first (the revision timeline).
@@ -1653,7 +1736,8 @@ impl TaskStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, task_id, round, dispatched_at, submitted_at, judged_at,
-                        verdict, judge_feedback, feedback_class
+                        verdict, judge_feedback, feedback_class, verdict_json,
+                        dispatch_count, state_hash, repeat_streak
                    FROM task_iterations WHERE task_id = ?1 ORDER BY round ASC, id ASC",
             )
             .map_err(|e| format!("prepare iterations: {e}"))?;
@@ -1987,6 +2071,40 @@ impl TaskStore {
             .map_err(|e| format!("collect activity: {e}"))?;
 
         Ok((rows, total))
+    }
+
+    /// Every activity row for one task, oldest first (chronological for the
+    /// goal-loop timeline). Task-scoped where [`Self::list_activity`] is
+    /// global — a long-running goal's kickoff/oscillation/needs_human events
+    /// would be washed out of any bounded global window.
+    pub async fn list_activity_for_task(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ActivityRow>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, event_type, agent_id, task_id, summary, timestamp, metadata
+                 FROM activity WHERE task_id = ?1 ORDER BY timestamp ASC LIMIT ?2",
+            )
+            .map_err(|e| format!("prepare task activity: {e}"))?;
+        let rows = stmt
+            .query_map(params![task_id, limit.clamp(1, 1000)], |r| {
+                Ok(ActivityRow {
+                    id: r.get(0)?,
+                    event_type: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    task_id: r.get(3)?,
+                    summary: r.get(4)?,
+                    timestamp: r.get(5)?,
+                    metadata: r.get(6)?,
+                })
+            })
+            .map_err(|e| format!("query task activity: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect task activity: {e}"))?;
+        Ok(rows)
     }
 
     // ── Task comments (L2) ──────────────────────────────────
@@ -2497,6 +2615,10 @@ fn row_to_iteration(row: &rusqlite::Row) -> rusqlite::Result<TaskIterationRow> {
         verdict: row.get(6)?,
         judge_feedback: row.get(7)?,
         feedback_class: row.get(8)?,
+        verdict_json: row.get(9)?,
+        dispatch_count: row.get(10)?,
+        state_hash: row.get(11)?,
+        repeat_streak: row.get(12)?,
     })
 }
 
@@ -2516,13 +2638,18 @@ fn round_seconds(dispatched_at: &str, submitted_at: &str) -> i64 {
     }
 }
 
-/// Open round `round` for `task_id` if it does not already exist. Idempotent per
-/// `(task_id, round)` — a stall re-dispatch of the same round writes nothing.
+/// Open round `round` for `task_id` if it does not already exist. Idempotent
+/// per `(task_id, round)` in the timeline sense — a stall re-dispatch of the
+/// same round keeps the original `dispatched_at` but increments
+/// `dispatch_count` and refreshes the visit-graph signal (the count was
+/// previously memory-only in the driver and lost on every restart).
 fn iter_dispatch_conn(
     conn: &Connection,
     task_id: &str,
     round: i64,
     now: &str,
+    state_hash: Option<&str>,
+    repeat_streak: Option<i64>,
 ) -> Result<(), String> {
     let exists: Option<i64> = conn
         .query_row(
@@ -2532,12 +2659,22 @@ fn iter_dispatch_conn(
         )
         .optional()
         .map_err(|e| format!("iter dispatch lookup: {e}"))?;
-    if exists.is_some() {
+    if let Some(id) = exists {
+        conn.execute(
+            "UPDATE task_iterations
+                SET dispatch_count = dispatch_count + 1,
+                    state_hash = COALESCE(?2, state_hash),
+                    repeat_streak = COALESCE(?3, repeat_streak)
+              WHERE id = ?1",
+            params![id, state_hash, repeat_streak],
+        )
+        .map_err(|e| format!("iter dispatch bump: {e}"))?;
         return Ok(());
     }
     conn.execute(
-        "INSERT INTO task_iterations (task_id, round, dispatched_at) VALUES (?1, ?2, ?3)",
-        params![task_id, round, now],
+        "INSERT INTO task_iterations (task_id, round, dispatched_at, state_hash, repeat_streak)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![task_id, round, now, state_hash, repeat_streak],
     )
     .map_err(|e| format!("iter dispatch insert: {e}"))?;
     Ok(())
@@ -2592,6 +2729,7 @@ fn iter_verdict_conn(
     task_id: &str,
     verdict: &str,
     feedback: &str,
+    verdict_json: Option<&str>,
     now: &str,
 ) -> Result<(), String> {
     let row_id: Option<i64> = conn
@@ -2607,8 +2745,10 @@ fn iter_verdict_conn(
     if let Some(id) = row_id {
         conn.execute(
             "UPDATE task_iterations
-                SET judged_at = ?2, verdict = ?3, judge_feedback = ?4 WHERE id = ?1",
-            params![id, now, verdict, feedback],
+                SET judged_at = ?2, verdict = ?3, judge_feedback = ?4,
+                    verdict_json = ?5
+              WHERE id = ?1",
+            params![id, now, verdict, feedback, verdict_json],
         )
         .map_err(|e| format!("iter verdict update: {e}"))?;
     }
@@ -4006,6 +4146,54 @@ mod tests {
         assert_eq!(iters.len(), 1);
         assert_eq!(iters[0].verdict.as_deref(), Some("rejected"));
         assert_eq!(iters[0].judge_feedback.as_deref(), Some("missing summary"));
+    }
+
+    /// 2026-08-14: the structured panel verdict is persisted verbatim, a
+    /// stall re-dispatch bumps `dispatch_count` while keeping the original
+    /// `dispatched_at`, and the visit-graph signal lands on the row.
+    #[tokio::test]
+    async fn iteration_rows_carry_verdict_json_and_dispatch_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        store.insert_task(&goal_review_task("g1")).await.unwrap();
+        store
+            .record_iteration_dispatch_with_state(
+                "g1", 1, "2026-08-14T10:00:00Z", Some("hash-a"), Some(1),
+            )
+            .await
+            .unwrap();
+        // Stall re-dispatch of the same round: count bumps, timestamp stays,
+        // refreshed streak wins.
+        store
+            .record_iteration_dispatch_with_state(
+                "g1", 1, "2026-08-14T10:30:00Z", Some("hash-a"), Some(2),
+            )
+            .await
+            .unwrap();
+        let aspects = r#"[{"name":"correctness","pass":true,"reason":""},{"name":"safety","pass":false,"reason":"deleted prod"}]"#;
+        store
+            .reject_review_with_verdict("g1", "[safety] deleted prod", 3, Some(aspects))
+            .await
+            .unwrap();
+
+        let iters = store.list_iterations("g1").await.unwrap();
+        assert_eq!(iters.len(), 1);
+        let it = &iters[0];
+        assert_eq!(it.dispatched_at, "2026-08-14T10:00:00Z");
+        assert_eq!(it.dispatch_count, 2);
+        assert_eq!(it.state_hash.as_deref(), Some("hash-a"));
+        assert_eq!(it.repeat_streak, Some(2));
+        let parsed: serde_json::Value =
+            serde_json::from_str(it.verdict_json.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed[1]["name"], "safety");
+        assert_eq!(parsed[1]["pass"], false);
+        // Legacy wrapper still writes rows without a panel.
+        store.insert_task(&goal_review_task("g2")).await.unwrap();
+        store.record_iteration_dispatch("g2", 1, "2026-08-14T11:00:00Z").await.unwrap();
+        store.reject_review("g2", "nope", 3).await.unwrap();
+        let g2 = store.list_iterations("g2").await.unwrap();
+        assert!(g2[0].verdict_json.is_none());
+        assert_eq!(g2[0].dispatch_count, 1);
     }
 
     #[tokio::test]

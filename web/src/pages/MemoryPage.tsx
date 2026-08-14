@@ -19,7 +19,6 @@ import { withParam } from '@/lib/url-params';
 import { toast } from '@/lib/toast';
 import { useSystemStore } from '@/stores/system-store';
 import { MemoryBrowser } from '@/components/memory/MemoryBrowser';
-import { ForwardModelView } from '@/components/memory/ForwardModelView';
 import { KnowledgeHubPage } from './KnowledgeHubPage';
 import { SharedWikiPage } from './SharedWikiPage';
 import {
@@ -81,9 +80,9 @@ import {
  * redirect straight into the knowledge tab and deep links keep working.
  */
 
-type ViewId = 'memories' | 'wiki' | 'shared' | 'insights' | 'evolution' | 'forward';
+type ViewId = 'memories' | 'wiki' | 'shared' | 'insights' | 'evolution';
 
-const VIEW_IDS: readonly ViewId[] = ['memories', 'wiki', 'shared', 'insights', 'evolution', 'forward'];
+const VIEW_IDS: readonly ViewId[] = ['memories', 'wiki', 'shared', 'insights', 'evolution'];
 
 function parseView(raw: string | null): ViewId {
   const v = VIEW_IDS.find((id) => id === raw);
@@ -146,7 +145,6 @@ export function MemoryPage() {
     opts.push(
       { value: 'insights', label: intl.formatMessage({ id: 'memory.tab.insights' }) },
       { value: 'evolution', label: intl.formatMessage({ id: 'memory.tab.evolution' }) },
-      { value: 'forward', label: intl.formatMessage({ id: 'memory.tab.forward' }) },
     );
     return opts;
   }, [intl, isPersonal]);
@@ -156,7 +154,7 @@ export function MemoryPage() {
   // stagnation/telemetry/consolidations/playbook detail sections underneath
   // need one agent selected — same picker, reused.
   const showAgentPicker =
-    view === 'memories' || view === 'insights' || view === 'evolution' || view === 'forward';
+    view === 'memories' || view === 'insights' || view === 'evolution';
 
   return (
     <div className="-mx-4 -mt-4 flex flex-col md:-mx-6 md:-mt-6">
@@ -202,7 +200,6 @@ export function MemoryPage() {
         {view === 'shared' && <SharedWikiPage embedded />}
         {view === 'insights' && <InsightsView agentId={selectedAgent} />}
         {view === 'evolution' && <EvolutionView selectedAgent={selectedAgent} />}
-        {view === 'forward' && <ForwardModelView selectedAgent={selectedAgent} />}
       </div>
     </div>
   );

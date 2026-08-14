@@ -3201,7 +3201,7 @@ fn extract_goal_loop_task_id(payload: &str) -> Option<&str> {
 /// `dispatch_engine.rs::settle_forward_model` computes on the review side
 /// (`task.revision_round + 1`, the same value `goal_loop.rs::enqueue_work`
 /// stamps here as `next_iter`).
-fn extract_goal_loop_task_id_and_round(payload: &str) -> Option<(&str, u32)> {
+pub(crate) fn extract_goal_loop_task_id_and_round(payload: &str) -> Option<(&str, u32)> {
     let task_id = extract_goal_loop_task_id(payload)?;
     const ITER_MARKER: &str = " iter=";
     let start = payload.find(ITER_MARKER)? + ITER_MARKER.len();

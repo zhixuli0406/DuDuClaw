@@ -58,6 +58,12 @@ pub struct DispatchRunRow {
     pub preview_in: String,
     pub preview_out: String,
     pub step_count: usize,
+    /// Goal-loop linkage parsed from the dispatch prompt marker
+    /// (`[goal-loop task_id=<uuid> iter=<n>]`) at record time — `None` for
+    /// cron runs and non-goal dispatches. Previously run ↔ round could only
+    /// be joined by string-parsing the masked preview after the fact.
+    pub task_id: Option<String>,
+    pub round: Option<i64>,
 }
 
 /// Row mapper shared by [`RunStepStore::list_dispatch_runs`] and
@@ -73,6 +79,8 @@ fn map_dispatch_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchRunRow>
         preview_in: row.get(6)?,
         preview_out: row.get(7)?,
         step_count: row.get::<_, i64>(8)?.max(0) as usize,
+        task_id: row.get(9)?,
+        round: row.get(10)?,
     })
 }
 
@@ -168,6 +176,27 @@ impl RunStepStore {
              CREATE INDEX IF NOT EXISTS idx_dispatch_runs_agent ON dispatch_runs(agent_id, id);",
         )
         .map_err(|e| format!("init run_steps schema: {e}"))?;
+        // 2026-08-14 additive columns: durable run ↔ goal-round linkage.
+        let existing: std::collections::HashSet<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(dispatch_runs)")
+                .map_err(|e| format!("pragma dispatch_runs: {e}"))?;
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| format!("query dispatch_runs info: {e}"))?
+                .collect::<Result<std::collections::HashSet<_>, _>>()
+                .map_err(|e| format!("collect dispatch_runs info: {e}"))?
+        };
+        for (col, ddl) in [("task_id", "task_id TEXT"), ("round", "round INTEGER")] {
+            if !existing.contains(col) {
+                conn.execute(&format!("ALTER TABLE dispatch_runs ADD COLUMN {ddl}"), [])
+                    .map_err(|e| format!("add dispatch_runs column {col}: {e}"))?;
+            }
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_runs_task ON dispatch_runs(task_id, id)",
+            [],
+        )
+        .map_err(|e| format!("index dispatch_runs task: {e}"))?;
         Ok(())
     }
 
@@ -248,6 +277,14 @@ impl RunStepStore {
         preview_out: &str,
         steps: &[(String, bool)],
     ) -> Result<i64, String> {
+        // Parse the goal-loop marker off the RAW prompt (before masking /
+        // truncation can mangle it) so the run row carries a durable
+        // task/round linkage instead of leaving consumers to string-parse.
+        let (task_id, round) =
+            match crate::dispatcher::extract_goal_loop_task_id_and_round(preview_in) {
+                Some((t, r)) => (Some(t.to_string()), Some(r as i64)),
+                None => (None, None),
+            };
         let preview_in =
             duduclaw_core::truncate_chars(&mask_secretish(preview_in), PAYLOAD_PREVIEW_CHAR_CAP);
         let preview_out =
@@ -256,11 +293,12 @@ impl RunStepStore {
             let conn = self.lock();
             conn.execute(
                 "INSERT INTO dispatch_runs
-                 (agent_id, source, started_at, ended_at, status, preview_in, preview_out, step_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (agent_id, source, started_at, ended_at, status, preview_in, preview_out,
+                  step_count, task_id, round)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     agent_id, source, started_at, ended_at, status, preview_in, preview_out,
-                    steps.len() as i64
+                    steps.len() as i64, task_id, round
                 ],
             )
             .map_err(|e| format!("insert dispatch run: {e}"))?;
@@ -287,7 +325,7 @@ impl RunStepStore {
     ) -> Result<Vec<DispatchRunRow>, String> {
         let conn = self.lock();
         let sql = "SELECT id, agent_id, source, started_at, ended_at, status, preview_in,
-                          preview_out, step_count
+                          preview_out, step_count, task_id, round
                    FROM dispatch_runs
                    WHERE (?1 = '' OR agent_id = ?1)
                    ORDER BY id DESC LIMIT ?2";
@@ -300,11 +338,32 @@ impl RunStepStore {
         Ok(rows)
     }
 
+    /// Every dispatch run recorded for one goal task, oldest first — the
+    /// `tasks.timeline` join (durable, no string parsing).
+    pub fn list_dispatch_runs_for_task(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> Result<Vec<DispatchRunRow>, String> {
+        let conn = self.lock();
+        let sql = "SELECT id, agent_id, source, started_at, ended_at, status, preview_in,
+                          preview_out, step_count, task_id, round
+                   FROM dispatch_runs WHERE task_id = ?1
+                   ORDER BY id ASC LIMIT ?2";
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![task_id, limit as i64], map_dispatch_run)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
     /// One dispatch run by id, for `runs.get`'s `dispatch:<id>` branch.
     pub fn get_dispatch_run(&self, id: i64) -> Result<Option<DispatchRunRow>, String> {
         let conn = self.lock();
         let sql = "SELECT id, agent_id, source, started_at, ended_at, status, preview_in,
-                          preview_out, step_count
+                          preview_out, step_count, task_id, round
                    FROM dispatch_runs WHERE id = ?1";
         match conn.query_row(sql, params![id], map_dispatch_run) {
             Ok(row) => Ok(Some(row)),
@@ -529,6 +588,50 @@ pub(crate) fn mask_secretish(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-08-14: a goal-loop dispatch prompt's marker is parsed into
+    /// durable `task_id`/`round` columns at record time; non-goal runs stay
+    /// unlinked; the per-task query returns exactly the linked rows.
+    #[test]
+    fn dispatch_run_parses_goal_loop_linkage() {
+        let store = RunStepStore::open_in_memory().unwrap();
+        store
+            .record_dispatch_run(
+                "agnes",
+                "dispatch",
+                "2026-08-14T01:00:00+00:00",
+                "2026-08-14T01:01:00+00:00",
+                "completed",
+                "[goal-loop task_id=abc-123 iter=2] 你有一個自主目標任務要推進",
+                "done",
+                &[],
+            )
+            .unwrap();
+        store
+            .record_dispatch_run(
+                "agnes",
+                "cron",
+                "2026-08-14T02:00:00+00:00",
+                "2026-08-14T02:01:00+00:00",
+                "completed",
+                "【每日盤前】檢查掛單",
+                "done",
+                &[],
+            )
+            .unwrap();
+        let all = store.list_dispatch_runs("agnes", 10).unwrap();
+        assert_eq!(all.len(), 2);
+        let linked = all.iter().find(|r| r.source == "dispatch").unwrap();
+        assert_eq!(linked.task_id.as_deref(), Some("abc-123"));
+        assert_eq!(linked.round, Some(2));
+        let cron = all.iter().find(|r| r.source == "cron").unwrap();
+        assert!(cron.task_id.is_none());
+
+        let for_task = store.list_dispatch_runs_for_task("abc-123", 10).unwrap();
+        assert_eq!(for_task.len(), 1);
+        assert_eq!(for_task[0].round, Some(2));
+        assert!(store.list_dispatch_runs_for_task("other", 10).unwrap().is_empty());
+    }
 
     #[test]
     fn dispatch_run_record_list_get_roundtrip() {

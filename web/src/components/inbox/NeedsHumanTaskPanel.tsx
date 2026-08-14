@@ -11,16 +11,6 @@ import { OpenInChannelButton } from './OpenInChannelButton';
 
 type ResolveAction = 'retry' | 'done' | 'abort';
 
-/** Action → the `TaskStatus` the existing generic `tasks.update` RPC writes.
- *  Mirrors the channel-side three-choice resolution
- *  (`goal_notify::resolve_needs_human`'s `retry`/`done`/`abort` decisions) —
- *  reusing the RPC that already exists rather than adding a new one. */
-const RESOLVE_STATUS: Record<ResolveAction, 'pending' | 'done' | 'cancelled'> = {
-  retry: 'pending',
-  done: 'done',
-  abort: 'cancelled',
-};
-
 /**
  * NeedsHumanActions — the three-state resolution (重試 / 標記完成 / 放棄) on its
  * own, so every surface that shows a `needs_human` task offers the SAME three
@@ -53,7 +43,12 @@ export function NeedsHumanActions({
       if (busy) return;
       setBusy(action);
       try {
-        await api.tasks.update(taskId, { status: RESOLVE_STATUS[action] });
+        // 2026-08-14: routed through the SAME fail-closed path as the channel
+        // buttons (`tasks.goal_decide` → `resolve_needs_human`) instead of a
+        // bare status write — the old `tasks.update` route left the stale
+        // claim/lease/result behind on retry and let the previous round's
+        // judge feedback leak into the next dispatch.
+        await api.tasks.goalDecide(taskId, action);
         toast.success(intl.formatMessage({ id: `inbox.needsHuman.${action}Toast` }));
         onResolved();
       } catch (e) {

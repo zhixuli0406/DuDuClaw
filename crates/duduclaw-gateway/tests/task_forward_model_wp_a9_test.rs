@@ -172,9 +172,9 @@ async fn run_scenario(dir: &Path, forward_model: Option<Arc<TaskForwardModel>>) 
     }
 
     let judge = ScriptedJudge::new(vec![
-        Ok(AcceptanceVerdict { passed: false, feedback: "round 1 not good enough".into() }),
-        Ok(AcceptanceVerdict { passed: false, feedback: "round 2 still missing X".into() }),
-        Ok(AcceptanceVerdict { passed: true, feedback: "round 3 accepted".into() }),
+        Ok(AcceptanceVerdict { passed: false, feedback: "round 1 not good enough".into(), aspects: None }),
+        Ok(AcceptanceVerdict { passed: false, feedback: "round 2 still missing X".into(), aspects: None }),
+        Ok(AcceptanceVerdict { passed: true, feedback: "round 3 accepted".into(), aspects: None }),
     ]);
     let mut dispatch_engine = DispatchEngine::new(store.clone(), Some(judge)).with_home_dir(dir.to_path_buf());
     if let Some(fm) = &forward_model {
