@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.59.0] - 2026-08-15 — 信念迴圈×目標契約＋排程可靠性修復
+
 ### Added
 - **信念迴圈（Belief Loop）**：task forward model 之外的第二個預測迴圈——agent 對「外部世界」（任何領域，不限投資）的結構化信念記帳。三個 MCP 工具（`belief_submit`／`belief_settle`／`belief_stats`）寫入 `prediction.db` 新表 `belief_log`；結算為確定性三向 Brier（方向 vs 提交時判斷基準值、可調 flat band 預設 ±0.3%、有 tick 資料時交叉核對申報值、容差 1% 外拒絕結算——agent 不能自報現實）；兩個程式化注入鉤點：目標派工 prompt 附校準統計區塊（<30 筆只給計數不下結論；逐筆記錄 `stats_injected` 供事後 A/B——文獻查無「注入歷史統計會變準」的一手證據，誠實以實驗形態上線）、autopilot tick 喚醒 prompt 附「你申報的方向 vs 現值」一行對照（程式化 diff，源自 arXiv:2605.29463 自由回憶 0% vs 程式化注入 86% 的證據；tick 欄位對映支援 `[belief] tick_subject_map` 顯式設定，慣例 `zXXXX→XXXX` 為 fallback）。統計復用既有 `calibration.rs`（Wilson 下界／proper scoring），不造第二套口徑。儀表板 /foresight 改雙分頁，新增「信念與驗證」分頁（`belief.recent`/`belief.summary` RPC，三態誠實標籤）。設計依 2026-08-14 六路文獻調研（詳 `docs/features/46-belief-loop.md`）。
 - **目標指派表單 v2（per-goal 時長與風險邊界）**：/goals 指派與 `tasks.goal_create` 新增 `duration_hours`（到期未過驗收 → `needs_human`，覆蓋全域 wall-clock 取較早者）與 `risk_boundary`（留空自動套用基本款——法規遵循／資安紅線／不得繞過硬性風控／金流與不可逆動作過人審／對外發言過人審，`[goal_defaults] baseline_boundary` 可客製）；邊界每輪程式化注入派工 prompt 並成為 MAV 判官 safety 面向的檢核基準（違反即退回，fail-closed 不變；底層 ActionGuard/ApprovalBroker/dispatch_guard 護欄照常疊加）。
