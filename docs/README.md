@@ -102,6 +102,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [todo/TODO-agent-cross-invocation-continuity.md](todo/TODO-agent-cross-invocation-continuity.md) | Agent 跨 invocation 行動連續性（否認/遺忘自己排程時的行動）修復 |
 | [todo/TODO-dispatch-run-visibility.md](todo/TODO-dispatch-run-visibility.md) | 排程／派工執行紀錄可觀測性——cron 路徑不落 run 紀錄，RunsPage 只看得到頻道對話 |
 | [todo/TODO-skill-extraction-cron-path.md](todo/TODO-skill-extraction-cron-path.md) | 技能萃取的排程路徑——cron 場景無使用者回饋，成功訊號分級（判官 accept/成功 run）替代方案已定向 |
+| [todo/TODO-cron-scheduler-sleep-drift.md](todo/TODO-cron-scheduler-sleep-drift.md) | CronScheduler 宿主睡眠後永久停擺（monotonic 漂移、健康檢查測不到的靜默失效）——wall-clock 對齊修法定向 |
 | [todo/TODO-rfc24-decision-continuity.md](todo/TODO-rfc24-decision-continuity.md) | RFC-24 decision-continuity implementation tracking |
 | [todo/TODO-rfc26-live-forking.md](todo/TODO-rfc26-live-forking.md) | RFC-26 live-forking implementation tracking |
 | [todo/TODO-telegram-reply-context.md](todo/TODO-telegram-reply-context.md) | Telegram 回覆/引用訊息內容遺失（reply_to_message 未解析）修復 |
