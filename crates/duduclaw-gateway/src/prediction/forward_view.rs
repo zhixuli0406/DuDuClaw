@@ -62,6 +62,16 @@ pub struct ForwardRecentRow {
     pub composite_error: Option<f64>,
     pub created_at: String,
     pub settled_at: Option<String>,
+    /// Compact "what was predicted / what actually happened" pair so the list
+    /// answers it without opening the chain drill-down (2026-08-14 operator
+    /// feedback: a row showing only category + Brier reads as a black box).
+    pub expected_outcome: Option<String>,
+    pub observed_outcome: Option<String>,
+    pub expected_artifact: Option<String>,
+    pub observed_artifact: Option<String>,
+    /// Task board title resolved by the RPC handler (this module reads only
+    /// `prediction.db`); `None` when the task row is gone.
+    pub task_title: Option<String>,
 }
 
 struct ScannedRow {
@@ -185,26 +195,100 @@ pub fn forward_summaries(
 }
 
 /// Newest predictions (settled and pending), newest first.
+///
+/// Unlike the summary fold this runs its own bounded query INCLUDING the two
+/// JSON blobs (≤[`RECENT_MAX_LIMIT`] rows), parsing out just the compact
+/// expected/observed pair — the 5000-row summary scan deliberately keeps
+/// skipping them.
 pub fn forward_recent(
     db_path: &Path,
     agent_filter: Option<&str>,
     limit: usize,
 ) -> Vec<ForwardRecentRow> {
     let capped = limit.clamp(1, RECENT_MAX_LIMIT);
-    scan_rows(db_path, agent_filter, capped)
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        return Vec::new();
+    };
+    let base = "SELECT prediction_id, task_id, agent_id, round, prediction_source,
+                       fidelity, category, brier_score, composite_error,
+                       created_at, settled_at, prediction_json, observation_json
+                FROM task_prediction_log";
+    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(ScannedRow, Option<String>, Option<String>)> {
+        Ok((
+            ScannedRow {
+                prediction_id: row.get(0)?,
+                task_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                round: row.get::<_, i64>(3)?.max(0) as u32,
+                source: row.get(4)?,
+                fidelity: row.get(5)?,
+                category: row.get(6)?,
+                brier: row.get(7)?,
+                composite_error: row.get(8)?,
+                created_at: row.get(9)?,
+                settled_at: row.get(10)?,
+            },
+            row.get(11)?,
+            row.get(12)?,
+        ))
+    };
+    let result = match agent_filter {
+        Some(agent) => {
+            let sql = format!("{base} WHERE agent_id = ?1 ORDER BY id DESC LIMIT ?2");
+            conn.prepare(&sql).and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![agent, capped as i64], map)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+        }
+        None => {
+            let sql = format!("{base} ORDER BY id DESC LIMIT ?1");
+            conn.prepare(&sql).and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![capped as i64], map)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+        }
+    };
+    result
+        .unwrap_or_default()
         .into_iter()
-        .map(|r| ForwardRecentRow {
-            prediction_id: r.prediction_id,
-            task_id: r.task_id,
-            agent_id: r.agent_id,
-            round: r.round,
-            source: r.source,
-            fidelity: r.fidelity,
-            category: r.category,
-            brier: r.brier,
-            composite_error: r.composite_error,
-            created_at: r.created_at,
-            settled_at: r.settled_at,
+        .map(|(r, pred_json, obs_json)| {
+            // Same typed structs the chain view parses; a malformed blob just
+            // yields `None` sides (fail-open, like everything in this module).
+            let pred = pred_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<TaskPrediction>(s).ok());
+            let obs = obs_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<TaskObservation>(s).ok());
+            ForwardRecentRow {
+                prediction_id: r.prediction_id,
+                task_id: r.task_id,
+                agent_id: r.agent_id,
+                round: r.round,
+                source: r.source,
+                fidelity: r.fidelity,
+                category: r.category,
+                brier: r.brier,
+                composite_error: r.composite_error,
+                created_at: r.created_at,
+                settled_at: r.settled_at,
+                expected_outcome: pred
+                    .as_ref()
+                    .map(|p| p.expected_outcome.as_str().to_string()),
+                expected_artifact: pred
+                    .as_ref()
+                    .map(|p| p.expected_artifact.as_str().to_string()),
+                observed_outcome: obs
+                    .as_ref()
+                    .map(|o| o.observed_outcome.as_str().to_string()),
+                observed_artifact: obs
+                    .as_ref()
+                    .map(|o| o.observed_artifact.as_str().to_string()),
+                task_title: None,
+            }
         })
         .collect()
 }

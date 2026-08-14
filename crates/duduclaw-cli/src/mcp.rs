@@ -216,6 +216,35 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "history_limit", description: "Max history records to return (default 20, max 100)", required: false },
         ],
     },
+    // ── Belief Loop (design-market-belief-loop-2026-08.md) ──
+    // Structured, programmatically-settled beliefs about an external
+    // subject — use these instead of only reasoning about direction/outcome
+    // in prose, so your track record can be measured instead of asserted.
+    ToolDef {
+        name: "belief_submit",
+        description: "Record a structured belief about an external subject (a ticker, an index, a KPI…) BEFORE the outcome is known, so it can be programmatically settled and scored later instead of only living in your prose reasoning. Call once per subject you're forecasting, at the start of the period (e.g. before market open, or before this week's numbers come in). Example: subject='2317', horizon='今日收盤', direction='up', prob=0.65, ref_value=105.5, rationale='outperformed peers on Q2 order growth'. Settle it afterward with belief_settle — never grade your own call from memory.",
+        params: &[
+            ParamDef { name: "subject", description: "What you're forecasting, e.g. a ticker, index, or KPI ('2317', 'TAIEX', 'trial_conversion_rate'). Short identifier, <=64 chars", required: true },
+            ParamDef { name: "horizon", description: "Free-form label for when this belief will be settled, <=40 chars (e.g. '今日收盤', '本週五', '明日 18:00'). No fixed enum — settlement timing is decided by when you call belief_settle", required: true },
+            ParamDef { name: "direction", description: "'up', 'down', or 'flat'", required: true },
+            ParamDef { name: "prob", description: "Your confidence in that direction, 0.0-1.0 (e.g. 0.65 = 65% confident)", required: true },
+            ParamDef { name: "rationale", description: "Why, in your own words (<=400 chars, kept compact — this is not the place for a full essay)", required: false },
+            ParamDef { name: "ref_value", description: "The judgment baseline value your direction call is measured against. Required if you want this belief settleable later — omit only when there is genuinely no numeric basis for this subject", required: false },
+        ],
+    },
+    ToolDef {
+        name: "belief_settle",
+        description: "Settle a belief you submitted earlier, once its horizon has passed (e.g. after market close for horizon='今日收盤'). Computes hit / miss / flat_band and a proper (ordinal) score deterministically from the realized value vs. the ref_value you gave at submit time — do NOT try to judge your own accuracy in prose, this tool is the source of truth. Report the realized_value honestly: this tool cannot independently verify it against live external data from within this process, so settle_source is recorded as 'agent_unverified' (the gateway performs its own cross-check separately when it has a matching live observation). You can only settle your own beliefs, and each belief settles exactly once.",
+        params: &[
+            ParamDef { name: "belief_id", description: "The belief_id returned by belief_submit", required: true },
+            ParamDef { name: "realized_value", description: "The actual value observed at the horizon", required: true },
+        ],
+    },
+    ToolDef {
+        name: "belief_stats",
+        description: "Read your own calibration track record: hit rate (Wilson lower bound), mean score, and whether you're systematically overconfident (mean stated confidence minus actual hit rate) — computed from your settled belief_submit/belief_settle history, never from memory or prose recollection. Below 30 settled beliefs this returns counts only and no verdict — that is the honest answer at small sample size, not an error. Check this before submitting new beliefs to see whether your recent confidence has actually been justified.",
+        params: &[],
+    },
     ToolDef {
         name: "memory_read",
         description: "Read a single memory entry by ID",
@@ -9853,6 +9882,8 @@ pub(crate) async fn handle_tools_call(
             | "working_state_set"
             | "working_state_clear"
             | "working_state_handoff"
+            | "belief_submit"
+            | "belief_settle"
             | "model_load"
             | "model_download"
             | "model_unload"
@@ -9890,6 +9921,10 @@ pub(crate) async fn handle_tools_call(
         "working_state_clear" => handle_working_state_clear(&arguments, home_dir, default_agent).await,
         "working_state_handoff" => handle_working_state_handoff(&arguments, home_dir, default_agent).await,
         "working_state_get" => handle_working_state_get(&arguments, home_dir, default_agent).await,
+        // ── Belief Loop (design-market-belief-loop-2026-08.md WP2) ──
+        "belief_submit" => handle_belief_submit(&arguments, home_dir, default_agent).await,
+        "belief_settle" => handle_belief_settle(&arguments, home_dir, default_agent).await,
+        "belief_stats" => handle_belief_stats(home_dir, default_agent).await,
         "user_profile_record" => crate::mcp_memory_handlers::handle_user_profile_record(&arguments, memory, ns_ctx).await,
         "user_profile_get" => crate::mcp_memory_handlers::handle_user_profile_get(&arguments, memory, ns_ctx).await,
         "user_code_profile" => crate::mcp_memory_handlers::handle_user_code_profile(memory, ns_ctx).await,
@@ -15227,6 +15262,109 @@ async fn handle_working_state_get(args: &Value, home_dir: &Path, default_agent: 
     match result {
         Ok(v) => tool_text(&v.to_string()),
         Err(e) => tool_error(&e),
+    }
+}
+
+// ── Belief Loop (design-market-belief-loop-2026-08.md WP2) ──────────────────
+// Structured, programmatically-settled beliefs about an external subject.
+// Agent identity is always `default_agent` (the caller's own), never a
+// client-supplied field — `submit`/`settle`/`stats` in
+// `duduclaw_gateway::prediction::belief` enforce ownership on top of
+// that, but the MCP front door never even offers an `agent_id` param to
+// spoof.
+
+async fn handle_belief_submit(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let horizon = args.get("horizon").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let direction = args.get("direction").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let Some(prob) = args
+        .get("prob")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+    else {
+        return tool_error("prob is required and must be a number in [0,1]");
+    };
+    let rationale = args
+        .get("rationale")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| duduclaw_core::truncate_chars(s, 400));
+    let ref_value = args
+        .get("ref_value")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
+
+    let home = home_dir.to_path_buf();
+    let agent = default_agent.to_string();
+    let belief = duduclaw_gateway::prediction::belief::NewBelief {
+        agent_id: agent,
+        subject,
+        horizon,
+        direction,
+        prob,
+        rationale,
+        ref_value,
+        source_goal_id: None,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let db_path = home.join("prediction.db");
+        duduclaw_gateway::prediction::belief::submit(&db_path, belief)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("belief_submit join error: {e}")));
+    match result {
+        Ok(belief_id) => {
+            tool_text(&serde_json::json!({ "ok": true, "belief_id": belief_id }).to_string())
+        }
+        Err(e) => tool_error(&e),
+    }
+}
+
+async fn handle_belief_settle(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let belief_id = args.get("belief_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if belief_id.is_empty() {
+        return tool_error("belief_id is required");
+    }
+    let Some(realized_value) = args
+        .get("realized_value")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+    else {
+        return tool_error("realized_value is required and must be a number");
+    };
+    let home = home_dir.to_path_buf();
+    let agent = default_agent.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let db_path = home.join("prediction.db");
+        // Cross-check against live tick data happens gateway-side (WP3's
+        // tick-wake hook reads the same table); the MCP server process has
+        // no TickHub access, so tick_price is always None here and
+        // settle_source is honestly recorded as "agent_unverified" rather
+        // than pretending to verify it.
+        duduclaw_gateway::prediction::belief::settle(
+            &db_path,
+            &agent,
+            &belief_id,
+            realized_value,
+            None,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("belief_settle join error: {e}")));
+    match result {
+        Ok(row) => tool_text(&serde_json::to_string(&row).unwrap_or_else(|_| "{}".to_string())),
+        Err(e) => tool_error(&e),
+    }
+}
+
+async fn handle_belief_stats(home_dir: &Path, default_agent: &str) -> Value {
+    let home = home_dir.to_path_buf();
+    let agent = default_agent.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let db_path = home.join("prediction.db");
+        duduclaw_gateway::prediction::belief::stats(&db_path, &agent)
+    })
+    .await;
+    match result {
+        Ok(stats) => tool_text(&serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())),
+        Err(e) => tool_error(&format!("belief_stats join error: {e}")),
     }
 }
 

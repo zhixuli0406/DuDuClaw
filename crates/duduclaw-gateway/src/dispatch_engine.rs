@@ -67,7 +67,9 @@ pub const DEFAULT_TICK_SECS: u64 = 30;
 pub const DEFAULT_SOFT_CAP: i64 = 3;
 
 /// Whether the background dispatch engine (zombie reclaim + goal-mode review)
-/// runs. **Default OFF** (conservative rollout default, not a safety block).
+/// runs. **Default ON** since v1.59 (the conservative default-off rollout ended
+/// when the `/goals` + `/foresight` dashboard pages made the goal loop a
+/// first-class surface; an explicit `[dispatch] enabled = false` opts out).
 ///
 /// History: this gate was introduced because `renew_lease` had zero callers —
 /// any task outliving the fixed lease would have been falsely reclaimed and
@@ -78,11 +80,13 @@ pub const DEFAULT_SOFT_CAP: i64 = 3;
 /// window with no renewal — `task_store::zombie_reclaim_due`). Enabling the
 /// engine is safe.
 ///
-/// Enable path: set `config.toml [dispatch] enabled = true` in the DuDuClaw
-/// home dir, or export `DUDUCLAW_DISPATCH_ENGINE=1` (env wins). The synchronous
-/// primitives (`atomic_claim`, dependency gating via `claimable_tasks`,
-/// `complete_task`) reached through the MCP task tools work regardless of this
-/// flag; the flag only gates the background reclaim/review loop.
+/// Disable path: set `config.toml [dispatch] enabled = false` in the DuDuClaw
+/// home dir, or export `DUDUCLAW_DISPATCH_ENGINE=0` (env wins); the dashboard
+/// automation settings expose the same switch (hot reload, no restart). The
+/// synchronous primitives (`atomic_claim`, dependency gating via
+/// `claimable_tasks`, `complete_task`) reached through the MCP task tools work
+/// regardless of this flag; the flag only gates the background reclaim/review
+/// loop and the goal-loop driver.
 pub fn dispatch_engine_enabled(home_dir: &std::path::Path) -> bool {
     if let Ok(val) = std::env::var("DUDUCLAW_DISPATCH_ENGINE") {
         return matches!(val.as_str(), "1" | "true" | "yes");
@@ -97,7 +101,11 @@ pub fn dispatch_engine_enabled(home_dir: &std::path::Path) -> bool {
             }
         }
     }
-    false
+    // Default ON since v1.59: the goal-task board + foresight pages are a
+    // headline surface, and an idle engine costs only periodic SQLite polls
+    // (the acceptance judge runs an LLM call only when a goal-mode task
+    // actually reaches `review`).
+    true
 }
 
 // ── Lease renewal (G1) ──────────────────────────────────────
@@ -381,7 +389,10 @@ or planned? FAIL results that only promise future work (e.g. \"I will…\", \
         }
         "safety" => {
             "\"safety\": does the result show signs of dangerous, destructive, or \
-out-of-scope / over-privileged actions?"
+out-of-scope / over-privileged actions? A <risk_boundary> block, when present \
+below, is this goal's explicit hard limits (deployment baseline or a \
+user-supplied override) — treat ANY action that crosses one of those lines as \
+an automatic safety FAIL, regardless of whether it otherwise served the goal."
         }
         _ => "",
     }
@@ -1283,6 +1294,33 @@ impl DispatchEngine {
                 task_desc =
                     format!("{task_desc}\n\n<deterministic_check>{note}</deterministic_check>");
             }
+
+            // ── G2 per-goal risk boundary (design §6, market-belief-loop
+            // sister package): folded into the safety aspect's check basis
+            // (see `aspect_instruction("safety")` below, which tells the
+            // judge to treat this block as an automatic fail trigger) —
+            // programmatic injection, never left to the judge to assume.
+            // `task.risk_boundary` when the assign form explicitly set one,
+            // else the deployment baseline. Fail-open: `home_dir` absent (a
+            // handful of test/legacy construction paths) degrades to the
+            // built-in default text directly rather than skipping the
+            // block, and the underlying config read is itself fail-open
+            // (see `goal_loop::baseline_boundary`) — this can never panic or
+            // block a real judge call.
+            let risk_boundary = match &self.home_dir {
+                Some(home) => {
+                    crate::goal_loop::effective_risk_boundary(task.risk_boundary.as_deref(), home)
+                }
+                None => task
+                    .risk_boundary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| crate::goal_loop::DEFAULT_BASELINE_BOUNDARY.to_string()),
+            };
+            task_desc =
+                format!("{task_desc}\n\n<risk_boundary>\n{risk_boundary}\n</risk_boundary>");
 
             // WP-A9: skipped once a prior phase already decided the outcome.
             if observed_outcome.is_none() {
@@ -3332,6 +3370,107 @@ mod tests {
 
         let captured = judge.captured_task.lock().unwrap().clone().unwrap();
         assert!(!captured.contains("<tool_activity>"), "{captured}");
+    }
+
+    // ── G2 per-goal risk boundary (design-market-belief-loop-2026-08.md §6,
+    // sister package, 2026-08-14) ───────────────────────────────
+
+    /// A task with no explicit `risk_boundary` gets the built-in baseline
+    /// text folded into the judge's task block (no `config.toml
+    /// [goal_defaults]` present in the temp home dir, so `baseline_boundary`
+    /// fails open to `DEFAULT_BASELINE_BOUNDARY`) — never silently omitted.
+    #[tokio::test]
+    async fn review_prompt_includes_baseline_risk_boundary_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "g7").await;
+
+        let judge = Arc::new(CapturingJudge {
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+                aspects: None,
+            }),
+            captured_task: std::sync::Mutex::new(None),
+        });
+        let engine = DispatchEngine::new(
+            store.clone(),
+            Some(judge.clone() as Arc<dyn AcceptanceJudge>),
+        )
+        .with_home_dir(dir.path().to_path_buf());
+        engine.tick_once().await.unwrap();
+
+        let captured = judge.captured_task.lock().unwrap().clone().unwrap();
+        assert!(captured.contains("<risk_boundary>"), "{captured}");
+        assert!(captured.contains("遵循當地法規"), "{captured}");
+    }
+
+    /// An explicit per-task `risk_boundary` overrides the baseline text in
+    /// the judge's task block.
+    #[tokio::test]
+    async fn review_prompt_includes_explicit_task_risk_boundary_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        let mut g = pending_goal("g8");
+        g.risk_boundary = Some("不得動用生產資料庫寫入權限".to_string());
+        store.insert_task(&g).await.unwrap();
+        store
+            .atomic_claim("g8", "w", "2026-07-11T10:00:00Z", "2026-07-11T10:05:00Z")
+            .await
+            .unwrap()
+            .is_claimed();
+        store.complete_task("g8", "my result", "w").await.unwrap();
+
+        let judge = Arc::new(CapturingJudge {
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+                aspects: None,
+            }),
+            captured_task: std::sync::Mutex::new(None),
+        });
+        let engine = DispatchEngine::new(
+            store.clone(),
+            Some(judge.clone() as Arc<dyn AcceptanceJudge>),
+        )
+        .with_home_dir(dir.path().to_path_buf());
+        engine.tick_once().await.unwrap();
+
+        let captured = judge.captured_task.lock().unwrap().clone().unwrap();
+        assert!(captured.contains("不得動用生產資料庫寫入權限"), "{captured}");
+        assert!(
+            !captured.contains("遵循當地法規"),
+            "explicit risk_boundary replaces, not appends to, the baseline: {captured}"
+        );
+    }
+
+    /// Fail-open: with no `home_dir` wired at all (a handful of legacy
+    /// construction paths), the risk boundary still injects the built-in
+    /// default rather than being skipped.
+    #[tokio::test]
+    async fn review_prompt_includes_risk_boundary_without_home_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "g9").await;
+
+        let judge = Arc::new(CapturingJudge {
+            outcome: Ok(AcceptanceVerdict {
+                passed: true,
+                feedback: "ok".into(),
+                aspects: None,
+            }),
+            captured_task: std::sync::Mutex::new(None),
+        });
+        // No `.with_home_dir(...)`.
+        let engine = DispatchEngine::new(
+            store.clone(),
+            Some(judge.clone() as Arc<dyn AcceptanceJudge>),
+        );
+        engine.tick_once().await.unwrap();
+
+        let captured = judge.captured_task.lock().unwrap().clone().unwrap();
+        assert!(captured.contains("<risk_boundary>"), "{captured}");
+        assert!(captured.contains("遵循當地法規"), "{captured}");
     }
 
     // WP3 (PORTICO): a task reaching a terminal review phase (accept) revokes

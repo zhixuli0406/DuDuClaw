@@ -1271,7 +1271,60 @@ impl AutopilotEngine {
             prompt.push_str("\n\n");
             prompt.push_str(&window);
         }
+        if let Some(diff) = self.belief_tick_diff_section(target, fields).await {
+            prompt.push_str("\n\n");
+            prompt.push_str(&diff);
+        }
         self.enqueue_prompt(target, &prompt).await
+    }
+
+    /// Belief Loop tick-wake hook (design-market-belief-loop-2026-08.md
+    /// WP3 / §4/§6): when a `tick` event wakes this delegate and the target
+    /// agent has today's unsettled beliefs whose `subject` resolves to one
+    /// of the tick payload's fields, append a one-line diff per matched
+    /// belief against the live tick value. Field resolution
+    /// ([`resolve_tick_field_name`]) prefers an explicit `config.toml
+    /// [belief] tick_subject_map` entry over the platform's `zXXXX → XXXX`
+    /// naming convention (`json_fields` keys — see `tick_config.rs`'s doc
+    /// comment; the `delta_`/`pct_`/`prev_` companion fields never match the
+    /// convention fallback since they don't start with a bare `z`).
+    ///
+    /// Zero LLM, zero network — reads only the local `prediction.db` /
+    /// `config.toml`. `None` for every non-tick event, when the agent has no
+    /// unsettled beliefs today, or when no subject resolves to one of this
+    /// tick's fields — never blocks the dispatch (same fail-open posture as
+    /// [`tick_context_window`] and the platform's other injection hooks).
+    async fn belief_tick_diff_section(
+        &self,
+        target: &str,
+        fields: &serde_json::Map<String, Value>,
+    ) -> Option<String> {
+        // Exact match on the event name — never a substring test.
+        if fields.get("event").and_then(|v| v.as_str())? != "tick" {
+            return None;
+        }
+        let db_path = self.home_dir.join("prediction.db");
+        let home_dir = self.home_dir.clone();
+        let agent = target.to_string();
+        let (unsettled, cfg) = tokio::task::spawn_blocking(move || {
+            let rows = crate::prediction::belief::unsettled_today(&db_path, &agent);
+            let cfg = crate::prediction::belief::BeliefConfig::from_home(&home_dir);
+            (rows, cfg)
+        })
+        .await
+        .ok()?;
+        if unsettled.is_empty() {
+            return None;
+        }
+        let pairs: Vec<(crate::prediction::belief::BeliefRow, f64)> = unsettled
+            .into_iter()
+            .filter_map(|row| {
+                let key = resolve_tick_field_name(&cfg, &row.subject);
+                let tick_value = fields.get(&key).and_then(|v| v.as_f64())?;
+                Some((row, tick_value))
+            })
+            .collect();
+        crate::prediction::belief::render_tick_diff_section(&pairs)
     }
 
     /// WP2 wake-up context: when a `tick` event woke this delegate, append a
@@ -1749,6 +1802,19 @@ impl AutopilotEngine {
         };
         mq.enqueue(&msg).await
     }
+}
+
+/// Resolve the tick payload field name that carries `subject`'s live value
+/// (design §4/§6): an explicit `config.toml [belief] tick_subject_map`
+/// entry (key = tick field name, value = subject) wins when present;
+/// otherwise falls back to the platform's `zXXXX → XXXX` naming convention.
+/// Pure and side-effect-free so it can be unit-tested without a running
+/// engine or database.
+fn resolve_tick_field_name(cfg: &crate::prediction::belief::BeliefConfig, subject: &str) -> String {
+    if let Some((field_name, _)) = cfg.tick_subject_map.iter().find(|(_, s)| s.as_str() == subject) {
+        return field_name.clone();
+    }
+    format!("z{subject}")
 }
 
 // ─── Filesystem safety helpers ──────────────────────────────
@@ -3796,5 +3862,29 @@ mod tests {
         let hub = engine.tick_hub.as_ref().unwrap();
         assert_eq!(hub.wake_counts().await, vec![("rule-screen".to_string(), 3)]);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── resolve_tick_field_name (design §4/§6: explicit map wins, zXXXX→XXXX
+    // convention is the fallback) ──
+
+    #[test]
+    fn resolve_tick_field_name_falls_back_to_z_prefix_convention_when_unmapped() {
+        let cfg = crate::prediction::belief::BeliefConfig::default();
+        assert_eq!(resolve_tick_field_name(&cfg, "2330"), "z2330");
+    }
+
+    #[test]
+    fn resolve_tick_field_name_prefers_explicit_config_map_over_convention() {
+        let mut cfg = crate::prediction::belief::BeliefConfig::default();
+        cfg.tick_subject_map
+            .insert("conversion_rate".to_string(), "trial_conversion_rate".to_string());
+        // An explicit mapping wins even though the z-prefix convention would
+        // have resolved to a different (wrong) field name here.
+        assert_eq!(
+            resolve_tick_field_name(&cfg, "trial_conversion_rate"),
+            "conversion_rate"
+        );
+        // A subject with no explicit entry still falls back to convention.
+        assert_eq!(resolve_tick_field_name(&cfg, "2330"), "z2330");
     }
 }

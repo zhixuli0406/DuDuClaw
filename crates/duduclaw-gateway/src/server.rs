@@ -146,6 +146,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Initialise the log broadcast channel (must happen before subscribers connect).
     let log_tx = crate::log::init_log_broadcaster();
     let tx = log_tx;
+    // Boot reference for the /healthz scheduler-staleness probe.
+    SERVER_START_UNIX.store(
+        chrono::Utc::now().timestamp(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let home_dir = config.home_dir.clone();
     let extension = config.extension.clone();
@@ -751,6 +756,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("Daily-digest scheduler scheduled — 1 min interval (off unless [notify] daily_digest = true)");
     }
 
+    // Belief loop × goal contract gap 2 (design-market-belief-loop-2026-08.md
+    // §3 「自主研究」): sweeps every agent every 5 minutes, self-gating on
+    // per-agent `agent.toml [research] self_study` (off by default) — a
+    // deployment where no agent opts in pays one `agents/` directory read
+    // per tick and creates nothing.
+    {
+        let self_study = Arc::new(crate::self_study::SelfStudyScheduler::new(home_dir.clone()));
+        tokio::spawn(self_study.run(std::time::Duration::from_secs(300)));
+        info!("Self-study scheduler scheduled — 5 min interval (off unless an agent sets [research] self_study = true)");
+    }
+
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
     let (event_tx, _) = broadcast::channel::<String>(64);
     handler.set_event_tx(event_tx.clone()).await;
@@ -814,7 +830,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // is the root cause of channel "identity mixing" (wrong agent answers).
     crate::channel_reply::validate_default_agent(&home_dir, handler.registry()).await;
 
-    // Start channel bots — per-agent where supported
+    // Start channel bots — per-agent where supported.
+    //
+    // Every starter below is awaited directly on the boot path, and several
+    // make a network round-trip (getMe / token fetch). All their HTTP clients
+    // carry a ≤35s request timeout, so the worst case is a bounded delay —
+    // but a hang here silently delays EVERYTHING after it (heartbeat, cron,
+    // tick sources). The per-stage `info!` markers make any such stall
+    // visible in the log instead of reconstructing it from absence
+    // (2026-08 LWM incident: the boot position could not be located because
+    // no stage markers existed and the pro binary logged nothing at all).
+    info!("boot: channel startup begin (telegram → slack → discord → webhooks)");
     for (label, h) in crate::telegram::start_telegram_bots(&home_dir, reply_ctx.clone()).await {
         handler.register_channel_handle(&label, h).await;
     }
@@ -838,6 +864,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let dingtalk_router =
         crate::dingtalk::start_dingtalk_webhook(&home_dir, reply_ctx.clone()).await;
     let webchat_ctx = reply_ctx.clone();
+    info!("boot: channel startup done — starting schedulers");
 
     // Start unified heartbeat scheduler (per-agent: evolution + cron + monitoring)
     // Replaces the old start_evolution_timers — each agent's HeartbeatConfig
@@ -1357,69 +1384,32 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // (`run_utility_prompt` → account rotator for Claude), so goal-mode `review`
     // tasks are evaluated on the same rotated LLM plumbing the fork/eval judges
     // use. Zombie reclaim + dependency gating are live regardless.
-    // Default OFF (conservative rollout default — see `dispatch_engine_enabled`).
-    // Lease renewal is wired (LeaseRenewalGuard for in-process workers,
-    // `tasks_renew` MCP heartbeat for external agents) and reclaim is
-    // conservative (expiry + one full unrenewed lease window), so enabling via
-    // `[dispatch] enabled = true` / DUDUCLAW_DISPATCH_ENGINE=1 is safe.
-    // Synchronous claim/dependency/complete via the MCP task tools work
-    // regardless of this flag.
-    if crate::dispatch_engine::dispatch_engine_enabled(&home_dir) {
-        if let Some(ts) = task_store_opt.clone() {
-            let caller = crate::dispatch_engine::GoalAcceptanceCaller {
-                home_dir: home_dir.clone(),
-            };
-            let judge: Arc<dyn crate::dispatch_engine::AcceptanceJudge> =
-                Arc::new(crate::dispatch_engine::LlmAcceptanceJudge::new(caller));
-            let mut dispatch_engine_builder =
-                crate::dispatch_engine::DispatchEngine::new(ts.clone(), Some(judge))
-                    // WP4 GroundEval: fold `tool_calls.jsonl` evidence into
-                    // the goal-mode acceptance judge prompt.
-                    .with_home_dir(home_dir.clone())
-                    // Iterative Kanban: share the goal loop's soft cap so a
-                    // rejection past it flags `diminishing` on the board.
-                    .with_soft_cap(
-                        crate::goal_loop::GoalLoopConfig::from_home(&home_dir).soft_cap,
-                    );
-            // WP-A9: A3 task-forward-model — default OFF (design §7.3).
-            // Constructed exactly once here and shared (same `Arc`) with the
-            // goal loop driver's predict hook via `handler.set_forward_model`
-            // so both hooks read/write one coherent in-memory statistical
-            // bucket cache instead of two never-reconciled copies (see
-            // `MethodHandler::forward_model`'s doc comment).
-            let tfm_cfg =
-                crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(
-                    &home_dir,
-                );
-            if tfm_cfg.enabled {
-                let forward_model = Arc::new(
-                    crate::prediction::task_forward_store::TaskForwardModel::new(
-                        home_dir.join("prediction.db"),
-                    ),
-                );
-                handler.set_forward_model(forward_model.clone()).await;
-                dispatch_engine_builder =
-                    dispatch_engine_builder.with_forward_model(forward_model);
-                info!("A3 task-forward-model enabled ([task_forward_model] enabled = true)");
-            }
-            let engine = Arc::new(dispatch_engine_builder);
-            bg_handles.push(tokio::spawn(async move { engine.run().await }));
-            info!("Dispatch engine started (durable SQLite派工：殭屍回收 + goal-mode 驗收)");
-
-            // ── P1: autonomous goal loop driver ──────────────────
-            // The DispatchEngine only reviews goal-mode completions; it does NOT
-            // drive execution. The goal loop driver is the missing outer loop:
-            // it dispatches todo/pending goal_mode tasks onto the existing
-            // message_queue wake-up rail, re-dispatches judge-rejected tasks with
-            // feedback, and owns the hard termination guards. Build + spawn logic
-            // lives on the handler so gateway startup and the `system.update_config`
-            // hot reload (iteration_cap_simple / dispatch.policy) share one path;
-            // the registered handle is abort+respawned on reload.
-            handler.respawn_goal_loop_driver().await;
-        }
+    // Default ON since v1.59 (see `dispatch_engine_enabled`; explicit
+    // `[dispatch] enabled = false` opts out). Lease renewal is wired
+    // (LeaseRenewalGuard for in-process workers, `tasks_renew` MCP heartbeat
+    // for external agents) and reclaim is conservative (expiry + one full
+    // unrenewed lease window). Synchronous claim/dependency/complete via the
+    // MCP task tools work regardless of this flag.
+    //
+    // Build + spawn lives on the handler (self-gating on `[dispatch] enabled`)
+    // so startup and the `system.update_config` hot reload share one path —
+    // false→true first spawn, true→false teardown, both without a restart.
+    // The engine respawn also owns constructing/registering the shared
+    // forward-model `Arc` (gated on `[task_forward_model] enabled`); the goal
+    // loop driver respawn AFTER it picks that same `Arc` up for its predict
+    // hook, so both hooks share one coherent in-memory bucket cache (see
+    // `MethodHandler::forward_model`'s doc comment).
+    if handler.respawn_dispatch_engine().await {
+        // ── P1: autonomous goal loop driver ──────────────────
+        // The DispatchEngine only reviews goal-mode completions; it does NOT
+        // drive execution. The goal loop driver is the missing outer loop:
+        // it dispatches todo/pending goal_mode tasks onto the existing
+        // message_queue wake-up rail, re-dispatches judge-rejected tasks with
+        // feedback, and owns the hard termination guards.
+        handler.respawn_goal_loop_driver().await;
     } else {
         info!(
-            "Dispatch engine disabled (預設關；lease 續租已接上，可用 [dispatch] enabled=true 啟用)"
+            "Dispatch engine disabled ([dispatch] enabled = false；lease 續租仍接上，MCP task 工具不受影響)"
         );
     }
 
@@ -1942,6 +1932,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let app = app;
 
     let addr = format!("{}:{}", config.bind, config.port);
+    info!("boot: all background subsystems wired — binding HTTP");
     info!("Gateway starting on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -4653,22 +4644,77 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
+/// Wall-clock unix seconds when `start_gateway` began (0 = unknown). Gives the
+/// `/healthz` scheduler probe a boot reference so "loop never started" can be
+/// distinguished from "still booting".
+pub(crate) static SERVER_START_UNIX: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// A scheduler loop is considered dead when its last tick is older than this
+/// (loops tick every 30s — 10 missed ticks is far beyond transient load).
+const SCHED_STALL_SECS: i64 = 300;
+
+/// Seconds-ago for one scheduler tick timestamp, plus whether it counts as
+/// stalled. `last == 0` (never ticked) only counts as stalled once the
+/// gateway has been up past the stall window — before that it's "booting".
+fn sched_probe(last: i64, now: i64, start: i64) -> (Option<i64>, bool) {
+    if last > 0 {
+        let ago = (now - last).max(0);
+        (Some(ago), ago > SCHED_STALL_SECS)
+    } else {
+        (None, start > 0 && now - start > SCHED_STALL_SECS)
+    }
+}
+
 /// JSON liveness probe for the desktop Gateway picker (WP-GW). Returns the
 /// gateway version + display name so the picker can show them next to a
 /// discovered / manually-entered endpoint. Unauthenticated, like `/health`.
-async fn healthz_handler() -> Json<serde_json::Value> {
+async fn healthz_handler() -> impl IntoResponse {
     let name = std::fs::read_to_string(
         duduclaw_core::platform::duduclaw_home().join("config.toml"),
     )
     .ok()
     .map(|text| crate::mdns::MdnsConfig::from_toml_str(&text, "DuDuClaw").name)
     .unwrap_or_else(|| "DuDuClaw".to_string());
-    Json(serde_json::json!({
-        "ok": true,
+
+    // Background-scheduler liveness (2026-08 LWM incident: cron/heartbeat
+    // silently dead while HTTP kept answering, so Docker showed "healthy"
+    // for days of missed schedules). A scheduler loop that has not ticked
+    // for SCHED_STALL_SECS — or never started at all after the boot grace
+    // window — flips this endpoint to 503 so restart policies can self-heal
+    // and monitors actually see the failure.
+    use std::sync::atomic::Ordering;
+    let now = chrono::Utc::now().timestamp();
+    let start = SERVER_START_UNIX.load(Ordering::Relaxed);
+    let (cron_ago, cron_stalled) = sched_probe(
+        crate::cron_scheduler::LAST_TICK_UNIX.load(Ordering::Relaxed),
+        now,
+        start,
+    );
+    let (hb_ago, hb_stalled) = sched_probe(
+        duduclaw_agent::heartbeat::LAST_TICK_UNIX.load(Ordering::Relaxed),
+        now,
+        start,
+    );
+    let ok = !cron_stalled && !hb_stalled;
+    let body = Json(serde_json::json!({
+        "ok": ok,
         "service": "duduclaw-gateway",
         "version": env!("CARGO_PKG_VERSION"),
         "name": name,
-    }))
+        "schedulers": {
+            "cron_tick_secs_ago": cron_ago,
+            "cron_stalled": cron_stalled,
+            "heartbeat_tick_secs_ago": hb_ago,
+            "heartbeat_stalled": hb_stalled,
+        },
+    }));
+    let status = if ok {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, body)
 }
 
 // ── Reliability Dashboard HTTP endpoint (W20-P0) ─────────────

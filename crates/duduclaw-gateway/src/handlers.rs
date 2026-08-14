@@ -771,6 +771,46 @@ fn apply_os_watch_to_table(table: &mut toml::Table, params: &Value) -> Result<Ve
     Ok(changes)
 }
 
+/// Validate + write the top-level `[research]` table into an agent.toml from
+/// the `agents.update` `research` param object. Returns the change list
+/// (empty if no `research` object was present). Mirrors
+/// [`apply_os_watch_to_table`]'s shape: a small additive top-level table read
+/// directly by `self_study::ResearchConfig::from_agent_dir` (bypasses
+/// `duduclaw_core::types::AgentConfig` entirely, same as `[os_watch]`), so
+/// this helper is the one and only writer that must gain/lose fields in step
+/// with that reader.
+///
+/// Belief loop × goal contract gap 2
+/// (design-market-belief-loop-2026-08.md §3 「自主研究」).
+fn apply_research_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec<String>, String> {
+    let mut changes: Vec<String> = Vec::new();
+
+    let research = match params.get("research").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return Ok(changes),
+    };
+
+    let section = table
+        .entry("research")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Invalid [research] section".to_string())?;
+
+    if let Some(v) = research.get("self_study").and_then(|v| v.as_bool()) {
+        section.insert("self_study".into(), toml::Value::Boolean(v));
+        changes.push(format!("research.self_study = {v}"));
+    }
+    if let Some(v) = research.get("self_study_hour").and_then(|v| v.as_u64()) {
+        if v > 23 {
+            return Err("research.self_study_hour must be 0-23".into());
+        }
+        section.insert("self_study_hour".into(), toml::Value::Integer(v as i64));
+        changes.push(format!("research.self_study_hour = {v}"));
+    }
+
+    Ok(changes)
+}
+
 /// Machine-readable code the dashboard OS page matches on for the OS-native
 /// quota rejection. Stable string — the frontend keys UI copy off it.
 pub const OS_NATIVE_QUOTA_ERROR_CODE: &str = "os_native_quota_exceeded";
@@ -4395,6 +4435,70 @@ impl MethodHandler {
         true
     }
 
+    /// (Re)build and spawn the dispatch engine (zombie reclaim + goal-mode
+    /// acceptance review) from current config. Shared by gateway startup and
+    /// the `system.update_config` hot reload of `[dispatch] enabled` — gated
+    /// on that same flag, so `false` tears down any running engine and `true`
+    /// (re)spawns one without a restart. Like the goal loop it is a stateless
+    /// periodic poller over SQLite, so abort-between-ticks + respawn is safe.
+    ///
+    /// When `[task_forward_model] enabled = true` this also (re)uses — or, on
+    /// a runtime false→true dispatch enable, constructs and registers — the
+    /// shared forward-model `Arc`, so callers must respawn the goal-loop
+    /// driver *after* this method to hand its predict hook the same `Arc`.
+    /// Returns `true` iff the engine is now running.
+    pub async fn respawn_dispatch_engine(&self) -> bool {
+        if !crate::dispatch_engine::dispatch_engine_enabled(&self.home_dir) {
+            self.abort_driver_handle("dispatch").await;
+            return false;
+        }
+        let Some(ts) = self.task_store.read().await.clone() else {
+            warn!("dispatch engine not (re)started: task store unavailable");
+            self.abort_driver_handle("dispatch").await;
+            return false;
+        };
+        let caller = crate::dispatch_engine::GoalAcceptanceCaller {
+            home_dir: self.home_dir.clone(),
+        };
+        let judge: Arc<dyn crate::dispatch_engine::AcceptanceJudge> =
+            Arc::new(crate::dispatch_engine::LlmAcceptanceJudge::new(caller));
+        let mut builder = crate::dispatch_engine::DispatchEngine::new(ts, Some(judge))
+            // WP4 GroundEval: fold `tool_calls.jsonl` evidence into the
+            // goal-mode acceptance judge prompt.
+            .with_home_dir(self.home_dir.clone())
+            // Iterative Kanban: share the goal loop's soft cap so a rejection
+            // past it flags `diminishing` on the board.
+            .with_soft_cap(crate::goal_loop::GoalLoopConfig::from_home(&self.home_dir).soft_cap);
+        let tfm_cfg =
+            crate::prediction::task_forward_store::TaskForwardModelConfig::from_home(
+                &self.home_dir,
+            );
+        if tfm_cfg.enabled {
+            // One coherent in-memory bucket cache: reuse the registered Arc
+            // when present (boot or a prior respawn built it), construct and
+            // register it otherwise (see `MethodHandler::forward_model` docs).
+            let fm = match self.forward_model().await {
+                Some(fm) => fm,
+                None => {
+                    let fm = Arc::new(
+                        crate::prediction::task_forward_store::TaskForwardModel::new(
+                            self.home_dir.join("prediction.db"),
+                        ),
+                    );
+                    self.set_forward_model(fm.clone()).await;
+                    info!("A3 task-forward-model enabled ([task_forward_model] enabled = true)");
+                    fm
+                }
+            };
+            builder = builder.with_forward_model(fm);
+        }
+        let engine = Arc::new(builder);
+        let handle = tokio::spawn(async move { engine.run().await });
+        self.register_driver_handle("dispatch", handle).await;
+        info!("Dispatch engine (re)started (durable SQLite派工：殭屍回收 + goal-mode 驗收)");
+        true
+    }
+
     /// (Re)build and spawn the semi-automatic topology-evolution driver from
     /// current config. Shared by startup and the `system.update_config` hot
     /// reload of `[topology_evolution] enabled`. Like the goal loop it is a
@@ -5481,6 +5585,19 @@ impl MethodHandler {
             "forward.states" => {
                 require_manager!();
                 self.handle_forward_states(params).await
+            }
+
+            // ── Belief Loop (WP4, design-market-belief-loop-2026-08)
+            //    — external-world belief bookkeeping, parallel to
+            //    the task forward model above. Same access bar / fail-open
+            //    shape as forward.*: manager+ only, reads prediction.db. ──
+            "belief.recent" => {
+                require_manager!();
+                self.handle_belief_recent(params).await
+            }
+            "belief.summary" => {
+                require_manager!();
+                self.handle_belief_summary(params).await
             }
 
             // ── Playbook (agent-scoped gene-shaped experience entries) ──
@@ -8346,6 +8463,13 @@ impl MethodHandler {
             let os_watch_changes = apply_os_watch_to_table(table, &params_clone)?;
             changes.extend(os_watch_changes);
 
+            // ── Self-study opt-in ([research] table) ──
+            // self_study / self_study_hour. Read by
+            // `self_study::ResearchConfig::from_agent_dir` on every 5-min
+            // scheduler sweep (design-market-belief-loop-2026-08.md §3).
+            let research_changes = apply_research_to_table(table, &params_clone)?;
+            changes.extend(research_changes);
+
             // ── Runtime ([runtime] section, RT.1) ──
             // provider enum / fallback / pty_pool_enabled / worker_managed.
             let rt_changes = apply_runtime_to_table(table, &params_clone)?;
@@ -10513,6 +10637,13 @@ impl MethodHandler {
                 }
                 let notify_policy =
                     crate::notify_governance::load_agent_policy(&self.home_dir, &cfg.agent.name);
+                // [research] table read (belief loop × goal contract gap 2) —
+                // computed outside the `json!` call below for the same reason
+                // `capabilities_json` above is: a nested `{ statement; expr }`
+                // block is ambiguous with the macro's own object-literal syntax.
+                let research_cfg = crate::self_study::ResearchConfig::from_agent_dir(
+                    &self.home_dir.join("agents").join(&cfg.agent.name),
+                );
                 WsFrame::ok_response(
                     "",
                     json!({
@@ -10629,6 +10760,15 @@ impl MethodHandler {
                         "os_watch": crate::os_events::read_os_watch_json(
                             &self.home_dir.join("agents").join(&cfg.agent.name),
                         ),
+                        // [research] table — raw from agent.toml (typed config
+                        // doesn't surface it), so the automation tab's
+                        // self-study toggle prefills the agent's own value
+                        // rather than the compiled-in default (belief loop ×
+                        // goal contract gap 2).
+                        "research": {
+                            "self_study": research_cfg.self_study,
+                            "self_study_hour": research_cfg.self_study_hour,
+                        },
                     }),
                 )
             }
@@ -19635,7 +19775,33 @@ impl MethodHandler {
         })
         .await;
         match result {
-            Ok(rows) => WsFrame::ok_response("", json!({ "predictions": rows })),
+            Ok(mut rows) => {
+                // Resolve task-board titles so the list reads as "which goal,
+                // which round" instead of a bare uuid prefix (forward_view
+                // reads only prediction.db; titles live in tasks.db). Missing
+                // store / vanished tasks simply leave the title `None`.
+                if let Ok(store) = self.task_store().await {
+                    let mut titles: std::collections::HashMap<String, Option<String>> =
+                        std::collections::HashMap::new();
+                    for row in &mut rows {
+                        let entry = match titles.entry(row.task_id.clone()) {
+                            std::collections::hash_map::Entry::Occupied(o) => o.get().clone(),
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                let t = store
+                                    .get_task(&row.task_id)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|t| t.title);
+                                v.insert(t.clone());
+                                t
+                            }
+                        };
+                        row.task_title = entry;
+                    }
+                }
+                WsFrame::ok_response("", json!({ "predictions": rows }))
+            }
             Err(e) => WsFrame::error_response("", &format!("forward recent: {e}")),
         }
     }
@@ -19717,6 +19883,62 @@ impl MethodHandler {
         match result {
             Ok(states) => WsFrame::ok_response("", json!({ "states": states })),
             Err(e) => WsFrame::error_response("", &format!("forward states: {e}")),
+        }
+    }
+
+    /// `belief.recent` — newest belief entries (settled + pending),
+    /// newest first. Optional `agent_id` scopes server-side; `limit` default
+    /// 50, capped 200. Same fail-open shape as `forward.recent`: a missing
+    /// store yields an empty list, never an error.
+    async fn handle_belief_recent(&self, params: Value) -> WsFrame {
+        let agent_filter = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(a) = agent_filter.as_deref() {
+            if !is_valid_agent_id(a) {
+                return WsFrame::error_response("", "Invalid agent_id format");
+            }
+        }
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).min(200) as usize;
+        let db_path = self.home_dir.join("prediction.db");
+        let result = tokio::task::spawn_blocking(move || {
+            crate::prediction::belief::recent(&db_path, agent_filter.as_deref(), limit)
+        })
+        .await;
+        match result {
+            Ok(beliefs) => WsFrame::ok_response("", json!({ "beliefs": beliefs })),
+            Err(e) => WsFrame::error_response("", &format!("belief recent: {e}")),
+        }
+    }
+
+    /// `belief.summary` — per-agent belief calibration stats
+    /// (`agent_id` required). n<30 settled ⇒ `insufficient_samples: true`
+    /// and every derived metric is `null` (§0-3 small-sample discipline —
+    /// never a point estimate dressed up as a verdict).
+    async fn handle_belief_summary(&self, params: Value) -> WsFrame {
+        let Some(agent_id) = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return WsFrame::error_response("", "agent_id is required");
+        };
+        if !is_valid_agent_id(agent_id) {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        let agent_id = agent_id.to_string();
+        let db_path = self.home_dir.join("prediction.db");
+        let result = tokio::task::spawn_blocking(move || {
+            crate::prediction::belief::stats(&db_path, &agent_id)
+        })
+        .await;
+        match result {
+            Ok(stats) => WsFrame::ok_response("", json!({ "stats": stats })),
+            Err(e) => WsFrame::error_response("", &format!("belief summary: {e}")),
         }
     }
 
@@ -21015,6 +21237,7 @@ impl MethodHandler {
         let mut applied_immediate = false;
         let mut reload_goal_loop = false;
         let mut reload_topology = false;
+        let mut reload_dispatch = false;
 
         // [knowledge_guard] enabled / window_secs / max_per_subject
         if let Some(kg) = params.get("knowledge_guard").and_then(|v| v.as_object()) {
@@ -21080,8 +21303,19 @@ impl MethodHandler {
             }
         }
 
-        // [dispatch] policy (hard — captured by the goal-loop driver at boot)
+        // [dispatch] enabled (hard — gates the dispatch engine + goal-loop
+        // driver) / policy (hard — captured by the goal-loop driver at boot)
         if let Some(dp) = params.get("dispatch").and_then(|v| v.as_object()) {
+            if let Some(v) = dp.get("enabled").and_then(|v| v.as_bool()) {
+                let section = table
+                    .entry("dispatch")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .unwrap();
+                section.insert("enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("dispatch.enabled = {v} (hot reload)"));
+                reload_dispatch = true;
+            }
             if let Some(v) = dp.get("policy").and_then(|v| v.as_str()) {
                 match v {
                     "fixed_hierarchy" | "round_robin" | "llm_select" => {
@@ -21129,6 +21363,64 @@ impl MethodHandler {
                 section.insert("enabled".into(), toml::Value::Boolean(v));
                 changes.push(format!("topology_evolution.enabled = {v} (hot reload)"));
                 reload_topology = true;
+            }
+        }
+
+        // [belief] flat_band_pct (easy — `BeliefConfig::from_db_path` re-reads
+        // config.toml on every `belief::settle` call) / tick_subject_map (easy
+        // — read by the autopilot tick-wake hook on every tick).
+        if let Some(bl) = params.get("belief").and_then(|v| v.as_object()) {
+            let section = table
+                .entry("belief")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            if let Some(v) = bl.get("flat_band_pct").and_then(|v| v.as_f64()) {
+                if !(0.01..=10.0).contains(&v) {
+                    return WsFrame::error_response(
+                        "",
+                        "belief.flat_band_pct must be 0.01-10.0",
+                    );
+                }
+                section.insert("flat_band_pct".into(), toml::Value::Float(v));
+                changes.push(format!("belief.flat_band_pct = {v}"));
+                applied_immediate = true;
+            }
+            if let Some(map) = bl.get("tick_subject_map").and_then(|v| v.as_object()) {
+                if map.len() > 32 {
+                    return WsFrame::error_response(
+                        "",
+                        "belief.tick_subject_map supports at most 32 entries",
+                    );
+                }
+                let mut tsm_table = toml::map::Map::new();
+                for (k, v) in map {
+                    if k.trim().is_empty() || k.chars().count() > 64 {
+                        return WsFrame::error_response(
+                            "",
+                            "belief.tick_subject_map keys must be non-empty and <= 64 chars",
+                        );
+                    }
+                    let Some(v_str) = v.as_str() else {
+                        return WsFrame::error_response(
+                            "",
+                            "belief.tick_subject_map values must be strings",
+                        );
+                    };
+                    if v_str.trim().is_empty() || v_str.chars().count() > 64 {
+                        return WsFrame::error_response(
+                            "",
+                            "belief.tick_subject_map values must be non-empty and <= 64 chars",
+                        );
+                    }
+                    tsm_table.insert(k.clone(), toml::Value::String(v_str.to_string()));
+                }
+                section.insert("tick_subject_map".into(), toml::Value::Table(tsm_table));
+                changes.push(format!(
+                    "belief.tick_subject_map = {} entries",
+                    map.len()
+                ));
+                applied_immediate = true;
             }
         }
 
@@ -21219,7 +21511,7 @@ impl MethodHandler {
         if changes.is_empty() {
             return WsFrame::error_response(
                 "",
-                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple), dispatch(policy), memory(graph_embed_seed), topology_evolution(enabled)",
+                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map)",
             );
         }
 
@@ -21248,8 +21540,18 @@ impl MethodHandler {
         // stateless periodic pollers — durable state lives in SQLite, so an abort
         // between ticks is safe). Report which reloaded so the UI can confirm.
         let mut hot_reloaded: Vec<&'static str> = Vec::new();
-        if reload_goal_loop {
+        if reload_dispatch {
+            // Order matters: the engine (re)constructs the shared forward-model
+            // Arc when `[task_forward_model]` is enabled, and the goal-loop
+            // driver respawn below picks that same Arc up for its predict hook.
+            self.respawn_dispatch_engine().await;
             self.respawn_goal_loop_driver().await;
+            hot_reloaded.push("dispatch");
+        }
+        if reload_goal_loop && !reload_dispatch {
+            self.respawn_goal_loop_driver().await;
+        }
+        if reload_goal_loop {
             hot_reloaded.push("goal_loop");
         }
         if reload_topology {
@@ -26568,7 +26870,13 @@ impl MethodHandler {
         let status = params.get("status").and_then(|v| v.as_str());
         let agent_id = params.get("agent_id").and_then(|v| v.as_str());
         let priority = params.get("priority").and_then(|v| v.as_str());
-        match store.list_tasks(status, agent_id, priority).await {
+        // Goal-scoped callers (the `/goals` page) filter server-side so the
+        // whole board never crosses the wire just to keep the goal rows.
+        let goal_mode = params.get("goal_mode").and_then(|v| v.as_bool());
+        match store
+            .list_tasks_filtered(status, agent_id, priority, goal_mode)
+            .await
+        {
             Ok(rows) => {
                 // E8 reverse handoff: "在 <通道> 中開啟" — resolve from the
                 // `/goal` entry point's stamped source conversation
@@ -27136,13 +27444,65 @@ impl MethodHandler {
             }
             None => None,
         };
+        // Goal assignment form v2 (design-market-belief-loop-2026-08.md §6,
+        // G1): both new fields are optional and per-goal — an absent value
+        // means "apply the deployment default" (global wall clock / baseline
+        // boundary), resolved at injection time in `goal_loop.rs` /
+        // `dispatch_engine.rs`, NOT baked in here. `duration_hours` is a
+        // plain number (not a duplicated `deadline_at` timestamp) so the
+        // caller never has to compute `now + N` itself.
+        let duration_hours = match params.get("duration_hours") {
+            None | Some(Value::Null) => None,
+            Some(v) => match v.as_f64() {
+                Some(h) if (1.0..=720.0).contains(&h) => Some(h),
+                Some(_) => {
+                    return WsFrame::error_response(
+                        "",
+                        "duration_hours must be between 1 and 720",
+                    )
+                }
+                None => {
+                    return WsFrame::error_response("", "duration_hours must be a number")
+                }
+            },
+        };
+        let risk_boundary = params
+            .get("risk_boundary")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| duduclaw_core::truncate_chars(s, 2000));
+        // Belief loop × goal contract gap 3
+        // (design-market-belief-loop-2026-08.md §3 「信念迴圈」): an
+        // optional per-goal opt-in that teaches the assigned agent to
+        // declare structured predictions (`belief_submit` / `belief_settle`)
+        // about the goal's measurable external indicators, and folds that
+        // requirement into the judge's acceptance bar. Off by default — the
+        // goal text alone remains sufficient unless the assigner opts in.
+        let require_beliefs = params
+            .get("require_beliefs")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
         };
         let task_id = uuid::Uuid::new_v4().to_string();
+        // Title reflects the goal itself — computed from the base
+        // description BEFORE the belief-declaration teaching paragraph is
+        // appended below, so the 60-char truncation never crowds out the
+        // actual goal text with boilerplate.
         let title = duduclaw_core::truncate_chars(&description, 60);
+        let description = if require_beliefs {
+            format!(
+                "{description}\n\n【信念申報要求】執行期間對目標相關的可量測外部指標用 \
+                 belief_submit 申報結構化預測（方向+信心 0-1+基準值），結果可得時用 \
+                 belief_settle 結算；驗收時需附申報與結算摘要。"
+            )
+        } else {
+            description
+        };
         let mut task = crate::task_store::TaskRow::new(
             task_id.clone(),
             title,
@@ -27153,11 +27513,21 @@ impl MethodHandler {
         );
         task.status = "todo".to_string();
         task.goal_mode = true;
-        task.acceptance_criteria =
-            Some(acceptance.unwrap_or_else(|| description.clone()));
+        let mut acceptance_criteria = acceptance.unwrap_or_else(|| description.clone());
+        if require_beliefs {
+            acceptance_criteria.push_str("；至少一筆 belief_submit 申報且已知結果者皆已結算");
+        }
+        task.acceptance_criteria = Some(acceptance_criteria);
         if let Some(tag) = &outcome_tag {
             task.tags = tag.clone();
         }
+        if let Some(hours) = duration_hours {
+            task.deadline_at = Some(
+                (Utc::now() + ChronoDuration::minutes((hours * 60.0).round() as i64))
+                    .to_rfc3339(),
+            );
+        }
+        task.risk_boundary = risk_boundary;
         if let Err(e) = store.insert_task(&task).await {
             return WsFrame::error_response("", &format!("create goal task: {e}"));
         }
@@ -30584,6 +30954,11 @@ fn task_row_to_json(r: &TaskRow) -> Value {
             .goal_state_json
             .as_ref()
             .and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        // Goal assignment form v2 (design-market-belief-loop-2026-08.md §6,
+        // G1): per-goal deadline + risk boundary, when explicitly set. `null`
+        // ⇒ the global wall clock / deployment baseline boundary applies.
+        "deadline_at": r.deadline_at,
+        "risk_boundary": r.risk_boundary,
     })
 }
 
@@ -33176,6 +33551,59 @@ policies:
         );
     }
 
+    // ── apply_research_to_table (belief loop × goal contract gap 2) ──────
+
+    #[test]
+    fn research_apply_writes_self_study_and_hour() {
+        let mut table = toml::Table::new();
+        let changes = apply_research_to_table(
+            &mut table,
+            &json!({ "research": { "self_study": true, "self_study_hour": 18 } }),
+        )
+        .expect("apply");
+        let r = table.get("research").unwrap().as_table().unwrap();
+        assert_eq!(r.get("self_study").unwrap().as_bool(), Some(true));
+        assert_eq!(r.get("self_study_hour").unwrap().as_integer(), Some(18));
+        assert!(changes.iter().any(|c| c.contains("research.self_study = true")));
+        assert!(changes.iter().any(|c| c.contains("research.self_study_hour = 18")));
+
+        // Absent research object ⇒ no-op, empty change list.
+        let mut empty = toml::Table::new();
+        assert!(
+            apply_research_to_table(&mut empty, &json!({}))
+                .expect("no-op")
+                .is_empty()
+        );
+        assert!(empty.get("research").is_none());
+    }
+
+    #[test]
+    fn research_apply_rejects_out_of_range_hour() {
+        let mut table = toml::Table::new();
+        assert!(
+            apply_research_to_table(
+                &mut table,
+                &json!({ "research": { "self_study_hour": 24 } }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn research_apply_explicit_false_round_trips_not_a_clear() {
+        let mut table = toml::Table::new();
+        apply_research_to_table(&mut table, &json!({ "research": { "self_study": true } }))
+            .expect("apply");
+        let changes = apply_research_to_table(
+            &mut table,
+            &json!({ "research": { "self_study": false } }),
+        )
+        .expect("apply");
+        let r = table.get("research").unwrap().as_table().unwrap();
+        assert_eq!(r.get("self_study").unwrap().as_bool(), Some(false));
+        assert!(changes.iter().any(|c| c.contains("self_study = false")));
+    }
+
     #[test]
     fn os_native_quota_reject_frame_carries_code_and_clean_message() {
         let frame = os_native_quota_reject_frame(1);
@@ -35144,6 +35572,85 @@ mod d6_curation_tests {
         assert!(!frame_ok(&bad_win), "window_secs=0 must be rejected");
 
         // A rejected payload must not create config.toml.
+        assert!(
+            !home.path().join("config.toml").exists(),
+            "no partial write on validation failure"
+        );
+    }
+
+    /// `[belief] flat_band_pct` / `tick_subject_map` round-trip: persists to
+    /// config.toml, `BeliefConfig::from_home` reads the exact same shape back
+    /// (proving the write is what the settlement path actually consumes).
+    #[tokio::test]
+    async fn system_update_config_belief_round_trips() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_system_update_config(json!({
+                "belief": {
+                    "flat_band_pct": 0.75,
+                    "tick_subject_map": {
+                        "conversion_rate": "trial_conversion_rate",
+                        "complaint_count": "daily_complaints",
+                    },
+                },
+            }))
+            .await;
+        assert!(frame_ok(&frame), "valid belief knobs must persist: {frame:?}");
+        let data = frame_data(&frame);
+        assert_eq!(data.get("applied").and_then(|v| v.as_bool()), Some(true));
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let cfg: toml::Table = raw.parse().unwrap();
+        assert!((cfg["belief"]["flat_band_pct"].as_float().unwrap() - 0.75).abs() < 1e-9);
+        assert_eq!(
+            cfg["belief"]["tick_subject_map"]["conversion_rate"].as_str(),
+            Some("trial_conversion_rate")
+        );
+
+        // The exact same shape re-parses through the real consumer.
+        let parsed = crate::prediction::belief::BeliefConfig::from_home(home.path());
+        assert!((parsed.flat_band_pct - 0.75).abs() < 1e-9);
+        assert_eq!(
+            parsed.tick_subject_map.get("complaint_count").map(String::as_str),
+            Some("daily_complaints")
+        );
+    }
+
+    #[tokio::test]
+    async fn system_update_config_rejects_bad_belief_values() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // flat_band_pct out of the 0.01-10.0 range.
+        let bad_band = handler
+            .handle_system_update_config(json!({ "belief": { "flat_band_pct": 15.0 } }))
+            .await;
+        assert!(!frame_ok(&bad_band), "out-of-range flat_band_pct must be rejected");
+
+        // tick_subject_map key too long.
+        let long_key = "x".repeat(65);
+        let bad_key = handler
+            .handle_system_update_config(json!({
+                "belief": { "tick_subject_map": { long_key: "subject" } },
+            }))
+            .await;
+        assert!(!frame_ok(&bad_key), "over-long tick_subject_map key must be rejected");
+
+        // tick_subject_map with more than 32 entries.
+        let mut too_many = serde_json::Map::new();
+        for i in 0..33 {
+            too_many.insert(format!("field_{i}"), json!(format!("subject_{i}")));
+        }
+        let bad_size = handler
+            .handle_system_update_config(json!({
+                "belief": { "tick_subject_map": too_many },
+            }))
+            .await;
+        assert!(!frame_ok(&bad_size), "more than 32 tick_subject_map entries must be rejected");
+
+        // Nothing was written by any rejected payload.
         assert!(
             !home.path().join("config.toml").exists(),
             "no partial write on validation failure"

@@ -67,7 +67,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -370,6 +370,110 @@ pub fn review_wip_limit(home_dir: &Path) -> i64 {
         .and_then(|v| v.as_integer())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_REVIEW_WIP_LIMIT)
+}
+
+// ── Goal assignment form v2 (design-market-belief-loop-2026-08.md §6,
+// G1) ────────────────────────────────────────────────────────────
+
+/// Built-in baseline risk-boundary text (design §6 G1): the five-line default
+/// applied to every goal-mode task whose assign form left `risk_boundary`
+/// blank. Used both as the deployment default and as the fail-open fallback
+/// when `config.toml [goal_defaults] baseline_boundary` is absent, malformed,
+/// or unreadable — a bad/missing config must never leave a goal task with NO
+/// boundary text injected.
+pub const DEFAULT_BASELINE_BOUNDARY: &str = "\
+- 遵循當地法規。\n\
+- 資安紅線：不得外洩秘密或憑證。\n\
+- 不得繞過或說服自己繞過任何硬性風控與平台護欄。\n\
+- 金流與不可逆動作須經人審。\n\
+- 對外公開發言須經人審。";
+
+/// Read `[goal_defaults] baseline_boundary` from `<home>/config.toml`.
+/// Absent / malformed / unreadable / blank ⇒ [`DEFAULT_BASELINE_BOUNDARY`]
+/// (fail-open — same "parsed in isolation, defaults on any failure" pattern
+/// as [`GoalLoopConfig::from_home`] and [`review_wip_limit`], so a broken
+/// unrelated config section can never take this down and a goal task is
+/// never dispatched with zero boundary text). Deployment-customizable so an
+/// operator can tailor the default to local regulatory / industry context.
+pub fn baseline_boundary(home_dir: &Path) -> String {
+    let path = home_dir.join("config.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return DEFAULT_BASELINE_BOUNDARY.to_string();
+    };
+    let Ok(table) = content.parse::<toml::Table>() else {
+        return DEFAULT_BASELINE_BOUNDARY.to_string();
+    };
+    table
+        .get("goal_defaults")
+        .and_then(|s| s.get("baseline_boundary"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| DEFAULT_BASELINE_BOUNDARY.to_string())
+}
+
+/// Resolve the effective risk-boundary text for a task: its own explicit
+/// `risk_boundary` when non-blank, else the deployment baseline. Shared by
+/// both G2 injection points (the goal-loop work message and the MAV judge
+/// prompt) so the two never drift out of sync.
+pub fn effective_risk_boundary(task_risk_boundary: Option<&str>, home_dir: &Path) -> String {
+    task_risk_boundary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| baseline_boundary(home_dir))
+}
+
+/// G3: which deadline actually fired — the escalation message tells a human
+/// whether it was the global wall-clock budget or the goal's own explicit
+/// `deadline_at` override, instead of one generic "goal-loop deadline" for
+/// both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadlineHit {
+    /// The global `[goal_loop] wall_clock_hours` budget (from `created_at`).
+    WallClock,
+    /// The per-task `deadline_at` override (design §6 G3).
+    TaskDeadline,
+}
+
+/// G3: resolves whether `now` has passed either the global wall-clock budget
+/// (`created_at + wall_clock_hours`) or an explicit per-task `deadline_at` —
+/// whichever is EARLIER wins, i.e. `deadline_at` can only *tighten* the
+/// effective deadline, never loosen it past the global budget (design §6:
+/// "deadline 覆蓋全域 wall-clock（取較早者）"). Pure and unit-testable without
+/// constructing a [`GoalLoopDriver`]. Unparseable timestamps degrade to "does
+/// not apply" for that half of the check (fail-open on the deadline only —
+/// same contract the pre-G3 wall-clock-only check had; the iteration cap
+/// still bounds the loop regardless).
+pub(crate) fn resolve_deadline_hit(
+    created_at: &str,
+    deadline_at: Option<&str>,
+    wall_clock_hours: i64,
+    now: DateTime<Utc>,
+) -> Option<DeadlineHit> {
+    let wall_clock_deadline = DateTime::parse_from_rfc3339(created_at)
+        .ok()
+        .map(|c| c.with_timezone(&Utc) + ChronoDuration::hours(wall_clock_hours));
+    let task_deadline = deadline_at
+        .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
+        .map(|d| d.with_timezone(&Utc));
+
+    match (wall_clock_deadline, task_deadline) {
+        (Some(wc), Some(td)) => {
+            let effective = wc.min(td);
+            if now < effective {
+                None
+            } else if td <= wc {
+                Some(DeadlineHit::TaskDeadline)
+            } else {
+                Some(DeadlineHit::WallClock)
+            }
+        }
+        (Some(wc), None) => (now >= wc).then_some(DeadlineHit::WallClock),
+        (None, Some(td)) => (now >= td).then_some(DeadlineHit::TaskDeadline),
+        (None, None) => None,
+    }
 }
 
 /// Per-task driver bookkeeping (in memory; the durable state is the task row).
@@ -812,9 +916,22 @@ impl GoalLoopDriver {
                 }
             }
 
-            // ── Wall-clock guard (from created_at) ──
-            if self.deadline_exceeded(&task.created_at, now) {
-                self.escalate(&mut inflight, task, "goal-loop deadline").await?;
+            // ── Wall-clock guard (from created_at) + G3 per-task deadline ──
+            // `deadline_at` (design §6 G3) overrides the global wall clock —
+            // whichever is earlier fires first; the escalation message names
+            // which one actually hit so a human sees a meaningful reason
+            // rather than one generic "deadline" for both.
+            if let Some(hit) = resolve_deadline_hit(
+                &task.created_at,
+                task.deadline_at.as_deref(),
+                self.config.wall_clock_hours,
+                now,
+            ) {
+                let reason = match hit {
+                    DeadlineHit::TaskDeadline => "時限已到未通過驗收",
+                    DeadlineHit::WallClock => "goal-loop deadline",
+                };
+                self.escalate(&mut inflight, task, reason).await?;
                 active = inflight.len();
                 continue;
             }
@@ -1210,6 +1327,63 @@ impl GoalLoopDriver {
                 }
             }
 
+            // ── Belief Loop (design-market-belief-loop-2026-08.md WP3) ──
+            // Pre-dispatch calibration section: a programmatic diff of the
+            // agent's own settled-belief track record, never left to the
+            // agent to recall from memory (§0-1 Honest Lying). Independent
+            // of the A3/A4 forward-model gating above — this reads a
+            // separate table (`belief_log`) and has no enable flag of
+            // its own. Best-effort: a failure here must never block or fail
+            // a real dispatch (same R5 discipline as the A3/A4 hooks).
+            let mut belief_section: Option<String> = None;
+            {
+                let db_path = self.home_dir.join("prediction.db");
+                let agent_id = task.assigned_to.clone();
+                let inject = async move {
+                    let stats_db = db_path.clone();
+                    let stats_agent = agent_id.clone();
+                    let stats = tokio::task::spawn_blocking(move || {
+                        crate::prediction::belief::stats(&stats_db, &stats_agent)
+                    })
+                    .await
+                    .ok()?;
+                    let section =
+                        crate::prediction::belief::render_calibration_section(&stats)?;
+                    // Only stamp the injection marker once the section is
+                    // actually about to be used in a real dispatch prompt
+                    // (design §3 WP3 / §0-2: an evaluable A/B, not an
+                    // assumed-effective mechanism).
+                    let mark_db = db_path.clone();
+                    let mark_agent = agent_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::prediction::belief::mark_stats_injected(&mark_db, &mark_agent)
+                    })
+                    .await;
+                    Some(section)
+                };
+                match std::panic::AssertUnwindSafe(inject).catch_unwind().await {
+                    Ok(section) => belief_section = section,
+                    Err(e) => warn!(
+                        task = %task.id,
+                        "belief calibration injection panicked: {e:?}"
+                    ),
+                }
+            }
+
+            // ── G2 per-goal risk boundary (design §6, belief-loop
+            // sister package) ──
+            // Appended UNCONDITIONALLY on every dispatch — this is a
+            // programmatic injection, not something the agent is trusted to
+            // recall from an earlier turn (Honest Lying, same discipline as
+            // the `<state>` block / recent-actions feed). `effective_risk_boundary`
+            // is pure string handling (no I/O beyond `baseline_boundary`'s
+            // already-fail-open config read) so no panic is reachable here —
+            // it can never block or fail a real dispatch.
+            let risk_boundary_section = format!(
+                "## 本目標風險邊界\n{}\n\n（違反任一條將被驗收判官退回。）",
+                effective_risk_boundary(task.risk_boundary.as_deref(), &self.home_dir)
+            );
+
             // ── Dispatch: enqueue a work message on the existing wake-up rail ──
             let next_iter = current_iter + 1;
             let mut state_text = state_block.render();
@@ -1217,6 +1391,12 @@ impl GoalLoopDriver {
                 state_text.push_str("\n\n");
                 state_text.push_str(section);
             }
+            if let Some(section) = &belief_section {
+                state_text.push_str("\n\n");
+                state_text.push_str(section);
+            }
+            state_text.push_str("\n\n");
+            state_text.push_str(&risk_boundary_section);
             self.enqueue_work(task, next_iter, &state_text).await?;
             // A2: commit this round's state as the latest dispatched state
             // for the unchanged-streak comparison the NEXT rejection
@@ -1319,18 +1499,6 @@ impl GoalLoopDriver {
         }
 
         Ok(())
-    }
-
-    /// True when `now` is more than `wall_clock_hours` past `created_at`.
-    /// An unparseable timestamp is treated as *not* expired (fail-open on the
-    /// deadline only — the iteration cap still bounds the loop).
-    fn deadline_exceeded(&self, created_at: &str, now: DateTime<Utc>) -> bool {
-        match DateTime::parse_from_rfc3339(created_at) {
-            Ok(created) => {
-                (now - created.with_timezone(&Utc)).num_hours() >= self.config.wall_clock_hours
-            }
-            Err(_) => false,
-        }
     }
 
     /// RFC-27: release the edition concurrency lease a terminal task held.
@@ -2058,6 +2226,91 @@ mod tests {
         assert_eq!(cfg.wall_clock_hours, 24);
     }
 
+    // ── G3: resolve_deadline_hit (design §6, market-belief-loop sister
+    // package) ────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_deadline_hit_neither_deadline_reached_is_none() {
+        let created = "2026-08-01T00:00:00Z";
+        let now = DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // wall clock budget 24h, no task deadline ⇒ 12h in, nothing fires.
+        assert_eq!(resolve_deadline_hit(created, None, 24, now), None);
+    }
+
+    #[test]
+    fn resolve_deadline_hit_wall_clock_only_matches_pre_g3_behavior() {
+        let created = "2026-08-01T00:00:00Z";
+        let now = DateTime::parse_from_rfc3339("2026-08-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // No deadline_at set ⇒ byte-identical to the old wall-clock-only check.
+        assert_eq!(
+            resolve_deadline_hit(created, None, 24, now),
+            Some(DeadlineHit::WallClock)
+        );
+    }
+
+    #[test]
+    fn resolve_deadline_hit_task_deadline_earlier_fires_first() {
+        let created = "2026-08-01T00:00:00Z";
+        // Wall clock budget is 24h (deadline 2026-08-02T00:00Z); the task's own
+        // deadline_at is much tighter — 4h from creation.
+        let deadline_at = "2026-08-01T04:00:00Z";
+        let now = DateTime::parse_from_rfc3339("2026-08-01T05:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            resolve_deadline_hit(created, Some(deadline_at), 24, now),
+            Some(DeadlineHit::TaskDeadline),
+            "the tighter per-task deadline overrides the looser global wall clock"
+        );
+    }
+
+    #[test]
+    fn resolve_deadline_hit_wall_clock_still_wins_when_task_deadline_is_looser() {
+        let created = "2026-08-01T00:00:00Z";
+        // Task deadline is LATER than the global wall-clock budget (720h vs
+        // 24h) — deadline_at can only tighten, never loosen, so the global
+        // budget must still fire at 24h.
+        let deadline_at = "2026-08-31T00:00:00Z";
+        let now = DateTime::parse_from_rfc3339("2026-08-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            resolve_deadline_hit(created, Some(deadline_at), 24, now),
+            Some(DeadlineHit::WallClock)
+        );
+    }
+
+    #[test]
+    fn resolve_deadline_hit_unparseable_deadline_at_degrades_to_wall_clock_only() {
+        let created = "2026-08-01T00:00:00Z";
+        let now = DateTime::parse_from_rfc3339("2026-08-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Garbage deadline_at must never panic and must never block the
+        // wall-clock half of the check (fail-open on the deadline only).
+        assert_eq!(
+            resolve_deadline_hit(created, Some("not-a-timestamp"), 24, now),
+            Some(DeadlineHit::WallClock)
+        );
+    }
+
+    #[test]
+    fn resolve_deadline_hit_unparseable_created_at_with_valid_task_deadline() {
+        let now = DateTime::parse_from_rfc3339("2026-08-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // created_at itself unparseable (legacy/corrupt row) but deadline_at
+        // is valid and past ⇒ the task-level deadline still fires.
+        assert_eq!(
+            resolve_deadline_hit("garbage", Some("2026-08-02T00:00:00Z"), 24, now),
+            Some(DeadlineHit::TaskDeadline)
+        );
+    }
+
     #[tokio::test]
     async fn candidate_selection_enqueues_only_assigned_goal_tasks() {
         let dir = tempfile::tempdir().unwrap();
@@ -2146,6 +2399,93 @@ mod tests {
         assert_eq!(got.judge_feedback.as_deref(), Some("goal-loop deadline"));
         // No work message enqueued — the deadline guard fired before dispatch.
         assert!(queue.pending_messages(10).await.unwrap().is_empty());
+    }
+
+    /// G3: a task-level `deadline_at` in the past escalates even though the
+    /// global wall-clock budget has not been reached, with a distinct
+    /// escalation reason so a human sees WHY (design §6 G3).
+    #[tokio::test]
+    async fn task_deadline_escalates_before_wall_clock_with_distinct_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        // Created 1h ago (wall-clock budget is 24h — nowhere near tripping),
+        // but the assign form's own deadline already lapsed.
+        let mut t = goal_task("g1", "alice");
+        t.created_at = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        t.deadline_at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
+        store.insert_task(&t).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "needs_human");
+        assert_eq!(got.judge_feedback.as_deref(), Some("時限已到未通過驗收"));
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+    }
+
+    /// G3: a task-level `deadline_at` set in the FUTURE (looser than the
+    /// global wall clock, or simply not yet reached) must not escalate —
+    /// only actually-past deadlines fire.
+    #[tokio::test]
+    async fn task_deadline_in_the_future_does_not_escalate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        let mut t = goal_task("g1", "alice");
+        t.deadline_at = Some((Utc::now() + chrono::Duration::hours(10)).to_rfc3339());
+        store.insert_task(&t).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_ne!(got.status, "needs_human");
+        assert!(!queue.pending_messages(10).await.unwrap().is_empty());
+    }
+
+    /// G2: every dispatch carries the risk boundary section, programmatically
+    /// — a task with no explicit `risk_boundary` gets the built-in baseline
+    /// text (no `config.toml [goal_defaults]` present in the test cwd, so
+    /// `baseline_boundary` fails open to `DEFAULT_BASELINE_BOUNDARY`), never
+    /// silently omitted.
+    #[tokio::test]
+    async fn dispatch_always_injects_risk_boundary_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].payload.contains("## 本目標風險邊界"));
+        assert!(pending[0].payload.contains("遵循當地法規"));
+        assert!(pending[0].payload.contains("驗收判官退回"));
+    }
+
+    /// G2: an explicit per-task `risk_boundary` overrides the baseline text
+    /// in the injected section.
+    #[tokio::test]
+    async fn dispatch_injects_explicit_task_risk_boundary_over_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut t = goal_task("g1", "alice");
+        t.risk_boundary = Some("不得動用生產資料庫寫入權限".to_string());
+        store.insert_task(&t).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        let pending = queue.pending_messages(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].payload.contains("不得動用生產資料庫寫入權限"));
+        assert!(
+            !pending[0].payload.contains("遵循當地法規"),
+            "explicit risk_boundary replaces, not appends to, the baseline"
+        );
     }
 
     #[tokio::test]

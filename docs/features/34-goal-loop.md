@@ -16,7 +16,7 @@ The goal loop (v1.37) turns one-shot Q&A into "give a goal → agent loops to co
 
 This creates a `goal_mode` task on the Task Board, stamped with the source channel and chat so progress pushes back to the conversation that started it. Omit the `||` part and the goal description itself becomes the acceptance baseline; an optional third `outcome:<spec>` segment adds a machine-checkable output contract (JSON Schema subset or workdir file globs) that runs deterministically, at zero LLM cost, *before* the judge — structurally deficient output bounces straight back to revision without spending a judge call.
 
-The whole feature is opt-in: nothing runs unless `config.toml` has `[dispatch] enabled = true`.
+The dispatch engine behind this is **on by default since v1.59** (it idles at a periodic SQLite poll until a goal task exists; the acceptance judge only spends an LLM call when a goal actually reaches review). To opt out, set `config.toml [dispatch] enabled = false` — or flip the「派工引擎」switch in Settings → Automation, which hot-applies without a restart.
 
 ## The Driver
 

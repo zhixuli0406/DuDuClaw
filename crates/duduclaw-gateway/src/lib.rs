@@ -316,3 +316,7 @@ pub mod goal_notify;
 pub mod eval_runner;
 // ── Read-once "rules/model changed" FYI marker for the channel reply path ──
 pub mod pending_agent_notice;
+// ── Belief loop × goal contract, gap 2 (design-market-belief-loop-2026-08.md
+//        §3 「自主研究」) — per-agent nightly self-study goal creation when
+//        today produced a belief miss ──
+pub mod self_study;

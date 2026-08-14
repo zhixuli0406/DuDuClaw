@@ -839,6 +839,27 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "admin",
         "task",
     ),
+    // ── Market Belief Loop (design-market-belief-loop-2026-08.md) ─────────
+    // Unmapped in `tool_requires_scope` (same C2 fail-closed default as the
+    // task-board family above), so scope is "admin" here too.
+    (
+        "belief_submit",
+        "Record a structured belief about an external subject",
+        "admin",
+        "prediction",
+    ),
+    (
+        "belief_settle",
+        "Settle a belief against a realized outcome",
+        "admin",
+        "prediction",
+    ),
+    (
+        "belief_stats",
+        "Read the agent's own belief calibration track record",
+        "admin",
+        "prediction",
+    ),
     (
         "activity_list",
         "List recent Activity Feed events",
