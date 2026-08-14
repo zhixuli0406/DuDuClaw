@@ -44,6 +44,99 @@ pub fn push_log(level: &str, target: &str, message: &str) {
     }
 }
 
+/// Install the full gateway tracing stack: env filter (`RUST_LOG` →
+/// `config.toml [general] log_level` → `"warn"`), stderr fmt layer,
+/// daily-rolling file layer under `<home>/logs/`, the WebSocket
+/// [`BroadcastLayer`], and the optional OTel bridge.
+///
+/// The open CLI installs an equivalent stack in `duduclaw-cli::entry_point`
+/// (with CLI-specific stdout hygiene notes); this shared entry exists for
+/// embedders that boot `start_gateway` directly. The `duduclaw-pro` binary
+/// shipped with a stub that installed NOTHING — every `info!`/`warn!` in the
+/// gateway was silently dropped, which kept the 2026-08 experiment
+/// container's scheduler death invisible (`docker logs` empty, dashboard log
+/// stream empty, file log absent). Any gateway embedder MUST call this (or
+/// install its own subscriber) before `start_gateway`.
+///
+/// Best-effort and idempotent: an unwritable log dir degrades to stderr-only,
+/// and a second call (or a subscriber installed elsewhere) is a no-op via
+/// `try_init`.
+pub fn init_tracing_stack(home_dir: &std::path::Path) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // Persistent file log — same fallible builder as the CLI (2026-07-28
+    // incident: `rolling::daily` panics on an unwritable dir).
+    let log_dir = home_dir.join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_writer = match tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("gateway.log")
+        .build(&log_dir)
+    {
+        Ok(appender) => {
+            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+            // Process-lifetime writer: leak the guard so it never flushes and
+            // closes the file early (mirrors the CLI).
+            std::mem::forget(guard);
+            Some(non_blocking)
+        }
+        Err(e) => {
+            eprintln!("[duduclaw] file log disabled ({e}) — continuing with stderr logging only");
+            None
+        }
+    };
+
+    // Three-tier level resolution: RUST_LOG → config.toml → "warn".
+    let config_level = std::fs::read_to_string(home_dir.join("config.toml"))
+        .ok()
+        .and_then(|c| c.parse::<toml::Table>().ok())
+        .and_then(|t| {
+            t.get("general")?
+                .as_table()?
+                .get("log_level")?
+                .as_str()
+                .map(str::to_string)
+        });
+    let (env_filter, level_source) = match std::env::var("RUST_LOG") {
+        Ok(spec) => (
+            tracing_subscriber::EnvFilter::try_new(&spec)
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            format!("RUST_LOG={spec}"),
+        ),
+        Err(_) => match config_level {
+            Some(level) => (
+                tracing_subscriber::EnvFilter::try_new(&level)
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                format!("config.toml [general] log_level={level}"),
+            ),
+            None => (
+                tracing_subscriber::EnvFilter::new("warn"),
+                "default=warn".to_string(),
+            ),
+        },
+    };
+    eprintln!("[duduclaw] effective log level: {level_source}");
+
+    // OTel must init before `subscriber_layer()` (the bridge needs the
+    // installed provider). Guard is process-lifetime here, so leak it.
+    if let Some(guard) = crate::otel::init(home_dir) {
+        std::mem::forget(guard);
+    }
+    let file_layer = file_writer.map(|w| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(w)
+    });
+    let _ = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(file_layer)
+        .with(BroadcastLayer)
+        .with(crate::otel::subscriber_layer())
+        .try_init();
+}
+
 /// A `tracing_subscriber::Layer` that captures events and pushes them as
 /// JSON lines to the broadcast channel.
 pub struct BroadcastLayer;

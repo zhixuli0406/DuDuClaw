@@ -31,6 +31,14 @@ use crate::registry::{AgentRegistry, LoadedAgent};
 
 // ── Public types ──────────────────────────────────────────────
 
+/// Wall-clock unix seconds of the scheduler loop's most recent wake-up
+/// (0 = the loop has not started yet). Written on every 30s tick and read by
+/// the gateway `/healthz` staleness probe — unlike `HeartbeatStatus.last_run`
+/// (last time an *agent* actually fired, `None` forever when all heartbeats
+/// are disabled), this distinguishes "nothing due" from "scheduler dead".
+pub static LAST_TICK_UNIX: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
 /// Snapshot of one agent's heartbeat state, for monitoring / RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatStatus {
@@ -328,6 +336,7 @@ impl HeartbeatScheduler {
     /// Syncs from registry every 5 minutes to pick up config changes.
     pub async fn run(self: Arc<Self>) {
         self.running.store(true, Ordering::SeqCst);
+        LAST_TICK_UNIX.store(Utc::now().timestamp(), Ordering::Relaxed);
         self.sync_from_registry().await;
         info!("Heartbeat scheduler started");
 
@@ -336,6 +345,7 @@ impl HeartbeatScheduler {
             // Wait before first check (give bots time to start)
             time::sleep(Duration::from_secs(30)).await;
             tick += 1;
+            LAST_TICK_UNIX.store(Utc::now().timestamp(), Ordering::Relaxed);
 
             // Re-sync from registry every 5 minutes (10 * 30s)
             if tick.is_multiple_of(10) {
