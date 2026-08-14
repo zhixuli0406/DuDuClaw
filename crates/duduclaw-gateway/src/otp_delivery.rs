@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 
 use crate::channel_sender::{create_sender, ChannelTarget};
-use crate::config_crypto::read_encrypted_config_field;
+use crate::config_crypto::channel_dm_token_candidates;
 
 /// Sends an already-composed OTP message to a channel DM. Fail-closed: a
 /// missing token or a send error is an `Err` — the caller must never fall
@@ -38,9 +38,14 @@ pub(crate) fn token_field(channel: &str) -> Option<&'static str> {
     }
 }
 
-/// Production deliverer: resolves the global channel bot token from
-/// `~/.duduclaw/config.toml` (encrypted-field + secret-reference aware) at send
-/// time and dispatches through the shared channel-sender factory.
+/// Production deliverer: resolves every candidate bot token — global
+/// `[channels]` first, then per-agent `[channels.<channel>]` (encrypted-field
+/// + secret-reference aware) — at send time and tries each through the shared
+/// channel-sender factory until one delivery succeeds. The per-agent fallback
+/// exists because a deployment whose only bot is agent-scoped must still be
+/// able to DM login codes (2026-08-13 outage: global token cleared when the
+/// Telegram channel moved onto the agent, OTP silently died while the bot
+/// itself stayed online).
 pub struct ConfigOtpDeliverer {
     home_dir: PathBuf,
     http: reqwest::Client,
@@ -57,20 +62,31 @@ impl OtpDeliverer for ConfigOtpDeliverer {
     async fn deliver(&self, channel: &str, chat_id: &str, text: &str) -> Result<(), String> {
         let field = token_field(channel)
             .ok_or_else(|| format!("channel {channel} does not support OTP delivery"))?;
-        let token = read_encrypted_config_field(&self.home_dir, "channels", field)
-            .await
-            .ok_or_else(|| format!("channels.{field} not configured"))?;
+        let candidates = channel_dm_token_candidates(&self.home_dir, channel).await;
+        if candidates.is_empty() {
+            return Err(format!(
+                "channels.{field} not configured (no global or agent-level {channel} bot token)"
+            ));
+        }
 
-        let target = ChannelTarget {
-            channel_type: channel.to_string(),
-            chat_id: chat_id.to_string(),
-            token,
-            extra_id: None,
-        };
-        create_sender(&target, self.http.clone())
-            .send_text(text)
-            .await
-            .map_err(|e| format!("otp delivery failed: {e}"))
+        // Try each candidate until one delivery succeeds. On Telegram only the
+        // bot the user has actually talked to can DM them, and we don't record
+        // which bot that is at bind time — trying in deterministic order is
+        // the robust resolution. Fail-closed: all-candidates-failed is an Err.
+        let mut last_err = String::new();
+        for token in candidates {
+            let target = ChannelTarget {
+                channel_type: channel.to_string(),
+                chat_id: chat_id.to_string(),
+                token,
+                extra_id: None,
+            };
+            match create_sender(&target, self.http.clone()).send_text(text).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = format!("otp delivery failed: {e}"),
+            }
+        }
+        Err(last_err)
     }
 }
 
@@ -119,5 +135,18 @@ mod tests {
     async fn mock_failure_propagates() {
         let mock = MockDeliverer { fail: true, ..Default::default() };
         assert!(mock.deliver("telegram", "tg-123", "x").await.is_err());
+    }
+
+    /// Fail-closed when neither the global config nor any agent carries a
+    /// token — and the error must say so (it lands in the audit log the
+    /// operator reads during an outage).
+    #[tokio::test]
+    async fn no_tokens_anywhere_is_a_configured_error() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[channels]\n").unwrap();
+        let d = ConfigOtpDeliverer::new(home.path().to_path_buf(), reqwest::Client::new());
+        let err = d.deliver("telegram", "tg-123", "code").await.unwrap_err();
+        assert!(err.contains("not configured"), "got: {err}");
+        assert!(err.contains("agent-level"), "got: {err}");
     }
 }

@@ -26,7 +26,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::autopilot_store::{AutopilotHistoryRow, AutopilotRuleRow, AutopilotStore};
-use crate::config_crypto::read_encrypted_config_field;
 use crate::message_queue::{MessageQueue, MessageStatus, QueueMessage};
 use crate::task_store::{ActivityRow, TaskStore};
 
@@ -1333,8 +1332,18 @@ impl AutopilotEngine {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "notify.text required".to_string())?;
         let text = with_perception_banner(banner, render_template(text_template, fields));
-        let token = resolve_channel_token(&self.home_dir, channel).await?;
-        send_channel_text(channel, chat_id, &token, &text).await
+        let candidates = resolve_channel_tokens(&self.home_dir, channel).await?;
+        // Global token first, then per-agent (same fallback the login-OTP
+        // deliverer uses) — try each until one send succeeds so an
+        // agent-scoped-bot deployment can still notify.
+        let mut last_err = String::new();
+        for token in &candidates {
+            match send_channel_text(channel, chat_id, token, &text).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
     }
 
     /// P2-2 `proactive_notify`: route a *system-initiated* notification through
@@ -1767,7 +1776,7 @@ fn is_safe_skill_name(name: &str) -> bool {
 
 // ─── Channel send helpers ───────────────────────────────────
 
-async fn resolve_channel_token(home_dir: &Path, channel: &str) -> Result<String, String> {
+async fn resolve_channel_tokens(home_dir: &Path, channel: &str) -> Result<Vec<String>, String> {
     let field = match channel {
         "telegram" => "telegram_bot_token",
         "line" => "line_channel_token",
@@ -1775,9 +1784,13 @@ async fn resolve_channel_token(home_dir: &Path, channel: &str) -> Result<String,
         "slack" => "slack_bot_token",
         other => return Err(format!("unsupported notify.channel: {other}")),
     };
-    read_encrypted_config_field(home_dir, "channels", field)
-        .await
-        .ok_or_else(|| format!("channels.{field} not configured"))
+    let candidates = crate::config_crypto::channel_dm_token_candidates(home_dir, channel).await;
+    if candidates.is_empty() {
+        return Err(format!(
+            "channels.{field} not configured (no global or agent-level {channel} bot token)"
+        ));
+    }
+    Ok(candidates)
 }
 
 /// Lazily-initialized shared HTTP client for autopilot notify actions.

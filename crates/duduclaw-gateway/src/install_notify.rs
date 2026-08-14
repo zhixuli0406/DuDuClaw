@@ -194,19 +194,26 @@ pub async fn notify_install_approvers(home_dir: &Path, db: &UserDb, req: &Instal
             }
         };
         for ident in channels {
-            let Some(token) = global_channel_token(home_dir, &ident.channel).await else {
+            let candidates =
+                crate::config_crypto::channel_dm_token_candidates(home_dir, &ident.channel).await;
+            if candidates.is_empty() {
                 info!(channel = %ident.channel, "install-notify: no bot token configured; skipping");
                 continue;
-            };
-            crate::decision_notify::deliver(
-                home_dir,
-                &http,
-                &ident.channel,
-                &token,
-                &ident.channel_user_id,
-                &card,
-            )
-            .await;
+            }
+            for token in &candidates {
+                if crate::decision_notify::deliver(
+                    home_dir,
+                    &http,
+                    &ident.channel,
+                    token,
+                    &ident.channel_user_id,
+                    &card,
+                )
+                .await
+                {
+                    break;
+                }
+            }
         }
     }
 }
@@ -242,24 +249,33 @@ async fn send_plain_text(
     chat_id: &str,
     text: &str,
 ) {
-    let Some(token) = global_channel_token(home_dir, channel).await else {
+    let candidates = crate::config_crypto::channel_dm_token_candidates(home_dir, channel).await;
+    if candidates.is_empty() {
         info!(channel = %channel, "install-notify: no bot token configured; skipping");
         return;
-    };
-    if !crate::goal_notify::send_plain_text(home_dir, http, channel, &token, chat_id, text).await {
+    }
+    let mut sent = false;
+    for token in &candidates {
+        if crate::goal_notify::send_plain_text(home_dir, http, channel, token, chat_id, text).await {
+            sent = true;
+            break;
+        }
+    }
+    if !sent {
         warn!(channel = %channel, "install-notify: send failed");
     }
 }
 
-/// Read the global bot token for a channel, using the same channel → config
-/// field mapping as OTP delivery (`telegram_bot_token`, `line_channel_token`,
-/// `discord_bot_token`, `slack_bot_token`). A naive `{channel}_bot_token`
-/// would silently miss LINE (whose field is `line_channel_token`).
+/// First candidate DM token for a channel — global `[channels]` first, then
+/// per-agent (`config_crypto::channel_dm_token_candidates`). Used by the
+/// card-collapse resolvers, which need one deterministic token to edit the
+/// already-delivered cards with; the delivery paths above instead try every
+/// candidate until a send succeeds.
 async fn global_channel_token(home_dir: &Path, channel: &str) -> Option<String> {
-    let field = crate::otp_delivery::token_field(channel)?;
-    crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field)
+    crate::config_crypto::channel_dm_token_candidates(home_dir, channel)
         .await
-        .filter(|t| !t.is_empty())
+        .into_iter()
+        .next()
 }
 
 /// Handle an install-approval action from a channel.

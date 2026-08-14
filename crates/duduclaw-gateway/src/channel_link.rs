@@ -305,11 +305,12 @@ fn telegram_username_cache() -> &'static TokioMutex<Option<(Option<String>, Inst
     CACHE.get_or_init(|| TokioMutex::new(None))
 }
 
-/// Resolve (and cache) the shared Telegram bot's `@username` from
-/// `config.toml`'s encrypted `channels.telegram_bot_token`. `None` when
-/// unconfigured or unreachable — cached too (for the same TTL), so a
-/// missing/offline bot costs at most one `getMe` attempt per cache window
-/// instead of one per list call.
+/// Resolve (and cache) the deployment Telegram bot's `@username` — the global
+/// `channels.telegram_bot_token` first, falling back to the first per-agent
+/// token (a deployment whose bot is agent-scoped has an empty global field
+/// but a perfectly linkable bot). `None` when unconfigured or unreachable —
+/// cached too (for the same TTL), so a missing/offline bot costs at most one
+/// `getMe` attempt per cache window instead of one per list call.
 pub async fn cached_telegram_bot_username(home_dir: &Path) -> Option<String> {
     let cache = telegram_username_cache();
     {
@@ -320,9 +321,10 @@ pub async fn cached_telegram_bot_username(home_dir: &Path) -> Option<String> {
             }
         }
     }
-    let token = crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "telegram_bot_token")
+    let token = crate::config_crypto::channel_dm_token_candidates(home_dir, "telegram")
         .await
-        .filter(|t| !t.is_empty());
+        .into_iter()
+        .next();
     let username = match token {
         Some(t) => crate::handlers::fetch_telegram_bot_username(&t).await,
         None => None,
