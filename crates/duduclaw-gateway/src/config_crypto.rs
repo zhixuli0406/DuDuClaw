@@ -437,6 +437,111 @@ pub fn resolve_agent_channel_token_via_reports_to(
     None
 }
 
+/// Every bot token that could DM a user on `channel` in this deployment:
+/// the global `[channels]` token first, then each agent's own
+/// `[channels.<channel>] bot_token(_enc)`, deduplicated, agents visited in
+/// sorted-id order so the result is deterministic.
+///
+/// ## Why this exists (2026-08-13 login-OTP outage)
+///
+/// User-level flows — login OTP, install sign-off DMs, autopilot notify —
+/// have no agent context, so they historically read only the global token.
+/// A deployment whose Telegram bot is agent-scoped (`agent.toml
+/// [channels.telegram]`, global `[channels] telegram_bot_token = ""`) kept a
+/// perfectly working bot while every one of those flows failed with "not
+/// configured". The agent bot is not merely a fallback there: on Telegram a
+/// bot can only DM users who have started a chat with it, and the agent bot
+/// is exactly the one the user has talked to. Callers should try each
+/// candidate in order until one send succeeds.
+pub async fn channel_dm_token_candidates(home_dir: &Path, channel: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(field) = crate::otp_delivery::token_field(channel) {
+        if let Some(tok) = read_encrypted_config_field(home_dir, "channels", field).await {
+            if !tok.is_empty() {
+                out.push(tok);
+            }
+        }
+    }
+    let agents_dir = home_dir.join("agents");
+    let mut ids: Vec<String> = match std::fs::read_dir(&agents_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    ids.sort();
+    for id in ids {
+        if let Some(tok) = read_agent_channel_token(home_dir, &id, channel) {
+            if !tok.is_empty() && !out.contains(&tok) {
+                out.push(tok);
+            }
+        }
+    }
+    out
+}
+
+/// DM token candidate resolution (2026-08-13 login-OTP outage regression).
+#[cfg(test)]
+mod dm_token_candidate_tests {
+    use super::*;
+
+    fn write(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_first_then_agents_sorted_and_deduped() {
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join("config.toml"),
+            "[channels]\ntelegram_bot_token = \"global-tok\"\n",
+        );
+        write(
+            &home.path().join("agents/zeta/agent.toml"),
+            "[channels.telegram]\nbot_token = \"agent-z\"\n",
+        );
+        write(
+            &home.path().join("agents/alpha/agent.toml"),
+            "[channels.telegram]\nbot_token = \"agent-a\"\n",
+        );
+        // Duplicate of the global token on another agent must not repeat.
+        write(
+            &home.path().join("agents/mid/agent.toml"),
+            "[channels.telegram]\nbot_token = \"global-tok\"\n",
+        );
+        let got = channel_dm_token_candidates(home.path(), "telegram").await;
+        assert_eq!(got, vec!["global-tok", "agent-a", "agent-z"]);
+    }
+
+    /// The outage shape: global field explicitly emptied (channel moved onto
+    /// an agent) — the agent token must still be found.
+    #[tokio::test]
+    async fn empty_global_falls_back_to_agent_token() {
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join("config.toml"),
+            "[channels]\ntelegram_bot_token = \"\"\ntelegram_bot_token_enc = \"\"\n",
+        );
+        write(
+            &home.path().join("agents/trader-lead/agent.toml"),
+            "[channels.telegram]\nbot_token = \"agent-tok\"\n",
+        );
+        let got = channel_dm_token_candidates(home.path(), "telegram").await;
+        assert_eq!(got, vec!["agent-tok"]);
+    }
+
+    #[tokio::test]
+    async fn no_tokens_anywhere_is_empty() {
+        let home = tempfile::tempdir().unwrap();
+        write(&home.path().join("config.toml"), "[channels]\n");
+        let got = channel_dm_token_candidates(home.path(), "telegram").await;
+        assert!(got.is_empty());
+    }
+}
+
 /// WP12 — Telegram token shape: repair, validation, and the config round-trip.
 #[cfg(test)]
 mod telegram_token_tests {
