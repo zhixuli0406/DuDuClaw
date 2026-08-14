@@ -1,6 +1,6 @@
 {
   "name": "duduclaw",
-  "version": "1.57.0",
+  "version": "1.58.0",
   "mcpName": "io.github.zhixuli0406/duduclaw",
   "description": "Open-source AI Agent platform unifying Claude / Codex / Gemini CLIs. Multi-LLM routing, 200+ MCP tools, 9+ messaging channels. Rust + Python.",
   "license": "Apache-2.0",
@@ -42,10 +42,10 @@
     "postinstall": "node scripts/install.js"
   },
   "optionalDependencies": {
-    "@duduclaw/darwin-arm64": "1.57.0",
-    "@duduclaw/darwin-x64": "1.57.0",
-    "@duduclaw/linux-x64": "1.57.0",
-    "@duduclaw/linux-arm64": "1.57.0",
-    "@duduclaw/win32-x64": "1.57.0"
+    "@duduclaw/darwin-arm64": "1.58.0",
+    "@duduclaw/darwin-x64": "1.58.0",
+    "@duduclaw/linux-x64": "1.58.0",
+    "@duduclaw/linux-arm64": "1.58.0",
+    "@duduclaw/win32-x64": "1.58.0"
   }
 }
