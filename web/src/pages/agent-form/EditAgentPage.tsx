@@ -13,7 +13,9 @@ import {
   type ContractConfig,
   type RuntimeProvider,
   type AgentOdooOverride,
+  type ChannelStatus,
 } from '@/lib/api';
+import { AddChannelDialog } from '@/components/channels/AddChannelDialog';
 import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { ChipEditor } from '@/components/shared/ChipEditor';
@@ -41,6 +43,10 @@ import {
   Settings2,
   ChevronRight,
   ArrowRight,
+  Plus,
+  Pencil,
+  TestTube,
+  Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
@@ -370,6 +376,54 @@ export function EditAgentPage() {
   // ODO — per-agent Odoo override form (write-only)
   const [odoo, setOdoo] = useState<OdooFormState>(DEFAULT_ODOO_FORM);
   const [odooDirty, setOdooDirty] = useState(false);
+
+  // ── Channels (2026-08-13 unification) ──
+  // The 整合 tab no longer keeps its own raw token fields — it shows this
+  // agent's channels from the same `channels.status` source the 管理→通道
+  // page reads, and adds/edits through the shared AddChannelDialog
+  // (`channels.add`, which hot-starts the bot; the raw agents.update token
+  // path never did). Global/webhook channels stay on the management page.
+  const [agentChannels, setAgentChannels] = useState<ReadonlyArray<ChannelStatus>>([]);
+  const [showAddChannel, setShowAddChannel] = useState(false);
+  const [editChannelTarget, setEditChannelTarget] = useState<string | null>(null);
+  const [removeChannelTarget, setRemoveChannelTarget] = useState<string | null>(null);
+  const [removingChannel, setRemovingChannel] = useState(false);
+  const fetchAgentChannels = useCallback(async () => {
+    if (!id) return;
+    try {
+      const result = await api.channels.status();
+      setAgentChannels((result?.channels ?? []).filter((ch) => ch.name.endsWith(`:${id}`)));
+    } catch {
+      // Non-fatal: the section renders its empty-state hint; the management
+      // page is the place to debug a broken channels backend.
+      setAgentChannels([]);
+    }
+  }, [id]);
+  useEffect(() => { void fetchAgentChannels(); }, [fetchAgentChannels]);
+  const testAgentChannel = useCallback(async (name: string) => {
+    try {
+      const result = await api.channels.test(name);
+      // Same honesty rule as ChannelsPage: `sent` is the only real success;
+      // `credential_only` must not render green.
+      if (result.sent) toast.success(result.detail);
+      else toast.error(result.detail);
+    } catch {
+      toast.error(intl.formatMessage({ id: 'channels.testFailed' }));
+    }
+  }, [intl]);
+  const removeAgentChannel = useCallback(async (name: string) => {
+    setRemovingChannel(true);
+    try {
+      await api.channels.remove(name);
+      toast.success(intl.formatMessage({ id: 'channels.removed' }, { type: name }));
+      setRemoveChannelTarget(null);
+      await fetchAgentChannels();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'channels.removeFailed' }, { error: String(e) }));
+    } finally {
+      setRemovingChannel(false);
+    }
+  }, [intl, fetchAgentChannels]);
 
   // Advanced — G.8 scattered fields (write-only); account_pool prefilled from inspect.
   const [adv, setAdv] = useState<typeof DEFAULT_ADVANCED>(DEFAULT_ADVANCED);
@@ -1318,23 +1372,78 @@ export function EditAgentPage() {
             </SettingsCard>
           </SettingsSection>
 
-          <SettingsSection title={t('agents.edit.group.integration')} description={t('agents.edit.channelsDesc')}>
-            <SettingsCard>
-              <RowText label="Discord Bot Token" type="password" autoComplete="off" value={form.discord_bot_token ?? ''} placeholder="MTIzNDU2Nzg5..." onChange={(v) => updateField('discord_bot_token', v)} />
-              <RowText label="Telegram Bot Token" type="password" autoComplete="off" value={form.telegram_bot_token ?? ''} placeholder="123456:ABC-DEF..." onChange={(v) => updateField('telegram_bot_token', v)} />
-              <RowText label="LINE Channel Token" type="password" autoComplete="off" value={form.line_channel_token ?? ''} onChange={(v) => updateField('line_channel_token', v)} />
-              <RowText label="LINE Channel Secret" type="password" autoComplete="off" value={form.line_channel_secret ?? ''} onChange={(v) => updateField('line_channel_secret', v)} />
-              <RowText label="Slack App Token" type="password" autoComplete="off" value={form.slack_app_token ?? ''} placeholder="xapp-1-..." onChange={(v) => updateField('slack_app_token', v)} />
-              <RowText label="Slack Bot Token" type="password" autoComplete="off" value={form.slack_bot_token ?? ''} placeholder="xoxb-..." onChange={(v) => updateField('slack_bot_token', v)} />
-              <RowText label="WhatsApp Access Token" type="password" autoComplete="off" value={form.whatsapp_access_token ?? ''} onChange={(v) => updateField('whatsapp_access_token', v)} />
-              <RowText label="WhatsApp Verify Token" value={form.whatsapp_verify_token ?? ''} onChange={(v) => updateField('whatsapp_verify_token', v)} />
-              <RowText label="WhatsApp Phone Number ID" value={form.whatsapp_phone_number_id ?? ''} onChange={(v) => updateField('whatsapp_phone_number_id', v)} />
-              <RowText label="WhatsApp App Secret" type="password" autoComplete="off" value={form.whatsapp_app_secret ?? ''} onChange={(v) => updateField('whatsapp_app_secret', v)} />
-              <RowText label="Feishu App ID" type="password" autoComplete="off" value={form.feishu_app_id ?? ''} onChange={(v) => updateField('feishu_app_id', v)} />
-              <RowText label="Feishu App Secret" type="password" autoComplete="off" value={form.feishu_app_secret ?? ''} onChange={(v) => updateField('feishu_app_secret', v)} />
-              <RowText label="Feishu Verification Token" type="password" autoComplete="off" value={form.feishu_verification_token ?? ''} onChange={(v) => updateField('feishu_verification_token', v)} />
-            </SettingsCard>
+          <SettingsSection title={t('agents.edit.group.integration')} description={t('agents.edit.channels.unified.desc')}>
+            {agentChannels.length === 0 ? (
+              <p className="rounded-md bg-secondary px-3 py-2 text-sm text-muted-foreground">
+                {t('agents.edit.channels.empty')}
+              </p>
+            ) : (
+              <SettingsCard>
+                {agentChannels.map((ch) => (
+                  <div key={ch.name} className="flex items-center justify-between gap-3 px-1 py-2.5">
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      <span
+                        className={cn(
+                          'inline-block size-2 shrink-0 rounded-full',
+                          ch.connected ? 'bg-success' : 'bg-destructive',
+                        )}
+                      />
+                      <span className="truncate text-sm font-medium capitalize">{ch.name.split(':')[0]}</span>
+                      {ch.error && <span className="truncate text-xs text-destructive">{ch.error}</span>}
+                    </div>
+                    <div className="flex shrink-0 gap-1">
+                      <Button variant="ghost" size="sm" onClick={() => void testAgentChannel(ch.name)}>
+                        <TestTube className="size-3.5" />
+                        <span className="hidden sm:inline">{t('channels.test')}</span>
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => setEditChannelTarget(ch.name)}>
+                        <Pencil className="size-3.5" />
+                        <span className="hidden sm:inline">{t('common.edit')}</span>
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => setRemoveChannelTarget(ch.name)}>
+                        <Trash2 className="size-3.5" />
+                        <span className="hidden sm:inline">{t('channels.remove')}</span>
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </SettingsCard>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => setShowAddChannel(true)}>
+                <Plus className="size-3.5" />
+                {t('agents.edit.channels.add')}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => navigate('/channels')}>
+                {t('agents.edit.channels.manageAll')}
+                <ArrowRight className="size-3.5" />
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">{t('agents.edit.channels.globalHint')}</p>
           </SettingsSection>
+
+          <AddChannelDialog
+            open={showAddChannel}
+            onClose={() => setShowAddChannel(false)}
+            onCreated={() => void fetchAgentChannels()}
+            lockedAgent={id}
+          />
+          <AddChannelDialog
+            open={editChannelTarget !== null}
+            onClose={() => setEditChannelTarget(null)}
+            onCreated={() => void fetchAgentChannels()}
+            fixedType={editChannelTarget ?? undefined}
+            lockedAgent={id}
+          />
+          <ConfirmDialog
+            open={removeChannelTarget !== null}
+            onClose={() => setRemoveChannelTarget(null)}
+            onConfirm={() => { if (removeChannelTarget) void removeAgentChannel(removeChannelTarget); }}
+            title={intl.formatMessage({ id: 'channels.remove.confirmTitle' })}
+            message={removeChannelTarget ? intl.formatMessage({ id: 'channels.confirmRemove' }, { type: removeChannelTarget }) : ''}
+            confirmLabel={intl.formatMessage({ id: 'channels.remove' })}
+            busy={removingChannel}
+          />
         </SettingsTab>
 
         {/* ── 一般 ─────────────────────────────────────────── */}
