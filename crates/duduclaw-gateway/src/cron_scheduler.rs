@@ -72,6 +72,14 @@ const MAX_CONCURRENT_CRON: usize = 4;
 /// to the shared SQLite DB).
 const TICK_INTERVAL_SECS: u64 = 30;
 
+/// Wall-clock unix seconds of the scheduler loop's most recent wake-up
+/// (0 = the loop has not started yet). Written on every tick and read by the
+/// `/healthz` staleness probe, so a silently-dead scheduler flips the
+/// container unhealthy instead of staying "Up (healthy)" forever while every
+/// cron task is missed (2026-08 LWM incident,
+/// docs/todo/TODO-cron-scheduler-sleep-drift.md).
+pub static LAST_TICK_UNIX: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 /// In-memory representation with parsed schedule and last-run tracking.
 struct LiveTask {
     task: CronTaskRow,
@@ -215,6 +223,8 @@ impl CronScheduler {
             warn!("cron JSONL migration failed: {e}");
         }
 
+        LAST_TICK_UNIX.store(Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed);
+        info!("cron scheduler loop started ({TICK_INTERVAL_SECS}s tick)");
         self.reload().await;
 
         loop {
@@ -225,6 +235,7 @@ impl CronScheduler {
                     info!("cron scheduler hot-reload signal received");
                 }
             }
+            LAST_TICK_UNIX.store(Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed);
 
             self.reload().await;
 

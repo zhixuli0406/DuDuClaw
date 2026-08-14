@@ -86,7 +86,15 @@ impl GoogleChatCreds {
                 .unwrap_or("https://oauth2.googleapis.com/token")
                 .to_string(),
             token: RwLock::new((String::new(), std::time::Instant::now())),
-            http: reqwest::Client::new(),
+            // 30s request timeout like every other channel client. A bare
+            // `Client::new()` has NO request timeout, and `get_token()` is
+            // awaited directly on the gateway boot path — an unresponsive
+            // oauth2.googleapis.com would stall the whole boot sequence
+            // (heartbeat/cron/tick never start) with zero diagnostics.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
         })
     }
 
