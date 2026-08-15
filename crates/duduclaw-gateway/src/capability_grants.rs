@@ -365,46 +365,30 @@ impl CapabilityGrantStore {
 /// returns an empty set. The deny is enforced at the grant check; a malformed
 /// toml must NOT make every tool look scoped and brick the agent. Mirrors the
 /// `approval_required_tools` fail-safe.
+/// Reads through the shared typed parse point ([`duduclaw_core::agent_toml`])
+/// since the R2 schema unification — `[capabilities]` used to straddle both
+/// schemas, with `computer_use`/`allowed_tools`/… typed and this key read
+/// straight off the file. The fail-safe-empty behavior below is unchanged:
+/// a missing file, a missing key, a wrong-typed value, and unparseable TOML
+/// all still yield an empty set.
 pub fn scoped_tools(agent_dir: &Path) -> HashSet<String> {
-    let path = agent_dir.join("agent.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return HashSet::new();
-    };
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?path, error = %e, "malformed agent.toml — scoped_tools defaults to empty (fail-safe)");
-            return HashSet::new();
-        }
-    };
-    value
-        .get("capabilities")
-        .and_then(|c| c.get("scoped_tools"))
-        .and_then(|t| t.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    duduclaw_core::agent_toml::load(agent_dir)
+        .capabilities
+        .scoped_tools
+        .into_iter()
+        .collect()
 }
 
 /// Parse `agent.toml [capabilities] grant_ttl_secs`. Absent / malformed / a
 /// non-positive value all fall back to [`DEFAULT_GRANT_TTL_SECS`].
 pub fn grant_ttl_secs(agent_dir: &Path) -> i64 {
-    let path = agent_dir.join("agent.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return DEFAULT_GRANT_TTL_SECS;
-    };
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(_) => return DEFAULT_GRANT_TTL_SECS,
-    };
-    value
-        .get("capabilities")
-        .and_then(|c| c.get("grant_ttl_secs"))
-        .and_then(|t| t.as_integer())
+    // The `> 0` filter stays here rather than moving into the schema: a
+    // written `grant_ttl_secs = 0` has always meant "fall back to the
+    // default", not "expire immediately", and collapsing that into a serde
+    // default would quietly change which of the two a zero means.
+    duduclaw_core::agent_toml::load(agent_dir)
+        .capabilities
+        .grant_ttl_secs
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_GRANT_TTL_SECS)
 }
@@ -739,6 +723,107 @@ mod tests {
         std::fs::write(dir3.join("agent.toml"), "[capabilities]\n").unwrap();
         assert_eq!(grant_ttl_secs(&dir3), DEFAULT_GRANT_TTL_SECS);
         std::fs::remove_dir_all(&dir3).unwrap();
+    }
+
+    // ── R5 default-direction locks ──────────────────────────
+    //
+    // These two keys moved from a raw `toml::Value` walk onto the typed
+    // `[capabilities]` section. Their missing-key directions are deliberately
+    // NOT the fail-closed choice a fresh design would pick, and that is
+    // historical fact preserved on purpose:
+    //
+    //   scoped_tools  absent ⇒ EMPTY (nothing is scoped) — fail-*safe*, not
+    //                 fail-closed. Defaulting to "everything is scoped" would
+    //                 brick an agent whose config failed to parse, which is a
+    //                 worse outcome than the grant check it bypasses; the real
+    //                 deny lives at the grant check itself.
+    //   grant_ttl_secs absent OR 0 OR negative ⇒ DEFAULT_GRANT_TTL_SECS. Zero
+    //                 means "use the default", never "expire immediately".
+    //
+    // Changing either direction must be a deliberate decision with its own
+    // reasoning — not a side effect of touching this file.
+
+    #[test]
+    fn default_direction_scoped_tools_absent_is_empty_not_everything() {
+        for body in [
+            "",                                    // no sections at all
+            "[agent]\nname = \"a\"\n",             // no [capabilities]
+            "[capabilities]\n",                    // section, no key
+            "[capabilities]\nscoped_tools = []\n", // explicit empty
+        ] {
+            let dir = tmp_agent_dir();
+            std::fs::write(dir.join("agent.toml"), body).unwrap();
+            assert!(
+                scoped_tools(&dir).is_empty(),
+                "scoped_tools must stay fail-safe empty for: {body:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        // Missing file entirely — same direction.
+        let dir = tmp_agent_dir();
+        assert!(scoped_tools(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_direction_scoped_tools_survives_wrong_types() {
+        // The old `.and_then(|t| t.as_array())` ignored a non-array, and
+        // `filter_map(as_str)` dropped non-string elements without failing.
+        // Typing the section must not turn either into a hard parse error.
+        let dir = tmp_agent_dir();
+        std::fs::write(
+            dir.join("agent.toml"),
+            "[capabilities]\nscoped_tools = \"send_message\"\n",
+        )
+        .unwrap();
+        assert!(scoped_tools(&dir).is_empty(), "non-array ⇒ empty, not error");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let dir2 = tmp_agent_dir();
+        std::fs::write(
+            dir2.join("agent.toml"),
+            "[capabilities]\nscoped_tools = [\"a\", 7, \"b\"]\n",
+        )
+        .unwrap();
+        let set = scoped_tools(&dir2);
+        assert_eq!(set.len(), 2, "non-string elements are dropped, not fatal");
+        assert!(set.contains("a") && set.contains("b"));
+        std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    #[test]
+    fn default_direction_grant_ttl_zero_means_default_not_immediate() {
+        for (body, why) in [
+            ("[capabilities]\ngrant_ttl_secs = 0\n", "0 ⇒ default"),
+            ("[capabilities]\ngrant_ttl_secs = -5\n", "negative ⇒ default"),
+            ("[capabilities]\ngrant_ttl_secs = \"600\"\n", "wrong type ⇒ default"),
+            ("", "absent ⇒ default"),
+        ] {
+            let dir = tmp_agent_dir();
+            std::fs::write(dir.join("agent.toml"), body).unwrap();
+            assert_eq!(grant_ttl_secs(&dir), DEFAULT_GRANT_TTL_SECS, "{why}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn default_direction_capability_keys_coexist_with_typed_siblings() {
+        // The point of the unification: `scoped_tools` (formerly untyped) and
+        // `os_native` (already typed) now come out of ONE parse of ONE
+        // section. Before, a file could satisfy one reader and not the other.
+        let dir = tmp_agent_dir();
+        std::fs::write(
+            dir.join("agent.toml"),
+            "[capabilities]\nos_native = true\nscoped_tools = [\"x\"]\ngrant_ttl_secs = 90\n",
+        )
+        .unwrap();
+        let sections = duduclaw_core::agent_toml::load(&dir);
+        assert!(sections.capabilities.os_native);
+        assert_eq!(sections.capabilities.scoped_tools, vec!["x".to_string()]);
+        assert!(scoped_tools(&dir).contains("x"));
+        assert_eq!(grant_ttl_secs(&dir), 90);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // ── spawn-layer disallow synthesis ──────────────────────
