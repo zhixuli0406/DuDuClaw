@@ -12,6 +12,9 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use duduclaw_core::error::{DuDuClawError, Result};
+// WP-4G: one source of truth for the entry-count and compression-ratio
+// ceilings, shared with the inbound-document gate.
+use duduclaw_gateway::document_limits as doclimits;
 
 /// Hard ceiling on total uncompressed bytes and on the archive file itself.
 pub const MAX_UNPACK_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
@@ -42,7 +45,22 @@ pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<()> {
         .canonicalize()
         .map_err(|e| io_err(format!("canonicalize {} 失敗: {e}", dest_root.display())))?;
 
+    // WP-4G ceiling 1 — entry count. A million micro-entries exhausts inodes
+    // and file handles long before the byte budget notices anything.
+    if archive.len() as u64 > doclimits::DEFAULT_MAX_ENTRIES as u64 {
+        return Err(cfg_err(format!(
+            "壓縮檔條目數 {} 超過上限 {}（疑似耗盡型攻擊）",
+            archive.len(),
+            doclimits::DEFAULT_MAX_ENTRIES
+        )));
+    }
+
+    // `total` tracks the sizes the archive *declares*; `written` tracks what
+    // actually lands on disk. Both are needed: a declared-size bomb is caught
+    // early and cheaply by `total`, and a lying header (declares tiny, inflates
+    // huge) is caught only by `written` — the gap WP-4G closed here.
     let mut total: u64 = 0;
+    let mut written: u64 = 0;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -94,12 +112,39 @@ pub fn extract_to(zip_path: &Path, dest_root: &Path) -> Result<()> {
             )));
         }
 
+        // WP-4G ceiling 2 — per-entry compression ratio. Entries compressing to
+        // under the floor are exempt (a tiny stub legitimately compresses hard);
+        // the total budget is what bounds a swarm of those.
+        let packed = entry.compressed_size();
+        if packed >= doclimits::RATIO_MIN_COMPRESSED_BYTES {
+            let ratio = entry.size() / packed;
+            if ratio > doclimits::DEFAULT_MAX_COMPRESSION_RATIO as u64 {
+                return Err(cfg_err(format!(
+                    "條目 {} 壓縮比 {ratio}:1 超過上限 {}:1（疑似 zip bomb）",
+                    rel.display(),
+                    doclimits::DEFAULT_MAX_COMPRESSION_RATIO
+                )));
+            }
+        }
+
         let mut out = std::fs::File::create(&out_path)
             .map_err(|e| io_err(format!("寫入 {} 失敗: {e}", out_path.display())))?;
-        // Size-limited copy — never trust the header `size()` alone.
-        let mut limited = entry.by_ref().take(MAX_UNPACK_BYTES);
-        std::io::copy(&mut limited, &mut out)
+        // WP-4G ceiling 3 — size-limited copy against the *remaining* budget,
+        // not a fresh `MAX_UNPACK_BYTES` per entry. The old per-entry `take`
+        // let N entries with lying headers write N × 50 MB while `total` (which
+        // only ever saw the declared sizes) stayed at zero. Take one byte past
+        // the budget so an over-budget entry is *detected*, never silently
+        // truncated into a corrupt file.
+        let remaining = MAX_UNPACK_BYTES.saturating_sub(written);
+        let mut limited = entry.by_ref().take(remaining.saturating_add(1));
+        let n = std::io::copy(&mut limited, &mut out)
             .map_err(|e| io_err(format!("解壓 {} 失敗: {e}", rel.display())))?;
+        written = written.saturating_add(n);
+        if written > MAX_UNPACK_BYTES {
+            return Err(cfg_err(format!(
+                "解包實際輸出超過上限 {MAX_UNPACK_BYTES} bytes（zip 標頭宣告不實，疑似 zip bomb）"
+            )));
+        }
     }
 
     Ok(())
@@ -245,6 +290,34 @@ mod tests {
         );
         // The escaped file must NOT exist next to dest.
         assert!(!tmp.join("escaped.txt").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// WP-4G: a single hyper-compressible entry is refused on ratio, before
+    /// the 50 MB byte budget would ever notice it.
+    #[test]
+    fn high_compression_ratio_entry_is_rejected() {
+        let tmp = std::env::temp_dir().join(format!("dc-ratio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let zip_path = tmp.join("bomb.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("payload.bin", opts).unwrap();
+            zw.write_all(&vec![0u8; 4 * 1024 * 1024]).unwrap();
+            zw.finish().unwrap();
+        }
+        // The archive on disk stays tiny — that is the whole point of the attack.
+        assert!(std::fs::metadata(&zip_path).unwrap().len() < 64 * 1024);
+
+        let dest = tmp.join("dest");
+        let err = extract_to(&zip_path, &dest).unwrap_err();
+        assert!(
+            format!("{err}").contains("壓縮比"),
+            "expected a compression-ratio rejection, got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
