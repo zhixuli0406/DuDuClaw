@@ -214,154 +214,28 @@ fn parse_relative_duration(input: &str) -> Result<Duration, String> {
 
 // ── Channel send (shared utility) ───────────────────────────
 
-/// Resolve the `channel_sender::ChannelTarget` for a reminder delivery.
-///
-/// Mirrors `cron_scheduler.rs::deliver_cron_result`'s self-configuring-
-/// channel handling (WeCom/DingTalk/Google Chat/Teams read multi-field
-/// credentials straight from `home_dir` at send time — the sender ignores
-/// `ChannelTarget.token` for those four, so "is there a token" becomes "is
-/// the marker field set", same as `goal_notify::channel_token`'s BUG-1 fix).
-///
-/// WebChat is deliberately refused rather than routed through the generic
-/// factory: it is a session-scoped WebSocket connection with no persistent
-/// bot identity, and `channel_sender::create_sender`'s WebChat arm built
-/// without an `event_tx` silently no-ops `send_text` — a background
-/// scheduler with no live connection reference must not report that as a
-/// successful delivery.
-async fn resolve_channel_target(
-    home_dir: &Path,
-    channel: &str,
-    chat_id: &str,
-) -> Result<crate::channel_sender::ChannelTarget, String> {
-    use crate::channel_sender::{self, ChannelTarget};
-
-    if channel == "webchat" {
-        return Err(
-            "reminders cannot target webchat — no persistent session to deliver into".to_string(),
-        );
-    }
-
-    if channel_sender::sender_self_configures(channel) {
-        let marker = channel_sender::self_config_marker_field(channel)
-            .expect("self-configuring channel must declare a marker field");
-        let present =
-            crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
-                .await
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
-        if !present {
-            return Err(format!(
-                "channel {channel} is not configured (missing `{marker}` in config.toml [channels])"
-            ));
-        }
-        return Ok(ChannelTarget {
-            channel_type: channel.to_string(),
-            chat_id: chat_id.to_string(),
-            token: String::new(), // factory-built {channel} sender ignores this
-            extra_id: None,
-        });
-    }
-
-    if channel == "whatsapp" {
-        let token = crate::config_crypto::read_encrypted_config_field(
-            home_dir,
-            "channels",
-            "whatsapp_access_token",
-        )
-        .await
-        .unwrap_or_default();
-        let phone_id = crate::config_crypto::read_encrypted_config_field(
-            home_dir,
-            "channels",
-            "whatsapp_phone_number_id",
-        )
-        .await
-        .unwrap_or_default();
-        if token.is_empty() || phone_id.is_empty() {
-            return Err("whatsapp_access_token / whatsapp_phone_number_id not configured".to_string());
-        }
-        return Ok(ChannelTarget {
-            channel_type: channel.to_string(),
-            chat_id: chat_id.to_string(),
-            token,
-            extra_id: Some(phone_id),
-        });
-    }
-
-    if channel == "feishu" {
-        let app_id =
-            crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "feishu_app_id")
-                .await
-                .unwrap_or_default();
-        let app_secret = crate::config_crypto::read_encrypted_config_field(
-            home_dir,
-            "channels",
-            "feishu_app_secret",
-        )
-        .await
-        .unwrap_or_default();
-        if app_id.is_empty() || app_secret.is_empty() {
-            return Err("feishu_app_id / feishu_app_secret not configured".to_string());
-        }
-        // Feishu's messages API needs a short-lived tenant_access_token, not
-        // the raw app_id/app_secret — fetched fresh per reminder (reminders
-        // fire at most a handful of times a minute; no caching needed,
-        // mirrors dispatcher.rs's identical forward-path fetch).
-        let http = reqwest::Client::new();
-        let resp = http
-            .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
-            .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
-            .send()
-            .await
-            .map_err(|e| format!("feishu token: {e}"))?;
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("feishu token parse: {e}"))?;
-        let token = body
-            .get("tenant_access_token")
-            .and_then(|v| v.as_str())
-            .ok_or("feishu: no tenant_access_token in response")?
-            .to_string();
-        return Ok(ChannelTarget {
-            channel_type: channel.to_string(),
-            chat_id: chat_id.to_string(),
-            token,
-            extra_id: None,
-        });
-    }
-
-    // telegram / line / discord / slack — single `<channel>_bot_token`
-    // field, per `otp_delivery::token_field`'s canonical mapping.
-    if channel == "discord" && !is_valid_discord_chat_id(chat_id) {
-        return Err(format!("Invalid Discord channel ID: '{chat_id}' (must be numeric)"));
-    }
-    let field = crate::otp_delivery::token_field(channel)
-        .ok_or_else(|| format!("Unknown channel: {channel}"))?;
-    let token = crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field)
-        .await
-        .unwrap_or_default();
-    if token.is_empty() {
-        return Err(format!("{field} not configured"));
-    }
-    Ok(ChannelTarget {
-        channel_type: channel.to_string(),
-        chat_id: chat_id.to_string(),
-        token,
-        extra_id: None,
-    })
-}
+// `resolve_channel_target` and `is_valid_discord_chat_id` now live in
+// `channel_sender.rs` — the single shared resolution path also used by
+// `autopilot_engine`'s `notify` action and the MCP `send_message` tool
+// (previously three independent hardcoded channel whitelists, each missing
+// a different subset of the 10 bot-pushable channels). Re-exported here so
+// existing internal (`resolve_channel_target(...)` in this file's own
+// tests/`send_channel_message`) and external
+// (`duduclaw_gateway::reminder_scheduler::is_valid_discord_chat_id`) call
+// sites keep working unchanged.
+pub use crate::channel_sender::{is_valid_discord_chat_id, resolve_channel_target};
 
 /// Send a text message to a channel.  Reads tokens from `config.toml`.
 ///
-/// This is the shared implementation used by both the MCP `send_message`
-/// handler and the `ReminderScheduler`. Delegates to the unified
-/// `channel_sender::create_sender` factory (all 10 bot-pushable channels —
-/// see [`resolve_channel_target`]'s doc for the WebChat exception) instead
-/// of hand-rolling telegram/line/discord — the previous implementation
-/// rejected every other channel with "Unknown channel", silently dropping
-/// reminders for slack/whatsapp/feishu/googlechat/teams/wecom/dingtalk
-/// agents (same defect class as `goal_notify::channel_token`'s BUG-1).
+/// This is the shared implementation used by the MCP `send_message` handler,
+/// `autopilot_engine`'s `notify` action, and the `ReminderScheduler`.
+/// Delegates to the unified `channel_sender::create_sender` factory (all 10
+/// bot-pushable channels — see [`resolve_channel_target`]'s doc for the
+/// WebChat exception) instead of hand-rolling telegram/line/discord — the
+/// previous implementation rejected every other channel with "Unknown
+/// channel", silently dropping reminders for
+/// slack/whatsapp/feishu/googlechat/teams/wecom/dingtalk agents (same defect
+/// class as `goal_notify::channel_token`'s BUG-1).
 pub async fn send_channel_message(
     home_dir: &Path,
     http: &reqwest::Client,
@@ -374,11 +248,6 @@ pub async fn send_channel_message(
         .send_text(text)
         .await
         .map_err(|e| e.to_string())
-}
-
-/// Validate a Discord channel ID (must be numeric snowflake).
-pub fn is_valid_discord_chat_id(chat_id: &str) -> bool {
-    !chat_id.is_empty() && chat_id.chars().all(|c| c.is_ascii_digit())
 }
 
 // ── Config helpers (duplicated from mcp.rs to avoid circular deps) ──
