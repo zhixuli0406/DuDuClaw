@@ -236,8 +236,21 @@ Before merging a new tool:
 - [ ] Rate limiting for external API calls
 - [ ] SSRF protection for URL parameters (use `web_fetch` patterns)
 - [ ] Audit logging for sensitive operations
-- [ ] Respect `CapabilitiesConfig` (check `allowed_tools` / `denied_tools`)
 - [ ] Feature gate check if tool is Pro/Enterprise only
+
+`agent.toml [capabilities] allowed_tools` / `denied_tools` no longer need a
+per-tool check: every call — stdio, HTTP/SSE, and the openai-compat
+tool-loop's internal MCP client alike — is dispatched through the shared
+`McpDispatcher::dispatch_tool_call` choke point (`mcp_dispatch.rs`), which
+enforces the caller's `[capabilities]` allow/deny list against the tool's
+base name (an `mcp__<server>__` qualifier is stripped before matching, and
+`denied_tools` always wins over `allowed_tools`) before your handler is ever
+invoked. A new tool registered in `handle_tool_call()` is covered
+automatically. This closed a real gap: before this enforcement moved to the
+choke point, `allowed_tools` / `denied_tools` only reached the Claude CLI
+spawn's `--allowedTools` / `--disallowedTools` flags, so a caller that talked
+to the MCP server directly (bypassing the CLI spawn) was unrestricted by
+them.
 
 ## JSON-RPC Protocol Reference
 

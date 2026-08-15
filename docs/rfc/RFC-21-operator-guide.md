@@ -266,6 +266,13 @@ is_external = false
 Both gates must pass: the **API key scope** (system layer) AND the
 agent's **`allowed_actions`** (data-layer defence-in-depth).
 
+Editing `[mcp_keys]` — minting, rescoping, or deleting a key — takes effect
+on the **next MCP call**, no gateway restart required: the key registry
+watches `config.toml`'s mtime and reloads whenever it changes. A reload that
+itself fails (I/O error, malformed TOML) denies that call rather than
+falling back to the previous cached registry — a broken edit can only ever
+tighten access, never accidentally keep a revoked key alive.
+
 ### Verify
 
 ```text

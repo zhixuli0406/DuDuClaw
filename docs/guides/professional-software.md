@@ -81,6 +81,8 @@ allowed_tools = [
 
 一旦設了 `allowed_tools`，它就成為**唯一**的自動核准集合（allowlist 模式），沒列到的工具一律不放行——這對收窄攻擊面有利（例如刻意不列 `Bash`）。
 
+`allowed_tools`／`denied_tools` 現在有兩層獨立強制：上面說的 Claude CLI `-p` 子行程 allow-list 只管**這個 agent 用 CLI spawn 出去的呼叫**；MCP 分派總門（`McpDispatcher`）另外會對**任何直接對 MCP server 說話的呼叫**（stdio／HTTP／SSE，或非 Claude runtime 的 openai-compat tool-loop）再檢查一次同一份設定，精確比對工具基底名稱（自動剝除 `mcp__<server>__` 前綴）。兩層設定同一份、判定邏輯一致（`denied_tools` 恆贏），不需要為了涵蓋非 CLI 呼叫路徑另外設定第二份。
+
 ### `denied_tools`：硬擋 RCE 工具（求值必勝）
 
 `denied_tools` 在 `allowed_tools` 之後求值，永遠贏。Photoshop 的任意腳本工具用此硬擋：

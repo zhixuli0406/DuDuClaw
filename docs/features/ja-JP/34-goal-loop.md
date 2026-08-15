@@ -59,12 +59,15 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 | プロセス横断サーキットブレーカー(`dispatch_guard`) | 20ディスパッチ / 60 sスライディングウィンドウ | クールダウン拒否 |
 | 委任ホップ深度 | 5 | ディスパッチ拒否 |
 | ゲートウェイ再起動時の復活(`resume_on_restart`) | `pause`(**既定**)——開機時に全ての in-flight `goal_mode` タスクを`needs_human`へ転換(理由: `gateway_restart`) | `auto` の場合、再起動後もin-flightタスクはそのまま継続(この設定が導入される前の唯一の動作);`config.toml` またはダッシュボードの「設定→自動化」タブで切替可能(`system.update_config` は `"auto"`/`"pause"` のみ受理) |
+| 進捗未報告レポート(`progress_report_minutes`) | クレーム済みタスクが10分間沈黙(判定基準はActivity Feedのシグナルで、lease renewerが定期的に更新する`updated_at`ではない) | 「まだ実行中、進捗シグナルなし」の通知をActivity Feed＋送信元の会話へ1ラウンドにつき最大1回プッシュ——再ディスパッチ・エスカレーション・キャンセルは一切しない;`0`で無効化 |
+| ツール連打アドバイザリ(`tool_streak_advisory`) | 1ラウンド内で同一ツール・同一(マスク済み)引数を3／5／8回連続呼び出し | 段階的に強まるzh-TWのヒントを次ラウンドの`<state>`ブロックへ注入——LLMコストゼロ、あくまでアドバイザリで呼び出しをブロックも拒否もしない;停滞検出のstate hashからは除外 |
+| エフェメラルspawnアドミッション(`[dispatch] admission`) | 同時実行上限(`ephemeral_max_active`、デフォルト32)を超過 | `"queue"`(**既定**)——即座に拒否せず境界付きFIFOキューへ永続的に積む(キュー深度上限・チケットごとのTTL・すべて監査ログ);`"fail"`でH19以前の即時拒否に戻す |
 
 すべて`config.toml`の`[goal_loop]` / `[dispatch_guard]`で設定でき、セクションがなければ組み込みのデフォルトが使われます。
 
 ## needs_humanエスカレーション
 
-タスクが`needs_human`として保留されると、`goal_notify.rs`は4つのアクション——**retry / mark done / abort / take over**——付きの承認メッセージを送信元の会話へプッシュします(なければエージェントの`[proactive]`コントロールチャネルにフォールバック)。1メッセージの主要アクションは3つまでという上限があるため、retry/mark doneを主要層に残し、abort/take overは各プラットフォーム自身のセカンダリ表現に折りたたまれます:TelegramとDiscordは2段目のボタン行、Slackはネイティブの`overflow`メニュー。LINEには対応するセカンダリメニューの仕組みが一切ないため、この2つはクイックリプライから外され、代わりに本文中のプレーンテキストとダッシュボードへのリンクとして表示されます。他のボタン非対応チャネルはテキストフォールバック、ダッシュボードにはneeds_humanのボード列が表示されます。
+タスクが`needs_human`として保留されると、既存の自由記述`judge_feedback`に加えて、6値のクローズドな分類`pause_reason`——`no_progress`／`budget_exhausted`／`blocked_needs_decision`／`infra`／`restart`／`unknown`——がトリガー箇所で静的にスタンプされます(判定者/評価者の文面から逆算することは決してありません)。`/goals`ボードとタスク詳細では分類チップとして、チャネルの承認メッセージでは「種類」の1行として表示されます;未分類または導入前の既存タスクは安全側の既定値`unknown`として扱われます。`goal_notify.rs`は4つのアクション——**retry / mark done / abort / take over**——付きの承認メッセージを送信元の会話へプッシュします(なければエージェントの`[proactive]`コントロールチャネルにフォールバック)。1メッセージの主要アクションは3つまでという上限があるため、retry/mark doneを主要層に残し、abort/take overは各プラットフォーム自身のセカンダリ表現に折りたたまれます:TelegramとDiscordは2段目のボタン行、Slackはネイティブの`overflow`メニュー。LINEには対応するセカンダリメニューの仕組みが一切ないため、この2つはクイックリプライから外され、代わりに本文中のプレーンテキストとダッシュボードへのリンクとして表示されます。他のボタン非対応チャネルはテキストフォールバック、ダッシュボードにはneeds_humanのボード列が表示されます。
 
 **take over**はタスク認領(`claimed_by`)するだけで解決しません——タスクは`needs_human`のまま残るため、ドライバーのディスパッチ候補クエリがそもそもこの状態を見ないため、状態遷移なしでも自動リトライは既に止まっています。これがループ停止 + マーク + カード収束の第1層です。会話制御権全体の引き継ぎは[42-human-takeover.md](../42-human-takeover.md)の別機能です(日本語訳は未提供)。
 
