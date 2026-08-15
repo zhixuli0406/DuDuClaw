@@ -853,6 +853,23 @@ fn goal_usage_text() -> String {
         .to_string()
 }
 
+/// H9-W four-element goal guidance (harness-borrowings 2026-08 WP-D,
+/// borrowed from WorkBuddy's task-description framework). Appended to the
+/// `/goal` creation reply only when no explicit `||` acceptance criteria was
+/// given — the goal text became the acceptance basis by default, and this
+/// nudges the user toward a sharper contract next time. zh-TW, terminal-user
+/// friendly: no internal vocabulary (no "judge"/"MAV"/"baseline"/"column").
+fn four_element_guidance() -> String {
+    "\n\n💡 這次沒有另外指定驗收標準，之後想清楚這四件事會更好抓：\n\
+     • 目標：要達成什麼\n\
+     • 輸入：需要用到哪些資料或素材\n\
+     • 輸出格式：成果長什麼樣子（例如 Word／Excel／一段文字／一張圖）\n\
+     • 約束：風格、時限等限制，以及「怎樣才算完成」\n\
+     建議補 3-5 條具體、看得出結果的驗收標準（例如「報表含每月營收圖表」而非「做得好」），\
+     用 `/goal 描述 || 標準` 格式重新交付一次即可。"
+        .to_string()
+}
+
 async fn handle_goal(
     ctx: &ReplyContext,
     session_id: &str,
@@ -962,7 +979,14 @@ async fn handle_goal_create(
     );
     task.status = "todo".to_string();
     task.goal_mode = true;
-    task.acceptance_criteria = Some(criteria);
+    task.acceptance_criteria = Some(criteria.clone());
+    // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D): snapshot the
+    // acceptance criteria into an immutable baseline the SAME moment they're
+    // set. The judge reads this column (see `dispatch_engine.rs`'s
+    // `review_goal_tasks`), never the mutable `acceptance_criteria` field, so
+    // a later operator edit to the latter cannot retroactively change what the
+    // task is judged on.
+    task.acceptance_criteria_baseline = Some(criteria);
     // Goal contract v2 (design §6 G1/G3): same semantics as the dashboard
     // form — deadline computed at creation; boundary stored only when
     // explicitly given (baseline is applied at injection time instead).
@@ -1020,6 +1044,13 @@ async fn handle_goal_create(
         msg.push_str("\n🚧 已設定本目標風險邊界：每輪執行與驗收判官都會以它檢核。");
     } else {
         msg.push_str("\n🚧 未指定風險邊界，將套用基本款（法規／資安／風控／人審紅線）。");
+    }
+    // H9-W four-element guidance (harness-borrowings 2026-08 WP-D): the task
+    // is created either way (goal text doubles as the acceptance basis when
+    // no `||` criteria was given) — this only nudges toward a clearer
+    // contract on the NEXT `/goal`, it never blocks or delays this one.
+    if acceptance_criteria.is_none() {
+        msg.push_str(&four_element_guidance());
     }
     if !enabled {
         msg.push_str(
@@ -2369,5 +2400,136 @@ mod takeover_command_tests {
         for internal in ["takeover_state", "claimed_by", "session_id", "needs_human"] {
             assert!(!help.contains(internal), "leaked `{internal}`: {help}");
         }
+    }
+}
+
+/// H9-W / H9-G (harness-borrowings 2026-08 WP-D) — `/goal` four-element
+/// guidance and immutable acceptance-criteria baseline freeze.
+#[cfg(test)]
+mod goal_contract_tests {
+    use super::*;
+
+    fn test_ctx(home: &std::path::Path) -> ReplyContext {
+        let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
+            duduclaw_agent::AgentRegistry::new(home.join("agents")),
+        ));
+        let sessions = std::sync::Arc::new(
+            crate::session::SessionManager::new(&home.join("sessions.db")).unwrap(),
+        );
+        let status: crate::channel_reply::ChannelStatusMap =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        ReplyContext::new(registry, home.to_path_buf(), sessions, status, tx)
+    }
+
+    #[tokio::test]
+    async fn four_element_guidance_appears_when_no_explicit_criteria() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let msg = handle_goal_create(
+            &ctx,
+            "telegram:123:abc",
+            "agent-a",
+            "整理客戶資料成報表",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(msg.contains("目標："), "{msg}");
+        assert!(msg.contains("輸入："), "{msg}");
+        assert!(msg.contains("輸出格式："), "{msg}");
+        assert!(msg.contains("約束："), "{msg}");
+        assert!(msg.contains("3-5"), "{msg}");
+        // No internal vocabulary leaks into the user-facing reply.
+        for internal in ["acceptance_criteria", "baseline", "MAV", "judge", "column"] {
+            assert!(!msg.contains(internal), "leaked `{internal}`: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_guidance_when_explicit_criteria_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let msg = handle_goal_create(
+            &ctx,
+            "telegram:123:abc",
+            "agent-a",
+            "整理客戶資料成報表",
+            Some("含營收圖表並寄出"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !msg.contains("這次沒有另外指定驗收標準"),
+            "guidance must not appear when criteria was explicitly given: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_create_freezes_an_immutable_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let _msg = handle_goal_create(
+            &ctx,
+            "telegram:123:abc",
+            "agent-a",
+            "整理客戶資料成報表",
+            Some("含營收圖表並寄出"),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
+        let tasks = store
+            .list_tasks_filtered(None, Some("agent-a"), None, Some(true))
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        let task = &tasks[0];
+        assert_eq!(task.acceptance_criteria.as_deref(), Some("含營收圖表並寄出"));
+        assert_eq!(
+            task.acceptance_criteria_baseline.as_deref(),
+            Some("含營收圖表並寄出"),
+            "baseline must be frozen to the same value at creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_create_without_explicit_criteria_still_freezes_the_goal_text_as_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let _msg = handle_goal_create(
+            &ctx,
+            "telegram:123:abc",
+            "agent-b",
+            "整理客戶資料成報表",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
+        let tasks = store
+            .list_tasks_filtered(None, Some("agent-b"), None, Some(true))
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        let task = &tasks[0];
+        assert_eq!(
+            task.acceptance_criteria.as_deref(),
+            Some("整理客戶資料成報表")
+        );
+        assert_eq!(
+            task.acceptance_criteria_baseline.as_deref(),
+            Some("整理客戶資料成報表")
+        );
     }
 }
