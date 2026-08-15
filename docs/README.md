@@ -57,6 +57,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/44-working-state.md](features/44-working-state.md) | 工作狀態（Working State）— AI 員工跨喚醒的唯一權威狀態：鍵值化現行規則＋交接註記每次喚醒自動注入、變更必經工具＋理由＋取代鏈、CAS 並發保護、TTL 當日規則 |
 | [features/45-local-model-marketplace.md](features/45-local-model-marketplace.md) | 本地模型市集 — 依用途挑選＋硬體適配三態燈＋一鍵安裝；MoE 省顯存雙軌判定（turbo-fieldfare 路線）；五發布者白名單＋手動 repo 逃生口 |
 | [features/46-belief-loop.md](features/46-belief-loop.md) | 信念迴圈（Belief Loop）— agent 對外部世界的結構化信念記帳：belief_submit/settle/stats、確定性三向 Brier＋觀測交叉核對、校準統計與 tick 信念對照程式化注入、/foresight 信念與驗證分頁 |
+| [features/47-agent-mail.md](features/47-agent-mail.md) | 信箱（Agent Mail）— 逐 agent 非即時信箱：Gmail／drop folder 兩種入站傳輸、到達即觸發（預設關）、外發一律經 ApprovalBroker 人工確認絕不自動寄出、可疑信顯示但不觸發、mail_list/mail_read/mail_send 三個 MCP 工具 |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios (zh-TW) — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix (zh-TW) — sales-facing coverage table |
 
