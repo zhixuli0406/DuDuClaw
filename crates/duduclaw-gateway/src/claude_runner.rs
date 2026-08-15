@@ -663,6 +663,19 @@ async fn call_claude_for_agent_impl(
         }),
         None => tasks_suffix,
     };
+    // WP-6F (agent presets P1): the agent-visible preset line — placed
+    // BEFORE working_state (design §3.2: "preset 行接在它前面即可"). A preset
+    // switch can silently change model/tools/evolution posture; without this
+    // the agent keeps reasoning from its old self-image and misattributes
+    // capability-driven failures to itself.
+    let tasks_suffix =
+        match crate::preset_prompt::build_preset_section(home_dir, agent_id) {
+            Some(ps) => Some(match tasks_suffix {
+                Some(t) => format!("{t}\n\n{ps}"),
+                None => ps,
+            }),
+            None => tasks_suffix,
+        };
     // Cross-wake working state: the agent's authoritative key-value posture
     // + handoff note (working_state.rs, D3 ghost-memory fix). Placed BEFORE
     // the recent-actions feed — standing authority first, action evidence
@@ -1755,15 +1768,27 @@ async fn run_llm_provider(
                 &prov_sensitive,
                 prompt,
             );
-            duduclaw_llm::run_tool_loop_with_provenance(
-                &provider,
+            // WP-6E: Code Mode Phase 0 measurement gate
+            // (`commercial/docs/DESIGN-code-mode-2026-08.md` §8.1) — beneficiary
+            // #2 of the design's §2 list. Pure observation layered over
+            // `RecordingProvider`; forwards everything verbatim.
+            let probe = crate::tool_loop_probe::ToolLoopProbe::new(&provider);
+            let loop_result = duduclaw_llm::run_tool_loop_with_provenance(
+                &probe,
                 req,
                 &guarded,
                 duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
                 prov_cfg,
             )
-            .await
-            .map(|out| {
+            .await;
+            // Before the error is mapped away: a partially-run turn is still a
+            // truthful measurement.
+            probe.finish_and_record(
+                agent_id,
+                crate::tool_loop_probe::ProbePath::DirectApi,
+                model,
+            );
+            loop_result.map(|out| {
                 if !out.provenance_flags.is_empty() {
                     tracing::warn!(
                         agent = %agent_id,

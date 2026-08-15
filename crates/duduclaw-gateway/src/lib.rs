@@ -159,6 +159,8 @@ pub mod install_notify;
 pub mod install_requests;
 pub mod mcp_oauth;
 pub mod mcp_scan;
+pub mod mail;
+pub mod mail_worker;
 pub mod media;
 pub mod model_capabilities;
 pub mod office_docs;
@@ -277,6 +279,8 @@ pub mod night_llm;
 // evidence block) and `prediction::task_observe` (A3 observation layer).
 pub mod recent_actions;
 pub mod tool_activity;
+/// Code Mode Phase 0 measurement gate (WP-H2 / WP-6E) — pure observation.
+pub mod tool_loop_probe;
 
 // WP-F (P2-c): durable per-task file-change evidence behind the dashboard's
 // needs_human 「變更」tab — persisted from the same native-tool collector,
@@ -300,6 +304,12 @@ pub mod artifact_gate;
 //    only via explicit MCP tools with CAS supersession (ghost-memory fix,
 //    A-TMA arXiv:2607.01935 / Letta memory-block pattern) ──
 pub mod working_state;
+
+// ── WP-6F (agent presets P1): the agent-visible "目前職務組合" dynamic-tail
+//    line — same injection pipeline as `working_state`, one section earlier
+//    (design §3.2 trace ③: a preset switch must be visible to the agent
+//    itself, not just to the dashboard/audit log) ──
+pub mod preset_prompt;
 
 // ── Local-model marketplace backend (`localmodels.*` RPCs): HF intent
 //    sweep + hardware fit via duduclaw-inference::model_registry::market,
