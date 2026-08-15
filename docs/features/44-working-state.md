@@ -43,7 +43,7 @@
 |------|------|
 | `working_state_set` | 設定/更新一個 key（`reason` 必填；可選 `ttl_hours` 讓當日規則自動到期；可選 `expected_value` 做並發保護——與現值不符即拒寫並回報現值） |
 | `working_state_clear` | 作廢一個 key（`reason` 必填） |
-| `working_state_handoff` | 覆寫「交接註記」——下一次喚醒的自己需要知道的事 |
+| `working_state_handoff` | 覆寫「交接註記」——下一次喚醒的自己需要知道的事（純文字，或見下方「結構化交接」） |
 | `working_state_get` | 讀全量：所有 key（含已到期的，會標記）、交接註記、近期取代歷史 |
 
 設計要點：
@@ -59,6 +59,30 @@
   狀態表膨脹成第二座筆記山就失去意義了。
 - **成本**：注入放在提示詞快取分層之後的動態尾巴，不打斷快取前綴；
   區塊上限 3KB；空狀態零注入。
+
+## 結構化交接（Ralph 式，可選）
+
+純文字交接（只給 `note`）完全不受影響：照舊靜默收合空白、超過約 1200 字元靜默截斷。
+
+想要更硬的交接，`working_state_handoff` 可以額外帶四個欄位——`status`（`continue`／`complete`／`blocked`）＋`next_steps`／`evidence`／`blocker`。一旦帶了其中任何一個，就必須同時帶 `status`，並且會依 `status` 強制校驗，不合規則直接拒絕整次呼叫：
+
+| status | 要求 |
+|--------|------|
+| `continue` | `next_steps` 必填非空；不能有 `blocker` |
+| `complete` | `evidence` 必填非空；不能有 `blocker` 或 `next_steps` |
+| `blocked` | `blocker` 必填非空 |
+
+背後的道理：「已完成」不能是自稱的——沒有具體證據就不准標 `complete`；還在做的交接也不能沒有下一步，否則下一次喚醒的自己等於白紙一張。
+
+**超長整筆拒絕、絕不截斷**：`note`＋`next_steps`＋`evidence`＋`blocker` 合計位元組數（CJK 安全計算）超過 `config.toml [memory] working_state_handoff_max_bytes`（預設 16384）會直接回錯誤，交接完全不會寫入。這點特意跟純文字模式的「靜默截斷」不同——結構化交接一旦被截斷，可能剛好削掉那段讓交接可信的證據或下一步，卻仍然看起來像一份完整、可信的交接，這比直接拒絕還危險。
+
+帶了 `status` 之後，注入到下一次喚醒的區塊也會多帶這些欄位：
+
+```
+交接註記（08-13 09:36 留）：盤中每 3 分巡檢中；帳務已核對。（狀態=continue；下一步：核對完後回報總額；證據：帳務表已比對三次）
+```
+
+上限可調（見下方「設定」的 `working_state_handoff_max_bytes`）。
 
 ## 與其他機制的分工
 
@@ -76,7 +100,8 @@
 
 ```toml
 [memory]
-working_state_enabled = true   # 預設開；只關「注入」，工具與檔案不受影響
+working_state_enabled = true             # 預設開；只關「注入」，工具與檔案不受影響
+working_state_handoff_max_bytes = 16384  # 結構化交接（見上方「結構化交接」）的總位元組上限，CJK 安全計算；純文字交接不受此限
 ```
 
 狀態檔在 `<員工目錄>/state/working_state.json`，取代歷史在同目錄
