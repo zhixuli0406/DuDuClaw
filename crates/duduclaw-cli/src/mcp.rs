@@ -1951,10 +1951,17 @@ fn jsonrpc_response(id: &Value, result: Value) -> Value {
 }
 
 /// Validate agent ID is safe for filesystem paths (no traversal).
+///
+/// WP-4I (2026-08): this hand-rolled copy had drifted from its two siblings
+/// in `duduclaw-gateway::handlers` and `duduclaw-cli::lib` — it was missing
+/// the leading/trailing-hyphen guard they both had (a leading hyphen risks
+/// being misread as a flag by any downstream command that forwards the id as
+/// a bare positional argument). Now delegates to
+/// [`duduclaw_core::is_valid_new_agent_id`], the single authoritative copy;
+/// this closes the drift (behavior change: an id like `-agent` or `agent-`,
+/// previously accepted here, is now rejected — see the WP-4I report).
 fn is_valid_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    duduclaw_core::is_valid_new_agent_id(id)
 }
 
 /// Count existing agents (directories under `<home>/agents/` that carry an
@@ -13348,7 +13355,37 @@ async fn handle_office_script(args: &Value, home_dir: &Path, default_agent: &str
         Some(_) => return tool_error("'args' must be a JSON array of strings."),
     };
 
-    // 5. run the script (cwd = agent dir so relative paths stay in the sandbox).
+    // 5. WP-4G: resource ceilings on every INPUT document before a parser runs.
+    //
+    // `.docx` / `.xlsx` / `.pptx` are zip containers, and the file an agent
+    // points at here is routinely something a stranger sent into a channel.
+    // The skill scripts hand those bytes to python-docx / openpyxl /
+    // python-pptx, none of which bound decompression or XML nesting: a zip
+    // bomb takes the host's RAM with it, and a deeply-nested part crashes a
+    // recursive-descent parser. Gate before spawning; fail-closed.
+    //
+    // Only *existing* files are inspected, so `--out` targets (not yet
+    // created) and bare flags (`--format`) fall through untouched, and a
+    // non-zip input (`.csv`, `.pdf`, legacy `.doc`) is out of scope by design.
+    let limits = duduclaw_gateway::document_limits::DocumentLimits::from_home(home_dir);
+    for arg in &script_args {
+        let p = Path::new(arg);
+        let abs = if p.is_absolute() { p.to_path_buf() } else { agent_dir.join(p) };
+        if !abs.is_file() {
+            continue;
+        }
+        if let Err(v) = duduclaw_gateway::document_limits::guard_document_path(&abs, &limits) {
+            let shown = abs.file_name().and_then(|n| n.to_str()).unwrap_or("input");
+            tracing::warn!(
+                file = %shown,
+                violation = v.kind(),
+                "office_script: refused — input document exceeds resource limits"
+            );
+            return tool_error(&v.user_message(shown));
+        }
+    }
+
+    // 6. run the script (cwd = agent dir so relative paths stay in the sandbox).
     run_office_script(&script_path, &script_args, &agent_dir).await
 }
 
