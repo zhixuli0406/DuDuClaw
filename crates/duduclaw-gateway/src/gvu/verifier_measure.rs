@@ -384,31 +384,31 @@ impl NoiseBand {
     /// Missing file / malformed TOML / absent table → [`Default`]. Every key
     /// is individually optional. `cases` is clamped to
     /// [`NOISE_BAND_CASES_MAX`].
+    ///
+    /// Goes through the shared typed parse point
+    /// ([`duduclaw_core::agent_toml`]). The fields use `opt_float_strict`, so
+    /// an **integer literal is still ignored** (`cases = 1` keeps the default)
+    /// exactly as `as_float()` did — see
+    /// `default_direction_noise_band_ignores_integer_literal`. Clamping stays
+    /// here because it is a policy of the gate, not of the file format.
     pub fn from_agent_dir(agent_dir: &std::path::Path) -> Self {
         let mut band = Self::default();
-        let Ok(raw) = std::fs::read_to_string(agent_dir.join("agent.toml")) else {
-            return band;
-        };
-        let Ok(value) = raw.parse::<toml::Value>() else {
-            return band;
-        };
-        let Some(table) = value.get("evolution").and_then(|e| e.get("noise_band")) else {
-            return band;
-        };
-        let get = |k: &str| table.get(k).and_then(|v| v.as_float());
-        if let Some(v) = get("cases") {
+        let raw = duduclaw_core::agent_toml::load(agent_dir)
+            .evolution
+            .noise_band;
+        if let Some(v) = raw.cases {
             band.cases = v.clamp(0.0, NOISE_BAND_CASES_MAX);
         }
-        if let Some(v) = get("judge") {
+        if let Some(v) = raw.judge {
             band.judge = v.max(0.0);
         }
-        if let Some(v) = get("anti_sycophancy") {
+        if let Some(v) = raw.anti_sycophancy {
             band.anti_sycophancy = v.max(0.0);
         }
-        if let Some(v) = get("novelty") {
+        if let Some(v) = raw.novelty {
             band.novelty = v.max(0.0);
         }
-        if let Some(v) = get("relevance") {
+        if let Some(v) = raw.relevance {
             band.relevance = v.max(0.0);
         }
         band
@@ -621,6 +621,83 @@ pub fn anti_drift(verdict: &CommitVerdict, state: AntiDriftState) -> AntiDriftDe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── R5: `[evolution.noise_band]` direction, pinned ───────────────────
+    //
+    // absent / malformed / wrong-typed ⇒ the `Default` band. Each key is
+    // independently optional, and — the quirk worth pinning — the raw reader
+    // used `as_float()` ONLY, so an INTEGER literal (`cases = 1`) was
+    // silently ignored and kept the default. Widening it would loosen a
+    // commit gate as a side effect of a schema refactor, so the typed field
+    // uses `opt_float_strict`, not `opt_number_lossy`. Note `[evolution]
+    // aee_settle_hours` in the same section deliberately points the OTHER
+    // way — it does accept an integer.
+
+    fn band_dir(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn default_direction_noise_band_absent_or_unreadable_is_default() {
+        for body in [
+            "",
+            "[evolution]\n",
+            "[evolution.noise_band]\n",
+            "evolution = \"scalar\"\n",
+            "[evolution]\nnoise_band = \"scalar\"\n",
+            "not toml [[[",
+        ] {
+            let dir = band_dir(body);
+            assert_eq!(
+                NoiseBand::from_agent_dir(dir.path()),
+                NoiseBand::default(),
+                "for {body:?}"
+            );
+        }
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(NoiseBand::from_agent_dir(empty.path()), NoiseBand::default());
+    }
+
+    #[test]
+    fn default_direction_noise_band_ignores_integer_literal() {
+        // Historical quirk, preserved: `as_float()` returned None for an
+        // integer, so the default survived.
+        let dir = band_dir("[evolution.noise_band]\ncases = 1\njudge = 2\n");
+        let band = NoiseBand::from_agent_dir(dir.path());
+        assert_eq!(band, NoiseBand::default(), "integer literals stay ignored");
+
+        // A real float is honoured (and clamped).
+        let dir = band_dir(
+            "[evolution.noise_band]\ncases = 0.02\njudge = -1.0\nnovelty = 0.5\n",
+        );
+        let band = NoiseBand::from_agent_dir(dir.path());
+        assert_eq!(band.cases, 0.02);
+        assert_eq!(band.judge, 0.0, "negatives clamp to 0");
+        assert_eq!(band.novelty, 0.5);
+        assert_eq!(
+            band.relevance,
+            NoiseBand::default().relevance,
+            "unset keys keep their defaults"
+        );
+    }
+
+    #[test]
+    fn default_direction_noise_band_wrong_typed_key_keeps_the_default() {
+        let dir = band_dir("[evolution.noise_band]\ncases = \"0.05\"\njudge = true\n");
+        assert_eq!(NoiseBand::from_agent_dir(dir.path()), NoiseBand::default());
+    }
+
+    #[test]
+    fn default_direction_noise_band_cases_is_clamped_to_the_max() {
+        let dir = band_dir("[evolution.noise_band]\ncases = 99.0\n");
+        assert_eq!(
+            NoiseBand::from_agent_dir(dir.path()).cases,
+            NOISE_BAND_CASES_MAX
+        );
+    }
 
     fn vec_with(judge: Option<f64>, cases: &[(&str, f64)]) -> MeasureVector {
         MeasureVector {

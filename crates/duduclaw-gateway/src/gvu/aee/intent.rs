@@ -55,20 +55,16 @@ impl EvolutionStrategy {
     /// `warn!`s: a typo'd strategy silently behaving as `balanced` is exactly
     /// the class of "config typo, nobody notices for three months" defect
     /// that root cause R3 was.
+    ///
+    /// Goes through the shared typed parse point
+    /// ([`duduclaw_core::agent_toml`]); the key stays a raw `String` on the
+    /// typed section so this lenient mapping (and its `warn!`) keeps running
+    /// instead of a strict serde enum turning a typo into total agent loss.
     pub fn from_agent_dir(agent_dir: &Path) -> Self {
-        let Ok(raw) = std::fs::read_to_string(agent_dir.join("agent.toml")) else {
+        let Some(s) = duduclaw_core::agent_toml::load(agent_dir).evolution.strategy else {
             return Self::default();
         };
-        let Ok(value) = raw.parse::<toml::Value>() else {
-            return Self::default();
-        };
-        let Some(s) = value
-            .get("evolution")
-            .and_then(|e| e.get("strategy"))
-            .and_then(|v| v.as_str())
-        else {
-            return Self::default();
-        };
+        let s = s.as_str();
         match Self::parse(s) {
             Some(v) => v,
             None => {
@@ -294,6 +290,56 @@ fn degrade(mut intent: RoundIntent, material: RoundMaterial) -> IntentDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── R5: `[evolution] strategy` direction, pinned ─────────────────────
+    //
+    // absent / malformed / wrong-typed / unrecognised ⇒ Balanced. The value
+    // deliberately stays a raw String on the typed section: a strict serde
+    // enum would turn `strategy = "hardern"` into an `AgentConfig` parse
+    // error, and `AgentRegistry::load_agent` treats that as fatal — the agent
+    // would vanish from the registry over a typo. Here it warns and runs
+    // balanced.
+
+    #[test]
+    fn default_direction_strategy_falls_back_to_balanced_never_errors() {
+        for body in [
+            "",                                     // empty file
+            "[evolution]\n",                        // section, no key
+            "[evolution]\ngvu_enabled = true\n",    // sibling key only
+            "[evolution]\nstrategy = \"hardern\"\n", // typo ⇒ warn + balanced
+            "[evolution]\nstrategy = \"\"\n",       // blank
+            "[evolution]\nstrategy = 42\n",         // wrong type
+            "evolution = \"scalar\"\n",             // wrong-typed section
+            "not toml [[[",                         // malformed file
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+            assert_eq!(
+                EvolutionStrategy::from_agent_dir(dir.path()),
+                EvolutionStrategy::Balanced,
+                "for {body:?}"
+            );
+        }
+
+        // Missing file entirely — same direction.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            EvolutionStrategy::from_agent_dir(empty.path()),
+            EvolutionStrategy::Balanced
+        );
+
+        // A recognised value still reaches the engine.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[evolution]\nstrategy = \"repair_only\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            EvolutionStrategy::from_agent_dir(dir.path()),
+            EvolutionStrategy::RepairOnly
+        );
+    }
 
     fn rich() -> RoundMaterial {
         RoundMaterial { unresolved_mistakes: 1, low_streak_entries: 1, active_entries: 0 }

@@ -185,6 +185,199 @@ where
         .unwrap_or_default())
 }
 
+/// Deserialize an ordered `key -> string` table, dropping non-string values.
+///
+/// Reproduces `v.as_table()` followed by
+/// `for (k, raw) in tbl { let Some(raw) = raw.as_str() else { continue }; … }`:
+/// a missing or non-table value yields an empty vec, and a value of the wrong
+/// type inside the table is skipped rather than failing the parse.
+///
+/// The result is a `Vec` of pairs, not a map, because the callers this
+/// replaces build ordered pair lists (process env / HTTP headers). Order is
+/// [`BTreeMap`](std::collections::BTreeMap) key order, which is exactly what
+/// iterating a `toml::Table` gave (the `toml` crate's table is a `BTreeMap`
+/// unless its `preserve_order` feature is enabled, which this workspace does
+/// not enable) — so the order-sensitive "first unresolved credential wins the
+/// warning" behavior is unchanged.
+pub fn string_map<'de, D>(d: D) -> Result<Vec<(String, String)>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    type Raw = std::collections::BTreeMap<String, Lenient<String>>;
+    let raw: Option<Lenient<Raw>> = Option::deserialize(d)?;
+    Ok(raw
+        .and_then(Lenient::into_option)
+        .map(|m| {
+            m.into_iter()
+                .filter_map(|(k, v)| v.into_option().map(|v| (k, v)))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Three-state read of one key: absent, well-typed, or present-but-wrong-type.
+///
+/// [`opt`] collapses the first and the third into `None`, which is right for
+/// the many readers whose missing-key and wrong-type behavior coincide. A few
+/// readers **must** tell them apart:
+///
+/// * `budget::load_budget_limits` logs a loud `warn!` for a wrong-typed
+///   `[budget]` key ("a config typo must not silently disable a cost
+///   control") but stays silent for an absent one;
+/// * `mcp_external`'s `allowed_tools` / `denied_tools` are security-relevant:
+///   absent means "no filter", while present-but-wrong-type must **skip the
+///   whole server** — collapsing it to "no filter" would silently widen the
+///   exposed tool surface.
+///
+/// Folding either into a two-state `Option` would change behavior, so the
+/// distinction is carried in the type instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tri<T> {
+    /// The key was not present at all.
+    Absent,
+    /// The key was present and deserialized as `T`.
+    Value(T),
+    /// The key was present but held some other type; the value is discarded.
+    WrongType,
+}
+
+impl<T> Default for Tri<T> {
+    /// `Absent` — a hand-written impl rather than `#[derive(Default)]`, which
+    /// would add an unwanted `T: Default` bound.
+    fn default() -> Self {
+        Tri::Absent
+    }
+}
+
+impl<T> Tri<T> {
+    /// The well-typed value, if any. Both `Absent` and `WrongType` map to
+    /// `None` — i.e. exactly what [`opt`] would have produced.
+    pub fn value(self) -> Option<T> {
+        match self {
+            Tri::Value(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// True when the key was present but of the wrong type (the case callers
+    /// warn about).
+    pub fn is_wrong_type(&self) -> bool {
+        matches!(self, Tri::WrongType)
+    }
+}
+
+/// Deserialize a [`Tri`]. Use with `#[serde(default)]` on the containing
+/// struct so an absent key yields [`Tri::Absent`] without calling this.
+pub fn tri<'de, D, T>(d: D) -> Result<Tri<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(match Option::<Lenient<T>>::deserialize(d)? {
+        None => Tri::Absent,
+        Some(Lenient::Value(v)) => Tri::Value(v),
+        Some(Lenient::Other(_)) => Tri::WrongType,
+    })
+}
+
+/// Deserialize a [`Tri<Vec<String>>`](Tri) that keeps non-string elements'
+/// tolerance while still flagging a non-array value.
+///
+/// Reproduces `mcp_external::tool_list_field` exactly: absent ⇒ [`Tri::Absent`];
+/// an array ⇒ [`Tri::Value`] of only its string elements (a mixed array is
+/// filtered, NOT rejected — `str_array` used `filter_map`); anything else ⇒
+/// [`Tri::WrongType`], which the caller turns into a fail-closed skip.
+///
+/// A plain `tri::<Vec<String>>` would misclassify the mixed array as
+/// `WrongType` and skip a server that used to load.
+pub fn tri_string_vec<'de, D>(d: D) -> Result<Tri<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(
+        match Option::<Lenient<Vec<Lenient<String>>>>::deserialize(d)? {
+            None => Tri::Absent,
+            Some(Lenient::Value(items)) => {
+                Tri::Value(items.into_iter().filter_map(Lenient::into_option).collect())
+            }
+            Some(Lenient::Other(_)) => Tri::WrongType,
+        },
+    )
+}
+
+/// Deserialize a `Vec<T>`, replacing a wrong-typed **element** with
+/// `T::default()` and a wrong-typed whole value with an empty vec.
+///
+/// For arrays of tables read element-by-element with `entry.get(..)` chains: a
+/// non-table element made every lookup return `None`, which is precisely what
+/// an all-defaults `T` produces. Failing the parse instead would lose every
+/// well-formed sibling element.
+pub fn lenient_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    let raw: Option<Lenient<Vec<Lenient<T>>>> = Option::deserialize(d)?;
+    Ok(raw
+        .and_then(Lenient::into_option)
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|e| e.into_option().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// A TOML number that keeps its integer-vs-float identity.
+///
+/// The readers this serves treat the two differently — `budget` rounds a
+/// float but clamps an integer, and both branches are reachable from real
+/// configs (`monthly_limit_cents = 100.0` is a documented common typo). A
+/// plain `f64` would lose the distinction (and, above 2^53, precision), so
+/// the variants are preserved and the arithmetic stays in the accessor.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum TomlNumber {
+    /// Matched first, so an integer literal never lands in [`Self::Float`].
+    Int(i64),
+    Float(f64),
+}
+
+/// A TOML boolean that also accepts an integer, keeping the two apart.
+///
+/// `budget`'s `hard_stop` tolerates `hard_stop = 1` as a common mistake but
+/// `warn!`s about it, so "was a bool" and "was an int" must remain
+/// distinguishable at the accessor.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum TomlFlag {
+    /// Matched first, so a real bool never lands in [`Self::Int`].
+    Bool(bool),
+    Int(i64),
+}
+
+/// Deserialize `Option<f64>` accepting an integer literal too, widening it.
+///
+/// The counterpart of [`opt_float_strict`], for the readers that wrote
+/// `as_float().or_else(|| as_integer().map(|i| i as f64))` — i.e. those that
+/// deliberately DID accept `aee_settle_hours = 24`. Keeping both helpers (and
+/// naming which is which at each call site) is how the two opposite
+/// historical quirks stay pinned instead of quietly converging.
+pub fn opt_number_lossy<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(
+        Option::<Lenient<TomlNumber>>::deserialize(d)?
+            .and_then(Lenient::into_option)
+            .map(|n| match n {
+                TomlNumber::Int(i) => i as f64,
+                TomlNumber::Float(f) => f,
+            }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +512,116 @@ mod tests {
         // that is the path `ForkSection` actually takes.
         assert_eq!(money("[m]\namount = 2.5\n").amount, Some(2.5));
         assert_eq!(money("[m]\namount = 2\n").amount, None);
+    }
+
+    // ── Tri / number / map helpers ───────────────────────────────────────
+
+    #[derive(Debug, Deserialize, Default, PartialEq)]
+    #[serde(default)]
+    struct TriDoc {
+        #[serde(deserialize_with = "tri")]
+        num: Tri<TomlNumber>,
+        #[serde(deserialize_with = "tri")]
+        flag: Tri<TomlFlag>,
+        #[serde(deserialize_with = "tri")]
+        list: Tri<Vec<String>>,
+    }
+
+    fn tri_doc(s: &str) -> TriDoc {
+        toml::from_str(s).expect("lenient schema must never fail to parse")
+    }
+
+    #[test]
+    fn tri_separates_absent_from_wrong_type() {
+        let absent = tri_doc("");
+        assert_eq!(absent.num, Tri::Absent);
+        assert!(!absent.num.is_wrong_type());
+
+        let wrong = tri_doc("num = \"lots\"\n");
+        assert_eq!(wrong.num, Tri::WrongType);
+        assert!(wrong.num.is_wrong_type());
+        // Both still read as "no usable value" for callers that don't care.
+        assert_eq!(absent.num.value(), None);
+        assert_eq!(wrong.num.value(), None);
+    }
+
+    #[test]
+    fn tri_number_keeps_integer_and_float_apart() {
+        assert_eq!(tri_doc("num = 100\n").num, Tri::Value(TomlNumber::Int(100)));
+        assert_eq!(
+            tri_doc("num = 100.0\n").num,
+            Tri::Value(TomlNumber::Float(100.0))
+        );
+    }
+
+    #[test]
+    fn tri_flag_keeps_bool_and_integer_apart() {
+        assert_eq!(tri_doc("flag = true\n").flag, Tri::Value(TomlFlag::Bool(true)));
+        assert_eq!(tri_doc("flag = 1\n").flag, Tri::Value(TomlFlag::Int(1)));
+        assert_eq!(tri_doc("flag = \"yes\"\n").flag, Tri::WrongType);
+    }
+
+    #[test]
+    fn tri_list_flags_a_scalar_where_an_array_was_expected() {
+        // The security-relevant case: `allowed_tools = "x"` must be
+        // distinguishable from an absent key, never collapse to "empty".
+        assert_eq!(tri_doc("list = [\"a\"]\n").list, Tri::Value(vec!["a".into()]));
+        assert_eq!(tri_doc("list = \"a\"\n").list, Tri::WrongType);
+        assert_eq!(tri_doc("").list, Tri::Absent);
+    }
+
+    #[derive(Debug, Deserialize, Default, PartialEq)]
+    #[serde(default)]
+    struct MapDoc {
+        #[serde(deserialize_with = "string_map")]
+        env: Vec<(String, String)>,
+    }
+
+    fn map_doc(s: &str) -> Vec<(String, String)> {
+        toml::from_str::<MapDoc>(s)
+            .expect("must never fail to parse")
+            .env
+    }
+
+    #[test]
+    fn string_map_keeps_key_order_and_drops_non_strings() {
+        let got = map_doc("[env]\nB = \"2\"\nA = \"1\"\nC = 3\n");
+        // BTreeMap order — the same order iterating a `toml::Table` gave.
+        assert_eq!(
+            got,
+            vec![("A".into(), "1".into()), ("B".into(), "2".into())]
+        );
+    }
+
+    #[test]
+    fn string_map_absent_or_wrong_typed_is_empty() {
+        assert!(map_doc("").is_empty());
+        assert!(map_doc("env = \"nope\"\n").is_empty());
+        assert!(map_doc("env = [1, 2]\n").is_empty());
+    }
+
+    #[derive(Debug, Deserialize, Default, PartialEq)]
+    #[serde(default)]
+    struct LossyDoc {
+        #[serde(deserialize_with = "opt_number_lossy")]
+        hours: Option<f64>,
+    }
+
+    fn lossy(s: &str) -> Option<f64> {
+        toml::from_str::<LossyDoc>(s)
+            .expect("must never fail to parse")
+            .hours
+    }
+
+    #[test]
+    fn opt_number_lossy_accepts_integers_unlike_the_strict_helper() {
+        // Deliberately the OPPOSITE quirk from `opt_float_strict`: these
+        // readers wrote `as_float().or_else(|| as_integer()…)`.
+        assert_eq!(lossy("hours = 24\n"), Some(24.0));
+        assert_eq!(lossy("hours = 1.5\n"), Some(1.5));
+        assert_eq!(lossy("hours = \"24\"\n"), None);
+        assert_eq!(lossy("hours = true\n"), None);
+        assert_eq!(lossy(""), None);
     }
 
     #[test]

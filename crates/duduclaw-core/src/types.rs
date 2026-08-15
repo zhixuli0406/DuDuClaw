@@ -655,12 +655,25 @@ pub struct CapabilitiesConfig {
 
     /// Explicit tool allowlist. If non-empty, ONLY these tools are permitted.
     /// Takes precedence over individual capability flags.
-    #[serde(default)]
+    ///
+    /// Uses [`crate::lenient::string_vec`] like its four `*_tools` siblings
+    /// below. Two reasons, both about a mixed array (`["Bash", 1]`):
+    /// the raw reader this field now serves
+    /// (`cli::expert::install::extract_agent_frontmatter`) used
+    /// `filter_map(as_str)` and kept `["Bash"]`, and the strict `AgentConfig`
+    /// path used to reject the whole file — meaning one stray element made
+    /// the agent vanish from the registry entirely. The lenient helper makes
+    /// both paths agree on "drop the bad element", which is also the only
+    /// non-fatal option.
+    #[serde(default, deserialize_with = "crate::lenient::string_vec")]
     pub allowed_tools: Vec<String>,
 
     /// Explicit tool denylist. Tools listed here are always blocked,
     /// even if allowed by other flags. Evaluated after `allowed_tools`.
-    #[serde(default)]
+    ///
+    /// Same [`crate::lenient::string_vec`] rationale as
+    /// [`Self::allowed_tools`].
+    #[serde(default, deserialize_with = "crate::lenient::string_vec")]
     pub denied_tools: Vec<String>,
 
     /// Wiki visibility control — which agents can read this agent's wiki.
@@ -753,11 +766,21 @@ pub struct CapabilitiesConfig {
     /// Goal-loop autonomy level. Missing ⇒ the caller's conservative
     /// `Approver` default; an unrecognised string also ⇒ `Approver`. Stored as
     /// the raw string so that lenient parse survives here exactly as it did in
-    /// the `toml::Value` reader. Read by `gateway::goal_loop` (not migrated
-    /// this round).
+    /// the `toml::Value` reader. Read by `gateway::goal_loop`.
     #[serde(default, deserialize_with = "crate::lenient::opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub autonomy_level: Option<String>,
+
+    /// WP5 F1: operator opt-OUT of the install-class MCP approval gate.
+    ///
+    /// **Fail-closed:** only an explicit `true` disables the gate. Missing,
+    /// wrong-typed, and `false` all leave it ON — so this stays `Option<bool>`
+    /// rather than `bool`, and the accessor
+    /// (`gateway::approval::auto_approve_install`) applies
+    /// `unwrap_or(false)`. Read there.
+    #[serde(default, deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_approve_install: Option<bool>,
 }
 
 /// Effect of a [`ToolPolicy`] rule.
@@ -903,6 +926,7 @@ impl Default for CapabilitiesConfig {
             irreversible_tools: Vec::new(),
             maybe_irreversible_tools: Vec::new(),
             autonomy_level: None,
+            auto_approve_install: None,
         }
     }
 }
@@ -1208,6 +1232,86 @@ pub struct EvolutionConfig {
     /// P1: `suppress` action will be wired up here without schema changes.
     #[serde(default)]
     pub stagnation_detection: StagnationDetectionConfig,
+
+    // ── Formerly-untyped `[evolution]` keys (R2 unification, 2nd pass) ───
+    //
+    // These four were read by raw `toml::Value` accessors in four different
+    // gateway modules (`gvu::loop_`, `gvu::aee::intent`, `gvu::aee::run`,
+    // `gvu::verifier_measure`) while `[evolution]` was otherwise typed here —
+    // the same straddling-two-schemas shape `[capabilities]` had. Typing them
+    // also stops the `agent_update` round-trip (which re-serializes
+    // `AgentConfig` over `agent.toml`) from silently dropping them.
+    //
+    // Each is `skip_serializing_if`-guarded: a config that never wrote the key
+    // still never gets it written back, so the on-disk shape is unchanged.
+    /// Escape hatch back to the legacy SOUL.md GVU write path (D1). Missing ⇒
+    /// `None` ⇒ `false` ⇒ AEE, the default and the path that cannot write
+    /// SOUL.md at all. Read by `gateway::gvu::loop_`.
+    #[serde(default, deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_soul_evolution: Option<bool>,
+
+    /// AEE round-intent strategy (`balanced` / `innovate` / `harden` /
+    /// `repair_only`). Stored raw: an unrecognised value must `warn!` and fall
+    /// back to `balanced` at the accessor, which a strict serde enum here
+    /// would turn into total agent loss. Read by `gateway::gvu::aee::intent`.
+    #[serde(default, deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+
+    /// Hours a committed AEE round is observed before its entries settle.
+    /// Missing / non-positive ⇒ the accessor's 24 h default; the clamp stays
+    /// in the accessor.
+    ///
+    /// Uses [`crate::lenient::opt_number_lossy`] — NOT `opt_float_strict` —
+    /// because this reader deliberately accepted an integer literal
+    /// (`as_float().or_else(|| as_integer()…)`), the opposite of the `[fork]`
+    /// budget quirk. Read by `gateway::gvu::aee::run`.
+    #[serde(default, deserialize_with = "crate::lenient::opt_number_lossy")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aee_settle_hours: Option<f64>,
+
+    /// `[evolution.noise_band]` — the AEE commit gate's per-dimension noise
+    /// band. Read by `gateway::gvu::verifier_measure`.
+    #[serde(default, skip_serializing_if = "NoiseBandSection::is_empty")]
+    pub noise_band: NoiseBandSection,
+}
+
+/// `agent.toml [evolution.noise_band]` — AEE matches-or-improves tolerances.
+///
+/// Every key is individually optional and **float-only**: the raw reader used
+/// `as_float()`, so `cases = 1` (an integer literal) was silently ignored and
+/// kept the default. [`crate::lenient::opt_float_strict`] preserves that;
+/// widening it here would quietly loosen a commit gate.
+///
+/// Clamping (`cases` to `NOISE_BAND_CASES_MAX`, the rest to `>= 0.0`) stays in
+/// the accessor — it is a policy of the gate, not of the file format.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct NoiseBandSection {
+    #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cases: Option<f64>,
+    #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge: Option<f64>,
+    #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anti_sycophancy: Option<f64>,
+    #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub novelty: Option<f64>,
+    #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevance: Option<f64>,
+}
+
+impl NoiseBandSection {
+    /// True when nothing was written — lets the enclosing section skip
+    /// serializing it so an absent `[evolution.noise_band]` stays absent.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for EvolutionConfig {
@@ -1245,6 +1349,12 @@ impl Default for EvolutionConfig {
             skill_behavior_drift_threshold: 0.3,
             // Stagnation detection
             stagnation_detection: StagnationDetectionConfig::default(),
+            // R2 2nd pass: absent by default so the on-disk shape is
+            // unchanged; each accessor owns its own missing-key direction.
+            legacy_soul_evolution: None,
+            strategy: None,
+            aee_settle_hours: None,
+            noise_band: NoiseBandSection::default(),
         }
     }
 }

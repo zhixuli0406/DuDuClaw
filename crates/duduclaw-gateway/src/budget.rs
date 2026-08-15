@@ -106,10 +106,27 @@ impl BudgetVerdict {
     }
 }
 
-/// Load `[budget]` limits from an agent's `agent.toml` (lightweight generic
-/// parse, mirroring `runtime_config`). Missing file / section ⇒ inert limits
-/// (never blocks).
+/// Load `[budget]` limits from an agent's `agent.toml`. Missing file /
+/// section ⇒ inert limits (never blocks).
+///
+/// Goes through the shared typed parse point ([`duduclaw_core::agent_toml`])
+/// rather than a hand-rolled `toml::Value` walk. Two properties of the old
+/// reader are load-bearing and are carried by the view's field *types*, not
+/// by convention:
+///
+/// * **absent ≠ wrong-typed.** A present-but-wrong-typed key must warn
+///   LOUDLY; an absent one must stay silent. Hence
+///   [`duduclaw_core::lenient::Tri`] rather than `Option`.
+/// * **integer ≠ float.** An integer is clamped, a float (the common `100.0`
+///   typo) is rounded. Hence [`duduclaw_core::lenient::TomlNumber`] rather
+///   than `f64`, which would also lose precision past 2^53.
+///
+/// A `[budget]` section that is absent entirely and one that is present but
+/// scalar (`budget = 1`) both produce the all-zero inert result, exactly as
+/// before — `toml::Value::get` on a non-table returned `None` for every key.
 pub fn load_budget_limits(agent_dir: Option<&Path>) -> BudgetLimits {
+    use duduclaw_core::lenient::{TomlFlag, TomlNumber, Tri};
+
     let inert = BudgetLimits {
         daily_cap_cents: 0,
         monthly_limit_cents: 0,
@@ -119,25 +136,17 @@ pub fn load_budget_limits(agent_dir: Option<&Path>) -> BudgetLimits {
     let Some(dir) = agent_dir else {
         return inert;
     };
-    let Ok(text) = std::fs::read_to_string(dir.join("agent.toml")) else {
-        return inert;
-    };
-    let Ok(v) = text.parse::<toml::Value>() else {
-        return inert;
-    };
-    let b = match v.get("budget") {
-        Some(b) => b,
-        None => return inert,
-    };
+    let b = duduclaw_core::agent_toml::load(dir).budget;
+
     // Coerce ints, and floats (a common `100.0` typo) → rounded u64. A key that
     // is present but a genuinely wrong type is logged LOUDLY rather than silently
     // treated as 0 — a config typo must not silently disable a cost control.
-    let num_of = |k: &str| -> u64 {
-        match b.get(k) {
-            None => 0,
-            Some(x) if x.as_integer().is_some() => x.as_integer().unwrap().max(0) as u64,
-            Some(x) if x.as_float().is_some() => x.as_float().unwrap().max(0.0).round() as u64,
-            Some(_) => {
+    let num_of = |k: &str, field: Tri<TomlNumber>| -> u64 {
+        match field {
+            Tri::Absent => 0,
+            Tri::Value(TomlNumber::Int(i)) => i.max(0) as u64,
+            Tri::Value(TomlNumber::Float(f)) => f.max(0.0).round() as u64,
+            Tri::WrongType => {
                 tracing::warn!(
                     key = k,
                     "budget: [budget].{k} has an unexpected type — treated as no cap; \
@@ -147,23 +156,24 @@ pub fn load_budget_limits(agent_dir: Option<&Path>) -> BudgetLimits {
             }
         }
     };
-    let hard_stop = match b.get("hard_stop") {
-        None => false,
-        Some(x) if x.as_bool().is_some() => x.as_bool().unwrap(),
+    let hard_stop = match b.hard_stop {
+        Tri::Absent => false,
+        Tri::Value(TomlFlag::Bool(v)) => v,
         // Tolerate `hard_stop = 1` / `0` (common mistake) but warn.
-        Some(x) if x.as_integer().is_some() => {
+        Tri::Value(TomlFlag::Int(i)) => {
             tracing::warn!("budget: [budget].hard_stop should be a bool; coercing integer");
-            x.as_integer().unwrap() != 0
+            i != 0
         }
-        Some(_) => {
+        Tri::WrongType => {
             tracing::warn!("budget: [budget].hard_stop has an unexpected type — treated as false");
             false
         }
     };
     BudgetLimits {
-        daily_cap_cents: num_of("daily_cap_cents"),
-        monthly_limit_cents: num_of("monthly_limit_cents"),
-        warn_threshold_percent: num_of("warn_threshold_percent").min(100) as u8,
+        daily_cap_cents: num_of("daily_cap_cents", b.daily_cap_cents),
+        monthly_limit_cents: num_of("monthly_limit_cents", b.monthly_limit_cents),
+        warn_threshold_percent: num_of("warn_threshold_percent", b.warn_threshold_percent).min(100)
+            as u8,
         hard_stop,
     }
 }
@@ -373,29 +383,28 @@ fn read_breaker_states(path: &Path) -> HashMap<String, String> {
 
 /// Resolve a human-readable agent name for the admin push — `agent.toml
 /// [agent] display_name`, falling back to `name`, falling back to the raw
-/// `agent_id` when neither is readable. Lightweight manual TOML parse,
-/// mirroring [`load_budget_limits`], rather than depending on the full
-/// `AgentRegistry` (this module has no registry handle, only a dir + id).
+/// `agent_id` when neither is readable. Goes through the shared typed parse
+/// point ([`duduclaw_core::agent_toml`]), mirroring [`load_budget_limits`],
+/// rather than depending on the full `AgentRegistry` (this module has no
+/// registry handle, only a dir + id).
+///
+/// The `[agent]` section is `Option` on the view precisely so a missing table
+/// still short-circuits to `agent_id` here rather than silently reading an
+/// all-empty one.
 fn agent_display_name(agent_dir: Option<&Path>, agent_id: &str) -> String {
     let Some(dir) = agent_dir else {
         return agent_id.to_string();
     };
-    let Ok(text) = std::fs::read_to_string(dir.join("agent.toml")) else {
+    let Some(a) = duduclaw_core::agent_toml::load(dir).agent else {
         return agent_id.to_string();
     };
-    let Ok(table) = text.parse::<toml::Value>() else {
-        return agent_id.to_string();
-    };
-    let Some(a) = table.get("agent").and_then(|v| v.as_table()) else {
-        return agent_id.to_string();
-    };
-    a.get("display_name")
-        .and_then(|v| v.as_str())
+    a.display_name
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            a.get("name")
-                .and_then(|v| v.as_str())
+            a.name
+                .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         })
@@ -444,6 +453,137 @@ mod tests {
             warn_threshold_percent: 0,
             hard_stop: hard,
         }
+    }
+
+    // ── R5: `[budget]` / `[agent]` directions, pinned ────────────────────
+    //
+    //   every numeric key   absent OR wrong-typed ⇒ 0 ⇒ NO CAP. Deliberately
+    //                 fail-*open*: a budget cap that materialises out of an
+    //                 unreadable config would silently strand an agent
+    //                 mid-task. The wrong-typed case is the one that WARNS —
+    //                 which is why the view field is three-state and not an
+    //                 Option.
+    //   integer vs float   an integer is clamped at 0, a float (`100.0`, a
+    //                 common typo) is ROUNDED. Both reachable, so the view
+    //                 keeps the variants apart.
+    //   hard_stop     absent ⇒ false; `1`/`0` tolerated-with-warning; any
+    //                 other type ⇒ false.
+    //   [agent] table absent ⇒ fall back to the raw agent id, never to a
+    //                 blank display name.
+
+    fn budget_dir(body: &str) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn default_direction_budget_absent_or_unreadable_is_no_cap() {
+        for body in [
+            "",                              // empty file
+            "[agent]\nname = \"a\"\n",       // no [budget]
+            "[budget]\n",                    // section, no keys
+            "budget = 1\n",                  // scalar where a table was expected
+            "not toml [[[",                  // malformed file
+        ] {
+            let dir = budget_dir(body);
+            let l = load_budget_limits(Some(dir.path()));
+            assert_eq!(l.daily_cap_cents, 0, "for {body:?}");
+            assert_eq!(l.monthly_limit_cents, 0, "for {body:?}");
+            assert_eq!(l.warn_threshold_percent, 0, "for {body:?}");
+            assert!(!l.hard_stop, "for {body:?}");
+        }
+
+        // No agent dir at all, and a dir with no file — same direction.
+        assert_eq!(load_budget_limits(None).monthly_limit_cents, 0);
+        let empty = tempdir().unwrap();
+        assert_eq!(load_budget_limits(Some(empty.path())).monthly_limit_cents, 0);
+    }
+
+    #[test]
+    fn default_direction_budget_wrong_typed_key_is_no_cap_not_fatal() {
+        // Present-but-wrong-type ⇒ 0 (and a loud warn!, which is the whole
+        // reason the field is three-state). It must NOT abort the parse and
+        // it must NOT be coerced from a string.
+        let dir = budget_dir(
+            "[budget]\n\
+             monthly_limit_cents = \"5000\"\n\
+             daily_cap_cents = true\n\
+             warn_threshold_percent = [80]\n\
+             hard_stop = \"yes\"\n",
+        );
+        let l = load_budget_limits(Some(dir.path()));
+        assert_eq!(l.monthly_limit_cents, 0, "a string is not coerced to a number");
+        assert_eq!(l.daily_cap_cents, 0);
+        assert_eq!(l.warn_threshold_percent, 0);
+        assert!(!l.hard_stop, "a non-bool, non-int hard_stop is false");
+    }
+
+    #[test]
+    fn default_direction_budget_integer_and_float_are_handled_differently() {
+        // Integers clamp at zero; floats round. Both are live paths, so the
+        // typed view must not flatten them into one `f64`.
+        let ints = budget_dir(
+            "[budget]\nmonthly_limit_cents = 5000\ndaily_cap_cents = -20\n\
+             warn_threshold_percent = 150\n",
+        );
+        let l = load_budget_limits(Some(ints.path()));
+        assert_eq!(l.monthly_limit_cents, 5000);
+        assert_eq!(l.daily_cap_cents, 0, "negative clamps to 0");
+        assert_eq!(l.warn_threshold_percent, 100, "capped at 100");
+
+        let floats = budget_dir(
+            "[budget]\nmonthly_limit_cents = 100.0\ndaily_cap_cents = 49.6\n",
+        );
+        let l = load_budget_limits(Some(floats.path()));
+        assert_eq!(l.monthly_limit_cents, 100, "the `100.0` typo still works");
+        assert_eq!(l.daily_cap_cents, 50, "floats round, not truncate");
+    }
+
+    #[test]
+    fn default_direction_hard_stop_tolerates_integers_only() {
+        for (body, want) in [
+            ("[budget]\nhard_stop = true\n", true),
+            ("[budget]\nhard_stop = false\n", false),
+            ("[budget]\nhard_stop = 1\n", true),   // tolerated with a warn
+            ("[budget]\nhard_stop = 0\n", false),  // tolerated with a warn
+            ("[budget]\nhard_stop = \"1\"\n", false), // NOT coerced
+            ("[budget]\n", false),
+        ] {
+            let dir = budget_dir(body);
+            assert_eq!(load_budget_limits(Some(dir.path())).hard_stop, want, "for {body:?}");
+        }
+    }
+
+    #[test]
+    fn default_direction_display_name_falls_back_to_the_agent_id() {
+        // The `[agent]` section is `Option` on the shared view precisely so a
+        // file with no `[agent]` table short-circuits here instead of reading
+        // an all-empty one and reporting a blank name.
+        for body in [
+            "",
+            "[budget]\nhard_stop = true\n",         // no [agent] table at all
+            "agent = \"scalar\"\n",                 // wrong-typed section
+            "[agent]\n",                            // table, no keys
+            "[agent]\ndisplay_name = \"  \"\n",     // blank ⇒ falls through
+            "[agent]\ndisplay_name = 42\n",         // wrong type
+            "not toml [[[",
+        ] {
+            let dir = budget_dir(body);
+            assert_eq!(
+                agent_display_name(Some(dir.path()), "alpha"),
+                "alpha",
+                "for {body:?}"
+            );
+        }
+
+        assert_eq!(agent_display_name(None, "alpha"), "alpha");
+
+        // display_name wins; `name` is the documented second choice.
+        let d = budget_dir("[agent]\nname = \"alpha\"\ndisplay_name = \" 阿爾法 \"\n");
+        assert_eq!(agent_display_name(Some(d.path()), "alpha"), "阿爾法");
+        let n = budget_dir("[agent]\nname = \"Alpha Bot\"\n");
+        assert_eq!(agent_display_name(Some(n.path()), "alpha"), "Alpha Bot");
     }
 
     // Record enough usage to exceed a cent budget. Pricing is model-dependent;

@@ -56,6 +56,8 @@
 
 use std::path::Path;
 
+use duduclaw_core::agent_toml::AgentTomlSections;
+use duduclaw_core::lenient::Tri;
 use duduclaw_llm::ToolFilter;
 
 /// Bearer scheme that resolves to the dashboard's connected Google account
@@ -264,16 +266,21 @@ pub async fn load_external_mcp_servers_resolved(
     resolve_secret_refs(load_external_mcp_servers(agent_dir), home_dir).await
 }
 
-/// Parse a security-relevant tool-filter list (`allowed_tools`/`denied_tools`).
+/// Resolve a security-relevant tool-filter list (`allowed_tools`/`denied_tools`).
 /// Absent ⇒ `Ok(empty)`. Present and an array ⇒ `Ok(strings)`. Present but the
 /// WRONG type ⇒ `Err(())` (caller skips the whole server, fail-closed) with a
 /// loud warning, so a `"x"`-instead-of-`["x"]` typo can never silently widen the
 /// exposed tool surface.
-fn tool_list_field(entry: &toml::Value, key: &str, server: &str) -> Result<Vec<String>, ()> {
-    match entry.get(key) {
-        None => Ok(Vec::new()),
-        Some(v) if v.as_array().is_some() => Ok(str_array(Some(v))),
-        Some(_) => {
+///
+/// This three-state distinction is why the view field is a
+/// [`duduclaw_core::lenient::Tri`] and not a `Vec<String>`: collapsing
+/// "wrong type" into "empty" here would silently turn a typo'd allowlist into
+/// a permissive one.
+fn tool_list_field(field: &Tri<Vec<String>>, key: &str, server: &str) -> Result<Vec<String>, ()> {
+    match field {
+        Tri::Absent => Ok(Vec::new()),
+        Tri::Value(v) => Ok(v.clone()),
+        Tri::WrongType => {
             tracing::warn!(
                 server = %server, key = %key,
                 "external MCP {key} must be an array of tool names — skipping server (fail-closed)"
@@ -283,34 +290,19 @@ fn tool_list_field(entry: &toml::Value, key: &str, server: &str) -> Result<Vec<S
     }
 }
 
-fn str_array(v: Option<&toml::Value>) -> Vec<String> {
-    v.and_then(|x| x.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| e.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Parse `[[mcp.external]]` entries out of an already-parsed `agent.toml`.
-/// Pure (no filesystem / env) except for `resolve_env_value`; split from the
-/// file read so the parsing + skip logic is unit-testable.
-pub fn parse_external_servers(toml_value: &toml::Value) -> Vec<ExternalMcpServer> {
-    let entries = toml_value
-        .get("mcp")
-        .and_then(|m| m.get("external"))
-        .and_then(|e| e.as_array());
-    let Some(entries) = entries else {
-        return Vec::new();
-    };
-
+/// Parse `[[mcp.external]]` entries out of already-parsed `agent.toml`
+/// sections. Pure (no filesystem / env) except for `resolve_env_value`; split
+/// from the file read so the parsing + skip logic is unit-testable.
+///
+/// Takes the shared typed projection ([`duduclaw_core::agent_toml`]) rather
+/// than a `toml::Value`. Every *semantic* decision below (preset resolution,
+/// the exactly-one-transport rule, credential resolution, the fail-closed
+/// filter skip) is unchanged — only the field access is now typed.
+pub fn parse_external_servers(sections: &AgentTomlSections) -> Vec<ExternalMcpServer> {
     let mut out = Vec::new();
-    for entry in entries {
-        let enabled = entry
-            .get("enabled")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(true);
+    for entry in &sections.mcp.external {
+        // Missing / wrong-typed ⇒ enabled (this is an opt-OUT flag).
+        let enabled = entry.enabled.unwrap_or(true);
         if !enabled {
             continue;
         }
@@ -318,8 +310,8 @@ pub fn parse_external_servers(toml_value: &toml::Value) -> Vec<ExternalMcpServer
         // known vendor's official remote MCP server, so users don't paste (or
         // mistype) endpoint URLs. An explicit `url` alongside it is ambiguous.
         let preset = entry
-            .get("preset")
-            .and_then(|x| x.as_str())
+            .preset
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let mut preset_bearer: Option<String> = None;
@@ -342,21 +334,17 @@ pub fn parse_external_servers(toml_value: &toml::Value) -> Vec<ExternalMcpServer
         }
 
         let name = entry
-            .get("name")
-            .and_then(|x| x.as_str())
+            .name
+            .as_deref()
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string)
             // A preset entry needs no `name` — the preset itself labels it.
             .or_else(|| preset.map(str::to_string))
             .unwrap_or_default();
-        let command = entry
-            .get("command")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
+        let command = entry.command.as_deref().unwrap_or("").to_string();
         let explicit_url = entry
-            .get("url")
-            .and_then(|x| x.as_str())
+            .url
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
@@ -381,27 +369,31 @@ pub fn parse_external_servers(toml_value: &toml::Value) -> Vec<ExternalMcpServer
             }
             _ => {}
         }
-        let args = str_array(entry.get("args"));
+        let args = entry.args.clone();
 
         // Resolve env + headers; a missing `env://` credential disables the
         // whole server. (`secret://` / `oauth://` resolve in the async pass.)
+        //
+        // `string_map` already dropped non-string values and preserves the
+        // `toml::Table` (BTreeMap) key order, so which key wins the "first
+        // unresolved" warning is unchanged.
         let mut env = Vec::new();
         let mut headers = Vec::new();
         let mut skip = false;
-        for (field, sink) in [("env", &mut env), ("headers", &mut headers)] {
-            if let Some(tbl) = entry.get(field).and_then(|e| e.as_table()) {
-                for (k, raw) in tbl {
-                    let Some(raw) = raw.as_str() else { continue };
-                    match resolve_env_value(raw) {
-                        Some(v) => sink.push((k.clone(), v)),
-                        None => {
-                            tracing::warn!(
-                                server = %name, key = %k,
-                                "external MCP {field} credential unresolved (env:// unset) — skipping server"
-                            );
-                            skip = true;
-                            break;
-                        }
+        for (field, source, sink) in [
+            ("env", &entry.env, &mut env),
+            ("headers", &entry.headers, &mut headers),
+        ] {
+            for (k, raw) in source {
+                match resolve_env_value(raw) {
+                    Some(v) => sink.push((k.clone(), v)),
+                    None => {
+                        tracing::warn!(
+                            server = %name, key = %k,
+                            "external MCP {field} credential unresolved (env:// unset) — skipping server"
+                        );
+                        skip = true;
+                        break;
                     }
                 }
             }
@@ -416,7 +408,7 @@ pub fn parse_external_servers(toml_value: &toml::Value) -> Vec<ExternalMcpServer
         // Bearer credential: env:// resolves now; secret:// and oauth://google
         // stay verbatim for the async pass; anything else is a literal. An
         // explicit `bearer_token` overrides the preset's default.
-        let bearer_token = match entry.get("bearer_token").and_then(|x| x.as_str()) {
+        let bearer_token = match entry.bearer_token.as_deref() {
             None => preset_bearer,
             Some(raw) if raw.starts_with("secret://") || raw == OAUTH_GOOGLE_REF => {
                 Some(raw.to_string())
@@ -437,11 +429,11 @@ pub fn parse_external_servers(toml_value: &toml::Value) -> Vec<ExternalMcpServer
         // value (e.g. `allowed_tools = "x"` instead of `["x"]`) must NOT silently
         // become an empty (permissive) allowlist. Fail closed — skip the server
         // loudly so a typo can't expose the whole external tool surface.
-        let allowed = match tool_list_field(entry, "allowed_tools", &name) {
+        let allowed = match tool_list_field(&entry.allowed_tools, "allowed_tools", &name) {
             Ok(v) => v,
             Err(()) => continue,
         };
-        let denied = match tool_list_field(entry, "denied_tools", &name) {
+        let denied = match tool_list_field(&entry.denied_tools, "denied_tools", &name) {
             Ok(v) => v,
             Err(()) => continue,
         };
@@ -464,13 +456,7 @@ pub fn parse_external_servers(toml_value: &toml::Value) -> Vec<ExternalMcpServer
 /// Load external MCP servers declared in `<agent_dir>/agent.toml`. Missing /
 /// malformed file ⇒ empty (no externals; behavior unchanged).
 pub fn load_external_mcp_servers(agent_dir: &Path) -> Vec<ExternalMcpServer> {
-    let Ok(text) = std::fs::read_to_string(agent_dir.join("agent.toml")) else {
-        return Vec::new();
-    };
-    let Ok(v) = text.parse::<toml::Value>() else {
-        return Vec::new();
-    };
-    parse_external_servers(&v)
+    parse_external_servers(&duduclaw_core::agent_toml::load(agent_dir))
 }
 
 #[cfg(test)]
@@ -478,7 +464,105 @@ mod tests {
     use super::*;
 
     fn parse(s: &str) -> Vec<ExternalMcpServer> {
-        parse_external_servers(&s.parse::<toml::Value>().unwrap())
+        parse_external_servers(&duduclaw_core::agent_toml::parse(s))
+    }
+
+    // ── R5: `[[mcp.external]]` directions, pinned ────────────────────────
+    //
+    //   whole section absent / malformed ⇒ no external servers (a failure to
+    //                 read config never mounts a server).
+    //   enabled       absent / wrong-typed ⇒ TRUE. This is an opt-OUT flag;
+    //                 a config written before the flag existed must keep
+    //                 working. The one place in this parser that defaults
+    //                 permissively.
+    //   allowed_tools / denied_tools
+    //                 absent ⇒ no filter, but present-and-wrong-typed ⇒ SKIP
+    //                 THE WHOLE SERVER. Collapsing those two into "no filter"
+    //                 would turn `allowed_tools = "x"` into a silently
+    //                 permissive allowlist — which is why the view field is
+    //                 three-state and not a `Vec<String>`.
+    //   a mixed array is FILTERED, not rejected: `["a", 1]` is a live config
+    //                 that used to yield `["a"]`, and still must.
+
+    #[test]
+    fn default_direction_absent_or_malformed_mounts_nothing() {
+        for body in [
+            "",                            // empty file
+            "[agent]\nname = \"a\"\n",     // no [mcp]
+            "[mcp]\n",                     // section, no external
+            "mcp = \"scalar\"\n",          // wrong-typed section
+            "[mcp]\nexternal = \"nope\"\n", // wrong-typed array
+            "not toml [[[",                // malformed file
+        ] {
+            assert!(parse(body).is_empty(), "for {body:?}");
+        }
+    }
+
+    #[test]
+    fn default_direction_enabled_is_opt_out_not_opt_in() {
+        // No `enabled` key at all — a pre-flag config must still mount.
+        let base = "[[mcp.external]]\nname = \"s\"\ncommand = \"npx\"\n";
+        assert_eq!(parse(base).len(), 1, "absent enabled ⇒ mounted");
+
+        // Wrong-typed ⇒ also mounted (the raw `as_bool()` returned None,
+        // which `unwrap_or(true)` turned into "on").
+        assert_eq!(
+            parse(&format!("{base}enabled = \"false\"\n")).len(),
+            1,
+            "wrong-typed enabled ⇒ mounted, NOT skipped"
+        );
+
+        // Only an explicit `false` opts out.
+        assert!(parse(&format!("{base}enabled = false\n")).is_empty());
+    }
+
+    #[test]
+    fn default_direction_wrong_typed_tool_filter_skips_the_whole_server() {
+        let base = "[[mcp.external]]\nname = \"s\"\ncommand = \"npx\"\n";
+
+        // Absent ⇒ mounted with an empty (inert) filter.
+        let servers = parse(base);
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].filter.allowed.is_empty());
+        assert!(servers[0].filter.denied.is_empty());
+
+        // Present-but-wrong-typed ⇒ fail closed, server dropped. This is the
+        // distinction that a two-state Option would have destroyed.
+        assert!(
+            parse(&format!("{base}allowed_tools = \"one_tool\"\n")).is_empty(),
+            "a scalar allowlist must not become a permissive empty one"
+        );
+        assert!(
+            parse(&format!("{base}denied_tools = 42\n")).is_empty(),
+            "a scalar denylist must skip the server too"
+        );
+
+        // A mixed array is filtered, not rejected — the historical behavior.
+        let mixed = parse(&format!("{base}allowed_tools = [\"a\", 7, \"b\"]\n"));
+        assert_eq!(mixed.len(), 1, "mixed array must not skip the server");
+        assert_eq!(mixed[0].filter.allowed, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn default_direction_env_and_headers_drop_non_string_values() {
+        // The raw loop did `let Some(raw) = raw.as_str() else { continue }` —
+        // a non-string value was skipped, never fatal, and never resolved.
+        let servers = parse(
+            "[[mcp.external]]\n\
+             name = \"s\"\n\
+             command = \"npx\"\n\
+             env = { A = \"1\", B = 2, C = \"3\" }\n",
+        );
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0].env,
+            vec![("A".to_string(), "1".to_string()), ("C".to_string(), "3".to_string())]
+        );
+
+        // A wrong-typed `env` as a whole ⇒ no env, still mounted.
+        let servers = parse("[[mcp.external]]\nname = \"s\"\ncommand = \"npx\"\nenv = \"x\"\n");
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].env.is_empty());
     }
 
     #[test]

@@ -180,30 +180,17 @@ const DISTILL_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Read `[os_watch] footprint` from an agent's `agent.toml`.
 ///
-/// Additive raw-TOML parse — same pattern as `os_events::read_os_watch_config`
-/// / `os_frontmost::read_frontmost_poll_secs` — never touches the serde
-/// `AgentConfig` struct, so this new key can't break existing configs.
+/// Goes through the shared typed parse point
+/// ([`duduclaw_core::agent_toml`]) — the key is typed on
+/// [`duduclaw_core::types::OsWatchSection`].
 /// **Deny-by-default**: absent file, absent `[os_watch]` table, absent key,
 /// malformed TOML, or a non-boolean value all resolve to `false` — digital-
 /// footprint aggregation is opt-in on top of `os_native` / `[os_watch]`, never
 /// implied by them.
 pub fn read_footprint_enabled(agent_dir: &Path) -> bool {
-    let path = agent_dir.join("agent.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?path, error = %e, "malformed agent.toml — [os_watch] footprint ignored");
-            return false;
-        }
-    };
-    value
-        .get("os_watch")
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get("footprint"))
-        .and_then(|v| v.as_bool())
+    duduclaw_core::agent_toml::load(agent_dir)
+        .os_watch
+        .footprint
         .unwrap_or(false)
 }
 
@@ -788,6 +775,43 @@ mod tests {
 
     fn enabled_set(agent: &str) -> HashSet<String> {
         [agent.to_string()].into_iter().collect()
+    }
+
+    // ── R5: `[os_watch] footprint` direction, pinned ─────────────────────
+    //
+    // absent / malformed / wrong-typed ⇒ FALSE. Footprint aggregation
+    // observes which directories a person works in all day; it is opt-in on
+    // top of `os_native` and `[os_watch]`, never implied by them and never
+    // implied by a config we failed to read.
+
+    #[test]
+    fn default_direction_footprint_is_deny_by_default() {
+        for body in [
+            "",                                  // empty file
+            "[os_watch]\n",                      // section, no key
+            "[os_watch]\npaths = [\"~/x\"]\n",   // watching, but no footprint
+            "[os_watch]\nfootprint = false\n",   // explicit off
+            "[os_watch]\nfootprint = \"true\"\n", // wrong type — NOT coerced
+            "[os_watch]\nfootprint = 1\n",       // wrong type
+            "os_watch = \"scalar\"\n",           // wrong-typed section
+            "not valid [[[ toml",                // malformed file
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+            assert!(
+                !read_footprint_enabled(dir.path()),
+                "footprint must stay off for {body:?}"
+            );
+        }
+
+        // Missing file entirely — same direction.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!read_footprint_enabled(empty.path()));
+
+        // Only an explicit `true` turns it on.
+        let on = tempfile::tempdir().unwrap();
+        std::fs::write(on.path().join("agent.toml"), "[os_watch]\nfootprint = true\n").unwrap();
+        assert!(read_footprint_enabled(on.path()));
     }
 
     // ── read_footprint_enabled: config reader ─────────────────────────────

@@ -988,9 +988,14 @@ fn reminder_navigate_path(id: &ApprovalId) -> String {
 /// Parse `agent.toml [capabilities] approval_required_tools = [...]` into a
 /// set of tool names the MCP dispatch path must gate behind an approval.
 ///
+/// Goes through the shared typed parse point
+/// ([`duduclaw_core::agent_toml`]) rather than a hand-rolled `toml::Value`
+/// walk; the field is [`duduclaw_core::types::CapabilitiesConfig::approval_required_tools`],
+/// whose `string_vec` leniency reproduces the former
+/// `as_array()` + `filter_map(as_str)` chain element-for-element.
+///
 /// **Fail-safe choice (documented):** a missing file, missing key, or a
-/// malformed `[capabilities]` table returns an **empty set** (a `warn!`
-/// is logged for the malformed case). This matches the project's
+/// malformed `[capabilities]` table returns an **empty set**. This matches the project's
 /// `CapabilitiesConfig` deny-by-default model where the *primary* gate is
 /// `allowed_tools` / `denied_tools`; `approval_required_tools` is
 /// **additive friction**, not the primary security gate. Failing it
@@ -999,28 +1004,11 @@ fn reminder_navigate_path(id: &ApprovalId) -> String {
 /// hard security boundary stays with the deny-list, which independently
 /// fails closed.
 pub fn approval_required_tools(agent_dir: &Path) -> HashSet<String> {
-    let path = agent_dir.join("agent.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return HashSet::new();
-    };
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?path, error = %e, "malformed agent.toml — approval_required_tools defaults to empty (additive gate)");
-            return HashSet::new();
-        }
-    };
-    value
-        .get("capabilities")
-        .and_then(|c| c.get("approval_required_tools"))
-        .and_then(|t| t.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    duduclaw_core::agent_toml::load(agent_dir)
+        .capabilities
+        .approval_required_tools
+        .into_iter()
+        .collect()
 }
 
 /// True when a tool name is listed in the agent's
@@ -1053,43 +1041,22 @@ pub fn tool_requires_approval(agent_dir: &Path, tool_name: &str) -> bool {
 /// empty set (additive gate; the primary security boundary stays with the
 /// deny-list).
 pub fn irreversible_tools(agent_dir: &Path) -> HashSet<String> {
-    parse_capability_tool_list(agent_dir, "irreversible_tools")
+    duduclaw_core::agent_toml::load(agent_dir)
+        .capabilities
+        .irreversible_tools
+        .into_iter()
+        .collect()
 }
 
 /// Parse `agent.toml [capabilities] maybe_irreversible_tools = [...]` — tools
 /// whose irreversibility is call-dependent, so the ActionGuard judge decides
 /// per specific call. Same empty-on-error fail-safe as the siblings.
 pub fn maybe_irreversible_tools(agent_dir: &Path) -> HashSet<String> {
-    parse_capability_tool_list(agent_dir, "maybe_irreversible_tools")
-}
-
-/// Shared reader for a `[capabilities]` string-array field. Follows the exact
-/// fail-safe contract of [`approval_required_tools`] (empty on missing/malformed,
-/// `warn!` on malformed TOML). Kept private so the three public parsers share one
-/// implementation without changing their documented semantics.
-fn parse_capability_tool_list(agent_dir: &Path, key: &str) -> HashSet<String> {
-    let path = agent_dir.join("agent.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return HashSet::new();
-    };
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?path, %key, error = %e, "malformed agent.toml — capability tool list defaults to empty (additive gate)");
-            return HashSet::new();
-        }
-    };
-    value
-        .get("capabilities")
-        .and_then(|c| c.get(key))
-        .and_then(|t| t.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    duduclaw_core::agent_toml::load(agent_dir)
+        .capabilities
+        .maybe_irreversible_tools
+        .into_iter()
+        .collect()
 }
 
 /// True when a tool is listed in `irreversible_tools` (always-irreversible).
@@ -2073,21 +2040,9 @@ pub fn render_grounding_block(snippets: &[String]) -> Option<String> {
 /// `Scope::Admin` (the default internal principal) is NOT a bypass. This is
 /// the sole exemption an operator can grant.
 pub fn auto_approve_install(agent_dir: &Path) -> bool {
-    let path = agent_dir.join("agent.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?path, error = %e, "malformed agent.toml — auto_approve_install defaults to false (gate stays on)");
-            return false;
-        }
-    };
-    value
-        .get("capabilities")
-        .and_then(|c| c.get("auto_approve_install"))
-        .and_then(|v| v.as_bool())
+    duduclaw_core::agent_toml::load(agent_dir)
+        .capabilities
+        .auto_approve_install
         .unwrap_or(false)
 }
 
@@ -2156,6 +2111,120 @@ pub fn pending_summary_for_channel(record: &ApprovalRecord) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── R5: agent.toml missing-key directions, pinned ────────────────────
+    //
+    // These four `[capabilities]` readers moved onto the shared typed parse
+    // point. Each one's missing-key direction is a deliberate, *asymmetric*
+    // decision, and the asymmetry is the point:
+    //
+    //   approval_required_tools / irreversible_tools /
+    //   maybe_irreversible_tools  absent ⇒ EMPTY (fail-*safe*). They are
+    //                 additive friction on top of the deny-list, which is the
+    //                 real security boundary and independently fails closed.
+    //                 Defaulting to "everything needs approval" would brick
+    //                 every agent on one typo.
+    //   auto_approve_install      absent ⇒ FALSE, i.e. the gate stays ON
+    //                 (fail-*closed*). Only an explicit `true` opens it.
+    //
+    // Two readers in one section pointing opposite ways is exactly the kind
+    // of thing a schema refactor flattens by accident. Changing either
+    // direction must be a deliberate decision with its own reasoning.
+
+    /// `tmp_agent_dir` + an `agent.toml` in one step. (`tmp_agent_dir` and
+    /// `write_agent_toml` are defined further down in this same module.)
+    fn with_toml(body: &str) -> std::path::PathBuf {
+        let dir = tmp_agent_dir();
+        write_agent_toml(&dir, body);
+        dir
+    }
+
+    #[test]
+    fn default_direction_tool_lists_absent_are_empty_not_everything() {
+        for body in [
+            "",                                   // no sections at all
+            "[agent]\nname = \"a\"\n",            // no [capabilities]
+            "[capabilities]\n",                   // section, no keys
+            "[capabilities]\nscoped_tools = []\n", // unrelated sibling only
+            "this is not toml {{{",               // malformed file
+        ] {
+            let dir = with_toml(body);
+            assert!(approval_required_tools(&dir).is_empty(), "for {body:?}");
+            assert!(irreversible_tools(&dir).is_empty(), "for {body:?}");
+            assert!(maybe_irreversible_tools(&dir).is_empty(), "for {body:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        // Missing file entirely — same direction.
+        let dir = tmp_agent_dir();
+        assert!(approval_required_tools(&dir).is_empty());
+        assert!(irreversible_tools(&dir).is_empty());
+        assert!(maybe_irreversible_tools(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_direction_tool_lists_survive_wrong_types() {
+        // The old `.and_then(|t| t.as_array())` ignored a non-array, and
+        // `filter_map(as_str)` dropped non-string elements without failing.
+        let dir = with_toml("[capabilities]\napproval_required_tools = \"Bash\"\n");
+        assert!(
+            approval_required_tools(&dir).is_empty(),
+            "non-array ⇒ empty, not error"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let dir = with_toml("[capabilities]\nirreversible_tools = [\"a\", 7, \"b\"]\n");
+        let set = irreversible_tools(&dir);
+        assert_eq!(set.len(), 2, "non-string elements dropped, not fatal");
+        assert!(set.contains("a") && set.contains("b"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_direction_auto_approve_install_is_fail_closed() {
+        // Opposite direction from its section-mates: only an explicit `true`
+        // disables the install-class approval gate.
+        for body in [
+            "",
+            "[capabilities]\n",
+            "[capabilities]\nauto_approve_install = false\n",
+            "[capabilities]\nauto_approve_install = \"true\"\n", // wrong type
+            "[capabilities]\nauto_approve_install = 1\n",        // wrong type
+            "not toml [[[",
+        ] {
+            let dir = with_toml(body);
+            assert!(
+                !auto_approve_install(&dir),
+                "gate must stay ON for {body:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        let dir = with_toml("[capabilities]\nauto_approve_install = true\n");
+        assert!(auto_approve_install(&dir), "explicit true is the sole opt-out");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_direction_tool_lists_coexist_in_one_section() {
+        // All four keys live in the SAME `[capabilities]` table as the
+        // long-typed fields. Reading one must not disturb the others.
+        let dir = with_toml(
+            "[capabilities]\n\
+             computer_use = true\n\
+             approval_required_tools = [\"send_email\"]\n\
+             irreversible_tools = [\"wire_transfer\"]\n\
+             maybe_irreversible_tools = [\"post_message\"]\n\
+             auto_approve_install = true\n",
+        );
+        assert!(tool_requires_approval(&dir, "send_email"));
+        assert!(!tool_requires_approval(&dir, "send_email_draft"), "exact match only");
+        assert!(tool_is_irreversible(&dir, "wire_transfer"));
+        assert!(tool_is_maybe_irreversible(&dir, "post_message"));
+        assert!(auto_approve_install(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn broker() -> ApprovalBroker {
         ApprovalBroker::new(std::sync::Arc::new(ApprovalStore::open_in_memory().unwrap()))

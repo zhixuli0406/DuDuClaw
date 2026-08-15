@@ -63,17 +63,16 @@ use super::AeeRoundRecord;
 pub const AEE_SETTLE_HOURS_DEFAULT: f64 = 24.0;
 
 /// `agent.toml [evolution] aee_settle_hours`, clamped to something sane.
+///
+/// Goes through the shared typed parse point ([`duduclaw_core::agent_toml`]).
+/// The field uses `opt_number_lossy`, NOT `opt_float_strict`: this reader
+/// deliberately accepted an integer literal (`as_float().or_else(|| …
+/// as_integer())`), the opposite of the `[fork]` budget quirk — see
+/// `default_direction_settle_hours_accepts_integer_literal`.
 fn settle_hours(agent_dir: &Path) -> f64 {
-    let Ok(raw) = std::fs::read_to_string(agent_dir.join("agent.toml")) else {
-        return AEE_SETTLE_HOURS_DEFAULT;
-    };
-    let Ok(value) = raw.parse::<toml::Value>() else {
-        return AEE_SETTLE_HOURS_DEFAULT;
-    };
-    match value
-        .get("evolution")
-        .and_then(|e| e.get("aee_settle_hours"))
-        .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+    match duduclaw_core::agent_toml::load(agent_dir)
+        .evolution
+        .aee_settle_hours
     {
         Some(v) if v > 0.0 => v.min(24.0 * 30.0),
         _ => AEE_SETTLE_HOURS_DEFAULT,
@@ -937,4 +936,70 @@ pub async fn settle_pending(
         "AEE settle: entry-level verdicts applied"
     );
     Some(report)
+}
+
+/// R5: `[evolution] aee_settle_hours` direction, pinned.
+///
+/// absent / malformed / wrong-typed / non-positive ⇒ [`AEE_SETTLE_HOURS_DEFAULT`],
+/// and any value is capped at 30 days.
+///
+/// The quirk worth pinning is the **opposite** of `[fork]`'s budget keys and
+/// of `[evolution.noise_band]`, both of which used `as_float()` alone and so
+/// ignored an integer literal. This reader wrote
+/// `as_float().or_else(|| as_integer().map(|i| i as f64))`, so
+/// `aee_settle_hours = 24` was — and remains — honoured. The typed field
+/// therefore uses `lenient::opt_number_lossy`, not `opt_float_strict`.
+/// Converging the two would be a real behavior change smuggled in by a schema
+/// refactor.
+#[cfg(test)]
+mod settle_hours_tests {
+    use super::{settle_hours, AEE_SETTLE_HOURS_DEFAULT};
+
+    fn dir_with(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn default_direction_settle_hours_falls_back_on_anything_unusable() {
+        for body in [
+            "",                                            // empty file
+            "[evolution]\n",                               // section, no key
+            "[evolution]\naee_settle_hours = 0\n",         // non-positive
+            "[evolution]\naee_settle_hours = -1.0\n",      // negative
+            "[evolution]\naee_settle_hours = \"24\"\n",    // wrong type
+            "[evolution]\naee_settle_hours = true\n",      // wrong type
+            "evolution = \"scalar\"\n",                    // wrong-typed section
+            "not toml [[[",                                // malformed file
+        ] {
+            let dir = dir_with(body);
+            assert_eq!(
+                settle_hours(dir.path()),
+                AEE_SETTLE_HOURS_DEFAULT,
+                "for {body:?}"
+            );
+        }
+
+        // Missing file entirely — same direction.
+        let empty = tempfile::TempDir::new().unwrap();
+        assert_eq!(settle_hours(empty.path()), AEE_SETTLE_HOURS_DEFAULT);
+    }
+
+    #[test]
+    fn default_direction_settle_hours_accepts_integer_literal() {
+        // The deliberate opposite of `[fork] default_budget_usd` and
+        // `[evolution.noise_band]`, both of which ignore an integer.
+        let dir = dir_with("[evolution]\naee_settle_hours = 48\n");
+        assert_eq!(settle_hours(dir.path()), 48.0);
+
+        let dir = dir_with("[evolution]\naee_settle_hours = 1.5\n");
+        assert_eq!(settle_hours(dir.path()), 1.5);
+    }
+
+    #[test]
+    fn default_direction_settle_hours_is_capped_at_thirty_days() {
+        let dir = dir_with("[evolution]\naee_settle_hours = 100000.0\n");
+        assert_eq!(settle_hours(dir.path()), 24.0 * 30.0);
+    }
 }

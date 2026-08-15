@@ -121,21 +121,12 @@ pub fn runtime_mode_for_agent(agent_dir: &Path) -> RuntimeMode {
     if is_pty_pool_disabled_globally() {
         return RuntimeMode::FreshSpawn;
     }
-    let path = agent_dir.join("agent.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return RuntimeMode::FreshSpawn;
-    };
-    let Ok(value) = text.parse::<toml::Value>() else {
-        warn!(
-            agent_dir = %agent_dir.display(),
-            "pty_runtime: agent.toml parse failed — defaulting to FreshSpawn"
-        );
-        return RuntimeMode::FreshSpawn;
-    };
-    let enabled = value
-        .get("runtime")
-        .and_then(|r| r.get("pty_pool_enabled"))
-        .and_then(|b| b.as_bool())
+    // Shared typed parse point (R2 unification) instead of a hand-rolled
+    // `toml::Value` walk: absent file / absent key / malformed TOML / a
+    // non-bool value all still resolve to `false` ⇒ `FreshSpawn`.
+    let enabled = duduclaw_core::agent_toml::load(agent_dir)
+        .runtime
+        .pty_pool_enabled
         .unwrap_or(false);
     if enabled {
         // WP10 (2026-08-04 field incident): honour the runtime demotion
@@ -372,11 +363,8 @@ pub fn resolve_interactive_deadline_secs(
         return secs;
     }
     if let Some(secs) = agent_toml_text
-        .and_then(|t| t.parse::<toml::Value>().ok())
-        .as_ref()
-        .and_then(|v| v.get("runtime"))
-        .and_then(|r| r.get("pty_interactive_timeout_secs"))
-        .and_then(|x| x.as_integer())
+        .map(duduclaw_core::agent_toml::parse)
+        .and_then(|s| s.runtime.pty_interactive_timeout_secs)
         .filter(|s| *s > 0)
     {
         return secs as u64;
@@ -403,11 +391,8 @@ pub fn resolve_interactive_idle_secs(
         return secs;
     }
     if let Some(secs) = agent_toml_text
-        .and_then(|t| t.parse::<toml::Value>().ok())
-        .as_ref()
-        .and_then(|v| v.get("runtime"))
-        .and_then(|r| r.get("pty_idle_timeout_secs"))
-        .and_then(|x| x.as_integer())
+        .map(duduclaw_core::agent_toml::parse)
+        .and_then(|s| s.runtime.pty_idle_timeout_secs)
         .filter(|s| *s > 0)
     {
         return secs as u64;
@@ -1549,6 +1534,100 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    // ── R5: `[runtime]` PTY directions, pinned ───────────────────────────
+    //
+    //   pty_pool_enabled  absent / malformed / wrong-typed ⇒ FreshSpawn.
+    //                 The pool is opt-in and (per CLAUDE.md) leaks context
+    //                 across conversations, so an unreadable config must
+    //                 never route an agent INTO it.
+    //   pty_interactive_timeout_secs / pty_idle_timeout_secs
+    //                 absent / wrong-typed / non-positive ⇒ the module
+    //                 constant. `0` means "use the default", never "no
+    //                 deadline" — a hard cap may not be disabled by config.
+
+    #[test]
+    fn default_direction_pty_pool_absent_is_fresh_spawn() {
+        // The env kill-switch is checked before the file, so skip this whole
+        // test if the ambient environment has it set.
+        if is_pty_pool_disabled_globally() {
+            return;
+        }
+        for body in [
+            "",                                       // empty file
+            "[runtime]\n",                            // section, no key
+            "[runtime]\nprovider = \"codex\"\n",      // sibling key only
+            "[runtime]\npty_pool_enabled = false\n",  // explicit off
+            "[runtime]\npty_pool_enabled = \"true\"\n", // wrong type
+            "[runtime]\npty_pool_enabled = 1\n",      // wrong type
+            "runtime = \"scalar\"\n",                 // wrong-typed section
+            "this is not toml {{{",                   // malformed file
+        ] {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("agent.toml"), body).unwrap();
+            assert_eq!(
+                runtime_mode_for_agent(dir.path()),
+                RuntimeMode::FreshSpawn,
+                "must stay FreshSpawn for {body:?}"
+            );
+        }
+
+        // Missing file entirely — same direction.
+        let empty = tempdir().unwrap();
+        assert_eq!(runtime_mode_for_agent(empty.path()), RuntimeMode::FreshSpawn);
+    }
+
+    #[test]
+    fn default_direction_pty_timeouts_treat_zero_as_default_not_infinite() {
+        for body in [
+            None,                                             // no file text
+            Some(""),                                         // empty
+            Some("[runtime]\n"),                              // no key
+            Some("[runtime]\npty_interactive_timeout_secs = 0\n"),
+            Some("[runtime]\npty_interactive_timeout_secs = -1\n"),
+            Some("[runtime]\npty_interactive_timeout_secs = \"600\"\n"),
+            Some("[runtime]\npty_interactive_timeout_secs = 600.0\n"), // float ⇒ not an int
+            Some("runtime = 5\n"),
+            Some("not toml [[["),
+        ] {
+            assert_eq!(
+                resolve_interactive_deadline_secs(None, body),
+                PTY_INTERACTIVE_DEADLINE_SECS,
+                "for {body:?}"
+            );
+        }
+        assert_eq!(
+            resolve_interactive_deadline_secs(None, Some("[runtime]\npty_interactive_timeout_secs = 600\n")),
+            600
+        );
+
+        for body in [
+            None,
+            Some("[runtime]\n"),
+            Some("[runtime]\npty_idle_timeout_secs = 0\n"),
+            Some("[runtime]\npty_idle_timeout_secs = \"90\"\n"),
+            Some("not toml [[["),
+        ] {
+            assert_eq!(
+                resolve_interactive_idle_secs(None, body),
+                PTY_INTERACTIVE_IDLE_SECS,
+                "for {body:?}"
+            );
+        }
+        assert_eq!(
+            resolve_interactive_idle_secs(None, Some("[runtime]\npty_idle_timeout_secs = 90\n")),
+            90
+        );
+
+        // The env override still wins over a valid file value.
+        assert_eq!(
+            resolve_interactive_deadline_secs(
+                Some("300"),
+                Some("[runtime]\npty_interactive_timeout_secs = 600\n")
+            ),
+            300
+        );
+    }
 
     #[test]
     fn account_env_stash_roundtrip() {
