@@ -795,6 +795,19 @@ fn is_legal_header_value_char(c: char) -> bool {
     matches!(c, ' '..='~')
 }
 
+/// Whether a header value is legal to send: non-empty, within the length cap,
+/// visible ASCII only.
+///
+/// The same rule [`validate_headers`] enforces at config-load time, exposed so
+/// that a value which never went through config validation — one resolved from
+/// a `secret://` backend at request time
+/// ([`crate::tick_headers::resolve_header_secrets`]) — is held to it too.
+pub(crate) fn header_value_is_legal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_HEADER_VALUE_BYTES
+        && value.chars().all(is_legal_header_value_char)
+}
+
 /// `^[a-z0-9][a-z0-9-]{0,63}$`, hand-rolled (the project does not carry a
 /// regex dependency for this class of check — see
 /// `autopilot_engine::is_safe_agent_id`).

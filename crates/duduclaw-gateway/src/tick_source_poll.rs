@@ -147,6 +147,25 @@ pub(crate) fn build_header_map(custom: &BTreeMap<String, String>) -> HeaderMap {
     map
 }
 
+/// WP-H1 P1 — this request's headers with any `secret://` value resolved.
+///
+/// Called per poll, not per task start: the doctrine's rule is that a call site
+/// may never hold a resolved credential, and re-resolving is what makes a
+/// rotated secret take effect without restarting the gateway. Local backends
+/// (`env` / `keychain` / `file`) cost effectively nothing; a network backend
+/// owns its own TTL. Sources with no reference short-circuit inside
+/// `resolve_header_secrets` before any config read.
+async fn resolved_headers(
+    cfg: &TickSourceConfig,
+    home_dir: &std::path::Path,
+) -> BTreeMap<String, String> {
+    if !cfg.headers.values().any(|v| v.starts_with("secret://")) {
+        return cfg.headers.clone();
+    }
+    let sm_cfg = crate::tick_headers::load_secret_manager_config(home_dir).await;
+    crate::tick_headers::resolve_header_secrets(&cfg.headers, &sm_cfg, home_dir, &cfg.id).await
+}
+
 /// Where the next `file_tail` read should start, given the current cursor and
 /// the file's length.
 ///
@@ -161,6 +180,7 @@ pub fn tail_start_offset(cursor: u64, len: u64) -> u64 {
 /// most one; `file_tail` produces one per newly-appended line.
 pub(crate) async fn poll_once(
     cfg: &TickSourceConfig,
+    home_dir: &std::path::Path,
     state: &mut SourceState,
     interval: Duration,
 ) -> Result<Vec<String>, String> {
@@ -186,7 +206,7 @@ pub(crate) async fn poll_once(
             let mut response = client
                 .get(url)
                 .timeout(timeout)
-                .headers(build_header_map(&cfg.headers))
+                .headers(build_header_map(&resolved_headers(cfg, home_dir).await))
                 .send()
                 .await
                 .map_err(|e| format!("request failed: {e}"))?;
@@ -546,7 +566,7 @@ mod tests {
         };
         let hub2 = hub.clone();
         let handle = tokio::spawn(async move {
-            run_source(cfg, tx, hub2, None).await;
+            run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub2, None).await;
         });
         // `run_source` sleeps `interval_secs` (1s) before its first poll —
         // real time, not paused (this crate's tests don't depend on the

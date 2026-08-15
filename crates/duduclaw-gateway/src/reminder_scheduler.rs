@@ -35,7 +35,7 @@ use tracing::{info, warn};
 use crate::claude_runner::call_claude_for_agent_with_type;
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_security::input_guard;
-use duduclaw_security::secret_manager::{resolve_secret_reference, SecretManagerConfig};
+use duduclaw_security::secret_manager::SecretManagerConfig;
 
 // ── Constants ───────────────────────────────────────────────
 
@@ -258,50 +258,43 @@ async fn read_config(home_dir: &Path) -> Option<toml::Table> {
     content.parse().ok()
 }
 
-fn decrypt_encrypted_value(encrypted: &str, home_dir: &Path) -> Option<String> {
-    // Converged onto the shared read-only decrypt primitive (deep-review unify):
-    // one keyfile-AES decrypt path across all crates. Handles empty/short-keyfile
-    // /non-empty-result internally.
-    duduclaw_security::keyfile::decrypt_keyfile_value(encrypted, home_dir)
-}
-
+/// Read one `[channels] <field>(_enc)` credential from an already-parsed
+/// `config.toml`.
+///
+/// WP-H1 P1 — this file used to carry its own copy of the "try `_enc`, else
+/// plaintext, else maybe a `secret://` reference" logic, one of the parallel
+/// implementations the credentials doctrine set out to collapse. It now
+/// delegates to `config_crypto::config_secret_ref`, the single place that
+/// knows the config-file layout convention, which additionally brings two
+/// behaviours the local copy never had: a present-but-blank plaintext key is
+/// honoured as an explicit removal marker (so a stale ciphertext cannot
+/// resurrect a channel an operator removed), and a `secret://` reference is
+/// recognised even when it arrives *out of* the encrypted field.
+///
+/// Returns `""` — not `Option` — because all four call sites already treat an
+/// empty token as "not configured"; the emptiness is produced here only by a
+/// genuinely unset or unresolvable credential, never by a literal URI.
 async fn decrypt_channel_token(
     config: &toml::Table,
     enc_key: &str,
     plain_key: &str,
     home_dir: &Path,
 ) -> String {
-    let channels = config.get("channels").and_then(|c| c.as_table());
-
-    // 1. Encrypted form takes precedence (AES ciphertext on disk).
-    if let Some(enc_val) = channels.and_then(|c| c.get(enc_key)).and_then(|v| v.as_str()) {
-        if !enc_val.is_empty() {
-            if let Some(decrypted) = decrypt_encrypted_value(enc_val, home_dir) {
-                return decrypted;
-            }
-        }
+    // Callers pass the `_enc` field name; the shared reader wants the base.
+    let field_base = enc_key.strip_suffix("_enc").unwrap_or(plain_key);
+    debug_assert_eq!(field_base, plain_key, "enc_key must be `<plain_key>_enc`");
+    let sm_cfg: SecretManagerConfig = config
+        .get("secret_manager")
+        .cloned()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_default();
+    match crate::config_crypto::config_secret_ref(config, "channels", field_base)
+        .resolve(&sm_cfg, home_dir)
+        .await
+    {
+        Some(secret) => secret.expose_owned(),
+        None => String::new(),
     }
-
-    // 2. Plaintext field — may itself be a `secret://` Vault reference.
-    let plain = channels
-        .and_then(|c| c.get(plain_key))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if plain.starts_with("secret://") {
-        let sm_cfg: SecretManagerConfig = config
-            .get("secret_manager")
-            .cloned()
-            .and_then(|v| v.try_into().ok())
-            .unwrap_or_default();
-        // Fail-soft: an unresolvable reference yields an empty token, which
-        // the callers treat as "not configured" rather than crashing.
-        return resolve_secret_reference(plain, &sm_cfg, home_dir)
-            .await
-            .unwrap_or_default();
-    }
-
-    plain.to_string()
 }
 
 /// Best-effort typing indicator for a reminder's delivery channel.

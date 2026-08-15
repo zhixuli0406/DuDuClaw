@@ -1038,6 +1038,7 @@ mod edition_rpc_gate_table_tests {
             "security.status",
             "security.audit_log",
             "security.credential_hygiene",
+            "security.credential_inventory",
             "security.credential_cleanup",
             "killswitch.get",
             "killswitch.update",
@@ -5565,6 +5566,12 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_security_credential_hygiene().await
             }
+            // WP-H1 P1: the structured credential list — every field's
+            // `describe()` verdict (source / writable / residue), no values.
+            "security.credential_inventory" => {
+                require_admin!();
+                self.handle_security_credential_inventory().await
+            }
             "security.credential_cleanup" => {
                 require_admin!();
                 self.handle_security_credential_cleanup(ctx).await
@@ -6527,6 +6534,7 @@ impl MethodHandler {
                     { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
                     { "name": "security.status", "description": "Security system status" },
                     { "name": "security.credential_hygiene", "description": "Scan config.toml for plaintext credentials (paths only, never values)" },
+                    { "name": "security.credential_inventory", "description": "List every credential field with its source (secret:// reference / encrypted / plaintext), never a value" },
                     { "name": "security.credential_cleanup", "description": "Remove plaintext credential fields that already have an encrypted twin" },
                     { "name": "analytics.summary", "description": "Analytics summary for a period" },
                     { "name": "analytics.conversations", "description": "Daily conversation counts" },
@@ -19262,6 +19270,90 @@ impl MethodHandler {
         )
     }
 
+    /// `security.credential_inventory` (WP-H1 P1) — the structured credential
+    /// list: every credential field in `config.toml` plus every per-agent
+    /// channel token, each with the `describe()` verdict (configured / source /
+    /// source_label / writable / residue).
+    ///
+    /// This is the answer to "which settings use `secret://`, which are still
+    /// plaintext or `_enc`" without rendering the config file — the design's
+    /// §2.3 replacement for the five masking dialects. `describe()` never
+    /// resolves, so listing forty fields costs zero backend round-trips, and it
+    /// never holds a value, so there is nothing here to mask in the first
+    /// place.
+    ///
+    /// Fail-closed like its hygiene sibling: an unparsable `config.toml` is an
+    /// ERROR, never an empty (falsely reassuring) list.
+    async fn handle_security_credential_inventory(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = match self.read_config_table_strict(&config_path).await {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &format!("憑證清單讀取失敗:{e}")),
+        };
+        let mut entries = crate::security_posture::credential_inventory(&table);
+
+        // Per-agent channel tokens live in each `agent.toml`, not in
+        // `config.toml`, and they are exactly the fields the 2026-08-13 OTP
+        // incident moved a credential *into*. A list that stopped at
+        // `config.toml` would show the global token as unset with no hint that
+        // an agent now owns it.
+        let agent_ids: Vec<String> = {
+            let reg = self.registry.read().await;
+            reg.list().iter().map(|a| a.config.agent.name.clone()).collect()
+        };
+        for agent_id in agent_ids {
+            for channel in crate::channel_settings::VALID_CHANNEL_TYPES {
+                let Some(status) = crate::config_crypto::agent_channel_token_ref(
+                    &self.home_dir,
+                    &agent_id,
+                    channel,
+                )
+                .map(|r| r.describe()) else {
+                    continue;
+                };
+                if !status.configured && !status.residue {
+                    continue;
+                }
+                entries.push(crate::security_posture::CredentialEntry {
+                    path: format!("agents.{agent_id}.channels.{channel}.bot_token"),
+                    configured: status.configured,
+                    source: status.source,
+                    source_label: status.source_label,
+                    writable: status.writable,
+                    residue: status.residue,
+                });
+            }
+        }
+
+        let configured = entries.iter().filter(|e| e.configured).count();
+        let referenced = entries
+            .iter()
+            .filter(|e| {
+                !matches!(
+                    e.source,
+                    duduclaw_security::secret_ref::SourceKind::Unset
+                        | duduclaw_security::secret_ref::SourceKind::Inline
+                        | duduclaw_security::secret_ref::SourceKind::Legacy
+                        | duduclaw_security::secret_ref::SourceKind::Ambiguous
+                )
+            })
+            .count();
+        WsFrame::ok_response(
+            "",
+            json!({
+                "entries": entries,
+                "total": entries.len(),
+                "configured": configured,
+                "referenced": referenced,
+                "residue": entries.iter().filter(|e| e.residue).count(),
+                "plaintext": entries
+                    .iter()
+                    .filter(|e| e.source == duduclaw_security::secret_ref::SourceKind::Legacy)
+                    .count(),
+            }),
+        )
+    }
+
     /// `security.credential_cleanup` (WP-K) — removes ONLY plaintext
     /// credential fields that already have a confirmed `_enc` twin (the
     /// residue pattern from the 2026-08-15 `[[accounts]] oauth_token`
@@ -22511,15 +22603,39 @@ impl MethodHandler {
             toml::Value::Integer(budget_cents as i64),
         );
         account.insert("priority".into(), toml::Value::Integer(priority as i64));
-        // Store plaintext key for runtime use + encrypted version for security
+        // WP-H1 P1 — write ONE of the two, never both.
+        //
+        // This line used to store the plaintext *and* the ciphertext side by
+        // side, which is precisely how the 2026-08-15 incident got made
+        // (`DESIGN-credentials-doctrine-2026-08.md` §1.5): the read paths only
+        // ever consume `<field>_enc`, so the plaintext was inert — and being
+        // inert, nothing ever cleaned it up, while `system.config`'s
+        // array-of-tables masking gap let it be read straight back out. The
+        // channel write path has always done the right thing here (it *removes*
+        // the plaintext key after encrypting, `handlers.rs` channel closure);
+        // this brings `[[accounts]]` into line.
+        //
+        // Plaintext is written only when encryption is impossible (no writable
+        // keyfile) — refusing outright would leave an operator unable to add an
+        // account at all, so it degrades loudly instead.
         let key_field = if auth_type == "oauth" {
             "oauth_token"
         } else {
             "anthropic_api_key"
         };
-        account.insert(key_field.into(), toml::Value::String(key.into()));
-        if let Some(enc) = &encrypted {
-            account.insert(format!("{key_field}_enc"), toml::Value::String(enc.clone()));
+        match &encrypted {
+            Some(enc) => {
+                account.insert(format!("{key_field}_enc"), toml::Value::String(enc.clone()));
+            }
+            None => {
+                warn!(
+                    id,
+                    field = key_field,
+                    "could not encrypt account credential (no writable keyfile) — storing it as \
+                     plaintext in config.toml; run `duduclaw doctor` after fixing the keyfile"
+                );
+                account.insert(key_field.into(), toml::Value::String(key.into()));
+            }
         }
         arr.push(toml::Value::Table(account));
 
@@ -26845,7 +26961,7 @@ impl MethodHandler {
             Err(e) => (false, String::new(), String::new(), e.to_string()),
         };
 
-        let bridge = crate::google_apps_script::config_for_home(&self.home_dir);
+        let bridge = crate::google_apps_script::config_for_home(&self.home_dir).await;
         let (gas_configured, gas_url, gas_error) = match bridge {
             Ok(Some(c)) => (true, c.url, String::new()),
             Ok(None) => (false, String::new(), String::new()),

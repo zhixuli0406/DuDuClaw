@@ -206,6 +206,131 @@ fn bind_is_loopback(bind: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── Credentials (WP-H1 P1) ──────────────────────────────────────
+//
+// The design doc's §3 P1 line: "`duduclaw doctor` 加憑證體檢（列出每個 ref 的
+// `describe()`,標出 unset / 不可解 / 明文殘留）". Same
+// `security_posture::credential_inventory` the dashboard RPC reads, so the CLI
+// and the dashboard can never disagree about what is configured — this
+// module's stated single-source convention.
+
+/// What `doctor` needs to say about this deployment's credentials.
+///
+/// Counts and paths only. `describe()` does not resolve, so building this
+/// costs no backend round-trip and cannot leak a value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CredentialAudit {
+    /// Total credential fields found.
+    pub total: usize,
+    /// Fields with a source configured.
+    pub configured: usize,
+    /// Fields sourced from an external `secret://` reference.
+    pub referenced: usize,
+    /// Fields still holding bare plaintext (no `_enc`, no reference).
+    pub plaintext_paths: Vec<String>,
+    /// Fields with a plaintext twin sitting next to a `_enc` twin (§1.5).
+    pub residue_paths: Vec<String>,
+    /// Fields whose reference cannot be parsed at all — the config names a
+    /// source that does not exist, so the credential is silently unusable.
+    pub broken_reference_paths: Vec<String>,
+}
+
+impl CredentialAudit {
+    /// Nothing an operator needs to act on.
+    pub fn is_clean(&self) -> bool {
+        self.plaintext_paths.is_empty()
+            && self.residue_paths.is_empty()
+            && self.broken_reference_paths.is_empty()
+    }
+
+    /// One-line zh-TW summary for the `doctor` table.
+    pub fn summary(&self) -> String {
+        if self.total == 0 {
+            return "設定檔中沒有任何憑證欄位。".to_string();
+        }
+        if self.is_clean() {
+            return format!(
+                "{} 個憑證欄位（{} 個已設定,{} 個走 secret:// 外部來源）,沒有明文或殘留。",
+                self.total, self.configured, self.referenced
+            );
+        }
+        let mut parts = Vec::new();
+        if !self.residue_paths.is_empty() {
+            parts.push(format!(
+                "{} 個明文殘留（已有加密孿生,可用 `duduclaw doctor --fix-residue` 清掉）:{}",
+                self.residue_paths.len(),
+                self.residue_paths.join(", ")
+            ));
+        }
+        if !self.plaintext_paths.is_empty() {
+            parts.push(format!(
+                "{} 個仍是明文（請在儀表板重存以加密,或改成 secret:// 參照）:{}",
+                self.plaintext_paths.len(),
+                self.plaintext_paths.join(", ")
+            ));
+        }
+        if !self.broken_reference_paths.is_empty() {
+            parts.push(format!(
+                "{} 個 secret:// 參照無法解析,這些憑證等於沒設定:{}",
+                self.broken_reference_paths.len(),
+                self.broken_reference_paths.join(", ")
+            ));
+        }
+        parts.join("；")
+    }
+}
+
+/// Audit a parsed `config.toml`. Split from [`credential_audit`] so the
+/// classification rules are testable without touching a filesystem.
+pub fn credential_audit_of(table: &toml::Table) -> CredentialAudit {
+    use duduclaw_security::secret_ref::SourceKind;
+
+    let entries = crate::security_posture::credential_inventory(table);
+    let mut audit = CredentialAudit {
+        total: entries.len(),
+        ..Default::default()
+    };
+    for e in entries {
+        if e.configured {
+            audit.configured += 1;
+        }
+        match e.source {
+            SourceKind::Legacy => audit.plaintext_paths.push(e.path.clone()),
+            SourceKind::Env
+            | SourceKind::Keychain
+            | SourceKind::File
+            | SourceKind::Vault
+            | SourceKind::OnePassword
+            | SourceKind::Infisical
+            | SourceKind::Local => audit.referenced += 1,
+            // `describe()` reports an unparseable reference as `Unset` with the
+            // label `unset(invalid-reference)` — the one case where "unset" has
+            // a cause worth naming, because the operator believes it is set.
+            SourceKind::Unset if e.source_label == "unset(invalid-reference)" => {
+                audit.broken_reference_paths.push(e.path.clone())
+            }
+            SourceKind::Unset | SourceKind::Inline | SourceKind::Ambiguous => {}
+        }
+        if e.residue {
+            audit.residue_paths.push(e.path);
+        }
+    }
+    audit
+}
+
+/// Audit the live home's `config.toml`.
+///
+/// An unreadable or unparsable file yields an empty audit rather than an error:
+/// `doctor` already has a dedicated check for "config.toml is missing/broken",
+/// and this probe must not double-report it.
+pub fn credential_audit(home: &Path) -> CredentialAudit {
+    std::fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .map(|t| credential_audit_of(&t))
+        .unwrap_or_default()
+}
+
 // ── Grok CLI ────────────────────────────────────────────────────
 
 /// Outcome of the live `grok -p "ping"` run.
@@ -401,5 +526,59 @@ mod tests {
         // about on a brand-new install.
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(local_auto_login_exposure(dir.path()), None);
+    }
+
+    // ── WP-H1 P1: credential audit ────────────────────────────────────
+
+    fn audit(toml_str: &str) -> CredentialAudit {
+        credential_audit_of(&toml_str.parse::<toml::Table>().unwrap())
+    }
+
+    #[test]
+    fn a_fully_encrypted_config_is_clean() {
+        let a = audit(
+            r#"
+            [channels]
+            telegram_bot_token_enc = "Y2lwaGVy"
+            discord_bot_token = "secret://env/DISCORD_TOKEN"
+            "#,
+        );
+        assert!(a.is_clean(), "{a:?}");
+        assert_eq!(a.total, 2);
+        assert_eq!(a.configured, 2);
+        assert_eq!(a.referenced, 1);
+        assert!(a.summary().contains("沒有明文或殘留"));
+    }
+
+    #[test]
+    fn plaintext_residue_and_broken_references_are_reported_separately() {
+        let a = audit(
+            r#"
+            [channels]
+            slack_bot_token = "xoxb-bare-plaintext"
+            [[accounts]]
+            oauth_token = "leftover"
+            oauth_token_enc = "Y2lwaGVy"
+            [voice]
+            stt_api_key = "secret://nosuchbackend/whatever"
+            "#,
+        );
+        assert_eq!(a.plaintext_paths, vec!["channels.slack_bot_token"]);
+        assert_eq!(a.residue_paths, vec!["accounts[0].oauth_token"]);
+        assert_eq!(a.broken_reference_paths, vec!["voice.stt_api_key"]);
+        assert!(!a.is_clean());
+        // The summary names paths, never values.
+        let s = a.summary();
+        assert!(!s.contains("xoxb-bare-plaintext"), "{s}");
+        assert!(!s.contains("leftover"), "{s}");
+        assert!(!s.contains("Y2lwaGVy"), "{s}");
+    }
+
+    #[test]
+    fn an_unreadable_home_yields_an_empty_audit_not_a_false_alarm() {
+        let a = credential_audit(std::path::Path::new("/nonexistent-duduclaw-home"));
+        assert_eq!(a, CredentialAudit::default());
+        assert!(a.is_clean());
+        assert!(a.summary().contains("沒有任何憑證欄位"));
     }
 }

@@ -227,22 +227,26 @@ impl std::fmt::Debug for OpenAiCompatConfig {
 impl OpenAiCompatConfig {
     /// Resolve the effective API key, read-only / fail-soft.
     ///
-    /// If `api_key_enc` is set + non-empty, decrypt it via the per-machine
-    /// keyfile (`~/.duduclaw/.keyfile`). On any decrypt failure (missing/short
-    /// keyfile, bad ciphertext) this falls back to the plaintext `api_key`.
-    /// Returns `None` when neither yields a non-empty key — callers should then
-    /// behave as today's "no key" case (no Authorization header).
+    /// `api_key_enc` first (decrypted via the per-machine keyfile), then the
+    /// plaintext `api_key`. Returns `None` when neither yields a non-empty key
+    /// — callers behave as the "no key" case (no Authorization header).
+    ///
+    /// WP-H1 P1 — this was the seventh hand-rolled decrypt dialect. Its
+    /// plaintext branch returned the field verbatim, so
+    /// `api_key = "secret://vault/deepseek"` was sent to the vendor **as the
+    /// bearer token**: every request failed 401 while the operator's secret
+    /// backend layout travelled in an `Authorization` header. Routing through
+    /// the shared [`duduclaw_security::secret_ref::SecretRef`] resolves the
+    /// reference instead (`env` / `keychain` / `file` here — a network backend
+    /// fails closed with a warning, never a literal, since this call site is
+    /// synchronous).
     pub fn resolved_api_key(&self, home_dir: &std::path::Path) -> Option<String> {
-        if let Some(enc) = self.api_key_enc.as_deref() {
-            if !enc.is_empty() {
-                if let Some(plain) =
-                    duduclaw_security::keyfile::decrypt_keyfile_value(enc, home_dir)
-                {
-                    return Some(plain);
-                }
-            }
-        }
-        self.api_key.clone().filter(|s| !s.is_empty())
+        duduclaw_security::secret_ref::SecretRef::from_typed(
+            self.api_key_enc.as_deref(),
+            self.api_key.as_deref().unwrap_or(""),
+        )
+        .resolve_sync(home_dir)
+        .map(|s| s.expose_owned())
     }
 }
 
@@ -564,6 +568,25 @@ mod openai_compat_key_tests {
         let home = TempHome::new();
         let c = cfg(Some("sk-plain"), Some("garbage"));
         assert_eq!(c.resolved_api_key(home.path()).as_deref(), Some("sk-plain"));
+    }
+
+    /// WP-H1 P1 — the dialect-7 bug: a `secret://` reference used to be
+    /// returned as the bearer token.
+    #[test]
+    fn a_secret_reference_resolves_and_never_becomes_the_bearer_token() {
+        let home = TempHome::new();
+        let var = format!("DUDUCLAW_INFER_KEY_{}", std::process::id());
+        // SAFETY: process-unique variable name, set and removed within this test.
+        unsafe { std::env::set_var(&var, "sk-from-env") };
+        let c = cfg(Some(&format!("secret://env/{var}")), None);
+        let got = c.resolved_api_key(home.path());
+        unsafe { std::env::remove_var(&var) };
+        assert_eq!(got.as_deref(), Some("sk-from-env"));
+
+        // A network-backed reference cannot be fetched from this synchronous
+        // path — it must read as "no key", never as the URI itself.
+        let c = cfg(Some("secret://vault/deepseek"), None);
+        assert_eq!(c.resolved_api_key(home.path()), None);
     }
 
     #[test]

@@ -867,6 +867,7 @@ impl SourceState {
 /// caller does not need to branch.
 pub fn spawn_tick_sources(
     config: &TickConfig,
+    home_dir: &std::path::Path,
     tx: broadcast::Sender<AutopilotEvent>,
     hub: Arc<TickHub>,
     events_bus: Option<Arc<crate::events_store::EventBusStore>>,
@@ -876,8 +877,12 @@ pub fn spawn_tick_sources(
         return Vec::new();
     }
     let mut handles = Vec::with_capacity(active.len());
+    // WP-H1 P1 — shared so each source task can resolve `secret://` header
+    // references against this home at request time.
+    let home: Arc<std::path::PathBuf> = Arc::new(home_dir.to_path_buf());
     for source in active {
         let cfg = source.clone();
+        let home = home.clone();
         let tx = tx.clone();
         let hub = hub.clone();
         let bus = events_bus.clone();
@@ -888,7 +893,7 @@ pub fn spawn_tick_sources(
             "tick source started"
         );
         handles.push(tokio::spawn(async move {
-            run_source(cfg, tx, hub, bus).await;
+            run_source(cfg, home, tx, hub, bus).await;
         }));
     }
     handles
@@ -898,6 +903,7 @@ pub fn spawn_tick_sources(
 /// shutdown) is what stops it, matching every other resident loop.
 pub(crate) async fn run_source(
     cfg: TickSourceConfig,
+    home_dir: Arc<std::path::PathBuf>,
     tx: broadcast::Sender<AutopilotEvent>,
     hub: Arc<TickHub>,
     events_bus: Option<Arc<crate::events_store::EventBusStore>>,
@@ -906,7 +912,7 @@ pub(crate) async fn run_source(
     // loop instead of the sleep-then-poll loop below. Everything downstream of
     // "here is a payload" is the same `emit_payload` pipeline.
     if cfg.kind == TickKind::Websocket {
-        crate::tick_source_ws::run_websocket_source(cfg, tx, hub, events_bus).await;
+        crate::tick_source_ws::run_websocket_source(cfg, home_dir, tx, hub, events_bus).await;
         return;
     }
 
@@ -927,7 +933,7 @@ pub(crate) async fn run_source(
     loop {
         tokio::time::sleep(interval).await;
 
-        let payloads = match crate::tick_source_poll::poll_once(&cfg, &mut state, interval).await {
+        let payloads = match crate::tick_source_poll::poll_once(&cfg, &home_dir, &mut state, interval).await {
             Ok(p) => p,
             Err(e) => {
                 state.failures += 1;

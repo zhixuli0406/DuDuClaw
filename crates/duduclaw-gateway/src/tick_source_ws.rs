@@ -186,6 +186,7 @@ enum SessionOutcome {
 /// stops it, so shutdown behaves identically to every other source kind.
 pub(crate) async fn run_websocket_source(
     cfg: TickSourceConfig,
+    home_dir: Arc<std::path::PathBuf>,
     tx: broadcast::Sender<AutopilotEvent>,
     hub: Arc<TickHub>,
     events_bus: Option<Arc<crate::events_store::EventBusStore>>,
@@ -208,7 +209,8 @@ pub(crate) async fn run_websocket_source(
     loop {
         let started = Instant::now();
         let outcome =
-            stream_websocket(&cfg, &url, &mut state, &tx, &hub, events_bus.as_ref()).await;
+            stream_websocket(&cfg, &home_dir, &url, &mut state, &tx, &hub, events_bus.as_ref())
+                .await;
         let session = started.elapsed();
         let mut recycled = false;
 
@@ -287,6 +289,7 @@ fn jitter_seed() -> u32 {
 /// address is by definition internal, and there is nothing to rebind to.
 async fn connect_source(
     cfg: &TickSourceConfig,
+    home_dir: &std::path::Path,
     url: &str,
     dns: &mut crate::tick_source::DnsCache,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
@@ -309,7 +312,13 @@ async fn connect_source(
     // can overwrite the handshake the library just generated. Values are never
     // logged — only the name is, and only when it fails to encode (which
     // config validation already makes unreachable).
-    for (name, value) in &cfg.headers {
+    // WP-H1 P1 — resolved per dial (a reconnect re-reads the backend), and
+    // re-validated: a value from Vault/keychain/file never passed through
+    // `validate_headers`, so CR/LF injection is checked again there.
+    let sm_cfg = crate::tick_headers::load_secret_manager_config(home_dir).await;
+    let resolved =
+        crate::tick_headers::resolve_header_secrets(&cfg.headers, &sm_cfg, home_dir, &cfg.id).await;
+    for (name, value) in &resolved {
         match (
             HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(value),
@@ -365,6 +374,7 @@ async fn connect_source(
 /// failed mid-stream.
 async fn stream_websocket(
     cfg: &TickSourceConfig,
+    home_dir: &std::path::Path,
     url: &str,
     state: &mut SourceState,
     tx: &broadcast::Sender<AutopilotEvent>,
@@ -376,7 +386,10 @@ async fn stream_websocket(
     // call is the same convention `poll_once` follows for `http_poll`.
     crate::tick_config::validate_ws_url(url)?;
 
-    let stream = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_source(cfg, url, &mut state.dns))
+    let stream = tokio::time::timeout(
+        WS_CONNECT_TIMEOUT,
+        connect_source(cfg, home_dir, url, &mut state.dns),
+    )
         .await
         .map_err(|_| format!("connect timed out after {}s", WS_CONNECT_TIMEOUT.as_secs()))??;
 
@@ -721,7 +734,7 @@ mod tests {
         cfg.idle_timeout_secs = 1;
         let hub = Arc::new(TickHub::new());
         let (tx, _rx) = broadcast::channel(16);
-        let source = tokio::spawn(run_source(cfg, tx, hub.clone(), None));
+        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub.clone(), None));
 
         let redialled = wait_until(Duration::from_secs(15), || {
             accepts.load(std::sync::atomic::Ordering::SeqCst) >= 2
@@ -769,7 +782,7 @@ mod tests {
         // make "did a ping arrive" depend on reconnect timing.
         let hub = Arc::new(TickHub::new());
         let (tx, _rx) = broadcast::channel(16);
-        let source = tokio::spawn(run_source(cfg, tx, hub, None));
+        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub, None));
 
         let pinged = tokio::time::timeout(Duration::from_secs(15), ping_rx).await;
         assert!(pinged.is_ok(), "no client ping reached the server");
@@ -815,7 +828,7 @@ mod tests {
         cfg.json_fields = pointers(&[("p", "/p")]);
         let hub = Arc::new(TickHub::new());
         let (tx, _rx) = broadcast::channel(64);
-        let source = tokio::spawn(run_source(cfg, tx, hub.clone(), None));
+        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub.clone(), None));
 
         // Long enough to cross the 2 s idle deadline twice over if the clock
         // were not being reset by the incoming frames.
@@ -877,7 +890,7 @@ mod tests {
         ]);
         let hub = Arc::new(TickHub::new());
         let (tx, _rx) = broadcast::channel(16);
-        let source = tokio::spawn(run_source(cfg, tx, hub, None));
+        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub, None));
 
         let seen = tokio::time::timeout(Duration::from_secs(15), seen_rx)
             .await
@@ -950,7 +963,7 @@ mod tests {
             baseline_max_age_secs: crate::tick_config::DEFAULT_BASELINE_MAX_AGE_SECS,
             dns_ttl_secs: 0,
         };
-        let source = tokio::spawn(run_source(cfg, tx, hub.clone(), None));
+        let source = tokio::spawn(run_source(cfg, Arc::new(std::env::temp_dir()), tx, hub.clone(), None));
 
         // Wait for both text frames to have made it through the pipeline.
         let settled = tokio::time::timeout(Duration::from_secs(10), async {

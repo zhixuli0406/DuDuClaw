@@ -269,6 +269,129 @@ pub fn strip_twin_residue(table: &mut toml::Table) -> Vec<String> {
     removed
 }
 
+// ── WP-H1 P1: the structured credential inventory ─────────────────────────
+//
+// `find_plaintext_secrets` answers "what is wrong". The inventory answers the
+// prior question — "what credentials does this deployment have, and where does
+// each one actually come from" — which is the design doc's §2.3 `describe()`
+// contract applied to a whole config file. It is the reason `describe()` was
+// built not to resolve: forty fields render for zero backend round-trips.
+//
+// Both walk the same tree with the same field-name heuristic, so a field can
+// never appear in one and be invisible to the other.
+
+/// One credential field and its non-secret status.
+///
+/// Serialises to exactly the fields of
+/// [`duduclaw_security::secret_ref::SecretStatus`] plus a `path`. Never carries
+/// a value, a ciphertext, or a masked fragment of either.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CredentialEntry {
+    /// Dotted/bracket TOML path of the logical field, always the **base** name
+    /// (`accounts[0].oauth_token`), never the `_enc` twin — the twin is a
+    /// storage detail, reported through `source` instead.
+    pub path: String,
+    pub configured: bool,
+    /// `unset` | `inline` | `legacy` | `env` | `keychain` | `file` | `vault` |
+    /// `onepassword` | `infisical` | `local` | `ambiguous`.
+    pub source: duduclaw_security::secret_ref::SourceKind,
+    /// Non-secret human description, e.g. `"encrypted(keyfile)"`,
+    /// `"env:TELEGRAM_BOT_TOKEN"`, `"keychain:duduclaw/telegram"`.
+    pub source_label: String,
+    /// Whether the dashboard may overwrite this field. External references are
+    /// rotated in their own backend, so the UI must not offer to.
+    pub writable: bool,
+    /// A plaintext twin sits next to a `_enc` twin (design §1.5).
+    pub residue: bool,
+}
+
+/// Walk a parsed `config.toml` and describe every credential field it holds.
+///
+/// Pairing rule, identical to the one every read path uses: `<field>` is the
+/// logical credential and `<field>_enc` is its ciphertext twin, so a table
+/// containing only `x_enc` still yields one entry at path `x`. Ordering is the
+/// TOML map's own (`BTreeMap`, i.e. sorted), so the dashboard list is stable
+/// across refreshes.
+pub fn credential_inventory(table: &toml::Table) -> Vec<CredentialEntry> {
+    use duduclaw_security::secret_ref::SecretRef;
+
+    fn describe_field(t: &toml::Table, base: &str, path: String, out: &mut Vec<CredentialEntry>) {
+        let enc_key = format!("{base}_enc");
+        let st = SecretRef::classify(
+            t.get(&enc_key).and_then(|v| v.as_str()),
+            t.get(base).and_then(|v| v.as_str()),
+        )
+        .describe();
+        out.push(CredentialEntry {
+            path,
+            configured: st.configured,
+            source: st.source,
+            source_label: st.source_label,
+            writable: st.writable,
+            residue: st.residue,
+        });
+    }
+
+    fn walk(t: &toml::Table, path: &str, out: &mut Vec<CredentialEntry>) {
+        // Collect logical base names first so `x` and `x_enc` produce exactly
+        // one entry regardless of which the map yields first.
+        let mut bases: Vec<String> = Vec::new();
+        for k in t.keys() {
+            let base = k.strip_suffix("_enc").unwrap_or(k);
+            if !is_secret_key_name(base) {
+                continue;
+            }
+            // Only string-valued fields are credentials; a `[tokens]` table
+            // named like one is a container, handled by the recursion below.
+            let is_stringy = t.get(base).is_some_and(|v| v.is_str())
+                || t.get(&format!("{base}_enc")).is_some_and(|v| v.is_str());
+            if is_stringy && !bases.iter().any(|b| b == base) {
+                bases.push(base.to_string());
+            }
+        }
+        bases.sort();
+        for base in bases {
+            let field_path = if path.is_empty() {
+                base.clone()
+            } else {
+                format!("{path}.{base}")
+            };
+            describe_field(t, &base, field_path, out);
+        }
+
+        for (k, v) in t.iter() {
+            // `[mcp_keys]` stores the API key as the *table name*
+            // (design §1.4). An inventory renders paths, so descending here
+            // would print the gateway's own admin key into the dashboard —
+            // the exact leak this pass exists to close. The section is skipped
+            // whole; `mcp_keys.list` already reports it, masked.
+            if path.is_empty() && k == "mcp_keys" {
+                continue;
+            }
+            let child = if path.is_empty() {
+                k.clone()
+            } else {
+                format!("{path}.{k}")
+            };
+            match v {
+                toml::Value::Table(sub) => walk(sub, &child, out),
+                toml::Value::Array(arr) => {
+                    for (i, item) in arr.iter().enumerate() {
+                        if let toml::Value::Table(sub) = item {
+                            walk(sub, &format!("{child}[{i}]"), out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(table, "", &mut out);
+    out
+}
+
 /// Compute the security posture from the live home directory.
 pub fn compute_posture(home_dir: &Path) -> PostureReport {
     let cfg = read_config(home_dir);
@@ -511,5 +634,148 @@ mod tests {
         // Idempotent: nothing left to remove on a second pass.
         let removed_again = strip_twin_residue(&mut table);
         assert!(removed_again.is_empty());
+    }
+
+    // ── WP-H1 P1: credential_inventory ────────────────────────────────────
+
+    use duduclaw_security::secret_ref::SourceKind;
+
+    fn inv(toml_str: &str) -> Vec<CredentialEntry> {
+        credential_inventory(&toml_str.parse::<toml::Table>().unwrap())
+    }
+
+    fn at<'a>(entries: &'a [CredentialEntry], path: &str) -> &'a CredentialEntry {
+        entries
+            .iter()
+            .find(|e| e.path == path)
+            .unwrap_or_else(|| panic!("no entry at {path}; got {:?}", entries.iter().map(|e| &e.path).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn inventory_reports_each_source_kind() {
+        let entries = inv(r#"
+            [channels]
+            telegram_bot_token_enc = "Y2lwaGVy"
+            discord_bot_token = "secret://env/DISCORD_TOKEN"
+            slack_bot_token = "xoxb-plain-legacy"
+            line_channel_token = "secret://keychain/duduclaw/line"
+            teams_app_password = "secret://file//run/secrets/teams"
+            wecom_secret = ""
+        "#);
+        assert_eq!(at(&entries, "channels.telegram_bot_token").source, SourceKind::Inline);
+        assert_eq!(at(&entries, "channels.discord_bot_token").source, SourceKind::Env);
+        assert_eq!(at(&entries, "channels.slack_bot_token").source, SourceKind::Legacy);
+        assert_eq!(at(&entries, "channels.line_channel_token").source, SourceKind::Keychain);
+        assert_eq!(at(&entries, "channels.teams_app_password").source, SourceKind::File);
+        assert!(!at(&entries, "channels.wecom_secret").configured);
+    }
+
+    #[test]
+    fn inventory_pairs_enc_with_its_base_and_never_lists_the_twin_separately() {
+        let entries = inv(r#"
+            [channels]
+            telegram_bot_token = "plain-residue"
+            telegram_bot_token_enc = "Y2lwaGVy"
+        "#);
+        assert_eq!(entries.len(), 1, "one logical field, not two: {entries:?}");
+        let e = at(&entries, "channels.telegram_bot_token");
+        assert_eq!(e.source, SourceKind::Inline, "ciphertext wins");
+        assert!(e.residue, "the plaintext twin is residue");
+        assert!(
+            !entries.iter().any(|e| e.path.ends_with("_enc")),
+            "the `_enc` twin is a storage detail, not its own credential"
+        );
+    }
+
+    #[test]
+    fn inventory_descends_arrays_of_tables() {
+        let entries = inv(r#"
+            [[accounts]]
+            id = "a1"
+            oauth_token_enc = "Y2lwaGVy"
+            [[accounts]]
+            id = "a2"
+            api_key = "secret://vault/anthropic"
+        "#);
+        assert_eq!(at(&entries, "accounts[0].oauth_token").source, SourceKind::Inline);
+        let a2 = at(&entries, "accounts[1].api_key");
+        assert_eq!(a2.source, SourceKind::Vault);
+        assert!(!a2.writable, "an external reference is not UI-writable");
+    }
+
+    /// §1.4's second leak: `[mcp_keys]` stores the key as the table *name*, so
+    /// an inventory that renders paths would print it verbatim.
+    #[test]
+    fn inventory_never_renders_the_mcp_keys_table_names() {
+        let entries = inv(r#"
+            [mcp_keys."ddc_prod_a1b2c3d4e5f6"]
+            scopes = ["admin"]
+            label = "internal"
+            [mcp_keys."ddc_prod_a1b2c3d4e5f6".meta]
+            rotation_token = "should-not-surface"
+        "#);
+        let joined = entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !joined.contains("ddc_prod_a1b2c3d4e5f6"),
+            "mcp_keys table names must never reach the inventory: {joined}"
+        );
+    }
+
+    #[test]
+    fn inventory_serializes_without_any_value_or_ciphertext() {
+        let entries = inv(r#"
+            [channels]
+            telegram_bot_token = "plain-secret-value"
+            telegram_bot_token_enc = "Y2lwaGVydGV4dHZhbHVl"
+        "#);
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(!json.contains("plain-secret-value"), "{json}");
+        assert!(!json.contains("Y2lwaGVydGV4dHZhbHVl"), "{json}");
+    }
+
+    /// Tick headers were the one pure-plaintext credential surface; the
+    /// inventory is how an operator now sees which of them still are.
+    #[test]
+    fn inventory_covers_tick_source_headers() {
+        let entries = inv(r#"
+            [[tick.sources]]
+            id = "feed"
+            [tick.sources.headers]
+            X-API-Key = "secret://env/FEED_KEY"
+            Accept = "application/json"
+        "#);
+        assert_eq!(
+            at(&entries, "tick.sources[0].headers.X-API-Key").source,
+            SourceKind::Env
+        );
+        assert!(
+            !entries.iter().any(|e| e.path.ends_with("Accept")),
+            "a non-credential header must not be listed"
+        );
+    }
+
+    /// The inventory and the hygiene scan must agree about which fields exist:
+    /// a residue finding with no inventory row would be invisible in the list
+    /// the operator actually reads.
+    #[test]
+    fn every_residue_finding_has_an_inventory_row() {
+        let toml_str = r#"
+            [[accounts]]
+            oauth_token = "sk-ant-oat01-PLAINTEXTLEAK"
+            oauth_token_enc = "Y2lwaGVy"
+            [channels]
+            telegram_bot_token = "plain"
+            telegram_bot_token_enc = "Y2lwaGVy"
+        "#;
+        let table: toml::Table = toml_str.parse().unwrap();
+        let entries = credential_inventory(&table);
+        for f in find_plaintext_secrets(&table).iter().filter(|f| f.has_enc_twin) {
+            let e = at(&entries, &f.path);
+            assert!(e.residue, "{} must read as residue in the inventory", f.path);
+        }
     }
 }

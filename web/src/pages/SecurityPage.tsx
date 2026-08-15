@@ -7,6 +7,7 @@ import { useSystemStore } from '@/stores/system-store';
 import { AdvancedSection, ConfirmDialog } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { CredentialHygienePanel } from '@/components/CredentialHygienePanel';
+import { CredentialInventoryPanel } from '@/components/CredentialInventoryPanel';
 import { toast, formatError } from '@/lib/toast';
 import {
   Card,
@@ -132,6 +133,12 @@ export function SecurityPage() {
           single-owner Personal install as to an Enterprise one, so unlike the
           cards below it does not fold behind the Personal AdvancedSection. */}
       <CredentialHygienePanel onGoToAccounts={() => navigate('/manage/accounts')} />
+
+      {/* Credential inventory (WP-H1 P1) — sits directly under hygiene because
+          the two answer adjacent questions: hygiene says what is wrong, the
+          inventory says where every credential comes from. Same reasoning for
+          showing it to every edition. */}
+      <CredentialInventoryPanel />
 
       {isPersonal ? (
         // Personal: everything left (audit log + kill switch) is an

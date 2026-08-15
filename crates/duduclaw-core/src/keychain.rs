@@ -152,6 +152,20 @@ pub fn delete_secret(_service: &str, _account: &str) -> Result<()> {
     Ok(())
 }
 
+// ── Availability ────────────────────────────────────────────────────────────
+
+/// Whether this binary can actually reach an OS credential store.
+///
+/// Exists because [`get_secret`] deliberately returns `Ok(None)` in a build
+/// without the feature, so that the master-key resolver can fall back to the
+/// filesystem silently. Callers for whom a keychain miss and an unbuilt
+/// keychain mean *different* things — the `secret://keychain/...` backend,
+/// where the first is "no such entry" and the second is "this binary cannot
+/// answer that question" — must distinguish them, and this is how.
+pub const fn is_available() -> bool {
+    cfg!(feature = "keychain")
+}
+
 // ── Resolver ────────────────────────────────────────────────────────────────
 
 /// Decide where the master key should come from.
