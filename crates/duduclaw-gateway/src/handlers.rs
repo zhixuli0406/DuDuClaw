@@ -1037,6 +1037,8 @@ mod edition_rpc_gate_table_tests {
             "audit.evolution_query",
             "security.status",
             "security.audit_log",
+            "security.credential_hygiene",
+            "security.credential_cleanup",
             "killswitch.get",
             "killswitch.update",
             // 帳務：同一 RPC 服務個人版預算檢視，分區隱藏在前端
@@ -5549,6 +5551,17 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_security_status().await
             }
+            // WP-K: dashboard "credential hygiene" friendly cleanup surface —
+            // detect plaintext credentials in config.toml (paths only, never
+            // values) and remove ONLY the ones with a confirmed `_enc` twin.
+            "security.credential_hygiene" => {
+                require_admin!();
+                self.handle_security_credential_hygiene().await
+            }
+            "security.credential_cleanup" => {
+                require_admin!();
+                self.handle_security_credential_cleanup(ctx).await
+            }
 
             // ── Analytics (manager+) ────────────────────────
             "analytics.summary" => {
@@ -6504,6 +6517,8 @@ impl MethodHandler {
                     { "name": "logs.subscribe", "description": "Subscribe to logs" },
                     { "name": "logs.unsubscribe", "description": "Unsubscribe from logs" },
                     { "name": "security.status", "description": "Security system status" },
+                    { "name": "security.credential_hygiene", "description": "Scan config.toml for plaintext credentials (paths only, never values)" },
+                    { "name": "security.credential_cleanup", "description": "Remove plaintext credential fields that already have an encrypted twin" },
                     { "name": "analytics.summary", "description": "Analytics summary for a period" },
                     { "name": "analytics.conversations", "description": "Daily conversation counts" },
                     { "name": "analytics.cost_savings", "description": "Monthly cost savings" },
@@ -19168,6 +19183,159 @@ impl MethodHandler {
         )
     }
 
+    /// `security.credential_hygiene` (WP-K) — read-only scan of `config.toml`
+    /// for plaintext credentials, built on
+    /// `security_posture::find_plaintext_secrets`. Never returns a value or a
+    /// masked fragment of one — only TOML paths, twin status and severity
+    /// (coding convention #4: this endpoint's entire reason to exist is to be
+    /// safe to render on the dashboard).
+    ///
+    /// Fail-closed: an existing-but-unparsable `config.toml` is reported as an
+    /// ERROR, never silently downgraded to "clean" — a corrupt file must not
+    /// hide real plaintext secrets behind a false-green card.
+    async fn handle_security_credential_hygiene(&self) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = match self.read_config_table_strict(&config_path).await {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &format!("憑證衛生偵測失敗:{e}")),
+        };
+        let findings = crate::security_posture::find_plaintext_secrets(&table);
+        let findings_json: Vec<Value> = findings
+            .iter()
+            .map(|f| {
+                json!({
+                    "path": f.path,
+                    "has_enc_twin": f.has_enc_twin,
+                    "severity": f.severity,
+                })
+            })
+            .collect();
+        WsFrame::ok_response(
+            "",
+            json!({
+                "clean": findings.is_empty(),
+                "count": findings.len(),
+                "findings": findings_json,
+            }),
+        )
+    }
+
+    /// `security.credential_cleanup` (WP-K) — removes ONLY plaintext
+    /// credential fields that already have a confirmed `_enc` twin (the
+    /// residue pattern from the 2026-08-15 `[[accounts]] oauth_token`
+    /// incident — see `commercial/docs/DESIGN-credentials-doctrine-2026-08.md`
+    /// §1.5 / §3 P1). Fields with no twin are left completely untouched by
+    /// this pass — encrypting an unfamiliar field in place risks writing a
+    /// corrupt `config.toml`; those are surfaced by
+    /// `security.credential_hygiene` for manual handling instead.
+    ///
+    /// Safety: backs up `config.toml` (timestamped filename, 0600) BEFORE
+    /// mutating, writes back through a cross-process advisory lock + atomic
+    /// temp/rename (coding convention #3 — config.toml is touched by many
+    /// other RPC handlers concurrently, and this one deletes user secrets so
+    /// it earns the strictest discipline in the file), and audits the
+    /// removed paths only — never values. Idempotent: nothing to clean
+    /// returns `cleaned: false` with an explanatory message rather than an
+    /// error, and creates no backup (a true no-op should leave no trace).
+    async fn handle_security_credential_cleanup(&self, ctx: &UserContext) -> WsFrame {
+        let config_path = self.home_dir.join("config.toml");
+        let table = match self.read_config_table_strict(&config_path).await {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &format!("憑證清理失敗:{e}")),
+        };
+
+        let cleanable = crate::security_posture::find_plaintext_secrets(&table)
+            .iter()
+            .filter(|f| f.has_enc_twin)
+            .count();
+        if cleanable == 0 {
+            return WsFrame::ok_response(
+                "",
+                json!({
+                    "cleaned": false,
+                    "removed_paths": Vec::<String>::new(),
+                    "message": "沒有可自動清理的明文憑證殘留。",
+                }),
+            );
+        }
+
+        // Backup BEFORE mutating — timestamped filename, best-effort 0600.
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+        let backup_path = self.home_dir.join(format!("config.toml.bak.{ts}"));
+        let raw = match tokio::fs::read(&config_path).await {
+            Ok(b) => b,
+            Err(e) => return WsFrame::error_response("", &format!("備份設定檔失敗:{e}")),
+        };
+        if let Err(e) = tokio::fs::write(&backup_path, &raw).await {
+            return WsFrame::error_response("", &format!("備份設定檔失敗:{e}"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = tokio::fs::set_permissions(
+                &backup_path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .await
+            {
+                warn!("failed to tighten permissions on credential backup: {e}");
+            }
+        }
+
+        let mut table = table;
+        let removed_paths = crate::security_posture::strip_twin_residue(&mut table);
+
+        // Atomic write under a cross-process advisory lock: config.toml is a
+        // hot file touched by many other RPC handlers, and this write
+        // deletes user secrets, so it does not reuse the ordinary
+        // read/mutate/rename-only pattern used elsewhere in this file.
+        let write_result = {
+            let path_for_lock = config_path.clone();
+            let table_for_write = table.clone();
+            tokio::task::spawn_blocking(move || {
+                duduclaw_core::with_file_lock(&path_for_lock, || {
+                    let content = toml::to_string_pretty(&table_for_write).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+                    let tmp_path = path_for_lock.with_extension("toml.tmp");
+                    std::fs::write(&tmp_path, content)?;
+                    std::fs::rename(&tmp_path, &path_for_lock)?;
+                    Ok::<(), std::io::Error>(())
+                })
+            })
+            .await
+        };
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return WsFrame::error_response("", &format!("寫回設定檔失敗:{e}")),
+            Err(e) => return WsFrame::error_response("", &format!("清理作業失敗:{e}")),
+        }
+
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "credential_hygiene_cleanup",
+                "dashboard",
+                duduclaw_security::audit::Severity::Warning,
+                json!({
+                    "actor_user_id": ctx.user_id,
+                    "actor_email": ctx.email,
+                    "removed_paths": removed_paths,
+                    "backup_path": backup_path.display().to_string(),
+                }),
+            ),
+        );
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "cleaned": true,
+                "removed_paths": removed_paths,
+                "backup_path": backup_path.display().to_string(),
+            }),
+        )
+    }
+
     // ── Analytics ────────────────────────────────────────────
 
     /// Summary metrics for the dashboard report page.
@@ -22527,6 +22695,28 @@ impl MethodHandler {
         let content = toml::to_string_pretty(table)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         tokio::fs::write(path, content).await
+    }
+
+    /// Strict TOML read for security-sensitive mutations (WP-K). Unlike
+    /// `read_config_table` above — which silently degrades BOTH "file
+    /// missing" and "file present but unparsable" to an empty table, which is
+    /// fine for additive writes elsewhere in this file — this distinguishes
+    /// the two: absent ⇒ `Ok(empty)` (no config, legitimately nothing to
+    /// protect), present-but-malformed ⇒ `Err`. A parse failure must never be
+    /// silently treated as "nothing to protect" (fail-closed detection) and
+    /// must never be silently overwritten with an empty file by a cleanup
+    /// pass that read a corrupt file and didn't notice.
+    async fn read_config_table_strict(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<toml::Table, String> {
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) => content
+                .parse::<toml::Table>()
+                .map_err(|e| format!("設定檔解析失敗:{e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+            Err(e) => Err(format!("設定檔讀取失敗:{e}")),
+        }
     }
 
     /// Run common health checks used by both doctor and doctor_repair.
@@ -27804,6 +27994,15 @@ impl MethodHandler {
     /// update: fail-closed `WHERE status='needs_human'`, claim/lease/result
     /// cleanup on retry, Activity Feed event, channel-card collapse.
     /// Operator access on the task's agent — the same bar as `tasks.update`.
+    ///
+    /// I-3a: `action: "continue"` is a fifth, separate action — WorkBuddy's
+    /// "已完成／失敗任務可續推" (design doc §3.3): reopen a `done` / `failed`
+    /// / `cancelled` goal task with a required follow-up `message` instead
+    /// of resolving a pending `needs_human` intervention. Same authorization
+    /// gate as every other branch here; routed to
+    /// [`crate::goal_notify::apply_continue_from_dashboard`] rather than the
+    /// `DecisionAct` match below since it operates on a different set of
+    /// source statuses and always carries a message.
     async fn handle_tasks_goal_decide(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let store = match self.task_store().await {
             Ok(s) => s,
@@ -27813,15 +28012,56 @@ impl MethodHandler {
         if task_id.is_empty() {
             return WsFrame::error_response("", "task_id is required");
         }
-        let act = match params.get("action").and_then(|v| v.as_str()) {
-            Some("retry") => crate::decision_action::DecisionAct::Retry,
-            Some("done") => crate::decision_action::DecisionAct::Done,
-            Some("abort") => crate::decision_action::DecisionAct::Abort,
-            Some("takeover") => crate::decision_action::DecisionAct::Takeover,
+        let action_str = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+        if action_str == "continue" {
+            let message = params
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(|s| duduclaw_core::truncate_chars(s.trim(), 2000))
+                .unwrap_or_default();
+            if message.is_empty() {
+                return WsFrame::error_response("", "接著做需要附上訊息");
+            }
+            if let Err(f) = self
+                .authorize_task_access(&store, ctx, task_id, AccessLevel::Operator)
+                .await
+            {
+                return f;
+            }
+            let decider = format!("dashboard:{}", ctx.user_id);
+            return match crate::goal_notify::apply_continue_from_dashboard(
+                &self.home_dir,
+                &decider,
+                task_id,
+                &message,
+            )
+            .await
+            {
+                Ok(message) => {
+                    let task = store.get_task(task_id).await.ok().flatten();
+                    WsFrame::ok_response(
+                        "",
+                        json!({
+                            "ok": true,
+                            "message": message,
+                            "task": task.as_ref().map(task_row_to_json),
+                        }),
+                    )
+                }
+                Err(e) => WsFrame::error_response("", &e),
+            };
+        }
+
+        let act = match action_str {
+            "retry" => crate::decision_action::DecisionAct::Retry,
+            "done" => crate::decision_action::DecisionAct::Done,
+            "abort" => crate::decision_action::DecisionAct::Abort,
+            "takeover" => crate::decision_action::DecisionAct::Takeover,
             _ => {
                 return WsFrame::error_response(
                     "",
-                    "action must be one of retry|done|abort|takeover",
+                    "action must be one of retry|done|abort|takeover|continue",
                 )
             }
         };
@@ -40376,6 +40616,181 @@ mod goal_contract_freeze_tests {
             "the frozen baseline must stay untouched even when an operator edits \
              the mutable field: {updated}"
         );
+    }
+}
+
+/// I-3a (`DESIGN-dashboard-ux-workbuddy-2026-08.md` §3.3, backlog item I-3a):
+/// a `done`/`failed`/`cancelled` **goal-mode** task can take a dashboard
+/// follow-up message via `tasks.goal_decide` `action: "continue"` and get
+/// reopened for another round — WorkBuddy's "已完成/失敗任務可續推" pattern,
+/// gated the same way as every other `goal_decide` action (Operator ACL on
+/// the task's assigned agent).
+#[cfg(test)]
+mod goal_continue_tests {
+    use super::*;
+
+    fn admin_ctx() -> UserContext {
+        UserContext::admin_fallback()
+    }
+
+    /// A caller holding only a `Viewer` binding on the task's agent — below
+    /// the `Operator` bar every `goal_decide` action requires.
+    fn viewer_ctx(agent: &str) -> UserContext {
+        let mut agent_access = std::collections::HashMap::new();
+        agent_access.insert(agent.to_string(), AccessLevel::Viewer);
+        UserContext {
+            user_id: "u1".to_string(),
+            email: "u1@test.local".to_string(),
+            role: UserRole::Employee,
+            agent_access,
+        }
+    }
+
+    fn payload(frame: &WsFrame) -> Value {
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => p.clone(),
+            WsFrame::Response { ok: false, error, .. } => {
+                panic!("RPC returned an error frame: {error:?}")
+            }
+            other => panic!("unexpected frame shape: {other:?}"),
+        }
+    }
+
+    fn error_text(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    async fn handler_with_task_store(home: &std::path::Path) -> MethodHandler {
+        let handler = MethodHandler::new(home.to_path_buf()).await;
+        handler
+            .set_task_store(Arc::new(TaskStore::open(home).unwrap()))
+            .await;
+        handler
+    }
+
+    fn goal_task(id: &str, agent: &str, status: &str) -> TaskRow {
+        let mut t = TaskRow::new(
+            id.into(),
+            "整理客戶月報".into(),
+            "把客戶資料整理成月報並寄出".into(),
+            "medium".into(),
+            agent.into(),
+            "system".into(),
+        );
+        t.status = status.into();
+        t.goal_mode = true;
+        t
+    }
+
+    #[tokio::test]
+    async fn continue_reopens_a_done_goal_task_with_the_message() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_task_store(home.path()).await;
+        let store = TaskStore::open(home.path()).unwrap();
+        store.insert_task(&goal_task("g-done", "agent-c1", "done")).await.unwrap();
+
+        let frame = handler
+            .handle_tasks_goal_decide(
+                json!({ "task_id": "g-done", "action": "continue", "message": "請加註本月營收數字" }),
+                &admin_ctx(),
+            )
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["task"]["status"], "pending", "a continued task must go back to pending: {p}");
+        assert!(
+            p["task"]["judge_feedback"]
+                .as_str()
+                .unwrap()
+                .contains("請加註本月營收數字"),
+            "the follow-up message must reach judge_feedback for the next dispatch: {p}"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_reopens_a_failed_goal_task_with_the_message() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_task_store(home.path()).await;
+        let store = TaskStore::open(home.path()).unwrap();
+        store.insert_task(&goal_task("g-failed", "agent-c2", "failed")).await.unwrap();
+
+        let frame = handler
+            .handle_tasks_goal_decide(
+                json!({ "task_id": "g-failed", "action": "continue", "message": "換一種方式重試" }),
+                &admin_ctx(),
+            )
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["task"]["status"], "pending");
+        assert!(p["task"]["judge_feedback"].as_str().unwrap().contains("換一種方式重試"));
+    }
+
+    #[tokio::test]
+    async fn continue_denies_a_caller_without_operator_access() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_task_store(home.path()).await;
+        let store = TaskStore::open(home.path()).unwrap();
+        store.insert_task(&goal_task("g-guard", "agent-c3", "done")).await.unwrap();
+
+        let frame = handler
+            .handle_tasks_goal_decide(
+                json!({ "task_id": "g-guard", "action": "continue", "message": "再多做一點" }),
+                &viewer_ctx("agent-c3"),
+            )
+            .await;
+        assert!(
+            error_text(&frame).contains("permission denied"),
+            "a Viewer binding must not be enough to continue a task — got: {frame:?}"
+        );
+        // The denial must be enforced BEFORE the store mutation, not after.
+        let still = store.get_task("g-guard").await.unwrap().unwrap();
+        assert_eq!(still.status, "done");
+    }
+
+    #[tokio::test]
+    async fn continue_requires_a_non_empty_message() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_task_store(home.path()).await;
+        let store = TaskStore::open(home.path()).unwrap();
+        store.insert_task(&goal_task("g-empty", "agent-c4", "done")).await.unwrap();
+
+        let frame = handler
+            .handle_tasks_goal_decide(
+                json!({ "task_id": "g-empty", "action": "continue", "message": "   " }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: false, .. }),
+            "a blank message must be refused: {frame:?}"
+        );
+        let still = store.get_task("g-empty").await.unwrap().unwrap();
+        assert_eq!(still.status, "done", "a refused continue must not touch the task");
+    }
+
+    #[tokio::test]
+    async fn continue_refuses_a_non_goal_mode_task() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_task_store(home.path()).await;
+        let store = TaskStore::open(home.path()).unwrap();
+        let mut t = goal_task("g-board", "agent-c5", "done");
+        t.goal_mode = false;
+        store.insert_task(&t).await.unwrap();
+
+        let frame = handler
+            .handle_tasks_goal_decide(
+                json!({ "task_id": "g-board", "action": "continue", "message": "再做一次" }),
+                &admin_ctx(),
+            )
+            .await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: false, .. }),
+            "an ordinary board task must not be reopenable via goal_decide continue: {frame:?}"
+        );
+        let still = store.get_task("g-board").await.unwrap().unwrap();
+        assert_eq!(still.status, "done");
     }
 }
 
