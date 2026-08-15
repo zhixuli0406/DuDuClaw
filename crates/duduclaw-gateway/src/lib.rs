@@ -137,6 +137,9 @@ pub mod delegation_gate;
 pub mod delegation_router;
 pub mod discord;
 pub mod discord_voice;
+/// WP-4G — resource ceilings applied to inbound office / compressed documents
+/// before any parser (LibreOffice, the bundled Python skills) is handed them.
+pub mod document_limits;
 pub mod email;
 pub mod dispatcher;
 pub mod ephemeral;
@@ -286,6 +289,12 @@ pub mod task_changes;
 // detail page's 「產物」tab and the `/files` origin column.
 pub mod artifacts;
 
+// WP-4H: zero-LLM delivery gate for the `📎DELIVER:` outbound path —
+// deterministic hard-fail (corrupt/empty/magic-mismatched file → never sent)
+// and soft-warn (placeholder residue → logged, not blocked) checks that run
+// right before `office_docs::deliver_one` archives + sends a file.
+pub mod artifact_gate;
+
 // ── D3 (LWM incident): per-agent authoritative working state — pinned
 //    key-value block + handoff note injected into every wake-up, updated
 //    only via explicit MCP tools with CAS supersession (ghost-memory fix,
@@ -318,6 +327,10 @@ pub mod goal_visit_graph;
 //        the byte-identical text comparison `StateBlock::hash_input` alone
 //        would otherwise perform ──
 pub mod goal_gap_fingerprint;
+// ── WP-4F: deterministic "best round" picker for budget-exhausted
+//        `needs_human` escalations — attaches the closest-to-done round's
+//        excerpt + gap list instead of an empty-handed pause note ──
+pub mod goal_budget_best_round;
 // ── H5 (WP-B): premature-stop ("bail") regex panel — zh+en anchored
 //        patterns compared against the last non-empty paragraph of an
 //        agent's completion text ──
