@@ -5,12 +5,30 @@
 //!   scattered hardcoded `"claude-haiku-4-5"` literals).
 //! - Phase 1+: `[runtime] provider` — which AgentRuntime backend to use.
 //!
-//! These are deliberately lightweight (parse `agent.toml` as a generic
-//! `toml::Value`) so callers that only have an `agent_dir` can resolve config
-//! without loading the full `AgentConfig`.
+//! These are callable by anything holding only an `agent_dir` — they do not
+//! need the registry or a fully-loaded `AgentConfig`.
+//!
+//! **R2 schema unification:** they used to parse `agent.toml` into a generic
+//! `toml::Value` and walk it by hand, which made `[runtime]`, `[model]
+//! fallbacks`/`standard`/`delegation_routing` and `[memory] decision_*`
+//! invisible to the typed `AgentConfig`. They now go through the shared typed
+//! parse point [`duduclaw_core::agent_toml`]. Two properties are preserved
+//! exactly:
+//!
+//! - **Read-per-call.** Every accessor still re-reads the file, so a live
+//!   `agent.toml` edit takes effect without a registry rescan (there is no
+//!   file watcher). Callers needing several fields should still
+//!   [`load_runtime_settings`] once.
+//! - **Missing-key defaults.** Each function's documented fallback is
+//!   unchanged, including the value-level filters (`> 0`, non-empty) that
+//!   deliberately treat an out-of-range written value as "unset".
+//!
+//! `config.toml` readers in this module are untouched — the unification is
+//! about `agent.toml` only.
 
 use std::path::Path;
 
+use duduclaw_core::agent_toml::{self, AgentTomlSections};
 use duduclaw_core::types::RuntimeType;
 
 /// Default lightweight model when `[model] utility` is unset.
@@ -24,9 +42,14 @@ use duduclaw_core::types::RuntimeType;
 /// parallel paths, not duplicated config.
 pub use duduclaw_core::types::DEFAULT_UTILITY_MODEL;
 
-fn read_agent_toml(agent_dir: &Path) -> Option<toml::Value> {
-    let text = std::fs::read_to_string(agent_dir.join("agent.toml")).ok()?;
-    text.parse::<toml::Value>().ok()
+/// One typed read of the agent's `agent.toml` sections.
+///
+/// Replaces the former `read_agent_toml -> Option<toml::Value>` helper. It
+/// returns sections rather than an `Option` because the typed parse is total:
+/// a missing, unreadable or malformed file yields all-defaults, which is what
+/// every caller's `Option` arm did anyway.
+fn read_sections(agent_dir: &Path) -> AgentTomlSections {
+    agent_toml::load(agent_dir)
 }
 
 /// All per-agent runtime/model settings from a single `agent.toml` read (RFC-25 L7).
@@ -70,35 +93,28 @@ impl RuntimeSettings {
 /// agent's `agent.toml` in a single read. Missing/malformed file ⇒ defaults
 /// (Claude / no fallback / [`DEFAULT_UTILITY_MODEL`]).
 pub fn load_runtime_settings(agent_dir: &Path) -> RuntimeSettings {
-    let Some(v) = read_agent_toml(agent_dir) else {
-        return RuntimeSettings::default();
-    };
-    let runtime = v.get("runtime");
-    let provider = runtime
-        .and_then(|r| r.get("provider"))
-        .and_then(|s| s.as_str())
+    let s = read_sections(agent_dir);
+
+    // `RuntimeType::parse` (not serde) stays the string→enum step on purpose:
+    // it maps an unrecognised provider to Claude with a warning instead of
+    // erroring, so a typo remains a warning rather than losing the agent.
+    let provider = s
+        .runtime
+        .provider
+        .as_deref()
         .map(RuntimeType::parse)
         .unwrap_or_default();
-    let fallback = runtime
-        .and_then(|r| r.get("fallback"))
-        .and_then(|s| s.as_str())
-        .map(RuntimeType::parse);
-    let utility_model = v
-        .get("model")
-        .and_then(|m| m.get("utility"))
-        .and_then(|s| s.as_str())
-        .map(str::to_string)
+    let fallback = s.runtime.fallback.as_deref().map(RuntimeType::parse);
+    let utility_model = s
+        .model
+        .utility
         .unwrap_or_else(|| DEFAULT_UTILITY_MODEL.to_string());
 
     // Provider↔model sanity check: `preferred = "gpt-5"` with the default
     // Claude provider used to route silently into the Claude CLI and fail at
     // the Anthropic API. Warn once per (agent, model) so the misconfiguration
     // is visible without spamming the hot reply path.
-    if let Some(preferred) = v
-        .get("model")
-        .and_then(|m| m.get("preferred"))
-        .and_then(|s| s.as_str())
-    {
+    if let Some(preferred) = s.model.preferred.as_deref() {
         if !model_matches_provider(preferred, provider) {
             warn_mismatch_once(agent_dir, preferred, provider);
         }
@@ -119,22 +135,26 @@ pub fn load_runtime_settings(agent_dir: &Path) -> RuntimeSettings {
 /// materializes the toggle only when it was never written. A missing/malformed
 /// file or absent `[runtime]` table yields an empty object.
 pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
+    // Every `RuntimeSection` field is `Option` precisely so this function can
+    // still tell "unset" from an explicit `false` — collapsing unset into a
+    // materialized default here would silently opt agents out of the PTY-pool
+    // default-enable migration, which only fires when the key was never
+    // written. The four keys are emitted individually (not via
+    // `serde_json::to_value`) to keep that contract explicit and to keep the
+    // two PTY timeout keys — which this form does not edit — out of the payload.
+    let rt = read_sections(agent_dir).runtime;
     let mut obj = serde_json::Map::new();
-    if let Some(v) = read_agent_toml(agent_dir)
-        && let Some(rt) = v.get("runtime")
-    {
-        if let Some(s) = rt.get("provider").and_then(|x| x.as_str()) {
-            obj.insert("provider".into(), serde_json::Value::String(s.to_string()));
-        }
-        if let Some(s) = rt.get("fallback").and_then(|x| x.as_str()) {
-            obj.insert("fallback".into(), serde_json::Value::String(s.to_string()));
-        }
-        if let Some(b) = rt.get("pty_pool_enabled").and_then(|x| x.as_bool()) {
-            obj.insert("pty_pool_enabled".into(), serde_json::Value::Bool(b));
-        }
-        if let Some(b) = rt.get("worker_managed").and_then(|x| x.as_bool()) {
-            obj.insert("worker_managed".into(), serde_json::Value::Bool(b));
-        }
+    if let Some(s) = rt.provider {
+        obj.insert("provider".into(), serde_json::Value::String(s));
+    }
+    if let Some(s) = rt.fallback {
+        obj.insert("fallback".into(), serde_json::Value::String(s));
+    }
+    if let Some(b) = rt.pty_pool_enabled {
+        obj.insert("pty_pool_enabled".into(), serde_json::Value::Bool(b));
+    }
+    if let Some(b) = rt.worker_managed {
+        obj.insert("worker_managed".into(), serde_json::Value::Bool(b));
     }
     serde_json::Value::Object(obj)
 }
@@ -238,20 +258,16 @@ pub fn agent_runtime_provider(agent_dir: &Path) -> RuntimeType {
 /// an empty vec — which the Direct-API path treats as "no chain" and keeps its
 /// existing single-shot behavior byte-identically (fail-safe).
 pub fn agent_model_fallbacks(agent_dir: &Path) -> Vec<String> {
-    read_agent_toml(agent_dir)
-        .and_then(|v| {
-            v.get("model")
-                .and_then(|m| m.get("fallbacks"))
-                .and_then(|f| f.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str())
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                })
-        })
-        .unwrap_or_default()
+    // Trim-and-drop-blanks stays here rather than in the schema: the stored
+    // value is what the operator wrote, and the dashboard edit form must be
+    // able to echo it back verbatim.
+    read_sections(agent_dir)
+        .model
+        .fallbacks
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Resolve the agent's runtime fallback provider (`[runtime] fallback`).
@@ -277,12 +293,9 @@ pub fn agent_uses_non_claude(agent_dir: &Path) -> Option<RuntimeType> {
 /// `[memory]` table, a missing key, or a non-bool value all resolve to `false`
 /// (fail-safe — the feature stays off unless explicitly turned on).
 pub fn decision_continuity_enabled(agent_dir: &Path) -> bool {
-    read_agent_toml(agent_dir)
-        .and_then(|v| {
-            v.get("memory")
-                .and_then(|m| m.get("decision_continuity"))
-                .and_then(|b| b.as_bool())
-        })
+    read_sections(agent_dir)
+        .memory
+        .decision_continuity
         .unwrap_or(false)
 }
 
@@ -292,12 +305,12 @@ pub fn decision_continuity_enabled(agent_dir: &Path) -> bool {
 /// ledger can't grow unbounded.
 pub fn decision_ttl_days(agent_dir: &Path) -> i64 {
     const DEFAULT_TTL_DAYS: i64 = 7;
-    read_agent_toml(agent_dir)
-        .and_then(|v| {
-            v.get("memory")
-                .and_then(|m| m.get("decision_ttl_days"))
-                .and_then(|n| n.as_integer())
-        })
+    // `> 0` stays a reader-side filter: a written `0` has always meant "use
+    // the default", never "never expire" — TTL is unconditional so the ledger
+    // cannot grow unbounded.
+    read_sections(agent_dir)
+        .memory
+        .decision_ttl_days
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_TTL_DAYS)
 }
@@ -332,25 +345,19 @@ pub fn global_delegation_routing(home_dir: &Path) -> bool {
 /// Per-agent `agent.toml [model] delegation_routing` override (O1).
 /// `None` when unset/malformed — the caller falls back to the global flag.
 pub fn agent_delegation_routing(agent_dir: &Path) -> Option<bool> {
-    read_agent_toml(agent_dir)
-        .and_then(|v| {
-            v.get("model")
-                .and_then(|m| m.get("delegation_routing"))
-                .and_then(|b| b.as_bool())
-        })
+    // `Option` all the way down: the agent overrides the global flag in BOTH
+    // directions, so "unset" and "explicitly false" must stay distinguishable.
+    read_sections(agent_dir).model.delegation_routing
 }
 
 /// Optional mid-tier model from `agent.toml [model] standard` (O1).
 /// `None` (or a blank value) means the config does not distinguish a mid
 /// tier — the Standard tier then resolves to the agent's preferred model.
 pub fn agent_standard_model(agent_dir: &Path) -> Option<String> {
-    read_agent_toml(agent_dir)
-        .and_then(|v| {
-            v.get("model")
-                .and_then(|m| m.get("standard"))
-                .and_then(|s| s.as_str())
-                .map(|s| s.trim().to_string())
-        })
+    read_sections(agent_dir)
+        .model
+        .standard
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
@@ -854,5 +861,200 @@ mod tests {
         assert!(model_matches_provider("anthropic/claude-sonnet-5", Claude));
         assert!(model_matches_provider("deepseek-v3.2", Claude));
         assert!(model_matches_provider("claude-sonnet-4-6", OpenAiCompat));
+    }
+
+    // ── R5 default-direction locks ──────────────────────────────────────
+    //
+    // These keys moved from hand-written `toml::Value` walks onto the typed
+    // `[runtime]` / `[model]` / `[memory]` sections. Each assertion below
+    // pins a missing-key direction that is historical behavior, deliberately
+    // preserved rather than harmonized. The set is intentionally inconsistent
+    // — `provider` absent means "Claude" (a real value) while `fallback`
+    // absent means `None` (no value), and `delegation_routing` absent means
+    // "defer to the global flag" rather than either boolean. Anyone changing
+    // one of these is changing behavior, not tidying a refactor.
+
+    #[test]
+    fn default_direction_runtime_provider_absent_is_claude() {
+        // Absent ⇒ Claude, i.e. a REAL default, not "unset".
+        let dir = TempDir::new().unwrap();
+        assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Claude);
+        write_agent_toml(dir.path(), "[runtime]\n");
+        assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Claude);
+        // …and `agent_uses_non_claude` therefore says None (stay on the
+        // optimized Claude path) rather than routing through the choke-point.
+        assert_eq!(agent_uses_non_claude(dir.path()), None);
+    }
+
+    #[test]
+    fn default_direction_runtime_fallback_absent_is_none_not_claude() {
+        // Contrast with `provider` above: same section, opposite direction.
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"codex\"\n");
+        assert_eq!(agent_runtime_fallback(dir.path()), None);
+    }
+
+    #[test]
+    fn default_direction_unknown_provider_warns_and_falls_back_not_errors() {
+        // A typo must degrade to Claude, never cost the agent its config.
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"claudee\"\n");
+        assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Claude);
+    }
+
+    #[test]
+    fn default_direction_wrong_typed_runtime_key_is_ignored_not_fatal() {
+        // Pre-migration this key lived outside the typed schema, so a
+        // wrong-typed value was invisible. Typing the section must not turn it
+        // into a parse failure that removes the agent from the registry.
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[runtime]\nprovider = 42\nfallback = true\n");
+        assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Claude);
+        assert_eq!(agent_runtime_fallback(dir.path()), None);
+        assert_eq!(read_runtime_json(dir.path()), serde_json::json!({}));
+    }
+
+    #[test]
+    fn default_direction_runtime_json_omits_unset_keys() {
+        // `read_runtime_json` must distinguish "never written" from an
+        // explicit `false`: the PTY-pool default-enable migration only fires
+        // on the former. Materializing a default here would silently opt
+        // agents out of it.
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"codex\"\n");
+        let json = read_runtime_json(dir.path());
+        assert_eq!(json.get("provider").and_then(|v| v.as_str()), Some("codex"));
+        assert!(json.get("pty_pool_enabled").is_none(), "unset must be absent");
+        assert!(json.get("worker_managed").is_none(), "unset must be absent");
+
+        write_agent_toml(dir.path(), "[runtime]\npty_pool_enabled = false\n");
+        let json = read_runtime_json(dir.path());
+        assert_eq!(
+            json.get("pty_pool_enabled").and_then(|v| v.as_bool()),
+            Some(false),
+            "explicit false must be present and false"
+        );
+
+        // No `[runtime]` at all ⇒ empty object, not a defaults object.
+        let empty = TempDir::new().unwrap();
+        assert_eq!(read_runtime_json(empty.path()), serde_json::json!({}));
+    }
+
+    #[test]
+    fn default_direction_utility_model_absent_is_the_shared_constant() {
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[model]\npreferred = \"claude-sonnet-4-6\"\n");
+        assert_eq!(agent_utility_model(dir.path()), DEFAULT_UTILITY_MODEL);
+    }
+
+    #[test]
+    fn default_direction_model_fallbacks_absent_is_empty_chain() {
+        // Empty ⇒ "no chain" ⇒ the Direct-API path keeps its single-shot
+        // behavior byte-identically. Blanks are dropped, not preserved.
+        let dir = TempDir::new().unwrap();
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+        write_agent_toml(dir.path(), "[model]\n");
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+        write_agent_toml(dir.path(), "[model]\nfallbacks = \"not-an-array\"\n");
+        assert!(agent_model_fallbacks(dir.path()).is_empty());
+        write_agent_toml(
+            dir.path(),
+            "[model]\nfallbacks = [\"  openai/gpt-5.4 \", \"   \", \"x/y\"]\n",
+        );
+        assert_eq!(
+            agent_model_fallbacks(dir.path()),
+            vec!["openai/gpt-5.4".to_string(), "x/y".to_string()]
+        );
+    }
+
+    #[test]
+    fn default_direction_standard_model_blank_counts_as_absent() {
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[model]\nstandard = \"   \"\n");
+        assert_eq!(agent_standard_model(dir.path()), None);
+        write_agent_toml(dir.path(), "[model]\nstandard = \" mid \"\n");
+        assert_eq!(agent_standard_model(dir.path()), Some("mid".to_string()));
+    }
+
+    #[test]
+    fn default_direction_delegation_routing_absent_is_none_not_false() {
+        // Three-state on purpose: the per-agent key overrides the global flag
+        // in BOTH directions, so "unset" must stay distinguishable from an
+        // explicit `false` or the override could never turn routing OFF.
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[model]\n");
+        assert_eq!(agent_delegation_routing(dir.path()), None);
+        write_agent_toml(dir.path(), "[model]\ndelegation_routing = false\n");
+        assert_eq!(agent_delegation_routing(dir.path()), Some(false));
+        write_agent_toml(dir.path(), "[model]\ndelegation_routing = true\n");
+        assert_eq!(agent_delegation_routing(dir.path()), Some(true));
+    }
+
+    #[test]
+    fn default_direction_decision_continuity_absent_is_false() {
+        let dir = TempDir::new().unwrap();
+        assert!(!decision_continuity_enabled(dir.path()));
+        write_agent_toml(dir.path(), "[memory]\n");
+        assert!(!decision_continuity_enabled(dir.path()));
+        write_agent_toml(dir.path(), "[memory]\ndecision_continuity = true\n");
+        assert!(decision_continuity_enabled(dir.path()));
+    }
+
+    #[test]
+    fn default_direction_decision_ttl_zero_means_default_not_never() {
+        // Opposite of `decision_continuity` in the SAME section: the feature
+        // switch is opt-in (absent ⇒ off) but the TTL is unconditional
+        // (absent OR zero OR negative ⇒ 7 days), because the ledger must not
+        // be able to grow unbounded.
+        let dir = TempDir::new().unwrap();
+        assert_eq!(decision_ttl_days(dir.path()), 7);
+        for body in [
+            "[memory]\n",
+            "[memory]\ndecision_ttl_days = 0\n",
+            "[memory]\ndecision_ttl_days = -1\n",
+            "[memory]\ndecision_ttl_days = \"30\"\n",
+        ] {
+            write_agent_toml(dir.path(), body);
+            assert_eq!(decision_ttl_days(dir.path()), 7, "for {body:?}");
+        }
+        write_agent_toml(dir.path(), "[memory]\ndecision_ttl_days = 30\n");
+        assert_eq!(decision_ttl_days(dir.path()), 30);
+    }
+
+    #[test]
+    fn default_direction_missing_and_malformed_file_agree() {
+        // Every accessor treats "no file" and "not TOML" identically — none of
+        // them ever surfaced an error to the caller.
+        let missing = TempDir::new().unwrap();
+        let broken = TempDir::new().unwrap();
+        write_agent_toml(broken.path(), "[runtime\nprovider = ");
+        for dir in [missing.path(), broken.path()] {
+            assert_eq!(agent_runtime_provider(dir), RuntimeType::Claude);
+            assert_eq!(agent_runtime_fallback(dir), None);
+            assert_eq!(agent_utility_model(dir), DEFAULT_UTILITY_MODEL);
+            assert!(agent_model_fallbacks(dir).is_empty());
+            assert_eq!(agent_standard_model(dir), None);
+            assert_eq!(agent_delegation_routing(dir), None);
+            assert!(!decision_continuity_enabled(dir));
+            assert_eq!(decision_ttl_days(dir), 7);
+            assert_eq!(read_runtime_json(dir), serde_json::json!({}));
+        }
+    }
+
+    #[test]
+    fn edits_take_effect_without_a_registry_rescan() {
+        // The migrated readers must keep reading the file per call. The
+        // registry's `AgentConfig` cache has no mtime invalidation and no
+        // watcher, so routing these through it would have turned an immediate
+        // read into a stale one — a silent behavior change.
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"codex\"\n");
+        assert_eq!(agent_runtime_provider(dir.path()), RuntimeType::Codex);
+        write_agent_toml(dir.path(), "[runtime]\nprovider = \"gemini\"\n");
+        assert_eq!(
+            agent_runtime_provider(dir.path()),
+            RuntimeType::Gemini,
+            "a live agent.toml edit must be visible on the next call"
+        );
     }
 }

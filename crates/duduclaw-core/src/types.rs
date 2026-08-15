@@ -180,6 +180,32 @@ pub struct ModelConfig {
     /// Defaults to claude-haiku-4-5. (RFC-25 Phase 0 — replaces scattered literals.)
     #[serde(default = "default_utility_model")]
     pub utility: String,
+
+    // ── Formerly-untyped `[model]` keys (R2 unification) ────────────────
+    //
+    // Read by `gateway::runtime_config`'s raw-TOML accessors before this
+    // migration. `skip_serializing_if` keeps the on-disk shape unchanged for
+    // configs that never wrote them.
+    /// Cross-provider Direct-API fallback chain (W3/G1), tried in order after
+    /// `preferred`. Missing / non-array ⇒ empty ⇒ "no chain" (single-shot).
+    /// Blank entries are dropped by the accessor, not here.
+    #[serde(default, deserialize_with = "crate::lenient::string_vec")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<String>,
+
+    /// Optional mid tier for confidence-aware delegation routing (O1).
+    /// Missing / blank ⇒ `None` ⇒ the Standard tier resolves to `preferred`.
+    #[serde(default, deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard: Option<String>,
+
+    /// Per-agent override of `config.toml [delegation] confidence_routing`
+    /// (O1). Deliberately `Option`: the agent wins over the global flag **in
+    /// both directions**, so "unset" and "explicitly false" are different
+    /// states and must not be collapsed.
+    #[serde(default, deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_routing: Option<bool>,
 }
 
 fn default_api_mode() -> String {
@@ -678,6 +704,60 @@ pub struct CapabilitiesConfig {
     /// sensitive, so this must be an explicit operator decision per agent.
     #[serde(default)]
     pub recording: bool,
+
+    // ── Formerly-untyped `[capabilities]` keys (R2 unification) ─────────
+    //
+    // These six lived in the same `[capabilities]` table as the fields above
+    // but were read by raw `toml::Value` accessors in four different modules,
+    // so `[capabilities]` alone straddled both schemas — the sharpest example
+    // of the R2 split. They are typed here so an assembly layer sees one
+    // section, and so the `agent_update` round-trip (which re-serializes
+    // `AgentConfig` over the file) stops silently dropping them.
+    //
+    // Each is `skip_serializing_if`-guarded: a config that never wrote the key
+    // still never gets it written back, so the on-disk shape is unchanged.
+    /// Tools that require an active task-scoped grant (PORTICO).
+    /// Missing ⇒ empty ⇒ nothing is scoped (documented fail-*safe*: a
+    /// malformed config must not make every tool look scoped and brick the
+    /// agent). Read by `gateway::capability_grants`.
+    #[serde(default, deserialize_with = "crate::lenient::string_vec")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scoped_tools: Vec<String>,
+
+    /// TTL for task-scoped grants. Missing / non-positive ⇒ the caller's
+    /// `DEFAULT_GRANT_TTL_SECS`. Stored raw; the positivity filter stays in
+    /// the accessor so the historical "0 means default, not zero" rule holds.
+    #[serde(default, deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_ttl_secs: Option<i64>,
+
+    /// Tools that must clear an ApprovalBroker request before running.
+    /// Missing ⇒ empty ⇒ no approval friction. Read by `gateway::approval`
+    /// (not migrated this round — see the remaining-shadow list).
+    #[serde(default, deserialize_with = "crate::lenient::string_vec")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approval_required_tools: Vec<String>,
+
+    /// ActionGuard "always irreversible" tools. Missing ⇒ empty.
+    /// Read by `gateway::approval` (not migrated this round).
+    #[serde(default, deserialize_with = "crate::lenient::string_vec")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub irreversible_tools: Vec<String>,
+
+    /// ActionGuard "maybe irreversible" tools (LLM judge, fail-closed).
+    /// Missing ⇒ empty. Read by `gateway::approval` (not migrated this round).
+    #[serde(default, deserialize_with = "crate::lenient::string_vec")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub maybe_irreversible_tools: Vec<String>,
+
+    /// Goal-loop autonomy level. Missing ⇒ the caller's conservative
+    /// `Approver` default; an unrecognised string also ⇒ `Approver`. Stored as
+    /// the raw string so that lenient parse survives here exactly as it did in
+    /// the `toml::Value` reader. Read by `gateway::goal_loop` (not migrated
+    /// this round).
+    #[serde(default, deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autonomy_level: Option<String>,
 }
 
 /// Effect of a [`ToolPolicy`] rule.
@@ -817,6 +897,12 @@ impl Default for CapabilitiesConfig {
             native_sandbox: false,
             os_native: false,
             recording: false,
+            scoped_tools: Vec::new(),
+            grant_ttl_secs: None,
+            approval_required_tools: Vec::new(),
+            irreversible_tools: Vec::new(),
+            maybe_irreversible_tools: Vec::new(),
+            autonomy_level: None,
         }
     }
 }
@@ -1885,6 +1971,244 @@ pub struct AgentInfo {
     pub department: String,
 }
 
+// ── agent.toml sections formerly read as raw `toml::Value` (R2) ─────────────
+//
+// Historically these sections existed ONLY as ad-hoc `toml::Value` accessors
+// scattered across the gateway and CLI ("shadow readers"): the typed
+// `AgentConfig` could not see them, and `AgentConfig` has no
+// `deny_unknown_fields`, so the two schemas were mutually invisible. Any
+// future single assembly point (preset / kit overlays) would have been
+// bypassed by every shadow reader, and the `agent_update` MCP tool — which
+// re-serializes `AgentConfig` over `agent.toml` — silently DROPPED these
+// sections entirely.
+//
+// Typing them here fixes both. Two rules govern the migration:
+//
+// 1. **Missing-key defaults are reproduced exactly, never "corrected".**
+//    Several of these directions contradict each other (`[guardrails]
+//    enabled` ⇒ false but `block_secrets` ⇒ true; `[evolution] enabled` ⇒
+//    true but `gvu_enabled` ⇒ false). That inconsistency is historical fact.
+//    Changing it is a separate, deliberate decision — not a side effect of a
+//    schema refactor. The `default_direction_*` tests lock each one down.
+// 2. **Tolerance is preserved.** Every field uses `crate::lenient`, so a
+//    wrong-typed key degrades to its default exactly as the `as_str()` /
+//    `as_bool()` chains did, instead of failing the whole `AgentConfig` parse
+//    and making the agent vanish from the registry.
+
+/// `agent.toml [runtime]` — which backend executes this agent, plus PTY-pool
+/// knobs.
+///
+/// Every field is `Option` on purpose: the dashboard's `agents.inspect` echoes
+/// back only the keys actually present so the operator can tell "unset" from
+/// an explicit `false` (the PTY-pool OAuth default-enable migration
+/// materializes its toggle only when it was never written). Collapsing unset
+/// into `false` here would silently opt agents out of that migration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct RuntimeSection {
+    /// Raw provider string. Kept as `String` (not [`RuntimeType`]) because
+    /// [`RuntimeType::parse`] is deliberately lenient — an unrecognised value
+    /// warns and falls back to Claude rather than erroring, and a strict serde
+    /// enum here would turn a provider typo into total agent loss.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Raw fallback provider string. Missing ⇒ `None` (no fallback).
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    /// Missing ⇒ `None`, which the runtime router reads as `FreshSpawn`.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty_pool_enabled: Option<bool>,
+    /// Missing ⇒ `None` (out-of-process worker not managed).
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_managed: Option<bool>,
+    /// PTY interactive-REPL hard deadline, seconds. Read by `pty_runtime`
+    /// (not migrated this round); typed here so `agent_update` stops dropping
+    /// it. Missing / non-positive ⇒ the caller's constant.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty_interactive_timeout_secs: Option<i64>,
+    /// PTY interactive-REPL idle timeout, seconds. Same status as above.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty_idle_timeout_secs: Option<i64>,
+}
+
+impl RuntimeSection {
+    /// True when nothing was written — lets `AgentConfig` skip serializing the
+    /// whole section so an absent `[runtime]` stays absent on rewrite.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `agent.toml [guardrails]` — outbound reply scanning.
+///
+/// **Mixed default directions, preserved verbatim:** the master switch is
+/// opt-in (`enabled` ⇒ `false`) but the two content scanners are opt-*out*
+/// (`block_secrets` / `block_injection_echo` ⇒ `true`). The scanners only run
+/// when the master switch is on, which is why "default true" is safe here —
+/// but the asymmetry is real and is locked by test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct GuardrailsSection {
+    /// Master switch. Missing ⇒ `false` (guardrails disabled entirely).
+    pub enabled: bool,
+    /// Missing ⇒ `true`.
+    pub block_secrets: bool,
+    /// Missing ⇒ `false`.
+    pub redact_pii: bool,
+    /// Missing ⇒ `true`.
+    pub block_injection_echo: bool,
+    /// Missing / non-array ⇒ empty.
+    #[serde(deserialize_with = "crate::lenient::string_vec")]
+    pub deny_phrases: Vec<String>,
+}
+
+impl Default for GuardrailsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            block_secrets: true,
+            redact_pii: false,
+            block_injection_echo: true,
+            deny_phrases: Vec::new(),
+        }
+    }
+}
+
+impl GuardrailsSection {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `agent.toml [os_watch]` — OS-native filesystem watching and its goal hook.
+///
+/// `paths` empty ⇒ **never watch**: the watcher is not started at all, no
+/// matter what the other keys say. That early return is the section's real
+/// master switch and is reproduced in the accessor, not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct OsWatchSection {
+    /// Missing / non-array ⇒ empty ⇒ nothing is ever watched.
+    /// Tilde expansion happens in the accessor (it is a filesystem concern,
+    /// not a schema one, and the dashboard edit form must see the raw value).
+    #[serde(deserialize_with = "crate::lenient::string_vec")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Missing / non-array ⇒ empty.
+    #[serde(deserialize_with = "crate::lenient::string_vec")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
+    /// Missing ⇒ `None` ⇒ the watcher crate's `DEFAULT_DEBOUNCE_MS`.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debounce_ms: Option<i64>,
+    /// Missing ⇒ `None` ⇒ the watcher crate's `DEFAULT_MAX_EVENTS_PER_MIN`.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_events_per_min: Option<i64>,
+    /// Goal-loop kickoff template. Missing / blank ⇒ `None` ⇒ an OS file
+    /// event never starts a goal.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_template: Option<String>,
+    /// Optional acceptance-criteria template. Missing / blank ⇒ `None`.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_acceptance: Option<String>,
+    /// Frontmost-app poll interval, seconds. Read by `os_frontmost` (not
+    /// migrated this round); typed here so `agent_update` stops dropping it.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontmost_poll_secs: Option<i64>,
+    /// Footprint distillation opt-in. Read by `footprint_distill` (not
+    /// migrated this round). Missing ⇒ `None` ⇒ off (deny-by-default).
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footprint: Option<bool>,
+}
+
+impl OsWatchSection {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `agent.toml [fork]` — RFC-26 live forking (parallel branch exploration).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ForkSection {
+    /// Missing ⇒ `false` (forking is opt-in per agent).
+    pub enabled: bool,
+    /// Missing / `< 1` ⇒ `4`.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_branches: Option<i64>,
+    /// Missing / `<= 0` ⇒ `0.50`.
+    ///
+    /// **Historical quirk, preserved:** the raw reader used `as_float()` only,
+    /// so an integer literal (`default_budget_usd = 1`) was silently ignored
+    /// and fell back to the default.
+    ///
+    /// [`crate::lenient::opt_float_strict`] — NOT `opt` — reproduces that:
+    /// serde's own `f64` impl accepts and widens an integer, which would have
+    /// doubled the effective ceiling of any config written that way. See
+    /// `default_direction_fork_budget_rejects_integer_literal`.
+    #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_budget_usd: Option<f64>,
+    /// Missing / `<= 0` ⇒ `1.50`. Same integer-literal quirk as above.
+    #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate_budget_usd: Option<f64>,
+    /// Missing ⇒ `"auto_with_fallback"`. Unknown values are mapped by
+    /// `parse_merge_mode` at use time, not rejected here.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_mode: Option<String>,
+    /// Missing / blank ⇒ `None` (no verification command).
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_command: Option<String>,
+    /// Missing / `< 1` ⇒ `120`.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_timeout_s: Option<i64>,
+    /// Missing ⇒ `false`.
+    pub fine_grained_judge: bool,
+    /// Missing / unrecognised ⇒ `"heuristic"` (deterministic, zero LLM cost).
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge: Option<String>,
+}
+
+impl Default for ForkSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_branches: None,
+            default_budget_usd: None,
+            aggregate_budget_usd: None,
+            merge_mode: None,
+            test_command: None,
+            test_timeout_s: None,
+            fine_grained_judge: false,
+            judge: None,
+        }
+    }
+}
+
+impl ForkSection {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Full agent configuration file (`agent.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1942,6 +2266,25 @@ pub struct AgentConfig {
     /// See `commercial/docs/TODO-runtime-health-fixes-202605.md #11`.
     #[serde(default)]
     pub prompt: PromptConfig,
+
+    // ── R2 unification: sections that used to be invisible here ─────────
+    //
+    // Each is skipped on serialize when untouched, so re-writing an
+    // `agent.toml` that never had the section leaves the file shape
+    // unchanged — while a config that DOES have it now survives the
+    // `agent_update` round-trip instead of being silently dropped.
+    /// `[runtime]` — see [`RuntimeSection`].
+    #[serde(default, skip_serializing_if = "RuntimeSection::is_empty")]
+    pub runtime: RuntimeSection,
+    /// `[guardrails]` — see [`GuardrailsSection`].
+    #[serde(default, skip_serializing_if = "GuardrailsSection::is_default")]
+    pub guardrails: GuardrailsSection,
+    /// `[os_watch]` — see [`OsWatchSection`].
+    #[serde(default, skip_serializing_if = "OsWatchSection::is_empty")]
+    pub os_watch: OsWatchSection,
+    /// `[fork]` — see [`ForkSection`].
+    #[serde(default, skip_serializing_if = "ForkSection::is_default")]
+    pub fork: ForkSection,
 }
 
 /// How the system prompt is assembled.
@@ -2016,6 +2359,24 @@ pub struct MemoryConfig {
     pub archival_tokens: u32,
     pub recall_auto_inject: u32,
     pub archival_auto_retrieve: u32,
+
+    // ── Formerly-untyped `[memory]` keys (R2 unification) ───────────────
+    //
+    // Unlike the fields above these ARE consumed at runtime (RFC-24 decision
+    // continuity); they were read by `gateway::runtime_config`'s raw-TOML
+    // accessors. `skip_serializing_if` keeps the on-disk shape unchanged.
+    /// RFC-24 decision continuity. Opt-in; missing ⇒ `false` (feature off).
+    #[serde(default, deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_continuity: Option<bool>,
+
+    /// Days after which an unanswered open decision auto-expires (RFC-24
+    /// §P3.2). Stored raw; the "non-positive ⇒ default 7" filter stays in the
+    /// accessor, because TTL is always enforced (the ledger may not grow
+    /// unbounded) and `0` therefore means "default", not "never expire".
+    #[serde(default, deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_ttl_days: Option<i64>,
 }
 
 impl Default for MemoryConfig {
@@ -2027,6 +2388,8 @@ impl Default for MemoryConfig {
             archival_tokens: 0,
             recall_auto_inject: 0,
             archival_auto_retrieve: 0,
+            decision_continuity: None,
+            decision_ttl_days: None,
         }
     }
 }

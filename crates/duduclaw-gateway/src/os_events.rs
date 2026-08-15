@@ -43,62 +43,43 @@ pub const STATS_FILE_NAME: &str = "os_watch_stats.json";
 /// Read `[os_watch]` from an agent's `agent.toml` into a [`WatchConfig`].
 ///
 /// Returns `None` when the file is missing/malformed, the `[os_watch]` table is
-/// absent, or `paths` is empty (no path is ever watched by default). This is the
-/// additive raw-TOML parse pattern used by `approval_required_tools` — it never
-/// touches the serde `AgentConfig` struct, so an unrelated new key can't break
-/// existing configs.
+/// absent, or `paths` is empty (no path is ever watched by default).
+///
+/// **R2 schema unification:** `[os_watch]` is now a typed section on
+/// `AgentConfig` and this function reads it through the shared parse point
+/// ([`duduclaw_core::agent_toml`]) instead of walking a `toml::Value` by hand.
+/// The section stays tolerant of unrelated new keys exactly as the additive
+/// raw-TOML pattern was — a wrong-typed key degrades to its default rather
+/// than failing the file. Every default and clamp below is unchanged; in
+/// particular `paths` empty ⇒ `None` remains this section's real master
+/// switch.
 pub fn read_os_watch_config(agent_dir: &Path) -> Option<WatchConfig> {
-    let path = agent_dir.join("agent.toml");
-    let text = std::fs::read_to_string(&path).ok()?;
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?path, error = %e, "malformed agent.toml — [os_watch] ignored");
-            return None;
-        }
-    };
-    let tbl = value.get("os_watch")?.as_table()?;
+    let w = duduclaw_core::agent_toml::load(agent_dir).os_watch;
 
-    let paths: Vec<PathBuf> = tbl
-        .get("paths")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(duduclaw_core::expand_tilde)
-                .collect()
-        })
-        .unwrap_or_default();
+    // Tilde expansion is a use-time concern, not a schema one: the dashboard
+    // edit form (`read_os_watch_json`) must still echo the raw `~/…` string.
+    let paths: Vec<PathBuf> = w
+        .paths
+        .iter()
+        .map(|s| duduclaw_core::expand_tilde(s.as_str()))
+        .collect();
     if paths.is_empty() {
         return None;
     }
 
-    let ignore: Vec<String> = tbl
-        .get("ignore")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let debounce_ms = tbl
-        .get("debounce_ms")
-        .and_then(|v| v.as_integer())
+    let debounce_ms = w
+        .debounce_ms
         .map(|i| i.max(1) as u64)
         .unwrap_or(duduclaw_os::watch::DEFAULT_DEBOUNCE_MS);
 
-    let max_events_per_min = tbl
-        .get("max_events_per_min")
-        .and_then(|v| v.as_integer())
+    let max_events_per_min = w
+        .max_events_per_min
         .map(|i| i.clamp(1, u32::MAX as i64) as u32)
         .unwrap_or(duduclaw_os::watch::DEFAULT_MAX_EVENTS_PER_MIN);
 
     Some(WatchConfig {
         paths,
-        ignore,
+        ignore: w.ignore,
         debounce_ms,
         max_events_per_min,
     })
@@ -131,27 +112,21 @@ pub struct GoalTemplateConfig {
 /// malformed, or `goal_template` is empty/whitespace-only — mirroring
 /// `read_os_watch_config`'s "empty ⇒ never watch by default" rule.
 pub fn read_goal_template_config(agent_dir: &Path) -> Option<GoalTemplateConfig> {
-    let path = agent_dir.join("agent.toml");
-    let text = std::fs::read_to_string(&path).ok()?;
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?path, error = %e, "malformed agent.toml — [os_watch] goal_template ignored");
-            return None;
-        }
-    };
-    let tbl = value.get("os_watch")?.as_table()?;
+    let w = duduclaw_core::agent_toml::load(agent_dir).os_watch;
 
-    let template = tbl
-        .get("goal_template")
-        .and_then(|v| v.as_str())
+    // Blank-after-trim counts as absent for both keys — an empty template must
+    // never kick off a goal, and an empty acceptance falls back to the
+    // description (the `/goal` command's own default when no `||` is given).
+    let template = w
+        .goal_template
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())?
         .to_string();
 
-    let acceptance = tbl
-        .get("goal_acceptance")
-        .and_then(|v| v.as_str())
+    let acceptance = w
+        .goal_acceptance
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
@@ -166,6 +141,14 @@ pub fn read_goal_template_config(agent_dir: &Path) -> Option<GoalTemplateConfig>
 /// dashboard edit form (`agents.inspect`). Unlike [`read_os_watch_config`] this
 /// does NOT expand `~` or apply defaults — it echoes exactly what's on disk so
 /// the operator edits their own values. Returns `Null` when absent/malformed.
+///
+/// **Deliberately NOT migrated to the typed section (R2).** Its contract is
+/// "echo the table verbatim, whatever is in it", which a typed struct cannot
+/// express: deserializing through [`duduclaw_core::types::OsWatchSection`]
+/// would silently drop any key the schema does not know, and this form's whole
+/// job is to hand the operator back exactly what they wrote. The other two
+/// `[os_watch]` readers in this file are typed; this one stays raw on purpose.
+/// It is read-only and feeds a UI form, so it is not a policy gate.
 pub fn read_os_watch_json(agent_dir: &Path) -> serde_json::Value {
     let path = agent_dir.join("agent.toml");
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1138,5 +1121,123 @@ goal_acceptance = "月報含 {file_name} 的資料"
         let (allow, _ws, count) = rate_limit_tick(0, 0, 0, 0);
         assert!(!allow);
         assert_eq!(count, 0);
+    }
+
+    // ── R5 default-direction locks ──────────────────────────────────────
+    //
+    // `[os_watch]` moved onto the typed schema. Its governing rule is unusual
+    // and must not drift: `paths` empty is the section's REAL master switch —
+    // no path, no watcher, regardless of every other key. `goal_template`
+    // follows the same shape (blank ⇒ never start a goal). Both are
+    // fail-closed; the numeric knobs beside them are fail-to-constant.
+
+    fn watch_dir(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn default_direction_os_watch_empty_paths_is_the_master_switch() {
+        // Every other key set, `paths` absent ⇒ still no watcher.
+        let dir = watch_dir(
+            "[os_watch]\nignore = [\"*.tmp\"]\ndebounce_ms = 50\nmax_events_per_min = 9\n",
+        );
+        assert!(
+            read_os_watch_config(dir.path()).is_none(),
+            "no paths ⇒ never watch, no matter what else is configured"
+        );
+
+        // A non-array `paths` degrades to empty ⇒ same answer, not an error.
+        let dir = watch_dir("[os_watch]\npaths = \"~/Downloads\"\n");
+        assert!(read_os_watch_config(dir.path()).is_none());
+
+        // A mixed array keeps only its string entries (was `filter_map`).
+        let dir = watch_dir("[os_watch]\npaths = [\"/abs/a\", 7]\n");
+        let cfg = read_os_watch_config(dir.path()).expect("one valid path remains");
+        assert_eq!(cfg.paths, vec![PathBuf::from("/abs/a")]);
+    }
+
+    #[test]
+    fn default_direction_os_watch_numeric_knobs_fall_back_to_constants() {
+        // Absent, wrong-typed, and out-of-range all land on the crate
+        // constants; explicit in-range values win.
+        for body in [
+            "[os_watch]\npaths = [\"/abs/a\"]\n",
+            "[os_watch]\npaths = [\"/abs/a\"]\ndebounce_ms = \"500\"\nmax_events_per_min = \"9\"\n",
+        ] {
+            let dir = watch_dir(body);
+            let cfg = read_os_watch_config(dir.path()).unwrap();
+            assert_eq!(cfg.debounce_ms, duduclaw_os::watch::DEFAULT_DEBOUNCE_MS);
+            assert_eq!(
+                cfg.max_events_per_min,
+                duduclaw_os::watch::DEFAULT_MAX_EVENTS_PER_MIN
+            );
+        }
+
+        // Below-range values are clamped up, not rejected (historical).
+        let dir = watch_dir(
+            "[os_watch]\npaths = [\"/abs/a\"]\ndebounce_ms = 0\nmax_events_per_min = 0\n",
+        );
+        let cfg = read_os_watch_config(dir.path()).unwrap();
+        assert_eq!(cfg.debounce_ms, 1);
+        assert_eq!(cfg.max_events_per_min, 1);
+    }
+
+    #[test]
+    fn default_direction_goal_template_blank_never_starts_a_goal() {
+        for body in [
+            "[os_watch]\npaths = [\"/abs/a\"]\n",
+            "[os_watch]\ngoal_template = \"\"\n",
+            "[os_watch]\ngoal_template = \"   \"\n",
+            "[os_watch]\ngoal_template = 42\n",
+            "",
+        ] {
+            let dir = watch_dir(body);
+            assert!(
+                read_goal_template_config(dir.path()).is_none(),
+                "blank/absent/wrong-typed goal_template must never kick off a goal: {body:?}"
+            );
+        }
+
+        // Present template, absent acceptance ⇒ Some(template) + None.
+        let dir = watch_dir("[os_watch]\ngoal_template = \" do {path} \"\n");
+        let g = read_goal_template_config(dir.path()).expect("template present");
+        assert_eq!(g.template, "do {path}");
+        assert_eq!(g.acceptance, None);
+
+        // Blank acceptance counts as absent, not as an empty criterion.
+        let dir = watch_dir("[os_watch]\ngoal_template = \"x\"\ngoal_acceptance = \"  \"\n");
+        assert_eq!(read_goal_template_config(dir.path()).unwrap().acceptance, None);
+    }
+
+    #[test]
+    fn default_direction_os_watch_missing_and_malformed_agree() {
+        let missing = tempfile::tempdir().unwrap();
+        let broken = watch_dir("[os_watch\npaths = ");
+        for dir in [missing.path(), broken.path()] {
+            assert!(read_os_watch_config(dir).is_none());
+            assert!(read_goal_template_config(dir).is_none());
+        }
+    }
+
+    /// `read_os_watch_json` is deliberately NOT migrated — it echoes the raw
+    /// table for the dashboard edit form, including keys the typed schema does
+    /// not model. This pins that contract so a future "let's type this one
+    /// too" change has to confront it.
+    #[test]
+    fn os_watch_json_stays_verbatim_including_unknown_keys() {
+        let dir = watch_dir("[os_watch]\npaths = [\"~/Downloads\"]\nsome_future_key = 3\n");
+        let json = read_os_watch_json(dir.path());
+        assert_eq!(
+            json.get("paths").and_then(|p| p.get(0)).and_then(|p| p.as_str()),
+            Some("~/Downloads"),
+            "the form must see the unexpanded value the operator wrote"
+        );
+        assert_eq!(
+            json.get("some_future_key").and_then(|v| v.as_i64()),
+            Some(3),
+            "unknown keys must survive the round-trip to the edit form"
+        );
     }
 }

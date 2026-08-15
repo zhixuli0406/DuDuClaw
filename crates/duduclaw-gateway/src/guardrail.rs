@@ -16,32 +16,16 @@
 use std::path::Path;
 
 use duduclaw_core::match_utils::word_contains_ci;
+use duduclaw_core::types::GuardrailsSection;
 
 /// Per-agent guardrail configuration (`agent.toml [guardrails]`).
-#[derive(Debug, Clone)]
-pub struct GuardrailConfig {
-    pub enabled: bool,
-    /// Block a reply that appears to contain a credential/secret.
-    pub block_secrets: bool,
-    /// Redact obvious PII (emails) in the reply rather than blocking.
-    pub redact_pii: bool,
-    /// Block a reply that echoes a prompt-injection instruction.
-    pub block_injection_echo: bool,
-    /// Extra operator deny phrases (whole-word, case-insensitive) → block.
-    pub deny_phrases: Vec<String>,
-}
-
-impl Default for GuardrailConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            block_secrets: true,
-            redact_pii: false,
-            block_injection_echo: true,
-            deny_phrases: Vec::new(),
-        }
-    }
-}
+///
+/// This is now the shared typed section [`GuardrailsSection`] rather than a
+/// local mirror of it (R2 schema unification): the fields and their
+/// missing-key defaults are identical, so an alias keeps every call site
+/// unchanged while the section becomes visible to `AgentConfig` and to any
+/// future assembly layer.
+pub type GuardrailConfig = GuardrailsSection;
 
 /// Outcome of scanning an outbound reply.
 #[derive(Debug, Clone, PartialEq)]
@@ -160,31 +144,15 @@ pub fn scan_output(text: &str, cfg: &GuardrailConfig) -> GuardrailAction {
 
 /// Load `[guardrails]` config from an agent's `agent.toml`. Missing / malformed
 /// ⇒ default (disabled — no behavior change).
+///
+/// Goes through the shared typed parse point
+/// ([`duduclaw_core::agent_toml`]) instead of its former hand-rolled
+/// `toml::Value` walk. The per-key defaults now live on
+/// [`GuardrailsSection`]'s `Default` impl and are byte-identical to the ones
+/// this function used to apply inline — including the deliberate asymmetry
+/// where the master switch is opt-in but the two content scanners are opt-out.
 pub fn load_guardrail_config(agent_dir: &Path) -> GuardrailConfig {
-    let def = GuardrailConfig::default();
-    let Ok(text) = std::fs::read_to_string(agent_dir.join("agent.toml")) else {
-        return def;
-    };
-    let Ok(v) = text.parse::<toml::Value>() else {
-        return def;
-    };
-    let g = match v.get("guardrails") {
-        Some(g) => g,
-        None => return def,
-    };
-    let b = |k: &str, d: bool| g.get(k).and_then(|x| x.as_bool()).unwrap_or(d);
-    let deny_phrases = g
-        .get("deny_phrases")
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
-    GuardrailConfig {
-        enabled: b("enabled", false),
-        block_secrets: b("block_secrets", true),
-        redact_pii: b("redact_pii", false),
-        block_injection_echo: b("block_injection_echo", true),
-        deny_phrases,
-    }
+    duduclaw_core::agent_toml::load(agent_dir).guardrails
 }
 
 /// A safe canned reply to send when a guardrail blocks the real reply. Keeps
@@ -265,5 +233,90 @@ mod tests {
     #[test]
     fn clean_reply_allowed() {
         assert_eq!(scan_output("Sure, here is the weather forecast for Taipei.", &on()), GuardrailAction::Allow);
+    }
+
+    // ── R5 default-direction locks ──────────────────────────────────────
+    //
+    // `[guardrails]` mixes two opposite missing-key directions in one
+    // section: the master switch is fail-OPEN (absent ⇒ disabled) while the
+    // two content scanners are fail-CLOSED (absent ⇒ on). That asymmetry is
+    // deliberate historical behavior carried through the R2 schema
+    // unification unchanged — these tests exist to make any future change to
+    // it a conscious, visible act rather than a silent side effect of a
+    // refactor. Do NOT "tidy" them into agreement.
+
+    fn write_agent_toml(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn default_direction_guardrails_absent_section() {
+        // No `[guardrails]` at all ⇒ the whole feature is off, but the
+        // scanners still read as enabled underneath the off switch.
+        let dir = write_agent_toml("[agent]\nname = \"a\"\n");
+        let cfg = load_guardrail_config(dir.path());
+        assert!(!cfg.enabled, "enabled: missing ⇒ false (opt-in) — historical");
+        assert!(cfg.block_secrets, "block_secrets: missing ⇒ true — historical");
+        assert!(!cfg.redact_pii, "redact_pii: missing ⇒ false — historical");
+        assert!(
+            cfg.block_injection_echo,
+            "block_injection_echo: missing ⇒ true — historical"
+        );
+        assert!(cfg.deny_phrases.is_empty(), "deny_phrases: missing ⇒ empty");
+    }
+
+    #[test]
+    fn default_direction_guardrails_partial_section() {
+        // Section present but individual keys absent: each key keeps its own
+        // direction; turning the feature on must NOT flip the scanners off.
+        let dir = write_agent_toml("[guardrails]\nenabled = true\n");
+        let cfg = load_guardrail_config(dir.path());
+        assert!(cfg.enabled);
+        assert!(cfg.block_secrets);
+        assert!(cfg.block_injection_echo);
+        assert!(!cfg.redact_pii);
+    }
+
+    #[test]
+    fn default_direction_guardrails_missing_file() {
+        // Missing file is treated as "no section", never as an error.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = load_guardrail_config(dir.path());
+        assert!(!cfg.enabled);
+        assert!(cfg.block_secrets);
+    }
+
+    #[test]
+    fn default_direction_guardrails_malformed_file() {
+        // Unparseable TOML degrades to defaults rather than propagating an
+        // error — the pre-migration reader did the same.
+        let dir = write_agent_toml("[guardrails\nenabled = ");
+        let cfg = load_guardrail_config(dir.path());
+        assert!(!cfg.enabled);
+        assert!(cfg.block_secrets);
+    }
+
+    #[test]
+    fn default_direction_guardrails_wrong_typed_key_is_ignored() {
+        // `.and_then(|x| x.as_bool())` returned None for a non-bool, so the
+        // key's default applied and the file still loaded. Typing the section
+        // must not turn that into a parse failure.
+        let dir = write_agent_toml("[guardrails]\nenabled = \"yes\"\nblock_secrets = 1\n");
+        let cfg = load_guardrail_config(dir.path());
+        assert!(!cfg.enabled);
+        assert!(cfg.block_secrets);
+    }
+
+    #[test]
+    fn explicit_values_still_win_in_both_directions() {
+        let dir = write_agent_toml(
+            "[guardrails]\nenabled = true\nblock_secrets = false\nblock_injection_echo = false\nredact_pii = true\ndeny_phrases = [\"x\"]\n",
+        );
+        let cfg = load_guardrail_config(dir.path());
+        assert!(cfg.enabled && cfg.redact_pii);
+        assert!(!cfg.block_secrets && !cfg.block_injection_echo);
+        assert_eq!(cfg.deny_phrases, vec!["x".to_string()]);
     }
 }

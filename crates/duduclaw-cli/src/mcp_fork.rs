@@ -61,57 +61,60 @@ impl Default for ForkSettings {
 }
 
 /// Parse `[fork]` out of an `agent.toml` string. Pure + fail-safe for testing.
+///
+/// **R2 schema unification:** `[fork]` is now a typed section on `AgentConfig`
+/// and this reads it through the shared parse point
+/// ([`duduclaw_core::agent_toml`]) rather than walking a `toml::Value`. Every
+/// missing-key default and range filter below is unchanged, including the two
+/// historical quirks called out inline.
 pub fn parse_fork_settings(toml_str: &str) -> ForkSettings {
+    fork_settings_from_section(duduclaw_core::agent_toml::parse(toml_str).fork)
+}
+
+/// Apply the reader-side range filters and validation to a typed `[fork]`
+/// section. The single place the historical defaults are materialized, shared
+/// by [`parse_fork_settings`] and [`load_fork_settings`].
+fn fork_settings_from_section(f: duduclaw_core::types::ForkSection) -> ForkSettings {
     let def = ForkSettings::default();
-    let parsed: toml::Value = match toml_str.parse() {
-        Ok(v) => v,
-        Err(_) => return def,
-    };
-    let fork = match parsed.get("fork").and_then(|v| v.as_table()) {
-        Some(t) => t,
-        None => return def,
-    };
-    let test_command = fork
-        .get("test_command")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+
     ForkSettings {
-        enabled: fork.get("enabled").and_then(|v| v.as_bool()).unwrap_or(def.enabled),
-        max_branches: fork
-            .get("max_branches")
-            .and_then(|v| v.as_integer())
+        enabled: f.enabled,
+        max_branches: f
+            .max_branches
             .filter(|n| *n >= 1)
             .map(|n| n as usize)
             .unwrap_or(def.max_branches),
-        default_budget_usd: fork
-            .get("default_budget_usd")
-            .and_then(|v| v.as_float())
+        // Quirk, preserved: the raw reader used `as_float()` only, so an
+        // integer literal (`default_budget_usd = 1`) never matched and fell
+        // through to the default. The lenient `Option<f64>` reproduces that —
+        // a TOML integer is not an f64 and deserializes to `None`. Fixing it
+        // would change the effective budget of any config written that way,
+        // which is a behavioral decision, not a refactor.
+        default_budget_usd: f
+            .default_budget_usd
             .filter(|n| *n > 0.0)
             .unwrap_or(def.default_budget_usd),
-        aggregate_budget_usd: fork
-            .get("aggregate_budget_usd")
-            .and_then(|v| v.as_float())
+        aggregate_budget_usd: f
+            .aggregate_budget_usd
             .filter(|n| *n > 0.0)
             .unwrap_or(def.aggregate_budget_usd),
-        merge_mode: fork
-            .get("merge_mode")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or(def.merge_mode),
-        test_command,
-        test_timeout_s: fork
-            .get("test_timeout_s")
-            .and_then(|v| v.as_integer())
+        merge_mode: f.merge_mode.unwrap_or(def.merge_mode),
+        test_command: f
+            .test_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        test_timeout_s: f
+            .test_timeout_s
             .filter(|n| *n >= 1)
             .map(|n| n as u64)
             .unwrap_or(def.test_timeout_s),
-        fine_grained_judge: fork
-            .get("fine_grained_judge")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(def.fine_grained_judge),
-        judge: match fork.get("judge").and_then(|v| v.as_str()) {
+        fine_grained_judge: f.fine_grained_judge,
+        // Judge validation stays at the reader: an unknown value warns and
+        // falls back rather than being rejected at parse time, so a typo can
+        // never cost the agent its whole config.
+        judge: match f.judge.as_deref() {
             Some(s) => {
                 let normalized = s.trim().to_ascii_lowercase();
                 match normalized.as_str() {
@@ -131,11 +134,7 @@ pub fn parse_fork_settings(toml_str: &str) -> ForkSettings {
 
 /// Load `[fork]` settings for an agent from `<home>/agents/<id>/agent.toml`.
 pub fn load_fork_settings(home_dir: &Path, agent_id: &str) -> ForkSettings {
-    let path = home_dir.join("agents").join(agent_id).join("agent.toml");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => parse_fork_settings(&s),
-        Err(_) => ForkSettings::default(),
-    }
+    fork_settings_from_section(duduclaw_core::agent_toml::load_for_agent(home_dir, agent_id).fork)
 }
 
 /// Map a merge-mode string to the typed enum; unknown ⇒ default + warn.
@@ -658,6 +657,91 @@ test_timeout_s = 60
         // Unknown / malformed values fall back to heuristic (fail-safe).
         assert_eq!(parse_fork_settings("[fork]\njudge=\"gpt9\"\n").judge, "heuristic");
         assert_eq!(parse_fork_settings("[fork]\njudge=42\n").judge, "heuristic");
+    }
+
+    // ── R5 default-direction locks ──────────────────────────────────────
+    //
+    // `[fork]` moved onto the typed schema. Its defaults are pinned here
+    // because the section mixes an opt-in master switch with fail-to-constant
+    // knobs, and because it carries one genuine historical quirk (integer
+    // budget literals are ignored) that this migration deliberately preserved
+    // rather than fixed — see the note in `fork_settings_from_section`.
+
+    #[test]
+    fn default_direction_fork_absent_section_is_fully_disabled_defaults() {
+        for body in ["", "[agent]\nname = \"a\"\n", "[fork]\n", "not toml {{{"] {
+            let s = parse_fork_settings(body);
+            assert!(!s.enabled, "fork is opt-in: {body:?}");
+            assert_eq!(s.max_branches, 4, "{body:?}");
+            assert_eq!(s.default_budget_usd, 0.50, "{body:?}");
+            assert_eq!(s.aggregate_budget_usd, 1.50, "{body:?}");
+            assert_eq!(s.merge_mode, "auto_with_fallback", "{body:?}");
+            assert_eq!(s.test_command, None, "{body:?}");
+            assert_eq!(s.test_timeout_s, 120, "{body:?}");
+            assert!(!s.fine_grained_judge, "{body:?}");
+            assert_eq!(s.judge, "heuristic", "{body:?}");
+        }
+    }
+
+    /// **Historical quirk, deliberately preserved.** The pre-migration reader
+    /// used `as_float()` only, so a TOML *integer* budget silently fell back
+    /// to the default. Any config written as `default_budget_usd = 1` has been
+    /// running at 0.50 all along; making the integer work here would silently
+    /// double some agent's spend ceiling. That is a product decision, not a
+    /// refactor — this test exists so the change can't happen by accident.
+    #[test]
+    fn default_direction_fork_budget_rejects_integer_literal() {
+        let s = parse_fork_settings(
+            "[fork]\nenabled=true\ndefault_budget_usd=1\naggregate_budget_usd=3\n",
+        );
+        assert_eq!(s.default_budget_usd, 0.50, "integer literal ⇒ default (historical)");
+        assert_eq!(s.aggregate_budget_usd, 1.50, "integer literal ⇒ default (historical)");
+
+        // Float literals are honored, which is the documented way to write it.
+        let s = parse_fork_settings(
+            "[fork]\nenabled=true\ndefault_budget_usd=1.0\naggregate_budget_usd=3.0\n",
+        );
+        assert_eq!(s.default_budget_usd, 1.0);
+        assert_eq!(s.aggregate_budget_usd, 3.0);
+    }
+
+    #[test]
+    fn default_direction_fork_out_of_range_counts_as_unset() {
+        // `>= 1` / `> 0.0` filters treat an out-of-range written value as
+        // absent rather than clamping it — preserved from the raw reader.
+        let s = parse_fork_settings(
+            "[fork]\nmax_branches=0\ntest_timeout_s=0\ndefault_budget_usd=-1.0\n",
+        );
+        assert_eq!(s.max_branches, 4);
+        assert_eq!(s.test_timeout_s, 120);
+        assert_eq!(s.default_budget_usd, 0.50);
+    }
+
+    #[test]
+    fn default_direction_fork_wrong_typed_keys_never_fail_the_parse() {
+        // Pre-migration these were invisible to `AgentConfig`; typing the
+        // section must not let a typo cost the agent its whole config.
+        let s = parse_fork_settings(
+            "[fork]\nenabled=\"yes\"\nmax_branches=\"four\"\ntest_timeout_s=true\n",
+        );
+        assert!(!s.enabled);
+        assert_eq!(s.max_branches, 4);
+        assert_eq!(s.test_timeout_s, 120);
+    }
+
+    #[test]
+    fn default_direction_load_and_parse_agree() {
+        // `load_fork_settings` (file) and `parse_fork_settings` (string) must
+        // resolve identically — they now share one section→settings step.
+        let home = tempfile::tempdir().unwrap();
+        let body = "[fork]\nenabled=true\nmax_branches=2\njudge=\"llm\"\n";
+        let dir = home.path().join("agents").join("a1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), body).unwrap();
+        assert_eq!(load_fork_settings(home.path(), "a1"), parse_fork_settings(body));
+
+        // Unknown agent ⇒ defaults, never an error.
+        assert_eq!(load_fork_settings(home.path(), "nope"), ForkSettings::default());
     }
 
     #[test]
