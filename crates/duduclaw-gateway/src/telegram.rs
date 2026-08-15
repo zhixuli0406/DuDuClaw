@@ -244,14 +244,16 @@ pub async fn start_telegram_bots(
         for agent in reg.list() {
             if let Some(channels) = &agent.config.channels {
                 if let Some(tg) = &channels.telegram {
-                    let token = crate::config_crypto::resolve_agent_token(
+                    // WP-H1: the resolver returns `None` for "not configured";
+                    // there is no empty-string state left to re-check here.
+                    if let Some(token) = crate::config_crypto::resolve_agent_token(
                         &tg.bot_token_enc, &tg.bot_token, home_dir,
-                    );
-                    // WP12: repair a stored token whose ':' was lost before it
-                    // reaches dedup — otherwise the same bot could be seen as
-                    // two different tokens.
-                    let token = crate::config_crypto::repair_telegram_token(&token).into_owned();
-                    if !token.is_empty() {
+                    ) {
+                        // WP12: repair a stored token whose ':' was lost before
+                        // it reaches dedup — otherwise the same bot could be
+                        // seen as two different tokens.
+                        let token = crate::config_crypto::repair_telegram_token(token.expose())
+                            .into_owned();
                         tokens.push((agent.config.agent.name.clone(), token));
                     }
                 }

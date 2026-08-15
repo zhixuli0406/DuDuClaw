@@ -3,8 +3,29 @@
 //! Provides a single `decrypt_config_field()` function used by all channel
 //! bots and handlers to read tokens from `config.toml`, trying the encrypted
 //! `_enc` field first and falling back to plaintext for backwards compatibility.
+//!
+//! ## Credentials doctrine (WP-H1, P0)
+//!
+//! Every read point in this module now classifies the `<field>_enc` /
+//! `<field>` pair through the one shared type,
+//! [`duduclaw_security::secret_ref::SecretRef`], and resolves it through that
+//! type's resolver. Two things follow:
+//!
+//! - **`secret://<backend>/<name>` is understood everywhere.** It used to be
+//!   honoured only by the async [`read_encrypted_config_field`]; every
+//!   synchronous path (per-agent channel tokens, the `reports_to` cascade, the
+//!   raw-table reader) handed the URI back verbatim and it was sent to the
+//!   vendor API as the bot token. Synchronous paths resolve inline ciphertext,
+//!   legacy plaintext and `secret://env/…`; a reference to a *network* backend
+//!   fails closed with a warning there (never a literal) and resolves normally
+//!   on the async path.
+//! - **"Empty" is not a value.** Resolvers return `Option<Secret>`, and
+//!   `Secret` cannot hold the empty string, so callers no longer each decide
+//!   what `""` means.
 
 use std::path::Path;
+
+use duduclaw_security::secret_ref::{Secret, SecretRef, SecretStatus};
 
 /// Load the AES-256 keyfile from `~/.duduclaw/.keyfile`.
 /// Used by GVU encryption, the ObservationFinalizer CLI, and other internal
@@ -114,22 +135,26 @@ pub fn encrypt_value(plaintext: &str, home_dir: &Path) -> Option<String> {
     engine.encrypt_string(plaintext).ok()
 }
 
-/// Resolve a per-agent channel token: try encrypted version first, fallback to plaintext.
+/// Resolve a per-agent channel token from `agent.toml`'s typed
+/// `[channels.*]` sections: encrypted twin first, then plaintext (which may be
+/// a `secret://` reference).
 ///
-/// Used by `start_*_bots()` to read tokens from agent.toml `[channels.*]` sections.
+/// Used by `start_*_bots()`. Returns `None` — never an empty string — when
+/// nothing is configured; the six call sites that used to re-check
+/// `!token.is_empty()` after this call no longer need to, and Discord's
+/// hand-inlined copy of this logic is gone (WP-H1 P0).
 pub(crate) fn resolve_agent_token(
     encrypted: &Option<String>,
     plaintext: &str,
     home_dir: &Path,
-) -> String {
-    if let Some(enc) = encrypted {
-        if !enc.is_empty() {
-            if let Some(decrypted) = decrypt_value(enc, home_dir) {
-                return decrypted;
-            }
-        }
-    }
-    plaintext.to_string()
+) -> Option<Secret> {
+    SecretRef::from_typed(encrypted.as_deref(), plaintext).resolve_sync(home_dir)
+}
+
+/// Non-secret status of a per-agent channel credential: configured / source /
+/// writable / plaintext-residue. Never touches a backend, never holds a value.
+pub fn describe_agent_token(encrypted: &Option<String>, plaintext: &str) -> SecretStatus {
+    SecretRef::from_typed(encrypted.as_deref(), plaintext).describe()
 }
 
 /// Repair a Telegram bot token whose `:` separator was lost (WP12).
@@ -229,96 +254,104 @@ pub fn validate_channel_token(channel: &str, token: &str) -> Result<String, Stri
     }
 }
 
+/// Classify a `<section>.<field_base>` credential in an already-parsed
+/// `config.toml` table into the shared [`SecretRef`].
+///
+/// This is the **single** place that knows the config-file layout convention
+/// (`<field>_enc` beats `<field>`, and a present-but-blank `<field>` is an
+/// explicit removal marker that suppresses a stale ciphertext twin). Both the
+/// synchronous [`decrypt_config_field`] and the asynchronous
+/// [`read_encrypted_config_field`] build on it, so they can no longer drift
+/// apart.
+pub fn config_secret_ref(table: &toml::Table, section: &str, field_base: &str) -> SecretRef {
+    let Some(section_table) = table.get(section).and_then(|v| v.as_table()) else {
+        return SecretRef::classify(None, None);
+    };
+    let enc_field = format!("{field_base}_enc");
+    SecretRef::classify(
+        section_table.get(&enc_field).and_then(|v| v.as_str()),
+        section_table.get(field_base).and_then(|v| v.as_str()),
+    )
+}
+
+/// Non-secret status of a `config.toml` credential field: configured / source /
+/// writable / plaintext-residue. Never resolves, never holds a value.
+///
+/// `residue == true` is the design §1.5 case: a plaintext twin sitting next to
+/// a `_enc` twin. The plaintext is inert for reads (the ciphertext wins) but it
+/// is still a live credential in the file, and until now nothing in the system
+/// could see it.
+pub fn describe_config_field(
+    table: &toml::Table,
+    section: &str,
+    field_base: &str,
+) -> SecretStatus {
+    config_secret_ref(table, section, field_base).describe()
+}
+
 /// Read a config field, trying the encrypted version first.
 ///
 /// For example, `decrypt_config_field(table, "channels", "telegram_bot_token", home_dir)`
 /// will try `channels.telegram_bot_token_enc` first, decrypt it, and fall back
 /// to `channels.telegram_bot_token` if the encrypted field is missing or empty.
+///
+/// The plaintext twin may hold a `secret://<backend>/<name>` reference:
+/// `secret://env/…` resolves here; a network-backed reference fails closed with
+/// a warning (it needs [`read_encrypted_config_field`], which can `await`).
+/// Either way the URI itself is never returned as if it were the credential.
 pub fn decrypt_config_field(
     table: &toml::Table,
     section: &str,
     field_base: &str,
     home_dir: &Path,
-) -> Option<String> {
-    let raw = decrypt_config_field_raw(table, section, field_base, home_dir)?;
-    if is_telegram_token_field(field_base) {
-        return Some(repair_telegram_token(&raw).into_owned());
-    }
-    Some(raw)
+) -> Option<Secret> {
+    let raw = config_secret_ref(table, section, field_base).resolve_sync(home_dir)?;
+    Some(apply_field_repairs(field_base, raw))
 }
 
-fn decrypt_config_field_raw(
-    table: &toml::Table,
-    section: &str,
-    field_base: &str,
-    home_dir: &Path,
-) -> Option<String> {
-    let section_table = table.get(section)?.as_table()?;
-
-    // If the plaintext field explicitly exists and is empty, the channel was removed.
-    // Respect this even if a stale _enc value remains (defensive against incomplete cleanup).
-    if let Some(plain_val) = section_table.get(field_base).and_then(|v| v.as_str()) {
-        if plain_val.is_empty() {
-            return None;
-        }
+/// Field-specific read-time repairs applied to a resolved value.
+/// Currently only the WP12 Telegram `:`-separator repair.
+fn apply_field_repairs(field_base: &str, value: Secret) -> Secret {
+    if !is_telegram_token_field(field_base) {
+        return value;
     }
-
-    // Try encrypted field first
-    let enc_field = format!("{field_base}_enc");
-    if let Some(enc_val) = section_table.get(&enc_field).and_then(|v| v.as_str()) {
-        if !enc_val.is_empty() {
-            if let Some(decrypted) = decrypt_value(enc_val, home_dir) {
-                return Some(decrypted);
-            }
-        }
+    match repair_telegram_token(value.expose()) {
+        std::borrow::Cow::Borrowed(_) => value,
+        std::borrow::Cow::Owned(fixed) => Secret::new(fixed).unwrap_or(value),
     }
-
-    // Fallback: plaintext field (backwards compatibility)
-    let plain = section_table.get(field_base)?.as_str()?;
-    if plain.is_empty() { None } else { Some(plain.to_string()) }
 }
 
 /// Read a config field from a TOML file, with encryption support.
 ///
 /// Resolution order for the effective value:
-/// 1. `<field>_enc` (decrypted) → `<field>` plaintext (via [`decrypt_config_field`]).
-/// 2. If that value is a `secret://<backend>/<name>` reference, resolve it
-///    through the configured [`SecretManager`] (e.g. HashiCorp Vault) — this is
+/// 1. `<field>_enc` (decrypted) → `<field>` plaintext.
+/// 2. If either yields a `secret://<backend>/<name>` reference, resolve it
+///    through the configured `SecretManager` (e.g. HashiCorp Vault) — this is
 ///    the opt-in externalised-secret path. Non-reference values are returned
 ///    unchanged, so existing inline / `_enc` secrets behave exactly as before.
+///
+/// Returns `Option<String>` rather than `Option<Secret>` only because its ~40
+/// call sites hand the value straight to an HTTP client; tightening those is a
+/// P1 item.
 pub async fn read_encrypted_config_field(
     home_dir: &Path,
     section: &str,
     field_base: &str,
 ) -> Option<String> {
+    use duduclaw_security::secret_manager::SecretManagerConfig;
+
     let config_path = home_dir.join("config.toml");
     let content = tokio::fs::read_to_string(&config_path).await.ok()?;
     let table: toml::Table = content.parse().ok()?;
-    let value = decrypt_config_field(&table, section, field_base, home_dir)?;
-    resolve_secret_reference(value, &table, home_dir).await
-}
-
-/// If `value` is a `secret://<backend>/<name>` reference, resolve it via the
-/// `[secret_manager]`-configured backend (the reference's own backend is
-/// honored, e.g. `secret://vault/...` always uses Vault). Otherwise return
-/// `value` unchanged. Resolution failures are logged and yield `None` (the
-/// caller then behaves as if the secret were unset — fail-soft, never panics).
-async fn resolve_secret_reference(
-    value: String,
-    table: &toml::Table,
-    home_dir: &Path,
-) -> Option<String> {
-    use duduclaw_security::secret_manager::SecretManagerConfig;
-
-    // Load `[secret_manager]` from the already-parsed config table, then
-    // delegate to the canonical shared resolver.
     let sm_cfg: SecretManagerConfig = table
         .get("secret_manager")
         .cloned()
         .and_then(|v| v.try_into().ok())
         .unwrap_or_default();
-
-    duduclaw_security::secret_manager::resolve_secret_reference(&value, &sm_cfg, home_dir).await
+    let resolved = config_secret_ref(&table, section, field_base)
+        .resolve(&sm_cfg, home_dir)
+        .await?;
+    Some(apply_field_repairs(field_base, resolved).expose_owned())
 }
 
 // ─── Per-agent channel token + reports_to cascade ───────────
@@ -330,7 +363,21 @@ pub fn read_agent_channel_token(
     home_dir: &Path,
     agent_id: &str,
     channel: &str,
-) -> Option<String> {
+) -> Option<Secret> {
+    agent_channel_token_ref(home_dir, agent_id, channel)?.resolve_sync(home_dir)
+}
+
+/// The [`SecretRef`] for one agent's `[channels.<channel>] bot_token(_enc)`.
+/// `None` when the agent file or the section is absent (as opposed to present
+/// and unset, which is an empty `SecretRef`).
+///
+/// Kept separate from [`read_agent_channel_token`] so `describe()` can report a
+/// per-agent credential's source and plaintext residue without resolving it.
+pub fn agent_channel_token_ref(
+    home_dir: &Path,
+    agent_id: &str,
+    channel: &str,
+) -> Option<SecretRef> {
     let agent_toml = home_dir.join("agents").join(agent_id).join("agent.toml");
     let content = std::fs::read_to_string(&agent_toml).ok()?;
     let table: toml::Value = content.parse().ok()?;
@@ -340,19 +387,17 @@ pub fn read_agent_channel_token(
         .and_then(|t| t.get(channel))
         .and_then(|v| v.as_table())?;
 
-    // Encrypted form first (bot_token_enc); then plaintext (bot_token).
-    if let Some(enc) = section.get("bot_token_enc").and_then(|v| v.as_str()) {
-        if !enc.is_empty() {
-            if let Some(plain) = decrypt_value(enc, home_dir) {
-                return Some(plain);
-            }
-        }
-    }
-    section
-        .get("bot_token")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    // `agent.toml` writes delete the plaintext key rather than blanking it, and
+    // the historical reader here tried `_enc` first and merely *skipped* an
+    // empty `bot_token` — it never treated blank-as-removal. `from_typed`
+    // preserves exactly that.
+    Some(SecretRef::from_typed(
+        section.get("bot_token_enc").and_then(|v| v.as_str()),
+        section
+            .get("bot_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    ))
 }
 
 /// Read one agent's `reports_to` field from `agent.toml`.
@@ -408,7 +453,7 @@ pub fn resolve_agent_channel_token_via_reports_to(
     home_dir: &Path,
     agent_id: &str,
     channel: &str,
-) -> Option<String> {
+) -> Option<Secret> {
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current = agent_id.to_string();
     for _ in 0..MAX_REPORTS_TO_HOPS {
@@ -456,10 +501,10 @@ pub fn resolve_agent_channel_token_via_reports_to(
 pub async fn channel_dm_token_candidates(home_dir: &Path, channel: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(field) = crate::otp_delivery::token_field(channel) {
+        // No `is_empty` guard: the resolver cannot hand back an empty token
+        // (WP-H1 — `Secret::new` refuses the empty string).
         if let Some(tok) = read_encrypted_config_field(home_dir, "channels", field).await {
-            if !tok.is_empty() {
-                out.push(tok);
-            }
+            out.push(tok);
         }
     }
     let agents_dir = home_dir.join("agents");
@@ -474,7 +519,8 @@ pub async fn channel_dm_token_candidates(home_dir: &Path, channel: &str) -> Vec<
     ids.sort();
     for id in ids {
         if let Some(tok) = read_agent_channel_token(home_dir, &id, channel) {
-            if !tok.is_empty() && !out.contains(&tok) {
+            let tok = tok.expose_owned();
+            if !out.contains(&tok) {
                 out.push(tok);
             }
         }
@@ -677,7 +723,7 @@ mod telegram_token_tests {
                 .unwrap();
         let home = std::env::temp_dir().join("duduclaw-wp12-nonexistent");
         let got = decrypt_config_field(&table, "channels", "telegram_bot_token", &home);
-        assert_eq!(got, Some(good()));
+        assert_eq!(got.map(|s| s.expose_owned()), Some(good()));
     }
 
     #[test]
@@ -688,7 +734,7 @@ mod telegram_token_tests {
             format!("[channels]\ndiscord_bot_token = \"{}\"\n", broken()).parse().unwrap();
         let home = std::env::temp_dir().join("duduclaw-wp12-nonexistent");
         let got = decrypt_config_field(&table, "channels", "discord_bot_token", &home);
-        assert_eq!(got, Some(broken()));
+        assert_eq!(got.map(|s| s.expose_owned()), Some(broken()));
     }
 }
 
@@ -736,7 +782,7 @@ mod tests {
         let home = TempHome::new();
         home.write_agent("xianwen-pm", &agent_toml("xianwen-pm", "xianwen-tl", Some("own-token")));
         let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord");
-        assert_eq!(tok.as_deref(), Some("own-token"));
+        assert_eq!(tok.map(|t| t.expose_owned()).as_deref(), Some("own-token"));
     }
 
     #[test]
@@ -746,7 +792,7 @@ mod tests {
         home.write_agent("xianwen-tl", &agent_toml("xianwen-tl", "agnes", None));
         home.write_agent("agnes", &agent_toml("agnes", "", Some("agnes-bot-token")));
         let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord");
-        assert_eq!(tok.as_deref(), Some("agnes-bot-token"));
+        assert_eq!(tok.map(|t| t.expose_owned()).as_deref(), Some("agnes-bot-token"));
     }
 
     #[test]
@@ -768,7 +814,7 @@ mod tests {
         home.write_agent("xianwen-tl", &agent_toml("xianwen-tl", "agnes", Some("tl-token")));
         home.write_agent("agnes", &agent_toml("agnes", "", Some("agnes-token")));
         let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord");
-        assert_eq!(tok.as_deref(), Some("tl-token"));
+        assert_eq!(tok.map(|t| t.expose_owned()).as_deref(), Some("tl-token"));
     }
 
     #[test]
@@ -804,7 +850,9 @@ mod tests {
                        [channels.telegram]\nbot_token = \"tg-tok\"\n";
         home.write_agent("x", tg_body);
         assert_eq!(
-            resolve_agent_channel_token_via_reports_to(home.path(), "x", "telegram").as_deref(),
+            resolve_agent_channel_token_via_reports_to(home.path(), "x", "telegram")
+                .map(|t| t.expose_owned())
+                .as_deref(),
             Some("tg-tok")
         );
         assert!(resolve_agent_channel_token_via_reports_to(home.path(), "x", "discord").is_none());
@@ -821,7 +869,8 @@ mod tests {
         let toml_src = format!("[channels]\nwecom_corp_secret_enc = \"{enc}\"\n");
         let table: toml::Table = toml_src.parse().unwrap();
         assert_eq!(
-            decrypt_config_field(&table, "channels", "wecom_corp_secret", home.path()),
+            decrypt_config_field(&table, "channels", "wecom_corp_secret", home.path())
+                .map(|s| s.expose_owned()),
             Some("corp-secret-value".to_string())
         );
     }
@@ -838,7 +887,8 @@ mod tests {
         );
         let table: toml::Table = toml_src.parse().unwrap();
         assert_eq!(
-            decrypt_config_field(&table, "channels", "wecom_corp_secret", home.path()),
+            decrypt_config_field(&table, "channels", "wecom_corp_secret", home.path())
+                .map(|s| s.expose_owned()),
             None
         );
     }
@@ -919,5 +969,341 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&parent);
+    }
+}
+
+/// WP-H1 (credentials doctrine P0) — behaviour equivalence for the three
+/// pre-existing resolution paths, plus the bug the convergence fixes.
+///
+/// The P0 acceptance bar is "existing `_enc`, plaintext and env paths resolve
+/// to the same value as before", which is what lets the whole change ship
+/// without a feature flag and be reverted as one commit. Everything asserted
+/// here was true before the `SecretRef` rewrite except where a test says
+/// otherwise in its own name.
+#[cfg(test)]
+mod wp_h1_credentials_doctrine_tests {
+    use super::*;
+    use duduclaw_security::secret_ref::SourceKind;
+
+    struct TempHome(std::path::PathBuf);
+    impl TempHome {
+        fn new() -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("duduclaw-wph1-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        fn write_agent(&self, agent: &str, body: &str) {
+            let dir = self.0.join("agents").join(agent);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.toml"), body).unwrap();
+        }
+        fn write_config(&self, body: &str) {
+            std::fs::write(self.0.join("config.toml"), body).unwrap();
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // ─── Equivalence: config.toml `_enc` / plaintext ────────────
+
+    #[test]
+    fn enc_field_resolves_unchanged() {
+        let home = TempHome::new();
+        let enc = encrypt_value("tok-from-enc", home.path()).unwrap();
+        let table: toml::Table = format!("[channels]\ndiscord_bot_token_enc = \"{enc}\"\n")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
+                .map(|s| s.expose_owned()),
+            Some("tok-from-enc".to_string())
+        );
+    }
+
+    #[test]
+    fn plaintext_field_resolves_unchanged() {
+        let home = TempHome::new();
+        let table: toml::Table = "[channels]\ndiscord_bot_token = \"tok-plain\"\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
+                .map(|s| s.expose_owned()),
+            Some("tok-plain".to_string())
+        );
+    }
+
+    #[test]
+    fn enc_beats_plaintext_and_undecryptable_enc_falls_back() {
+        let home = TempHome::new();
+        let enc = encrypt_value("winner", home.path()).unwrap();
+        let table: toml::Table =
+            format!("[channels]\ndiscord_bot_token = \"loser\"\ndiscord_bot_token_enc = \"{enc}\"\n")
+                .parse()
+                .unwrap();
+        assert_eq!(
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
+                .map(|s| s.expose_owned()),
+            Some("winner".to_string())
+        );
+
+        // Garbage ciphertext → the plaintext twin still answers (pre-existing
+        // fail-soft behaviour: a rotated keyfile must not brick the channel).
+        let table: toml::Table =
+            "[channels]\ndiscord_bot_token = \"loser\"\ndiscord_bot_token_enc = \"@@garbage@@\"\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
+                .map(|s| s.expose_owned()),
+            Some("loser".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_section_and_missing_field_are_unset() {
+        let home = TempHome::new();
+        let table: toml::Table = "[other]\nx = 1\n".parse().unwrap();
+        assert!(decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none());
+        let table: toml::Table = "[channels]\nother_token = \"v\"\n".parse().unwrap();
+        assert!(decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none());
+    }
+
+    // ─── Equivalence: async file path (incl. env backend) ───────
+
+    #[tokio::test]
+    async fn async_path_matches_sync_for_enc_and_plaintext() {
+        let home = TempHome::new();
+        let enc = encrypt_value("async-enc", home.path()).unwrap();
+        home.write_config(&format!(
+            "[channels]\ndiscord_bot_token_enc = \"{enc}\"\nslack_bot_token = \"async-plain\"\n"
+        ));
+        assert_eq!(
+            read_encrypted_config_field(home.path(), "channels", "discord_bot_token").await,
+            Some("async-enc".to_string())
+        );
+        assert_eq!(
+            read_encrypted_config_field(home.path(), "channels", "slack_bot_token").await,
+            Some("async-plain".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn async_path_still_resolves_env_references() {
+        let home = TempHome::new();
+        let var = format!("DUDUCLAW_WPH1_ASYNC_{}", std::process::id());
+        // SAFETY: process-unique name, set and removed inside this test.
+        unsafe { std::env::set_var(&var, "from-env-async") };
+        home.write_config(&format!(
+            "[channels]\ndiscord_bot_token = \"secret://env/{var}\"\n"
+        ));
+        let got = read_encrypted_config_field(home.path(), "channels", "discord_bot_token").await;
+        unsafe { std::env::remove_var(&var) };
+        assert_eq!(got, Some("from-env-async".to_string()));
+    }
+
+    #[tokio::test]
+    async fn async_path_still_resolves_an_encrypted_pointer_to_a_reference() {
+        // `<field>_enc` whose decrypted content is itself a `secret://` URI —
+        // the pre-existing async behaviour, which must survive the rewrite.
+        let home = TempHome::new();
+        let var = format!("DUDUCLAW_WPH1_PTR_{}", std::process::id());
+        // SAFETY: process-unique name, set and removed inside this test.
+        unsafe { std::env::set_var(&var, "pointer-target") };
+        let enc = encrypt_value(&format!("secret://env/{var}"), home.path()).unwrap();
+        home.write_config(&format!("[channels]\ndiscord_bot_token_enc = \"{enc}\"\n"));
+        let got = read_encrypted_config_field(home.path(), "channels", "discord_bot_token").await;
+        unsafe { std::env::remove_var(&var) };
+        assert_eq!(got, Some("pointer-target".to_string()));
+    }
+
+    // ─── The bug: `secret://` used to leave sync paths as a literal ───
+
+    /// Before WP-H1 every one of these returned the URI string itself, which
+    /// was then sent to Telegram / Discord / Slack as the bot token.
+    #[test]
+    fn sync_paths_never_return_a_secret_uri_as_the_token() {
+        let home = TempHome::new();
+        let reference = "secret://vault/telegram_bot_token";
+
+        // (a) raw config table
+        let table: toml::Table =
+            format!("[channels]\ndiscord_bot_token = \"{reference}\"\n").parse().unwrap();
+        let got = decrypt_config_field(&table, "channels", "discord_bot_token", home.path());
+        assert!(got.is_none(), "config field leaked a secret:// literal");
+
+        // (b) per-agent typed token (telegram.rs / slack.rs / discord.rs)
+        let got = resolve_agent_token(&None, reference, home.path());
+        assert!(got.is_none(), "agent token leaked a secret:// literal");
+
+        // (c) per-agent channel token + reports_to cascade
+        home.write_agent(
+            "kid",
+            "[agent]\nname = \"kid\"\nreports_to = \"boss\"\n",
+        );
+        home.write_agent(
+            "boss",
+            &format!(
+                "[agent]\nname = \"boss\"\nreports_to = \"\"\n\
+                 [channels.discord]\nbot_token = \"{reference}\"\n"
+            ),
+        );
+        assert!(
+            read_agent_channel_token(home.path(), "boss", "discord").is_none(),
+            "per-agent token leaked a secret:// literal"
+        );
+        assert!(
+            resolve_agent_channel_token_via_reports_to(home.path(), "kid", "discord").is_none(),
+            "reports_to cascade leaked a secret:// literal"
+        );
+    }
+
+    /// The other half of the fix: a reference that a sync path *can* satisfy.
+    #[test]
+    fn sync_paths_resolve_env_references() {
+        let home = TempHome::new();
+        let var = format!("DUDUCLAW_WPH1_SYNC_{}", std::process::id());
+        // SAFETY: process-unique name, set and removed inside this test.
+        unsafe { std::env::set_var(&var, "env-token") };
+        let reference = format!("secret://env/{var}");
+
+        let table: toml::Table =
+            format!("[channels]\ndiscord_bot_token = \"{reference}\"\n").parse().unwrap();
+        let from_config = decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
+            .map(|s| s.expose_owned());
+        let from_agent =
+            resolve_agent_token(&None, &reference, home.path()).map(|s| s.expose_owned());
+
+        home.write_agent(
+            "solo",
+            &format!(
+                "[agent]\nname = \"solo\"\nreports_to = \"\"\n\
+                 [channels.discord]\nbot_token = \"{reference}\"\n"
+            ),
+        );
+        let from_cascade =
+            resolve_agent_channel_token_via_reports_to(home.path(), "solo", "discord")
+                .map(|s| s.expose_owned());
+        unsafe { std::env::remove_var(&var) };
+
+        assert_eq!(from_config.as_deref(), Some("env-token"));
+        assert_eq!(from_agent.as_deref(), Some("env-token"));
+        assert_eq!(from_cascade.as_deref(), Some("env-token"));
+    }
+
+    // ─── Empty-value semantics collapsed onto Option ────────────
+
+    #[test]
+    fn empty_inputs_are_none_not_empty_strings() {
+        let home = TempHome::new();
+        assert!(resolve_agent_token(&None, "", home.path()).is_none());
+        assert!(resolve_agent_token(&Some(String::new()), "", home.path()).is_none());
+        let table: toml::Table = "[channels]\ndiscord_bot_token = \"\"\n".parse().unwrap();
+        assert!(decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none());
+    }
+
+    /// The typed `agent.toml` structs cannot express "present but blank", so an
+    /// enc-only agent channel must still resolve — the exact case
+    /// `handlers.rs`'s enc-only round-trip test covers.
+    #[test]
+    fn typed_enc_only_agent_token_survives_the_blank_plaintext() {
+        let home = TempHome::new();
+        let enc = encrypt_value("enc-only-agent-token", home.path()).unwrap();
+        assert_eq!(
+            resolve_agent_token(&Some(enc), "", home.path()).map(|s| s.expose_owned()),
+            Some("enc-only-agent-token".to_string())
+        );
+    }
+
+    /// **Deliberate convergence, not equivalence.** `config.toml`'s canonical
+    /// reader has always treated a present-but-blank plaintext key as "channel
+    /// removed" and ignored a stale `_enc` twin; the dispatcher's forward path
+    /// had its own reader that did not, so a removed channel kept forwarding on
+    /// the stale ciphertext. Both now agree.
+    #[test]
+    fn blank_plaintext_in_config_suppresses_a_stale_ciphertext() {
+        let home = TempHome::new();
+        let enc = encrypt_value("stale-after-removal", home.path()).unwrap();
+        let table: toml::Table =
+            format!("[channels]\ndiscord_bot_token = \"\"\ndiscord_bot_token_enc = \"{enc}\"\n")
+                .parse()
+                .unwrap();
+        assert!(decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none());
+    }
+
+    // ─── describe(): one dialect, and residue detection ─────────
+
+    #[test]
+    fn describe_reports_source_and_residue_without_the_value() {
+        let home = TempHome::new();
+        let enc = encrypt_value("real-token", home.path()).unwrap();
+
+        // §1.5 shape: a plaintext twin left behind next to the ciphertext.
+        let table: toml::Table = format!(
+            "[channels]\ndiscord_bot_token = \"leftover-plaintext\"\n\
+             discord_bot_token_enc = \"{enc}\"\n"
+        )
+        .parse()
+        .unwrap();
+        let st = describe_config_field(&table, "channels", "discord_bot_token");
+        assert!(st.configured);
+        assert_eq!(st.source, SourceKind::Inline);
+        assert!(st.writable);
+        assert!(st.residue, "plaintext twin next to _enc must be reported");
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(!json.contains("leftover-plaintext") && !json.contains(&enc));
+
+        // Clean encrypted-only field: no residue.
+        let table: toml::Table =
+            format!("[channels]\ndiscord_bot_token_enc = \"{enc}\"\n").parse().unwrap();
+        assert!(!describe_config_field(&table, "channels", "discord_bot_token").residue);
+
+        // Unset field.
+        let table: toml::Table = "[channels]\n".parse().unwrap();
+        let st = describe_config_field(&table, "channels", "discord_bot_token");
+        assert!(!st.configured && st.source == SourceKind::Unset);
+
+        // External reference: configured, but not writable from the dashboard.
+        let table: toml::Table =
+            "[channels]\ndiscord_bot_token = \"secret://vault/dc\"\n".parse().unwrap();
+        let st = describe_config_field(&table, "channels", "discord_bot_token");
+        assert!(st.configured && !st.writable);
+        assert_eq!(st.source, SourceKind::Vault);
+        assert_eq!(st.source_label, "vault:dc");
+
+        // Per-agent variant shares the dialect.
+        let st = describe_agent_token(&Some("ct".into()), "pt");
+        assert!(st.residue);
+    }
+
+    // ─── Telegram read-time repair survives the rewrite ─────────
+
+    #[test]
+    fn telegram_repair_still_applies_on_both_paths() {
+        let home = TempHome::new();
+        let broken = "7000000001-AAExampleExampleExampleExampleXYZ12";
+        let fixed = "7000000001:AAExampleExampleExampleExampleXYZ12";
+        let table: toml::Table =
+            format!("[channels]\ntelegram_bot_token = \"{broken}\"\n").parse().unwrap();
+        assert_eq!(
+            decrypt_config_field(&table, "channels", "telegram_bot_token", home.path())
+                .map(|s| s.expose_owned()),
+            Some(fixed.to_string())
+        );
+        // …and only for the Telegram field.
+        let table: toml::Table =
+            format!("[channels]\ndiscord_bot_token = \"{broken}\"\n").parse().unwrap();
+        assert_eq!(
+            decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
+                .map(|s| s.expose_owned()),
+            Some(broken.to_string())
+        );
     }
 }

@@ -15,6 +15,7 @@ base64 = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
+zeroize = "1"
 unicode-normalization = "0.1"
 unicode-script = "0.5"
 unicode-segmentation = "1.12"
