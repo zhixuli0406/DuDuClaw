@@ -34,6 +34,8 @@ import {
   Check,
   Sparkles,
   Building2,
+  User,
+  Info,
 } from 'lucide-react';
 import { GenerateExpertDialog } from '@/components/experts/GenerateExpertDialog';
 import { AttachUnderSelect } from '@/components/experts/AttachUnderSelect';
@@ -43,11 +45,14 @@ import { AutonomyNote } from '@/components/AutonomyNote';
 const CATEGORY_ORDER = ['health', 'professional', 'retail', 'lifestyle', 'education', 'other'] as const;
 
 /**
- * ExpertsPage — 專家包 management (admin-only, mirrors the `experts.*` RPCs).
- *
- * A pack bundles a ready-made AI team: staffers, skills, and knowledge pages.
- * Flow: upload a .zip → `POST /api/experts/upload` stages it server-side →
- * `experts.install` runs the full security-scanned install pipeline. Packs
+ * ExpertsPage — AI team management (admin-only, mirrors the `experts.*`
+ * RPCs). Two ways in: upload a custom .zip bundling a ready-made AI team
+ * (staffers, skills, and knowledge pages) — `POST /api/experts/upload`
+ * stages it server-side, `experts.install` runs the full security-scanned
+ * pipeline — or summon a built-in industry team from the catalog below
+ * (`experts.catalog` / `experts.install_builtin`, WP P2-a "召喚卡片": each
+ * card shows the real roster, which positions stay human, and a few concrete
+ * tasks it handles — never fabricated, all sourced from `team.toml`). Packs
  * that ship hooks land with hooks DISABLED pending approval (fail-closed);
  * once decided in the inbox/approval center, the "套用" button applies the
  * decision via `experts.hooks_apply`.
@@ -281,61 +286,13 @@ export function ExpertsPage() {
               </h3>
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
                 {entries.map((entry) => (
-                  <Card key={entry.slug} className="gap-3">
-                    <CardContent className="space-y-3">
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <h3 className="truncate text-sm font-medium">{entry.label}</h3>
-                          {entry.kind === 'expert' && (
-                            <Badge variant="ghost">{t('experts.kind.expert')}</Badge>
-                          )}
-                        </div>
-                        {entry.description && (
-                          <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
-                            {entry.description}
-                          </p>
-                        )}
-                      </div>
-                      {(entry.departments?.length ?? 0) > 0 && (
-                        <div className="flex flex-wrap items-center gap-1">
-                          {entry.departments!.map((d) => (
-                            <Badge key={d} variant="ghost">{d}</Badge>
-                          ))}
-                        </div>
-                      )}
-                      <div className="flex items-center justify-between">
-                        <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-                          <Users className="size-3.5" />
-                          {intl.formatMessage({ id: 'experts.card.agents' }, { count: entry.agents_count })}
-                        </span>
-                        {entry.installed ? (
-                          <Badge variant="secondary">
-                            <Check />
-                            {t('experts.builtin.installed')}
-                          </Badge>
-                        ) : (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={installingBuiltin !== null}
-                            onClick={() => { setAttachUnder(''); setInstallTarget(entry); }}
-                          >
-                            {installingBuiltin === entry.slug ? (
-                              <>
-                                <Spinner className="size-3.5" />
-                                {t('experts.installing')}
-                              </>
-                            ) : (
-                              <>
-                                <Download />
-                                {t('experts.builtin.install')}
-                              </>
-                            )}
-                          </Button>
-                        )}
-                      </div>
-                    </CardContent>
-                  </Card>
+                  <BuiltinCatalogCard
+                    key={entry.slug}
+                    entry={entry}
+                    installing={installingBuiltin === entry.slug}
+                    installDisabled={installingBuiltin !== null}
+                    onInstall={() => { setAttachUnder(''); setInstallTarget(entry); }}
+                  />
                 ))}
               </div>
             </div>
@@ -521,5 +478,160 @@ export function ExpertsPage() {
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+/**
+ * BuiltinCatalogCard — one "召喚卡片" (WP P2-a). Shows what the design doc
+ * calls the honest picture of a team: who is actually on it (`members`),
+ * which positions stay human (`humans`/`excluded` — a deliberate
+ * differentiator from an "AI replaces everything" pitch), and a few concrete
+ * tasks it handles (`examples`, author-written or derived from real worker
+ * summaries — never invented client-side). Once installed, the entry point
+ * links straight to the created lead agent instead of leaving a dead badge.
+ */
+function BuiltinCatalogCard({
+  entry,
+  installing,
+  installDisabled,
+  onInstall,
+}: {
+  entry: ExpertCatalogEntry;
+  installing: boolean;
+  installDisabled: boolean;
+  onInstall: () => void;
+}) {
+  const intl = useIntl();
+  const navigate = useNavigate();
+  const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
+  const members = entry.members ?? [];
+  const humans = entry.humans ?? [];
+  const excluded = entry.excluded ?? [];
+  const examples = entry.examples ?? [];
+
+  return (
+    <Card className="gap-3">
+      <CardContent className="space-y-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <h3 className="truncate text-sm font-medium">{entry.label}</h3>
+            {entry.kind === 'expert' && <Badge variant="ghost">{t('experts.kind.expert')}</Badge>}
+          </div>
+          {entry.description && (
+            <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{entry.description}</p>
+          )}
+        </div>
+
+        {(entry.departments?.length ?? 0) > 0 && (
+          <div className="flex flex-wrap items-center gap-1">
+            {entry.departments!.map((d) => (
+              <Badge key={d} variant="ghost">{d}</Badge>
+            ))}
+          </div>
+        )}
+
+        {members.length > 0 && (
+          <div className="space-y-1.5 rounded-lg bg-muted/40 p-2.5">
+            <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              {intl.formatMessage({ id: 'experts.card.members.title' }, { count: members.length })}
+            </p>
+            <ul className="space-y-1">
+              {members.map((m) => (
+                <li key={m.name} className="flex items-start gap-1.5 text-xs">
+                  <User className="mt-0.5 size-3 shrink-0 text-muted-foreground" aria-hidden="true" />
+                  <span className="min-w-0 truncate">
+                    <span className="font-medium text-foreground">{m.display_name || m.name}</span>
+                    {m.summary && <span className="text-muted-foreground"> — {m.summary}</span>}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {(humans.length > 0 || excluded.length > 0) && (
+          <div className="space-y-1 rounded-lg border border-dashed border-surface-border p-2.5 text-xs text-muted-foreground">
+            {humans.length > 0 && (
+              <p className="flex items-start gap-1.5">
+                <User className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
+                {intl.formatMessage(
+                  { id: 'experts.card.humans' },
+                  { titles: intl.formatList(humans.map((h) => h.title), { type: 'unit' }) },
+                )}
+              </p>
+            )}
+            {excluded.length > 0 && (
+              <p className="flex items-start gap-1.5">
+                <Info className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
+                {intl.formatMessage(
+                  { id: 'experts.card.excluded' },
+                  {
+                    items: intl.formatList(
+                      excluded.map((x) => intl.formatMessage({ id: 'experts.card.excludedItem' }, { kit: x.kit, reason: x.reason })),
+                      { type: 'unit' },
+                    ),
+                  },
+                )}
+              </p>
+            )}
+          </div>
+        )}
+
+        {examples.length > 0 && (
+          <div className="space-y-1">
+            <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              {t('experts.card.examples.title')}
+            </p>
+            <ul className="space-y-1 text-xs text-muted-foreground">
+              {examples.map((ex, i) => (
+                <li key={i} className="flex gap-1.5">
+                  <span aria-hidden="true" className="shrink-0">▸</span>
+                  <span>{ex}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-2">
+          <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+            <Users className="size-3.5" />
+            {intl.formatMessage({ id: 'experts.card.agents' }, { count: entry.agents_count })}
+          </span>
+          {entry.installed ? (
+            <div className="flex items-center gap-2">
+              <Badge variant="secondary">
+                <Check />
+                {t('experts.builtin.installed')}
+              </Badge>
+              {entry.lead_agent_name && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => navigate(`/agents/${encodeURIComponent(entry.lead_agent_name!)}`)}
+                >
+                  {t('experts.builtin.viewTeam')}
+                  <ArrowRight />
+                </Button>
+              )}
+            </div>
+          ) : (
+            <Button variant="outline" size="sm" disabled={installDisabled} onClick={onInstall}>
+              {installing ? (
+                <>
+                  <Spinner className="size-3.5" />
+                  {t('experts.installing')}
+                </>
+              ) : (
+                <>
+                  <Download />
+                  {entry.kind === 'expert' ? t('experts.builtin.summonExpert') : t('experts.builtin.summonTeam')}
+                </>
+              )}
+            </Button>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   );
 }

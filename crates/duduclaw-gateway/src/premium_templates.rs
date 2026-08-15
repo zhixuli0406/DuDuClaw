@@ -240,6 +240,12 @@ pub struct TeamManifest {
     pub humans: Vec<HumanRoleSpec>,
     #[serde(default)]
     pub excluded: Vec<ExcludedKitSpec>,
+    /// `examples = [...]` — 2-3 concrete task examples this team is good at
+    /// (dashboard "召喚卡片" content, WP P2-a). Optional and content-authored;
+    /// empty ⇒ the catalog derives a fallback from real worker `summary`
+    /// strings (never LLM-fabricated — see `expert_generate::builtin_catalog`).
+    #[serde(default)]
+    pub examples: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1119,6 +1125,7 @@ summary = "留真人"
             }],
             humans: Vec::new(),
             excluded: Vec::new(),
+            examples: Vec::new(),
         };
         assert_eq!(team_department(&m_empty), None);
 
