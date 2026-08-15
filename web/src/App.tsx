@@ -30,6 +30,7 @@ const FilesPage = lazyPage(() => import('./pages/FilesPage'), 'FilesPage');
 const AgentDetailPage = lazyPage(() => import('./pages/AgentDetailPage'), 'AgentDetailPage');
 const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'SkillMarketPage');
 const ExpertsPage = lazyPage(() => import('./pages/ExpertsPage'), 'ExpertsPage');
+const GalleryPage = lazyPage(() => import('./pages/GalleryPage'), 'GalleryPage');
 const WidgetsPage = lazyPage(() => import('./pages/WidgetsPage'), 'WidgetsPage');
 const WidgetComposerPage = lazyPage(() => import('./pages/WidgetComposerPage'), 'WidgetComposerPage');
 const IntegrationsPage = lazyPage(() => import('./pages/IntegrationsPage'), 'IntegrationsPage');
@@ -246,6 +247,10 @@ export function App() {
                 {/* 專家包 — expert-pack management; experts.* RPCs are
                     require_admin!-gated server-side, this mirrors that. */}
                 <Route path="experts" element={<ExpertsPage />} />
+                {/* 靈感畫廊 (P2-b) — curated "做同款" showcase; gallery.list
+                    reads the same license-gated premium tree as
+                    experts.catalog, require_admin!-gated the same way. */}
+                <Route path="gallery" element={<GalleryPage />} />
               </Route>
 
               {/* ── Zone D 管理 — single entry, ManageShell subnav tree ──
