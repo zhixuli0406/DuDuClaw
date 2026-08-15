@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils';
 import { api, type AccountInfo, type BudgetSummary, type CliCredentialInfo } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { ChipEditor } from '@/components/shared/ChipEditor';
+import { SecretSourceField } from '@/components/shared/SecretSourceField';
 import {
   Button,
   Badge,
@@ -486,10 +487,9 @@ function AddAccountDialog({
           </Field>
 
           <Field label={keyLabel}>
-            <Input
-              type="password"
+            <SecretSourceField
               value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              onChange={setApiKey}
               placeholder={accountType === 'api_key' ? 'sk-ant-...' : 'oauth-token-...'}
             />
           </Field>

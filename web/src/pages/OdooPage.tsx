@@ -29,7 +29,7 @@ import {
   SettingsCard,
   CrossLink,
 } from '@/components/mds';
-import { RowText, RowNumber, RowSwitch, RowSelect } from '@/pages/agent-form/form-rows';
+import { RowText, RowSecret, RowNumber, RowSwitch, RowSelect } from '@/pages/agent-form/form-rows';
 import { DangerZone, ConfirmDialog, type SelectOption } from '@/components/settings/controls';
 
 const FEATURE_MODULES = ['crm', 'sale', 'inventory', 'accounting', 'project', 'hr'] as const;
@@ -358,25 +358,19 @@ export function OdooPage() {
           <RowSelect label={t('odoo.authMethod')} value={authMethod} onChange={setAuthMethod} options={authOptions} />
           <RowText label={t('odoo.username')} value={username} onChange={setUsername} placeholder="admin@mycompany.com" tier="text" />
           {authMethod === 'api_key' ? (
-            <RowText
+            <RowSecret
               label={t('odoo.apiKey')}
               description={t('odoo.apiKeyHint')}
               value={apiKey}
               onChange={setApiKey}
-              type="password"
               placeholder={savedCreds.apiKey ? t('integrations.secretKeep') : '••••••••'}
-              autoComplete="off"
-              tier="text"
             />
           ) : (
-            <RowText
+            <RowSecret
               label={t('odoo.password')}
               value={password}
               onChange={setPassword}
-              type="password"
               placeholder={savedCreds.password ? t('integrations.secretKeep') : '••••••••'}
-              autoComplete="off"
-              tier="text"
             />
           )}
         </SettingsCard>
@@ -533,14 +527,12 @@ export function OdooPage() {
           )}
           <RowSwitch label={t('odoo.webhookEnabled')} checked={webhookEnabled} onChange={setWebhookEnabled} />
           {webhookEnabled && (
-            <RowText
+            <RowSecret
               label={t('odoo.webhookSecret')}
               description={t('odoo.webhookSecretHint')}
               value={webhookSecret}
               onChange={setWebhookSecret}
-              type="password"
               placeholder={savedCreds.webhookSecret ? t('integrations.secretKeep') : '••••••••'}
-              tier="text"
             />
           )}
         </SettingsCard>
