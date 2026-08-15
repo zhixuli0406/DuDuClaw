@@ -295,6 +295,14 @@ async fn poll_and_dispatch_sqlite(
         // panic), never affects the dispatch result already computed above.
         if let (Some((task_id, round)), Some(collector)) = (goal_loop_ref, native_collector) {
             let events = collector.lock().map(|g| g.clone()).unwrap_or_default();
+            // WP-F (P2-c): the in-memory bridge above is remove-once and
+            // process-lifetime, so it is long gone by the time a human opens
+            // the needs_human card. Persist the file-effect subset here — the
+            // only point where native (non-MCP) tool evidence exists for a
+            // goal-loop round. Best-effort, same contract as the bridge.
+            crate::task_changes::record_round_changes(
+                home_dir, task_id, &msg.target, round, &events,
+            );
             crate::prediction::task_observe::record_native_evidence(task_id, round, events);
         }
 

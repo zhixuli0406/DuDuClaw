@@ -561,6 +561,7 @@ export function TaskDetailPage() {
 
         {/* Bottom tabs (discussion / activity) */}
         <TaskBottomTabs
+          taskId={task.id}
           events={taskActivities}
           comments={taskComments}
           agents={agents}
