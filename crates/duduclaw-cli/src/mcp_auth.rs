@@ -5,6 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use subtle::ConstantTimeEq;
@@ -124,6 +126,12 @@ pub enum AuthError {
     UnknownKey,
     KeyExpired { days_old: u64 },
     InvalidScope(String),
+    /// Gap (a), WP-H2 §1.3: a per-call re-authentication attempt needed to
+    /// reload the on-disk key registry (its mtime had changed) but the
+    /// reload itself failed — an I/O error other than "file does not exist",
+    /// or malformed TOML. Fail-closed: this is intentionally a HARD deny,
+    /// never a silent fall-back to whatever was cached before.
+    ReloadFailed,
 }
 
 impl std::fmt::Display for AuthError {
@@ -136,6 +144,10 @@ impl std::fmt::Display for AuthError {
                 write!(f, "API key expired ({days_old} days old, max 30)")
             }
             AuthError::InvalidScope(s) => write!(f, "Unknown scope: {s}"),
+            AuthError::ReloadFailed => write!(
+                f,
+                "MCP key registry reload failed (I/O or parse error) — denying (fail-closed)"
+            ),
         }
     }
 }
@@ -150,7 +162,7 @@ fn is_valid_key_format(key: &str) -> bool {
 
 // ── Config parsing ───────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct KeyEntry {
     client_id: String,
     scopes: HashSet<Scope>,
@@ -158,24 +170,45 @@ struct KeyEntry {
     created_at: DateTime<Utc>,
 }
 
-/// Load mcp_keys from ~/.duduclaw/config.toml
-fn load_key_registry(config_dir: &Path) -> HashMap<String, KeyEntry> {
+/// Outcome of attempting to (re)parse the on-disk `[mcp_keys]` registry.
+///
+/// Distinguishing "loaded, possibly empty" from "failed to load" is what lets
+/// [`KeyRegistryCache`] implement the fail-closed reload contract (Gap (a),
+/// WP-H2 §1.3): a config.toml that never existed (or has no `[mcp_keys]`
+/// table) is a legitimate empty-registry state, but a config.toml that
+/// EXISTS and cannot be read/parsed is a genuine failure — a previously-good
+/// cache must never be reused past that point.
+enum LoadOutcome {
+    /// Parsed successfully. An empty map is legitimate (no `[mcp_keys]`
+    /// configured, or the file does not exist yet) — not a failure.
+    Loaded(HashMap<String, KeyEntry>),
+    /// The file exists but could not be read or parsed (an I/O error other
+    /// than "not found", or malformed TOML).
+    Failed,
+}
+
+/// Parse `[mcp_keys]` from `<config_dir>/config.toml`, distinguishing a
+/// genuine reload failure from "nothing configured". See [`LoadOutcome`].
+fn load_key_registry_checked(config_dir: &Path) -> LoadOutcome {
     let config_path = config_dir.join("config.toml");
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
-        Err(_) => return HashMap::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return LoadOutcome::Loaded(HashMap::new());
+        }
+        Err(_) => return LoadOutcome::Failed,
     };
 
     let doc: toml::Value = match toml::from_str(&content) {
         Ok(v) => v,
-        Err(_) => return HashMap::new(),
+        Err(_) => return LoadOutcome::Failed,
     };
 
     let mut registry = HashMap::new();
 
     let mcp_keys = match doc.get("mcp_keys").and_then(|v| v.as_table()) {
         Some(t) => t,
-        None => return registry,
+        None => return LoadOutcome::Loaded(registry),
     };
 
     for (key, val) in mcp_keys {
@@ -228,7 +261,104 @@ fn load_key_registry(config_dir: &Path) -> HashMap<String, KeyEntry> {
         );
     }
 
-    registry
+    LoadOutcome::Loaded(registry)
+}
+
+/// Load mcp_keys from ~/.duduclaw/config.toml.
+///
+/// Backward-compatible wrapper over [`load_key_registry_checked`]: any load
+/// failure degrades to an empty registry, matching this function's original
+/// (pre-cache) behavior — an unreadable/malformed file must not crash the
+/// boot path, it just means "no keys usable right now" (which itself
+/// composes into a fail-closed `UnknownKey` the moment a caller looks up a
+/// real key against the empty map). [`KeyRegistryCache`] deliberately does
+/// NOT go through this wrapper — it needs the `Failed` distinction to refuse
+/// reusing a stale good cache after a broken reload.
+fn load_key_registry(config_dir: &Path) -> HashMap<String, KeyEntry> {
+    match load_key_registry_checked(config_dir) {
+        LoadOutcome::Loaded(registry) => registry,
+        LoadOutcome::Failed => HashMap::new(),
+    }
+}
+
+// ── Per-call re-authentication cache (Gap (a), WP-H2 §1.3) ──────────────────
+//
+// The MCP stdio server previously resolved `DUDUCLAW_MCP_API_KEY` against the
+// on-disk registry exactly ONCE at process startup (`mcp.rs::run_mcp_server`)
+// and reused that `Principal` for the lifetime of the long-running
+// subprocess — rotating scopes or revoking a key in `config.toml [mcp_keys]`
+// had no observable effect until the child was restarted. `KeyRegistryCache`
+// + [`authenticate_from_env_cached`] let every dispatch re-validate while
+// keeping the hot path cheap: `config.toml` is only re-parsed when its mtime
+// has changed since the last check (one `fs::metadata` stat otherwise).
+
+enum CacheState {
+    Empty,
+    Loaded {
+        mtime: Option<SystemTime>,
+        registry: HashMap<String, KeyEntry>,
+    },
+}
+
+/// mtime-aware cache over the `[mcp_keys]` registry. One instance is created
+/// per long-lived MCP server process and shared across every dispatch.
+pub struct KeyRegistryCache {
+    inner: Mutex<CacheState>,
+}
+
+impl Default for KeyRegistryCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyRegistryCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(CacheState::Empty),
+        }
+    }
+
+    /// Return the current registry. Reparses `config.toml` only when its
+    /// mtime differs from the last successful load (or there is no cache
+    /// yet).
+    ///
+    /// Fail-closed: a reload that hits [`LoadOutcome::Failed`] clears the
+    /// cache and returns `Err(())` instead of returning the previously
+    /// cached (and now possibly stale) registry — the caller must deny the
+    /// in-flight auth attempt, never fall back to "whatever used to work".
+    fn registry(&self, config_dir: &Path) -> Result<HashMap<String, KeyEntry>, ()> {
+        let config_path = config_dir.join("config.toml");
+        let current_mtime = std::fs::metadata(&config_path)
+            .and_then(|m| m.modified())
+            .ok();
+
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let CacheState::Loaded { mtime, registry } = &*guard {
+            if let (Some(cur), Some(cached)) = (current_mtime, mtime) {
+                if cur == *cached {
+                    return Ok(registry.clone());
+                }
+            }
+            // Either the mtime moved, or the file that used to exist can no
+            // longer be stat'd (e.g. deleted) — both are changes; fall
+            // through and reload from scratch rather than trusting `guard`.
+        }
+
+        match load_key_registry_checked(config_dir) {
+            LoadOutcome::Loaded(fresh) => {
+                *guard = CacheState::Loaded {
+                    mtime: current_mtime,
+                    registry: fresh.clone(),
+                };
+                Ok(fresh)
+            }
+            LoadOutcome::Failed => {
+                *guard = CacheState::Empty;
+                Err(())
+            }
+        }
+    }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -244,7 +374,17 @@ fn load_key_registry(config_dir: &Path) -> HashMap<String, KeyEntry> {
 ///   injected via [`crate::mcp_auth_strategy::AuthContext::credential`]
 pub fn authenticate_with_key(raw_key: &str, config_dir: &Path) -> Result<Principal, AuthError> {
     let registry = load_key_registry(config_dir);
+    authenticate_against_registry(raw_key, &registry)
+}
 
+/// Core lookup shared by [`authenticate_with_key`] (fresh parse every call)
+/// and [`authenticate_from_env_cached`] (mtime-cached parse) — the constant-
+/// time comparison and expiry check are identical either way; only how the
+/// `registry` argument was obtained differs.
+fn authenticate_against_registry(
+    raw_key: &str,
+    registry: &HashMap<String, KeyEntry>,
+) -> Result<Principal, AuthError> {
     if !is_valid_key_format(raw_key) {
         return Err(AuthError::InvalidFormat);
     }
@@ -255,7 +395,7 @@ pub fn authenticate_with_key(raw_key: &str, config_dir: &Path) -> Result<Princip
     let entry = {
         let raw_bytes = raw_key.as_bytes();
         let mut found: Option<&KeyEntry> = None;
-        for (stored_key, entry) in &registry {
+        for (stored_key, entry) in registry {
             let stored_bytes = stored_key.as_bytes();
             // Lengths must match; pad to avoid length-based side-channel.
             // Both sides are the same fixed-length format (validated above), so
@@ -348,6 +488,67 @@ pub fn authenticate_from_env(config_dir: &Path) -> Result<Principal, AuthError> 
     }
 
     authenticate_with_key(&raw_key, config_dir)
+}
+
+/// Per-call variant of [`authenticate_from_env`] backed by a
+/// [`KeyRegistryCache`] (Gap (a), WP-H2 §1.3): a caller that re-authenticates
+/// on every MCP request — instead of once at process boot — pays only an
+/// `fs::metadata` stat when `config.toml` hasn't changed. Behaviorally
+/// identical to `authenticate_from_env` on the happy path; the moment an
+/// operator edits `[mcp_keys]` (rotate scopes, revoke, add a key), the very
+/// next call observes it — no gateway/child restart required.
+///
+/// Refresh tokens are NOT routed through the cache:
+/// [`crate::mcp_refresh::authenticate_with_refresh_token`] already re-queries
+/// the SQLite token store on every call (real-time revocation by
+/// construction — see that module's doc comment), so wrapping it here would
+/// only add complexity without a performance win.
+///
+/// Fail-closed on a broken reload: if the registry needed to be reparsed
+/// (mtime changed) and that reparse fails, this returns
+/// [`AuthError::ReloadFailed`] rather than reusing a previously-cached
+/// principal — see [`KeyRegistryCache::registry`].
+pub fn authenticate_from_env_cached(
+    config_dir: &Path,
+    cache: &KeyRegistryCache,
+) -> Result<Principal, AuthError> {
+    let raw_key = match std::env::var("DUDUCLAW_MCP_API_KEY") {
+        Ok(k) => k,
+        Err(_) => {
+            // Mirrors `authenticate_from_env`'s unauthenticated-default
+            // fallback (M6). A reload failure here degrades to "treat the
+            // registry as non-empty" (`unwrap_or(false)`) so a broken
+            // config.toml can never accidentally unlock the all-scopes
+            // default principal — fail-closed bias, consistent with the rest
+            // of this function.
+            let registry_empty = cache.registry(config_dir).map(|r| r.is_empty()).unwrap_or(false);
+            if registry_empty && allow_unauthenticated_default() {
+                tracing::warn!(
+                    "MCP server starting without API key authentication \
+                     (DUDUCLAW_MCP_ALLOW_UNAUTHENTICATED=1, no DUDUCLAW_MCP_API_KEY and no \
+                     [mcp_keys] in config.toml). All scopes granted to default internal \
+                     principal. This is only safe for trusted local usage."
+                );
+                return Ok(default_internal_principal());
+            }
+            return Err(AuthError::MissingKey);
+        }
+    };
+
+    // Same prefix-based dispatch as `authenticate_from_env`.
+    if raw_key.starts_with(crate::mcp_refresh::REFRESH_TOKEN_PREFIX) {
+        return crate::mcp_refresh::authenticate_with_refresh_token(&raw_key, config_dir);
+    }
+
+    let registry = cache.registry(config_dir).map_err(|()| {
+        tracing::warn!(
+            "MCP key registry reload failed (I/O or parse error on config.toml) — \
+             denying this call (fail-closed); a stale cached principal is never reused"
+        );
+        AuthError::ReloadFailed
+    })?;
+
+    authenticate_against_registry(&raw_key, &registry)
 }
 
 /// M6: whether the operator has explicitly opted into running the MCP server
@@ -1257,6 +1458,192 @@ is_external = true
         assert!(principal.is_external);
         assert!(principal.scopes.contains(&Scope::WikiRead));
         assert!(!principal.scopes.contains(&Scope::MemoryRead));
+    }
+
+    // ── Gap (a), WP-H2 §1.3: KeyRegistryCache / authenticate_from_env_cached ──
+
+    /// Explicitly set a file's mtime forward so tests never depend on
+    /// filesystem mtime resolution (HFS+ can be 1s-granular) or need a real
+    /// sleep to observe a "changed" mtime.
+    fn bump_mtime(path: &std::path::Path, seconds_forward: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let current = f.metadata().unwrap().modified().unwrap();
+        f.set_modified(current + std::time::Duration::from_secs(seconds_forward))
+            .unwrap();
+    }
+
+    /// Key rotation (scopes changed in `[mcp_keys]`) takes effect on the very
+    /// next call once the file's mtime has moved — no restart, no waiting for
+    /// a TTL. This is the direct regression test for Gap (a): before the fix,
+    /// only a fresh `authenticate_from_env` call (i.e. process restart) would
+    /// observe a scope change.
+    #[test]
+    fn cached_auth_observes_scope_rotation_after_mtime_change() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = fresh_key("prod");
+        let today = fresh_today_rfc3339();
+        let dir = make_config_dir_with_key(&key, "rotating-client", &["memory:read"], false, &today);
+        let cache = KeyRegistryCache::new();
+
+        unsafe { std::env::set_var("DUDUCLAW_MCP_API_KEY", &key) };
+
+        let first = authenticate_from_env_cached(dir.path(), &cache).expect("first call authenticates");
+        assert!(first.scopes.contains(&Scope::MemoryRead));
+        assert!(!first.scopes.contains(&Scope::WikiWrite));
+
+        // Operator rotates the key's scopes in place (same key string, wider
+        // grant) and the file's mtime visibly advances.
+        let dir2 = make_config_dir_with_key(&key, "rotating-client", &["memory:read", "wiki:write"], false, &today);
+        std::fs::copy(dir2.path().join("config.toml"), dir.path().join("config.toml")).unwrap();
+        bump_mtime(&dir.path().join("config.toml"), 5);
+
+        let second = authenticate_from_env_cached(dir.path(), &cache).expect("second call authenticates");
+        unsafe { std::env::remove_var("DUDUCLAW_MCP_API_KEY") };
+
+        assert!(
+            second.scopes.contains(&Scope::WikiWrite),
+            "rotated scope must be visible on the very next call, not just after a restart"
+        );
+    }
+
+    /// Key revocation (entry removed from `[mcp_keys]`) takes effect on the
+    /// very next call once the file's mtime has moved.
+    #[test]
+    fn cached_auth_observes_revocation_after_mtime_change() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = fresh_key("prod");
+        let today = fresh_today_rfc3339();
+        let dir = make_config_dir_with_key(&key, "revoked-client", &["memory:read"], false, &today);
+        let cache = KeyRegistryCache::new();
+
+        unsafe { std::env::set_var("DUDUCLAW_MCP_API_KEY", &key) };
+
+        let first = authenticate_from_env_cached(dir.path(), &cache).expect("first call authenticates");
+        assert_eq!(first.client_id, "revoked-client");
+
+        // Operator revokes the key: the `[mcp_keys]` table loses the entry.
+        std::fs::write(dir.path().join("config.toml"), "[settings]\nfoo = 1\n").unwrap();
+        bump_mtime(&dir.path().join("config.toml"), 5);
+
+        let second = authenticate_from_env_cached(dir.path(), &cache);
+        unsafe { std::env::remove_var("DUDUCLAW_MCP_API_KEY") };
+
+        assert_eq!(
+            second.unwrap_err(),
+            AuthError::UnknownKey,
+            "a revoked key must be denied on the very next call, not just after a restart"
+        );
+    }
+
+    /// When `config.toml`'s mtime has NOT changed, the cache must be reused
+    /// rather than re-read from disk. Proven by making the file unreadable
+    /// (permission-denied) WITHOUT touching its mtime: a naive
+    /// "re-parse every call" implementation would start failing immediately,
+    /// while the cached implementation keeps succeeding because it never
+    /// re-opens the file.
+    #[cfg(unix)]
+    #[test]
+    fn cached_auth_reuses_registry_when_mtime_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = fresh_key("prod");
+        let today = fresh_today_rfc3339();
+        let dir = make_config_dir_with_key(&key, "cached-client", &["memory:read"], false, &today);
+        let cache = KeyRegistryCache::new();
+        let config_path = dir.path().join("config.toml");
+
+        unsafe { std::env::set_var("DUDUCLAW_MCP_API_KEY", &key) };
+
+        let first = authenticate_from_env_cached(dir.path(), &cache).expect("first call authenticates");
+        assert_eq!(first.client_id, "cached-client");
+
+        // Make the file unreadable WITHOUT changing its mtime.
+        let original_perms = std::fs::metadata(&config_path).unwrap().permissions();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let second = authenticate_from_env_cached(dir.path(), &cache);
+
+        // Restore permissions before any panic/cleanup can trip over it.
+        std::fs::set_permissions(&config_path, original_perms).unwrap();
+        unsafe { std::env::remove_var("DUDUCLAW_MCP_API_KEY") };
+
+        let second = second.expect(
+            "an unchanged mtime must serve the cached registry, not attempt (and fail) a fresh read",
+        );
+        assert_eq!(second.client_id, "cached-client");
+    }
+
+    /// Fail-closed reload: once a reload is triggered (mtime changed) and the
+    /// new content is malformed TOML, the call must be DENIED — never fall
+    /// back to whatever principal was cached from the last good load.
+    #[test]
+    fn cached_auth_fails_closed_when_reload_hits_malformed_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = fresh_key("prod");
+        let today = fresh_today_rfc3339();
+        let dir = make_config_dir_with_key(&key, "good-client", &["memory:read"], false, &today);
+        let cache = KeyRegistryCache::new();
+        let config_path = dir.path().join("config.toml");
+
+        unsafe { std::env::set_var("DUDUCLAW_MCP_API_KEY", &key) };
+
+        let first = authenticate_from_env_cached(dir.path(), &cache).expect("first call authenticates");
+        assert_eq!(first.client_id, "good-client");
+
+        // Corrupt the file (unterminated table header) and bump its mtime so
+        // a reload is triggered.
+        std::fs::write(&config_path, "[mcp_keys.\"broken\n\nnot valid toml at all {{{{").unwrap();
+        bump_mtime(&config_path, 5);
+
+        let second = authenticate_from_env_cached(dir.path(), &cache);
+        unsafe { std::env::remove_var("DUDUCLAW_MCP_API_KEY") };
+
+        assert_eq!(
+            second.unwrap_err(),
+            AuthError::ReloadFailed,
+            "a broken reload must deny outright, never reuse the previously-cached good principal"
+        );
+    }
+
+    /// Fail-closed reload with the file becoming genuinely unreadable
+    /// (permission denied) after a mtime change — same contract as the
+    /// malformed-TOML case above, exercised via a real I/O error instead of a
+    /// parse error.
+    #[cfg(unix)]
+    #[test]
+    fn cached_auth_fails_closed_when_reload_hits_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let key = fresh_key("prod");
+        let today = fresh_today_rfc3339();
+        let dir = make_config_dir_with_key(&key, "good-client", &["memory:read"], false, &today);
+        let cache = KeyRegistryCache::new();
+        let config_path = dir.path().join("config.toml");
+
+        unsafe { std::env::set_var("DUDUCLAW_MCP_API_KEY", &key) };
+
+        let first = authenticate_from_env_cached(dir.path(), &cache).expect("first call authenticates");
+        assert_eq!(first.client_id, "good-client");
+
+        // Touch the file (new content, so mtime genuinely changes) then
+        // revoke read permission entirely.
+        std::fs::write(&config_path, "# still readable for a moment\n").unwrap();
+        bump_mtime(&config_path, 5);
+        let original_perms = std::fs::metadata(&config_path).unwrap().permissions();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let second = authenticate_from_env_cached(dir.path(), &cache);
+
+        std::fs::set_permissions(&config_path, original_perms).unwrap();
+        unsafe { std::env::remove_var("DUDUCLAW_MCP_API_KEY") };
+
+        assert_eq!(
+            second.unwrap_err(),
+            AuthError::ReloadFailed,
+            "an I/O error on reload must deny outright, never reuse the previously-cached principal"
+        );
     }
 }
 
