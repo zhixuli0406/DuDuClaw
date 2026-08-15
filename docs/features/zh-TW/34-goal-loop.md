@@ -71,6 +71,14 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 決策具冪等性且 fail-closed:重試/標記完成/中止只從 `needs_human` 狀態轉出,所以過期或重複按下都是 no-op;交給我沒有終態可比對,重複按(甚至換另一位有權限的人按)就是重新認領,不會報錯。
 
+## 「想一想」計畫模式(I-1c)
+
+儀表板交辦面板的第三種模式,與「問一問」「交辦」並列。選它時 `tasks.goal_create` 帶 `plan_first: true`:後端不會立刻派工,而是先同步呼叫工具用 LLM,依目標描述與驗收標準產出一份簡短(3-8 條、純文字)的執行計畫,任務直接誕生在 `needs_human`——沿用既有的 `blocked_needs_decision` 分類,沒有新增分類——核准前不會進入驅動器的派工候選查詢,連一輪都不會跑。
+
+計畫存在獨立欄位 `plan_pending`,刻意與 `judge_feedback` 分開:任何 `needs_human` 任務用來恢復執行的「重試」動作會用你的核准備註覆寫 `judge_feedback`,若共用同一欄位,核准當下計畫就會被自己的核准動作洗掉、永遠傳不到第一輪派工。核准就是既有的「重試」按鈕,沒有新增按鈕種類。核准後的第一輪派工會把 `plan_pending` 的內容包成 `<execution_plan>` 區塊注入工作提示,注入後立刻清空,後續輪次不再重複貼。計畫是指引,不是免驗收憑證——執行結果仍要通過與其他目標任務相同的兩段式驗收裁決／MAV 判官團。
+
+若規劃器呼叫本身失敗(逾時、傳輸錯誤、空回覆),任務照樣 fail-closed 停在 `needs_human`,但分類改成 `infra` 而非 `blocked_needs_decision`,且不帶 `plan_pending`——核准動作永遠不會在沒有計畫的情況下悄悄開始執行。
+
 ## 自主等級
 
 每個 agent 的韁繩長度就是一顆旋鈕:`agent.toml [capabilities] autonomy_level`。缺席或無法解析時,預設為保守的 `approver`。

@@ -71,6 +71,14 @@ When a task parks as `needs_human`, it is stamped with a closed six-way `pause_r
 
 Decisions are idempotent and fail-closed: retry/mark-done/abort only transition *from* `needs_human`, so a stale or double press is a no-op; take-over has no terminal state to compare against, so a repeat press (even by a different authorized decider) simply re-claims it.
 
+## Plan-First Mode ("想一想", I-1c)
+
+The dashboard assign panel's third mode, alongside 問一問 (ask) and 交辦 (assign). Selecting it sends `tasks.goal_create` with `plan_first: true`: instead of dispatching, the gateway synchronously calls the utility LLM to draft a short (3–8 bullet, plain-text) execution plan from the goal + acceptance criteria, and the task is born directly in `needs_human` — under the existing `blocked_needs_decision` pause reason, no new class added — so it never reaches the driver's dispatch-candidate query until a human approves.
+
+The plan lives in a dedicated `plan_pending` column, kept separate from `judge_feedback` on purpose: the "重試" (retry) action any `needs_human` task uses to resume overwrites `judge_feedback` with the human's own approval note, which would otherwise erase the plan before it was ever read. Approving is that same existing retry action — no new button kind was added. Once approved, the very first dispatch round injects the plan as an `<execution_plan>` block into the work prompt, then clears `plan_pending` so later rounds don't repeat it. The plan is guidance, not an exemption — the executed work still goes through the same two-stage/MAV acceptance judging as any other goal task.
+
+If the planner call itself fails (timeout, transport error, empty reply), the task still parks `needs_human` fail-closed — but under the `infra` pause reason instead of `blocked_needs_decision`, with no `plan_pending` set, so approval can never silently start a task with no plan behind it.
+
 ## Autonomy Levels
 
 Each agent's leash length is one dial: `agent.toml [capabilities] autonomy_level`. Missing or unparseable defaults to the conservative `approver`.

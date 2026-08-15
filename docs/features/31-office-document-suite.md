@@ -60,6 +60,27 @@ The Files page previews office documents in the browser via `GET /api/files/prev
 - LibreOffice missing → an explicit 503 JSON message, never a broken byte stream.
 - Same JWT auth and path fences as the download endpoint.
 
+## Provenance (I-2b)
+
+Every file that lands in `attachments/` used to be an anonymous entry in a flat directory listing — a customer's inbound upload and a report the agent produced for a goal task were indistinguishable. A provenance ledger (`artifacts.jsonl`, next to `tool_calls.jsonl` and `task_changes.jsonl`) now records where each file came from, recorded **at the write site**, never guessed after the fact:
+
+| Origin | Meaning |
+|---|---|
+| `declared` | The agent hand-delivered it via `📎DELIVER:`. |
+| `swept` | `sweep_undeclared_deliverables` recovered it — the file exists but the marker was forgotten. |
+| `uploaded` | A human sent it in through a channel (inbound attachment). |
+| `produced` | Derived read-side from the task's own change ledger — never persisted to the artifacts file itself. |
+| `unknown` | The evidence doesn't reach far enough to say. Honest, not a guess. |
+
+Task attribution is two-tier and labelled the same way: `exact` when the row (or the task's own change ledger) names the task directly, `inferred` when only the claim→review time-window convention places it there (the same window `tasks.changes` uses) — the dashboard never presents an inference as a fact. The merge key is the file's real basename, not the CJK-sanitized display name, so two differently-sourced files that happen to sanitize to the same string are never collapsed into one row. A boot-time backfill fills in history for files that predate the ledger, but only as far as existing evidence (declared/swept records, `task_changes.jsonl`) reaches — anything it can't place stays `unknown` rather than assuming direction.
+
+Two surfaces read the ledger:
+
+- **Task detail → 產物 (Artifacts) tab**: every file tied to a task, with its origin, round, and (for `uploaded`/`declared`/`swept` rows with an archived copy) a download link. A file the agent wrote but never archived shows the path it was written to instead of a dead download link.
+- **Files page**: a 來源 (origin) column plus a task filter, so "find last week's deliverable" is a filter, not a scroll.
+
+**Known limitation**: the goal-loop dispatch path does not yet archive a downloadable copy of files it produces — those rows can appear as `produced` with no attachment behind them. Closing that gap is tracked for a future wave.
+
 ## Limits
 
 | Aspect | Limit |
