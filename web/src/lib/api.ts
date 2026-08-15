@@ -481,6 +481,29 @@ export interface AuditEvent {
   details: Record<string, unknown>;
 }
 
+// ── Credential hygiene (WP-K) ──
+// `security.credential_hygiene` / `security.credential_cleanup` never return
+// the secret value itself — only the TOML path, twin status and severity.
+export interface CredentialFinding {
+  /** Dotted/bracket TOML path, e.g. "accounts[0].oauth_token". Never a value. */
+  path: string;
+  /** True when an encrypted `<field>_enc` twin already exists — safe for
+   *  `security.credential_cleanup` to auto-remove. False = manual only. */
+  has_enc_twin: boolean;
+  severity: 'info' | 'low' | 'medium' | 'high';
+}
+export interface CredentialHygieneReport {
+  clean: boolean;
+  count: number;
+  findings: CredentialFinding[];
+}
+export interface CredentialCleanupResult {
+  cleaned: boolean;
+  removed_paths: string[];
+  backup_path?: string;
+  message?: string;
+}
+
 // ── Delegation permissions (WP21 §2.8) ──
 /** How the gateway decides whether one AI staffer may hand work to another. */
 export type DelegationPolicy = 'department' | 'hierarchy' | 'open';
@@ -3656,6 +3679,10 @@ export const api = {
       model_preferred?: string;
     }) =>
       client.call('agents.create', params) as Promise<{ success: boolean; agent: AgentInfo }>,
+    /** Fire-and-forget bus message to one agent. No dashboard surface calls
+     *  this since UX plan I-1a: the employee-card 交辦 action now opens the
+     *  AssignSheet, which files a trackable, judge-verified goal task instead.
+     *  Kept as the thin wrapper for the RPC the gateway still serves. */
     delegate: (agentId: string, prompt: string) =>
       client.call('agents.delegate', { agent_id: agentId, prompt }) as Promise<{
         success: boolean;
@@ -4568,6 +4595,15 @@ export const api = {
         rate_limiter: { requests_per_minute: number; concurrent_requests: number };
         soul_drift: Array<{ agent_id: string; soul_exists: boolean; gvu_enabled: boolean }>;
       }>,
+    /** Read-only scan of config.toml for plaintext credentials — paths only,
+     *  never values (WP-K). */
+    credentialHygiene: () =>
+      client.call('security.credential_hygiene') as Promise<CredentialHygieneReport>,
+    /** Removes ONLY plaintext fields that already have a confirmed `_enc`
+     *  twin; auto-backs up config.toml first. Fields with no twin are left
+     *  for manual handling (see `CredentialFinding.has_enc_twin`). */
+    credentialCleanup: () =>
+      client.call('security.credential_cleanup') as Promise<CredentialCleanupResult>,
   },
   audit: {
     unifiedLog: (params?: {
@@ -4990,6 +5026,16 @@ export const api = {
      *  (fail-closed, clears stale claim/lease on retry, collapses cards). */
     goalDecide: (taskId: string, action: 'retry' | 'done' | 'abort' | 'takeover', note?: string) =>
       client.call('tasks.goal_decide', { task_id: taskId, action, note: note ?? '' }) as Promise<{
+        ok: boolean;
+        message: string;
+        task: TaskInfo | null;
+      }>,
+    /** I-3a "接著做": reopen a `done`/`failed`/`cancelled` goal task with a
+     *  required follow-up message (new round, same acceptance criteria and
+     *  risk boundary — still goes through the MAV judge). Separate from
+     *  `goalDecide` because it acts on terminal statuses, not `needs_human`. */
+    goalContinue: (taskId: string, message: string) =>
+      client.call('tasks.goal_decide', { task_id: taskId, action: 'continue', message }) as Promise<{
         ok: boolean;
         message: string;
         task: TaskInfo | null;
