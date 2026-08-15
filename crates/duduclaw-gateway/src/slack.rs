@@ -82,10 +82,16 @@ pub async fn start_slack_bots(
         for agent in reg.list() {
             if let Some(channels) = &agent.config.channels {
                 if let Some(slack) = &channels.slack {
+                    // WP-H1: Slack needs BOTH tokens; `None` from either is
+                    // "not configured" — the resolver has no empty-string state.
                     let app = crate::config_crypto::resolve_agent_token(&slack.app_token_enc, &slack.app_token, home_dir);
                     let bot = crate::config_crypto::resolve_agent_token(&slack.bot_token_enc, &slack.bot_token, home_dir);
-                    if !app.is_empty() && !bot.is_empty() {
-                        tokens.push((agent.config.agent.name.clone(), app, bot));
+                    if let (Some(app), Some(bot)) = (app, bot) {
+                        tokens.push((
+                            agent.config.agent.name.clone(),
+                            app.expose_owned(),
+                            bot.expose_owned(),
+                        ));
                     }
                 }
             }

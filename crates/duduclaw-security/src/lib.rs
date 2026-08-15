@@ -17,6 +17,7 @@ pub mod rate_limiter;
 pub mod safety_word;
 pub mod security_posture;
 pub mod secret_manager;
+pub mod secret_ref;
 pub mod soul_guard;
 pub mod soul_scanner;
 pub mod stability_index;

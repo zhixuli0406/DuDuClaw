@@ -321,23 +321,16 @@ pub async fn start_discord_bots(
         for agent in reg.list() {
             if let Some(channels) = &agent.config.channels {
                 if let Some(discord) = &channels.discord {
-                    let token = if let Some(enc) = &discord.bot_token_enc {
-                        if !enc.is_empty() {
-                            crate::config_crypto::decrypt_value(enc, home_dir)
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    };
-                    let token = if token.is_empty() {
-                        discord.bot_token.clone()
-                    } else {
-                        token
-                    };
-                    if !token.is_empty() {
-                        tokens.push((agent.config.agent.name.clone(), token));
+                    // WP-H1: this used to be a hand-inlined 4th copy of
+                    // `resolve_agent_token`'s enc-then-plaintext logic — with
+                    // its own empty-string dance and no `secret://` support, so
+                    // a reference here was passed to Discord as the bot token.
+                    if let Some(token) = crate::config_crypto::resolve_agent_token(
+                        &discord.bot_token_enc,
+                        &discord.bot_token,
+                        home_dir,
+                    ) {
+                        tokens.push((agent.config.agent.name.clone(), token.expose_owned()));
                     }
                 }
             }

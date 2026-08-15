@@ -693,7 +693,7 @@ async fn resolve_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -
     if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
         home_dir, agent_id, channel,
     ) {
-        return tok;
+        return tok.expose_owned();
     }
 
     // Global config fallback — only reached when nobody on the chain has
