@@ -443,8 +443,8 @@ impl ResumeOnRestart {
 }
 
 /// H6: boot-time reconciliation for `resume_on_restart = "pause"`. Scans
-/// every non-terminal (`todo` / `pending` / `revising` / `in_progress` /
-/// `review` / `blocked`) `goal_mode` task and escalates it to `needs_human`
+/// every genuinely in-flight (`revising` / `in_progress` / `review` /
+/// `blocked`) `goal_mode` task and escalates it to `needs_human`
 /// (reason `gateway_restart`), reusing [`GoalLoopDriver::escalate`]'s
 /// well-tested path (grant revocation, activity post, visit-graph /
 /// state-capture cleanup) via a throwaway driver instance — safe because at
@@ -472,10 +472,16 @@ pub async fn pause_inflight_on_restart(
         return 0;
     }
     let driver = GoalLoopDriver::new(store.clone(), queue, cfg).with_home_dir(home_dir.to_path_buf());
-    const NON_TERMINAL_STATUSES: &[&str] =
-        &["todo", "pending", "revising", "in_progress", "review", "blocked"];
+    // Queue states a goal task holds BEFORE its first dispatch (`todo`,
+    // `pending`) are deliberately NOT escalated: the user confirmed the goal
+    // at creation and no round has run yet, so dispatching it after boot is
+    // starting the confirmed work — not silently resuming an interrupted,
+    // unconfirmed run. The documented contract (CHANGELOG / goal-loop guide)
+    // promises pausing tasks "still running"; live verification 2026-08-15
+    // caught the earlier all-non-terminal scan pausing queued tasks too.
+    const INFLIGHT_STATUSES: &[&str] = &["revising", "in_progress", "review", "blocked"];
     let mut paused = 0usize;
-    for status in NON_TERMINAL_STATUSES {
+    for status in INFLIGHT_STATUSES {
         let tasks = match store.tasks_in_status(status).await {
             Ok(t) => t,
             Err(e) => {
@@ -3758,7 +3764,7 @@ mod tests {
         t2.status = "review".into();
         store.insert_task(&t2).await.unwrap();
 
-        let mut t3 = goal_task("g3", "alice"); // still "todo" — never dispatched
+        let mut t3 = goal_task("g3", "alice"); // still "todo" — never dispatched, must NOT be paused
         store.insert_task(&t3).await.unwrap();
 
         // A terminal task must NOT be touched.
@@ -3779,13 +3785,21 @@ mod tests {
         store.insert_task(&t5).await.unwrap();
 
         let paused = pause_inflight_on_restart(store.clone(), queue, dir.path()).await;
-        assert_eq!(paused, 3, "exactly the 3 non-terminal goal_mode tasks must be paused");
+        assert_eq!(paused, 2, "exactly the 2 genuinely in-flight goal_mode tasks must be paused");
 
-        for id in ["g1", "g2", "g3"] {
+        for id in ["g1", "g2"] {
             let got = store.get_task(id).await.unwrap().unwrap();
             assert_eq!(got.status, "needs_human", "{id} must be escalated");
             assert_eq!(got.judge_feedback.as_deref(), Some("gateway_restart"));
         }
+        // A queued goal the user confirmed but that never dispatched is NOT
+        // "still running" — it must survive the boot scan untouched and
+        // dispatch normally afterwards (live-verification catch, 2026-08-15).
+        assert_eq!(
+            store.get_task("g3").await.unwrap().unwrap().status,
+            "todo",
+            "queued-but-never-dispatched goal must not be paused"
+        );
         assert_eq!(store.get_task("g4").await.unwrap().unwrap().status, "done", "terminal task untouched");
         assert_eq!(
             store.get_task("t5").await.unwrap().unwrap().status,
