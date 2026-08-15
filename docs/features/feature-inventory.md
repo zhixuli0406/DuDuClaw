@@ -14,6 +14,7 @@
 | Feature | Description |
 |---------|-------------|
 | Working State — cross-wake authoritative state | Per-agent key-value posture + handoff note auto-injected into every wake-up (cron / heartbeat / goal loop / channels) as the single source of truth; explicit-tool-only updates with required reason + supersession history, `expected_value` CAS against concurrent wakes, `ttl_hours` for day-scoped rules, 32-key cap; `[memory] working_state_enabled`, default on ([44-working-state.md](44-working-state.md)) |
+| Inspiration Gallery (`/gallery`, P2-b, newIn 1.60.0) | Curated MVP fanning out industry-team `team.toml` task examples into showcase cards with a one-click "做一個同款" (remake) action that pre-fills the assign panel; `gallery.list` RPC, admin-only, same license/premium-tree gating as `experts.catalog`, fail-safe empty grid without a premium tree ([31-office-document-suite.md](31-office-document-suite.md) covers the artifact provenance the gallery's future "my results" tab will depend on) |
 
 ## 2026-08 additions (v1.53)
 
