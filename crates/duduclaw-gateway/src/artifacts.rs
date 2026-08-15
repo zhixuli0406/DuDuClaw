@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::truncate_bytes;
+use tracing::warn;
 
 /// Durable provenance ledger, next to `tool_calls.jsonl` / `task_changes.jsonl`.
 pub const ARTIFACTS_FILE: &str = "artifacts.jsonl";
@@ -60,6 +61,13 @@ pub const MAX_QUERY_LIMIT: usize = 500;
 /// larger than this is backfilled newest-first up to the cap rather than
 /// stalling boot.
 const BACKFILL_MAX_FILES_PER_DIR: usize = 2000;
+
+/// WP-4B: total bytes archived per task in one
+/// [`archive_goal_task_artifacts`] call — a multiple of the per-file cap
+/// (`media::MAX_FILE_SIZE`) so an unattended goal-loop settle cannot fill
+/// disk even when a task legitimately produced several near-max-size
+/// deliverables across its rounds.
+const GOAL_ARCHIVE_MAX_TOTAL_BYTES: u64 = 5 * crate::media::MAX_FILE_SIZE;
 
 // ── Shape ────────────────────────────────────────────────────────────────
 
@@ -998,6 +1006,257 @@ fn index_task_writes(home_dir: &Path) -> BTreeMap<(String, String), (String, Opt
     out
 }
 
+// ── Goal-loop settle archiving (WP-4B) ──────────────────────────────────
+//
+// The declared/swept archive above only ever runs on the channel-reply path
+// (`office_docs::deliver_one` / `sweep_undeclared_deliverables`), which a
+// goal-loop dispatch round never touches — `dispatcher.rs` drives goal tasks
+// straight through `claude_runner`, not `channel_reply`. So a goal task's
+// deliverables previously existed only as an unarchived
+// [`ArtifactOrigin::Produced`] breadcrumb in `task_changes.jsonl`
+// (`archived_name: None`): the 「產物」tab could say WHERE a file was
+// written, never offer a download. [`archive_goal_task_artifacts`] closes
+// that gap by physically copying a task's produced files into the SAME
+// `attachments/` bucket the declared/swept path uses, the moment a goal task
+// is accepted — so the same `/api/files/download` endpoint and the same
+// ledger merge logic ([`merge_into`]) that already handle "a Produced row
+// gained a matching archived copy" pick it up with no further plumbing.
+
+/// What one [`archive_goal_task_artifacts`] call did. Every number is
+/// measured, never estimated — mirrors [`BackfillReport`]'s honesty stance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GoalArchiveReport {
+    /// Files copied into `attachments/` and recorded in the ledger.
+    pub archived: usize,
+    /// A file with the same sanitized name + size already sat in
+    /// `attachments/` (mirrors `office_docs::already_archived`) — not
+    /// re-copied, since the running total must reflect real new disk usage.
+    pub already_archived: usize,
+    /// The source path was not absolute, could not be canonicalized, no
+    /// longer exists, or is not a regular file by settle time (the agent may
+    /// have deleted or moved it across rounds).
+    pub skipped_missing: usize,
+    /// The canonicalized source escaped the agent's own directory tree — a
+    /// symlink-escape attempt, a non-absolute path, or a write outside the
+    /// trusted workspace. Always logged (never silent) — this is a
+    /// security-relevant skip, not a housekeeping one.
+    pub skipped_outside_root: usize,
+    /// The file (or the running per-task total) exceeded the size cap.
+    /// Always logged (never silent).
+    pub skipped_oversize: usize,
+}
+
+/// True when `dir` already holds an archived copy of `display_name` with
+/// `size` bytes — the goal-loop counterpart of `office_docs::already_archived`
+/// (private to that module), reusing the same `<ts>_<sanitized>` name+size
+/// match so a task settled twice (or a file also delivered via the
+/// declared/swept path earlier in the same round) does not duplicate the
+/// copy on disk.
+fn goal_archive_already_present(dir: &Path, display_name: &str, size: u64) -> bool {
+    let target = sanitize_name(display_name);
+    list_bucket(dir)
+        .into_iter()
+        .any(|(name, entry_size, _)| {
+            entry_size == size
+                && split_archived_name(&name).is_some_and(|(_, sanitized)| sanitized == target)
+        })
+}
+
+/// WP-4B: archive a goal task's produced deliverable-shaped files into the
+/// owning agent's `attachments/`, and record each copy in the provenance
+/// ledger with an EXACT task/round attribution (unlike the read-side
+/// inference [`collect_task_artifacts`] falls back to for undeclared uploads).
+///
+/// Called from `dispatch_engine.rs` at accept-settle — the moment a goal
+/// task's phase closes as `done`. Sourced from `task_changes.jsonl`
+/// (`task_changes::collect_task_changes`, native rows only) rather than a
+/// single round's live `NativeToolEvent` slice, so a file written in an
+/// EARLIER revision round (and never re-touched in the accepted round) is
+/// still archived — the ledger already has it, this only makes it
+/// downloadable. Rows are newest-first, so when the same path was written
+/// more than once across rounds only its most recent version is archived.
+///
+/// ## Security (coding convention 4 — fail closed)
+///
+/// - Every candidate path must be absolute, canonicalize, and land inside the
+///   agent's own directory tree (`<home>/agents/<agent_id>/`); anything
+///   else — including a symlink planted to point outside it — is rejected
+///   and counted in [`GoalArchiveReport::skipped_outside_root`], never
+///   silently followed.
+/// - `agent_id` is validated against the same allowlist the `/api/files`
+///   endpoints use ([`crate::files_api::is_safe_agent_id`]) BEFORE it is
+///   joined into a path — a malformed id must not be able to walk the join
+///   itself outside `<home>/agents/`.
+/// - A path already inside `attachments/` is skipped (it is already an
+///   archive; re-copying it would just duplicate disk usage and could loop
+///   on its own output if ever called twice).
+/// - Per-file (`media::MAX_FILE_SIZE`) and per-task
+///   ([`GOAL_ARCHIVE_MAX_TOTAL_BYTES`]) byte caps stop an unattended loop
+///   from filling disk; both are recorded in the report, never silently
+///   dropped ("skipped-oversize" per the design brief).
+///
+/// Best-effort end to end: any single-file failure (copy error, missing
+/// file, oversize) is skipped and counted, never propagated — this function
+/// must not be able to fail (or even delay past a warning) the settle that
+/// already committed the task's verdict.
+pub async fn archive_goal_task_artifacts(
+    home_dir: &Path,
+    task_id: &str,
+    agent_id: &str,
+) -> GoalArchiveReport {
+    let mut report = GoalArchiveReport::default();
+    if task_id.is_empty() || agent_id.is_empty() {
+        return report;
+    }
+    if !crate::files_api::is_safe_agent_id(agent_id) {
+        warn!(
+            task = task_id, agent = agent_id,
+            "WP-4B goal archive: agent id failed the safety allowlist — archiving skipped entirely"
+        );
+        return report;
+    }
+
+    let agent_dir = home_dir.join("agents").join(agent_id);
+    let Ok(canon_root) = std::fs::canonicalize(&agent_dir) else {
+        // No agent workspace to trust ⇒ nothing to archive from, fail-open
+        // (an agent directory that vanished mid-task is an anomaly the
+        // caller's own logs already cover; this is not that caller).
+        return report;
+    };
+    let attach_dir = agent_dir.join("attachments");
+    let canon_attach = std::fs::canonicalize(&attach_dir).unwrap_or_else(|_| attach_dir.clone());
+
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut total_bytes: u64 = 0;
+
+    for change in crate::task_changes::collect_task_changes(
+        home_dir,
+        task_id,
+        // Same convention as `collect_task_artifacts`: an empty agent drops
+        // the MCP-audit half so only task-keyed native rows come back — MCP
+        // tools (`shared_wiki_write` et al.) are not goal-loop file
+        // deliverables in this sense.
+        "",
+        "",
+        "",
+        crate::task_changes::MAX_QUERY_LIMIT,
+    )
+    .changes
+    {
+        if !matches!(
+            change.op,
+            crate::task_changes::ChangeOp::Write | crate::task_changes::ChangeOp::Edit
+        ) || !change.success
+            || !is_artifact_path(&change.path)
+        {
+            continue;
+        }
+        // Newest-first input ⇒ the first time we see a path is its most
+        // recent version; later (older) rows for the same path are skipped.
+        if !seen.insert(change.path.clone()) {
+            continue;
+        }
+
+        let src = Path::new(&change.path);
+        if !src.is_absolute() {
+            report.skipped_outside_root += 1;
+            warn!(
+                task = task_id, path = %change.path,
+                "WP-4B goal archive: source path is not absolute — skipped"
+            );
+            continue;
+        }
+        let canon_src = match std::fs::canonicalize(src) {
+            Ok(p) => p,
+            Err(_) => {
+                report.skipped_missing += 1;
+                continue;
+            }
+        };
+        if !canon_src.starts_with(&canon_root) || canon_src.starts_with(&canon_attach) {
+            report.skipped_outside_root += 1;
+            warn!(
+                task = task_id, path = %change.path,
+                "WP-4B goal archive: source path escapes the agent workspace — skipped (possible symlink escape)"
+            );
+            continue;
+        }
+        let meta = match std::fs::metadata(&canon_src) {
+            Ok(m) if m.is_file() => m,
+            _ => {
+                report.skipped_missing += 1;
+                continue;
+            }
+        };
+        let size = meta.len();
+        if size > crate::media::MAX_FILE_SIZE {
+            report.skipped_oversize += 1;
+            warn!(
+                task = task_id, path = %change.path, size,
+                "WP-4B goal archive: file exceeds the per-file cap — skipped"
+            );
+            continue;
+        }
+        if total_bytes.saturating_add(size) > GOAL_ARCHIVE_MAX_TOTAL_BYTES {
+            report.skipped_oversize += 1;
+            warn!(
+                task = task_id, path = %change.path, size,
+                "WP-4B goal archive: per-task archive budget exhausted — skipped"
+            );
+            continue;
+        }
+
+        let display_name = canon_src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        if goal_archive_already_present(&attach_dir, display_name, size) {
+            report.already_archived += 1;
+            continue;
+        }
+
+        let data = match tokio::fs::read(&canon_src).await {
+            Ok(d) => d,
+            Err(e) => {
+                report.skipped_missing += 1;
+                warn!(task = task_id, path = %change.path, error = %e, "WP-4B goal archive: read failed — skipped");
+                continue;
+            }
+        };
+
+        match crate::media::save_attachment_in_base_untracked(&agent_dir, &data, display_name)
+            .await
+        {
+            Ok(saved) => {
+                total_bytes = total_bytes.saturating_add(data.len() as u64);
+                report.archived += 1;
+                record_saved(
+                    &agent_dir,
+                    &saved,
+                    display_name,
+                    data.len() as u64,
+                    &SaveContext {
+                        origin: ArtifactOrigin::Swept,
+                        task_id: Some(task_id),
+                        round: change.round,
+                        channel: None,
+                        source_path: Some(src),
+                    },
+                );
+            }
+            Err(e) => {
+                warn!(
+                    task = task_id, path = %change.path, error = %e,
+                    "WP-4B goal archive: archive copy failed — settle continues"
+                );
+            }
+        }
+    }
+
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1415,5 +1674,194 @@ mod tests {
         let r = backfill(dir.path());
         assert_eq!(r, BackfillReport::default());
         assert!(!dir.path().join(ARTIFACTS_FILE).exists());
+    }
+
+    // ── WP-4B: goal-loop settle archiving ─────────────────────────────────
+
+    fn write_native(path: &Path, content: &[u8]) -> crate::runtime::NativeToolEvent {
+        std::fs::write(path, content).unwrap();
+        crate::runtime::NativeToolEvent {
+            tool_name: "Write".into(),
+            success: true,
+            result_text: None,
+            input_text: Some(format!(
+                r#"{{"file_path":"{}","content":"x"}}"#,
+                path.display()
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_archive_copies_cjk_named_produced_file_with_exact_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent_dir = home.join("agents").join("sales");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let src = agent_dir.join("報告.md");
+
+        crate::task_changes::record_round_changes(
+            home,
+            "task-1",
+            "sales",
+            2,
+            &[write_native(&src, b"hello")],
+        );
+
+        let report = archive_goal_task_artifacts(home, "task-1", "sales").await;
+        assert_eq!(report.archived, 1, "{report:?}");
+        assert_eq!(report.skipped_missing, 0);
+        assert_eq!(report.skipped_outside_root, 0);
+        assert_eq!(report.skipped_oversize, 0);
+
+        let idx = provenance_index(home, Some("sales"));
+        assert_eq!(idx.len(), 1);
+        let (_, prov) = idx.iter().next().unwrap();
+        assert_eq!(prov.origin, ArtifactOrigin::Swept);
+        assert_eq!(prov.task_id.as_deref(), Some("task-1"));
+        assert_eq!(prov.round, Some(2));
+        assert_eq!(prov.display_name, "報告.md");
+
+        // The 產物 tab now offers a real download, not just a source-path
+        // breadcrumb: the Produced (task_changes-derived) row and this new
+        // ledger row merge into one artifact.
+        let ev = collect_task_artifacts(home, "task-1", "sales", "", "", 50);
+        assert_eq!(ev.artifacts.len(), 1, "{ev:?}");
+        assert!(ev.artifacts[0].archived_name.is_some());
+        assert_eq!(ev.artifacts[0].round, Some(2));
+
+        // Re-running is idempotent: the same file is not re-copied.
+        let report2 = archive_goal_task_artifacts(home, "task-1", "sales").await;
+        assert_eq!(report2.archived, 0);
+        assert_eq!(report2.already_archived, 1, "{report2:?}");
+        assert_eq!(provenance_index(home, Some("sales")).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_archive_skips_oversize_file_and_counts_it_not_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent_dir = home.join("agents").join("sales");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let src = agent_dir.join("big.pdf");
+        // Sparse file over the per-file cap — no need to actually write tens
+        // of MB to exercise the size-check-before-read path.
+        let f = std::fs::File::create(&src).unwrap();
+        f.set_len(crate::media::MAX_FILE_SIZE + 1).unwrap();
+        drop(f);
+
+        crate::task_changes::record_round_changes(
+            home,
+            "task-1",
+            "sales",
+            1,
+            &[crate::runtime::NativeToolEvent {
+                tool_name: "Write".into(),
+                success: true,
+                result_text: None,
+                input_text: Some(format!(
+                    r#"{{"file_path":"{}","content":"x"}}"#,
+                    src.display()
+                )),
+            }],
+        );
+
+        let report = archive_goal_task_artifacts(home, "task-1", "sales").await;
+        assert_eq!(report.archived, 0);
+        assert_eq!(report.skipped_oversize, 1, "{report:?}");
+        assert!(provenance_index(home, Some("sales")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_archive_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent_dir = home.join("agents").join("sales");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        // A secret sitting OUTSIDE the agent workspace entirely.
+        let secret = dir.path().join("secret.pdf");
+        std::fs::write(&secret, b"top secret").unwrap();
+        // The agent's own Write call names a path INSIDE its workspace that
+        // is actually a symlink pointing at the secret.
+        let escape = agent_dir.join("report.pdf");
+        symlink(&secret, &escape).unwrap();
+
+        crate::task_changes::record_round_changes(
+            home,
+            "task-1",
+            "sales",
+            1,
+            &[crate::runtime::NativeToolEvent {
+                tool_name: "Write".into(),
+                success: true,
+                result_text: None,
+                input_text: Some(format!(
+                    r#"{{"file_path":"{}","content":"x"}}"#,
+                    escape.display()
+                )),
+            }],
+        );
+
+        let report = archive_goal_task_artifacts(home, "task-1", "sales").await;
+        assert_eq!(report.archived, 0);
+        assert_eq!(report.skipped_outside_root, 1, "{report:?}");
+        assert!(
+            provenance_index(home, Some("sales")).is_empty(),
+            "a symlink escape must never be archived"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_archive_rejects_path_outside_agent_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent_dir = home.join("agents").join("sales");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // A real file that just happens to sit outside this agent's tree
+        // (e.g. a stray absolute path from a misbehaving tool call) — no
+        // symlink involved, the plain containment check alone must reject it.
+        let outside = home.join("agents").join("other").join("leak.pdf");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"not yours").unwrap();
+
+        crate::task_changes::record_round_changes(
+            home,
+            "task-1",
+            "sales",
+            1,
+            &[crate::runtime::NativeToolEvent {
+                tool_name: "Write".into(),
+                success: true,
+                result_text: None,
+                input_text: Some(format!(
+                    r#"{{"file_path":"{}","content":"x"}}"#,
+                    outside.display()
+                )),
+            }],
+        );
+
+        let report = archive_goal_task_artifacts(home, "task-1", "sales").await;
+        assert_eq!(report.archived, 0);
+        assert_eq!(report.skipped_outside_root, 1, "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn goal_archive_of_no_evidence_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::create_dir_all(home.join("agents").join("sales")).unwrap();
+        let report = archive_goal_task_artifacts(home, "task-1", "sales").await;
+        assert_eq!(report, GoalArchiveReport::default());
+        // Empty task id / agent id ⇒ no-op rather than "archive everything".
+        assert_eq!(
+            archive_goal_task_artifacts(home, "", "sales").await,
+            GoalArchiveReport::default()
+        );
+        assert_eq!(
+            archive_goal_task_artifacts(home, "task-1", "").await,
+            GoalArchiveReport::default()
+        );
     }
 }
