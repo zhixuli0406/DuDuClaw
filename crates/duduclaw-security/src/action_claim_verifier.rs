@@ -21,7 +21,28 @@ struct ClaimPattern {
 }
 
 /// Agent ID character class for regex: lowercase alphanumeric + hyphens.
-/// Matches the validation in `is_valid_agent_id()` (mcp.rs).
+///
+/// WP-5B (2026-08): this comment used to claim the regex "matches
+/// `is_valid_agent_id()` (mcp.rs)". That was never quite true and has drifted
+/// further since — `duduclaw-security` has no dependency on `duduclaw-cli`,
+/// so this pattern is deliberately hand-rolled, not delegated, and it is
+/// *stricter* than either mcp.rs id validator in one respect and looser in
+/// another:
+/// - stricter: the first character here must be `[a-z]` (a lowercase
+///   letter); both `duduclaw-cli::mcp::is_valid_agent_id` (which now
+///   delegates to [`duduclaw_core::is_valid_new_agent_id`]) and the broad
+///   [`duduclaw_core::is_valid_agent_id`] allow a leading digit.
+/// - looser: this pattern does not forbid a trailing hyphen, while
+///   `is_valid_new_agent_id` does.
+///
+/// This is intentional and safe to keep as-is: this module only *reads*
+/// agent output to detect claimed-but-unperformed tool actions (zero
+/// security-gate role — see module doc), so a slightly different id shape
+/// here only changes which claims get flagged for cross-referencing, never
+/// an authorization decision. Do not "fix" this by loosening it to match
+/// `is_valid_agent_id` byte-for-byte; if it ever needs to change, change it
+/// deliberately and re-verify the claim-detection regressions in this file's
+/// test module.
 const AGENT_ID_RE: &str = "[a-z][a-z0-9-]{0,63}";
 
 /// Maximum hallucination claims per response to prevent DoS via adversarial output.
