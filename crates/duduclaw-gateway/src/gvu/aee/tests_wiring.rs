@@ -82,8 +82,70 @@ exit 0
     )
 }
 
+/// The whole-suite (outer) measurement always asks for `c2`; the inner loop
+/// only ever asks for the delta's linked case (`c1`). That is the cheapest
+/// honest way for a fake binary to tell the two apart without coupling itself
+/// to how many times the inner loop happens to run.
+///
+/// Outer call #1 (the champion bootstrap) fails `c1` and passes `h1`;
+/// outer call #2 (the candidate) passes `c1` and fails `h1`. The mixed suite
+/// mean is 2/3 on both sides — so the ONLY dimension that moves is the
+/// held-out one, which is precisely the visible-gain-pays-for-held-out-loss
+/// pattern WP-4E's fence exists to catch.
+#[cfg(unix)]
+fn held_out_flip_eval_script(counter: &Path) -> String {
+    let counter = counter.display();
+    format!(
+        r#"
+report=""
+cases=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--report" ]; then report="$arg"; fi
+  if [ "$prev" = "--case" ]; then cases="$arg"; fi
+  prev="$arg"
+done
+fail_c1=no
+fail_h1=no
+case "$cases" in
+  *c2*)
+    n=0
+    if [ -f "{counter}" ]; then n=$(cat "{counter}"); fi
+    n=$((n + 1))
+    echo "$n" > "{counter}"
+    if [ "$n" = "1" ]; then fail_c1=yes; else fail_h1=yes; fi
+    ;;
+esac
+entries=""
+for id in c1 c2 h1; do
+  passed=true
+  if [ "$id" = "c1" ] && [ "$fail_c1" = "yes" ]; then passed=false; fi
+  if [ "$id" = "h1" ] && [ "$fail_h1" = "yes" ]; then passed=false; fi
+  if [ -n "$entries" ]; then entries="$entries,"; fi
+  entries="$entries{{\"id\":\"$id\",\"passed\":$passed,\"failed_assertions\":[]}}"
+done
+cat > "$report" <<EOF
+{{"suite":"{AGENT}","total":3,"passed":3,"per_case":[$entries]}}
+EOF
+exit 0
+"#
+    )
+}
+
 #[cfg(unix)]
 fn home_with(agent_toml: &str, eval_fail_ids: &[&str]) -> Home {
+    let owned: Vec<String> = eval_fail_ids.iter().map(|s| (*s).to_string()).collect();
+    home_with_script(agent_toml, move |_root| {
+        let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+        eval_script(&borrowed)
+    })
+}
+
+/// [`home_with`] with the fake binary's behaviour supplied by the caller. The
+/// closure receives the home root so a stateful script can put its counter
+/// file inside the fixture instead of a shared temp dir.
+#[cfg(unix)]
+fn home_with_script(agent_toml: &str, script: impl FnOnce(&Path) -> String) -> Home {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
 
@@ -116,7 +178,7 @@ fn home_with(agent_toml: &str, eval_fail_ids: &[&str]) -> Home {
     .unwrap();
     std::fs::write(suite.join("held-out").join("h1.transcript.jsonl"), "{}\n").unwrap();
 
-    let bin = fake_binary(&root, &eval_script(eval_fail_ids));
+    let bin = fake_binary(&root, &script(&root));
 
     // Hermetic wiring: the suites root and the spawned binary are BOTH
     // resolved from this home's `config.toml`, so nothing here touches the
@@ -277,6 +339,161 @@ async fn champion_is_bootstrapped_from_the_current_playbook_before_the_first_can
     assert!(
         !champ.measure.cases.is_empty(),
         "the bootstrap measured real cases rather than inventing a baseline"
+    );
+}
+
+// ── WP-5A: the bootstrap is measured the same shape as the candidate ─────
+//
+// Before WP-5A the champion bootstrap ran with `include_holdout: false` while
+// the candidate measurement ran with `true`. The first comparison of an
+// agent's life was therefore "champion's visible-only mean" against
+// "candidate's visible+held-out mean" — mixed dimensions on one axis, and the
+// `cases_holdout` fence skipped entirely (a dimension present on one side only
+// is not comparable). The three tests below lock both directions: the new
+// bootstrap carries held-out scores and the fence bites from round one, and a
+// champion row persisted in the old shape still compares without panicking.
+
+/// Direction 1 — a freshly bootstrapped champion's stored vector contains
+/// held-out case scores.
+///
+/// Driven through a round that proposes nothing (`[]`), so the champion left
+/// in the table is the BOOTSTRAP vector rather than a committed candidate's.
+#[cfg(unix)]
+#[tokio::test]
+async fn bootstrap_champion_is_measured_with_the_held_out_subset() {
+    let home = home_with(AEE_TOML, &[]);
+    let result = run_round(&home, "[]".to_string()).await;
+    assert!(
+        matches!(result.verdict, super::run::AeeVerdict::Skipped { .. }),
+        "fixture precondition: an empty delta array ends the round before any commit"
+    );
+
+    let champ = ChampionStore::new(&home.db()).get(AGENT).expect("bootstrap champion row");
+    assert!(
+        champ.measure.cases.iter().any(|c| c.held_out),
+        "the bootstrap must measure the held-out subset too, or the first round's \
+         cases_holdout fence is skipped for want of a champion-side value"
+    );
+    assert!(
+        champ.measure.holdout_cases_mean().is_some(),
+        "the held-out sub-dimension is comparable on the champion side"
+    );
+    assert!(
+        champ.measure.visible_cases_mean().is_some(),
+        "and so is the visible half — both, not one"
+    );
+}
+
+/// Direction 2 — with the bootstrap aligned, a first-round candidate that
+/// trades a held-out loss for a visible gain is fenced.
+///
+/// Numbers (see [`held_out_flip_eval_script`]): champion `c1=0 c2=1 h1=1`,
+/// candidate `c1=1 c2=1 h1=0`. The mixed `cases` mean is 2/3 on both sides and
+/// `cases_visible` improves, so every pre-WP-4E signal says "commit"; only
+/// `cases_holdout` (1.0 → 0.0) objects. Before WP-5A the champion had no
+/// held-out value at all and this candidate committed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_first_round_held_out_regression_is_fenced_against_the_bootstrap() {
+    let home = home_with_script(AEE_TOML, |root| {
+        held_out_flip_eval_script(&root.join("eval-phase.count"))
+    });
+
+    let result = run_round(
+        &home,
+        add_delta("\u{56DE}\u{8986}\u{524D}\u{5148}\u{78BA}\u{8A8D}\u{9700}\u{6C42}", &format!("{AGENT}/c1")),
+    )
+    .await;
+
+    match &result.verdict {
+        super::run::AeeVerdict::NotCommitted { reason, .. } => assert!(
+            reason.contains("cases_holdout"),
+            "the held-out fence must be the dimension that blocked it; got: {reason}"
+        ),
+        other => panic!(
+            "a held-out regression in the very first round must not commit: {other:?}"
+        ),
+    }
+    assert!(
+        home.playbook().await.is_empty(),
+        "nothing reached the playbook"
+    );
+    assert!(
+        PendingSettlementStore::new(&home.db()).get(AGENT).is_none(),
+        "and no settlement was queued for a round that committed nothing"
+    );
+}
+
+/// Direction 3 — a champion row written in the OLD shape (no held-out scores)
+/// keeps comparing, and self-heals.
+///
+/// Deliberately asserts the *unfenced* outcome: `cases_holdout` is present on
+/// the candidate side only, so it is skipped exactly as any one-sided
+/// dimension is, and the candidate commits on the mixed `cases` gain. That is
+/// the documented cost of not retro-measuring stored champions — one round,
+/// after which the committed candidate's own held-out-inclusive vector becomes
+/// the champion and the fence is live again. What must never happen is a panic
+/// or a champion that stops being comparable at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_legacy_champion_without_held_out_scores_still_compares_and_self_heals() {
+    // `h1` fails every time; only the champion's shape distinguishes this test
+    // from the fenced one above.
+    let home = home_with(AEE_TOML, &["h1"]);
+    let store = ChampionStore::new(&home.db());
+
+    // A pre-WP-5A bootstrap: visible cases only, no held-out entry.
+    store
+        .put(&crate::gvu::champion::Champion {
+            agent_id: AGENT.to_string(),
+            snapshot_hash: crate::gvu::champion::snapshot_hash(&["legacy".to_string()]),
+            measure: crate::gvu::verifier_measure::MeasureVector {
+                cases: vec![
+                    crate::gvu::verifier_measure::CaseScore {
+                        case: format!("{AGENT}/c1"),
+                        score: 0.0,
+                        held_out: false,
+                    },
+                    crate::gvu::verifier_measure::CaseScore {
+                        case: format!("{AGENT}/c2"),
+                        score: 1.0,
+                        held_out: false,
+                    },
+                ],
+                judge: None,
+                anti_sycophancy: 1.0,
+                novelty: 1.0,
+                relevance: 0.5,
+                hard_zero: false,
+            },
+            established_at: Utc::now(),
+            anti_drift: Default::default(),
+            round_seq: 7,
+            holdout_rotation_due: false,
+        })
+        .unwrap();
+
+    let result = run_round(
+        &home,
+        add_delta("\u{56DE}\u{8986}\u{524D}\u{5148}\u{78BA}\u{8A8D}\u{9700}\u{6C42}", &format!("{AGENT}/c1")),
+    )
+    .await;
+    assert!(
+        matches!(result.verdict, super::run::AeeVerdict::Committed { .. }),
+        "an old-shaped champion must stay comparable (one-sided dimension skipped), \
+         not break the round: {:?}",
+        result.verdict
+    );
+
+    let champ = store.get(AGENT).expect("champion row");
+    assert!(
+        champ.measure.cases.iter().any(|c| c.held_out),
+        "self-heal: the committed candidate's held-out-inclusive vector is the new champion, \
+         so the next round IS fenced"
+    );
+    assert!(
+        champ.measure.holdout_cases_mean().is_some_and(|m| m < 0.5),
+        "and it records the real held-out failure rather than dropping it"
     );
 }
 
