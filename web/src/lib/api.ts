@@ -621,6 +621,18 @@ export type TaskStatus =
   | 'cancelled';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';
 
+/** H11 — why a goal task is parked `needs_human`. Mirrors the Rust
+ *  `pause_reason::PauseReason` wire tokens exactly (that enum's
+ *  `wire_tokens_are_pinned` test guards the other side of this contract).
+ *  `'unknown'` is what every unclassified / legacy row resolves to. */
+export type PauseReasonToken =
+  | 'no_progress'
+  | 'budget_exhausted'
+  | 'blocked_needs_decision'
+  | 'infra'
+  | 'restart'
+  | 'unknown';
+
 export interface TaskInfo {
   id: string;
   title: string;
@@ -635,6 +647,12 @@ export interface TaskInfo {
   blocked_reason?: string;
   /** Latest judge feedback / escalation reason (populated for needs_human). */
   judge_feedback?: string;
+  /** H11 — closed classification of WHY the task parked `needs_human`, as a
+   *  stable token the UI maps to `goals.pauseReason.<token>`. The server
+   *  always resolves it, so an unrecognised/legacy row arrives as
+   *  `'unknown'` rather than absent. Only meaningful while
+   *  `status === 'needs_human'`; cleared once a human resolves the pause. */
+  pause_reason?: PauseReasonToken;
   parent_task_id?: string;
   tags: string[];
   message_id?: string;
@@ -2124,6 +2142,29 @@ export interface ExpertPack {
   hooks_files: number;
 }
 
+/** One AI-team roster member (`experts.catalog` `members[]`, team entries
+ *  only) — display_name/summary verbatim from `team.toml`, never re-authored
+ *  client-side. */
+export interface ExpertCatalogMember {
+  role: 'front_desk' | 'worker';
+  name: string;
+  display_name: string;
+  summary: string;
+}
+
+/** A position deliberately left to a human (`experts.catalog` `humans[]`). */
+export interface ExpertCatalogHuman {
+  title: string;
+  summary: string;
+}
+
+/** A shared worker kit deliberately not deployed for this team
+ *  (`experts.catalog` `excluded[]`). */
+export interface ExpertCatalogExcludedKit {
+  kit: string;
+  reason: string;
+}
+
 /** One built-in industry pack row from `experts.catalog` (admin-only). */
 export interface ExpertCatalogEntry {
   /** WP-ORG — `team` = industry team pack; `expert` = standalone expert pack. */
@@ -2139,6 +2180,21 @@ export interface ExpertCatalogEntry {
   description: string;
   agents_count: number;
   installed: boolean;
+  /** P2-a — team roster (front desk + workers). Team entries only; standalone
+   *  `expert` entries carry no per-member summary in their manifest. */
+  members?: ExpertCatalogMember[];
+  /** P2-a — positions kept human (team entries only). */
+  humans?: ExpertCatalogHuman[];
+  /** P2-a — shared kits deliberately excluded from this team (team entries only). */
+  excluded?: ExpertCatalogExcludedKit[];
+  /** P2-a — 2-3 concrete task examples; author-written in `team.toml`, or
+   *  derived from real worker summaries when none are authored (never
+   *  LLM-fabricated). */
+  examples?: string[];
+  /** P2-a — once installed, the agent id the "已加入" entry point should link
+   *  into (`/agents/<name>`). `null`/absent when not installed, or when the
+   *  install record has no resolvable agent. */
+  lead_agent_name?: string | null;
 }
 
 /** Preview of an LLM-generated expert-pack draft (`experts.generate`). */

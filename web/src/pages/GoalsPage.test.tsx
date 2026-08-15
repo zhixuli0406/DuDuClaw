@@ -20,6 +20,7 @@ const goalTask = {
   goal_mode: true,
   revision_round: 2,
   judge_feedback: '缺少營收圖表',
+  pause_reason: 'no_progress',
 };
 
 beforeEach(() => {
@@ -61,6 +62,31 @@ describe('GoalsPage', () => {
     expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Mark done/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /take over/i })).toBeInTheDocument();
+  });
+
+  // H11: the free-text feedback says WHAT the judge complained about; the chip
+  // says what KIND of stop this was, which is what a person triages on.
+  it('shows the pause-reason chip on a needs_human card', async () => {
+    renderWithProviders(<GoalsPage />);
+    await screen.findByText('整理客戶月報');
+    expect(screen.getByText('Stuck, no progress')).toBeInTheDocument();
+  });
+
+  it('falls back to the unknown chip for a legacy or unrecognised pause reason', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      switch (method) {
+        case 'tasks.list':
+          // No `pause_reason` at all — a row written before H11 existed.
+          return Promise.resolve({ tasks: [{ ...goalTask, pause_reason: undefined }] });
+        case 'agents.list':
+          return Promise.resolve({ agents: [{ name: 'agnes', display_name: 'Agnes' }] });
+        default:
+          return Promise.resolve({});
+      }
+    });
+    renderWithProviders(<GoalsPage />);
+    await screen.findByText('整理客戶月報');
+    expect(screen.getByText('Needs a human to check')).toBeInTheDocument();
   });
 
   it('routes a needs_human decision through tasks.goal_decide, never tasks.update', async () => {

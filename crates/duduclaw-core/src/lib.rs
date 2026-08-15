@@ -1,5 +1,6 @@
 pub mod agent_guard;
 pub mod agent_rename;
+pub mod agent_toml;
 pub mod autostart;
 pub mod concurrency_gate;
 pub mod config;
@@ -12,12 +13,14 @@ pub mod fs_lock;
 pub mod grounding;
 pub mod identity_token;
 pub mod keychain;
+pub mod lenient;
 pub mod match_utils;
 pub mod org;
 pub mod org_field_guard;
 pub mod org_store;
 pub mod platform;
 pub mod sensitivity;
+pub mod spawn_admission;
 pub mod takeover_state;
 pub mod text_utils;
 pub mod tool_catalog;
@@ -80,6 +83,14 @@ pub use org_store::{
 };
 pub use platform::{duduclaw_home, duduclaw_instance, expand_tilde, home_dir, mcp_server_key};
 pub use sensitivity::{is_private_session, perception_source_sensitivity, Sensitivity};
+pub use spawn_admission::{
+    clamp_min_one as spawn_admission_clamp_min_one, dequeue_next as spawn_admission_dequeue_next,
+    enqueue as spawn_admission_enqueue, invalidate_owner as spawn_admission_invalidate_owner,
+    queue_depth as spawn_admission_queue_depth, sweep_expired as spawn_admission_sweep_expired,
+    AdmissionConfig as SpawnAdmissionConfig, AdmissionMode as SpawnAdmissionMode,
+    DequeueResult as SpawnDequeueResult, EnqueueOutcome as SpawnEnqueueOutcome,
+    QueuedSpawn,
+};
 pub use takeover_state::{
     BeginOutcome as TakeoverBeginOutcome, BeginRequest as TakeoverBeginRequest, TakeoverConfig,
     TakeoverRecord,

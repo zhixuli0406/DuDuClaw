@@ -13,7 +13,7 @@ import {
   UserCheck,
 } from 'lucide-react';
 
-import { api, type TaskInfo, type GoalTimeline } from '@/lib/api';
+import { api, type TaskInfo, type GoalTimeline, type PauseReasonToken } from '@/lib/api';
 import { timeAgo } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -89,6 +89,39 @@ function GoalStatusBadge({ status }: { status: string }) {
   return (
     <span className={`text-xs font-medium ${statusTone(status)}`}>
       {intl.formatMessage({ id: `goals.status.${status}`, defaultMessage: status })}
+    </span>
+  );
+}
+
+/** The closed set the backend can send (`pause_reason::PauseReason`). Kept as
+ *  a runtime list, not just a TS type, so a token this build has never heard
+ *  of (older/newer gateway) falls back to `unknown` = 「需要人工確認」 rather
+ *  than rendering a raw key. */
+const PAUSE_REASONS: readonly PauseReasonToken[] = [
+  'no_progress',
+  'budget_exhausted',
+  'blocked_needs_decision',
+  'infra',
+  'restart',
+  'unknown',
+];
+
+/**
+ * H11 — why this goal stopped, in one chip.
+ *
+ * `judge_feedback` (rendered right below wherever this appears) is free text:
+ * often several sentences of judge or evaluator prose, sometimes a raw
+ * transport error. That is the detail; this is the triage. Only rendered for
+ * `needs_human` — the column is cleared the moment a human resolves the pause.
+ */
+function PauseReasonChip({ reason }: { reason?: string | null }) {
+  const intl = useIntl();
+  const token = (PAUSE_REASONS as readonly string[]).includes(reason ?? '')
+    ? (reason as PauseReasonToken)
+    : 'unknown';
+  return (
+    <span className="inline-flex items-center rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300">
+      {intl.formatMessage({ id: `goals.pauseReason.${token}` })}
     </span>
   );
 }
@@ -368,9 +401,12 @@ function GoalDetailDialog({
             {/* needs_human intervention */}
             {timeline.task.status === 'needs_human' && (
               <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2">
-                <p className="mb-1 text-xs font-medium text-amber-700 dark:text-amber-300">
-                  {intl.formatMessage({ id: 'goals.needsHuman.title' })}
-                </p>
+                <div className="mb-1 flex flex-wrap items-center gap-2">
+                  <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                    {intl.formatMessage({ id: 'goals.needsHuman.title' })}
+                  </p>
+                  <PauseReasonChip reason={timeline.task.pause_reason} />
+                </div>
                 {timeline.task.judge_feedback && (
                   <p className="mb-2 whitespace-pre-wrap text-xs text-muted-foreground">
                     {timeline.task.judge_feedback}
@@ -553,6 +589,9 @@ function GoalCard({
         </button>
         {task.status === 'needs_human' && (
           <div className="border-t border-surface-border pt-2">
+            <div className="mb-1.5">
+              <PauseReasonChip reason={task.pause_reason} />
+            </div>
             {task.judge_feedback && (
               <p className="mb-1.5 line-clamp-2 text-xs text-muted-foreground">{task.judge_feedback}</p>
             )}

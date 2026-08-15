@@ -310,6 +310,16 @@ pub struct GoalLoopConfig {
     /// A dispatched task the agent has not picked up within this many seconds is
     /// considered stalled and may be re-dispatched (counts as an iteration).
     pub stalled_secs: i64,
+    /// H22 (workbuddy-codebuddy §2.5): after this many minutes with no
+    /// observable progress signal, an already-picked-up (`in_progress`) goal
+    /// task gets ONE "已執行 X 分鐘未回報進度" notice — Activity Feed plus the
+    /// launching conversation — at most once per round.
+    ///
+    /// Strictly a report. It never re-dispatches, escalates, or cancels
+    /// anything; `stalled_secs` / `iteration_cap` / `wall_clock_hours` remain
+    /// the only guards that act. `0` (or any negative value) disables it
+    /// entirely, and the disabled path costs zero queries.
+    pub progress_report_minutes: i64,
     /// H6 (WP-B) / WP-E (2026-08 P1 rollout): `"auto"` or `"pause"`
     /// (**default since WP-E**). Read as a raw string (not a typed enum) so
     /// an unrecognized value degrades to the safe default instead of
@@ -318,6 +328,14 @@ pub struct GoalLoopConfig {
     /// [`AutonomyLevel::from_toml_str`] uses elsewhere in this file. Resolve
     /// via [`GoalLoopConfig::resume_on_restart`].
     pub resume_on_restart: String,
+    /// H10: whether `capture_round_state` computes and injects the tool-call
+    /// streak advisory (`goal_tool_streak.rs`, deepseek-harness §2.16
+    /// `repeat-tool-reminder`) into the next round's `<state>` block.
+    /// Default `true` — this is purely advisory text (it can never change
+    /// what the agent is allowed to do, only nudge what it is told), so
+    /// unlike most goal-loop gates the safe default is ON, not off. Set
+    /// `false` in `config.toml [goal_loop]` to silence it entirely.
+    pub tool_streak_advisory: bool,
 }
 
 impl Default for GoalLoopConfig {
@@ -330,6 +348,12 @@ impl Default for GoalLoopConfig {
             max_concurrent: 3,
             tick_secs: 30,
             stalled_secs: 600,
+            // H22: 10 minutes of silence is where a human starts wondering
+            // whether anything is happening at all. Deliberately the same
+            // intuition as `stalled_secs` (600s) about how long "quiet" is
+            // tolerable — but this one only reports, on an already-picked-up
+            // task, where `stalled_secs` re-dispatches an unclaimed one.
+            progress_report_minutes: 10,
             // WP-E (2026-08 P1 rollout, user-approved spec change): default
             // flipped from "auto" to "pause". H6 shipped opt-in-only first;
             // this is the deliberate follow-up so an unattended gateway
@@ -338,6 +362,8 @@ impl Default for GoalLoopConfig {
             // `config.toml [goal_loop]` (or via the dashboard's Automation
             // tab) to restore the pre-WP-E behavior.
             resume_on_restart: "pause".to_string(),
+            // H10: on by default — advisory-only, never behavior-changing.
+            tool_streak_advisory: true,
         }
     }
 }
@@ -462,7 +488,15 @@ pub async fn pause_inflight_on_restart(
                 continue;
             }
             let mut dummy_inflight: HashMap<String, InFlight> = HashMap::new();
-            if let Err(e) = driver.escalate(&mut dummy_inflight, &t, "gateway_restart").await {
+            if let Err(e) = driver
+                .escalate(
+                    &mut dummy_inflight,
+                    &t,
+                    "gateway_restart",
+                    crate::pause_reason::PauseReason::Restart,
+                )
+                .await
+            {
                 warn!(task = %t.id, error = %e, "goal loop: resume_on_restart escalate failed for this task (continuing)");
                 continue;
             }
@@ -622,6 +656,31 @@ struct InFlight {
     /// the gate is unwired in tests) — carried forward across re-dispatch,
     /// renewed each tick, released when the task reaches a terminal state.
     lease: Option<duduclaw_core::ConcurrencyLease>,
+    /// H22: the round (`iter`) for which the no-progress notice has already
+    /// been emitted, so a long-running task reports at most once per round
+    /// instead of once per tick. Reset to `None` implicitly on every
+    /// re-dispatch, since dispatch rebuilds the whole [`InFlight`] entry.
+    progress_reported_round: Option<u32>,
+}
+
+/// H22: pure predicate — how many whole minutes a task has gone without an
+/// observable progress signal, when that exceeds the configured threshold.
+///
+/// `Some(elapsed_minutes)` ⇒ report; `None` ⇒ stay quiet. Disabled
+/// (`threshold_minutes <= 0`) and clocks that run backwards (a `last_signal`
+/// in the future — NTP correction, a hand-edited row) both return `None`:
+/// the notice is a courtesy, so every ambiguous case degrades to silence
+/// rather than to a wrong number in a user's chat.
+pub(crate) fn no_progress_minutes(
+    last_signal: DateTime<Utc>,
+    now: DateTime<Utc>,
+    threshold_minutes: i64,
+) -> Option<i64> {
+    if threshold_minutes <= 0 {
+        return None;
+    }
+    let elapsed = (now - last_signal).num_minutes();
+    (elapsed >= threshold_minutes).then_some(elapsed)
 }
 
 /// The goal loop background driver.
@@ -904,6 +963,13 @@ impl GoalLoopDriver {
                     if let Some(e) = inflight.get_mut(&id) {
                         e.awaiting_pickup = false;
                     }
+                    // H22: the task IS claimed and running — the stall guard
+                    // (`stalled_secs`) no longer applies here, so a silent
+                    // long-runner had no visible signal at all until it
+                    // finished. Report, never intervene.
+                    if let Some(t) = &task_opt {
+                        self.maybe_report_no_progress(&mut inflight, t, now).await;
+                    }
                 }
                 // Under acceptance review — push the "驗收中" progress once,
                 // and (A1/A2, once per review sitting) capture this round's
@@ -1061,7 +1127,15 @@ impl GoalLoopDriver {
                     DeadlineHit::TaskDeadline => "時限已到未通過驗收",
                     DeadlineHit::WallClock => "goal-loop deadline",
                 };
-                self.escalate(&mut inflight, task, reason).await?;
+                // H11: both halves are a time budget running out — one class,
+                // two different human-readable reasons.
+                self.escalate(
+                    &mut inflight,
+                    task,
+                    reason,
+                    crate::pause_reason::PauseReason::BudgetExhausted,
+                )
+                .await?;
                 active = inflight.len();
                 continue;
             }
@@ -1099,10 +1173,13 @@ impl GoalLoopDriver {
                             &format!("上游依賴 #{short} 未能完成,凍結並轉人工 — {}", task.title),
                         )
                         .await;
+                        // H11: nothing this agent can do — another task has to
+                        // be unstuck first, which is a human decision.
                         self.escalate(
                             &mut inflight,
                             task,
                             &format!("goal-loop upstream dependency failed: {dep}"),
+                            crate::pause_reason::PauseReason::BlockedNeedsDecision,
                         )
                         .await?;
                         active = inflight.len();
@@ -1277,8 +1354,13 @@ impl GoalLoopDriver {
                         ),
                     )
                     .await;
-                    self.escalate(&mut inflight, task, "goal-loop no-progress oscillation")
-                        .await?;
+                    self.escalate(
+                        &mut inflight,
+                        task,
+                        "goal-loop no-progress oscillation",
+                        crate::pause_reason::PauseReason::NoProgress,
+                    )
+                    .await?;
                     active = inflight.len();
                     continue;
                 }
@@ -1301,7 +1383,13 @@ impl GoalLoopDriver {
             // ── Iteration guard (difficulty-scaled cap, D4 item 3) ──
             let current_iter = entry.as_ref().map(|e| e.iter).unwrap_or(0);
             if current_iter >= iter_cap {
-                self.escalate(&mut inflight, task, "goal-loop iteration cap")
+                // H11: a hard cap fired (same family as the deadline guard).
+                self.escalate(
+                    &mut inflight,
+                    task,
+                    "goal-loop iteration cap",
+                    crate::pause_reason::PauseReason::BudgetExhausted,
+                )
                     .await?;
                 active = inflight.len();
                 continue;
@@ -1575,6 +1663,8 @@ impl GoalLoopDriver {
                     enqueued_at: now,
                     awaiting_pickup: true,
                     lease,
+                    // H22: a fresh round starts its own silence window.
+                    progress_reported_round: None,
                 },
             );
 
@@ -1641,13 +1731,21 @@ impl GoalLoopDriver {
     }
 
     /// Park a task for a human and drop its in-flight tracking.
+    ///
+    /// H11: `pause` is the closed classification of this escalation, supplied
+    /// by the call site (the trigger is known statically there; `reason` is
+    /// free text that in some paths embeds a task id or LLM prose and must
+    /// never be re-parsed for a routing decision).
     async fn escalate(
         &self,
         inflight: &mut HashMap<String, InFlight>,
         task: &TaskRow,
         reason: &str,
+        pause: crate::pause_reason::PauseReason,
     ) -> Result<(), String> {
-        self.store.mark_needs_human(&task.id, reason).await?;
+        self.store
+            .mark_needs_human_with_pause(&task.id, reason, pause)
+            .await?;
         // WP3 (PORTICO): escalation ends the autonomous phase (iteration cap /
         // oscillation) → revoke the task's grants. Mirrors the DispatchEngine
         // needs_human revocation for the goal-loop-side escalation path.
@@ -2187,6 +2285,99 @@ impl GoalLoopDriver {
         }
     }
 
+    /// H22 (workbuddy-codebuddy §2.5): emit ONE "已執行 X 分鐘未回報進度"
+    /// notice for an `in_progress` goal task that has gone quiet.
+    ///
+    /// ## What counts as "progress"
+    ///
+    /// The most recent Activity Feed row for this task, floored at the
+    /// round's dispatch time. That covers all three producers of a real
+    /// signal — the driver's own `goal_loop.dispatched`, the dispatch
+    /// engine's review/verdict events, and anything the agent posts itself
+    /// via the `activity_post` MCP tool.
+    ///
+    /// `tasks.updated_at` is deliberately NOT the signal: the dispatch
+    /// engine's lease renewer calls `renew_lease` on a timer, which bumps
+    /// `updated_at` for every claimed task, so a completely silent agent's
+    /// row keeps looking fresh (see [`TaskStore::latest_activity_at`]).
+    ///
+    /// ## Guarantees
+    ///
+    /// - **Report only.** Nothing here changes a task's status, re-dispatches
+    ///   it, or counts against any cap.
+    /// - **At most once per round.** Guarded by `InFlight::progress_reported_round`,
+    ///   which a re-dispatch resets along with the rest of the entry.
+    /// - **Zero cost when off.** `progress_report_minutes <= 0` returns before
+    ///   touching the store.
+    /// - **Fail-quiet.** A store error just skips this tick; the notice is a
+    ///   courtesy, never a correctness signal.
+    /// - Delivery follows [`Self::push_progress`]'s existing retry contract —
+    ///   the round is only marked reported once the push is handled, so a
+    ///   transient send failure retries next tick instead of vanishing.
+    async fn maybe_report_no_progress(
+        &self,
+        inflight: &mut HashMap<String, InFlight>,
+        task: &TaskRow,
+        now: DateTime<Utc>,
+    ) {
+        let threshold = self.config.progress_report_minutes;
+        if threshold <= 0 {
+            return; // disabled — no query, no allocation
+        }
+        let Some(entry) = inflight.get(&task.id) else {
+            return; // not tracked by this driver (e.g. dispatched pre-restart)
+        };
+        let round = entry.iter;
+        if entry.progress_reported_round == Some(round) {
+            return; // already reported for this round
+        }
+        let enqueued_at = entry.enqueued_at;
+
+        let last_signal = match self.store.latest_activity_at(&task.id).await {
+            Ok(Some(ts)) => DateTime::parse_from_rfc3339(&ts)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+                // An activity row older than this round's dispatch is not a
+                // signal *for this round* — floor at the dispatch instant so a
+                // re-dispatched task never inherits the previous round's silence.
+                .filter(|d| *d > enqueued_at)
+                .unwrap_or(enqueued_at),
+            Ok(None) => enqueued_at,
+            Err(e) => {
+                debug!(task = %task.id, error = %e, "goal loop: progress-signal lookup failed (skipping notice)");
+                return;
+            }
+        };
+        let Some(minutes) = no_progress_minutes(last_signal, now, threshold) else {
+            return;
+        };
+
+        let delivered = self
+            .push_progress(
+                task,
+                &format!("stalled:{round}"),
+                crate::goal_notify::GoalProgress::NoProgressReport { minutes },
+            )
+            .await;
+        if !delivered {
+            return; // transient send failure — push_progress retries next tick
+        }
+        if let Some(e) = inflight.get_mut(&task.id) {
+            e.progress_reported_round = Some(round);
+        }
+        // Posted last, and only once: this row itself becomes the newest
+        // activity signal, so posting it before the dedup flag was set would
+        // reset the very clock that decides whether to post again.
+        self.post_activity(
+            "goal_loop.progress_report",
+            &task.assigned_to,
+            Some(&task.id),
+            &format!("goal-loop 已執行 {minutes} 分鐘未回報進度 — {}", task.title),
+        )
+        .await;
+        info!(task = %task.id, round, minutes, "goal loop: no-progress notice pushed");
+    }
+
     /// Drop any in-flight progress-push retry counters for `task_id` — called
     /// when a task leaves the driver's dispatch concern entirely (terminal
     /// cleanup), so a stale counter never lingers keyed to a task that no
@@ -2253,6 +2444,19 @@ impl GoalLoopDriver {
                 &result_text,
             );
             self.visit_graph.record_round(&task.id, &state_hash, &digest).await;
+
+            // ── H10: tool-call streak advisory (deepseek-harness §2.16
+            //    repeat-tool-reminder) — same `(agent_id, since, until)`
+            //    window as the A2 action digest above, read via the shared
+            //    `tool_activity` evidence reader. Config-gated (default on,
+            //    advisory-only) — see `GoalLoopConfig::tool_streak_advisory`.
+            if self.config.tool_streak_advisory {
+                if let Some(hit) =
+                    crate::goal_tool_streak::detect_tool_streak(&self.home_dir, &agent_id, &since, &until)
+                {
+                    self.record_tool_streak_hint(task, &hit).await;
+                }
+            }
         }
 
         if let Some(result_text) = task.result_summary.as_deref() {
@@ -2341,6 +2545,39 @@ impl GoalLoopDriver {
         }
     }
 
+    /// H10: record one round's tool-call streak — mirrors
+    /// `record_bail_pattern`'s shape (activity feed for dashboard
+    /// observability + a best-effort hint carried into the NEXT dispatch
+    /// round's `<state>` block, `GoalStateSnapshot.tool_streak_hint`,
+    /// surfaced via `StateBlock::render`). Advisory only: never blocks,
+    /// never retries, never changes what gets dispatched — a no-op below
+    /// the lowest threshold (`goal_tool_streak::advisory_text` returns
+    /// `None`), so a `StreakHit` of 1 or 2 produces zero activity/hint.
+    async fn record_tool_streak_hint(&self, task: &TaskRow, hit: &crate::goal_tool_streak::StreakHit) {
+        let Some(text) = crate::goal_tool_streak::advisory_text(hit) else {
+            return;
+        };
+        self.post_activity(
+            "goal_loop.tool_call_streak",
+            &task.assigned_to,
+            Some(&task.id),
+            &format!(
+                "偵測到連續 {} 次呼叫同一工具「{}」且參數相同 — {}",
+                hit.len, hit.tool_name, task.title
+            ),
+        )
+        .await;
+        if let Err(e) = self
+            .store
+            .merge_goal_state_json(&task.id, move |v| {
+                v["tool_streak_hint"] = serde_json::json!(text);
+            })
+            .await
+        {
+            debug!(task = %task.id, error = %e, "goal loop: tool streak hint persist failed (non-fatal)");
+        }
+    }
+
     /// Best-effort append to the dashboard Activity Feed. A failure here must not
     /// break the loop — it is progress telemetry, not control flow.
     async fn post_activity(
@@ -2385,7 +2622,11 @@ mod tests {
             max_concurrent: 3,
             tick_secs: 30,
             stalled_secs: 600,
+            // H22 off by default in tests — the timeout-report tests build
+            // their own config so every other test's tick stays query-free.
+            progress_report_minutes: 0,
             resume_on_restart: "auto".to_string(),
+            tool_streak_advisory: true,
         }
     }
 
@@ -2419,6 +2660,9 @@ mod tests {
         assert_eq!(d.iteration_cap_simple, 3);
         assert_eq!(d.soft_cap, 3);
         assert_eq!(d.max_concurrent, 3);
+        // H10: advisory-only, so the safe default is ON (unlike most
+        // goal-loop gates, which default off).
+        assert!(d.tool_streak_advisory);
 
         // Partial section ⇒ only the given field overrides; the rest default.
         let toml = "[goal_loop]\niteration_cap = 7\n";
@@ -2430,6 +2674,189 @@ mod tests {
         assert_eq!(cfg.soft_cap, 3, "unspecified field keeps its default");
         assert_eq!(cfg.max_concurrent, 3, "unspecified field keeps its default");
         assert_eq!(cfg.wall_clock_hours, 24);
+        assert!(cfg.tool_streak_advisory, "unspecified field keeps its default (on)");
+
+        // H10: explicit `false` in config.toml is honored.
+        let toml_off = "[goal_loop]\ntool_streak_advisory = false\n";
+        let table_off: toml::Table = toml_off.parse().unwrap();
+        let cfg_off: GoalLoopConfig =
+            table_off.get("goal_loop").unwrap().clone().try_into().unwrap();
+        assert!(!cfg_off.tool_streak_advisory);
+    }
+
+    // ── H10: tool-call streak advisory — capture_round_state integration ──
+
+    /// Write `count` identical `(tool, input)` calls for `agent` into
+    /// `<dir>/tool_calls.jsonl`, timestamped "now" — paired with a task
+    /// `claimed_at` fixed safely in the past, this lands every write inside
+    /// `capture_round_state`'s `[since, until]` evidence window.
+    fn write_tool_calls_jsonl(dir: &Path, agent: &str, tool: &str, input: &str, count: usize) {
+        let lines: Vec<String> = (0..count)
+            .map(|_| {
+                serde_json::json!({
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "agent_id": agent,
+                    "tool_name": tool,
+                    "success": true,
+                    "input": input,
+                })
+                .to_string()
+            })
+            .collect();
+        std::fs::write(dir.join("tool_calls.jsonl"), format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    fn claimed_review_task(id: &str, agent: &str) -> TaskRow {
+        let mut t = goal_task(id, agent);
+        t.claimed_by = Some(agent.to_string());
+        // Safely in the past so any "now"-stamped tool_calls.jsonl row lands
+        // inside `capture_round_state`'s `[since, until]` window.
+        t.claimed_at = Some("2020-01-01T00:00:00Z".into());
+        t.status = "review".into();
+        t.result_summary = Some("did the thing".into());
+        t
+    }
+
+    #[tokio::test]
+    async fn capture_round_state_injects_escalating_tool_streak_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let t = claimed_review_task("g1", "alice");
+        store.insert_task(&t).await.unwrap();
+        write_tool_calls_jsonl(dir.path(), "alice", "bash", "ls -la", 5);
+
+        let d = driver(store.clone(), queue.clone(), small_cfg()).with_home_dir(dir.path().to_path_buf());
+        d.capture_round_state(&t).await;
+
+        let after = store.get_task("g1").await.unwrap().unwrap();
+        let snap = GoalStateSnapshot::from_json(after.goal_state_json.as_deref());
+        let hint = snap.tool_streak_hint.expect("a streak of 5 must inject a hint");
+        assert!(hint.contains("bash"));
+        assert!(hint.contains('5'));
+        // Tier 5 wording ("switch approach"), not tier 3's ("re-read the result").
+        assert!(hint.contains("換一個方法") || hint.contains("換個方法"));
+
+        // H10: also recorded to the Activity Feed for dashboard observability.
+        let activity = store.list_activity_for_task("g1", 10).await.unwrap();
+        assert!(
+            activity
+                .iter()
+                .any(|a| a.event_type == "goal_loop.tool_call_streak" && a.summary.contains('5')),
+            "streak count must be recorded to the activity feed: {activity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_round_state_tier_8_hint_mentions_tasks_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let t = claimed_review_task("g1", "alice");
+        store.insert_task(&t).await.unwrap();
+        write_tool_calls_jsonl(dir.path(), "alice", "web_fetch", "{\"url\":\"https://x\"}", 9);
+
+        let d = driver(store.clone(), queue.clone(), small_cfg()).with_home_dir(dir.path().to_path_buf());
+        d.capture_round_state(&t).await;
+
+        let after = store.get_task("g1").await.unwrap().unwrap();
+        let snap = GoalStateSnapshot::from_json(after.goal_state_json.as_deref());
+        let hint = snap.tool_streak_hint.expect("a streak of 9 must inject a hint");
+        assert!(hint.contains("tasks_block"), "tier 8 must point at the escape hatch: {hint}");
+    }
+
+    #[tokio::test]
+    async fn capture_round_state_no_hint_below_lowest_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let t = claimed_review_task("g1", "alice");
+        store.insert_task(&t).await.unwrap();
+        // Only 2 in a row — below the tier-3 floor.
+        write_tool_calls_jsonl(dir.path(), "alice", "bash", "ls -la", 2);
+
+        let d = driver(store.clone(), queue.clone(), small_cfg()).with_home_dir(dir.path().to_path_buf());
+        d.capture_round_state(&t).await;
+
+        let after = store.get_task("g1").await.unwrap().unwrap();
+        let snap = GoalStateSnapshot::from_json(after.goal_state_json.as_deref());
+        assert!(snap.tool_streak_hint.is_none(), "a streak below 3 must not inject anything");
+    }
+
+    #[tokio::test]
+    async fn capture_round_state_different_params_never_form_a_streak() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let t = claimed_review_task("g1", "alice");
+        store.insert_task(&t).await.unwrap();
+        // 4 calls to the same tool, but every one has a distinct argument —
+        // real exploration, not a stuck loop.
+        let lines: Vec<String> = (0..4)
+            .map(|i| {
+                serde_json::json!({
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "agent_id": "alice",
+                    "tool_name": "bash",
+                    "success": true,
+                    "input": format!("cat file_{i}.txt"),
+                })
+                .to_string()
+            })
+            .collect();
+        std::fs::write(dir.path().join("tool_calls.jsonl"), format!("{}\n", lines.join("\n"))).unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg()).with_home_dir(dir.path().to_path_buf());
+        d.capture_round_state(&t).await;
+
+        let after = store.get_task("g1").await.unwrap().unwrap();
+        let snap = GoalStateSnapshot::from_json(after.goal_state_json.as_deref());
+        assert!(snap.tool_streak_hint.is_none(), "distinct params each round must never register as a streak");
+    }
+
+    #[tokio::test]
+    async fn capture_round_state_config_off_yields_zero_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let t = claimed_review_task("g1", "alice");
+        store.insert_task(&t).await.unwrap();
+        // Well past every threshold — would inject the tier-8 hint if enabled.
+        write_tool_calls_jsonl(dir.path(), "alice", "bash", "ls -la", 10);
+
+        let cfg = GoalLoopConfig { tool_streak_advisory: false, ..small_cfg() };
+        let d = driver(store.clone(), queue.clone(), cfg).with_home_dir(dir.path().to_path_buf());
+        d.capture_round_state(&t).await;
+
+        let after = store.get_task("g1").await.unwrap().unwrap();
+        let snap = GoalStateSnapshot::from_json(after.goal_state_json.as_deref());
+        assert!(snap.tool_streak_hint.is_none(), "tool_streak_advisory = false must produce zero injection");
+
+        // No activity event either — config off means the whole feature is silent.
+        let activity = store.list_activity_for_task("g1", 10).await.unwrap();
+        assert!(
+            !activity.iter().any(|a| a.event_type == "goal_loop.tool_call_streak"),
+            "config off must not even post the activity event: {activity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_round_state_tool_streak_hint_renders_in_next_round_state_block() {
+        // End-to-end: the persisted hint round-trips through
+        // `GoalStateSnapshot` into the next dispatch round's rendered
+        // `<state>` block, exactly like `bail_hint` already does.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let t = claimed_review_task("g1", "alice");
+        store.insert_task(&t).await.unwrap();
+        write_tool_calls_jsonl(dir.path(), "alice", "bash", "ls -la", 5);
+
+        let d = driver(store.clone(), queue.clone(), small_cfg()).with_home_dir(dir.path().to_path_buf());
+        d.capture_round_state(&t).await;
+
+        let after = store.get_task("g1").await.unwrap().unwrap();
+        let snapshot = GoalStateSnapshot::from_json(after.goal_state_json.as_deref());
+        let block = goal_state::build_state_block(&after, &[], &snapshot);
+        let rendered = block.render();
+        assert!(
+            rendered.contains("bash"),
+            "the tool-streak hint must surface in the rendered <state> block: {rendered}"
+        );
     }
 
     // ── G3: resolve_deadline_hit (design §6, market-belief-loop sister
@@ -3846,5 +4273,331 @@ mod tests {
             2,
             "a takeover on one conversation must not freeze the whole board"
         );
+    }
+
+    // ── H11: every escalation path stamps its pause class ───────────────
+    //
+    // One test per trigger, asserting BOTH the (unchanged) free-text reason
+    // and the new class — the whole point of H11 is that a human triages on
+    // the class, so a trigger silently landing in the wrong bucket is a real
+    // regression, not a cosmetic one.
+
+    async fn pause_class_of(store: &TaskStore, id: &str) -> crate::pause_reason::PauseReason {
+        let t = store.get_task(id).await.unwrap().unwrap();
+        assert_eq!(t.status, "needs_human", "{id} should be parked");
+        crate::pause_reason::PauseReason::from_stored(t.pause_reason.as_deref())
+    }
+
+    #[tokio::test]
+    async fn iteration_cap_escalation_is_classified_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+        let cfg = GoalLoopConfig { iteration_cap: 2, stalled_secs: 0, ..small_cfg() };
+        let d = driver(store.clone(), queue.clone(), cfg);
+
+        d.tick_once().await.unwrap();
+        d.tick_once().await.unwrap();
+        d.tick_once().await.unwrap(); // cap reached ⇒ escalate
+
+        assert_eq!(
+            pause_class_of(&store, "g1").await,
+            crate::pause_reason::PauseReason::BudgetExhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn both_deadline_flavours_are_classified_budget_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        // Global wall clock (created 48h ago, budget 24h).
+        let mut wall = goal_task("g-wall", "alice");
+        wall.created_at = (Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        store.insert_task(&wall).await.unwrap();
+        // Per-goal deadline that already lapsed, wall clock nowhere near.
+        let mut task_dl = goal_task("g-dl", "alice");
+        task_dl.deadline_at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
+        store.insert_task(&task_dl).await.unwrap();
+
+        driver(store.clone(), queue.clone(), small_cfg()).tick_once().await.unwrap();
+
+        // Two different human-readable reasons, one class — a person triaging
+        // 「次數或時限用盡」 does not care which clock ran out, only that one did.
+        let wall_row = store.get_task("g-wall").await.unwrap().unwrap();
+        assert_eq!(wall_row.judge_feedback.as_deref(), Some("goal-loop deadline"));
+        let dl_row = store.get_task("g-dl").await.unwrap().unwrap();
+        assert_eq!(dl_row.judge_feedback.as_deref(), Some("時限已到未通過驗收"));
+        for id in ["g-wall", "g-dl"] {
+            assert_eq!(
+                pause_class_of(&store, id).await,
+                crate::pause_reason::PauseReason::BudgetExhausted,
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oscillation_escalation_is_classified_no_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let cfg = GoalLoopConfig { iteration_cap: 10, iteration_cap_simple: 10, ..small_cfg() };
+        let mut t = goal_task("g1", "alice");
+        t.max_retries = 100; // only the A2 guard may escalate here
+        store.insert_task(&t).await.unwrap();
+        let d = driver(store.clone(), queue.clone(), cfg);
+
+        d.tick_once().await.unwrap();
+        agent_round_then_reject(&d, &store, "g1", "same reason").await;
+        d.tick_once().await.unwrap();
+        agent_round_then_reject(&d, &store, "g1", "same reason").await;
+        d.tick_once().await.unwrap();
+
+        // Distinct from the cap escalations above: the loop still had budget,
+        // it just stopped making progress.
+        assert_eq!(
+            pause_class_of(&store, "g1").await,
+            crate::pause_reason::PauseReason::NoProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_failure_escalation_is_classified_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut g1 = goal_task("g1", "alice");
+        g1.status = "failed".into();
+        store.insert_task(&g1).await.unwrap();
+        let mut g2 = goal_task("g2", "alice");
+        g2.depends_on = r#"["g1"]"#.into();
+        store.insert_task(&g2).await.unwrap();
+
+        driver(store.clone(), queue.clone(), small_cfg()).tick_once().await.unwrap();
+
+        assert_eq!(
+            pause_class_of(&store, "g2").await,
+            crate::pause_reason::PauseReason::BlockedNeedsDecision
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_pause_is_classified_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[goal_loop]\nresume_on_restart = \"pause\"\n",
+        )
+        .unwrap();
+        let mut t = goal_task("g1", "alice");
+        t.status = "in_progress".into();
+        store.insert_task(&t).await.unwrap();
+
+        assert_eq!(pause_inflight_on_restart(store.clone(), queue, dir.path()).await, 1);
+        assert_eq!(
+            pause_class_of(&store, "g1").await,
+            crate::pause_reason::PauseReason::Restart
+        );
+    }
+
+    /// The safety net: a task parked through a path that declares no class
+    /// (any future caller of the string-only `mark_needs_human`, plus every
+    /// row that predates the column) reads as `Unknown` = 「需要人工確認」,
+    /// never as a confident bucket.
+    #[tokio::test]
+    async fn unclassified_and_legacy_pauses_read_as_needs_human_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+        store.mark_needs_human("g1", "something odd happened").await.unwrap();
+        assert_eq!(
+            pause_class_of(&store, "g1").await,
+            crate::pause_reason::PauseReason::Unknown
+        );
+
+        // A legacy row: parked with no class column value at all.
+        let mut legacy = goal_task("g2", "alice");
+        legacy.status = "needs_human".into();
+        legacy.pause_reason = None;
+        store.insert_task(&legacy).await.unwrap();
+        assert_eq!(
+            pause_class_of(&store, "g2").await,
+            crate::pause_reason::PauseReason::Unknown
+        );
+    }
+
+    // ── H22: no-progress timeout report ─────────────────────────────────
+
+    #[test]
+    fn no_progress_minutes_thresholds() {
+        let now = Utc::now();
+        let twelve_ago = now - chrono::Duration::minutes(12);
+
+        // Disabled: 0 and any negative value never report, however long the
+        // silence has been.
+        assert_eq!(no_progress_minutes(twelve_ago, now, 0), None);
+        assert_eq!(no_progress_minutes(twelve_ago, now, -5), None);
+
+        // Below / at / above the threshold.
+        assert_eq!(no_progress_minutes(now - chrono::Duration::minutes(9), now, 10), None);
+        assert_eq!(no_progress_minutes(now - chrono::Duration::minutes(10), now, 10), Some(10));
+        assert_eq!(no_progress_minutes(twelve_ago, now, 10), Some(12));
+
+        // A signal timestamped in the FUTURE (clock skew / hand-edited row)
+        // degrades to silence rather than reporting a negative duration.
+        assert_eq!(
+            no_progress_minutes(now + chrono::Duration::hours(1), now, 10),
+            None
+        );
+    }
+
+    /// Test-only: put a task into the driver's in-flight map with a chosen
+    /// dispatch instant, so the silence window can be exercised without
+    /// waiting real minutes (and without any activity row the driver's own
+    /// dispatch would have stamped at "now").
+    fn inflight_entry(iter: u32, enqueued_at: DateTime<Utc>) -> InFlight {
+        InFlight {
+            iter,
+            enqueued_at,
+            awaiting_pickup: false,
+            lease: None,
+            progress_reported_round: None,
+        }
+    }
+
+    async fn progress_report_events(store: &TaskStore, id: &str) -> usize {
+        store
+            .list_activity_for_task(id, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.event_type == "goal_loop.progress_report")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn silent_task_gets_one_notice_and_is_deduped_within_the_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut t = goal_task("g1", "alice");
+        t.status = "in_progress".into();
+        store.insert_task(&t).await.unwrap();
+
+        let cfg = GoalLoopConfig { progress_report_minutes: 10, ..small_cfg() };
+        let d = driver(store.clone(), queue.clone(), cfg).with_home_dir(dir.path().to_path_buf());
+
+        let now = Utc::now();
+        let mut map: HashMap<String, InFlight> =
+            HashMap::from([("g1".to_string(), inflight_entry(3, now - chrono::Duration::minutes(45)))]);
+
+        d.maybe_report_no_progress(&mut map, &t, now).await;
+        assert_eq!(progress_report_events(&store, "g1").await, 1);
+        assert_eq!(
+            map["g1"].progress_reported_round,
+            Some(3),
+            "the round must be marked reported so later ticks stay quiet"
+        );
+        let summary = store
+            .list_activity_for_task("g1", 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.event_type == "goal_loop.progress_report")
+            .unwrap()
+            .summary;
+        assert!(summary.contains("45 分鐘"), "elapsed minutes must be named: {summary}");
+        assert!(summary.contains("未回報進度"), "{summary}");
+
+        // Ten hours later, still the same round: the dedup flag alone must
+        // hold (the elapsed time is now enormous, so nothing else would).
+        d.maybe_report_no_progress(&mut map, &t, now + chrono::Duration::hours(10)).await;
+        assert_eq!(
+            progress_report_events(&store, "g1").await,
+            1,
+            "at most one notice per round"
+        );
+
+        // A NEW round (a re-dispatch rebuilds the entry) reports again. The
+        // round-4 dispatch is placed AFTER the round-3 notice's own activity
+        // row, so that row cannot masquerade as this round's progress signal —
+        // which is precisely the `> enqueued_at` floor being exercised.
+        let after_first_notice = Utc::now();
+        map.insert(
+            "g1".to_string(),
+            inflight_entry(4, after_first_notice + chrono::Duration::seconds(1)),
+        );
+        d.maybe_report_no_progress(&mut map, &t, after_first_notice + chrono::Duration::minutes(30))
+            .await;
+        assert_eq!(progress_report_events(&store, "g1").await, 2);
+    }
+
+    #[tokio::test]
+    async fn progress_report_stays_silent_when_disabled_or_recently_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut t = goal_task("g1", "alice");
+        t.status = "in_progress".into();
+        store.insert_task(&t).await.unwrap();
+        let now = Utc::now();
+
+        // progress_report_minutes = 0 ⇒ off, even after 45 minutes of silence.
+        let off = driver(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf());
+        assert_eq!(off.config.progress_report_minutes, 0);
+        let mut map: HashMap<String, InFlight> =
+            HashMap::from([("g1".to_string(), inflight_entry(1, now - chrono::Duration::minutes(45)))]);
+        off.maybe_report_no_progress(&mut map, &t, now).await;
+        assert_eq!(progress_report_events(&store, "g1").await, 0, "0 disables the notice");
+        assert!(map["g1"].progress_reported_round.is_none());
+
+        // Enabled, but the agent posted to the feed 1 minute ago ⇒ that IS
+        // progress; the long-ago dispatch time must not win.
+        let on = driver(store.clone(), queue.clone(), GoalLoopConfig { progress_report_minutes: 10, ..small_cfg() })
+            .with_home_dir(dir.path().to_path_buf());
+        store
+            .append_activity(&crate::task_store::ActivityRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: "agent.progress".into(),
+                agent_id: "alice".into(),
+                task_id: Some("g1".into()),
+                summary: "還在跑第三步".into(),
+                timestamp: (now - chrono::Duration::minutes(1)).to_rfc3339(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        on.maybe_report_no_progress(&mut map, &t, now).await;
+        assert_eq!(
+            progress_report_events(&store, "g1").await,
+            0,
+            "a fresh activity row is a progress signal — stay quiet"
+        );
+    }
+
+    /// End-to-end through `tick_once`, so the reconcile-loop wiring (not just
+    /// the helper) is covered: an `in_progress` tracked task that has gone
+    /// quiet produces the notice on a real tick.
+    #[tokio::test]
+    async fn tick_reports_no_progress_for_a_tracked_in_progress_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut t = goal_task("g1", "alice");
+        t.status = "in_progress".into();
+        store.insert_task(&t).await.unwrap();
+
+        let cfg = GoalLoopConfig { progress_report_minutes: 10, ..small_cfg() };
+        let d = driver(store.clone(), queue.clone(), cfg).with_home_dir(dir.path().to_path_buf());
+        d.inflight.lock().await.insert(
+            "g1".to_string(),
+            inflight_entry(1, Utc::now() - chrono::Duration::minutes(30)),
+        );
+
+        d.tick_once().await.unwrap();
+        assert_eq!(progress_report_events(&store, "g1").await, 1);
+        // Purely a report: the task keeps running, untouched.
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "in_progress", "the notice must never intervene");
+        assert!(got.pause_reason.is_none());
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
     }
 }

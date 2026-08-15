@@ -96,7 +96,11 @@ fn small_cfg() -> GoalLoopConfig {
         max_concurrent: 3,
         tick_secs: 30,
         stalled_secs: 600,
+        // H22: no-progress notice off in fixtures — this suite exercises the
+        // A3 forward-model hooks, not the timeout report.
+        progress_report_minutes: 0,
         resume_on_restart: "auto".to_string(),
+        tool_streak_advisory: true,
     }
 }
 

@@ -170,6 +170,20 @@ pub fn start_agent_dispatcher_with_crypto(
                 if swept > 0 {
                     info!(swept, "ephemeral agent GC sweep complete");
                 }
+                // H19: drain the ephemeral spawn admission queue right after
+                // GC — capacity for this class is only ever freed by GC (a
+                // scaffold's completion grace + the hourly sweep cadence), so
+                // this is the natural, already-existing tick to retry queued
+                // requests, not a new poll loop.
+                let admission = crate::ephemeral::drain_admission_queue(&home_dir).await;
+                if admission.admitted > 0 || admission.expired > 0 || admission.failed > 0 {
+                    info!(
+                        admitted = admission.admitted,
+                        expired = admission.expired,
+                        failed = admission.failed,
+                        "H19: ephemeral spawn admission queue drained"
+                    );
+                }
             }
             // TaskSpec polling every 2 ticks (~10 seconds)
             if tick % 2 == 0 {
@@ -286,6 +300,34 @@ async fn poll_and_dispatch_sqlite(
             (None, _) => dispatch_fut.await,
         };
         drop(typing_guard);
+
+        // H19: same turn-end invalidation as the JSONL bus rail above — this
+        // turn concluded, so any ephemeral spawn tickets it queued while over
+        // capacity are moot. Best-effort, fail-open no-op when absent.
+        if let Some(tid) = msg.turn_id.as_deref() {
+            let removed = duduclaw_core::spawn_admission::invalidate_owner(
+                home_dir,
+                crate::ephemeral::EPHEMERAL_ADMISSION_CLASS,
+                tid,
+            );
+            if !removed.is_empty() {
+                info!(
+                    turn = tid,
+                    count = removed.len(),
+                    "H19: turn ended — invalidated its queued ephemeral spawn ticket(s)"
+                );
+                for t in &removed {
+                    duduclaw_security::audit::append_tool_call_with_extras(
+                        home_dir,
+                        "system",
+                        "ephemeral_admission_invalidated",
+                        &format!("ticket_id={} turn_id={tid}", t.ticket_id),
+                        true,
+                        &[("ticket_id", serde_json::Value::String(t.ticket_id.clone()))],
+                    );
+                }
+            }
+        }
 
         // WP-A4/A5/T10: bridge whatever the collector accumulated over to
         // `dispatch_engine.rs::settle_forward_model`, keyed by (task_id,
@@ -783,12 +825,50 @@ async fn poll_and_dispatch(
                 &home, &msg.message_id, msg.origin_agent.as_deref(),
             ).await;
 
+            // H19: captured before the move below — the turn that is about
+            // to conclude is the natural "session end" boundary for any
+            // ephemeral spawn requests it queued while over capacity (Grok's
+            // "Stop blocks late spawns" analog). See the invalidation call
+            // after this dispatch resolves.
+            let turn_id_for_admission_invalidate = turn_id_for_scope.clone();
             let dispatch_fut = dispatch_to_agent(&home, &reg, &msg.agent_id, &msg.payload, &delegation_env);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_SESSION_ID
                 .scope(session_id_for_scope, dispatch_fut);
             let dispatch_fut = duduclaw_memory::feedback::CURRENT_TURN_ID
                 .scope(turn_id_for_scope, dispatch_fut);
             let result = dispatch_fut.await;
+
+            // H19: this turn has concluded — any ephemeral spawn tickets it
+            // enqueued while over capacity are now moot (the turn that would
+            // have consumed their eventual response is gone). Best-effort,
+            // never fails the dispatch: `invalidate_owner` is a fail-open
+            // no-op on a missing/corrupt queue file, and a `None` turn id
+            // (most non-channel dispatch kinds) is a deliberate no-op — see
+            // module docs.
+            if let Some(tid) = turn_id_for_admission_invalidate.as_deref() {
+                let removed = duduclaw_core::spawn_admission::invalidate_owner(
+                    &home,
+                    crate::ephemeral::EPHEMERAL_ADMISSION_CLASS,
+                    tid,
+                );
+                if !removed.is_empty() {
+                    info!(
+                        turn = tid,
+                        count = removed.len(),
+                        "H19: turn ended — invalidated its queued ephemeral spawn ticket(s)"
+                    );
+                    for t in &removed {
+                        duduclaw_security::audit::append_tool_call_with_extras(
+                            &home,
+                            "system",
+                            "ephemeral_admission_invalidated",
+                            &format!("ticket_id={} turn_id={tid}", t.ticket_id),
+                            true,
+                            &[("ticket_id", serde_json::Value::String(t.ticket_id.clone()))],
+                        );
+                    }
+                }
+            }
             drop(typing_guard);
 
             let mut response_text = match &result {

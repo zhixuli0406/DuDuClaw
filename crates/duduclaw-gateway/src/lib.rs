@@ -315,6 +315,12 @@ pub mod goal_gap_fingerprint;
 //        patterns compared against the last non-empty paragraph of an
 //        agent's completion text ──
 pub mod goal_bail_detect;
+// ── H10: tool-call streak advisory (deepseek-harness §2.16
+//        repeat-tool-reminder) — detects a long run of identical
+//        (tool, masked-params) calls within one round's evidence and
+//        surfaces an escalating [3, 5, 8] zh-TW advisory hint into the
+//        NEXT dispatch round's <state> block. Advisory only, zero LLM cost ──
+pub mod goal_tool_streak;
 // ── D4: pluggable dispatch policy (agent selection = data) + LLMCompiler-style
 //        goal decomposition (planner → dependency DAG) ──
 pub mod dispatch_policy;
@@ -326,6 +332,10 @@ pub mod goal_plan;
 pub mod outcome_spec;
 // ── P2a: goal-loop channel push + decision (needs_human exit + autonomy kickoff) ──
 pub mod goal_notify;
+// ── H11: closed classification of WHY a goal task parked `needs_human`
+//        (grok-build §2.3 eight-state machine, adapted — a reason column, not
+//        a new task status) ──
+pub mod pause_reason;
 // ── WP2.2: gateway-side subprocess driver for `duduclaw eval --replay`
 //         (B1 cli↔gateway dependency-direction boundary) ──
 pub mod eval_runner;

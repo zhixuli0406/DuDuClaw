@@ -20,7 +20,8 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      claimed_by, claimed_at, lease_expires_at, depends_on, retry_count, max_retries, \
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
-     source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline";
+     source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
+     pause_reason";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -195,6 +196,19 @@ pub struct TaskRow {
     /// `duduclaw-cli::mcp::handle_tasks_update`).
     #[serde(default)]
     pub acceptance_criteria_baseline: Option<String>,
+
+    // ── H11 pause-reason classification (harness-borrowings 2026-08 §2) ──
+    /// Closed classification of WHY this task is parked `needs_human` —
+    /// the wire token of a [`crate::pause_reason::PauseReason`], stamped at
+    /// the escalation call site (never parsed back out of `judge_feedback`,
+    /// which is partly LLM-authored prose). `None` for tasks that were never
+    /// escalated, for rows written before this column existed, and after a
+    /// human resolves the pause (`resolve_needs_human` clears it, so a
+    /// retried task never carries a stale class). Readers must go through
+    /// `PauseReason::from_stored`, which maps `None` / unrecognised values
+    /// to `Unknown` = 「需要人工確認」.
+    #[serde(default)]
+    pub pause_reason: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -252,6 +266,7 @@ impl TaskRow {
             deadline_at: None,
             risk_boundary: None,
             acceptance_criteria_baseline: None,
+            pause_reason: None,
         }
     }
 }
@@ -747,6 +762,10 @@ impl TaskStore {
             // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D):
             // immutable snapshot of acceptance_criteria at goal-creation time.
             ("acceptance_criteria_baseline", "acceptance_criteria_baseline TEXT"),
+            // H11 pause-reason classification (harness-borrowings 2026-08 §2):
+            // WHY a task parked `needs_human`, as a closed-set token. Nullable
+            // on purpose — every pre-existing row reads back as `Unknown`.
+            ("pause_reason", "pause_reason TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -837,10 +856,10 @@ impl TaskStore {
                  max_retries, goal_mode, acceptance_criteria, result_summary, judge_feedback,
                  goal_id, lease_renewed_at, source_channel, source_chat_id,
                  revision_round, diminishing, agent_seconds, source_discord_guild_id,
-                 deadline_at, risk_boundary, acceptance_criteria_baseline)
+                 deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
             params![
                 row.id,
                 row.title,
@@ -877,6 +896,7 @@ impl TaskStore {
                 row.deadline_at,
                 row.risk_boundary,
                 row.acceptance_criteria_baseline,
+                row.pause_reason,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -1597,12 +1617,21 @@ impl TaskStore {
             }
             Ok("revising".to_string())
         } else {
+            // H11: the retry budget is spent — a hard cap fired, not a fresh
+            // blocker. Stamped here (not derived from `feedback`, which is
+            // judge-authored prose) so the dashboard/channel chip is exact.
             let n = conn
                 .execute(
                     "UPDATE tasks
-                    SET status = 'needs_human', judge_feedback = ?2, updated_at = ?3
+                    SET status = 'needs_human', judge_feedback = ?2, pause_reason = ?4,
+                        updated_at = ?3
                   WHERE id = ?1 AND status = 'review'",
-                    params![id, feedback, now],
+                    params![
+                        id,
+                        feedback,
+                        now,
+                        crate::pause_reason::PauseReason::BudgetExhausted.as_str()
+                    ],
                 )
                 .map_err(|e| format!("reject review (escalate): {e}"))?;
             if n == 1 {
@@ -1614,14 +1643,41 @@ impl TaskStore {
 
     /// Fail-safe escalation: park a task for human attention without killing or
     /// looping it. Used when the judge itself errors (goal mode).
+    ///
+    /// H11: leaves `pause_reason` unclassified ([`PauseReason::Unknown`] at
+    /// read time). Production escalation paths call
+    /// [`Self::mark_needs_human_with_pause`] instead — this string-only form
+    /// is kept for callers (and tests) that genuinely have no class to
+    /// declare, and its fallback is the *safe* direction (「需要人工確認」).
     pub async fn mark_needs_human(&self, id: &str, reason: &str) -> Result<bool, String> {
+        self.mark_needs_human_with_pause(id, reason, crate::pause_reason::PauseReason::Unknown)
+            .await
+    }
+
+    /// H11: [`Self::mark_needs_human`] carrying the structured pause class.
+    ///
+    /// The class is supplied by the caller because only the call site knows
+    /// the trigger statically — three of the `reason` strings this stores are
+    /// built from LLM output or a transport error, so classifying them by
+    /// substring afterwards would be a routing decision made on model-authored
+    /// prose (coding convention 2). [`PauseReason::Unknown`] is written as a
+    /// real token rather than `NULL` so "explicitly unclassified" and "row
+    /// predates the column" are the same at read time and neither can be
+    /// mistaken for a confident class.
+    pub async fn mark_needs_human_with_pause(
+        &self,
+        id: &str,
+        reason: &str,
+        pause: crate::pause_reason::PauseReason,
+    ) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
         let n = conn
             .execute(
-                "UPDATE tasks SET status = 'needs_human', judge_feedback = ?2, updated_at = ?3
+                "UPDATE tasks SET status = 'needs_human', judge_feedback = ?2, pause_reason = ?4,
+                        updated_at = ?3
                   WHERE id = ?1",
-                params![id, reason, now],
+                params![id, reason, now, pause.as_str()],
             )
             .map_err(|e| format!("mark needs_human: {e}"))?;
         Ok(n > 0)
@@ -1647,13 +1703,16 @@ impl TaskStore {
         let note_opt: Option<&str> = if note.trim().is_empty() { None } else { Some(note) };
         let conn = self.conn.lock().await;
         let now = Utc::now().to_rfc3339();
+        // H11: the pause is over on every branch — clear the class so a task
+        // sent back around the loop (or closed out) never renders a stale
+        // 「卡住沒進展」chip from the pause a human just resolved.
         let n = match decision {
             "retry" => conn
                 .execute(
                     "UPDATE tasks
                         SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
                             lease_expires_at = NULL, result_summary = NULL,
-                            judge_feedback = ?2, updated_at = ?3
+                            judge_feedback = ?2, pause_reason = NULL, updated_at = ?3
                       WHERE id = ?1 AND status = 'needs_human'",
                     params![id, note_opt, now],
                 )
@@ -1662,7 +1721,7 @@ impl TaskStore {
                 .execute(
                     "UPDATE tasks
                         SET status = 'done', completed_at = ?3, judge_feedback = ?2,
-                            updated_at = ?3
+                            pause_reason = NULL, updated_at = ?3
                       WHERE id = ?1 AND status = 'needs_human'",
                     params![id, note_opt, now],
                 )
@@ -1670,7 +1729,8 @@ impl TaskStore {
             "abort" => conn
                 .execute(
                     "UPDATE tasks
-                        SET status = 'cancelled', judge_feedback = ?2, updated_at = ?3
+                        SET status = 'cancelled', judge_feedback = ?2, pause_reason = NULL,
+                            updated_at = ?3
                       WHERE id = ?1 AND status = 'needs_human'",
                     params![id, note_opt, now],
                 )
@@ -2252,6 +2312,31 @@ impl TaskStore {
         Ok(rows)
     }
 
+    /// H22: RFC3339 timestamp of the most recent Activity Feed event for a
+    /// task, or `None` when the task has none.
+    ///
+    /// This is the goal loop's **progress signal** for the timeout notice.
+    /// The obvious alternative, `tasks.updated_at`, is unusable: the dispatch
+    /// engine's lease renewer calls [`Self::renew_lease`], which bumps
+    /// `updated_at` on a timer for every `in_progress` task — so a silent
+    /// agent's row looks freshly updated forever. The activity feed only
+    /// moves when something actually happened (the driver dispatched a round,
+    /// the engine judged one, or the agent itself posted via the
+    /// `activity_post` MCP tool), which is exactly the definition of
+    /// "reported progress".
+    ///
+    /// Served by `idx_activity_ts` (`timestamp DESC`); one row, one task.
+    pub async fn latest_activity_at(&self, task_id: &str) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT timestamp FROM activity WHERE task_id = ?1 ORDER BY timestamp DESC LIMIT 1",
+            params![task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("latest activity: {e}"))
+    }
+
     // ── Task comments (L2) ──────────────────────────────────
 
     /// Append a comment. Caller is responsible for verifying the task exists and
@@ -2749,6 +2834,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         deadline_at: row.get(33)?,
         risk_boundary: row.get(34)?,
         acceptance_criteria_baseline: row.get(35)?,
+        pause_reason: row.get(36)?,
     })
 }
 
@@ -3199,8 +3285,8 @@ pub fn introduces_parent_cycle(
 mod tests {
     use super::{
         deps_satisfied, introduces_dependency_cycle, introduces_parent_cycle, lease_is_expired,
-        parse_depends_on, zombie_action, zombie_reclaim_due, CommentRow, GoalRow, TaskRow,
-        TaskStore, ZombieAction,
+        parse_depends_on, zombie_action, zombie_reclaim_due, ActivityRow, CommentRow, GoalRow,
+        TaskRow, TaskStore, ZombieAction,
     };
     use std::collections::HashSet;
 
@@ -4502,6 +4588,170 @@ mod tests {
         assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "needs_human");
         let iters = store.list_iterations("g1").await.unwrap();
         assert_eq!(iters[0].verdict.as_deref(), Some("escalated"));
+    }
+
+    // ── H11: pause-reason classification ────────────────────────────────
+
+    /// `mark_needs_human_with_pause` stamps the class alongside the free-text
+    /// reason, and the string-only wrapper degrades to the SAFE class rather
+    /// than guessing one from the text.
+    #[tokio::test]
+    async fn mark_needs_human_stamps_the_pause_class() {
+        use crate::pause_reason::PauseReason;
+        let (store, _dir) = temp_store();
+        store.insert_task(&goal_review_task("g1")).await.unwrap();
+        store.insert_task(&goal_review_task("g2")).await.unwrap();
+
+        store
+            .mark_needs_human_with_pause("g1", "judge unavailable: connect timeout", PauseReason::Infra)
+            .await
+            .unwrap();
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "needs_human");
+        assert_eq!(got.pause_reason.as_deref(), Some("infra"));
+        assert_eq!(
+            PauseReason::from_stored(got.pause_reason.as_deref()),
+            PauseReason::Infra
+        );
+
+        // The un-classified wrapper must NOT sniff the reason text — it writes
+        // `unknown`, which reads as 「需要人工確認」.
+        store
+            .mark_needs_human("g2", "goal-loop iteration cap")
+            .await
+            .unwrap();
+        let got2 = store.get_task("g2").await.unwrap().unwrap();
+        assert_eq!(
+            PauseReason::from_stored(got2.pause_reason.as_deref()),
+            PauseReason::Unknown
+        );
+    }
+
+    /// A judge rejection at the spent retry budget is a hard cap firing, so
+    /// the escalate branch classifies it `budget_exhausted` — while the
+    /// `revising` branch (budget left) writes no class at all.
+    #[tokio::test]
+    async fn reject_review_classifies_only_the_escalating_branch() {
+        use crate::pause_reason::PauseReason;
+        let (store, _dir) = temp_store();
+
+        let mut spent = goal_review_task("g1");
+        spent.max_retries = 1;
+        spent.retry_count = 1;
+        store.insert_task(&spent).await.unwrap();
+        assert_eq!(store.reject_review("g1", "give up", 3).await.unwrap(), "needs_human");
+        assert_eq!(
+            PauseReason::from_stored(
+                store.get_task("g1").await.unwrap().unwrap().pause_reason.as_deref()
+            ),
+            PauseReason::BudgetExhausted
+        );
+
+        // Budget remaining ⇒ back around the loop, no pause at all.
+        store.insert_task(&goal_review_task("g2")).await.unwrap();
+        assert_eq!(store.reject_review("g2", "try again", 3).await.unwrap(), "revising");
+        assert!(store.get_task("g2").await.unwrap().unwrap().pause_reason.is_none());
+    }
+
+    /// Every `resolve_needs_human` branch ends the pause, so the class is
+    /// cleared — a retried task must never re-render the chip of the pause a
+    /// human just resolved.
+    #[tokio::test]
+    async fn resolving_a_pause_clears_the_class() {
+        use crate::pause_reason::PauseReason;
+        for (decision, expect_status) in
+            [("retry", "pending"), ("done", "done"), ("abort", "cancelled")]
+        {
+            let (store, _dir) = temp_store();
+            store.insert_task(&goal_review_task("g1")).await.unwrap();
+            store
+                .mark_needs_human_with_pause("g1", "stuck", PauseReason::NoProgress)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_task("g1").await.unwrap().unwrap().pause_reason.as_deref(),
+                Some("no_progress")
+            );
+
+            assert!(store.resolve_needs_human("g1", decision, "").await.unwrap());
+            let got = store.get_task("g1").await.unwrap().unwrap();
+            assert_eq!(got.status, expect_status);
+            assert!(
+                got.pause_reason.is_none(),
+                "{decision}: the pause is over — the class must be cleared"
+            );
+        }
+    }
+
+    /// Legacy rows (written before the column existed) and rows that were
+    /// never escalated both read back as `Unknown` — the safe direction.
+    #[tokio::test]
+    async fn pause_reason_round_trips_and_legacy_rows_are_unknown() {
+        use crate::pause_reason::PauseReason;
+        let (store, _dir) = temp_store();
+
+        let mut t = pending_task("p1");
+        t.pause_reason = Some("restart".into());
+        store.insert_task(&t).await.unwrap();
+        assert_eq!(
+            store.get_task("p1").await.unwrap().unwrap().pause_reason.as_deref(),
+            Some("restart")
+        );
+
+        let plain = pending_task("p2");
+        store.insert_task(&plain).await.unwrap();
+        let got = store.get_task("p2").await.unwrap().unwrap();
+        assert!(got.pause_reason.is_none());
+        assert_eq!(
+            PauseReason::from_stored(got.pause_reason.as_deref()),
+            PauseReason::Unknown
+        );
+    }
+
+    /// The `pause_reason` ALTER is idempotent across reopens (the shared
+    /// migration-loop contract), and rows written before it existed survive.
+    #[tokio::test]
+    async fn pause_reason_migration_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let store = TaskStore::open(dir.path()).unwrap();
+            store.insert_task(&pending_task("old")).await.unwrap();
+        }
+        for _ in 0..2 {
+            let store = TaskStore::open(dir.path()).unwrap();
+            let got = store.get_task("old").await.unwrap().unwrap();
+            assert!(got.pause_reason.is_none());
+        }
+    }
+
+    // ── H22: latest activity timestamp (the progress signal) ────────────
+
+    #[tokio::test]
+    async fn latest_activity_at_returns_the_newest_row_or_none() {
+        let (store, _dir) = temp_store();
+        assert!(store.latest_activity_at("t1").await.unwrap().is_none());
+
+        for ts in ["2026-08-15T10:00:00Z", "2026-08-15T10:30:00Z", "2026-08-15T10:05:00Z"] {
+            store
+                .append_activity(&ActivityRow {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    event_type: "goal_loop.dispatched".into(),
+                    agent_id: "alice".into(),
+                    task_id: Some("t1".into()),
+                    summary: "x".into(),
+                    timestamp: ts.into(),
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.latest_activity_at("t1").await.unwrap().as_deref(),
+            Some("2026-08-15T10:30:00Z"),
+            "newest wins regardless of insertion order"
+        );
+        // Scoped per task — another task's events are not this task's signal.
+        assert!(store.latest_activity_at("t2").await.unwrap().is_none());
     }
 
     // ── W1-5: claim_needs_human (take over) ─────────────────────────────
