@@ -21,7 +21,7 @@ import {
   type SettingsSaveStatus,
   type SettingsRowTier,
 } from '@/components/mds';
-import { RowText, RowSwitch, FieldBlock } from '@/pages/agent-form/form-rows';
+import { RowText, RowSecret, RowSwitch, FieldBlock } from '@/pages/agent-form/form-rows';
 import { Cpu, Save, RefreshCw, Loader2, AlertTriangle } from 'lucide-react';
 
 /** Read a flat backend sub-section value as a string for the input field. */
@@ -346,11 +346,9 @@ export function InferencePage() {
             <SettingsCard>
               <RowText label={t('inference.oc.baseUrl')} value={oc.base_url ?? ''} onChange={(v) => setOc((p) => ({ ...p, base_url: v }))} placeholder="http://localhost:8080/v1" />
               <RowText label={t('inference.oc.model')} value={oc.model ?? ''} onChange={(v) => setOc((p) => ({ ...p, model: v }))} />
-              <RowText
+              <RowSecret
                 label={t('inference.oc.apiKey')}
                 description={ocApiKeySet ? t('inference.oc.apiKey.set') : t('inference.oc.apiKey.hint')}
-                type="password"
-                autoComplete="off"
                 value={ocApiKey}
                 onChange={setOcApiKey}
                 placeholder={ocApiKeySet ? '••••••••' : ''}

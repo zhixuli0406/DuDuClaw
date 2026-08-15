@@ -16,6 +16,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/mds';
+import { SecretSourceField } from '@/components/shared/SecretSourceField';
 import { AlertTriangle } from 'lucide-react';
 
 /** Channel type picker options — value ⇒ human label (spec §4 Select). */
@@ -356,22 +357,16 @@ export function AddChannelDialog({
           </div>
 
           <DialogField label={guide.tokenLabel}>
-            <Input
-              type="password"
+            <SecretSourceField
               value={token}
-              onChange={(e) => setToken(e.target.value)}
+              onChange={setToken}
               placeholder={intl.formatMessage({ id: 'channels.dialog.pastePlaceholder' }, { tokenLabel: guide.tokenLabel.toLowerCase() })}
             />
           </DialogField>
 
           {guide.secretLabel && (
             <DialogField label={guide.secretLabel}>
-              <Input
-                type="password"
-                value={secret}
-                onChange={(e) => setSecret(e.target.value)}
-                placeholder={guide.secretLabel}
-              />
+              <SecretSourceField value={secret} onChange={setSecret} placeholder={guide.secretLabel} />
             </DialogField>
           )}
 
@@ -379,10 +374,10 @@ export function AddChannelDialog({
           {channelType === 'whatsapp' && (
             <>
               <DialogField label="Verify Token" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
-                <Input type="password" value={waVerifyToken} onChange={(e) => setWaVerifyToken(e.target.value)} autoComplete="off" />
+                <SecretSourceField value={waVerifyToken} onChange={setWaVerifyToken} />
               </DialogField>
               <DialogField label="App Secret" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
-                <Input type="password" value={waAppSecret} onChange={(e) => setWaAppSecret(e.target.value)} autoComplete="off" />
+                <SecretSourceField value={waAppSecret} onChange={setWaAppSecret} />
               </DialogField>
             </>
           )}
@@ -390,7 +385,7 @@ export function AddChannelDialog({
           {/* G.6 — extra Feishu token (global) */}
           {channelType === 'feishu' && (
             <DialogField label="Verification Token" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
-              <Input type="password" value={feishuVerifyToken} onChange={(e) => setFeishuVerifyToken(e.target.value)} autoComplete="off" />
+              <SecretSourceField value={feishuVerifyToken} onChange={setFeishuVerifyToken} />
             </DialogField>
           )}
 
@@ -407,10 +402,10 @@ export function AddChannelDialog({
                 <Input type="text" value={wecomAgentId} onChange={(e) => setWecomAgentId(e.target.value)} autoComplete="off" />
               </DialogField>
               <DialogField label="Callback Token" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
-                <Input type="password" value={wecomCallbackToken} onChange={(e) => setWecomCallbackToken(e.target.value)} autoComplete="off" />
+                <SecretSourceField value={wecomCallbackToken} onChange={setWecomCallbackToken} />
               </DialogField>
               <DialogField label="EncodingAESKey" help={intl.formatMessage({ id: 'channels.field.writeOnly' })}>
-                <Input type="password" value={wecomAesKey} onChange={(e) => setWecomAesKey(e.target.value)} autoComplete="off" />
+                <SecretSourceField value={wecomAesKey} onChange={setWecomAesKey} />
               </DialogField>
             </>
           )}

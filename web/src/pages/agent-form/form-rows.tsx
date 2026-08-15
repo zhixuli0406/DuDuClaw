@@ -11,6 +11,7 @@ import {
   SettingsRow,
   type SettingsRowTier,
 } from '@/components/mds';
+import { SecretSourceField } from '@/components/shared/SecretSourceField';
 import type { SelectOption } from '@/components/settings/controls';
 
 /**
@@ -50,6 +51,31 @@ export function RowText({
         autoComplete={autoComplete}
         onChange={(e) => onChange(e.target.value)}
       />
+    </SettingsRow>
+  );
+}
+
+/** Credential field — same slot as `RowText`, but the control is a
+ *  `SecretSourceField` (WP-5C) so a `secret://` reference is discoverable
+ *  instead of requiring the operator to already know the URI grammar. */
+export function RowSecret({
+  label,
+  description,
+  value,
+  onChange,
+  placeholder,
+  tier = 'text',
+}: {
+  label: ReactNode;
+  description?: ReactNode;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  tier?: SettingsRowTier;
+}) {
+  return (
+    <SettingsRow label={label} description={description} tier={tier}>
+      <SecretSourceField value={value} onChange={onChange} placeholder={placeholder} />
     </SettingsRow>
   );
 }
