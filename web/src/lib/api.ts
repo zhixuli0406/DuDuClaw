@@ -2283,6 +2283,63 @@ export interface ExpertCatalogEntry {
 /** One showcase card from `gallery.list` — a single team task example,
  *  fanned out from the same `team.toml` data `experts.catalog` reads (no
  *  new storage, nothing user-submitted in this wave). */
+/** Agent Mail (P2-d) — one arrived message, as `mail.list` returns it. */
+export interface MailMessage {
+  mail_id: string;
+  agent_id: string;
+  from: string;
+  subject: string;
+  /** List view only: first ~160 chars. `mail.read` returns the full `body`. */
+  snippet: string;
+  received_at: string;
+  /** Which transport delivered it (`gmail` / `dropfolder`). */
+  source: string;
+  read: boolean;
+  archived: boolean;
+  /** An AI staff member was woken for this mail (到達即觸發). */
+  handled: boolean;
+  /** The prompt-injection scanner flagged the content. Shown, never hidden. */
+  flagged: boolean;
+  risk_score: number;
+}
+
+/** Full message body, as `mail.read` returns it (and marks the mail read). */
+export interface MailMessageFull extends Omit<MailMessage, 'snippet'> {
+  body: string;
+}
+
+/** An outgoing draft awaiting (or past) human confirmation. */
+export interface MailDraft {
+  mail_id: string;
+  agent_id: string;
+  to: string;
+  subject: string;
+  body: string;
+  created_at: string;
+  /** `pending` is the only state in which nothing has left the building. */
+  status: 'pending' | 'sent' | 'rejected' | 'failed';
+  approval_id: string;
+  in_reply_to?: string | null;
+  /** Why it was rejected, or the transport error behind a `failed`. */
+  note?: string | null;
+  settled_at?: string | null;
+}
+
+/** Mailbox feature state — enough for the page to explain itself, never any
+ *  credential (only whether sending is possible at all). */
+export interface MailStatus {
+  enabled: boolean;
+  auto_trigger: boolean;
+  gmail_enabled: boolean;
+  dropfolder_enabled: boolean;
+  poll_interval_secs: number;
+  default_agent: string;
+  smtp_configured: boolean;
+  sender_allowlist_count: number;
+  recipient_allowlist_count: number;
+  inbound_dir: string;
+}
+
 export interface GalleryCard {
   /** Deterministic (`<team-slug>-<example-index>`) — stable React key. */
   id: string;
@@ -4109,6 +4166,28 @@ export const api = {
         unlocked: boolean;
         present_but_locked: boolean;
         cards: GalleryCard[];
+      }>,
+  },
+  /** Agent Mail (P2-d) — the AI staff member's non-real-time mailbox.
+   *  Manager-gated, same tier as the approval centre. `decide` does not send:
+   *  it records the human decision, and the gateway's mail worker performs
+   *  (or refuses) the transmission on its next pass. */
+  mail: {
+    status: () => client.call('mail.status') as Promise<MailStatus>,
+    list: (params: { agent_id?: string; include_archived?: boolean; limit?: number } = {}) =>
+      client.call('mail.list', params) as Promise<{ count: number; messages: MailMessage[] }>,
+    /** Reads one message in full — and marks it read as a side effect. */
+    read: (mail_id: string) => client.call('mail.read', { mail_id }) as Promise<MailMessageFull>,
+    archive: (mail_id: string) => client.call('mail.archive', { mail_id }) as Promise<{ ok: boolean }>,
+    outbox: (params: { agent_id?: string; status?: MailDraft['status']; limit?: number } = {}) =>
+      client.call('mail.outbox', params) as Promise<{ count: number; drafts: MailDraft[] }>,
+    /** Confirm (`approve: true`) or refuse an outgoing draft. */
+    decide: (mail_id: string, approve: boolean) =>
+      client.call('mail.decide', { mail_id, approve }) as Promise<{
+        ok: boolean;
+        mail_id: string;
+        approved: boolean;
+        state: 'approved_queued' | 'rejected';
       }>,
   },
   channels: {

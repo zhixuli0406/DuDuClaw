@@ -80,6 +80,14 @@ pub enum Scope {
     /// per-agent `[capabilities] recording = true` flag (defence-in-depth,
     /// deny-by-default).
     Recording,
+    /// Agent Mail (P2-d): gates `mail_list` / `mail_read`. Split from
+    /// [`Scope::MailSend`] so an operator can let an agent *see* the mailbox
+    /// without granting it the ability to queue outbound correspondence.
+    MailRead,
+    /// Agent Mail (P2-d): gates `mail_send`. Named as a send scope even though
+    /// the tool cannot transmit — what it grants is the ability to put a draft
+    /// in front of a human, which is the step worth authorising separately.
+    MailSend,
     Admin,
 }
 
@@ -105,6 +113,8 @@ impl std::fmt::Display for Scope {
             Scope::OsNative => "os:native",
             Scope::SkillExecute => "skill:execute",
             Scope::Recording => "recording",
+            Scope::MailRead => "mail:read",
+            Scope::MailSend => "mail:send",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -649,6 +659,12 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
             "skill:execute" => {
                 result.insert(Scope::SkillExecute);
             }
+            "mail:read" => {
+                result.insert(Scope::MailRead);
+            }
+            "mail:send" => {
+                result.insert(Scope::MailSend);
+            }
             "recording" => {
                 result.insert(Scope::Recording);
             }
@@ -766,6 +782,14 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // ── Messaging / media egress ─────────────────────────────────────
         "send_message" | "send_photo" | "send_sticker" | "synthesize_speech"
         | "transcribe_audio" => Some(Scope::MessagingSend),
+        // ── Agent Mail (P2-d) ────────────────────────────────────────────
+        // Read and draft-send are separate grants. `mail_send` cannot
+        // transmit (a human decision in `mail_worker::settle_outbox` does),
+        // but queuing correspondence in front of a person is still an egress
+        // -shaped act, so it gets its own scope rather than riding on
+        // `MailRead`.
+        "mail_list" | "mail_read" => Some(Scope::MailRead),
+        "mail_send" => Some(Scope::MailSend),
         // RFC-21 §1: identity resolution requires its own scope so operators
         // can grant wiki access without exposing the person registry.
         "identity_resolve" => Some(Scope::IdentityRead),

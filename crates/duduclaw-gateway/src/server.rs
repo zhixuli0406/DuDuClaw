@@ -899,6 +899,15 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     );
     info!("Night Engine scheduler started (idle-time N1–N4, disabled per-agent by default)");
 
+    // ── Agent Mail (P2-d) ──
+    // Inbound polling + the outbound confirmation settler. Always spawned, but
+    // every pass is a no-op until `config.toml [mail] enabled = true`, so an
+    // install that never configures a mailbox is byte-identical to before.
+    // The config is re-read each tick, so switching it on needs no restart.
+    let _mail_worker =
+        crate::mail_worker::start_mail_worker(home_dir.clone(), handler.registry().clone());
+    info!("Agent Mail worker started (no-op until [mail] enabled = true)");
+
     // ── Playbook stale/capacity sweep (WP1.2 G5) ──
     // Gateway-owned periodic loop, NOT hooked into
     // `duduclaw_agent::HeartbeatScheduler::run`'s tick body as the design doc
