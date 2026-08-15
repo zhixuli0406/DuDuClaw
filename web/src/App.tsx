@@ -31,6 +31,7 @@ const AgentDetailPage = lazyPage(() => import('./pages/AgentDetailPage'), 'Agent
 const SkillMarketPage = lazyPage(() => import('./pages/SkillMarketPage'), 'SkillMarketPage');
 const ExpertsPage = lazyPage(() => import('./pages/ExpertsPage'), 'ExpertsPage');
 const GalleryPage = lazyPage(() => import('./pages/GalleryPage'), 'GalleryPage');
+const MailPage = lazyPage(() => import('./pages/MailPage'), 'MailPage');
 const WidgetsPage = lazyPage(() => import('./pages/WidgetsPage'), 'WidgetsPage');
 const WidgetComposerPage = lazyPage(() => import('./pages/WidgetComposerPage'), 'WidgetComposerPage');
 const IntegrationsPage = lazyPage(() => import('./pages/IntegrationsPage'), 'IntegrationsPage');
@@ -238,6 +239,9 @@ export function App() {
                 <Route path="timeline" element={<TimelinePage />} />
                 <Route path="reports" element={<ReportPage />} />
                 <Route path="org" element={<OrgChartPage />} />
+                {/* 信箱 (Agent Mail, P2-d) — every `mail.*` RPC is
+                    `require_manager!`-gated server-side; this mirrors that. */}
+                <Route path="mail" element={<MailPage />} />
               </Route>
 
               {/* P4-3 — OS-native fleet report + settings. All five os.* RPCs

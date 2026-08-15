@@ -860,6 +860,30 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "admin",
         "prediction",
     ),
+    // ── Agent Mail (P2-d) ────────────────────────────────────────────────
+    // Read and draft-send are separate grants, matching
+    // `tool_requires_scope`: an operator can let an AI employee see the
+    // mailbox without letting it queue outbound correspondence. `mail_send`
+    // cannot transmit — a human confirmation does — but it is the tool that
+    // puts a message in front of a person, so it is gated on its own.
+    (
+        "mail_list",
+        "List mail that arrived in the agent's mailbox",
+        "mail:read",
+        "channel",
+    ),
+    (
+        "mail_read",
+        "Read one message in full and mark it read",
+        "mail:read",
+        "channel",
+    ),
+    (
+        "mail_send",
+        "Draft an outgoing email for human confirmation (never sends)",
+        "mail:send",
+        "channel",
+    ),
     (
         "activity_list",
         "List recent Activity Feed events",

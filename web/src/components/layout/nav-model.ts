@@ -40,6 +40,7 @@ import {
   PawPrint,
   Package,
   Images,
+  Mail,
   LogIn,
   Download,
   Crosshair,
@@ -290,6 +291,12 @@ export const navGroups: NavGroup[] = [
       { to: '/canvas', icon: Presentation, label: 'nav.canvas', desc: 'nav.canvas.desc', ownScope: true },
       // WP1.4 file panel — attachments an AI staff member received/produced.
       { to: '/files', icon: FolderOpen, label: 'nav.files', desc: 'nav.files.desc', ownScope: true },
+      // 信箱 (Agent Mail, P2-d, 2026-08-15) — the non-real-time channel: mail
+      // arrives here, and every outgoing reply waits for a human 確認. Sits
+      // next to 檔案 because both are "material an AI employee received or
+      // produced". Manager-gated to match `mail.*`, which is on the same tier
+      // as the approval centre (real correspondence + a real-world send).
+      { to: '/mail', icon: Mail, label: 'nav.mail', desc: 'nav.mail.desc', minRole: 'manager', newIn: '1.60.0' },
       // — oversight rows: read weekly, not daily (WP-NAV frequency order).
       // G11 Work Timeline — company-level Gantt of every AI staff member's runs.
       { to: '/timeline', icon: ChartGantt, label: 'nav.timeline', desc: 'nav.timeline.desc', minRole: 'manager' },
@@ -464,6 +471,12 @@ export const personalAdvancedGroup: NavGroup = {
     '/runs',
     '/canvas',
     '/files',
+    // 信箱 (Agent Mail, P2-d) — same slot as the Enterprise 工作 group (right
+    // after 檔案). It follows the `/timeline` + `/reports` precedent rather
+    // than the primary rail: manager-gated surfaces live in 進階 on Personal,
+    // and the 2026-08-04 client-annotated primary order (例行工作 → 技能庫 →
+    // 記憶 → AI 員工 → 世界) is fixed and must not be reshuffled.
+    '/mail',
     '/timeline',
     '/reports',
     '/forks',

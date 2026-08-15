@@ -99,3 +99,48 @@ describe('nav-model — P2-b /gallery addition', () => {
     expect(fromPersonal).toBe(fromEnterprise);
   });
 });
+
+// P2-d Agent Mail (2026-08-15): `/mail` is a genuinely new page, so it must
+// carry `newIn` and must be registered in BOTH nav lists — the Personal
+// edition's arrays are maintained independently, and a missed addition there
+// means Personal users never see the mailbox at all.
+describe('nav-model — P2-d /mail addition', () => {
+  it('is added to the Enterprise 工作 group (navGroups[0]) only', () => {
+    expect(navGroups[0].items.some((i) => i.to === '/mail')).toBe(true);
+    expect(navGroups[1].items.some((i) => i.to === '/mail')).toBe(false);
+    expect(navGroups[2].items.some((i) => i.to === '/mail')).toBe(false);
+  });
+
+  it('is added to the Personal 進階 group (independent pickItems array)', () => {
+    // 進階 rather than the primary rail: it is manager-gated (same as
+    // /timeline + /reports), and the 2026-08-04 client-annotated primary
+    // order is fixed.
+    expect(personalAdvancedGroup.items.some((i) => i.to === '/mail')).toBe(true);
+    expect(personalPrimaryItems.some((i) => i.to === '/mail')).toBe(false);
+  });
+
+  it('a viewer on either edition sees /mail exactly once', () => {
+    for (const isPersonal of [true, false]) {
+      const primary = primaryItemsForEdition(isPersonal);
+      const groups = navGroupsForEdition(isPersonal);
+      const occurrences =
+        primary.filter((i) => i.to === '/mail').length +
+        groups.flatMap((g) => g.items).filter((i) => i.to === '/mail').length;
+      expect(occurrences).toBe(1);
+    }
+  });
+
+  it('is tagged newIn 1.60.0 and manager-gated to match the mail.* RPCs', () => {
+    const item = navGroups[0].items.find((i) => i.to === '/mail');
+    expect(item?.newIn).toBe('1.60.0');
+    expect(item?.minRole).toBe('manager');
+    // Both editions share the SAME NavItem object (pickItems looks it up).
+    expect(personalAdvancedGroup.items.find((i) => i.to === '/mail')).toBe(item);
+  });
+
+  it('has i18n label/desc ids following the `${label}.desc` convention', () => {
+    const item = navGroups[0].items.find((i) => i.to === '/mail');
+    expect(item?.label).toBe('nav.mail');
+    expect(item?.desc).toBe('nav.mail.desc');
+  });
+});
