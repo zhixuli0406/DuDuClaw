@@ -1736,6 +1736,16 @@ impl GoalLoopDriver {
     /// by the call site (the trigger is known statically there; `reason` is
     /// free text that in some paths embeds a task id or LLM prose and must
     /// never be re-parsed for a routing decision).
+    ///
+    /// WP-4F: a `BudgetExhausted` escalation (iteration cap / wall clock /
+    /// per-task deadline — the only pause classes this driver's own caps
+    /// ever raise) attaches the closest-to-done round's excerpt + gap list
+    /// instead of leaving the human with a bare "we ran out of budget"
+    /// reason (see `goal_budget_best_round.rs`). Every other pause class
+    /// (`NoProgress`, `BlockedNeedsDecision`) passes `reason` through
+    /// byte-identical to before this feature existed. Best-effort: a failed
+    /// iteration-history read degrades to the bare `reason`, never blocks
+    /// the escalation itself.
     async fn escalate(
         &self,
         inflight: &mut HashMap<String, InFlight>,
@@ -1743,8 +1753,32 @@ impl GoalLoopDriver {
         reason: &str,
         pause: crate::pause_reason::PauseReason,
     ) -> Result<(), String> {
+        let effective_reason = if pause == crate::pause_reason::PauseReason::BudgetExhausted {
+            match self.store.list_iterations(&task.id).await {
+                Ok(iterations) => {
+                    match crate::goal_budget_best_round::pick_best_round(&iterations) {
+                        Some(pick) => {
+                            crate::goal_budget_best_round::compose_escalation_note(reason, &pick)
+                        }
+                        // 0 rounds ever judged (e.g. a wall-clock deadline
+                        // hit before the first dispatch) — keep the bare
+                        // pre-WP-4F reason, never fabricate a pick.
+                        None => reason.to_string(),
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        task = %task.id, error = %e,
+                        "goal loop: iteration history read failed for WP-4F best-round pick (non-fatal, using bare reason)"
+                    );
+                    reason.to_string()
+                }
+            }
+        } else {
+            reason.to_string()
+        };
         self.store
-            .mark_needs_human_with_pause(&task.id, reason, pause)
+            .mark_needs_human_with_pause(&task.id, &effective_reason, pause)
             .await?;
         // WP3 (PORTICO): escalation ends the autonomous phase (iteration cap /
         // oscillation) → revoke the task's grants. Mirrors the DispatchEngine

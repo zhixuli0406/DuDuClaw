@@ -326,6 +326,12 @@ pub struct TaskIterationRow {
     pub state_hash: Option<String>,
     /// Same-(state, action) repeat streak observed at dispatch time.
     pub repeat_streak: Option<i64>,
+    /// WP-4F: a bounded, CJK-safe-truncated snapshot of this round's own
+    /// worker output, taken at verdict time (before `result_summary` is
+    /// wiped on rejection). `None` for accepted rounds (never needed — an
+    /// accepted task never re-enters `needs_human`) and for rows sealed
+    /// before this column existed.
+    pub worker_excerpt: Option<String>,
 }
 
 /// Per-agent slice of [`FlowMetrics`] (Iterative Kanban analytics, P2).
@@ -691,6 +697,14 @@ impl TaskStore {
             ("dispatch_count", "dispatch_count INTEGER NOT NULL DEFAULT 1"),
             ("state_hash", "state_hash TEXT"),
             ("repeat_streak", "repeat_streak INTEGER"),
+            // WP-4F: a bounded, CJK-safe-truncated snapshot of the round's
+            // own worker output (`tasks.result_summary` at verdict time),
+            // taken because `reject_review_with_verdict` wipes
+            // `result_summary` back to NULL on every "revising" rejection —
+            // without this snapshot no round's actual output survives past
+            // its own rejection, so a later budget-exhausted escalation has
+            // nothing to attach (see `goal_budget_best_round.rs`).
+            ("worker_excerpt", "worker_excerpt TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -1586,8 +1600,11 @@ impl TaskStore {
             )
             .map_err(|e| format!("accept review: {e}"))?;
         if n == 1 {
-            // Iterative Kanban: seal the current round's verdict.
-            iter_verdict_conn(&conn, id, "accepted", feedback, verdict_json, &now)?;
+            // Iterative Kanban: seal the current round's verdict. No
+            // `worker_excerpt` snapshot needed on the accept path — an
+            // accepted task never re-enters `needs_human`, so this round can
+            // never be a WP-4F best-round candidate.
+            iter_verdict_conn(&conn, id, "accepted", feedback, verdict_json, None, &now)?;
         }
         Ok(n == 1)
     }
@@ -1625,6 +1642,24 @@ impl TaskStore {
             None => return Err(format!("task not found: {id}")),
         };
         let now = Utc::now().to_rfc3339();
+        // WP-4F: snapshot THIS round's own worker output before it is wiped
+        // (the "revising" branch below nulls `result_summary`) — the only
+        // point in the whole rejection flow where the round's real output is
+        // still readable. Bounded + CJK-safe so a multi-KB agent reply never
+        // balloons the iteration history row. `None` when the round produced
+        // no result text at all.
+        let worker_excerpt: Option<String> = row
+            .result_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                duduclaw_core::truncate_bytes(
+                    s,
+                    crate::goal_budget_best_round::WORKER_EXCERPT_MAX_BYTES,
+                )
+                .to_string()
+            });
         let conn = self.conn.lock().await;
         if row.retry_count < row.max_retries {
             let new_retry = row.retry_count + 1;
@@ -1642,7 +1677,15 @@ impl TaskStore {
                 )
                 .map_err(|e| format!("reject review (revising): {e}"))?;
             if n == 1 {
-                iter_verdict_conn(&conn, id, "rejected", feedback, verdict_json, &now)?;
+                iter_verdict_conn(
+                    &conn,
+                    id,
+                    "rejected",
+                    feedback,
+                    verdict_json,
+                    worker_excerpt.as_deref(),
+                    &now,
+                )?;
             }
             Ok("revising".to_string())
         } else {
@@ -1664,7 +1707,38 @@ impl TaskStore {
                 )
                 .map_err(|e| format!("reject review (escalate): {e}"))?;
             if n == 1 {
-                iter_verdict_conn(&conn, id, "escalated", feedback, verdict_json, &now)?;
+                iter_verdict_conn(
+                    &conn,
+                    id,
+                    "escalated",
+                    feedback,
+                    verdict_json,
+                    worker_excerpt.as_deref(),
+                    &now,
+                )?;
+
+                // WP-4F: this is the OTHER budget-exhausted escalation site
+                // (the judge retry budget, `max_retries` — distinct from
+                // `goal_loop::GoalLoopDriver::escalate`'s iteration-cap /
+                // wall-clock checks, but the same `PauseReason::
+                // BudgetExhausted` family per `pause_reason.rs`'s own doc
+                // comment: "iteration cap, judge retry budget, the global
+                // wall clock, or a per-goal deadline_at"). Attach the
+                // closest-to-done round instead of leaving `judge_feedback`
+                // as the bare last-round rejection text. Best-effort: any
+                // failure below leaves `judge_feedback` exactly as already
+                // written above, never blocks the escalation itself.
+                if let Ok(iterations) = list_iterations_conn(&conn, id) {
+                    if let Some(pick) = crate::goal_budget_best_round::pick_best_round(&iterations)
+                    {
+                        let enriched =
+                            crate::goal_budget_best_round::compose_escalation_note(feedback, &pick);
+                        let _ = conn.execute(
+                            "UPDATE tasks SET judge_feedback = ?2 WHERE id = ?1",
+                            params![id, enriched],
+                        );
+                    }
+                }
             }
             Ok("needs_human".to_string())
         }
@@ -1985,20 +2059,7 @@ impl TaskStore {
     /// All iteration rows for a task, oldest round first (the revision timeline).
     pub async fn list_iterations(&self, task_id: &str) -> Result<Vec<TaskIterationRow>, String> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, task_id, round, dispatched_at, submitted_at, judged_at,
-                        verdict, judge_feedback, feedback_class, verdict_json,
-                        dispatch_count, state_hash, repeat_streak
-                   FROM task_iterations WHERE task_id = ?1 ORDER BY round ASC, id ASC",
-            )
-            .map_err(|e| format!("prepare iterations: {e}"))?;
-        let rows = stmt
-            .query_map(params![task_id], row_to_iteration)
-            .map_err(|e| format!("query iterations: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("collect iterations: {e}"))?;
-        Ok(rows)
+        list_iterations_conn(&conn, task_id)
     }
 
     /// Per-agent + board-level flow metrics for the Iterative Kanban analytics
@@ -2901,7 +2962,29 @@ fn row_to_iteration(row: &rusqlite::Row) -> rusqlite::Result<TaskIterationRow> {
         dispatch_count: row.get(10)?,
         state_hash: row.get(11)?,
         repeat_streak: row.get(12)?,
+        worker_excerpt: row.get(13)?,
     })
+}
+
+/// Sync twin of [`TaskStore::list_iterations`] — usable inside a caller that
+/// already holds `self.conn`'s lock (e.g. `reject_review_with_verdict`'s
+/// WP-4F best-round pick, which must not re-lock the same `Mutex` and
+/// deadlock).
+fn list_iterations_conn(conn: &Connection, task_id: &str) -> Result<Vec<TaskIterationRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, task_id, round, dispatched_at, submitted_at, judged_at,
+                    verdict, judge_feedback, feedback_class, verdict_json,
+                    dispatch_count, state_hash, repeat_streak, worker_excerpt
+               FROM task_iterations WHERE task_id = ?1 ORDER BY round ASC, id ASC",
+        )
+        .map_err(|e| format!("prepare iterations: {e}"))?;
+    let rows = stmt
+        .query_map(params![task_id], row_to_iteration)
+        .map_err(|e| format!("query iterations: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("collect iterations: {e}"))?;
+    Ok(rows)
 }
 
 // ── Iterative Kanban: iteration sync helpers (usable in a tx) ──
@@ -3006,12 +3089,17 @@ fn iter_submit_conn(
 
 /// Seal the judge verdict on the latest un-judged round (max round with a NULL
 /// `judged_at`). No open round ⇒ no-op (best-effort telemetry).
+/// `worker_excerpt` (WP-4F): a bounded, CJK-safe-truncated snapshot of this
+/// round's own worker output — `None` for the accept path (never needed,
+/// see `TaskIterationRow::worker_excerpt`'s doc) and for callers with no
+/// result text to snapshot.
 fn iter_verdict_conn(
     conn: &Connection,
     task_id: &str,
     verdict: &str,
     feedback: &str,
     verdict_json: Option<&str>,
+    worker_excerpt: Option<&str>,
     now: &str,
 ) -> Result<(), String> {
     let row_id: Option<i64> = conn
@@ -3028,9 +3116,9 @@ fn iter_verdict_conn(
         conn.execute(
             "UPDATE task_iterations
                 SET judged_at = ?2, verdict = ?3, judge_feedback = ?4,
-                    verdict_json = ?5
+                    verdict_json = ?5, worker_excerpt = ?6
               WHERE id = ?1",
-            params![id, now, verdict, feedback, verdict_json],
+            params![id, now, verdict, feedback, verdict_json, worker_excerpt],
         )
         .map_err(|e| format!("iter verdict update: {e}"))?;
     }
@@ -4636,6 +4724,59 @@ mod tests {
         assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "needs_human");
         let iters = store.list_iterations("g1").await.unwrap();
         assert_eq!(iters[0].verdict.as_deref(), Some("escalated"));
+    }
+
+    /// WP-4F ③: the round's own `result_summary` is snapshotted into
+    /// `task_iterations.worker_excerpt` via `duduclaw_core::truncate_bytes`
+    /// (never a raw byte slice, which panics on a multi-byte CJK boundary),
+    /// AND the task-level `judge_feedback` is enriched with the composed
+    /// best-round note when the retry budget is exhausted on a CJK-heavy
+    /// result. Exercises the real `reject_review` → `iter_verdict_conn` →
+    /// `goal_budget_best_round` path end-to-end (not just the pure-function
+    /// unit tests in `goal_budget_best_round.rs`).
+    #[tokio::test]
+    async fn reject_review_escalate_truncates_cjk_excerpt_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.max_retries = 1;
+        t.retry_count = 1; // budget already spent ⇒ this rejection escalates
+        // Deliberately over the WORKER_EXCERPT_MAX_BYTES (500) budget with a
+        // 3-byte-per-char CJK string so a naive `&s[..500]` byte slice would
+        // panic (500 does not land on a char boundary for an all-3-byte
+        // string — see the constant's own test in goal_budget_best_round.rs).
+        t.result_summary = Some("驗".repeat(400)); // 1200 bytes, all 3-byte chars
+        store.insert_task(&t).await.unwrap();
+        store.record_iteration_dispatch("g1", 1, "2026-08-15T10:00:00Z").await.unwrap();
+
+        // Must not panic.
+        let status = store.reject_review("g1", "見 goal_loop.rs:120 缺邊界檢查", 3).await.unwrap();
+        assert_eq!(status, "needs_human");
+
+        let iters = store.list_iterations("g1").await.unwrap();
+        assert_eq!(iters.len(), 1);
+        let excerpt = iters[0]
+            .worker_excerpt
+            .as_deref()
+            .expect("a non-empty result_summary must be snapshotted");
+        assert!(
+            excerpt.len() <= crate::goal_budget_best_round::WORKER_EXCERPT_MAX_BYTES,
+            "excerpt must respect the byte budget: {} bytes",
+            excerpt.len()
+        );
+        assert!(!excerpt.is_empty());
+        assert!(excerpt.chars().all(|c| c == '驗'), "truncation must land on a char boundary");
+
+        // The task-level judge_feedback was enriched with the best-round
+        // note (this round is the only candidate, so priority 1 picks it via
+        // its own verdict_json... actually this round has no verdict_json,
+        // so priority 2/3 applies — either way `pick_best_round` finds this
+        // sole round and the note is composed).
+        let task = store.get_task("g1").await.unwrap().unwrap();
+        let fb = task.judge_feedback.expect("judge_feedback must be set");
+        assert!(fb.contains("已附上第 1 輪最接近完成的成果"));
+        assert!(fb.contains(excerpt));
+        assert!(fb.contains("goal_loop.rs:120"), "extracted gap token must be listed");
     }
 
     // ── H11: pause-reason classification ────────────────────────────────
