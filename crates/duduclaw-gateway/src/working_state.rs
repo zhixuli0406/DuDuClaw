@@ -49,6 +49,13 @@ const KEY_MAX_LEN: usize = 64;
 const VALUE_CHAR_CAP: usize = 400;
 const REASON_CHAR_CAP: usize = 200;
 const HANDOFF_CHAR_CAP: usize = 1200;
+/// H8 (Ralph loop, `research/harness-2026-08/deepseek-harness.md` §2.8):
+/// default byte budget for the STRUCTURED handoff payload (note +
+/// next_steps + evidence + blocker combined, raw bytes). Config-overridable
+/// via `config.toml [memory] working_state_handoff_max_bytes`. Only enforced
+/// once the caller opts into the structured contract (any of
+/// status/next_steps/evidence/blocker present) — see `set_handoff`.
+const DEFAULT_HANDOFF_MAX_BYTES: usize = 16384;
 /// Injected-section byte budget (lines only, header excluded) — same
 /// discipline as `recent_actions::SECTION_LINES_MAX_BYTES`.
 const SECTION_LINES_MAX_BYTES: usize = 3072;
@@ -68,12 +75,67 @@ pub struct StateEntry {
     pub expires_at: Option<String>,
 }
 
+/// H8: Ralph-style structured handoff status
+/// (`RalphRoundReport.status` in deepseek-harness §2.8). Optional — a
+/// handoff with `status: None` is the legacy free-text note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HandoffStatus {
+    /// Work is in progress; `next_steps` must be non-empty, `blocker` must
+    /// be empty.
+    Continue,
+    /// Work is done; `evidence` must be non-empty, `blocker` and
+    /// `next_steps` must both be empty.
+    Complete,
+    /// Work cannot proceed; `blocker` must be non-empty.
+    Blocked,
+}
+
+impl HandoffStatus {
+    /// Parse the MCP tool's `status` string argument. Unknown values are a
+    /// caller error, not a silent default — an unrecognized status must not
+    /// be misread as any of the three real ones.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "continue" => Ok(Self::Continue),
+            "complete" => Ok(Self::Complete),
+            "blocked" => Ok(Self::Blocked),
+            other => Err(format!(
+                "status 必須是 continue / complete / blocked 其中之一（收到：{}）",
+                truncate_chars(other, 40)
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Complete => "complete",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
 /// The handoff note — "what the next wake-up needs to know", overwrite-only.
+///
+/// H8 extension: optionally carries a Ralph-style constrained report
+/// (`status` + `next_steps` + `evidence` + `blocker`) alongside the
+/// free-text `note`. All four new fields are `Option` and
+/// `#[serde(default)]` so a pre-H8 `working_state.json` (which has no
+/// knowledge of them) still deserializes cleanly as a plain-note handoff.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandoffNote {
     pub note: String,
     pub updated_at: String,
     pub updated_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<HandoffStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_steps: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
 }
 
 /// The whole per-agent working state. `BTreeMap` keeps serialization
@@ -116,6 +178,102 @@ fn enabled_from_home(home_dir: &Path) -> bool {
         .and_then(|s| s.get("working_state_enabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
+}
+
+/// `config.toml [memory] working_state_handoff_max_bytes` — default
+/// `DEFAULT_HANDOFF_MAX_BYTES` (16384). Any parse failure, missing config,
+/// or non-positive value returns the default (mirrors `enabled_from_home`).
+fn handoff_max_bytes_from_home(home_dir: &Path) -> usize {
+    let path = home_dir.join("config.toml");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return DEFAULT_HANDOFF_MAX_BYTES;
+    };
+    let Ok(table) = raw.parse::<toml::Table>() else {
+        return DEFAULT_HANDOFF_MAX_BYTES;
+    };
+    table
+        .get("memory")
+        .and_then(|v| v.as_table())
+        .and_then(|s| s.get("working_state_handoff_max_bytes"))
+        .and_then(|v| v.as_integer())
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_HANDOFF_MAX_BYTES)
+}
+
+/// H8: reject-not-truncate on the RAW (pre-flatten) structured handoff
+/// payload. Rationale (deepseek-harness §2.8): a truncated evidence/
+/// next-step field silently deletes exactly the content the next wake-up
+/// needs, while the handoff still LOOKS authoritative — an explicit
+/// rejection is strictly safer than a quiet mutilation. `total_bytes` is a
+/// plain `str::len()` sum (UTF-8 byte count), so no byte-index slicing is
+/// ever performed here — nothing to CJK-guard against in the check itself.
+fn check_handoff_byte_budget(home_dir: &Path, total_bytes: usize) -> Result<(), String> {
+    let cap = handoff_max_bytes_from_home(home_dir);
+    if total_bytes > cap {
+        return Err(format!(
+            "交接內容過長（{total_bytes} bytes，上限 {cap} bytes，可用 config.toml \
+             [memory] working_state_handoff_max_bytes 調整）——拒絕寫入而非截斷：\
+             截斷可能刪掉狀態證據或下一步，卻仍看起來像權威交接，請縮短內容後重試"
+        ));
+    }
+    Ok(())
+}
+
+/// H8 semantic validation for the Ralph-style structured handoff fields.
+/// Only reached once `status` is `Some` — the legacy note-only call shape
+/// never runs this. Inputs are the already-flattened (single-line,
+/// whitespace-collapsed), non-empty-or-`None` field values.
+fn validate_handoff_status(
+    status: HandoffStatus,
+    next_steps: Option<&str>,
+    evidence: Option<&str>,
+    blocker: Option<&str>,
+) -> Result<(), String> {
+    let has_next = next_steps.is_some();
+    let has_evidence = evidence.is_some();
+    let has_blocker = blocker.is_some();
+    match status {
+        HandoffStatus::Continue => {
+            if !has_next {
+                return Err(
+                    "status=continue 需要非空的 next_steps（下一次喚醒該接著做什麼）".to_string(),
+                );
+            }
+            if has_blocker {
+                return Err(
+                    "status=continue 不應帶 blocker——如果真的卡住了請改用 status=blocked"
+                        .to_string(),
+                );
+            }
+        }
+        HandoffStatus::Complete => {
+            if !has_evidence {
+                return Err(
+                    "status=complete 需要非空的 evidence（完成的具體證據，而非自稱完成）"
+                        .to_string(),
+                );
+            }
+            if has_blocker {
+                return Err("status=complete 不應帶 blocker——已完成代表沒有卡住".to_string());
+            }
+            if has_next {
+                return Err(
+                    "status=complete 不應帶 next_steps——若還有下一步代表尚未完成，請改用 status=continue"
+                        .to_string(),
+                );
+            }
+        }
+        HandoffStatus::Blocked => {
+            if !has_blocker {
+                return Err(
+                    "status=blocked 需要非空的 blocker（具體卡在哪裡，而不是空泛的『卡住了』）"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the agent's on-disk `state/` directory. Registry agents live at
@@ -368,21 +526,84 @@ pub fn clear_entry(
 }
 
 /// Overwrite the handoff note ("what the next wake-up needs to know").
-pub fn set_handoff(home_dir: &Path, agent_id: &str, note: &str) -> Result<MutateOutcome, String> {
+///
+/// Two call shapes, dispatched by whether any of `status`/`next_steps`/
+/// `evidence`/`blocker` is `Some`:
+///
+/// - **Legacy (all four `None`)**: plain free-text `note` only. Byte-for-
+///   byte the pre-H8 behavior — silent whitespace-collapse + char-cap
+///   truncation at `HANDOFF_CHAR_CAP`, no status/oversize checks at all.
+/// - **Structured (H8, Ralph-style)**: `status` becomes mandatory (an error
+///   if the caller supplied `next_steps`/`evidence`/`blocker` without it —
+///   those fields are meaningless without a status to interpret them
+///   against). The combined raw payload is checked against
+///   `working_state_handoff_max_bytes` and REJECTED wholesale if over
+///   budget — never truncated (see `check_handoff_byte_budget`) — then
+///   `status` is validated against `next_steps`/`evidence`/`blocker`
+///   per `validate_handoff_status`.
+#[allow(clippy::too_many_arguments)]
+pub fn set_handoff(
+    home_dir: &Path,
+    agent_id: &str,
+    note: &str,
+    status: Option<HandoffStatus>,
+    next_steps: Option<&str>,
+    evidence: Option<&str>,
+    blocker: Option<&str>,
+) -> Result<MutateOutcome, String> {
     let state_dir =
         resolve_state_dir(home_dir, agent_id).ok_or_else(|| format!("unknown agent: {agent_id}"))?;
-    let (note, truncated) = normalize_field(note, HANDOFF_CHAR_CAP);
-    if note.is_empty() {
-        return Err("note 不可為空".to_string());
-    }
+
+    let structured = status.is_some() || next_steps.is_some() || evidence.is_some() || blocker.is_some();
+
+    let (note_out, status_out, next_steps_out, evidence_out, blocker_out, truncated) = if !structured {
+        let (note, truncated) = normalize_field(note, HANDOFF_CHAR_CAP);
+        if note.is_empty() {
+            return Err("note 不可為空".to_string());
+        }
+        (note, None, None, None, None, truncated)
+    } else {
+        let status = status.ok_or_else(|| {
+            "提供 next_steps / evidence / blocker 時必須同時指定 status \
+             （continue/complete/blocked），否則無法判斷這些欄位的語意角色"
+                .to_string()
+        })?;
+        // Reject-not-truncate on the RAW, pre-flatten input — see
+        // `check_handoff_byte_budget` doc comment for why.
+        let raw_total = note.len()
+            + next_steps.unwrap_or("").len()
+            + evidence.unwrap_or("").len()
+            + blocker.unwrap_or("").len();
+        check_handoff_byte_budget(home_dir, raw_total)?;
+
+        let note_flat = one_line(note);
+        if note_flat.is_empty() {
+            return Err("note 不可為空".to_string());
+        }
+        let next_steps_flat = next_steps.map(one_line).filter(|s| !s.is_empty());
+        let evidence_flat = evidence.map(one_line).filter(|s| !s.is_empty());
+        let blocker_flat = blocker.map(one_line).filter(|s| !s.is_empty());
+        validate_handoff_status(
+            status,
+            next_steps_flat.as_deref(),
+            evidence_flat.as_deref(),
+            blocker_flat.as_deref(),
+        )?;
+        (note_flat, Some(status), next_steps_flat, evidence_flat, blocker_flat, false)
+    };
+
     with_file_lock(&state_file(&state_dir), || {
         let mut state = load(&state_dir);
         let now = now_rfc3339();
         let prev = state.handoff.take().map(|h| h.note);
         state.handoff = Some(HandoffNote {
-            note: note.clone(),
+            note: note_out.clone(),
             updated_at: now.clone(),
             updated_by: agent_id.to_string(),
+            status: status_out,
+            next_steps: next_steps_out.clone(),
+            evidence: evidence_out.clone(),
+            blocker: blocker_out.clone(),
         });
         state.version += 1;
         persist(&state_dir, &state)?;
@@ -392,8 +613,12 @@ pub fn set_handoff(home_dir: &Path, agent_id: &str, note: &str) -> Result<Mutate
                 "ts": now,
                 "op": "handoff",
                 "agent": agent_id,
-                "value": note,
+                "value": note_out,
                 "prev_value": prev,
+                "status": status_out.map(HandoffStatus::as_str),
+                "next_steps": next_steps_out,
+                "evidence": evidence_out,
+                "blocker": blocker_out,
                 "version": state.version,
             }),
         );
@@ -512,7 +737,28 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
         ));
     }
     let handoff_line = handoff.map(|h| {
-        format!("交接註記（{} 留）：{}", display_time(&h.updated_at), one_line(&h.note))
+        let base = format!("交接註記（{} 留）：{}", display_time(&h.updated_at), one_line(&h.note));
+        // H8: when the handoff carries a structured Ralph-style report,
+        // surface status/next_steps/evidence/blocker too — otherwise they'd
+        // be persisted but invisible to the very next wake-up they exist
+        // for. Stored fields are already flattened/validated, so no
+        // re-flattening needed here.
+        match h.status {
+            None => base,
+            Some(status) => {
+                let mut extra = format!("狀態={}", status.as_str());
+                if let Some(n) = &h.next_steps {
+                    extra.push_str(&format!("；下一步：{n}"));
+                }
+                if let Some(e) = &h.evidence {
+                    extra.push_str(&format!("；證據：{e}"));
+                }
+                if let Some(b) = &h.blocker {
+                    extra.push_str(&format!("；卡點：{b}"));
+                }
+                format!("{base}（{extra}）")
+            }
+        }
     });
 
     let budget = SECTION_LINES_MAX_BYTES
@@ -721,12 +967,222 @@ mod tests {
     #[test]
     fn handoff_overwrites_and_renders() {
         let home = mk_home("trader");
-        set_handoff(home.path(), "trader", "帳務已核對\n盤中巡檢中").unwrap();
-        let out = set_handoff(home.path(), "trader", "收盤，明日看 257").unwrap();
+        set_handoff(home.path(), "trader", "帳務已核對\n盤中巡檢中", None, None, None, None).unwrap();
+        let out =
+            set_handoff(home.path(), "trader", "收盤，明日看 257", None, None, None, None).unwrap();
         assert_eq!(out.superseded.as_deref(), Some("帳務已核對 盤中巡檢中"));
         let section = build_working_state_section(home.path(), "trader").unwrap();
         assert!(section.contains("交接註記"));
         assert!(section.contains("收盤，明日看 257"));
+    }
+
+    // ── handoff: H8 structured Ralph-style report ──────────────
+
+    #[test]
+    fn handoff_legacy_plain_note_unaffected_by_h8() {
+        // Backward compatibility: no status/next_steps/evidence/blocker at
+        // all ⇒ byte-for-byte the pre-H8 path, including silent char-cap
+        // truncation for an over-length note (no new rejection kicks in).
+        let home = mk_home("trader");
+        let long = "鴻海走勢分析".repeat(300); // well over HANDOFF_CHAR_CAP chars
+        let out = set_handoff(home.path(), "trader", &long, None, None, None, None).unwrap();
+        assert!(out.truncated);
+        let full = read_full(home.path(), "trader", 1).unwrap();
+        let stored = full["handoff"]["note"].as_str().unwrap();
+        assert!(stored.chars().count() <= HANDOFF_CHAR_CAP);
+        assert!(full["handoff"]["status"].is_null());
+    }
+
+    #[test]
+    fn handoff_continue_requires_next_steps_and_forbids_blocker() {
+        let home = mk_home("trader");
+        // Missing next_steps.
+        let err = set_handoff(
+            home.path(),
+            "trader",
+            "追蹤 2317 停損",
+            Some(HandoffStatus::Continue),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("next_steps"));
+
+        // next_steps present but blocker also present ⇒ rejected.
+        let err2 = set_handoff(
+            home.path(),
+            "trader",
+            "追蹤 2317 停損",
+            Some(HandoffStatus::Continue),
+            Some("明早確認持股比例"),
+            None,
+            Some("等待人工核准"),
+        )
+        .unwrap_err();
+        assert!(err2.contains("blocked"), "error should point at status=blocked instead: {err2}");
+
+        // Valid continue: passes and renders.
+        let out = set_handoff(
+            home.path(),
+            "trader",
+            "追蹤 2317 停損",
+            Some(HandoffStatus::Continue),
+            Some("明早確認持股比例"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!out.truncated);
+        let section = build_working_state_section(home.path(), "trader").unwrap();
+        assert!(section.contains("狀態=continue"));
+        assert!(section.contains("下一步：明早確認持股比例"));
+    }
+
+    #[test]
+    fn handoff_complete_requires_evidence_forbids_blocker_and_next_steps() {
+        let home = mk_home("trader");
+        // Missing evidence.
+        let err = set_handoff(
+            home.path(),
+            "trader",
+            "已完成停損調整",
+            Some(HandoffStatus::Complete),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("evidence"));
+
+        // Evidence present but next_steps also present ⇒ rejected (not
+        // actually complete if there's a next step).
+        let err2 = set_handoff(
+            home.path(),
+            "trader",
+            "已完成停損調整",
+            Some(HandoffStatus::Complete),
+            Some("再檢查一次"),
+            Some("working_state_get 顯示 stop_loss.2317=257"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err2.contains("continue"), "error should point at status=continue instead: {err2}");
+
+        // Valid complete: passes and renders.
+        let out = set_handoff(
+            home.path(),
+            "trader",
+            "已完成停損調整",
+            Some(HandoffStatus::Complete),
+            None,
+            Some("working_state_get 顯示 stop_loss.2317=257"),
+            None,
+        )
+        .unwrap();
+        assert!(!out.truncated);
+        let section = build_working_state_section(home.path(), "trader").unwrap();
+        assert!(section.contains("狀態=complete"));
+        assert!(section.contains("證據：working_state_get 顯示 stop_loss.2317=257"));
+    }
+
+    #[test]
+    fn handoff_blocked_requires_blocker() {
+        let home = mk_home("trader");
+        let err = set_handoff(
+            home.path(),
+            "trader",
+            "無法送出下單",
+            Some(HandoffStatus::Blocked),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("blocker"));
+
+        let out = set_handoff(
+            home.path(),
+            "trader",
+            "無法送出下單",
+            Some(HandoffStatus::Blocked),
+            None,
+            None,
+            Some("券商 API 回傳 403，疑似 token 過期"),
+        )
+        .unwrap();
+        assert!(!out.truncated);
+        let section = build_working_state_section(home.path(), "trader").unwrap();
+        assert!(section.contains("狀態=blocked"));
+        assert!(section.contains("卡點：券商 API 回傳 403，疑似 token 過期"));
+    }
+
+    #[test]
+    fn handoff_structured_fields_without_status_are_rejected() {
+        let home = mk_home("trader");
+        let err = set_handoff(
+            home.path(),
+            "trader",
+            "備註",
+            None,
+            Some("有下一步但沒給 status"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("status"));
+    }
+
+    #[test]
+    fn handoff_oversize_structured_payload_is_rejected_not_truncated() {
+        let home = mk_home("trader");
+        // Only the structured path enforces the byte budget; build a
+        // next_steps field alone big enough to blow the 16384-byte default.
+        let huge = "x".repeat(DEFAULT_HANDOFF_MAX_BYTES + 1);
+        let err = set_handoff(
+            home.path(),
+            "trader",
+            "備註",
+            Some(HandoffStatus::Continue),
+            Some(&huge),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("過長"));
+        assert!(err.contains("bytes"));
+        // Nothing was written — no handoff at all yet.
+        assert!(build_working_state_section(home.path(), "trader").is_none());
+    }
+
+    #[test]
+    fn handoff_oversize_check_uses_config_override() {
+        let home = mk_home("trader");
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[memory]\nworking_state_handoff_max_bytes = 20\n",
+        )
+        .unwrap();
+        let err = set_handoff(
+            home.path(),
+            "trader",
+            "備註",
+            Some(HandoffStatus::Continue),
+            Some("這個下一步字串肯定超過二十個位元組"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("上限 20 bytes"));
+    }
+
+    #[test]
+    fn handoff_status_parse_rejects_unknown_values() {
+        assert!(HandoffStatus::parse("continue").is_ok());
+        assert!(HandoffStatus::parse("complete").is_ok());
+        assert!(HandoffStatus::parse("blocked").is_ok());
+        let err = HandoffStatus::parse("done").unwrap_err();
+        assert!(err.contains("continue"));
     }
 
     // ── section builder ────────────────────────────────────────
