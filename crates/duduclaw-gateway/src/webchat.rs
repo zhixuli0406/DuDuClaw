@@ -831,13 +831,20 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     }
                                 };
 
-                                // WP1.3: 📎DELIVER: handling. WebChat has no
-                                // in-band binary frame (the browser client
-                                // surfaces generated files via the dashboard
-                                // Files panel), so strip the marker and degrade
-                                // to a text note naming each sandbox-validated
-                                // file — never leak the raw marker, never echo
-                                // an out-of-sandbox path.
+                                // WP1.3 + live-verification fix (2026-08-15):
+                                // 📎DELIVER: handling. WebChat has no in-band
+                                // binary frame, so the archival copy IS the
+                                // delivery — earlier code only validated the
+                                // path and appended a "downloadable from the
+                                // Files panel" note without archiving anything
+                                // (a false promise) and without running the
+                                // WP-4H delivery gate. Now each declared file
+                                // goes through the same channel-agnostic
+                                // stage_deliverable() as every other channel:
+                                // validate → delivery gate → archive + ledger.
+                                // Gate rejections surface as actionable text;
+                                // the download note is only made when a copy
+                                // really landed in attachments/.
                                 let reply = {
                                     let (cleaned, paths) =
                                         crate::office_docs::parse_deliverables(&reply);
@@ -849,32 +856,53 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             .home_dir
                                             .join("agents")
                                             .join(effective_agent_id);
-                                        let names: Vec<String> = paths
-                                            .iter()
-                                            .filter_map(|p| {
-                                                crate::office_docs::validate_deliver_path(
-                                                    p, &agent_dir, &state.ctx.home_dir,
-                                                )
-                                                .ok()
-                                                .and_then(|cp| {
-                                                    cp.file_name()
+                                        let mut delivered: Vec<String> = Vec::new();
+                                        let mut failed: Vec<String> = Vec::new();
+                                        for p in &paths {
+                                            match crate::office_docs::stage_deliverable(
+                                                p,
+                                                &agent_dir,
+                                                &state.ctx.home_dir,
+                                                crate::artifacts::ArtifactOrigin::Declared,
+                                                Some("webchat"),
+                                            )
+                                            .await
+                                            {
+                                                Ok(staged) if staged.archived => {
+                                                    delivered.push(staged.filename)
+                                                }
+                                                Ok(staged) => failed.push(format!(
+                                                    "{}：封存副本寫入失敗，檔案仍在工作目錄",
+                                                    staged.filename
+                                                )),
+                                                Err(e) => {
+                                                    // The gate/validator message is
+                                                    // already zh-TW actionable; the
+                                                    // raw path never echoes here.
+                                                    let name = std::path::Path::new(p)
+                                                        .file_name()
                                                         .and_then(|n| n.to_str())
-                                                        .map(|s| s.to_string())
-                                                })
-                                            })
-                                            .collect();
-                                        if names.is_empty() {
-                                            cleaned
-                                        } else {
-                                            let note = format!(
-                                                "📎 已生成檔案：{}（可至 Dashboard 檔案面板下載）",
-                                                names.join("、")
-                                            );
-                                            if cleaned.is_empty() {
-                                                note
-                                            } else {
-                                                format!("{cleaned}\n\n{note}")
+                                                        .unwrap_or("檔案");
+                                                    failed.push(format!("{name}：{e}"));
+                                                }
                                             }
+                                        }
+                                        let mut notes: Vec<String> = Vec::new();
+                                        if !delivered.is_empty() {
+                                            notes.push(format!(
+                                                "📎 已生成檔案：{}（可至 Dashboard 檔案面板下載）",
+                                                delivered.join("、")
+                                            ));
+                                        }
+                                        for f in &failed {
+                                            notes.push(format!("⚠️ 交付被攔下——{f}"));
+                                        }
+                                        if notes.is_empty() {
+                                            cleaned
+                                        } else if cleaned.is_empty() {
+                                            notes.join("\n")
+                                        } else {
+                                            format!("{cleaned}\n\n{}", notes.join("\n"))
                                         }
                                     }
                                 };

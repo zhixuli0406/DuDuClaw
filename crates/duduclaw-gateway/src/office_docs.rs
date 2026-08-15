@@ -201,13 +201,30 @@ pub async fn process_deliverables(
 /// `📎DELIVER:` declaration, or the undeclared sweep recovering it. It is
 /// recorded alongside the archived copy so the dashboard can tell a hand-over
 /// from a file a human sent in, instead of showing one flat directory.
-async fn deliver_one(
+/// The channel-agnostic first half of a `📎DELIVER:` hand-over: validate the
+/// path, enforce the WP-4H delivery gate, and archive a copy into the agent's
+/// `attachments/` (provenance ledger included) so the file is genuinely
+/// downloadable from the dashboard Files page. Transports with an in-band
+/// binary frame then push `data`; transports without one (WebChat) rely on
+/// the archival side effect alone — which is exactly why `archived` is
+/// reported instead of swallowed: a caller about to promise "可至檔案面板
+/// 下載" must not make that claim when the copy failed.
+pub struct StagedDeliverable {
+    pub data: Vec<u8>,
+    pub filename: String,
+    pub mime: &'static str,
+    /// True when a downloadable copy exists under `attachments/` (either the
+    /// archive copy succeeded, or the file already lived there).
+    pub archived: bool,
+}
+
+pub async fn stage_deliverable(
     raw: &str,
     agent_dir: &Path,
     home_dir: &Path,
-    sender: &dyn ChannelSender,
     origin: crate::artifacts::ArtifactOrigin,
-) -> Result<(), String> {
+    channel: Option<&str>,
+) -> Result<StagedDeliverable, String> {
     let path = validate_deliver_path(raw, agent_dir, home_dir)?;
 
     let meta = tokio::fs::metadata(&path)
@@ -226,7 +243,7 @@ async fn deliver_one(
 
     // WP-4H: zero-LLM delivery gate. Hard failures (empty / magic mismatch /
     // corrupt zip container) reject the whole delivery here — before
-    // anything is archived or sent — and propagate through this function's
+    // anything is archived or sent — and propagate through the caller's
     // existing `Err` degrade-to-text-note path. Soft signals (placeholder
     // residue) are logged and let `data` through unchanged.
     let office_gate_cfg = crate::artifact_gate::OfficeGateConfig::from_home(home_dir);
@@ -236,45 +253,66 @@ async fn deliver_one(
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("document");
+        .unwrap_or("document")
+        .to_string();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let mime = media::mime_from_extension(ext);
 
     // Archive a copy under the agent's attachments/ BEFORE sending, so the
     // deliverable stays browsable/downloadable in the dashboard Files page
-    // even after channel delivery (and even when the send below fails).
+    // even after channel delivery (and even when the send fails).
     // Files already inside attachments/ are listed as-is — no duplicate copy.
     // `path` is canonicalized by validate_deliver_path, so the guard base must
     // be canonicalized too (macOS: /var vs /private/var).
     let attach_base = std::fs::canonicalize(agent_dir.join("attachments"))
         .unwrap_or_else(|_| agent_dir.join("attachments"));
-    if !path.starts_with(&attach_base) {
+    let archived = if path.starts_with(&attach_base) {
+        // A file already living in `attachments/` keeps whatever provenance it
+        // was first recorded with (an inbound upload the agent is handing back
+        // is still the human's file) — re-labelling it here would rewrite
+        // history.
+        true
+    } else {
         // I-2b: archive WITHOUT the inbound-upload provenance the shared
         // helper stamps, then record this hand-over's real origin (declared /
         // swept) plus the channel it went out on and where it was produced.
-        match media::save_attachment_in_base_untracked(agent_dir, &data, filename).await {
-            Ok(saved) => crate::artifacts::record_saved(
-                agent_dir,
-                &saved,
-                filename,
-                data.len() as u64,
-                &crate::artifacts::SaveContext::delivered(
-                    origin,
-                    Some(sender.channel_type()),
-                    &path,
-                ),
-            ),
+        match media::save_attachment_in_base_untracked(agent_dir, &data, &filename).await {
+            Ok(saved) => {
+                crate::artifacts::record_saved(
+                    agent_dir,
+                    &saved,
+                    &filename,
+                    data.len() as u64,
+                    &crate::artifacts::SaveContext::delivered(origin, channel, &path),
+                );
+                true
+            }
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "📎DELIVER: archive copy failed — delivery continues");
+                false
             }
         }
-    }
-    // A file already living in `attachments/` keeps whatever provenance it was
-    // first recorded with (an inbound upload the agent is handing back is still
-    // the human's file) — re-labelling it here would rewrite history.
+    };
 
+    Ok(StagedDeliverable {
+        data,
+        filename,
+        mime,
+        archived,
+    })
+}
+
+async fn deliver_one(
+    raw: &str,
+    agent_dir: &Path,
+    home_dir: &Path,
+    sender: &dyn ChannelSender,
+    origin: crate::artifacts::ArtifactOrigin,
+) -> Result<(), String> {
+    let staged =
+        stage_deliverable(raw, agent_dir, home_dir, origin, Some(sender.channel_type())).await?;
     sender
-        .send_document(&data, filename, mime)
+        .send_document(&staged.data, &staged.filename, staged.mime)
         .await
         .map_err(|e| e.to_string())
 }
