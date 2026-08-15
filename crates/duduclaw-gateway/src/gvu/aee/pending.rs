@@ -43,6 +43,20 @@ pub struct PendingSettlement {
     /// the same tolerance the commit gate did instead of re-reading a config
     /// that may have changed underneath it.
     pub band_cases: f64,
+    /// WP-4E: the held-out band in force at commit time, frozen for the same
+    /// reason. `None` on a row written before this column existed — the
+    /// accessor then falls back to the shared derivation instead of guessing.
+    pub band_holdout: Option<f64>,
+}
+
+impl PendingSettlement {
+    /// The tolerances the settlement fence must use.
+    pub fn case_bands(&self) -> crate::gvu::aee::settle::CaseBands {
+        match self.band_holdout {
+            Some(h) => crate::gvu::aee::settle::CaseBands { cases: self.band_cases, holdout: h },
+            None => crate::gvu::aee::settle::CaseBands::from_cases_only(self.band_cases),
+        }
+    }
 }
 
 /// CRUD over the `aee_pending_settlement` table.
@@ -75,7 +89,16 @@ impl PendingSettlementStore {
                  band_cases     REAL NOT NULL DEFAULT 0.05
              );",
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        // WP-4E: nullable on purpose — a row written before this column
+        // existed reads back as `None`, which the accessor turns into the
+        // documented derivation. `ALTER TABLE` on an existing column is an
+        // error, not a problem, so it is swallowed rather than surfaced.
+        let _ = conn.execute(
+            "ALTER TABLE aee_pending_settlement ADD COLUMN band_holdout REAL",
+            [],
+        );
+        Ok(())
     }
 
     /// Install (or replace) the agent's pending settlement.
@@ -85,14 +108,16 @@ impl PendingSettlementStore {
         let ids = serde_json::to_string(&p.entry_ids).map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO aee_pending_settlement
-                 (agent_id, applied_at, settle_after, before_json, entry_ids_json, band_cases)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 (agent_id, applied_at, settle_after, before_json, entry_ids_json, band_cases,
+                  band_holdout)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(agent_id) DO UPDATE SET
                  applied_at     = excluded.applied_at,
                  settle_after   = excluded.settle_after,
                  before_json    = excluded.before_json,
                  entry_ids_json = excluded.entry_ids_json,
-                 band_cases     = excluded.band_cases",
+                 band_cases     = excluded.band_cases,
+                 band_holdout   = excluded.band_holdout",
             params![
                 p.agent_id,
                 p.applied_at.to_rfc3339(),
@@ -100,6 +125,7 @@ impl PendingSettlementStore {
                 before,
                 ids,
                 p.band_cases,
+                p.band_holdout,
             ],
         )
         .map(|_| ())
@@ -111,7 +137,8 @@ impl PendingSettlementStore {
         let conn = self.conn().ok()?;
         let mut stmt = conn
             .prepare(
-                "SELECT agent_id, applied_at, settle_after, before_json, entry_ids_json, band_cases
+                "SELECT agent_id, applied_at, settle_after, before_json, entry_ids_json, band_cases,
+                        band_holdout
                  FROM aee_pending_settlement WHERE agent_id = ?1",
             )
             .ok()?;
@@ -126,7 +153,8 @@ impl PendingSettlementStore {
             return Vec::new();
         };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT agent_id, applied_at, settle_after, before_json, entry_ids_json, band_cases
+            "SELECT agent_id, applied_at, settle_after, before_json, entry_ids_json, band_cases,
+                    band_holdout
              FROM aee_pending_settlement WHERE settle_after <= ?1 ORDER BY settle_after ASC",
         ) else {
             return Vec::new();
@@ -158,6 +186,9 @@ fn row_to_pending(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<PendingSettl
     let before_json: String = r.get(3)?;
     let ids_json: String = r.get(4)?;
     let band_cases: f64 = r.get(5)?;
+    // Nullable, and a non-REAL value is treated as absent rather than as an
+    // error that would drop the whole settlement.
+    let band_holdout: Option<f64> = r.get(6).unwrap_or(None);
 
     let (Ok(before), Ok(entry_ids)) = (
         serde_json::from_str::<Vec<CaseScore>>(&before_json),
@@ -178,6 +209,7 @@ fn row_to_pending(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<PendingSettl
         before,
         entry_ids,
         band_cases,
+        band_holdout,
     }))
 }
 
@@ -197,6 +229,7 @@ mod tests {
             before: vec![cs("s/a", 1.0), cs("s/b", 0.0)],
             entry_ids: vec!["e1".into(), "e2".into()],
             band_cases: 0.05,
+            band_holdout: Some(0.025),
         }
     }
 
@@ -231,6 +264,54 @@ mod tests {
         let due = store.due(Utc::now());
         assert_eq!(due.len(), 1, "one row per agent");
         assert_eq!(due[0].entry_ids, vec!["e9".to_string()]);
+    }
+
+    /// WP-4E: the held-out band is frozen at commit time like `band_cases`,
+    /// and a row written before the column existed settles under the shared
+    /// derivation rather than under an invented number.
+    #[test]
+    fn holdout_band_round_trips_and_a_legacy_row_derives_it() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let store = PendingSettlementStore::new(f.path());
+        let past = Utc::now() - chrono::Duration::hours(1);
+
+        let mut p = sample("a3", past);
+        p.band_cases = 0.08;
+        p.band_holdout = Some(0.01);
+        store.put(&p).unwrap();
+        let got = store.get("a3").unwrap();
+        assert_eq!(got.band_holdout, Some(0.01));
+        assert_eq!(got.case_bands().holdout, 0.01, "an override is not re-derived");
+
+        // Simulate a pre-migration row: the column is NULL.
+        {
+            let conn = Connection::open(f.path()).unwrap();
+            conn.execute(
+                "UPDATE aee_pending_settlement SET band_holdout = NULL WHERE agent_id = 'a3'",
+                [],
+            )
+            .unwrap();
+        }
+        let legacy = store.get("a3").unwrap();
+        assert_eq!(legacy.band_holdout, None);
+        assert_eq!(legacy.case_bands().cases, 0.08);
+        assert_eq!(legacy.case_bands().holdout, 0.04, "derived, not defaulted to zero or to cases");
+    }
+
+    /// The `ALTER TABLE` migration must be idempotent — `new()` runs on every
+    /// gateway boot and on every store construction.
+    #[test]
+    fn reopening_the_store_does_not_break_on_the_added_column() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let past = Utc::now() - chrono::Duration::hours(1);
+        {
+            let s = PendingSettlementStore::new(f.path());
+            s.put(&sample("a4", past)).unwrap();
+        }
+        let s2 = PendingSettlementStore::new(f.path());
+        let s3 = PendingSettlementStore::new(f.path());
+        assert_eq!(s2.get("a4").unwrap().band_holdout, Some(0.025));
+        assert_eq!(s3.due(Utc::now()).len(), 1);
     }
 
     #[test]

@@ -617,6 +617,7 @@ where
         before: before_cases,
         entry_ids: entry_ids.clone(),
         band_cases: band.cases,
+        band_holdout: Some(band.holdout),
     }) {
         warn!(agent = %agent_id, "AEE: settlement enqueue failed: {e}");
     }
@@ -916,7 +917,7 @@ pub async fn settle_pending(
     let suite = super::settle::suite_verdict(
         &MeasureVector { cases: p.before.clone(), ..Default::default() },
         &MeasureVector { cases: after.clone(), ..Default::default() },
-        p.band_cases,
+        p.case_bands(),
     );
     let (deltas, report) = super::settle::finalise(&observations, &suite, agent_id);
 

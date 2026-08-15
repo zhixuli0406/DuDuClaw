@@ -62,8 +62,8 @@ pub use intent::{
 };
 pub use prompt::{assemble, is_holdout, reject_holdout_links, PromptContext};
 pub use settle::{
-    entry_verdict, finalise, observe_entries, settlement_deltas, suite_verdict, EntryVerdict,
-    SettleReport, SuiteVerdict,
+    entry_verdict, finalise, observe_entries, settlement_deltas, suite_verdict, CaseBands,
+    EntryVerdict, SettleReport, SuiteVerdict,
 };
 pub use snapshot::{PendingFailureNote, PlaybookSnapshot};
 
