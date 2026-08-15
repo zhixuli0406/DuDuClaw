@@ -118,6 +118,45 @@ fn lead_agent_name(agents: &[String], front_desk_name: Option<&str>) -> Option<S
     agents.first().cloned()
 }
 
+/// The distinct functional departments a team's roster lands in (zh-TW data
+/// strings) — a worker's explicit `department` wins, otherwise it is derived
+/// from its shared `kit`. Shared by `builtin_catalog` and `gallery_cards` so
+/// the two surfaces never drift on what "department" means for the same team.
+fn team_departments(m: &pt::TeamManifest) -> Vec<&str> {
+    m.workers
+        .iter()
+        .filter_map(|w| {
+            if w.department.trim().is_empty() {
+                duduclaw_core::org::department_for_kit(&w.kit)
+            } else {
+                Some(w.department.trim())
+            }
+        })
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .collect()
+}
+
+/// A team's 2-3 concrete task examples: author-written `team.toml` `examples`
+/// win; otherwise derived from real worker `summary` strings (front-desk
+/// summary is skipped — it is shown separately as the team `description`).
+/// Never LLM-fabricated. Shared by `builtin_catalog` (P2-a) and
+/// `gallery_cards` (P2-b) — one source of truth for "what does this team
+/// actually do".
+fn team_examples(m: &pt::TeamManifest) -> Vec<String> {
+    if !m.examples.is_empty() {
+        m.examples.clone()
+    } else {
+        m.workers
+            .iter()
+            .map(|w| w.summary.trim())
+            .filter(|s| !s.is_empty())
+            .take(3)
+            .map(str::to_string)
+            .collect()
+    }
+}
+
 /// Build the `experts.catalog` payload from a (possibly absent) premium tree
 /// and the current install records. Fail-safe: absent / unreadable premium
 /// dir ⇒ `deployed: false` with an empty list — never an error.
@@ -152,23 +191,7 @@ pub fn builtin_catalog(premium_dir: Option<&Path>, installed: &[InstallRecord]) 
                 .as_ref()
                 .map(|m| m.front_desk.summary.clone())
                 .unwrap_or_default();
-            let departments: Vec<&str> = manifest
-                .as_ref()
-                .map(|m| {
-                    m.workers
-                        .iter()
-                        .filter_map(|w| {
-                            if w.department.trim().is_empty() {
-                                duduclaw_core::org::department_for_kit(&w.kit)
-                            } else {
-                                Some(w.department.trim())
-                            }
-                        })
-                        .collect::<BTreeSet<&str>>()
-                        .into_iter()
-                        .collect()
-                })
-                .unwrap_or_default();
+            let departments: Vec<&str> = manifest.as_ref().map(team_departments).unwrap_or_default();
             let slug = builtin_pack_slug(&t.industry);
             let installed_agents = installed
                 .iter()
@@ -210,25 +233,7 @@ pub fn builtin_catalog(premium_dir: Option<&Path>, installed: &[InstallRecord]) 
                         .collect()
                 })
                 .unwrap_or_default();
-            // Author-written examples win; otherwise derive from real worker
-            // summaries (front-desk summary already shown as `description`,
-            // so it is not repeated here). Never invented from scratch.
-            let examples: Vec<String> = manifest
-                .as_ref()
-                .map(|m| {
-                    if !m.examples.is_empty() {
-                        m.examples.clone()
-                    } else {
-                        m.workers
-                            .iter()
-                            .map(|w| w.summary.trim())
-                            .filter(|s| !s.is_empty())
-                            .take(3)
-                            .map(str::to_string)
-                            .collect()
-                    }
-                })
-                .unwrap_or_default();
+            let examples: Vec<String> = manifest.as_ref().map(team_examples).unwrap_or_default();
             json!({
                 "kind": "team",
                 "industry": t.industry,
@@ -329,6 +334,67 @@ fn standalone_catalog_entries(premium_dir: &Path, installed: &[InstallRecord]) -
         }));
     }
     out
+}
+
+// ─────────────────────────── Gallery (P2-b 靈感畫廊) ───────────────────────────
+
+/// Build the `gallery.list` payload: one card per team task example, curated
+/// straight from the same `team.toml` data `builtin_catalog` already reads —
+/// no new storage, no LLM rewriting, nothing user-submitted (that is a later
+/// wave, gated on artifact objectification). Fail-safe: absent premium tree,
+/// or a tree with no team ever authoring/deriving a non-empty example list,
+/// both return `deployed: false` with an empty list — never an error.
+///
+/// Standalone `expert` packs are not included: `expert.toml` carries no
+/// `examples`-equivalent field, so there is nothing honest to show as a
+/// "sample outcome" for them (mirrors the "never fabricated" rule the P2-a
+/// catalog already follows).
+///
+/// Card `id` is deterministic (`<team-slug>-<example-index>`) so the
+/// dashboard can use it as a stable React key across reloads without a new
+/// id-allocation store.
+pub fn gallery_cards(premium_dir: Option<&Path>, installed: &[InstallRecord]) -> Value {
+    let installed_slugs: BTreeSet<&str> = installed.iter().map(|r| r.slug.as_str()).collect();
+    let Some(dir) = premium_dir else {
+        return json!({ "deployed": false, "cards": [] });
+    };
+    let teams = pt::list_team_industries(dir);
+    let mut cards: Vec<Value> = Vec::new();
+    for t in &teams {
+        let Ok(manifest) = pt::load_team_manifest(dir, &t.industry) else {
+            continue; // best-effort, mirrors builtin_catalog's tolerance
+        };
+        let examples = team_examples(&manifest);
+        if examples.is_empty() {
+            continue;
+        }
+        let slug = builtin_pack_slug(&t.industry);
+        let installed_now = installed_slugs.contains(slug.as_str());
+        let installed_agents = installed
+            .iter()
+            .find(|r| r.slug == slug)
+            .map(|r| r.agents.as_slice())
+            .unwrap_or(&[]);
+        let lead = lead_agent_name(installed_agents, Some(manifest.front_desk.name.as_str()));
+        let departments = team_departments(&manifest);
+        for (i, example) in examples.iter().enumerate() {
+            cards.push(json!({
+                "id": format!("{slug}-{i}"),
+                "industry": t.industry,
+                "category": duduclaw_core::org::industry_category(&t.industry),
+                "departments": departments,
+                "team_slug": slug,
+                "team_label": manifest.label,
+                "example": example,
+                "team_installed": installed_now,
+                "lead_agent_name": lead,
+            }));
+        }
+    }
+    if cards.is_empty() {
+        return json!({ "deployed": false, "cards": [] });
+    }
+    json!({ "deployed": true, "cards": cards })
 }
 
 // ─────────────────────────── Draft store ───────────────────────────
@@ -1714,6 +1780,124 @@ reason = "本店未設帳務職"
                 serde_json::json!("產出本月請款通知"),
             ]
         );
+    }
+
+    // ── gallery (P2-b) ──
+
+    #[test]
+    fn gallery_fail_safe_when_premium_absent() {
+        let v = gallery_cards(None, &[]);
+        assert_eq!(v["deployed"], false);
+        assert_eq!(v["cards"].as_array().map(|a| a.len()), Some(0));
+        // Existing-but-empty dir is also "not deployed".
+        let tmp = tempfile::tempdir().unwrap();
+        let v = gallery_cards(Some(tmp.path()), &[]);
+        assert_eq!(v["deployed"], false);
+    }
+
+    /// One card per example, in the same fallback-to-worker-summary order as
+    /// `builtin_catalog`'s `examples[]` — the gallery is a straight fan-out of
+    /// that same list, never a second source of truth.
+    #[test]
+    fn gallery_one_card_per_example_with_deterministic_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        premium_fixture(tmp.path());
+        let v = gallery_cards(Some(tmp.path()), &[]);
+        assert_eq!(v["deployed"], true);
+        let cards = v["cards"].as_array().unwrap();
+        // Fixture has exactly 1 worker summary → 1 fallback example → 1 card.
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["id"], "foo-team-0");
+        assert_eq!(cards[0]["industry"], "foo");
+        assert_eq!(cards[0]["team_slug"], "foo-team");
+        assert_eq!(cards[0]["team_label"], "Foo 產業");
+        assert_eq!(cards[0]["category"], "other");
+        assert_eq!(cards[0]["example"], "歸檔與提醒");
+        assert_eq!(cards[0]["team_installed"], false);
+        assert_eq!(cards[0]["lead_agent_name"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn gallery_marks_installed_team_and_links_lead_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        premium_fixture(tmp.path());
+        let installed = vec![InstallRecord {
+            slug: "foo-team".into(),
+            kind: crate::expert_admin::PackKind::Native,
+            display_name: "Foo 產業".into(),
+            version: "1.0.0".into(),
+            description: String::new(),
+            agents: vec!["foo-assistant".into(), "foo-docs".into()],
+            global_skills: vec![],
+            wiki_files: vec![],
+            installed_at: crate::expert_admin::now_iso(),
+        }];
+        let v = gallery_cards(Some(tmp.path()), &installed);
+        let cards = v["cards"].as_array().unwrap();
+        assert_eq!(cards[0]["team_installed"], true);
+        assert_eq!(cards[0]["lead_agent_name"], "foo-assistant");
+    }
+
+    /// Authored `examples[]` fan out into one card each, in authored order —
+    /// same source `builtin_catalog` reads, no gallery-only rewriting.
+    #[test]
+    fn gallery_fans_out_authored_examples_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team = tmp.path().join("teams/foo-team");
+        premium_fixture(tmp.path());
+        let toml = std::fs::read_to_string(team.join("team.toml")).unwrap();
+        let toml = toml.replacen(
+            "\n[front_desk]",
+            "\nexamples = [\"把本週未回覆的名單排跟進順序\", \"產出本月請款通知\"]\n\n[front_desk]",
+            1,
+        );
+        std::fs::write(team.join("team.toml"), toml).unwrap();
+
+        let v = gallery_cards(Some(tmp.path()), &[]);
+        let cards = v["cards"].as_array().unwrap();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0]["id"], "foo-team-0");
+        assert_eq!(cards[0]["example"], "把本週未回覆的名單排跟進順序");
+        assert_eq!(cards[1]["id"], "foo-team-1");
+        assert_eq!(cards[1]["example"], "產出本月請款通知");
+    }
+
+    /// A team whose manifest fails to load, and one with no worker summaries
+    /// at all (empty examples after fallback), are both skipped rather than
+    /// producing an error or an empty-example card.
+    #[test]
+    fn gallery_skips_teams_with_no_examples() {
+        let tmp = tempfile::tempdir().unwrap();
+        premium_fixture(tmp.path());
+        // Second team, same pack/kit, but its one worker has a blank summary
+        // — the fallback derivation yields zero examples.
+        let team2 = tmp.path().join("teams/bar-team");
+        std::fs::create_dir_all(&team2).unwrap();
+        std::fs::write(
+            team2.join("team.toml"),
+            r#"schema = 1
+industry = "bar"
+pack = "foo-pro"
+label = "Bar 產業"
+
+[front_desk]
+name = "bar-assistant"
+display_name = "Bar 總機"
+summary = "對外唯一窗口"
+
+[[workers]]
+kit = "docs-admin"
+name = "bar-docs"
+display_name = "文件助理"
+summary = "   "
+"#,
+        )
+        .unwrap();
+
+        let v = gallery_cards(Some(tmp.path()), &[]);
+        let cards = v["cards"].as_array().unwrap();
+        assert_eq!(cards.len(), 1, "only foo-team contributes a card");
+        assert_eq!(cards[0]["industry"], "foo");
     }
 
     /// WP-ORG: team entries carry kind/category/departments; standalone packs

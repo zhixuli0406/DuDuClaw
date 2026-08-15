@@ -39,6 +39,7 @@ import {
   FolderOpen,
   PawPrint,
   Package,
+  Images,
   LogIn,
   Download,
   Crosshair,
@@ -352,6 +353,11 @@ export const navGroups: NavGroup[] = [
       // (`experts.install_builtin` etc.) is untouched: seeing the card is not
       // the same as being allowed to install it.
       { to: '/experts', icon: Package, label: 'nav.experts', desc: 'nav.experts.desc' },
+      // 靈感畫廊 (P2-b, curated MVP, 2026-08-15) — "做過的好案例" showcase, one
+      // click into a prefilled 交辦 panel. Sits right after 「AI 團隊」: the two
+      // are a pair (install a team → see what it can do), and both are the
+      // 低頻 tail of this group.
+      { to: '/gallery', icon: Images, label: 'nav.gallery', desc: 'nav.gallery.desc', newIn: '1.60.0' },
       // Widget 工坊 — custom dashboard cards (AI-built / HTML / shared).
       { to: '/widgets', icon: LayoutGrid, label: 'nav.widgets', desc: 'nav.widgets.desc' },
       // 桌寵工作室 — photo → interactive desktop pet. Desktop app only
@@ -427,6 +433,9 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   // industry teams were previously undiscoverable on Personal: admin-gated
   // AND buried at the bottom of a collapsed group (design doc walkthrough 5).
   '/experts',
+  // 靈感畫廊 (P2-b, curated MVP, 2026-08-15) — right after 「AI 團隊」 on Personal
+  // too, same pairing rationale as the Enterprise 公司 group above.
+  '/gallery',
   '/pet-studio',
 ]);
 

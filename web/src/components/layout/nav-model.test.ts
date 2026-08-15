@@ -62,3 +62,40 @@ describe('nav-model — P2-a-nav /experts promotion', () => {
     expect(fromPersonal).toBe(fromEnterprise);
   });
 });
+
+// P2-b (2026-08-15, `DESIGN-dashboard-ux-workbuddy-2026-08.md` §3.5): the new
+// 靈感畫廊 page must land in BOTH the Enterprise 公司 group and the Personal
+// primary rail — Personal is a separately-maintained `pickItems([...])` array
+// and a missed addition there means Personal never sees the new page at all.
+describe('nav-model — P2-b /gallery addition', () => {
+  it('is added to the Enterprise 公司 group (navGroups[1]) only', () => {
+    expect(navGroups[0].items.some((i) => i.to === '/gallery')).toBe(false);
+    expect(navGroups[1].items.some((i) => i.to === '/gallery')).toBe(true);
+    expect(navGroups[2].items.some((i) => i.to === '/gallery')).toBe(false);
+  });
+
+  it('is added to the Personal primary rail (independent pickItems array)', () => {
+    expect(personalPrimaryItems.some((i) => i.to === '/gallery')).toBe(true);
+    expect(personalAdvancedGroup.items.some((i) => i.to === '/gallery')).toBe(false);
+  });
+
+  it('a viewer on either edition sees /gallery exactly once', () => {
+    for (const isPersonal of [true, false]) {
+      const primary = primaryItemsForEdition(isPersonal);
+      const groups = navGroupsForEdition(isPersonal);
+      const occurrences =
+        primary.filter((i) => i.to === '/gallery').length +
+        groups.flatMap((g) => g.items).filter((i) => i.to === '/gallery').length;
+      expect(occurrences).toBe(1);
+    }
+  });
+
+  it('is tagged newIn 1.60.0 — a genuinely new page (per the newIn convention)', () => {
+    const fromPersonal = personalPrimaryItems.find((i) => i.to === '/gallery');
+    const fromEnterprise = navGroups[1].items.find((i) => i.to === '/gallery');
+    expect(fromPersonal?.newIn).toBe('1.60.0');
+    expect(fromEnterprise?.newIn).toBe('1.60.0');
+    // Both editions share the SAME NavItem object.
+    expect(fromPersonal).toBe(fromEnterprise);
+  });
+});
