@@ -1227,10 +1227,73 @@ pub fn builtin_tool_catalog() -> Vec<ToolCatalogEntry> {
     out
 }
 
+/// Strip an optional `(qualifier)` suffix and an optional `mcp__<server>__`
+/// namespace prefix from a `[capabilities] allowed_tools` / `denied_tools`
+/// entry, returning the bare tool name a security gate can compare against.
+///
+/// Both spellings must resolve to the same identity so an operator-authored
+/// entry (bare, e.g. `memory_search`) and a dashboard-authored entry
+/// (qualified, e.g. `mcp__duduclaw__memory_search`) enforce identically
+/// regardless of which layer reads it — the Claude CLI's `--disallowedTools`
+/// (bare-or-qualified, see `duduclaw-gateway::claude_runner::tool_base_name`,
+/// the original implementation this mirrors) and the MCP dispatch gate
+/// (`duduclaw-cli::mcp_dispatch`, WP-H2 §1.3 Gap (b) — the MCP transport only
+/// ever sees bare names, since that's what JSON-RPC `tools/call` carries).
+///
+/// A degenerate qualifier with an empty tool segment (`"mcp__duduclaw__"`)
+/// deliberately does NOT strip to `""` — that would make an operator typo
+/// silently deny/allow *every* MCP tool. Comparison callers should use exact
+/// equality on the returned string (project coding convention 2: no
+/// unanchored substring matching for security decisions).
+pub fn mcp_tool_base_name(entry: &str) -> &str {
+    let e = entry.split('(').next().unwrap_or(entry).trim();
+    if let Some(rest) = e.strip_prefix("mcp__") {
+        if let Some(idx) = rest.find("__") {
+            let bare = &rest[idx + 2..];
+            if !bare.is_empty() {
+                return bare;
+            }
+        }
+    }
+    e
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_mcp_tool_base_name_bare_passthrough() {
+        assert_eq!(mcp_tool_base_name("memory_search"), "memory_search");
+    }
+
+    #[test]
+    fn test_mcp_tool_base_name_strips_qualifier() {
+        assert_eq!(
+            mcp_tool_base_name("mcp__duduclaw__memory_search"),
+            "memory_search"
+        );
+    }
+
+    #[test]
+    fn test_mcp_tool_base_name_strips_paren_suffix() {
+        assert_eq!(mcp_tool_base_name("Bash(git:*)"), "Bash");
+    }
+
+    #[test]
+    fn test_mcp_tool_base_name_degenerate_prefix_does_not_collapse_to_empty() {
+        // A typo'd qualifier with no tool segment must not become a wildcard.
+        assert_eq!(mcp_tool_base_name("mcp__duduclaw__"), "mcp__duduclaw__");
+    }
+
+    #[test]
+    fn test_mcp_tool_base_name_cross_form_equality() {
+        assert_eq!(
+            mcp_tool_base_name("mcp__duduclaw__office_script"),
+            mcp_tool_base_name("office_script")
+        );
+    }
 
     #[test]
     fn test_catalog_is_non_empty() {

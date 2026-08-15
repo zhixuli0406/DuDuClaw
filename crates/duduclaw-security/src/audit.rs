@@ -688,6 +688,63 @@ pub fn append_tool_call_with_input(
     append_tool_call_with_extras(home_dir, agent_id, tool_name, params_summary, success, &extras)
 }
 
+/// Log an MCP dispatch-gate REJECTION (WP-H2 §1.3, Gap (c)).
+///
+/// Every guard in `McpDispatcher::dispatch_tool_call` (scope check, the
+/// `denied_tools`/`allowed_tools` capability gate, the PORTICO task-scoped
+/// grant gate, …) previously returned a JSON-RPC error straight to the
+/// caller without ever writing to `tool_calls.jsonl` — "the tool ran" was
+/// recorded, but "the tool was BLOCKED" left no trace at all. That is the
+/// same failure-leaves-no-trace defect class this project has hit before
+/// (OTP silent-fail, the WP-A10 BUG-1 attribution gap): evidence consumers
+/// that read this file (`recent_actions.rs`'s self-action feed, the
+/// dashboard's change tab, the goal-loop MAV judge's audit digest) could
+/// never see a blocked attempt, so an agent asked "did you try X?" would
+/// truthfully-but-misleadingly say "no" about a call it DID attempt and was
+/// denied.
+///
+/// Always written (never gated by `is_state_changing` — a rejected call
+/// changed nothing, but the attempt itself is exactly the kind of self-action
+/// this audit trail exists to answer questions about).
+///
+/// `error_class` is a short, machine-stable token — e.g. `"insufficient_scope"`,
+/// `"capability_grant_missing"`, `"denied_tools"`, `"allowed_tools"` — chosen
+/// to read consistently with the credential-resolution line's
+/// `describe().last_resolve.error_class` field (commercial/docs/
+/// DESIGN-credentials-doctrine-2026-08.md §4.3's note that both lines should
+/// share one field-naming convention for "failures must leave a trace").
+///
+/// `input`, when provided, is masked via [`mask_sensitive_json`] and capped
+/// the same way [`append_tool_call_with_input`] caps a successful call's
+/// input — unlike that function, this one does NOT skip capture for
+/// read-only tool names: visibility into *why a call was blocked* matters
+/// regardless of whether the tool itself would have mutated state.
+pub fn append_tool_call_denied(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    error_class: &str,
+    detail: &str,
+    input: Option<&serde_json::Value>,
+) {
+    let mut extras: Vec<(&str, serde_json::Value)> =
+        vec![("error_class", serde_json::Value::String(error_class.to_string()))];
+    if let Some(raw) = input {
+        let masked = mask_sensitive_json(raw);
+        let serialized = masked.to_string();
+        let truncated = serialized.chars().count() > AUDIT_INPUT_MAX_CHARS;
+        let rendered = if truncated {
+            duduclaw_core::truncate_chars(&serialized, AUDIT_INPUT_MAX_CHARS)
+        } else {
+            serialized
+        };
+        extras.push(("input", serde_json::Value::String(rendered)));
+        extras.push(("input_truncated", serde_json::Value::Bool(truncated)));
+    }
+    let params_summary = format!("denied ({error_class}): {}", duduclaw_core::truncate_chars(detail, 200));
+    append_tool_call_with_extras(home_dir, agent_id, tool_name, &params_summary, false, &extras);
+}
+
 /// Read tool call records for a specific agent within a time window.
 ///
 /// Uses `flock(LOCK_SH)` to prevent reading partially-written lines

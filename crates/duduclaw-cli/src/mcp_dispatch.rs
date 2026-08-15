@@ -103,11 +103,23 @@ fn neutralize_os_notify_args(args: &mut serde_json::Map<String, Value>) -> (Vec<
 /// `os_native = false`. A broken config must never silently grant OS
 /// integration; the policy layer is additive friction whose absence leaves the
 /// scope / injection / `denied_tools` layers as the hard gates.
+///
+/// `denied_tools` / `allowed_tools` (Gap (b), WP-H2 §1.3): previously these
+/// only reached the Claude CLI spawn's `--disallowedTools` / `--allowedTools`
+/// flags (`duduclaw_core::types::CapabilitiesConfig::disallowed_tools` /
+/// `allowed_tools`) — a caller that talked to the MCP server directly
+/// (stdio/HTTP/SSE) was unrestricted by them. A malformed/absent config still
+/// degrades these to empty (matching the rest of this struct's fields), which
+/// means "no MCP-layer restriction" rather than "deny everything" — the same
+/// posture the CLI-spawn path already has for a malformed config, and
+/// unrelated to whether the NEW gate added in this dispatcher fires.
 #[derive(Default)]
 struct AgentGateConfig {
     policy: Vec<ToolPolicy>,
     os_native: bool,
     recording: bool,
+    denied_tools: Vec<String>,
+    allowed_tools: Vec<String>,
 }
 
 /// Read `<home>/agents/<id>/agent.toml` once and extract the gate-relevant
@@ -131,6 +143,8 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
             policy: cfg.capabilities.policy,
             os_native: cfg.capabilities.os_native,
             recording: cfg.capabilities.recording,
+            denied_tools: cfg.capabilities.denied_tools,
+            allowed_tools: cfg.capabilities.allowed_tools,
         },
         Err(e) => {
             warn!(
@@ -236,6 +250,44 @@ impl McpDispatcher {
         self
     }
 
+    /// Write a guard-rejection row to `tool_calls.jsonl` (Gap (c), WP-H2
+    /// §1.3). Every guard in this pipeline previously returned straight to
+    /// the caller on denial WITHOUT leaving a trace — "a rejected/blocked
+    /// action leaves no audit trail" is a recurring defect class in this
+    /// project (OTP silent-fail, WP-A10 BUG-1), and it starves the evidence
+    /// consumers that read `tool_calls.jsonl` (`recent_actions.rs`'s
+    /// "近期自身行動" section, the dashboard's change feed, the MAV judge's
+    /// audit digest) of exactly the rows they'd need to answer "did you try
+    /// to do X (and get blocked)?".
+    ///
+    /// `error_class` is a short, machine-stable token naming which guard
+    /// fired (e.g. `"insufficient_scope"`, `"capability_grant_missing"`,
+    /// `"denied_tools"`) — chosen to read consistently with the credential-
+    /// resolution line's `describe().last_resolve.error_class` field
+    /// (commercial/docs/DESIGN-credentials-doctrine-2026-08.md §4.3's
+    /// "failures must leave a trace with a consistent field name" note).
+    ///
+    /// Agent attribution mirrors `crate::mcp::handle_tools_call`'s own
+    /// state-changing-tool audit write (`resolve_audit_agent`), so a denied
+    /// call and an executed call attribute to the same identity.
+    fn audit_dispatch_denial(
+        &self,
+        tool_name: &str,
+        params: &Value,
+        error_class: &str,
+        detail: &str,
+    ) {
+        let agent_id = crate::mcp::resolve_audit_agent(|| self.default_agent.clone());
+        duduclaw_security::audit::append_tool_call_denied(
+            &self.home_dir,
+            &agent_id,
+            tool_name,
+            error_class,
+            detail,
+            params.get("arguments"),
+        );
+    }
+
     /// Execute a `tools/call` JSON-RPC request through the full security pipeline.
     ///
     /// # Pipeline
@@ -299,6 +351,8 @@ impl McpDispatcher {
                 && !principal.scopes.contains(&Scope::Admin)
             {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+                let detail = format!("required {required:?}, principal lacks it (and Admin)");
+                self.audit_dispatch_denial(tool_name, params, "insufficient_scope", &detail);
                 return jsonrpc_error(
                     id,
                     -32003,
@@ -400,15 +454,66 @@ impl McpDispatcher {
             }
         }
 
-        // Resolve the per-agent gate config ONCE for this dispatch — both the
-        // PolicyKernel gate (§3.5) and the OS-native gate (§3.62) read it, so we
-        // avoid parsing agent.toml twice. External clients aren't agents (no
+        // Resolve the per-agent gate config ONCE for this dispatch — the
+        // denied_tools/allowed_tools gate (§3.45), the PolicyKernel gate
+        // (§3.5) and the OS-native gate (§3.62) all read it, so we avoid
+        // parsing agent.toml twice. External clients aren't agents (no
         // per-agent config), so they get the empty default without a fs read.
         let agent_gate = if principal.is_external {
             AgentGateConfig::default()
         } else {
             load_agent_gate_config(&self.home_dir, &principal.client_id).await
         };
+
+        // ── 3.45 denied_tools / allowed_tools capability gate (Gap (b), WP-H2 §1.3) ──
+        // `agent.toml [capabilities] denied_tools` / `allowed_tools` previously
+        // only reached the Claude CLI spawn's `--disallowedTools` /
+        // `--allowedTools` flags — an agent calling the MCP server directly
+        // (stdio/HTTP/SSE, or the openai-compat tool-loop's internal MCP
+        // client) was unrestricted by them. Enforced here at the shared choke
+        // point so every transport honours it, mirroring CLI-flag semantics:
+        // `denied_tools` always wins over `allowed_tools`; a non-empty
+        // `allowed_tools` switches the agent into allowlist mode. Exact match
+        // on the tool's base name (never substring, per coding convention 2)
+        // after stripping an optional `mcp__<server>__` qualifier, so both a
+        // bare entry (`memory_search`) and a dashboard-authored qualified
+        // entry (`mcp__duduclaw__memory_search`) enforce identically. External
+        // clients are already whitelist-confined (§0) and carry no per-agent
+        // capability config (`agent_gate` is the empty default for them), so
+        // they are not subject to this gate.
+        if !principal.is_external {
+            let base = duduclaw_core::tool_catalog::mcp_tool_base_name(tool_name);
+            let is_denied = agent_gate
+                .denied_tools
+                .iter()
+                .any(|d| duduclaw_core::tool_catalog::mcp_tool_base_name(d) == base);
+            let allowlist_active = !agent_gate.allowed_tools.is_empty();
+            let is_allowed = allowlist_active
+                && agent_gate
+                    .allowed_tools
+                    .iter()
+                    .any(|a| duduclaw_core::tool_catalog::mcp_tool_base_name(a) == base);
+            if is_denied || (allowlist_active && !is_allowed) {
+                let (error_class, msg) = if is_denied {
+                    (
+                        "denied_tools",
+                        format!(
+                            "工具「{tool_name}」已被此代理的 [capabilities] denied_tools 設定阻擋。"
+                        ),
+                    )
+                } else {
+                    (
+                        "allowed_tools",
+                        format!(
+                            "工具「{tool_name}」不在此代理的 [capabilities] allowed_tools 允許清單中。"
+                        ),
+                    )
+                };
+                duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+                self.audit_dispatch_denial(tool_name, &params_owned, error_class, &msg);
+                return jsonrpc_error(id, -32003, &msg);
+            }
+        }
 
         // ── 3.5 PolicyKernel reference monitor (deterministic, zero-LLM) ─────
         // Per-agent static policy from agent.toml [capabilities].policy. Empty
@@ -685,14 +790,17 @@ impl McpDispatcher {
                 };
                 if !has_grant {
                     duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
-                    return jsonrpc_error(
-                        id,
-                        -32003,
-                        &format!(
-                            "工具「{tool_name}」為階段性授權工具，目前無有效授權。請先呼叫 \
-                             capability_request（附 tool 與 reason）取得人工核准後再執行。"
-                        ),
+                    let msg = format!(
+                        "工具「{tool_name}」為階段性授權工具，目前無有效授權。請先呼叫 \
+                         capability_request（附 tool 與 reason）取得人工核准後再執行。"
                     );
+                    self.audit_dispatch_denial(
+                        tool_name,
+                        &params_owned,
+                        "capability_grant_missing",
+                        &msg,
+                    );
+                    return jsonrpc_error(id, -32003, &msg);
                 }
             }
         }
@@ -1557,5 +1665,233 @@ effect = "forbid"
             !serialized.contains("alice@acme.com"),
             "raw PII must not survive result redaction, got: {serialized}"
         );
+    }
+
+    // ── Gap (b), WP-H2 §1.3: denied_tools / allowed_tools reach the MCP gate ──
+
+    #[tokio::test]
+    async fn denied_tools_blocks_mcp_call() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\ndenied_tools = [\"memory_search\"]\n");
+
+        // Admin bypasses scope so the call reaches the new gate.
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(60);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "denied_tools must block the MCP call, got: {result}"
+        );
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("denied_tools"), "denial must mention denied_tools, got: {msg}");
+    }
+
+    /// A dashboard-authored qualified entry (`mcp__duduclaw__<name>`) must
+    /// enforce identically to a bare entry — both spellings reach the same
+    /// tool at the MCP transport, which only ever sees the bare name.
+    #[tokio::test]
+    async fn denied_tools_matches_qualified_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(
+            &tmp,
+            "[capabilities]\ndenied_tools = [\"mcp__duduclaw__memory_search\"]\n",
+        );
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(61);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "a qualified denied_tools entry must still block, got: {result}"
+        );
+    }
+
+    /// A non-empty `allowed_tools` switches the agent into allowlist mode: a
+    /// tool NOT named there is blocked, even without any `denied_tools` entry.
+    #[tokio::test]
+    async fn allowed_tools_allowlist_blocks_unlisted_tool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nallowed_tools = [\"tasks_list\"]\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(62);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "a tool outside the allowlist must be blocked, got: {result}"
+        );
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("allowed_tools"), "denial must mention allowed_tools, got: {msg}");
+    }
+
+    /// The tool named in `allowed_tools` passes this gate (may still fail
+    /// downstream for unrelated reasons, but never with the allowlist
+    /// message).
+    #[tokio::test]
+    async fn allowed_tools_allowlist_passes_listed_tool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nallowed_tools = [\"memory_search\"]\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(63);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("allowed_tools"),
+            "a listed tool must pass the allowlist gate, got: {result}"
+        );
+    }
+
+    /// Regression: an agent with no `denied_tools`/`allowed_tools` at all is
+    /// unaffected — byte-identical to pre-Gap-(b) behavior.
+    #[tokio::test]
+    async fn no_tool_restrictions_unaffected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nos_native = false\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(64);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("denied_tools") && !msg.contains("allowed_tools"),
+            "an agent with no tool restrictions must never hit the Gap-(b) gate, got: {result}"
+        );
+    }
+
+    // ── Gap (c), WP-H2 §1.3: guard denials are audited to tool_calls.jsonl ──
+
+    /// Read every JSON row of `tool_calls.jsonl` (order preserved).
+    fn read_tool_call_rows(tmp: &tempfile::TempDir) -> Vec<serde_json::Value> {
+        let path = tmp.path().join("tool_calls.jsonl");
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        body.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn scope_denial_is_audited() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+
+        let principal = make_principal(vec![], false); // no scopes at all
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(70);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        assert_eq!(result["error"]["code"], -32003);
+
+        let rows = read_tool_call_rows(&tmp);
+        let row = rows
+            .iter()
+            .find(|r| r["tool_name"] == "memory_search")
+            .expect("scope denial must be audited to tool_calls.jsonl");
+        assert_eq!(row["success"], false);
+        assert_eq!(row["error_class"], "insufficient_scope");
+    }
+
+    #[tokio::test]
+    async fn capability_grant_missing_denial_is_audited() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nscoped_tools = [\"memory_search\"]\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "x" }));
+        let id = serde_json::json!(71);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        assert_eq!(result["error"]["code"], -32003);
+
+        let rows = read_tool_call_rows(&tmp);
+        let row = rows
+            .iter()
+            .find(|r| r["tool_name"] == "memory_search")
+            .expect("capability-grant denial must be audited to tool_calls.jsonl");
+        assert_eq!(row["success"], false);
+        assert_eq!(row["error_class"], "capability_grant_missing");
+    }
+
+    #[tokio::test]
+    async fn denied_tools_denial_is_audited() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\ndenied_tools = [\"memory_search\"]\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("memory_search", serde_json::json!({ "query": "secret plan" }));
+        let id = serde_json::json!(72);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        assert_eq!(result["error"]["code"], -32003);
+
+        let rows = read_tool_call_rows(&tmp);
+        let row = rows
+            .iter()
+            .find(|r| r["tool_name"] == "memory_search")
+            .expect("denied_tools denial must be audited to tool_calls.jsonl");
+        assert_eq!(row["success"], false);
+        assert_eq!(row["error_class"], "denied_tools");
+        // Input is captured (masked/capped) for denial rows too.
+        assert!(
+            row["input"].as_str().unwrap_or("").contains("secret plan"),
+            "denial rows should still capture the (masked) input for forensics: {row}"
+        );
+    }
+
+    /// A successful call must NOT gain an `error_class` field — it is
+    /// exclusively a denial-row marker.
+    #[tokio::test]
+    async fn successful_call_has_no_error_class_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params(
+            "memory_store",
+            serde_json::json!({ "content": "a benign fact" }),
+        );
+        let id = serde_json::json!(73);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+        assert!(result.get("error").is_none(), "memory_store must succeed, got: {result}");
+
+        let rows = read_tool_call_rows(&tmp);
+        let row = rows
+            .iter()
+            .find(|r| r["tool_name"] == "memory_store")
+            .expect("memory_store is state-changing and must be audited");
+        assert_eq!(row["success"], true);
+        assert!(row.get("error_class").is_none(), "success rows must not carry error_class: {row}");
     }
 }
