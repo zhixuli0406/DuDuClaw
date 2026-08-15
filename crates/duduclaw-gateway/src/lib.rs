@@ -279,6 +279,12 @@ pub mod tool_activity;
 // merged with the MCP audit window at read time.
 pub mod task_changes;
 
+// I-2b 產物物件化: provenance for every file that lands in `attachments/` —
+// which agent handed it over, for which task/round, declared with `📎DELIVER:`
+// or recovered by the sweep, versus a file a human sent in. Backs the task
+// detail page's 「產物」tab and the `/files` origin column.
+pub mod artifacts;
+
 // ── D3 (LWM incident): per-agent authoritative working state — pinned
 //    key-value block + handoff note injected into every wake-up, updated
 //    only via explicit MCP tools with CAS supersession (ghost-memory fix,

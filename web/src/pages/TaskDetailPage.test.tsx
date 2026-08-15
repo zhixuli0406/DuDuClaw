@@ -149,6 +149,61 @@ describe('TaskDetailPage — 等你決定 (WP-A §2-6)', () => {
   });
 });
 
+// ── I-1c 想一想 (plan-first): a task parked `needs_human` with `plan_pending`
+// set gets a distinct plan card + copy instead of the generic 「卡住原因」
+// line, but reuses the exact same three-button decision (no new button kind).
+
+const PLAN_PENDING: TaskInfo = {
+  ...TASK,
+  status: 'needs_human',
+  judge_feedback: '- Search the vendor catalog\n- Draft a comparison table',
+  plan_pending: '- Search the vendor catalog\n- Draft a comparison table',
+};
+
+describe('TaskDetailPage — 想一想 plan-first (I-1c)', () => {
+  beforeEach(() => {
+    mockWsClient.call.mockResolvedValue({ tasks: [PLAN_PENDING], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [PLAN_PENDING], comments: {}, activities: [], loading: false });
+  });
+
+  it('shows the plan-approval copy and the plan body, not the generic needs-human line', () => {
+    renderAt('task-aaaa1111');
+    expect(
+      screen.getByText('The AI employee drafted an execution plan — it will only start once you approve it.'),
+    ).toBeInTheDocument();
+    // Testing-library's default whitespace normalizer would collapse the
+    // embedded newline, so match the plan body's rendered node directly
+    // instead of a string containing "\n".
+    expect(
+      screen.getByText((_, el) => el?.textContent === PLAN_PENDING.plan_pending),
+    ).toBeInTheDocument();
+    // The generic "waiting on your decision" prompt is replaced, not stacked.
+    expect(
+      screen.queryByText('This task is waiting on your decision: try again, call it done, or give up?'),
+    ).toBeNull();
+  });
+
+  it('still offers the same three decision buttons — no new button kind', () => {
+    renderAt('task-aaaa1111');
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Mark complete' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Give up' })).toBeInTheDocument();
+  });
+
+  it('approving (重試) routes through the SAME tasks.goal_decide retry path', async () => {
+    const user = userEvent.setup();
+    renderAt('task-aaaa1111');
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_decide', {
+        task_id: 'task-aaaa1111',
+        action: 'retry',
+        note: '',
+      }),
+    );
+  });
+});
+
 // ── I-3a: 已完成／失敗可續推 — a goal-mode task that already reached a
 // terminal state can take a follow-up message and get reopened for another
 // round instead of being a dead end (design doc §3.3).

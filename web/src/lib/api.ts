@@ -653,6 +653,11 @@ export interface TaskInfo {
    *  `'unknown'` rather than absent. Only meaningful while
    *  `status === 'needs_human'`; cleared once a human resolves the pause. */
   pause_reason?: PauseReasonToken;
+  /** I-1c "想一想": a generated execution plan awaiting human approval.
+   *  Only meaningful while `status === 'needs_human'` — the server clears it
+   *  after the first dispatch that follows approval, and scopes it to
+   *  `needs_human` the same defensive way as `pause_reason`. */
+  plan_pending?: string | null;
   parent_task_id?: string;
   tags: string[];
   message_id?: string;
@@ -1327,6 +1332,38 @@ export interface TaskChanges {
   changes: TaskChange[];
   distinct_paths: number;
   truncated: boolean;
+}
+
+/** How a file in `attachments/` came to be there (I-2b provenance).
+ *  · `declared` — the AI staff member handed it over explicitly
+ *  · `swept`    — it produced the file but forgot to declare it; we recovered it
+ *  · `produced` — a round wrote it, but no archived copy exists to download
+ *  · `uploaded` — a human sent it in
+ *  · `unknown`  — backfilled and the evidence could not place it（來源不明） */
+export type ArtifactOrigin = 'declared' | 'swept' | 'produced' | 'uploaded' | 'unknown';
+
+/** One deliverable of a task (`tasks.artifacts`). `attribution: 'inferred'`
+ *  means only the time window ties it to this task — never presented as fact. */
+export interface TaskArtifact {
+  name: string;
+  /** `/api/files/download?name=` key. `null` ⇒ written but never archived. */
+  archived_name: string | null;
+  agent_id: string;
+  origin: ArtifactOrigin;
+  attribution: 'exact' | 'inferred';
+  produced_at: string;
+  size: number | null;
+  round: number | null;
+  channel: string | null;
+  source_path: string | null;
+}
+
+/** `tasks.artifacts` — what the task actually produced, for the 「產物」tab. */
+export interface TaskArtifacts {
+  artifacts: TaskArtifact[];
+  truncated: boolean;
+  /** How many rows are placed by the time window rather than by an id. */
+  inferred_count: number;
 }
 
 /** `tasks.timeline` — one goal task's whole loop story. */
@@ -2194,6 +2231,29 @@ export interface ExpertCatalogEntry {
   /** P2-a — once installed, the agent id the "已加入" entry point should link
    *  into (`/agents/<name>`). `null`/absent when not installed, or when the
    *  install record has no resolvable agent. */
+  lead_agent_name?: string | null;
+}
+
+// ── Inspiration gallery (靈感畫廊, P2-b, curated-only MVP) ───────────
+
+/** One showcase card from `gallery.list` — a single team task example,
+ *  fanned out from the same `team.toml` data `experts.catalog` reads (no
+ *  new storage, nothing user-submitted in this wave). */
+export interface GalleryCard {
+  /** Deterministic (`<team-slug>-<example-index>`) — stable React key. */
+  id: string;
+  industry: string;
+  /** Catalog section slug (health/professional/retail/lifestyle/education/other) —
+   *  same values as `ExpertCatalogEntry.category`. */
+  category: string;
+  /** Distinct functional departments the team's roster lands in (zh-TW data strings). */
+  departments: string[];
+  team_slug: string;
+  team_label: string;
+  /** The task example itself — verbatim from `team.toml`, never rewritten. */
+  example: string;
+  team_installed: boolean;
+  /** Once the team is installed, the agent id "做同款" should preselect. */
   lead_agent_name?: string | null;
 }
 
@@ -3993,6 +4053,20 @@ export const api = {
         output: string;
       }>,
   },
+  gallery: {
+    /** Curated inspiration-gallery cards. Fail-safe: `deployed: false` when
+     *  this install ships no premium templates or no team ever authors/
+     *  derives a non-empty example list. Same license gate as
+     *  `experts.catalog` — `present_but_locked` when the tree is deployed
+     *  but the license doesn't unlock it. */
+    list: () =>
+      client.call('gallery.list') as Promise<{
+        deployed: boolean;
+        unlocked: boolean;
+        present_but_locked: boolean;
+        cards: GalleryCard[];
+      }>,
+  },
   channels: {
     status: () =>
       client.call('channels.status') as Promise<{ channels: ChannelStatus[] }>,
@@ -5040,6 +5114,9 @@ export const api = {
     // what the task's rounds actually wrote/edited/deleted, newest first.
     changes: (taskId: string, limit?: number) =>
       client.call('tasks.changes', limit ? { task_id: taskId, limit } : { task_id: taskId }) as Promise<TaskChanges>,
+    // I-2b: the deliverables a task produced — the 「產物」tab. Read-only.
+    artifacts: (taskId: string, limit?: number) =>
+      client.call('tasks.artifacts', limit ? { task_id: taskId, limit } : { task_id: taskId }) as Promise<TaskArtifacts>,
     // Iterative Kanban: per-agent + board flow metrics. Non-admins pass an
     // agent_id and see only that agent's slice.
     flowMetrics: (agentId?: string) =>
@@ -5068,11 +5145,19 @@ export const api = {
        *  `belief_settle`) about the goal's measurable external indicators,
        *  folded into the judge's acceptance bar. Default `false`. */
       require_beliefs?: boolean;
+      /** I-1c "想一想" (AssignSheet's third execution mode): generate a
+       *  short human-readable plan and park the task `needs_human` for
+       *  approval instead of letting the goal loop execute immediately.
+       *  Default `false` (the existing `直接做` behaviour). */
+      plan_first?: boolean;
     }) =>
       client.call('tasks.goal_create', { ...params }) as Promise<{
         task: TaskInfo;
         iteration_cap: number;
         dispatch_enabled: boolean;
+        /** Echoes the request's `plan_first` — lets the caller show "計畫已
+         *  生成，等待你核准" instead of the normal assign toast. */
+        plan_first: boolean;
       }>,
     /** One goal task's whole loop story: rounds, task-scoped activity,
      *  pending kickoff approval. */
