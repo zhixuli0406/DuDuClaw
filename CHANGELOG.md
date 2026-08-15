@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.60.0] - 2026-08-15 — 三 harness 借鑑收官——可換判官×Agent Mail×交付與附件安全×交辦 UX
+
 ### Added
 - **needs_human 暫停原因封閉分類（pause_reason）**：goal 任務轉 `needs_human` 時，除了既有的自由文字 `judge_feedback`，現在同時蓋上一個六選一的封閉分類——`no_progress`（卡住沒進展）／`budget_exhausted`（次數或時限用盡）／`blocked_needs_decision`（等你決策）／`infra`（系統問題）／`restart`（系統重啟後暫停）／`unknown`（需要人工確認）。分類在**觸發現場**靜態標記，絕不從 `judge_feedback` 的 LLM 敘述反解——避免把模型自己的用詞當成路由依據。`/goals` 看板卡片、任務詳情頁、通道 needs_human 審批訊息（含 Observer 全自動模式的純通知）都新增這個分類 chip／一行「類型」；未分類或既有舊任務一律讀成「需要人工確認」（安全方向，不猜測），任務被人工決定（重試／完成／放棄）後分類欄清空，不殘留到下一次卡住。
 - **逾時進度通報**：一個已被認領（`in_progress`）但超過 `[goal_loop] progress_report_minutes`（預設 10 分鐘，`0` 關閉）沒有任何可觀察進度訊號的目標任務，會收到一則「已執行 X 分鐘未回報進度」通知（Activity Feed ＋來源對話），同一任務每輪最多發一次。**純粹是提醒，不介入**：不會重派工、不升級、不取消，`stalled_secs`／`iteration_cap`／`wall_clock_hours` 仍是唯一會真的動手的護欄。
