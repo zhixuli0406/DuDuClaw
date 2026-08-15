@@ -3009,6 +3009,7 @@ async fn forward_to_channel(
             let token = crate::config_crypto::decrypt_config_field(
                 config_table, "channels", "whatsapp_access_token", home_dir,
             )
+            .map(|s| s.expose_owned())
             .unwrap_or_default();
             let phone_id = config_table
                 .get("channels")
@@ -3043,10 +3044,12 @@ async fn forward_to_channel(
             let app_id = crate::config_crypto::decrypt_config_field(
                 config_table, "channels", "feishu_app_id", home_dir,
             )
+            .map(|s| s.expose_owned())
             .unwrap_or_default();
             let app_secret = crate::config_crypto::decrypt_config_field(
                 config_table, "channels", "feishu_app_secret", home_dir,
             )
+            .map(|s| s.expose_owned())
             .unwrap_or_default();
             if app_id.is_empty() || app_secret.is_empty() {
                 return Err("feishu_app_id / feishu_app_secret not configured".into());
@@ -3171,7 +3174,7 @@ fn resolve_forward_token(
         callback_agent_id,
         channel,
     ) {
-        return tok;
+        return tok.expose_owned();
     }
     // 3: origin_agent + its reports_to cascade (covers the case where
     // callback_agent_id's chain doesn't reach the thread opener).
@@ -3179,7 +3182,7 @@ fn resolve_forward_token(
         if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
             home_dir, root, channel,
         ) {
-            return tok;
+            return tok.expose_owned();
         }
     }
     // 4: global fallback.
@@ -3208,17 +3211,24 @@ fn lookup_origin_agent(home_dir: &Path, message_id: &str) -> Option<String> {
     .filter(|s| !s.is_empty())
 }
 
+/// WP-H1: this was a 5th hand-rolled copy of the enc-then-plaintext read, with
+/// no `secret://` support — a reference configured for a global channel token
+/// was returned verbatim and sent to the vendor API as the credential. It now
+/// classifies through the one shared `SecretRef`. `plain_key` must be the
+/// `<field>` whose `<field>_enc` is `enc_key`; the pairing is asserted so a
+/// mismatched call cannot silently read the wrong field.
 fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
-    let channels = config.get("channels");
-    // Try encrypted token first
-    if let Some(enc) = channels.and_then(|c| c.get(enc_key)).and_then(|v| v.as_str()) {
-        match crate::config_crypto::decrypt_value(enc, home_dir) {
-            Some(decrypted) => return decrypted,
-            None => warn!(key = enc_key, "Failed to decrypt channel token — falling back to plaintext"),
-        }
-    }
-    // Fallback to plaintext
-    channels.and_then(|c| c.get(plain_key)).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    debug_assert_eq!(
+        enc_key,
+        format!("{plain_key}_enc"),
+        "get_config_token expects the <field>/<field>_enc pair"
+    );
+    let Some(table) = config.as_table() else {
+        return String::new();
+    };
+    crate::config_crypto::decrypt_config_field(table, "channels", plain_key, home_dir)
+        .map(|s| s.expose_owned())
+        .unwrap_or_default()
 }
 
 // ── Typing indicator for dispatched tasks ────────────────────

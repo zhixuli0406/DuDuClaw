@@ -7,6 +7,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
 import {
   PageHeader,
+  Badge,
   Button,
   buttonVariants,
   Empty,
@@ -35,6 +36,13 @@ import {
  * `/api/files/download` endpoint; PDFs and images open inline in a new tab for
  * native preview. Everything shown is the real directory listing — an agent
  * that has produced nothing simply shows the empty state.
+ *
+ * I-2b adds the 來源 column: the flat directory used to mix a customer's upload
+ * with a report the agent delivered for a goal task, with no way to tell them
+ * apart. The gateway now records provenance at the moment a file lands, and
+ * this page joins it — plus a task filter, so 「找回上週的產物」 stops being a
+ * scroll through everything. A file the ledger does not know keeps saying
+ * 來源不明 rather than being assigned a plausible-looking origin.
  */
 
 /** Sentinel Select value for the shared (agent-less) bucket. */
@@ -46,7 +54,17 @@ interface FileRow {
   size: number;
   /** Unix epoch milliseconds. */
   mtime: number;
+  /** I-2b provenance — absent when the ledger has no row for this file. */
+  origin?: 'declared' | 'swept' | 'produced' | 'uploaded' | 'unknown';
+  task_id?: string;
+  round?: number;
+  display_name?: string;
 }
+
+/** Sentinel Select value for "no task filter". */
+const ALL_TASKS = '__all__';
+/** Sentinel Select value for files not tied to any task. */
+const NO_TASK = '__none__';
 
 /** Human-readable byte size (1 KB = 1024 B). */
 function formatSize(bytes: number): string {
@@ -83,6 +101,8 @@ export function FilesPage() {
   // P11 (state-as-URL): the browsed bucket lives in `?agent=<id>` (or the
   // shared bucket sentinel) so a refresh keeps you where you were looking.
   const [selected, setSelected] = useUrlState('agent', '');
+  // I-2b: task filter lives in the URL too, so a shared link keeps the view.
+  const [taskFilter, setTaskFilter] = useUrlState('task', '');
   const [files, setFiles] = useState<FileRow[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -175,6 +195,25 @@ export function FilesPage() {
 
   const showShared = scope === 'all';
 
+  // I-2b: the tasks actually represented in this bucket. Built from the rows
+  // themselves, so the filter can never offer a task with nothing behind it.
+  const taskOptions = useMemo(() => {
+    const ids = new Set<string>();
+    for (const f of files) if (f.task_id) ids.add(f.task_id);
+    return [...ids].sort();
+  }, [files]);
+
+  const visibleFiles = useMemo(() => {
+    if (!taskFilter || taskFilter === ALL_TASKS) return files;
+    if (taskFilter === NO_TASK) return files.filter((f) => !f.task_id);
+    return files.filter((f) => f.task_id === taskFilter);
+  }, [files, taskFilter]);
+
+  /** Origin label — a file the ledger never saw is honestly 來源不明, not a
+   *  guess about who put it there. */
+  const originLabel = (f: FileRow) =>
+    intl.formatMessage({ id: `files.origin.${f.origin ?? 'unknown'}` });
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <PageHeader hideTrigger>
@@ -183,9 +222,35 @@ export function FilesPage() {
           {intl.formatMessage({ id: 'nav.files' })}
         </h1>
         <span className="font-mono text-xs tabular-nums text-muted-foreground">
-          {files.length}
+          {visibleFiles.length}
         </span>
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
+          {taskOptions.length > 0 && (
+            <Select
+              value={taskFilter || ALL_TASKS}
+              onValueChange={(v) => setTaskFilter(String(v) === ALL_TASKS ? '' : String(v))}
+            >
+              <SelectTrigger size="sm" className="max-w-44">
+                <SelectValue
+                  aria-label={intl.formatMessage({ id: 'files.filter.task' })}
+                  placeholder={intl.formatMessage({ id: 'files.filter.task' })}
+                />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_TASKS}>
+                  {intl.formatMessage({ id: 'files.filter.task.all' })}
+                </SelectItem>
+                <SelectItem value={NO_TASK}>
+                  {intl.formatMessage({ id: 'files.filter.task.none' })}
+                </SelectItem>
+                {taskOptions.map((id) => (
+                  <SelectItem key={id} value={id}>
+                    {intl.formatMessage({ id: 'files.origin.task' }, { id: id.slice(0, 8) })}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
           <Select value={effective} onValueChange={(v) => setSelected(String(v))}>
             <SelectTrigger size="sm" className="max-w-44">
               <SelectValue
@@ -227,11 +292,15 @@ export function FilesPage() {
             error={error}
             onRetry={() => void fetchFiles()}
           />
-        ) : files.length === 0 ? (
+        ) : visibleFiles.length === 0 ? (
           <Empty
             icon={FolderOpen}
-            title={intl.formatMessage({ id: 'files.empty' })}
-            description={intl.formatMessage({ id: 'files.empty.hint' })}
+            title={intl.formatMessage({
+              id: files.length > 0 ? 'files.empty.filtered' : 'files.empty',
+            })}
+            description={
+              files.length > 0 ? undefined : intl.formatMessage({ id: 'files.empty.hint' })
+            }
           />
         ) : (
           <div className="overflow-x-auto">
@@ -239,6 +308,9 @@ export function FilesPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>{intl.formatMessage({ id: 'files.col.name' })}</TableHead>
+                  <TableHead className="w-40">
+                    {intl.formatMessage({ id: 'files.col.origin' })}
+                  </TableHead>
                   <TableHead className="w-24 text-right">
                     {intl.formatMessage({ id: 'files.col.size' })}
                   </TableHead>
@@ -251,10 +323,28 @@ export function FilesPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {files.map((f) => (
+                {visibleFiles.map((f) => (
                   <TableRow key={f.name}>
-                    <TableCell className="font-medium break-all text-foreground">
-                      {f.name}
+                    <TableCell
+                      className="font-medium break-all text-foreground"
+                      title={f.name}
+                    >
+                      {f.display_name ?? f.name}
+                    </TableCell>
+                    <TableCell className="text-xs">
+                      <div className="flex flex-wrap items-center gap-1">
+                        <Badge variant={f.origin && f.origin !== 'unknown' ? 'secondary' : 'outline'}>
+                          {originLabel(f)}
+                        </Badge>
+                        {f.task_id && (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {intl.formatMessage(
+                              { id: 'files.origin.task' },
+                              { id: f.task_id.slice(0, 8) },
+                            )}
+                          </span>
+                        )}
+                      </div>
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs tabular-nums text-muted-foreground">
                       {formatSize(f.size)}

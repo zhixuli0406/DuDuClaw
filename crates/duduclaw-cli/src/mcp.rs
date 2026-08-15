@@ -30,9 +30,9 @@ struct ParamDef {
 const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "send_message",
-        description: "Send a message to a channel (Telegram/LINE/Discord)",
+        description: "Send a message to a channel (Telegram/LINE/Discord/Slack/WhatsApp/Feishu/Google Chat/Teams/WeCom/DingTalk)",
         params: &[
-            ParamDef { name: "channel", description: "Channel type (telegram, line, discord)", required: true },
+            ParamDef { name: "channel", description: "Channel type (telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom, dingtalk)", required: true },
             ParamDef { name: "chat_id", description: "Chat/group ID", required: true },
             ParamDef { name: "text", description: "Message text", required: true },
         ],
@@ -1994,16 +1994,14 @@ fn collect_existing_agent_identifiers(home_dir: &Path) -> std::collections::Hash
         if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
             ids.insert(dir_name.to_string());
         }
-        if let Ok(content) = std::fs::read_to_string(path.join("agent.toml")) {
-            if let Ok(table) = content.parse::<toml::Table>() {
-                if let Some(name) = table
-                    .get("agent")
-                    .and_then(|a| a.get("name"))
-                    .and_then(|v| v.as_str())
-                {
-                    ids.insert(name.to_string());
-                }
-            }
+        // Shared typed parse point (R2 unification): absent file / malformed
+        // TOML / absent `[agent]` table / absent-or-wrong-typed `name` all
+        // still contribute nothing, exactly as the raw walk did.
+        if let Some(name) = duduclaw_core::agent_toml::load(&path)
+            .agent
+            .and_then(|a| a.name)
+        {
+            ids.insert(name);
         }
     }
     ids
@@ -2100,85 +2098,22 @@ async fn handle_send_message(
         });
     }
 
-    let config = match read_config(home_dir).await {
-        Some(c) => c,
-        None => {
-            return serde_json::json!({
-                "content": [{"type": "text", "text": "Error: could not read config.toml"}],
-                "isError": true
-            });
-        }
-    };
-
-    let result = match channel {
-        "telegram" => {
-            let token = decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir).await;
-            if token.is_empty() {
-                "Error: telegram_bot_token not configured".to_string()
-            } else {
-                let url = format!(
-                    "https://api.telegram.org/bot{}/sendMessage",
-                    token
-                );
-                match http
-                    .post(&url)
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "text": text
-                    }))
-                    .send()
-                    .await
-                {
-                    Ok(resp) => if resp.status().is_success() { "Message sent successfully.".to_string() } else { format!("Error: API returned {}", resp.status()) },
-                    Err(e) => format!("Error sending Telegram message: {e}"),
-                }
-            }
-        }
-        "line" => {
-            let token = decrypt_channel_token(&config, "line_channel_token_enc", "line_channel_token", home_dir).await;
-            if token.is_empty() {
-                "Error: line_channel_token not configured".to_string()
-            } else {
-                let url = "https://api.line.me/v2/bot/message/push";
-                match http
-                    .post(url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .json(&serde_json::json!({
-                        "to": chat_id,
-                        "messages": [{"type": "text", "text": text}]
-                    }))
-                    .send()
-                    .await
-                {
-                    Ok(resp) => if resp.status().is_success() { "Message sent successfully.".to_string() } else { format!("Error: API returned {}", resp.status()) },
-                    Err(e) => format!("Error sending LINE message: {e}"),
-                }
-            }
-        }
-        "discord" => {
-            let token = decrypt_channel_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir).await;
-            if token.is_empty() {
-                "Error: discord_bot_token not configured".to_string()
-            } else {
-                let url = format!(
-                    "https://discord.com/api/v10/channels/{}/messages",
-                    chat_id
-                );
-                match http
-                    .post(&url)
-                    .header("Authorization", format!("Bot {}", token))
-                    .json(&serde_json::json!({
-                        "content": text
-                    }))
-                    .send()
-                    .await
-                {
-                    Ok(resp) => if resp.status().is_success() { "Message sent successfully.".to_string() } else { format!("Error: API returned {}", resp.status()) },
-                    Err(e) => format!("Error sending Discord message: {e}"),
-                }
-            }
-        }
-        _ => format!("Unknown channel: {channel}"),
+    // Delegate to the unified `channel_sender::resolve_channel_target` +
+    // `create_sender` path via `reminder_scheduler::send_channel_message`
+    // (same shared implementation `autopilot_engine`'s `notify` action now
+    // uses) — supports every bot-pushable channel
+    // (telegram/line/discord/slack/whatsapp/feishu/googlechat/teams/wecom/
+    // dingtalk), not just the original hardcoded telegram/line/discord
+    // three. WebChat is refused inside `resolve_channel_target`: it's a
+    // session-scoped WebSocket connection with no persistent bot identity a
+    // stateless MCP call can deliver into.
+    let result = match duduclaw_gateway::reminder_scheduler::send_channel_message(
+        home_dir, http, channel, chat_id, text,
+    )
+    .await
+    {
+        Ok(()) => "Message sent successfully.".to_string(),
+        Err(e) => format!("Error: {e}"),
     };
 
     serde_json::json!({
@@ -4426,13 +4361,16 @@ async fn handle_task_status(params: &Value, home_dir: &Path, caller: &str) -> Va
 /// callers can decide the indeterminate policy (spawn treats indeterminate as
 /// operational for backward-compat with pre-WP4 configs that lack the field).
 fn agent_status_of(home_dir: &Path, agent_id: &str) -> Option<duduclaw_core::types::AgentStatus> {
-    let toml_path = home_dir.join("agents").join(agent_id).join("agent.toml");
-    let content = std::fs::read_to_string(&toml_path).ok()?;
-    let value: toml::Value = content.parse().ok()?;
-    let status_str = value.get("agent")?.get("status")?.as_str()?;
+    // Shared typed parse point (R2 unification). `status` stays a raw String
+    // on the view so an unrecognised value keeps resolving to `None`
+    // (indeterminate) here rather than becoming a hard deserialization error
+    // that would take the whole `AgentConfig` — and the agent — with it.
+    let status_str = duduclaw_core::agent_toml::load_for_agent(home_dir, agent_id)
+        .agent
+        .and_then(|a| a.status)?;
     // AgentStatus derives Deserialize with snake_case rename, so a bare status
     // string round-trips through serde.
-    serde_json::from_value(serde_json::Value::String(status_str.to_string())).ok()
+    serde_json::from_value(serde_json::Value::String(status_str)).ok()
 }
 
 /// Spawn a persistent sub-agent task in the background.
@@ -7152,10 +7090,7 @@ async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, caller_agent: &s
         .join("agent.toml");
     let override_cfg: Option<AgentOdooConfig> =
         match tokio::fs::read_to_string(&agent_toml_path).await {
-            Ok(raw) => raw
-                .parse::<toml::Table>()
-                .ok()
-                .and_then(|t| AgentOdooConfig::from_agent_toml(&t)),
+            Ok(raw) => AgentOdooConfig::from_agent_toml(&raw),
             Err(_) => None,
         };
     if let Some(cfg) = &override_cfg {
@@ -10284,12 +10219,13 @@ pub(crate) async fn handle_tools_call(
             let cu_allowed = {
                 let agent_dir = home_dir.join("agents").join(default_agent);
                 let toml_path = agent_dir.join("agent.toml");
-                // Use async read to avoid blocking the Tokio worker thread
+                // Use async read to avoid blocking the Tokio worker thread,
+                // then hand the text to the shared typed parse point (R2
+                // unification). Absent file / malformed TOML / absent or
+                // wrong-typed `computer_use` all still deny (fail-closed).
                 tokio::fs::read_to_string(&toml_path)
                     .await
-                    .ok()
-                    .and_then(|c| c.parse::<toml::Table>().ok())
-                    .and_then(|t| t.get("capabilities")?.as_table()?.get("computer_use")?.as_bool())
+                    .map(|c| duduclaw_core::agent_toml::parse(&c).capabilities.computer_use)
                     .unwrap_or(false)
             };
             if !cu_allowed {
@@ -12679,10 +12615,15 @@ async fn handle_shared_wiki_delete(args: &Value, home_dir: &Path, caller_agent: 
     let content = std::fs::read_to_string(&full_path).unwrap_or_default();
     let page_author = extract_frontmatter_field(&content, "author").unwrap_or_default();
 
-    // Check if caller is the main agent
-    let is_main = std::fs::read_to_string(home_dir.join("agents").join(caller_agent).join("agent.toml"))
-        .map(|c| c.contains("role = \"main\""))
-        .unwrap_or(false);
+    // Check if caller is the main agent. Must parse the typed [agent] role —
+    // an unanchored substring scan over the whole file would let any agent
+    // whose SOUL/comments contain the literal `role = "main"` spoof main-agent
+    // deletion rights (coding convention 2: no unanchored contains for authz).
+    let is_main = duduclaw_core::agent_toml::load_for_agent(home_dir, caller_agent)
+        .agent
+        .and_then(|a| a.role)
+        .as_deref()
+        == Some("main");
 
     if page_author != caller_agent && !is_main {
         return tool_error(&format!(
@@ -19775,6 +19716,53 @@ mod wiki_schema_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn shared_wiki_delete_main_role_requires_typed_agent_role_not_a_substring() {
+        let tmp = TempDir::new();
+        let agents_dir = tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_toml(&agents_dir, "agnes");
+
+        // "mallory" only carries the literal inside a comment — the old
+        // unanchored contains() check would have treated this as main.
+        let mallory = agents_dir.join("mallory");
+        fs::create_dir_all(&mallory).unwrap();
+        fs::write(
+            mallory.join("agent.toml"),
+            "# note to self: never set role = \"main\" here\n[agent]\nname = \"mallory\"\nrole = \"worker\"\n",
+        )
+        .unwrap();
+
+        // "boss" is a genuine typed main agent.
+        let boss = agents_dir.join("boss");
+        fs::create_dir_all(&boss).unwrap();
+        fs::write(
+            boss.join("agent.toml"),
+            "[agent]\nname = \"boss\"\nrole = \"main\"\n",
+        )
+        .unwrap();
+
+        let write_args = serde_json::json!({
+            "page_path": "notes/acl-probe.md",
+            "content": clean_karpathy_page("ACL Probe"),
+        });
+        let write_res = handle_shared_wiki_write(&write_args, tmp.path(), "agnes").await;
+        assert!(!write_res["isError"].as_bool().unwrap_or(false));
+
+        let del_args = serde_json::json!({ "page_path": "notes/acl-probe.md" });
+        let spoof = handle_shared_wiki_delete(&del_args, tmp.path(), "mallory").await;
+        assert!(
+            spoof["isError"].as_bool().unwrap_or(false),
+            "a role=main literal in a comment must not grant main-agent delete rights, got: {spoof}"
+        );
+
+        let real = handle_shared_wiki_delete(&del_args, tmp.path(), "boss").await;
+        assert!(
+            !real["isError"].as_bool().unwrap_or(false),
+            "a typed [agent] role=\"main\" must still be honored, got: {real}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn wiki_namespace_status_reports_loaded_policy() {
         let tmp = TempDir::new();
         write_scope_policy(
@@ -24081,5 +24069,113 @@ mod office_script_tests {
         .await;
         assert!(!is_err(&out), "expected success, got: {}", text_of(&out));
         assert!(text_of(&out).contains("OFFICE_SCRIPT_OK"));
+    }
+}
+
+/// R5: `agent.toml` reader directions inside this module, pinned.
+///
+/// Three readers here moved onto the shared typed parse point
+/// (`duduclaw_core::agent_toml`). Their missing-key directions differ on
+/// purpose and the differences are the point:
+///
+/// * `collect_existing_agent_identifiers` — an unreadable `[agent] name`
+///   contributes NOTHING to the reserved-id set. Fail-open: a broken config
+///   must not permanently block an id from ever being claimed.
+/// * `agent_status_of` — absent / unrecognised ⇒ `None` (indeterminate), which
+///   `spawn` deliberately treats as operational for pre-WP4 configs. The value
+///   stays a raw `String` on the view so an unknown status is indeterminate
+///   here rather than a fatal `AgentConfig` parse error.
+/// * the `computer_use` capability gate — absent / wrong-typed ⇒ DENY
+///   (fail-closed), the opposite of the two above.
+#[cfg(test)]
+mod agent_toml_reader_direction_tests {
+    use super::*;
+
+    fn home_with(agent_id: &str, body: Option<&str>) -> std::path::PathBuf {
+        let home = std::env::temp_dir()
+            .join(format!("duduclaw-atoml-{}", uuid::Uuid::new_v4()));
+        let dir = home.join("agents").join(agent_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(b) = body {
+            std::fs::write(dir.join("agent.toml"), b).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn default_direction_agent_ids_skip_unreadable_names_but_keep_dir_names() {
+        for body in [
+            None,                                  // no agent.toml
+            Some(""),                              // empty file
+            Some("[budget]\nhard_stop = true\n"),  // no [agent]
+            Some("[agent]\n"),                     // table, no name
+            Some("[agent]\nname = 42\n"),          // wrong type
+            Some("agent = \"scalar\"\n"),          // wrong-typed section
+            Some("not toml [[["),                  // malformed
+        ] {
+            let home = home_with("dirname", body);
+            let ids = collect_existing_agent_identifiers(&home);
+            assert!(
+                ids.contains("dirname"),
+                "the directory name is always reserved, for {body:?}"
+            );
+            assert_eq!(ids.len(), 1, "no phantom id from {body:?}");
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        // A readable name reserves BOTH the dir name and the declared name.
+        let home = home_with("dirname", Some("[agent]\nname = \"declared\"\n"));
+        let ids = collect_existing_agent_identifiers(&home);
+        assert!(ids.contains("dirname") && ids.contains("declared"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_direction_agent_status_unknown_is_indeterminate_not_fatal() {
+        for body in [
+            None,
+            Some(""),
+            Some("[agent]\n"),
+            Some("[agent]\nstatus = \"retired_maybe\""), // unrecognised value
+            Some("[agent]\nstatus = 3\n"),               // wrong type
+            Some("agent = \"scalar\"\n"),
+            Some("not toml [[["),
+        ] {
+            let home = home_with("a", body);
+            assert!(
+                agent_status_of(&home, "a").is_none(),
+                "indeterminate expected for {body:?}"
+            );
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        let home = home_with("a", Some("[agent]\nstatus = \"active\"\n"));
+        assert_eq!(
+            agent_status_of(&home, "a"),
+            Some(duduclaw_core::types::AgentStatus::Active)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_direction_computer_use_gate_is_fail_closed() {
+        // The gate reads `[capabilities] computer_use` through the shared
+        // parse point; everything except an explicit `true` must deny.
+        for (body, want) in [
+            ("", false),
+            ("[capabilities]\n", false),
+            ("[capabilities]\ncomputer_use = false\n", false),
+            ("[capabilities]\ncomputer_use = \"true\"\n", false), // wrong type
+            ("[capabilities]\ncomputer_use = 1\n", false),        // wrong type
+            ("capabilities = \"scalar\"\n", false),
+            ("not toml [[[", false),
+            ("[capabilities]\ncomputer_use = true\n", true),
+        ] {
+            assert_eq!(
+                duduclaw_core::agent_toml::parse(body).capabilities.computer_use,
+                want,
+                "for {body:?}"
+            );
+        }
     }
 }

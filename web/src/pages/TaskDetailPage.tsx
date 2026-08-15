@@ -402,20 +402,37 @@ export function TaskDetailPage() {
         </div>
 
         {/* WP-A (§2-6): the one decision surface for a 等你決定 task, identical to
-            the inbox's — reason first, then the same three choices. */}
+            the inbox's — reason first, then the same three choices.
+            I-1c: a task parked with `plan_pending` came from 想一想 mode —
+            same three buttons (重試 = 核准並開始執行 / 放棄 = 取消任務), but a
+            distinct heading + a dedicated plan card instead of the generic
+            「卡住原因」 line (which would otherwise duplicate the same text,
+            since the server also mirrors the plan into `judge_feedback` for
+            channel/legacy display surfaces). */}
         {needsHuman && (
           <section
             aria-label={intl.formatMessage({ id: 'taskStatus.needs_human' })}
             className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4"
           >
             <p className="text-sm font-medium text-foreground">
-              {intl.formatMessage({ id: 'tasks.needsHuman.prompt' })}
+              {intl.formatMessage({
+                id: task.plan_pending ? 'tasks.planFirst.prompt' : 'tasks.needsHuman.prompt',
+              })}
             </p>
-            {task.judge_feedback && (
-              <p className="flex items-start gap-2 rounded-lg bg-surface px-3 py-2 text-xs text-muted-foreground">
-                <MessageSquareWarning className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-                <span>{task.judge_feedback}</span>
-              </p>
+            {task.plan_pending ? (
+              <div className="space-y-1.5 rounded-lg bg-surface px-3 py-2.5">
+                <p className="text-xs text-muted-foreground">
+                  {intl.formatMessage({ id: 'tasks.planFirst.hint' })}
+                </p>
+                <p className="whitespace-pre-wrap text-sm text-foreground">{task.plan_pending}</p>
+              </div>
+            ) : (
+              task.judge_feedback && (
+                <p className="flex items-start gap-2 rounded-lg bg-surface px-3 py-2 text-xs text-muted-foreground">
+                  <MessageSquareWarning className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+                  <span>{task.judge_feedback}</span>
+                </p>
+              )
             )}
             <NeedsHumanActions taskId={task.id} onResolved={fetchTasks} />
           </section>

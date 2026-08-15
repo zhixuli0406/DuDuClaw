@@ -5350,6 +5350,13 @@ impl MethodHandler {
                 self.handle_experts_install_draft(params).await
             }
 
+            // ── Inspiration gallery (P2-b, curated-only, admin only —
+            //    mirrors experts.catalog's license/premium-tree gate) ──
+            "gallery.list" => {
+                require_admin!();
+                self.handle_gallery_list().await
+            }
+
             // ── Cron (admin only) ────────────────────────────
             "cron.list" => {
                 require_admin!();
@@ -5883,6 +5890,7 @@ impl MethodHandler {
             // WP-F (P2-c): per-task file-change evidence for the needs_human
             // 「變更」tab. Same read-only, task-scoped gate as tasks.comments.
             "tasks.changes" => self.handle_tasks_changes(params, ctx).await,
+            "tasks.artifacts" => self.handle_tasks_artifacts(params, ctx).await,
             "tasks.goal_decide" => self.handle_tasks_goal_decide(params, ctx).await,
             "tasks.goal_create" => self.handle_tasks_goal_create(params, ctx).await,
             "tasks.flow_metrics" => {
@@ -6506,6 +6514,7 @@ impl MethodHandler {
                     { "name": "experts.generate", "description": "LLM-generate a custom expert-pack draft from a guided form (admin)" },
                     { "name": "experts.generate_revise", "description": "Regenerate an expert-pack draft with feedback (admin, max 5 rounds)" },
                     { "name": "experts.install_draft", "description": "Install a generated expert-pack draft via the full security pipeline (admin)" },
+                    { "name": "gallery.list", "description": "List curated inspiration-gallery cards (team task examples) for one-click remake (admin)" },
                     { "name": "mcp.install_request", "description": "File an MCP install request for approval (non-admin)" },
                     { "name": "install_requests.list", "description": "List install requests actionable by the caller (manager+)" },
                     { "name": "install_requests.mine", "description": "The caller's own install requests + status" },
@@ -17882,6 +17891,38 @@ impl MethodHandler {
         )
     }
 
+    // ── Inspiration gallery (P2-b "一鍵做同款", curated-only MVP) ──
+
+    /// `gallery.list` — read-only fan-out of the same `team.toml` task
+    /// examples `experts.catalog` already reads (`expert_generate::
+    /// gallery_cards`), reformatted as one showcase card per example instead
+    /// of grouped under its team. No new storage: this assembles straight
+    /// from the builtin catalog's source data on every call. Same
+    /// license/deployment gating as `experts.catalog` (same underlying
+    /// premium tree) — `present_but_locked` lets the dashboard show an
+    /// upsell instead of an empty grid.
+    ///
+    /// Deliberately NOT included in this MVP wave (tracked in the P2-b design
+    /// doc): user-submitted "我的" gallery entries from real completed goal
+    /// runs — that depends on artifact objectification (I-2b), which has not
+    /// shipped yet.
+    async fn handle_gallery_list(&self) -> WsFrame {
+        let unlocked = self.premium_templates_unlocked().await;
+        let dir = crate::premium_templates::find_premium_templates_dir();
+        let records = crate::expert_admin::list_records(&self.home_dir);
+        let gallery = crate::expert_generate::gallery_cards(dir.as_deref(), &records);
+        let deployed = gallery["deployed"].as_bool().unwrap_or(false);
+        WsFrame::ok_response(
+            "",
+            json!({
+                "deployed": deployed,
+                "unlocked": unlocked,
+                "present_but_locked": deployed && !unlocked,
+                "cards": if unlocked { gallery["cards"].clone() } else { json!([]) },
+            }),
+        )
+    }
+
     /// `experts.install_builtin` — convert (cached, idempotent) + install one
     /// built-in industry pack. Both steps reuse the CLI pipelines via
     /// subprocess: `expert convert-teams` then `expert install` (full
@@ -18290,6 +18331,7 @@ impl MethodHandler {
                 match content.parse::<toml::Table>() {
                     Ok(mut table) => {
                         Self::mask_sensitive_fields(&mut table);
+                        Self::mask_keyed_secret_tables(&mut table);
                         let masked =
                             toml::to_string_pretty(&table).unwrap_or_else(|_| content.clone());
                         WsFrame::ok_response(
@@ -22066,20 +22108,17 @@ impl MethodHandler {
                                 None => continue,
                             };
                             dirs.insert(dir_name.clone());
-                            let Ok(content) = std::fs::read_to_string(path.join("agent.toml"))
+                            // Shared typed parse point (R2 unification): an
+                            // absent file, malformed TOML, an absent
+                            // `[agent]` table and an absent/wrong-typed
+                            // `name` all still skip this directory.
+                            let Some(name) = duduclaw_core::agent_toml::load(&path)
+                                .agent
+                                .and_then(|a| a.name)
                             else {
                                 continue;
                             };
-                            let Ok(table) = content.parse::<toml::Table>() else {
-                                continue;
-                            };
-                            let Some(name) = table
-                                .get("agent")
-                                .and_then(|a| a.get("name"))
-                                .and_then(|v| v.as_str())
-                            else {
-                                continue;
-                            };
+                            let name = name.as_str();
                             if let Some(existing_dir) = map.get(name) {
                                 if existing_dir != &dir_name {
                                     ambiguous.insert(name.to_string());
@@ -24182,6 +24221,37 @@ impl MethodHandler {
     /// dead end, so `[[accounts]]` entries, the standard shape for
     /// multi-account config, were never masked and their plaintext
     /// `oauth_token` was readable verbatim via the `system.config` RPC).
+    /// Mask secrets that live as **table key names** rather than as values.
+    ///
+    /// `[mcp_keys]` stores each API key as the section name
+    /// (`[mcp_keys."ddc_prod_…"]`) with only metadata as the value, so
+    /// [`Self::mask_sensitive_fields`] — which can only ever rewrite values —
+    /// rendered every internal MCP key verbatim through `system.config`
+    /// (credentials-doctrine design §1.4; that key is the gateway's own
+    /// admin-scope credential). Key names are rewritten with the same
+    /// `mask_mcp_key` dialect the dedicated `mcp_keys.list` RPC already uses,
+    /// so the two admin surfaces agree instead of contradicting each other.
+    ///
+    /// Masked names can collide (two keys sharing a prefix); a numeric suffix
+    /// keeps the rendered TOML valid and the entry count honest rather than
+    /// silently dropping a row.
+    fn mask_keyed_secret_tables(table: &mut toml::Table) {
+        let Some(mcp_keys) = table.get_mut("mcp_keys").and_then(|v| v.as_table_mut()) else {
+            return;
+        };
+        let original = std::mem::take(mcp_keys);
+        for (key, value) in original {
+            let base = mask_mcp_key(&key);
+            let mut name = base.clone();
+            let mut n = 2;
+            while mcp_keys.contains_key(&name) {
+                name = format!("{base}#{n}");
+                n += 1;
+            }
+            mcp_keys.insert(name, value);
+        }
+    }
+
     fn mask_sensitive_fields(table: &mut toml::Table) {
         let sensitive_patterns = ["token", "secret", "key", "password"];
         for (key, value) in table.iter_mut() {
@@ -27732,6 +27802,76 @@ impl MethodHandler {
         )
     }
 
+    /// I-2b `tasks.artifacts` — the deliverables a task produced, for the
+    /// detail page's 「產物」tab: 「東西在哪」, which the page previously could
+    /// not answer at all (走查 2 卡點 1).
+    ///
+    /// Read-only board evidence (Viewer), gated on the task's owning agent
+    /// exactly like `tasks.changes`. Two trails, one shape: rows the artifacts
+    /// ledger ties to this task id, plus deliverable-shaped file writes the
+    /// task's own change ledger recorded. Rows that only the (agent,
+    /// claim→review window) convention places here come back labelled
+    /// `attribution: "inferred"` so the UI can say so — an inference is never
+    /// dressed up as a fact, and no evidence yields an empty list.
+    async fn handle_tasks_artifacts(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        if task_id.is_empty() {
+            return WsFrame::error_response("", "task_id is required");
+        }
+        let task = match self
+            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+            .await
+        {
+            Ok(t) => t,
+            Err(f) => return f,
+        };
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(crate::artifacts::DEFAULT_QUERY_LIMIT);
+
+        let agent_id = task
+            .claimed_by
+            .clone()
+            .unwrap_or_else(|| task.assigned_to.clone());
+        let since = task
+            .claimed_at
+            .clone()
+            .unwrap_or_else(|| task.created_at.clone());
+        let until = task
+            .completed_at
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+        let evidence = crate::artifacts::collect_task_artifacts(
+            &self.home_dir,
+            task_id,
+            &agent_id,
+            &since,
+            &until,
+            limit,
+        );
+        let artifacts: Vec<Value> = evidence
+            .artifacts
+            .iter()
+            .map(|a| a.to_wire_json())
+            .collect();
+        WsFrame::ok_response(
+            "",
+            json!({
+                "artifacts": artifacts,
+                "truncated": evidence.truncated,
+                "inferred_count": evidence.inferred_count,
+            }),
+        )
+    }
+
     /// `tasks.goal_create` — assign an autonomous goal from the dashboard,
     /// with the SAME semantics as the channel `/goal` command
     /// (`chat_commands::handle_goal_create`): `goal_mode` task in `todo`,
@@ -27739,9 +27879,12 @@ impl MethodHandler {
     /// spec parsed fail-closed. Differences, both deliberate: `created_by`
     /// is `goal:dashboard` and there is no source conversation (progress
     /// and needs_human cards fall back to the agent's `[proactive]` notify
-    /// target, exactly like any channel-less goal). The optional planner
-    /// decomposition is chat-path-only for now. Operator access on the
-    /// target agent.
+    /// target, exactly like any channel-less goal). The optional LLMCompiler
+    /// sub-task decomposition (`goal_plan::planner_enabled`) is chat-path-only
+    /// for now. I-1c `plan_first` (dashboard-path only, see below) is a
+    /// different feature — a single-task narrative plan for human approval,
+    /// not a machine-parsed DAG — and the two are independent. Operator
+    /// access on the target agent.
     async fn handle_tasks_goal_create(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_id = params
             .get("agent_id")
@@ -27830,6 +27973,17 @@ impl MethodHandler {
             .get("require_beliefs")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // I-1c "想一想": dashboard AssignSheet's third execution mode
+        // (alongside 問一問 / 直接做, WorkBuddy Plan mode). `true` ⇒ generate a
+        // short human-readable plan and park the task for approval instead of
+        // letting the goal loop execute immediately — see the branch right
+        // before `insert_task` below. Default `false` keeps every existing
+        // caller (including the chat `/goal` command, which never sends this
+        // field) byte-identical.
+        let plan_first = params
+            .get("plan_first")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let store = match self.task_store().await {
             Ok(s) => s,
@@ -27880,6 +28034,31 @@ impl MethodHandler {
             );
         }
         task.risk_boundary = risk_boundary;
+
+        // I-1c "想一想": generate the plan and park the task `needs_human`
+        // instead of `todo` — runs synchronously here, same precedent as the
+        // chat `/goal` path's decomposer call in
+        // `chat_commands::try_decompose_goal`, so no dispatch-engine round
+        // (not even a restricted one) ever starts before a human approves.
+        // Fail-closed: a planner failure never falls through to the normal
+        // `todo` path — `apply_plan_first_result`'s `Err` branch still parks
+        // `needs_human`, under the `infra` pause class, for a human to retry
+        // or cancel.
+        if plan_first {
+            let criteria_for_plan = task.acceptance_criteria.as_deref().unwrap_or("");
+            let plan_result =
+                crate::goal_plan::generate_plan_first(&self.home_dir, &task.description, criteria_for_plan)
+                    .await;
+            if let Err(e) = &plan_result {
+                warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "goal plan-first: planner failed — parking needs_human (infra class) instead of auto-starting"
+                );
+            }
+            crate::goal_plan::apply_plan_first_result(&mut task, plan_result);
+        }
+
         if let Err(e) = store.insert_task(&task).await {
             return WsFrame::error_response("", &format!("create goal task: {e}"));
         }
@@ -27889,10 +28068,17 @@ impl MethodHandler {
                 event_type: "goal_loop.created".into(),
                 agent_id: agent_id.to_string(),
                 task_id: Some(task_id.clone()),
-                summary: format!(
-                    "儀表板指派目標任務「{}」",
-                    duduclaw_core::truncate_chars(&description, 60)
-                ),
+                summary: if plan_first {
+                    format!(
+                        "儀表板產生執行計畫「{}」，等待核准後才開始執行",
+                        duduclaw_core::truncate_chars(&description, 60)
+                    )
+                } else {
+                    format!(
+                        "儀表板指派目標任務「{}」",
+                        duduclaw_core::truncate_chars(&description, 60)
+                    )
+                },
                 timestamp: Utc::now().to_rfc3339(),
                 metadata: None,
             })
@@ -27905,6 +28091,10 @@ impl MethodHandler {
                 "task": task_row_to_json(&task),
                 "iteration_cap": cap,
                 "dispatch_enabled": dispatch_enabled,
+                // I-1c: lets the caller (AssignSheet) show "計畫已生成，等待
+                // 你核准" instead of the normal "已交辦" toast without having
+                // to re-derive it from `task.status`/`pause_reason`.
+                "plan_first": plan_first,
             }),
         )
     }
@@ -31374,6 +31564,11 @@ fn task_row_to_json(r: &TaskRow) -> Value {
         "pause_reason": (r.status == "needs_human").then(|| {
             crate::pause_reason::PauseReason::from_stored(r.pause_reason.as_deref()).as_str()
         }),
+        // I-1c "想一想": a generated plan awaiting approval. Scoped to
+        // `needs_human` the same defensive way as `pause_reason` above — the
+        // store already clears it after the first post-approval dispatch, but
+        // a stale value must never render on a task that is no longer paused.
+        "plan_pending": (r.status == "needs_human").then(|| r.plan_pending.clone()).flatten(),
     })
 }
 
@@ -36200,6 +36395,37 @@ mod d6_curation_tests {
         assert!(data["unlocked"].is_boolean());
     }
 
+    /// `gallery.list` is admin-only fail-closed, same as the `experts.*`
+    /// family it reads from (P2-b mirrors P2-a's license/deployment gate).
+    #[tokio::test]
+    async fn gallery_list_denies_non_admin() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext {
+            user_id: "m1".to_string(),
+            email: "m1@test.local".to_string(),
+            role: UserRole::Manager,
+            agent_access: std::collections::HashMap::new(),
+        };
+        let frame = handler.handle("gallery.list", json!({}), &ctx).await;
+        assert!(!frame_ok(&frame), "gallery.list must deny non-admin: {frame:?}");
+    }
+
+    /// `gallery.list` is fail-safe: a fresh home with no premium tree returns
+    /// an ok frame with an empty card list, never an error.
+    #[tokio::test]
+    async fn gallery_list_fail_safe_without_premium() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        let frame = handler.handle("gallery.list", json!({}), &ctx).await;
+        assert!(frame_ok(&frame), "gallery.list must not error: {frame:?}");
+        let data = frame_data(&frame);
+        assert!(data["cards"].is_array());
+        assert!(data["deployed"].is_boolean());
+        assert!(data["unlocked"].is_boolean());
+    }
+
     /// `experts.install_builtin` rejects unsafe industry slugs BEFORE license
     /// checks or any subprocess spawn (path-traversal fence).
     #[tokio::test]
@@ -36800,7 +37026,9 @@ mod channels_add_enc_only_tests {
         );
         let enc = tg["bot_token_enc"].as_str().unwrap();
         assert_eq!(
-            crate::config_crypto::resolve_agent_token(&Some(enc.to_string()), "", home.path(),),
+            crate::config_crypto::resolve_agent_token(&Some(enc.to_string()), "", home.path())
+                .map(|s| s.expose_owned())
+                .unwrap_or_default(),
             tg_token,
             "enc-only roundtrip must recover the original token"
         );
@@ -40929,5 +41157,62 @@ mod wp_h1_mask_sensitive_fields_tests {
             .and_then(|v| v.as_table())
             .unwrap();
         assert_eq!(odoo.get("api_key").and_then(|v| v.as_str()), Some("********"));
+    }
+
+    /// The second `system.config` leak from the same design section: the MCP
+    /// API key is the **table key name**, so a value-only mask never touched
+    /// it and `[mcp_keys."ddc_prod_…"]` rendered verbatim — and that key is the
+    /// gateway's own admin-scope credential.
+    #[test]
+    fn masks_mcp_key_table_names() {
+        let mut table = parse(
+            r#"
+            [mcp_keys.ddc_prod_a1b2c3d4e5f6]
+            scopes = ["admin"]
+            created = "2026-08-15"
+            "#,
+        );
+        MethodHandler::mask_sensitive_fields(&mut table);
+        MethodHandler::mask_keyed_secret_tables(&mut table);
+
+        let rendered = toml::to_string_pretty(&table).unwrap();
+        assert!(
+            !rendered.contains("ddc_prod_a1b2c3d4e5f6"),
+            "full MCP key must not survive rendering: {rendered}"
+        );
+        let keys = table.get("mcp_keys").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(keys.len(), 1, "the entry itself must survive: {keys:?}");
+        // Metadata under the (now masked) key is untouched.
+        let entry = keys.values().next().and_then(|v| v.as_table()).unwrap();
+        assert_eq!(entry.get("created").and_then(|v| v.as_str()), Some("2026-08-15"));
+    }
+
+    /// Two keys that mask to the same display form must not collapse into one
+    /// row — a silently vanishing credential is worse than a duplicate label.
+    #[test]
+    fn masked_mcp_key_collisions_keep_every_entry() {
+        let mut table = parse(
+            r#"
+            [mcp_keys.ddc_prod_aaaabbbbcccc]
+            scopes = ["admin"]
+
+            [mcp_keys.ddc_prod_aaaadddddddd]
+            scopes = ["read"]
+            "#,
+        );
+        MethodHandler::mask_keyed_secret_tables(&mut table);
+        let keys = table.get("mcp_keys").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(keys.len(), 2, "both entries must survive: {keys:?}");
+        let rendered = toml::to_string_pretty(&table).unwrap();
+        assert!(!rendered.contains("aaaabbbbcccc") && !rendered.contains("aaaadddddddd"));
+    }
+
+    /// No `[mcp_keys]` section is a no-op, not a panic.
+    #[test]
+    fn mask_keyed_secret_tables_is_a_no_op_without_the_section() {
+        let mut table = parse("[channels]\ntelegram_bot_token = \"x\"\n");
+        let before = table.clone();
+        MethodHandler::mask_keyed_secret_tables(&mut table);
+        assert_eq!(table, before);
     }
 }
