@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# H4/H5 (WP-B goal loop hardening): gap-fingerprint path:line extraction +
+# the bail-pattern regex panel. Already a direct dependency elsewhere in the
+# workspace (duduclaw-cli, duduclaw-security, duduclaw-redaction), so no new
+# transitive units.
+regex = "1"
 duduclaw-core = { workspace = true }
 duduclaw-auth = { workspace = true }
 duduclaw-agent = { workspace = true }

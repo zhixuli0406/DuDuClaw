@@ -116,6 +116,12 @@ pub struct MetricsRegistry {
     /// keyed by `rule_id` — never `rule_name`, which is operator-authored
     /// free text and must not become an unescaped Prometheus label.
     pub tick_wakes: RwLock<std::collections::HashMap<String, u64>>,
+
+    // ── H5 (WP-B goal loop hardening): bail-pattern panel telemetry ──
+    /// Premature-stop pattern hits, keyed by the fixed pattern name from
+    /// `goal_bail_detect::pattern_names()` (a closed, small, code-defined
+    /// set — safe to use directly as a Prometheus label, unlike free text).
+    pub goal_loop_bail_pattern: RwLock<std::collections::HashMap<String, u64>>,
 }
 
 const DURATION_BOUNDS_MS: [u64; 7] = [100, 250, 500, 1000, 2500, 5000, 10000];
@@ -192,6 +198,8 @@ impl MetricsRegistry {
             tick_screen_drop_total: AtomicU64::new(0),
             tick_screen_unavailable_total: AtomicU64::new(0),
             tick_wakes: RwLock::new(std::collections::HashMap::new()),
+
+            goal_loop_bail_pattern: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -264,6 +272,15 @@ impl MetricsRegistry {
     pub async fn tick_wake(&self, rule_id: &str) {
         let mut map = self.tick_wakes.write().await;
         *map.entry(rule_id.to_string()).or_insert(0) += 1;
+    }
+
+    // ── H5 (WP-B): bail-pattern panel telemetry ────────────────────────
+
+    /// Record one premature-stop pattern hit for `pattern` (one of
+    /// `goal_bail_detect::pattern_names()`).
+    pub async fn goal_loop_bail_pattern_hit(&self, pattern: &str) {
+        let mut map = self.goal_loop_bail_pattern.write().await;
+        *map.entry(pattern.to_string()).or_insert(0) += 1;
     }
 
     // ── PTY pool helpers (Phase 8 production-rollout observability) ───
@@ -718,6 +735,15 @@ impl MetricsRegistry {
             out.push_str(&format!("tick_wakes_total{{rule=\"{rule_id}\"}} {count}\n"));
         }
 
+        // ── H5 (WP-B): bail-pattern panel telemetry ──
+        out.push_str(
+            "# HELP goal_loop_bail_pattern_total Premature-stop pattern hits, by pattern name.\n",
+        );
+        out.push_str("# TYPE goal_loop_bail_pattern_total counter\n");
+        for (pattern, count) in self.goal_loop_bail_pattern.read().await.iter() {
+            out.push_str(&format!("goal_loop_bail_pattern_total{{pattern=\"{pattern}\"}} {count}\n"));
+        }
+
         out
     }
 }
@@ -1085,6 +1111,27 @@ mod tests {
         let map = r.tick_wakes.read().await;
         assert_eq!(map.get("rule-1"), Some(&2));
         assert_eq!(map.get("rule-2"), Some(&1));
+    }
+
+    // ── H5 (WP-B): bail-pattern panel telemetry ────────────────────────
+
+    #[tokio::test]
+    async fn goal_loop_bail_pattern_counts_by_pattern_name() {
+        let r = MetricsRegistry::new();
+        r.goal_loop_bail_pattern_hit("stopping_here").await;
+        r.goal_loop_bail_pattern_hit("stopping_here").await;
+        r.goal_loop_bail_pattern_hit("verdict_line").await;
+        let map = r.goal_loop_bail_pattern.read().await;
+        assert_eq!(map.get("stopping_here"), Some(&2));
+        assert_eq!(map.get("verdict_line"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn render_emits_goal_loop_bail_pattern_metric_labels() {
+        let r = MetricsRegistry::new();
+        r.goal_loop_bail_pattern_hit("giving_up").await;
+        let output = r.render().await;
+        assert!(output.contains("goal_loop_bail_pattern_total{pattern=\"giving_up\"} 1"));
     }
 
     #[tokio::test]

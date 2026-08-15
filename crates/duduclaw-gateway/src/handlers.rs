@@ -4435,6 +4435,35 @@ impl MethodHandler {
         true
     }
 
+    /// H6 (WP-B, `resume_on_restart`): boot-time reconciliation — see
+    /// `goal_loop::pause_inflight_on_restart` for the actual scan/escalate
+    /// logic (kept in `goal_loop.rs`; this method only supplies the store
+    /// handles it needs, mirroring how `respawn_goal_loop_driver` above
+    /// resolves them).
+    ///
+    /// **Deliberately called ONLY from the gateway boot path in
+    /// `server.rs`** — NEVER from `respawn_goal_loop_driver`'s hot-reload
+    /// call sites (`system.update_config`'s `[goal_loop]`/`[dispatch]`
+    /// reload branches). Those fire on every unrelated config edit while
+    /// the SAME process — and its already-tracked in-flight goals — keeps
+    /// running; conflating that with an actual process restart would
+    /// escalate live goals just because an operator tweaked an unrelated
+    /// setting, which is not what `resume_on_restart` means.
+    ///
+    /// No-op when the task store is unavailable yet, or when
+    /// `resume_on_restart` resolves to `Auto` (no longer the
+    /// `GoalLoopConfig` default since WP-E — see `goal_loop::ResumeOnRestart`)
+    /// — see `goal_loop::pause_inflight_on_restart`'s own no-op contract.
+    pub async fn pause_inflight_goal_tasks_on_restart(&self) -> usize {
+        let (Some(ts), Some(mq)) = (
+            self.task_store.read().await.clone(),
+            self.message_queue.read().await.clone(),
+        ) else {
+            return 0;
+        };
+        crate::goal_loop::pause_inflight_on_restart(ts, mq, &self.home_dir).await
+    }
+
     /// (Re)build and spawn the dispatch engine (zombie reclaim + goal-mode
     /// acceptance review) from current config. Shared by gateway startup and
     /// the `system.update_config` hot reload of `[dispatch] enabled` — gated
@@ -4462,7 +4491,18 @@ impl MethodHandler {
         };
         let judge: Arc<dyn crate::dispatch_engine::AcceptanceJudge> =
             Arc::new(crate::dispatch_engine::LlmAcceptanceJudge::new(caller));
+        // H1 two-stage adjudication: the cheap first-stage evaluator runs on
+        // the SAME utility choke-point as the panel (own caller instance — the
+        // judge consumed the first). Always wired; `[dispatch] two_stage_judge`
+        // (default true) is read at review time so the switch hot-reloads.
+        let evaluator: Arc<dyn crate::dispatch_engine::PreAcceptanceEvaluator> =
+            Arc::new(crate::dispatch_engine::LlmPreEvaluator::new(
+                crate::dispatch_engine::GoalAcceptanceCaller {
+                    home_dir: self.home_dir.clone(),
+                },
+            ));
         let mut builder = crate::dispatch_engine::DispatchEngine::new(ts, Some(judge))
+            .with_evaluator(evaluator)
             // WP4 GroundEval: fold `tool_calls.jsonl` evidence into the
             // goal-mode acceptance judge prompt.
             .with_home_dir(self.home_dir.clone())
@@ -5827,6 +5867,9 @@ impl MethodHandler {
             // a bound agent (check_agent_filter) and filters the result to it.
             "tasks.iterations" => self.handle_tasks_iterations(params, ctx).await,
             "tasks.timeline" => self.handle_tasks_timeline(params, ctx).await,
+            // WP-F (P2-c): per-task file-change evidence for the needs_human
+            // 「變更」tab. Same read-only, task-scoped gate as tasks.comments.
+            "tasks.changes" => self.handle_tasks_changes(params, ctx).await,
             "tasks.goal_decide" => self.handle_tasks_goal_decide(params, ctx).await,
             "tasks.goal_create" => self.handle_tasks_goal_create(params, ctx).await,
             "tasks.flow_metrics" => {
@@ -21275,7 +21318,14 @@ impl MethodHandler {
             }
         }
 
-        // [goal_loop] planner_enabled (easy) / iteration_cap_simple (hard)
+        // [goal_loop] planner_enabled (easy) / iteration_cap_simple (hard) /
+        // resume_on_restart (WP-E — boot-only read, neither hot-reloaded nor
+        // "easy": `GoalLoopConfig::from_home` / `pause_inflight_on_restart`
+        // are only consulted at gateway boot, never on a config hot-reload —
+        // see `goal_loop.rs`'s own doc comment on that function. So this
+        // write persists but deliberately does NOT set `applied_immediate`
+        // or any `reload_*` flag, same posture as the G.1 gateway.bind/port
+        // "restart required" fields above.
         if let Some(gl) = params.get("goal_loop").and_then(|v| v.as_object()) {
             let section = table
                 .entry("goal_loop")
@@ -21300,6 +21350,27 @@ impl MethodHandler {
                 );
                 changes.push(format!("goal_loop.iteration_cap_simple = {v} (hot reload)"));
                 reload_goal_loop = true;
+            }
+            // Fail-closed whitelist: exactly "auto" or "pause", nothing else
+            // — an unrecognized value must be rejected at write time here,
+            // not silently degrade later at `ResumeOnRestart::from_str_lenient`
+            // read time (that lenient fallback exists for hand-edited
+            // config.toml, not for a value this RPC itself just accepted).
+            if let Some(v) = gl.get("resume_on_restart").and_then(|v| v.as_str()) {
+                match v {
+                    "auto" | "pause" => {
+                        section.insert("resume_on_restart".into(), toml::Value::String(v.into()));
+                        changes.push(format!(
+                            "goal_loop.resume_on_restart = \"{v}\" (takes effect on next gateway restart)"
+                        ));
+                    }
+                    _ => {
+                        return WsFrame::error_response(
+                            "",
+                            "Invalid goal_loop.resume_on_restart. Valid: auto, pause",
+                        );
+                    }
+                }
             }
         }
 
@@ -21511,7 +21582,7 @@ impl MethodHandler {
         if changes.is_empty() {
             return WsFrame::error_response(
                 "",
-                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map)",
+                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple/resume_on_restart), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map)",
             );
         }
 
@@ -23913,20 +23984,45 @@ impl MethodHandler {
     }
 
     /// Mask sensitive values (tokens, secrets, keys) in a TOML table.
+    ///
+    /// Recurses into nested tables, arrays, and arrays-of-tables (e.g.
+    /// `[[accounts]]`) so a plaintext `oauth_token` living inside an
+    /// array-of-tables can't slip through unmasked (WP-H1: previously only
+    /// `toml::Value::Table` was recursed into — `toml::Value::Array` was a
+    /// dead end, so `[[accounts]]` entries, the standard shape for
+    /// multi-account config, were never masked and their plaintext
+    /// `oauth_token` was readable verbatim via the `system.config` RPC).
     fn mask_sensitive_fields(table: &mut toml::Table) {
         let sensitive_patterns = ["token", "secret", "key", "password"];
         for (key, value) in table.iter_mut() {
             let is_sensitive = sensitive_patterns
                 .iter()
                 .any(|p| key.to_lowercase().contains(p));
-            match value {
-                toml::Value::String(s) if is_sensitive && !s.is_empty() => {
-                    // Fully mask sensitive values — do NOT leak any prefix chars (MCP-M7)
-                    *s = "********".to_string();
-                }
-                toml::Value::Table(t) => Self::mask_sensitive_fields(t),
-                _ => {}
+            Self::mask_toml_value(value, is_sensitive);
+        }
+    }
+
+    /// Recursive helper for [`Self::mask_sensitive_fields`]. `is_sensitive`
+    /// reflects whether the *containing key* matched a sensitive pattern —
+    /// it gates whether a scalar (or array of scalars) directly under that
+    /// key gets masked. Tables and arrays-of-tables are always recursed
+    /// into regardless of `is_sensitive`: each nested table judges its own
+    /// keys independently one level down, which is what lets `[[accounts]]`
+    /// entries get their `oauth_token` masked even though the `accounts`
+    /// key itself isn't sensitive.
+    fn mask_toml_value(value: &mut toml::Value, is_sensitive: bool) {
+        match value {
+            toml::Value::String(s) if is_sensitive && !s.is_empty() => {
+                // Fully mask sensitive values — do NOT leak any prefix chars (MCP-M7)
+                *s = "********".to_string();
             }
+            toml::Value::Table(t) => Self::mask_sensitive_fields(t),
+            toml::Value::Array(arr) => {
+                for v in arr.iter_mut() {
+                    Self::mask_toml_value(v, is_sensitive);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -27385,6 +27481,67 @@ impl MethodHandler {
         }
     }
 
+    /// WP-F (P2-c) `tasks.changes` — the file-change evidence behind the
+    /// dashboard's 「變更」tab: what this task's rounds actually wrote / edited /
+    /// deleted, so a human deciding a `needs_human` escalation reviews the
+    /// recorded effects instead of the agent's narrative. Read-only board
+    /// evidence (Viewer), gated on the task's owning agent inside the handler
+    /// exactly like `tasks.comments` / `tasks.iterations`.
+    ///
+    /// Attribution: the native half is keyed by task id (persisted per
+    /// dispatch round by `task_changes::record_round_changes`); the MCP-audit
+    /// half reuses the claim→review window convention `dispatch_engine` uses
+    /// for the judge's `<tool_activity>` block. No evidence ⇒ an empty list —
+    /// the tab says so rather than inventing a summary.
+    async fn handle_tasks_changes(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let store = match self.task_store().await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        if task_id.is_empty() {
+            return WsFrame::error_response("", "task_id is required");
+        }
+        let task = match self
+            .authorize_task_access(&store, ctx, task_id, AccessLevel::Viewer)
+            .await
+        {
+            Ok(t) => t,
+            Err(f) => return f,
+        };
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(crate::task_changes::DEFAULT_QUERY_LIMIT);
+
+        let agent_id = task.claimed_by.clone().unwrap_or_else(|| task.assigned_to.clone());
+        let since = task.claimed_at.clone().unwrap_or_else(|| task.created_at.clone());
+        let until = task
+            .completed_at
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+        let evidence = crate::task_changes::collect_task_changes(
+            &self.home_dir,
+            task_id,
+            &agent_id,
+            &since,
+            &until,
+            limit,
+        );
+        let changes: Vec<Value> = evidence.changes.iter().map(|c| c.to_wire_json()).collect();
+        WsFrame::ok_response(
+            "",
+            json!({
+                "changes": changes,
+                "distinct_paths": evidence.distinct_paths,
+                "truncated": evidence.truncated,
+            }),
+        )
+    }
+
     /// `tasks.goal_create` — assign an autonomous goal from the dashboard,
     /// with the SAME semantics as the channel `/goal` command
     /// (`chat_commands::handle_goal_create`): `goal_mode` task in `todo`,
@@ -27517,7 +27674,12 @@ impl MethodHandler {
         if require_beliefs {
             acceptance_criteria.push_str("；至少一筆 belief_submit 申報且已知結果者皆已結算");
         }
-        task.acceptance_criteria = Some(acceptance_criteria);
+        task.acceptance_criteria = Some(acceptance_criteria.clone());
+        // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D): same
+        // immutable-baseline snapshot as the chat `/goal` path
+        // (`chat_commands::handle_goal_create`) — the judge reads this
+        // column, never the mutable `acceptance_criteria` field.
+        task.acceptance_criteria_baseline = Some(acceptance_criteria);
         if let Some(tag) = &outcome_tag {
             task.tags = tag.clone();
         }
@@ -30946,6 +31108,9 @@ fn task_row_to_json(r: &TaskRow) -> Value {
         // invisible.
         "goal_mode": r.goal_mode,
         "acceptance_criteria": r.acceptance_criteria,
+        // H9-G goal contract freeze: the immutable snapshot taken at goal
+        // creation, when one exists (see `TaskRow::acceptance_criteria_baseline`).
+        "acceptance_criteria_baseline": r.acceptance_criteria_baseline,
         "result_summary": r.result_summary,
         "retry_count": r.retry_count,
         "max_retries": r.max_retries,
@@ -35578,6 +35743,80 @@ mod d6_curation_tests {
         );
     }
 
+    /// WP-E: `[goal_loop] resume_on_restart` whitelist accepts exactly
+    /// "auto"/"pause" and persists the exact value `GoalLoopConfig::from_home`
+    /// reads back — this is a boot-only-read field (see the doc comment on
+    /// the write-site above), so it must persist WITHOUT being flagged as
+    /// `applied` or `hot_reloaded` (unlike the "easy"/"hard" knobs in the
+    /// same section).
+    #[tokio::test]
+    async fn system_update_config_resume_on_restart_accepts_auto_and_pause() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        let frame = handler
+            .handle_system_update_config(json!({ "goal_loop": { "resume_on_restart": "pause" } }))
+            .await;
+        assert!(frame_ok(&frame), "\"pause\" must be accepted: {frame:?}");
+        let data = frame_data(&frame);
+        assert_eq!(
+            data.get("applied").and_then(|v| v.as_bool()),
+            Some(false),
+            "resume_on_restart alone must not be reported as live-applied — it only takes effect on next gateway restart"
+        );
+        let hot: Vec<String> = data
+            .get("hot_reloaded")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(hot.is_empty(), "resume_on_restart must never trigger a driver hot reload: {hot:?}");
+
+        let cfg: toml::Table = std::fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(cfg["goal_loop"]["resume_on_restart"].as_str(), Some("pause"));
+        assert_eq!(
+            crate::goal_loop::GoalLoopConfig::from_home(home.path()).resume_on_restart(),
+            crate::goal_loop::ResumeOnRestart::Pause
+        );
+
+        // Round-trips back to "auto" too.
+        let frame = handler
+            .handle_system_update_config(json!({ "goal_loop": { "resume_on_restart": "auto" } }))
+            .await;
+        assert!(frame_ok(&frame), "\"auto\" must be accepted: {frame:?}");
+        assert_eq!(
+            crate::goal_loop::GoalLoopConfig::from_home(home.path()).resume_on_restart(),
+            crate::goal_loop::ResumeOnRestart::Auto
+        );
+    }
+
+    /// WP-E: any value other than exactly "auto"/"pause" is rejected
+    /// fail-closed at write time, and — matching the sibling dispatch.policy
+    /// / iteration_cap_simple / window_secs rejection test above — a
+    /// rejected payload must not create config.toml at all.
+    #[tokio::test]
+    async fn system_update_config_rejects_bad_resume_on_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        for bad in ["Auto", "PAUSE", "pausing", "", "auto ", " pause", "yes", "true"] {
+            let frame = handler
+                .handle_system_update_config(json!({ "goal_loop": { "resume_on_restart": bad } }))
+                .await;
+            assert!(
+                !frame_ok(&frame),
+                "resume_on_restart={bad:?} must be rejected (whitelist is exactly auto/pause, no case-folding)"
+            );
+        }
+
+        assert!(
+            !home.path().join("config.toml").exists(),
+            "no partial write on validation failure"
+        );
+    }
+
     /// `[belief] flat_band_pct` / `tick_subject_map` round-trip: persists to
     /// config.toml, `BeliefConfig::from_home` reads the exact same shape back
     /// (proving the write is what the settlement path actually consumes).
@@ -40024,5 +40263,246 @@ mod resident_sensing_dashboard_tests {
             p["records"].as_array().unwrap().len(),
             crate::tick_source::TICK_RECENT_RPC_LIMIT
         );
+    }
+}
+
+/// H9-G goal contract freeze (harness-borrowings 2026-08 WP-D): `tasks.goal_create`
+/// (dashboard RPC) freezes an immutable acceptance-criteria baseline at
+/// creation time; the dashboard/operator `tasks.update` RPC may still edit the
+/// mutable copy — distinct from the agent-facing MCP `tasks_update` tool
+/// (`duduclaw-cli::mcp::handle_tasks_update`), which refuses that same edit
+/// on a `goal_mode` task.
+#[cfg(test)]
+mod goal_contract_freeze_tests {
+    use super::*;
+
+    fn admin_ctx() -> UserContext {
+        UserContext::admin_fallback()
+    }
+
+    fn payload(frame: &WsFrame) -> Value {
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(p), .. } => p.clone(),
+            WsFrame::Response { ok: false, error, .. } => {
+                panic!("RPC returned an error frame: {error:?}")
+            }
+            other => panic!("unexpected frame shape: {other:?}"),
+        }
+    }
+
+    /// `MethodHandler::new` leaves `task_store` unset (`RwLock::new(None)`) —
+    /// production wires it via `set_task_store` during gateway boot
+    /// (`server.rs`). Every test in this module needs the same wiring.
+    async fn handler_with_task_store(home: &std::path::Path) -> MethodHandler {
+        let handler = MethodHandler::new(home.to_path_buf()).await;
+        handler
+            .set_task_store(Arc::new(TaskStore::open(home).unwrap()))
+            .await;
+        handler
+    }
+
+    #[tokio::test]
+    async fn goal_create_freezes_an_immutable_baseline() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_task_store(home.path()).await;
+        let frame = handler
+            .handle_tasks_goal_create(
+                json!({
+                    "agent_id": "agent-x",
+                    "description": "整理報表",
+                    "acceptance_criteria": "含營收圖表",
+                }),
+                &admin_ctx(),
+            )
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["task"]["acceptance_criteria"], "含營收圖表");
+        assert_eq!(
+            p["task"]["acceptance_criteria_baseline"], "含營收圖表",
+            "baseline must be frozen to the same value at creation: {p}"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_create_without_explicit_criteria_still_freezes_the_goal_text_as_baseline() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_task_store(home.path()).await;
+        let frame = handler
+            .handle_tasks_goal_create(
+                json!({ "agent_id": "agent-x", "description": "整理報表" }),
+                &admin_ctx(),
+            )
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["task"]["acceptance_criteria"], "整理報表");
+        assert_eq!(p["task"]["acceptance_criteria_baseline"], "整理報表");
+    }
+
+    #[tokio::test]
+    async fn operator_can_edit_the_mutable_acceptance_criteria_via_tasks_update() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_task_store(home.path()).await;
+        let created = payload(
+            &handler
+                .handle_tasks_goal_create(
+                    json!({
+                        "agent_id": "agent-y",
+                        "description": "整理報表",
+                        "acceptance_criteria": "含營收圖表",
+                    }),
+                    &admin_ctx(),
+                )
+                .await,
+        );
+        let task_id = created["task"]["id"].as_str().unwrap();
+
+        let updated = payload(
+            &handler
+                .handle_tasks_update(
+                    json!({
+                        "task_id": task_id,
+                        "acceptance_criteria": "含營收圖表與客訴摘要",
+                    }),
+                    &admin_ctx(),
+                )
+                .await,
+        );
+        assert_eq!(
+            updated["task"]["acceptance_criteria"], "含營收圖表與客訴摘要",
+            "an operator via the dashboard RPC may edit the mutable copy: {updated}"
+        );
+        assert_eq!(
+            updated["task"]["acceptance_criteria_baseline"], "含營收圖表",
+            "the frozen baseline must stay untouched even when an operator edits \
+             the mutable field: {updated}"
+        );
+    }
+}
+
+/// WP-H1 (credentials doctrine 2026-08): `mask_sensitive_fields` must recurse
+/// into arrays and arrays-of-tables, not just nested tables — otherwise a
+/// plaintext `oauth_token` inside `[[accounts]]` (the standard shape for
+/// multi-account config) survives the mask and is readable verbatim via the
+/// `system.config` dashboard RPC.
+#[cfg(test)]
+mod wp_h1_mask_sensitive_fields_tests {
+    use super::*;
+
+    fn parse(toml_str: &str) -> toml::Table {
+        toml_str.parse::<toml::Table>().expect("valid toml fixture")
+    }
+
+    #[test]
+    fn masks_oauth_token_inside_array_of_tables() {
+        let mut table = parse(
+            r#"
+            [[accounts]]
+            id = "acct-1"
+            oauth_token = "sk-live-plaintext-secret"
+            label = "Primary"
+
+            [[accounts]]
+            id = "acct-2"
+            oauth_token = "sk-live-another-secret"
+            "#,
+        );
+        MethodHandler::mask_sensitive_fields(&mut table);
+
+        let accounts = table.get("accounts").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(accounts.len(), 2);
+        for acc in accounts {
+            let t = acc.as_table().unwrap();
+            assert_eq!(
+                t.get("oauth_token").and_then(|v| v.as_str()),
+                Some("********"),
+                "oauth_token inside [[accounts]] must be masked: {t:?}"
+            );
+            assert!(
+                t.get("id").and_then(|v| v.as_str()).is_some(),
+                "non-sensitive fields must survive: {t:?}"
+            );
+        }
+        assert_eq!(
+            accounts[0]
+                .as_table()
+                .unwrap()
+                .get("label")
+                .and_then(|v| v.as_str()),
+            Some("Primary"),
+            "non-sensitive fields must not be masked"
+        );
+    }
+
+    #[test]
+    fn masks_sensitive_key_nested_two_tables_deep() {
+        let mut table = parse(
+            r#"
+            [channels.telegram]
+            bot_token = "123456:ABC-plaintext"
+            chat_id = "789"
+            "#,
+        );
+        MethodHandler::mask_sensitive_fields(&mut table);
+        let telegram = table
+            .get("channels")
+            .and_then(|v| v.as_table())
+            .and_then(|c| c.get("telegram"))
+            .and_then(|v| v.as_table())
+            .unwrap();
+        assert_eq!(
+            telegram.get("bot_token").and_then(|v| v.as_str()),
+            Some("********")
+        );
+        assert_eq!(telegram.get("chat_id").and_then(|v| v.as_str()), Some("789"));
+    }
+
+    #[test]
+    fn masks_sensitive_key_holding_array_of_strings() {
+        let mut table = parse(
+            r#"
+            api_keys = ["key-one", "key-two"]
+            names = ["alice", "bob"]
+            "#,
+        );
+        MethodHandler::mask_sensitive_fields(&mut table);
+        let keys = table.get("api_keys").and_then(|v| v.as_array()).unwrap();
+        for k in keys {
+            assert_eq!(k.as_str(), Some("********"));
+        }
+        let names = table.get("names").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(names[0].as_str(), Some("alice"));
+        assert_eq!(names[1].as_str(), Some("bob"));
+    }
+
+    #[test]
+    fn leaves_empty_sensitive_string_unmasked() {
+        // Matches pre-existing behavior: an unset (empty string) secret is
+        // left as-is rather than replaced with "********", which would
+        // falsely imply a secret is configured.
+        let mut table = parse(r#"password = """#);
+        MethodHandler::mask_sensitive_fields(&mut table);
+        assert_eq!(table.get("password").and_then(|v| v.as_str()), Some(""));
+    }
+
+    #[test]
+    fn masks_table_nested_inside_array_of_tables_entry() {
+        let mut table = parse(
+            r#"
+            [[agents]]
+            id = "agent-1"
+
+            [agents.odoo]
+            api_key = "plaintext-odoo-key"
+            "#,
+        );
+        MethodHandler::mask_sensitive_fields(&mut table);
+        let agents = table.get("agents").and_then(|v| v.as_array()).unwrap();
+        let odoo = agents[0]
+            .as_table()
+            .unwrap()
+            .get("odoo")
+            .and_then(|v| v.as_table())
+            .unwrap();
+        assert_eq!(odoo.get("api_key").and_then(|v| v.as_str()), Some("********"));
     }
 }

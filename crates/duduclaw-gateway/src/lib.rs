@@ -274,6 +274,11 @@ pub mod night_llm;
 pub mod recent_actions;
 pub mod tool_activity;
 
+// WP-F (P2-c): durable per-task file-change evidence behind the dashboard's
+// needs_human 「變更」tab — persisted from the same native-tool collector,
+// merged with the MCP audit window at read time.
+pub mod task_changes;
+
 // ── D3 (LWM incident): per-agent authoritative working state — pinned
 //    key-value block + handoff note injected into every wake-up, updated
 //    only via explicit MCP tools with CAS supersession (ghost-memory fix,
@@ -300,6 +305,16 @@ pub mod goal_state;
 //        arXiv:2512.24156) — structural loop detection, replaces the old
 //        two-round identical-feedback oscillation guard ──
 pub mod goal_visit_graph;
+// ── H4 (WP-B): stagnation gap fingerprinting — extracts path:line citations
+//        + key tokens from judge rejection feedback and normalizes them so a
+//        reworded-but-same gap collapses to the same fingerprint, instead of
+//        the byte-identical text comparison `StateBlock::hash_input` alone
+//        would otherwise perform ──
+pub mod goal_gap_fingerprint;
+// ── H5 (WP-B): premature-stop ("bail") regex panel — zh+en anchored
+//        patterns compared against the last non-empty paragraph of an
+//        agent's completion text ──
+pub mod goal_bail_detect;
 // ── D4: pluggable dispatch policy (agent selection = data) + LLMCompiler-style
 //        goal decomposition (planner → dependency DAG) ──
 pub mod dispatch_policy;
