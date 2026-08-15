@@ -1663,6 +1663,45 @@ impl DispatchEngine {
                 None;
             let mut judge_feedback_for_settle: Option<String> = None;
             let mut new_confirmed_facts: Vec<String> = Vec::new();
+            // WP-5D: a verdict produced by a non-MAV seam implementation
+            // (today: `evaluator_only`'s `candidate_complete`). Set here and
+            // consumed by the ONE verdict-handling `match` below, so accept /
+            // reject / artifact-archiving / grant-revocation logic exists in
+            // exactly one place regardless of which judge produced it.
+            let mut preset_verdict: Option<AcceptanceVerdict> = None;
+
+            // ── WP-5D judge seam: which acceptance implementation adjudicates
+            // this task ("everything is a plugin" design §2 row 8 / §6-P1).
+            // Read HERE, per task, on exactly the same schedule as the
+            // pre-existing `[dispatch] two_stage_judge` below — one
+            // `config.toml` read per review, no second hot-reload mechanism,
+            // no `respawn_dispatch_engine` round-trip needed for a switch to
+            // take effect. `home_dir` absent (test / legacy construction
+            // paths) ⇒ `Mav` ⇒ everything below is byte-identical to the
+            // pre-seam flow.
+            let judge_mode = crate::judge_mode::JudgeMode::from_home(self.home_dir.as_deref());
+
+            // `human_only`: never machine-judged. Parked BEFORE any evidence
+            // work or LLM/subprocess call so the mode is also the cheapest.
+            // Uses the WP-A9 `observed_outcome` short-circuit (not a bare
+            // `continue`) so the A3 settle tail still records the escalation.
+            if judge_mode == crate::judge_mode::JudgeMode::HumanOnly {
+                let reason = "依 [dispatch] judge = \"human_only\" 設定，本部署不做機器驗收，\
+                              一律交由人工判定是否完成。"
+                    .to_string();
+                self.store
+                    .mark_needs_human_with_pause(
+                        &task.id,
+                        &reason,
+                        crate::pause_reason::PauseReason::BlockedNeedsDecision,
+                    )
+                    .await?;
+                self.revoke_task_grants(&task.id).await;
+                info!(task = %task.id, "judge seam: human_only → needs_human（不做機器驗收）");
+                observed_outcome =
+                    Some(crate::prediction::task_forward::ObservedOutcome::Escalated);
+                judge_feedback_for_settle = Some(reason);
+            }
 
             // ── WP2.4: deterministic outcome acceptance (BEFORE the judge) ──
             // A goal that declares a structured outcome contract (`json:` /
@@ -1675,7 +1714,13 @@ impl DispatchEngine {
             // `files:` assertions); a corrupt tag yields `None` and falls through
             // to the judge unchanged (the judge remains a backstop).
             let mut deterministic_note: Option<String> = None;
-            if let Some(home) = &self.home_dir {
+            // WP-5D: the `observed_outcome` half of this pattern is new —
+            // guarded like every later phase (the WP-A9 pattern) so the
+            // `human_only` short-circuit above cannot be overwritten by a
+            // deterministic verdict. In every other mode `observed_outcome`
+            // is unconditionally `None` at this point, so the guard is
+            // behavior-identical to the unguarded original.
+            if let (None, Some(home)) = (observed_outcome, &self.home_dir) {
                 if let Some(spec) = crate::outcome_spec::OutcomeSpec::from_tags(&task.tags) {
                     let worker = task
                         .claimed_by
@@ -1834,9 +1879,47 @@ impl DispatchEngine {
             // evaluator is wired, or when `[dispatch] two_stage_judge = false`.
             // Every failure mode below degrades to the panel — never accepts,
             // never rejects on its own malfunction.
+            //
+            // WP-5D: under `[dispatch] judge = "evaluator_only"` this stage is
+            // no longer a *pre*-filter — it is the entire acceptance decision,
+            // and there is no panel behind it to degrade onto. So the two
+            // "evaluator not available" conditions that are harmless in `mav`
+            // mode (no evaluator wired / `two_stage_judge = false`) become a
+            // fail-closed `needs_human` here: an unavailable judge must never
+            // read as an unopposed pass.
             if observed_outcome.is_none() {
-                if let Some(evaluator) = &self.evaluator {
-                    if TwoStageJudgeConfig::from_home(self.home_dir.as_deref()).enabled {
+                let two_stage_enabled =
+                    TwoStageJudgeConfig::from_home(self.home_dir.as_deref()).enabled;
+                let evaluator_usable = self.evaluator.is_some() && two_stage_enabled;
+                if judge_mode == crate::judge_mode::JudgeMode::EvaluatorOnly && !evaluator_usable {
+                    let reason = format!(
+                        "[dispatch] judge = \"evaluator_only\" 但第一階段評估器不可用（\
+                         evaluator_wired={}, two_stage_judge={}）——本模式沒有 MAV 判官可退回，\
+                         依 fail-closed 交由人工驗收。",
+                        self.evaluator.is_some(),
+                        two_stage_enabled
+                    );
+                    warn!(task = %task.id, "judge seam: evaluator_only 不可用 → needs_human（fail-closed）");
+                    crate::judge_mode::log_judge_seam_event(
+                        self.home_dir.as_deref(),
+                        &task.claimed_by.clone().unwrap_or_else(|| task.assigned_to.clone()),
+                        "judge_seam_unavailable",
+                        judge_mode,
+                        &reason,
+                    );
+                    self.store
+                        .mark_needs_human_with_pause(
+                            &task.id,
+                            &reason,
+                            crate::pause_reason::PauseReason::Infra,
+                        )
+                        .await?;
+                    self.revoke_task_grants(&task.id).await;
+                    observed_outcome =
+                        Some(crate::prediction::task_forward::ObservedOutcome::Escalated);
+                    judge_feedback_for_settle = Some(reason);
+                } else if let Some(evaluator) = &self.evaluator {
+                    if two_stage_enabled {
                         let transcript = build_evaluator_transcript(&[
                             ("worker_result", result.as_str()),
                             ("tool_activity", tool_activity_body.as_deref().unwrap_or("")),
@@ -1905,23 +1988,95 @@ impl DispatchEngine {
                                     judge_feedback_for_settle = Some(reason);
                                 }
                                 PreDecision::CandidateComplete => {
-                                    debug!(
-                                        task = %task.id,
-                                        "兩段式裁決：第一階段判定為完成候選 → 交由 MAV 判官"
-                                    );
+                                    // WP-5D: in `evaluator_only` this IS the
+                                    // acceptance decision — no panel follows.
+                                    // The verdict is handed to the shared
+                                    // verdict `match` below (rather than
+                                    // duplicating the accept path) and is
+                                    // labelled so nobody reading the round
+                                    // timeline mistakes a low-cost
+                                    // single-evaluator pass for a MAV panel
+                                    // verdict.
+                                    if judge_mode
+                                        == crate::judge_mode::JudgeMode::EvaluatorOnly
+                                    {
+                                        info!(
+                                            task = %task.id,
+                                            "judge seam: evaluator_only 第一階段判定完成候選 → 直接驗收通過（未經 MAV 判官）"
+                                        );
+                                        preset_verdict = Some(AcceptanceVerdict {
+                                            passed: true,
+                                            feedback: format!(
+                                                "驗收通過（[dispatch] judge = \"evaluator_only\" 低成本模式：\
+                                                 僅第一階段評估器裁決，未經 MAV 判官，驗收強度較弱）：{}",
+                                                ev.evidence
+                                            ),
+                                            // No panel ran ⇒ no aspects. Never
+                                            // fabricate a panel record.
+                                            aspects: None,
+                                        });
+                                    } else {
+                                        debug!(
+                                            task = %task.id,
+                                            "兩段式裁決：第一階段判定為完成候選 → 交由 MAV 判官"
+                                        );
+                                    }
                                 }
                             },
                             Ok(Err(e)) => {
-                                warn!(
-                                    task = %task.id, error = %e,
-                                    "兩段式裁決：第一階段評估失敗 → 降級直接走 MAV 判官（不影響裁決結果）"
-                                );
+                                // WP-5D: `mav` degrades to the panel (unchanged);
+                                // `evaluator_only` has nothing to degrade onto, so
+                                // an evaluator malfunction parks for a human.
+                                if judge_mode == crate::judge_mode::JudgeMode::EvaluatorOnly {
+                                    let reason = format!(
+                                        "[dispatch] judge = \"evaluator_only\"：第一階段評估失敗且無 MAV 判官可退回，\
+                                         依 fail-closed 交由人工驗收：{e}"
+                                    );
+                                    warn!(task = %task.id, error = %e, "judge seam: evaluator_only 評估失敗 → needs_human（fail-closed）");
+                                    self.store
+                                        .mark_needs_human_with_pause(
+                                            &task.id,
+                                            &reason,
+                                            crate::pause_reason::PauseReason::Infra,
+                                        )
+                                        .await?;
+                                    self.revoke_task_grants(&task.id).await;
+                                    observed_outcome = Some(
+                                        crate::prediction::task_forward::ObservedOutcome::Escalated,
+                                    );
+                                    judge_feedback_for_settle = Some(reason);
+                                } else {
+                                    warn!(
+                                        task = %task.id, error = %e,
+                                        "兩段式裁決：第一階段評估失敗 → 降級直接走 MAV 判官（不影響裁決結果）"
+                                    );
+                                }
                             }
                             Err(_) => {
-                                warn!(
-                                    task = %task.id, secs = EVALUATOR_TIMEOUT_SECS,
-                                    "兩段式裁決：第一階段評估逾時 → 降級直接走 MAV 判官（不影響裁決結果）"
-                                );
+                                if judge_mode == crate::judge_mode::JudgeMode::EvaluatorOnly {
+                                    let reason = format!(
+                                        "[dispatch] judge = \"evaluator_only\"：第一階段評估逾時（{EVALUATOR_TIMEOUT_SECS}s）\
+                                         且無 MAV 判官可退回，依 fail-closed 交由人工驗收。"
+                                    );
+                                    warn!(task = %task.id, secs = EVALUATOR_TIMEOUT_SECS, "judge seam: evaluator_only 評估逾時 → needs_human（fail-closed）");
+                                    self.store
+                                        .mark_needs_human_with_pause(
+                                            &task.id,
+                                            &reason,
+                                            crate::pause_reason::PauseReason::Infra,
+                                        )
+                                        .await?;
+                                    self.revoke_task_grants(&task.id).await;
+                                    observed_outcome = Some(
+                                        crate::prediction::task_forward::ObservedOutcome::Escalated,
+                                    );
+                                    judge_feedback_for_settle = Some(reason);
+                                } else {
+                                    warn!(
+                                        task = %task.id, secs = EVALUATOR_TIMEOUT_SECS,
+                                        "兩段式裁決：第一階段評估逾時 → 降級直接走 MAV 判官（不影響裁決結果）"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1930,7 +2085,82 @@ impl DispatchEngine {
 
             // WP-A9: skipped once a prior phase already decided the outcome.
             if observed_outcome.is_none() {
-                match judge.judge(&criteria, &task_desc, &result).await {
+                // ── WP-5D judge seam: resolve THIS round's verdict ──
+                // Exactly one of three sources, and the `match` below (accept /
+                // reject / artifact archive / grant revocation / A3 settle) is
+                // shared by all of them:
+                //   1. `preset_verdict` — an earlier seam stage already decided
+                //      (today: `evaluator_only`'s `candidate_complete`).
+                //   2. `external` — an operator-configured subprocess. EVERY
+                //      defect (missing/malformed `judge_command`, spawn failure,
+                //      timeout, non-zero exit, unparseable verdict,
+                //      injection-flagged feedback) degrades to the MAV panel and
+                //      is audited. A degrade is never a release: the strongest
+                //      verifier decides, exactly as in `mav`.
+                //   3. `mav` (default) — `judge.judge(...)`, byte-identical to
+                //      the pre-seam flow.
+                let verdict = match preset_verdict.take() {
+                    Some(v) => Ok(v),
+                    None if judge_mode == crate::judge_mode::JudgeMode::External => {
+                        let audit_agent = task
+                            .claimed_by
+                            .clone()
+                            .unwrap_or_else(|| task.assigned_to.clone());
+                        match crate::judge_mode::ExternalJudgeConfig::from_home(
+                            self.home_dir.as_deref(),
+                        ) {
+                            None => {
+                                let detail = "[dispatch] judge = \"external\" 但 judge_command 未設定或格式不合法 → 降級走 MAV 判官".to_string();
+                                warn!(task = %task.id, "judge seam: {detail}");
+                                crate::judge_mode::log_judge_seam_event(
+                                    self.home_dir.as_deref(),
+                                    &audit_agent,
+                                    "judge_seam_degraded",
+                                    judge_mode,
+                                    &detail,
+                                );
+                                judge.judge(&criteria, &task_desc, &result).await
+                            }
+                            Some(cfg) => {
+                                let ext =
+                                    crate::judge_mode::ExternalAcceptanceJudge::new(cfg);
+                                match ext
+                                    .judge_with_context(
+                                        &criteria,
+                                        &task_desc,
+                                        &result,
+                                        tool_activity_body.as_deref().unwrap_or(""),
+                                    )
+                                    .await
+                                {
+                                    Ok(v) => {
+                                        info!(
+                                            task = %task.id, passed = v.passed,
+                                            "judge seam: external 判官回傳裁決"
+                                        );
+                                        Ok(v)
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            task = %task.id, error = %e,
+                                            "judge seam: external 判官失敗 → 降級走 MAV 判官（降級不放行）"
+                                        );
+                                        crate::judge_mode::log_judge_seam_event(
+                                            self.home_dir.as_deref(),
+                                            &audit_agent,
+                                            "judge_seam_degraded",
+                                            judge_mode,
+                                            &e,
+                                        );
+                                        judge.judge(&criteria, &task_desc, &result).await
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => judge.judge(&criteria, &task_desc, &result).await,
+                };
+                match verdict {
                     Ok(v) if v.passed => {
                         let verdict_json = v
                             .aspects
@@ -5092,5 +5322,429 @@ mod tests {
 
         let captured = judge.captured_criteria.lock().unwrap().clone().unwrap();
         assert!(captured.contains("only mutable criteria present"), "{captured}");
+    }
+
+    // ── WP-5D: the judge seam, end to end through `review_goal_tasks` ────
+    //
+    // `judge_mode.rs`'s own unit tests cover parsing, the external subprocess
+    // contract, and feedback sanitization in isolation. These drive the real
+    // review loop so the *routing* is proven: which implementation is asked,
+    // whether the MAV panel was consulted, and where each failure lands.
+
+    /// Write `<home>/config.toml` with a `[dispatch]` body.
+    fn write_dispatch_config(home: &std::path::Path, body: &str) {
+        std::fs::write(home.join("config.toml"), format!("[dispatch]\n{body}\n")).unwrap();
+    }
+
+    /// Engine wired with home dir (so config is read), an accepting counting
+    /// judge, and an evaluator returning `candidate_complete`.
+    async fn seam_engine(
+        home: &std::path::Path,
+        store: Arc<TaskStore>,
+        evaluator_outcome: Result<PreEvaluation, String>,
+    ) -> (
+        DispatchEngine,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<StubPreEvaluator>,
+    ) {
+        let (judge, judge_calls) = accepting_counting_judge();
+        let evaluator = StubPreEvaluator::new(evaluator_outcome);
+        let engine = DispatchEngine::new(store, Some(judge))
+            .with_evaluator(evaluator.clone())
+            .with_home_dir(home.to_path_buf());
+        (engine, judge_calls, evaluator)
+    }
+
+    /// ① Default (no key) and an unrecognized value must BOTH land on `mav`:
+    /// the panel is consulted and its verdict is what settles the task. An
+    /// unknown value must never be read as "skip the expensive judge".
+    #[tokio::test]
+    async fn judge_seam_defaults_and_unknown_values_use_the_mav_panel() {
+        for body in ["enabled = true", "judge = \"chaos_monkey\"", "judge = \"mav\""] {
+            let dir = tempfile::tempdir().unwrap();
+            write_dispatch_config(dir.path(), body);
+            let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+            seed_review(&store, "sm1").await;
+
+            let (engine, judge_calls, evaluator) = seam_engine(
+                dir.path(),
+                store.clone(),
+                Ok(pre_eval(PreDecision::CandidateComplete, None)),
+            )
+            .await;
+            engine.tick_once().await.unwrap();
+
+            let t = store.get_task("sm1").await.unwrap().unwrap();
+            assert_eq!(t.status, "done", "body = {body}");
+            assert_eq!(
+                judge_calls.load(Ordering::SeqCst),
+                1,
+                "the MAV panel must decide in mav mode (body = {body})"
+            );
+            assert_eq!(evaluator.calls.load(Ordering::SeqCst), 1, "body = {body}");
+        }
+    }
+
+    /// ④ `mav` regression: an explicit `judge = "mav"` and a home dir with no
+    /// `[dispatch] judge` at all must produce byte-identical observable
+    /// outcomes (status, feedback, round counters) — the seam adds routing,
+    /// never behavior, in the default mode.
+    #[tokio::test]
+    async fn judge_seam_mav_is_byte_identical_to_the_pre_seam_flow() {
+        async fn run(body: Option<&str>) -> (String, String, i64, i64) {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(b) = body {
+                write_dispatch_config(dir.path(), b);
+            }
+            let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+            seed_review(&store, "mv1").await;
+            let judge = Arc::new(StubJudge {
+                outcome: Ok(AcceptanceVerdict {
+                    passed: false,
+                    feedback: "缺少測試".into(),
+                    aspects: None,
+                }),
+            });
+            let engine = DispatchEngine::new(store.clone(), Some(judge))
+                .with_home_dir(dir.path().to_path_buf());
+            engine.tick_once().await.unwrap();
+            let t = store.get_task("mv1").await.unwrap().unwrap();
+            (
+                t.status,
+                t.judge_feedback.unwrap_or_default(),
+                t.revision_round,
+                t.retry_count,
+            )
+        }
+        assert_eq!(run(None).await, run(Some("judge = \"mav\"")).await);
+    }
+
+    /// ② `evaluator_only` accepts on `candidate_complete` WITHOUT paying for
+    /// the panel, and labels the verdict as the weaker low-cost mode.
+    #[tokio::test]
+    async fn judge_seam_evaluator_only_accepts_without_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_dispatch_config(dir.path(), "judge = \"evaluator_only\"");
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "eo1").await;
+
+        let (engine, judge_calls, evaluator) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Ok(pre_eval(PreDecision::CandidateComplete, None)),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+
+        let t = store.get_task("eo1").await.unwrap().unwrap();
+        assert_eq!(t.status, "done");
+        assert_eq!(
+            judge_calls.load(Ordering::SeqCst),
+            0,
+            "evaluator_only must never pay for the MAV panel"
+        );
+        assert_eq!(evaluator.calls.load(Ordering::SeqCst), 1);
+        let fb = t.judge_feedback.unwrap_or_default();
+        assert!(
+            fb.contains("evaluator_only") && fb.contains("驗收強度較弱"),
+            "the accept must self-label as the weaker low-cost mode: {fb}"
+        );
+    }
+
+    /// ② `evaluator_only` still rejects/escalates exactly as before on the
+    /// evaluator's own `continue` / `blocked` verdicts (those paths are mode
+    /// independent — the mode only changes what `candidate_complete` means).
+    #[tokio::test]
+    async fn judge_seam_evaluator_only_keeps_continue_and_blocked_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_dispatch_config(dir.path(), "judge = \"evaluator_only\"");
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "eo2").await;
+        let (engine, judge_calls, _) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Ok(pre_eval(PreDecision::Continue, None)),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+        assert_eq!(
+            store.get_task("eo2").await.unwrap().unwrap().status,
+            "revising"
+        );
+        assert_eq!(judge_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// ② fail-closed: an evaluator that ERRORS under `evaluator_only` has no
+    /// panel to degrade onto, so the task parks for a human — it must never
+    /// read as an unopposed pass, and must not silently fall through to the
+    /// panel either (that would make the mode a lie).
+    #[tokio::test]
+    async fn judge_seam_evaluator_only_error_fails_closed_to_needs_human() {
+        let dir = tempfile::tempdir().unwrap();
+        write_dispatch_config(dir.path(), "judge = \"evaluator_only\"");
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "eo3").await;
+
+        let (engine, judge_calls, _) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Err("llm unreachable".into()),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+
+        let t = store.get_task("eo3").await.unwrap().unwrap();
+        assert_eq!(t.status, "needs_human");
+        assert_eq!(
+            judge_calls.load(Ordering::SeqCst),
+            0,
+            "a failed evaluator_only must not silently borrow the MAV panel"
+        );
+        assert_eq!(
+            t.pause_reason.as_deref(),
+            Some(crate::pause_reason::PauseReason::Infra.as_str())
+        );
+    }
+
+    /// ② fail-closed: `evaluator_only` with the evaluator switched off via
+    /// `[dispatch] two_stage_judge = false` leaves NO judge at all. It parks
+    /// for a human rather than accepting or quietly using the panel.
+    #[tokio::test]
+    async fn judge_seam_evaluator_only_without_a_usable_evaluator_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_dispatch_config(
+            dir.path(),
+            "judge = \"evaluator_only\"\ntwo_stage_judge = false",
+        );
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "eo4").await;
+
+        let (engine, judge_calls, evaluator) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Ok(pre_eval(PreDecision::CandidateComplete, None)),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+
+        let t = store.get_task("eo4").await.unwrap().unwrap();
+        assert_eq!(t.status, "needs_human");
+        assert_eq!(judge_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(evaluator.calls.load(Ordering::SeqCst), 0);
+
+        // And the same config WITHOUT the mode is unchanged: two_stage off in
+        // `mav` mode simply means "straight to the panel".
+        let dir2 = tempfile::tempdir().unwrap();
+        write_dispatch_config(dir2.path(), "two_stage_judge = false");
+        let store2 = Arc::new(TaskStore::open(dir2.path()).unwrap());
+        seed_review(&store2, "eo5").await;
+        let (engine2, judge_calls2, _) = seam_engine(
+            dir2.path(),
+            store2.clone(),
+            Ok(pre_eval(PreDecision::CandidateComplete, None)),
+        )
+        .await;
+        engine2.tick_once().await.unwrap();
+        assert_eq!(store2.get_task("eo5").await.unwrap().unwrap().status, "done");
+        assert_eq!(judge_calls2.load(Ordering::SeqCst), 1);
+    }
+
+    /// `human_only` (design §6-P1's third mode): never machine-judged, and it
+    /// must ACTUALLY stop the task — "必須真的攔下、不得自動放行".
+    #[tokio::test]
+    async fn judge_seam_human_only_never_auto_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        write_dispatch_config(dir.path(), "judge = \"human_only\"");
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "ho1").await;
+
+        let (engine, judge_calls, evaluator) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Ok(pre_eval(PreDecision::CandidateComplete, None)),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+
+        let t = store.get_task("ho1").await.unwrap().unwrap();
+        assert_eq!(t.status, "needs_human");
+        assert_eq!(judge_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            evaluator.calls.load(Ordering::SeqCst),
+            0,
+            "human_only must not pay for any model call"
+        );
+    }
+
+    // ── ③ external: success / timeout degrade / bad-JSON degrade ─────────
+    //
+    // Unix-only: these need a real spawnable test double. The production path
+    // itself is platform-neutral (`tokio::process::Command`); what is
+    // Unix-specific is the `#!/bin/sh` stand-in, not the code under test.
+
+    #[cfg(unix)]
+    fn judge_script(dir: &std::path::Path, name: &str, body: &str) -> String {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/sh\n{body}").unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn judge_seam_external_verdict_settles_the_task_without_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = judge_script(
+            dir.path(),
+            "ext-pass.sh",
+            "cat > /dev/null\necho '{\"pass\": true, \"feedback\": \"外部判官確認交付\"}'",
+        );
+        write_dispatch_config(
+            dir.path(),
+            &format!("judge = \"external\"\njudge_command = [\"{bin}\"]"),
+        );
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "ex1").await;
+
+        let (engine, judge_calls, _) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Ok(pre_eval(PreDecision::CandidateComplete, None)),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+
+        let t = store.get_task("ex1").await.unwrap().unwrap();
+        assert_eq!(t.status, "done");
+        assert_eq!(
+            judge_calls.load(Ordering::SeqCst),
+            0,
+            "a healthy external judge replaces the panel"
+        );
+        let fb = t.judge_feedback.unwrap_or_default();
+        assert!(fb.contains("外部判官確認交付"), "{fb}");
+        assert!(
+            fb.contains("未受信資料"),
+            "external feedback must carry its provenance label: {fb}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn judge_seam_external_rejection_settles_the_task_without_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = judge_script(
+            dir.path(),
+            "ext-fail.sh",
+            "cat > /dev/null\necho '{\"pass\": false, \"feedback\": \"驗收條件三未達成\"}'",
+        );
+        write_dispatch_config(
+            dir.path(),
+            &format!("judge = \"external\"\njudge_command = [\"{bin}\"]"),
+        );
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "ex2").await;
+
+        let (engine, judge_calls, _) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Ok(pre_eval(PreDecision::CandidateComplete, None)),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+
+        let t = store.get_task("ex2").await.unwrap().unwrap();
+        assert_eq!(t.status, "revising");
+        assert_eq!(judge_calls.load(Ordering::SeqCst), 0);
+        assert!(t.judge_feedback.unwrap_or_default().contains("驗收條件三未達成"));
+    }
+
+    /// ③ timeout ⇒ degrade to the MAV panel (a degrade must be *stricter*, not
+    /// a release), and the degrade is audited.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn judge_seam_external_timeout_degrades_to_the_panel_and_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = judge_script(dir.path(), "ext-slow.sh", "sleep 30");
+        write_dispatch_config(
+            dir.path(),
+            &format!(
+                "judge = \"external\"\njudge_command = [\"{bin}\"]\njudge_timeout_secs = 1"
+            ),
+        );
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "ex3").await;
+
+        let (engine, judge_calls, _) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Ok(pre_eval(PreDecision::CandidateComplete, None)),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+
+        assert_eq!(store.get_task("ex3").await.unwrap().unwrap().status, "done");
+        assert_eq!(
+            judge_calls.load(Ordering::SeqCst),
+            1,
+            "a timed-out external judge must hand the decision to the MAV panel"
+        );
+        let audit = std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("judge_seam_degraded"), "{audit}");
+        assert!(audit.contains("timed out"), "{audit}");
+    }
+
+    /// ③ unparseable stdout ⇒ degrade to the panel. "LGTM" is not a verdict.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn judge_seam_external_bad_json_degrades_to_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = judge_script(dir.path(), "ext-junk.sh", "cat > /dev/null\necho 'LGTM'");
+        write_dispatch_config(
+            dir.path(),
+            &format!("judge = \"external\"\njudge_command = [\"{bin}\"]"),
+        );
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "ex4").await;
+
+        let (engine, judge_calls, _) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Ok(pre_eval(PreDecision::CandidateComplete, None)),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+
+        assert_eq!(store.get_task("ex4").await.unwrap().unwrap().status, "done");
+        assert_eq!(judge_calls.load(Ordering::SeqCst), 1);
+        let audit = std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("judge_seam_degraded"), "{audit}");
+    }
+
+    /// ③ `external` selected but never configured ⇒ degrade to the panel +
+    /// audit. A misconfigured seam is never a free pass.
+    #[tokio::test]
+    async fn judge_seam_external_without_a_command_degrades_to_the_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_dispatch_config(dir.path(), "judge = \"external\"");
+        let store = Arc::new(TaskStore::open(dir.path()).unwrap());
+        seed_review(&store, "ex5").await;
+
+        let (engine, judge_calls, _) = seam_engine(
+            dir.path(),
+            store.clone(),
+            Ok(pre_eval(PreDecision::CandidateComplete, None)),
+        )
+        .await;
+        engine.tick_once().await.unwrap();
+
+        assert_eq!(store.get_task("ex5").await.unwrap().unwrap().status, "done");
+        assert_eq!(judge_calls.load(Ordering::SeqCst), 1);
+        let audit = std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("judge_seam_degraded"), "{audit}");
     }
 }

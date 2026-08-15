@@ -145,6 +145,7 @@ enabled = true          # 啟用自主派工引擎（含 goal loop 驅動器）�
 policy = "fixed_hierarchy"  # 派工策略（選哪個 AI 員工接任務）。見下方「派工策略」。預設 fixed_hierarchy
 grounding_precheck_enabled = true  # 驗收前的證據落地預檢（見「證據落地預檢」）。預設 true
 two_stage_judge = true  # 驗收前先跑便宜的第一階段評估（見「兩段式驗收裁決」）。預設 true
+judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / evaluator_only / external / human_only。預設 mav
 admission = "queue"     # 子代理（ephemeral spawn）撞並發上限時的處置，"queue" 或 "fail"。預設 queue（見下方「ephemeral spawn 准入排隊」）
 
 [task_forward_model]    # 任務層前瞻模型（見同名章節）。預設整組關閉
@@ -307,6 +308,56 @@ AI 員工回報完成、任務進入 `review` 之後，不是每次都直接燒�
 | `candidate_complete` | 看起來是完成候選 | 才進現行的 MAV 三面向判官團仔細核 |
 
 **評估器出任何狀況（逾時、解析失敗、呼叫本身出錯）一律降級直接跑 MAV 判官**——絕不會因為第一階段故障就自動判過或自動判失敗，安全性與沒有這層時完全一樣。設定 `config.toml [dispatch] two_stage_judge`（預設 `true`）；設成 `false` 退回單段式、每輪都跑完整判官團的舊行為。
+
+## 換掉驗收判官
+
+「這件工作算不算完成」是整個平台唯一的放行權力點。預設由平台內建的 MAV 三面向判官團裁決，也可以換成別的實作，用 `config.toml [dispatch] judge` 指定：
+
+| 值 | 誰來裁決 | 適用情境 |
+|---|---|---|
+| `mav`（預設） | 第一階段評估器 → MAV 三面向判官團 | 一般情況 |
+| `evaluator_only` | 只跑第一階段評估器，`candidate_complete` 直接判過 | 省成本。**驗收強度明顯較弱**：只有一次無工具的便宜呼叫在把關，沒有判官團複核，通過的回饋會自我標註為低成本模式 |
+| `external` | 你自己的程式（`judge_command`） | 想接自家 CI、規則引擎、或第二個模型當判官 |
+| `human_only` | 沒有機器裁決，每個 `review` 任務都轉 `needs_human` | 高風險部署，要求每次交付都經人眼 |
+
+寫錯值不會靜默生效：gateway 會警告並回退 `mav`（四個選項裡驗收最嚴的一個）。這個設定每次裁決時重讀，跟 `two_stage_judge` 一樣改完即生效，不必重啟。
+
+### 外部判官（`external`）
+
+```toml
+[dispatch]
+judge = "external"
+judge_command = ["/usr/local/bin/my-judge", "--strict"]
+judge_timeout_secs = 120   # 預設 120
+```
+
+平台會執行這支指令，把一份 JSON 從 stdin 餵進去：
+
+```json
+{
+  "schema": "duduclaw.judge.v1",
+  "task": "任務描述（已含 <tool_activity> / <risk_boundary> 等區塊）",
+  "acceptance_criteria": "凍結的驗收標準基準",
+  "result": "AI 員工這輪的提交內容",
+  "tool_activity": "工具稽核摘要"
+}
+```
+
+指令要在 stdout 印出一個 JSON 物件當裁決：
+
+```json
+{"pass": true, "feedback": "驗收條件逐項核對通過"}
+```
+
+`pass` 收 `true`/`false`，也收 `"pass"`/`"fail"` 字串；`feedback` 可省略。
+
+三件事值得先知道：
+
+1. **外部判官出任何狀況都退回 MAV 判官團**，包含逾時、非零離開碼、stdout 不是合法 JSON、`judge_command` 沒設好。降級的方向永遠是變嚴，不會變成放行，每次降級都會寫進 `security_audit.jsonl`（`judge_seam_degraded`）。
+2. **它的輸出被當成不受信資料**。`feedback` 會進到下一輪派工的 prompt，所以會先過注入掃描並截斷；掃描擋下來時整份裁決作廢，改由 MAV 判官團決定。回饋文字前面會標上來源，你在任務時間軸上看得出哪一段話是外部判官說的。
+3. **`judge_command` 只能改檔案，不能從儀表板改**。它指定一支可執行檔，所以 `system.update_config` RPC 只收 `judge`（四個列舉值），不收 `judge_command` 與 `judge_timeout_secs`；AI 員工本身也寫不了 `~/.duduclaw/config.toml`。
+
+想拿 `duduclaw eval` 當判官的話，直接把 `judge_command` 指向包一層 `duduclaw eval` 的腳本即可，不需要另一個模式。
 
 ## 驗收判官紀律
 
