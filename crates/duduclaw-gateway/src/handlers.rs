@@ -80,15 +80,25 @@ fn scrub_premium_path(err: &str, premium_dir: &Path) -> String {
 }
 
 /// Validate agent ID is safe for filesystem paths (no traversal).
+///
+/// WP-4I (2026-08): used to be an independent hand-rolled copy of the
+/// lowercase-slug rule (byte-identical to `duduclaw-cli::lib.rs`'s copy, up
+/// to a dead `!id.contains("..")` check — impossible to trigger once the
+/// charset already excludes `.`) — now delegates to
+/// [`duduclaw_core::is_valid_new_agent_id`], the single authoritative copy
+/// of that rule. Deliberately narrower than the general-purpose
+/// [`duduclaw_core::is_valid_agent_id`] (which also accepts uppercase and
+/// `_`, for agents that predate this slug convention) because this name is
+/// used both to validate ids at creation time (where the stricter slug rule
+/// is the actual product requirement — see `handle_agents_create`'s
+/// "lowercase alphanumeric with hyphens" error message) and, more broadly
+/// throughout this file, to validate a caller-supplied agent id before it is
+/// used to build a filesystem path. See the WP-4I report for the residual
+/// risk this dual role carries: an existing agent whose id predates the
+/// slug convention (mixed case or `_`) would fail these checks even though
+/// `duduclaw_core::is_valid_agent_id` would accept it as path-safe.
 pub(crate) fn is_valid_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !id.starts_with('-')
-        && !id.ends_with('-')
-        && !id.contains("..")
+    duduclaw_core::is_valid_new_agent_id(id)
 }
 
 /// Validate a `[gateway] bind` value: fail-closed to a literal IP address only.
@@ -34519,6 +34529,10 @@ policies:
 
     #[test]
     fn xc4_invalid_target_agent_id_rejected() {
+        // Smoke test that the delegation to
+        // `duduclaw_core::is_valid_new_agent_id` (WP-4I 2026-08) is wired
+        // correctly; the exhaustive cases live in that function's own
+        // `agent_id_tests` module in duduclaw-core/src/lib.rs.
         assert!(!is_valid_agent_id("../etc"));
         assert!(!is_valid_agent_id("Bad Name"));
         assert!(is_valid_agent_id("bruno"));

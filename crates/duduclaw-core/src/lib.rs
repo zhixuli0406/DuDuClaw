@@ -290,13 +290,115 @@ pub fn resolve_duduclaw_bin_from_exe(exe: &std::path::Path) -> std::path::PathBu
 
 /// Validate that an agent ID is safe for filesystem and log use.
 ///
-/// A valid agent ID contains only lowercase alphanumerics, hyphens, and
-/// underscores; is non-empty; and is at most 64 characters long.
+/// A valid agent ID contains only ASCII alphanumerics (either case —
+/// `is_ascii_alphanumeric()` does not restrict to lowercase, despite this
+/// comment's prior wording; kept case-insensitive deliberately so agents
+/// created before the stricter [`is_valid_new_agent_id`] slug convention
+/// existed, or ones with a mixed-case id, still validate for path safety),
+/// hyphens, and underscores; is non-empty; and is at most 64 characters
+/// long. This is the broad "safe to use as a path/log component" predicate —
+/// use it to validate an id that may already exist. For minting a *new*
+/// agent id, see [`is_valid_new_agent_id`], which additionally enforces the
+/// lowercase-slug naming convention.
 pub fn is_valid_agent_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Validate a *newly minted* agent id/slug — used when creating an agent via
+/// the CLI `agent create` command, the dashboard `agents.create` RPC, and the
+/// MCP `create_agent` tool.
+///
+/// Deliberately stricter than [`is_valid_agent_id`]: a fresh agent id is
+/// meant to read as a clean URL/CLI-friendly slug, not merely "safe for a
+/// filesystem path". Rules: lowercase ASCII letters, digits, and hyphens
+/// only (no underscore, no uppercase — `is_valid_agent_id` allows both, for
+/// backward compatibility with agents created before this convention
+/// existed); non-empty; at most 64 characters; must not start or end with a
+/// hyphen (a leading hyphen risks being misread as a flag by any downstream
+/// command that forwards the id as a bare positional argument).
+///
+/// WP-4I (2026-08) consolidation: this rule used to be hand-rolled
+/// independently in `duduclaw-gateway::handlers`, `duduclaw-cli::mcp`, and
+/// `duduclaw-cli::lib` — three copies of the same intended rule that had
+/// already drifted (the `mcp.rs` copy was missing the leading/trailing-hyphen
+/// guard the other two had). All three now delegate here.
+pub fn is_valid_new_agent_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+}
+
+#[cfg(test)]
+mod agent_id_tests {
+    use super::{is_valid_agent_id, is_valid_new_agent_id};
+
+    #[test]
+    fn valid_agent_id_rejects_empty() {
+        assert!(!is_valid_agent_id(""));
+        assert!(!is_valid_new_agent_id(""));
+    }
+
+    #[test]
+    fn valid_agent_id_rejects_path_traversal() {
+        for bad in ["../etc", "..", "a/b", "a\\b", "./x", "a/../b"] {
+            assert!(!is_valid_agent_id(bad), "{bad} must be rejected");
+            assert!(!is_valid_new_agent_id(bad), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn valid_agent_id_rejects_cjk_and_unicode() {
+        for bad in ["嘟嘟", "agent-嘟", "café", "agent\u{0}x"] {
+            assert!(!is_valid_agent_id(bad), "{bad} must be rejected");
+            assert!(!is_valid_new_agent_id(bad), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn valid_agent_id_rejects_over_length() {
+        assert!(!is_valid_agent_id(&"a".repeat(65)));
+        assert!(is_valid_agent_id(&"a".repeat(64)));
+        assert!(!is_valid_new_agent_id(&"a".repeat(65)));
+        assert!(is_valid_new_agent_id(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn valid_agent_id_allows_mixed_case_and_underscore() {
+        // Broad predicate: safe for path use even if it predates the slug
+        // convention (mixed case / underscore agent ids created historically).
+        assert!(is_valid_agent_id("Agent-01"));
+        assert!(is_valid_agent_id("agent_01"));
+        assert!(is_valid_agent_id("AGENT"));
+    }
+
+    #[test]
+    fn new_agent_id_rejects_uppercase_and_underscore() {
+        // Narrow predicate: new ids must be a clean lowercase slug.
+        assert!(!is_valid_new_agent_id("Agent-01"));
+        assert!(!is_valid_new_agent_id("agent_01"));
+        assert!(!is_valid_new_agent_id("AGENT"));
+    }
+
+    #[test]
+    fn new_agent_id_rejects_leading_or_trailing_hyphen() {
+        assert!(!is_valid_new_agent_id("-agent"));
+        assert!(!is_valid_new_agent_id("agent-"));
+        assert!(is_valid_new_agent_id("agent-01"));
+    }
+
+    #[test]
+    fn both_accept_ordinary_slugs() {
+        for good in ["bruno", "agent-01", "a", "z9"] {
+            assert!(is_valid_agent_id(good));
+            assert!(is_valid_new_agent_id(good));
+        }
+    }
 }
 
 /// Find the `claude` binary in PATH or common locations (BE-L1, BE-M1).
