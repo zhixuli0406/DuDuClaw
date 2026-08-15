@@ -158,6 +158,23 @@ pub async fn start_whatsapp_webhook(
         return None;
     }
 
+    // WP-H1: an empty app_secret used to make signature verification skip
+    // entirely (fail-open) — any inbound POST to the webhook URL was accepted
+    // and processed, regardless of source. Same threat model as LINE's
+    // missing-channel-secret check and Feishu's missing-verification-token
+    // refusal-to-start. WhatsApp still mounts the route (the access token /
+    // phone number id are enough to *send*), but every inbound webhook
+    // request is rejected until an app_secret is configured — see
+    // `receive_webhook` below.
+    if app_secret.is_empty() {
+        warn!(
+            "⚠️  WhatsApp webhook starting WITHOUT app_secret: signature verification is \
+             impossible, so ALL inbound webhook requests will be rejected (401) until an \
+             App Secret is set in the dashboard channel settings. Outbound sending is \
+             unaffected."
+        );
+    }
+
     info!("📱 WhatsApp webhook starting (phone: {phone_number_id})");
     set_channel_connected(&ctx.channel_status, "whatsapp", true, None, Some(&ctx.event_tx)).await;
 
@@ -217,19 +234,32 @@ async fn receive_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    // Verify signature if app_secret is configured — header is mandatory when secret exists
-    if !state.app_secret.is_empty() {
-        let sig_str = match headers.get("x-hub-signature-256") {
-            Some(h) => h.to_str().unwrap_or(""),
-            None => {
-                warn!("WhatsApp webhook: missing required x-hub-signature-256 header");
-                return StatusCode::UNAUTHORIZED;
+    // WP-H1: fail-closed. An empty app_secret means signature verification is
+    // impossible — previously this silently skipped verification and accepted
+    // every inbound request unauthenticated (webhook wide open to anyone who
+    // knew the URL). Reject instead, same posture as LINE (missing channel
+    // secret) and Feishu (refuses to even start without a verification
+    // token). The gating decision lives in the pure `webhook_signature_ok`
+    // helper so it's covered by unit tests independent of axum state; the
+    // branches below only decide which log message to emit.
+    let sig_str = headers.get("x-hub-signature-256").and_then(|h| h.to_str().ok());
+    if !webhook_signature_ok(&state.app_secret, sig_str, &body) {
+        if state.app_secret.is_empty() {
+            // Warn once per process so a misconfigured deployment doesn't
+            // spam logs on every dropped request.
+            static MISSING_SECRET_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if MISSING_SECRET_WARNED.set(()).is_ok() {
+                warn!(
+                    "WhatsApp webhook: app_secret not configured — webhook 已拒收所有 inbound \
+                     請求（fail-closed）。請至 dashboard 通道設定補設 WhatsApp App Secret 以恢復收訊。"
+                );
             }
-        };
-        if !verify_signature(&body, &state.app_secret, sig_str) {
+        } else if sig_str.is_none() {
+            warn!("WhatsApp webhook: missing required x-hub-signature-256 header");
+        } else {
             warn!("WhatsApp webhook: signature verification failed");
-            return StatusCode::UNAUTHORIZED;
         }
+        return StatusCode::UNAUTHORIZED;
     }
 
     let webhook: WebhookBody = match serde_json::from_slice(&body) {
@@ -535,6 +565,20 @@ fn verify_signature(body: &[u8], secret: &str, signature: &str) -> bool {
     constant_time_eq(computed.as_bytes(), expected.as_bytes())
 }
 
+/// WP-H1: pure authorization gate for the WhatsApp webhook. Fail-closed —
+/// an empty `app_secret` (verification impossible) or a missing/invalid
+/// signature header both return `false`. Previously an empty secret made
+/// the caller skip verification entirely and return `true` unconditionally.
+fn webhook_signature_ok(app_secret: &str, sig_header: Option<&str>, body: &[u8]) -> bool {
+    if app_secret.is_empty() {
+        return false;
+    }
+    match sig_header {
+        Some(sig) => verify_signature(body, app_secret, sig),
+        None => false,
+    }
+}
+
 async fn read_wa_config(home_dir: &Path, field: &str) -> Option<String> {
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field).await
 }
@@ -572,5 +616,52 @@ mod tests {
         assert_eq!(body["messaging_product"], "whatsapp");
         assert_eq!(body["to"], "886912345678");
         assert_eq!(body["text"]["body"], "Hello from DuDuClaw!");
+    }
+
+    // ── WP-H1: WhatsApp webhook signature fail-closed ──────────────
+
+    /// Empty app_secret must reject the request outright — no fallback to
+    /// "accept unauthenticated". This is the regression test for the
+    /// original fail-open bug (app_secret empty ⇒ verification silently
+    /// skipped ⇒ any inbound POST accepted).
+    #[test]
+    fn test_webhook_signature_ok_rejects_empty_secret_even_with_valid_looking_header() {
+        let body = b"{\"entry\":[]}";
+        // Even a syntactically well-formed signature header must not help —
+        // there is no secret to verify it against.
+        assert!(!webhook_signature_ok("", Some("sha256=deadbeef"), body));
+        assert!(!webhook_signature_ok("", None, body));
+    }
+
+    /// A configured secret + correctly computed signature passes.
+    #[test]
+    fn test_webhook_signature_ok_accepts_valid_signature() {
+        let secret = "test_app_secret";
+        let body = b"{\"entry\":[{\"changes\":[]}]}";
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert!(webhook_signature_ok(secret, Some(&sig), body));
+    }
+
+    /// A configured secret + wrong/forged signature is rejected.
+    #[test]
+    fn test_webhook_signature_ok_rejects_invalid_signature() {
+        let secret = "test_app_secret";
+        let body = b"{\"entry\":[{\"changes\":[]}]}";
+        assert!(!webhook_signature_ok(secret, Some("sha256=0000forged0000"), body));
+        // Body tampered after signing (secret is correct, payload is not).
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(b"{\"entry\":[{\"changes\":[{\"tampered\":true}]}]}");
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        assert!(!webhook_signature_ok(secret, Some(&sig), body));
+    }
+
+    /// A configured secret but a missing signature header is rejected (the
+    /// header is mandatory once a secret exists — no anonymous fallback).
+    #[test]
+    fn test_webhook_signature_ok_rejects_missing_header_when_secret_configured() {
+        let body = b"{\"entry\":[]}";
+        assert!(!webhook_signature_ok("test_app_secret", None, body));
     }
 }
