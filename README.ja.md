@@ -11,7 +11,7 @@ DuDuClaw は、Claude Code・Codex・Gemini などの AI コマンドライン�
 必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳は Claude・Codex・Gemini・Antigravity、あるいは任意の OpenAI 互換 API へいつでも切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
 
 [![CI](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/zhixuli0406/DuDuClaw/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-1.59.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.60.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
