@@ -31364,6 +31364,16 @@ fn task_row_to_json(r: &TaskRow) -> Value {
         // ⇒ the global wall clock / deployment baseline boundary applies.
         "deadline_at": r.deadline_at,
         "risk_boundary": r.risk_boundary,
+        // H11 pause-reason classification. Always a RESOLVED token, never the
+        // raw column: a legacy / unrecognised row must reach the dashboard as
+        // `unknown` = 「需要人工確認」 (a real chip) rather than as a missing
+        // field the UI would have to guess about. Scoped to `needs_human` so a
+        // class can never linger on a task that is no longer paused — the
+        // store clears it on `resolve_needs_human`, but a direct `tasks.update`
+        // status write bypasses that, and a stale chip is worse than none.
+        "pause_reason": (r.status == "needs_human").then(|| {
+            crate::pause_reason::PauseReason::from_stored(r.pause_reason.as_deref()).as_str()
+        }),
     })
 }
 

@@ -1882,7 +1882,17 @@ impl DispatchEngine {
                                 }
                                 PreDecision::Blocked => {
                                     let reason = format_blocked_reason(&ev);
-                                    self.store.mark_needs_human(&task.id, &reason).await?;
+                                    // H11: an external blocker the agent cannot
+                                    // clear — classified at the call site (the
+                                    // reason text itself is evaluator prose and
+                                    // must never be re-parsed for the class).
+                                    self.store
+                                        .mark_needs_human_with_pause(
+                                            &task.id,
+                                            &reason,
+                                            crate::pause_reason::PauseReason::BlockedNeedsDecision,
+                                        )
+                                        .await?;
                                     self.revoke_task_grants(&task.id).await;
                                     warn!(
                                         task = %task.id,
@@ -1963,8 +1973,15 @@ impl DispatchEngine {
                         // Fail-safe: judge itself failed — park for a human, do NOT
                         // auto-accept and do NOT loop.
                         warn!(task = %task.id, error = %e, "goal-mode judge 失敗 → needs_human（待人工）");
+                        // H11: the platform failed, not the work — a distinct
+                        // class from "the agent got stuck", so a human sees
+                        // 「系統問題」rather than a false no-progress verdict.
                         self.store
-                            .mark_needs_human(&task.id, &format!("judge unavailable: {e}"))
+                            .mark_needs_human_with_pause(
+                                &task.id,
+                                &format!("judge unavailable: {e}"),
+                                crate::pause_reason::PauseReason::Infra,
+                            )
                             .await?;
                         // WP3 (PORTICO): parked for a human → revoke task grants.
                         self.revoke_task_grants(&task.id).await;
@@ -2993,10 +3010,12 @@ mod tests {
         let existing = crate::goal_state::GoalStateSnapshot {
             pending_hypotheses: Vec::new(),
             confirmed_facts: (0..6).map(|i| format!("old fact {i}")).collect(),
-            // H5 (WP-B): `GoalStateSnapshot` gained a `bail_hint` field —
-            // this literal is updated to keep compiling, unrelated to what
-            // this test actually exercises (confirmed_facts capping).
+            // H5 (WP-B) / H10: `GoalStateSnapshot` gained `bail_hint` and
+            // `tool_streak_hint` fields — these literals are updated to keep
+            // compiling, unrelated to what this test actually exercises
+            // (confirmed_facts capping).
             bail_hint: None,
+            tool_streak_hint: None,
         };
         store
             .set_goal_state_json("cf2", Some(&existing.to_json()))
@@ -4439,6 +4458,7 @@ mod tests {
                 "上一輪疑似提前收工(pattern=stopping_here),請確認任務是否真的完成,或誠實回報實際受阻原因,勿在未完成時提前結束。"
                     .into(),
             ),
+            tool_streak_hint: None,
         };
         store
             .set_goal_state_json("bh1", Some(&snap.to_json()))

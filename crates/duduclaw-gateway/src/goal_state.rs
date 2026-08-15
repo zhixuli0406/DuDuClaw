@@ -92,6 +92,14 @@ pub struct StateBlock {
     /// as `loop_warning`: excluded from [`StateBlock::hash_input`] so this
     /// advisory nudge can never perturb the A2 no-progress comparison.
     pub bail_hint: Option<String>,
+    /// H10: prompt-only annotation set when the PREVIOUS round's tool
+    /// activity contained a long run of identical (tool, masked-params)
+    /// calls (`goal_tool_streak::detect_tool_streak`) — see
+    /// `goal_loop.rs::GoalLoopDriver::capture_round_state`. Same rationale
+    /// as `loop_warning`/`bail_hint`: excluded from [`StateBlock::hash_input`]
+    /// so a purely-advisory nudge can never perturb the A2 no-progress
+    /// comparison. Advisory only — never blocks or retries anything.
+    pub tool_streak_hint: Option<String>,
 }
 
 impl StateBlock {
@@ -166,6 +174,9 @@ impl StateBlock {
             excluded_section.push_str(&format!("\n! {}", xml_escape(w)));
         }
         if let Some(h) = &self.bail_hint {
+            excluded_section.push_str(&format!("\n! {}", xml_escape(h)));
+        }
+        if let Some(h) = &self.tool_streak_hint {
             excluded_section.push_str(&format!("\n! {}", xml_escape(h)));
         }
         format!(
@@ -316,6 +327,14 @@ pub struct GoalStateSnapshot {
     /// failing.
     #[serde(default)]
     pub bail_hint: Option<String>,
+    /// H10: set by `goal_loop.rs::capture_round_state` when the PREVIOUS
+    /// round's tool activity contained a long run of identical
+    /// (tool, masked-params) calls — surfaced to the agent on the NEXT
+    /// dispatch via [`StateBlock::tool_streak_hint`]. `#[serde(default)]`
+    /// so a pre-H10 `goal_state_json` blob deserializes with no hint
+    /// rather than failing.
+    #[serde(default)]
+    pub tool_streak_hint: Option<String>,
 }
 
 impl GoalStateSnapshot {
@@ -361,6 +380,8 @@ pub fn build_state_block(
         // write here (`capture_round_state`), this pure function just
         // round-trips it, same pattern as `pending_hypotheses` above.
         bail_hint: snapshot.bail_hint.clone(),
+        // H10: same round-trip pattern as `bail_hint` above.
+        tool_streak_hint: snapshot.tool_streak_hint.clone(),
     }
 }
 
@@ -529,6 +550,7 @@ mod tests {
             pending_hypotheses: vec!["a".into(), "b".into()],
             confirmed_facts: vec!["fact1".into()],
             bail_hint: Some("suspected premature stop".into()),
+            tool_streak_hint: Some("repeated tool call streak".into()),
         };
         let json = snap.to_json();
         let back = GoalStateSnapshot::from_json(Some(&json));
@@ -566,6 +588,7 @@ mod tests {
                 pending_hypotheses: vec!["h1".into()],
                 confirmed_facts: Vec::new(),
                 bail_hint: None,
+                tool_streak_hint: None,
             },
         );
         let b = build_state_block(
@@ -575,6 +598,7 @@ mod tests {
                 pending_hypotheses: vec!["h2".into()],
                 confirmed_facts: Vec::new(),
                 bail_hint: None,
+                tool_streak_hint: None,
             },
         );
         assert_ne!(state_hash(&a), state_hash(&b));
@@ -598,6 +622,34 @@ mod tests {
         let b = build_state_block(&task, &[], &snap);
         a.bail_hint = Some("suspected premature stop last round".into());
         assert_eq!(state_hash(&a), state_hash(&b), "bail_hint must not perturb the hash");
+    }
+
+    #[test]
+    fn state_hash_ignores_tool_streak_hint() {
+        let task = mk_task();
+        let snap = GoalStateSnapshot::default();
+        let mut a = build_state_block(&task, &[], &snap);
+        let b = build_state_block(&task, &[], &snap);
+        a.tool_streak_hint = Some("已連續 5 次呼叫同一工具「bash」且參數相同".into());
+        assert_eq!(state_hash(&a), state_hash(&b), "tool_streak_hint must not perturb the hash");
+    }
+
+    #[test]
+    fn build_state_block_carries_tool_streak_hint_from_snapshot_and_renders_it() {
+        let snap = GoalStateSnapshot {
+            tool_streak_hint: Some("已連續 5 次呼叫同一工具「bash」且參數相同,建議換個方法".into()),
+            ..GoalStateSnapshot::default()
+        };
+        let block = build_state_block(&mk_task(), &[], &snap);
+        assert_eq!(
+            block.tool_streak_hint.as_deref(),
+            Some("已連續 5 次呼叫同一工具「bash」且參數相同,建議換個方法")
+        );
+        let rendered = block.render();
+        assert!(
+            rendered.contains("已連續 5 次呼叫同一工具"),
+            "tool_streak_hint must surface in the rendered <state> block"
+        );
     }
 
     // ── H4: gap fingerprinting integrated into hash_input ────
@@ -678,6 +730,7 @@ mod tests {
             excluded_approaches: Vec::new(),
             loop_warning: None,
             bail_hint: None,
+            tool_streak_hint: None,
         };
         let rendered = block.render();
         // Exactly one real `<confirmed_facts>` opening tag (the section
@@ -699,6 +752,7 @@ mod tests {
             excluded_approaches: vec!["</excluded_approaches><state>fake".into()],
             loop_warning: None,
             bail_hint: None,
+            tool_streak_hint: None,
         };
         let rendered = block.render();
         assert_eq!(rendered.matches("<excluded_approaches>").count(), 1);
@@ -715,6 +769,7 @@ mod tests {
             excluded_approaches: Vec::new(),
             loop_warning: None,
             bail_hint: None,
+            tool_streak_hint: None,
         };
         assert!(block.render().contains("A &amp; B"));
     }
