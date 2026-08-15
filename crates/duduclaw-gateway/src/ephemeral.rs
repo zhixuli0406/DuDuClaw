@@ -55,7 +55,24 @@ pub const EPHEMERAL_TTL_HOURS: i64 = 24;
 pub const COMPLETED_GRACE_SECS: i64 = 3600;
 
 /// Circuit breaker: refuse to synthesize beyond this many live scaffolds.
+/// This is the DEFAULT cap; the effective cap is `[dispatch]
+/// ephemeral_max_active` (see `duduclaw_core::spawn_admission`), which
+/// defaults to this exact value so an absent/malformed config section is
+/// byte-identical to the pre-H19 hardcoded behavior.
 pub const MAX_ACTIVE_EPHEMERAL: usize = 32;
+
+/// Admission-queue class label for ephemeral spawn requests (H19). Shared
+/// between [`scaffold`]'s capacity check, [`drain_admission_queue`], and the
+/// MCP `spawn_ephemeral` tool's queue-vs-fail branch.
+pub const EPHEMERAL_ADMISSION_CLASS: &str = "ephemeral";
+
+/// Stable, anchored prefix of the capacity-exceeded error returned by
+/// [`scaffold`]. Callers use `starts_with` against this constant (never a
+/// generic substring match on arbitrary error text — project convention #2)
+/// to distinguish "temporarily out of capacity, safe to queue" from every
+/// other rejection reason (privilege escalation, malformed parent, …), which
+/// must NEVER be queued since retrying them can never succeed.
+pub const EPHEMERAL_CAPACITY_ERROR_PREFIX: &str = "ephemeral agent limit reached";
 
 /// Metadata sidecar (`ephemeral.toml`) written next to the scaffold's
 /// `agent.toml`. Kept separate from `AgentConfig` so no core-schema change
@@ -237,11 +254,26 @@ pub fn scaffold(home_dir: &Path, spec: &EphemeralSpawnSpec) -> Result<ScaffoldRe
     // advisory lock (sidecar `.ephemeral.lock` next to the root, so the lock
     // file is never counted as a scaffold) — parallel spawns from the gateway
     // and MCP-server processes can no longer race past the cap.
+    //
+    // H19: the cap itself is now config-driven (`[dispatch]
+    // ephemeral_max_active`, default `MAX_ACTIVE_EPHEMERAL`) and clamped to
+    // at least 1 — a concurrency limit can be adjusted but never fully
+    // disabled. `scaffold`'s own contract (hard `Err` at the cap) is
+    // otherwise UNCHANGED: it stays a synchronous, TOCTOU-safe circuit
+    // breaker. Queue-vs-fail admission handling lives one layer up, in the
+    // `spawn_ephemeral` MCP tool, which recognizes this specific error via
+    // [`EPHEMERAL_CAPACITY_ERROR_PREFIX`] and decides whether to durably
+    // queue the request instead of forwarding the rejection.
+    let admission_cfg = duduclaw_core::spawn_admission::AdmissionConfig::from_home(home_dir);
+    let cap = duduclaw_core::spawn_admission::clamp_min_one(
+        admission_cfg.ephemeral_max_active,
+        EPHEMERAL_ADMISSION_CLASS,
+    ) as usize;
     let root = ephemeral_root(home_dir);
     let agent_id = new_ephemeral_id();
     let dir = root.join(&agent_id);
     let created = duduclaw_core::with_file_lock(&root, || {
-        if active_count(&root) >= MAX_ACTIVE_EPHEMERAL {
+        if active_count(&root) >= cap {
             return Ok(false);
         }
         std::fs::create_dir_all(&dir)?;
@@ -250,7 +282,7 @@ pub fn scaffold(home_dir: &Path, spec: &EphemeralSpawnSpec) -> Result<ScaffoldRe
     .map_err(|e| format!("create scaffold dir: {e}"))?;
     if !created {
         return Err(format!(
-            "ephemeral agent limit reached ({MAX_ACTIVE_EPHEMERAL} live scaffolds) — \
+            "{EPHEMERAL_CAPACITY_ERROR_PREFIX} ({cap} live scaffolds) — \
              wait for the hourly GC sweep or complete running tasks first"
         ));
     }
@@ -682,6 +714,235 @@ fn sweep_blocking(home_dir: &Path) -> usize {
         }
     }
     removed
+}
+
+// ---------------------------------------------------------------------------
+// H19 — admission queue drain (queue-vs-fail admission for ephemeral spawn)
+// ---------------------------------------------------------------------------
+
+/// Summary of one [`drain_admission_queue`] pass, for the caller to log.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionDrainSummary {
+    /// Queued spawns admitted (scaffolded + bus-enqueued) this pass.
+    pub admitted: u32,
+    /// Queued tickets dropped because their TTL elapsed before capacity
+    /// freed.
+    pub expired: u32,
+    /// Queued tickets dropped because replaying them failed (rare — a
+    /// cross-process race lost to another spawn, or a malformed/stale
+    /// payload). Never retried — see [`replay_queued_ephemeral`] doc.
+    pub failed: u32,
+}
+
+/// Drain the H19 admission queue for ephemeral spawn requests (class
+/// [`EPHEMERAL_ADMISSION_CLASS`]).
+///
+/// Called from the dispatcher's existing hourly maintenance tick, right
+/// after [`sweep`] frees capacity — deliberately the SAME cadence as GC:
+/// `ephemeral_max_active` slots are only ever freed by GC (a scaffold's
+/// `.completed` marker starts a 1h grace, and the sweep itself only runs
+/// hourly), so a tighter poll interval would just spin without finding new
+/// room. Also unconditionally sweeps TTL-expired tickets first — even when
+/// no capacity is free, a perpetually-full queue must still shed and log
+/// dead entries (see `duduclaw_core::spawn_admission::sweep_expired`).
+pub async fn drain_admission_queue(home_dir: &Path) -> AdmissionDrainSummary {
+    let home = home_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || drain_admission_queue_blocking(&home))
+        .await
+        .unwrap_or_default()
+}
+
+fn log_admission_event(home_dir: &Path, event_type: &str, ticket_id: &str, extra: &str, ok: bool) {
+    duduclaw_security::audit::append_tool_call_with_extras(
+        home_dir,
+        "system",
+        event_type,
+        &format!("ticket_id={ticket_id}{extra}"),
+        ok,
+        &[("ticket_id", serde_json::Value::String(ticket_id.to_string()))],
+    );
+}
+
+fn drain_admission_queue_blocking(home_dir: &Path) -> AdmissionDrainSummary {
+    let mut summary = AdmissionDrainSummary::default();
+
+    // Unconditional expiry sweep — independent of current capacity, so a
+    // queue that stays full forever still visibly sheds dead entries.
+    for expired in
+        duduclaw_core::spawn_admission::sweep_expired(home_dir, EPHEMERAL_ADMISSION_CLASS)
+    {
+        summary.expired += 1;
+        tracing::info!(
+            ticket = %expired.ticket_id,
+            "H19: queued ephemeral spawn expired before capacity freed, discarded"
+        );
+        log_admission_event(home_dir, "ephemeral_admission_expired", &expired.ticket_id, "", true);
+    }
+
+    let admission_cfg = duduclaw_core::spawn_admission::AdmissionConfig::from_home(home_dir);
+    let cap = duduclaw_core::spawn_admission::clamp_min_one(
+        admission_cfg.ephemeral_max_active,
+        EPHEMERAL_ADMISSION_CLASS,
+    ) as usize;
+    let root = ephemeral_root(home_dir);
+
+    loop {
+        if active_count(&root) >= cap {
+            break; // still at capacity — retry on the next hourly tick
+        }
+        let result =
+            duduclaw_core::spawn_admission::dequeue_next(home_dir, EPHEMERAL_ADMISSION_CLASS);
+        for expired in result.expired {
+            summary.expired += 1;
+            tracing::info!(ticket = %expired.ticket_id, "H19: queued ephemeral spawn expired, discarded");
+            log_admission_event(
+                home_dir, "ephemeral_admission_expired", &expired.ticket_id, "", true,
+            );
+        }
+        let Some(ticket) = result.ticket else {
+            break; // queue empty — nothing left to admit
+        };
+        match replay_queued_ephemeral(home_dir, &ticket) {
+            Ok(eph_id) => {
+                summary.admitted += 1;
+                tracing::info!(
+                    ticket = %ticket.ticket_id, ephemeral = %eph_id,
+                    "H19: queued ephemeral spawn admitted (FIFO release)"
+                );
+                log_admission_event(
+                    home_dir, "ephemeral_admission_admitted", &ticket.ticket_id,
+                    &format!(" agent_id={eph_id}"), true,
+                );
+            }
+            Err(reason) => {
+                summary.failed += 1;
+                tracing::warn!(
+                    ticket = %ticket.ticket_id, error = %reason,
+                    "H19: queued ephemeral spawn replay failed — dropped, not retried"
+                );
+                log_admission_event(
+                    home_dir, "ephemeral_admission_failed", &ticket.ticket_id,
+                    &format!(" error={reason}"), false,
+                );
+            }
+        }
+    }
+
+    summary
+}
+
+/// Reconstruct and replay one queued ephemeral spawn — `scaffold` (under the
+/// free capacity [`drain_admission_queue_blocking`]'s loop already confirmed)
+/// followed by the same bus-queue enqueue `spawn_ephemeral_with_ctx` performs
+/// at request time. Returns the newly-scaffolded ephemeral agent id.
+///
+/// The dispatch circuit breaker (`dispatch_guard`) is re-evaluated NOW, at
+/// actual dispatch time, from the `incoming_hop` captured at the ORIGINAL
+/// enqueue time — never at enqueue time itself — matching
+/// `spawn_ephemeral_with_ctx`'s ordering (rate-limiting must gate when the
+/// bus task is actually created, not when the request was merely queued).
+/// A malformed payload or a lost cross-process race is a non-retryable
+/// failure: this function is never called again for the same ticket (the
+/// caller already popped it), which is intentional — retrying a request that
+/// fails for a reason OTHER than capacity would just fail again and starve
+/// FIFO order behind it.
+fn replay_queued_ephemeral(
+    home_dir: &Path,
+    ticket: &duduclaw_core::spawn_admission::QueuedSpawn,
+) -> Result<String, String> {
+    let p = &ticket.payload;
+    let get_str = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let parent = get_str("parent");
+    let instruction = get_str("instruction");
+    let tier = get_str("tier");
+    let context = get_str("context");
+    let origin = get_str("origin");
+    let tools: Vec<String> = p
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let outgoing_depth = p.get("outgoing_depth").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+    let incoming_hop = p.get("incoming_hop").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+
+    if parent.is_empty() || instruction.is_empty() || context.is_empty() || tools.is_empty() {
+        return Err("queued payload malformed (missing a required field)".to_string());
+    }
+
+    let spec = EphemeralSpawnSpec {
+        parent: parent.clone(),
+        instruction,
+        tools,
+        tier,
+    };
+    let scaffolded = scaffold(home_dir, &spec)?;
+    let eph_id = scaffolded.agent_id.clone();
+
+    // ── P3 runaway guard (cascade hop-depth + dispatch circuit breaker) ──
+    // Mirrors `check_dispatch_runaway` in duduclaw-cli's mcp.rs (that helper
+    // lives one crate layer up and is not reachable from here); kept in sync
+    // by the shared `duduclaw_core::dispatch_guard` primitives it wraps.
+    let guard_cfg = duduclaw_core::DispatchGuardConfig::from_home(home_dir);
+    let outgoing_hop = incoming_hop.saturating_add(1);
+    if outgoing_hop > guard_cfg.max_hop_depth {
+        let _ = std::fs::remove_dir_all(&scaffolded.dir);
+        return Err(format!(
+            "hop_depth {outgoing_hop} exceeds max {} on replay",
+            guard_cfg.max_hop_depth
+        ));
+    }
+    match duduclaw_core::dispatch_guard_check(home_dir, "ephemeral", &parent, &guard_cfg) {
+        duduclaw_core::DispatchGuardDecision::Trip { reason, .. } => {
+            let _ = std::fs::remove_dir_all(&scaffolded.dir);
+            return Err(format!("dispatch circuit breaker tripped on replay: {reason}"));
+        }
+        duduclaw_core::DispatchGuardDecision::Allow => {}
+    }
+
+    // ── Enqueue on the bus — identical shape to `spawn_ephemeral_with_ctx` ──
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let queue_path = home_dir.join("bus_queue.jsonl");
+    let entry = serde_json::json!({
+        "type": "agent_message",
+        "message_id": &task_id,
+        "agent_id": &eph_id,
+        "payload": context,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "session_key": &task_id,
+        "persistent": true,
+        "delegation_depth": outgoing_depth,
+        "hop_depth": outgoing_hop,
+        "origin_agent": origin,
+        "sender_agent": parent,
+    });
+    let entry_str = entry.to_string();
+    const MAX_QUEUE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB (same cap as the live path)
+    let write_result = duduclaw_core::with_file_lock(&queue_path, || {
+        use std::io::Write;
+        if let Ok(meta) = std::fs::metadata(&queue_path) {
+            if meta.len() > MAX_QUEUE_SIZE {
+                return Err(std::io::Error::other(format!(
+                    "bus_queue.jsonl exceeds {}MB size limit",
+                    MAX_QUEUE_SIZE / (1024 * 1024)
+                )));
+            }
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&queue_path)?;
+        writeln!(f, "{entry_str}")?;
+        Ok(())
+    });
+    if let Err(e) = write_result {
+        // Queueing failed — tear the scaffold down (mirrors the live path's
+        // same rollback), do NOT fabricate a reply on the ephemeral's behalf.
+        let _ = std::fs::remove_dir_all(&scaffolded.dir);
+        return Err(format!("bus enqueue failed on replay: {e}"));
+    }
+
+    Ok(eph_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,5 +1426,194 @@ skill_security_scan = false
         assert_eq!(parse_tier(""), Some(ModelTier::Standard));
         assert_eq!(parse_tier("claude-opus-4-5"), None);
         assert_eq!(parse_tier("gpt-5"), None);
+    }
+
+    // ── H19: admission-queue cap sourcing + drain ──────────────────────────
+
+    /// `[dispatch] ephemeral_max_active` now sources the cap instead of the
+    /// hardcoded constant, and `0` is clamped to `1` — a concurrency limit
+    /// can be adjusted but never fully disabled.
+    #[test]
+    fn scaffold_cap_is_configurable_and_zero_is_clamped_to_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_parent(home, "boss", "");
+        std::fs::write(
+            home.join("config.toml"),
+            "[dispatch]\nephemeral_max_active = 0\n",
+        )
+        .unwrap();
+
+        let spec = |n: usize| EphemeralSpawnSpec {
+            parent: "boss".into(),
+            instruction: format!("worker {n}"),
+            tools: strs(&["Read"]),
+            tier: "standard".into(),
+        };
+        // Clamped to 1: exactly one scaffold succeeds.
+        assert!(scaffold(home, &spec(1)).is_ok());
+        let err = scaffold(home, &spec(2)).unwrap_err();
+        assert!(
+            err.starts_with(EPHEMERAL_CAPACITY_ERROR_PREFIX),
+            "got: {err}"
+        );
+        assert!(err.contains("(1 live scaffolds)"), "got: {err}");
+    }
+
+    /// A smaller-than-default configured cap is honored end-to-end (not just
+    /// the pure clamp function).
+    #[test]
+    fn scaffold_cap_honors_a_small_configured_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_parent(home, "boss", "");
+        std::fs::write(
+            home.join("config.toml"),
+            "[dispatch]\nephemeral_max_active = 2\n",
+        )
+        .unwrap();
+        let spec = |n: usize| EphemeralSpawnSpec {
+            parent: "boss".into(),
+            instruction: format!("worker {n}"),
+            tools: strs(&["Read"]),
+            tier: "standard".into(),
+        };
+        assert!(scaffold(home, &spec(1)).is_ok());
+        assert!(scaffold(home, &spec(2)).is_ok());
+        assert!(
+            scaffold(home, &spec(3)).unwrap_err().starts_with(EPHEMERAL_CAPACITY_ERROR_PREFIX)
+        );
+    }
+
+    fn queued_ephemeral_payload(parent: &str, instruction: &str, context: &str) -> serde_json::Value {
+        serde_json::json!({
+            "parent": parent,
+            "instruction": instruction,
+            "tools": ["Read"],
+            "tier": "standard",
+            "context": context,
+            "origin": parent,
+            "outgoing_depth": 1,
+            "incoming_hop": 0,
+        })
+    }
+
+    /// FIFO release: once a slot frees (simulated GC removal, since the real
+    /// resource is disk-scaffold-count-until-GC), the drain loop admits the
+    /// OLDEST queued ticket first and stops as soon as the (now again full)
+    /// cap is hit — the second ticket stays queued for the next tick.
+    #[tokio::test]
+    async fn drain_admission_queue_admits_oldest_ticket_first_then_stops_at_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_parent(home, "boss", "");
+        std::fs::write(
+            home.join("config.toml"),
+            "[dispatch]\nephemeral_max_active = 1\n",
+        )
+        .unwrap();
+
+        // Fill the (cap=1) capacity directly, as a live in-flight scaffold would.
+        let filled = scaffold(
+            home,
+            &EphemeralSpawnSpec {
+                parent: "boss".into(),
+                instruction: "occupies the only slot".into(),
+                tools: strs(&["Read"]),
+                tier: "standard".into(),
+            },
+        )
+        .unwrap();
+
+        let admission_cfg = duduclaw_core::spawn_admission::AdmissionConfig::from_home(home);
+        let a = duduclaw_core::spawn_admission::enqueue(
+            home,
+            EPHEMERAL_ADMISSION_CLASS,
+            &admission_cfg,
+            None,
+            queued_ephemeral_payload("boss", "first queued", "ctx-1"),
+        )
+        .unwrap();
+        let b = duduclaw_core::spawn_admission::enqueue(
+            home,
+            EPHEMERAL_ADMISSION_CLASS,
+            &admission_cfg,
+            None,
+            queued_ephemeral_payload("boss", "second queued", "ctx-2"),
+        )
+        .unwrap();
+        assert!(matches!(a, duduclaw_core::spawn_admission::EnqueueOutcome::Queued { .. }));
+        assert!(matches!(b, duduclaw_core::spawn_admission::EnqueueOutcome::Queued { .. }));
+
+        // Simulate GC freeing the one slot.
+        std::fs::remove_dir_all(&filled.dir).unwrap();
+
+        let summary = drain_admission_queue(home).await;
+        assert_eq!(summary.admitted, 1, "cap=1 admits exactly one per drain pass");
+        assert_eq!(summary.expired, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            duduclaw_core::spawn_admission::queue_depth(home, EPHEMERAL_ADMISSION_CLASS),
+            1,
+            "the second ticket stays queued — capacity is full again"
+        );
+
+        // The admitted ticket must be the FIFO-oldest ("first queued"), and
+        // must have actually landed on the bus.
+        let content = std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
+        assert!(content.contains("ctx-1"), "oldest ticket's context must be dispatched: {content}");
+        assert!(!content.contains("ctx-2"), "second ticket must NOT be dispatched yet: {content}");
+
+        // A second drain pass (after freeing the slot again) admits the rest.
+        let live_dir = std::fs::read_dir(ephemeral_root(home))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().is_dir())
+            .unwrap()
+            .path();
+        std::fs::remove_dir_all(&live_dir).unwrap();
+        let summary2 = drain_admission_queue(home).await;
+        assert_eq!(summary2.admitted, 1);
+        assert_eq!(
+            duduclaw_core::spawn_admission::queue_depth(home, EPHEMERAL_ADMISSION_CLASS),
+            0
+        );
+    }
+
+    /// TTL expiry: a ticket that outlives its TTL is dropped (never admitted)
+    /// and reported in the summary — even when capacity IS free.
+    #[tokio::test]
+    async fn drain_admission_queue_drops_and_reports_expired_tickets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        write_parent(home, "boss", "");
+        // Plenty of capacity; TTL 0 ⇒ already expired the instant it is queued.
+        std::fs::write(
+            home.join("config.toml"),
+            "[dispatch]\nephemeral_max_active = 32\nqueue_item_ttl_secs = 0\n",
+        )
+        .unwrap();
+        let admission_cfg = duduclaw_core::spawn_admission::AdmissionConfig::from_home(home);
+        duduclaw_core::spawn_admission::enqueue(
+            home,
+            EPHEMERAL_ADMISSION_CLASS,
+            &admission_cfg,
+            None,
+            queued_ephemeral_payload("boss", "will expire", "ctx-expired"),
+        )
+        .unwrap();
+
+        let summary = drain_admission_queue(home).await;
+        assert_eq!(summary.admitted, 0);
+        assert_eq!(summary.expired, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            duduclaw_core::spawn_admission::queue_depth(home, EPHEMERAL_ADMISSION_CLASS),
+            0
+        );
+        assert!(
+            !home.join("bus_queue.jsonl").exists(),
+            "an expired ticket must never be dispatched"
+        );
     }
 }
