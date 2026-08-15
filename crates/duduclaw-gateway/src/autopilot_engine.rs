@@ -1390,14 +1390,40 @@ impl AutopilotEngine {
         // per-agent) token fallback the 2026-08-13 login-OTP outage fix
         // added (`config_crypto::channel_dm_token_candidates`) — an
         // agent-scoped-bot deployment can still notify even when the global
-        // token is unset.
+        // token is unset. `resolve_channel_target` only reads the single
+        // global token, so this loop builds a `ChannelTarget` per candidate
+        // itself, but delegation and sending both go through
+        // `channel_sender::create_sender` — WP-4C removed the hand-rolled
+        // per-channel reqwest calls this loop used to make directly
+        // (`send_channel_text`), which had silently drifted out of sync with
+        // `create_sender`'s senders: its `match` had no "slack" arm at all,
+        // so every slack notify action failed with "unsupported channel:
+        // slack" despite `slack` being accepted right above by the
+        // `matches!` guard and `resolve_channel_tokens`.
         if matches!(channel, "telegram" | "line" | "discord" | "slack") {
+            // L29: discord chat_id is interpolated directly into the request
+            // path by `DiscordSender::send_text` with no validation of its
+            // own, so validate it is a snowflake before any candidate token
+            // is tried (prevents path traversal / injection when the notify
+            // rule's chat_id comes from less-trusted rule config).
+            if channel == "discord" && !crate::channel_sender::is_valid_discord_chat_id(chat_id) {
+                return Err(format!("invalid discord chat_id (not a snowflake): {chat_id}"));
+            }
             let candidates = resolve_channel_tokens(&self.home_dir, channel).await?;
             let mut last_err = String::new();
             for token in &candidates {
-                match send_channel_text(channel, chat_id, token, &text).await {
+                let target = crate::channel_sender::ChannelTarget {
+                    channel_type: channel.to_string(),
+                    chat_id: chat_id.to_string(),
+                    token: token.clone(),
+                    extra_id: None,
+                };
+                match crate::channel_sender::create_sender(&target, notify_http_client().clone())
+                    .send_text(&text)
+                    .await
+                {
                     Ok(()) => return Ok(()),
-                    Err(e) => last_err = e,
+                    Err(e) => last_err = e.to_string(),
                 }
             }
             return Err(last_err);
@@ -1902,83 +1928,6 @@ fn notify_http_client() -> &'static reqwest::Client {
             .build()
             .expect("reqwest client build (autopilot notify)")
     })
-}
-
-/// L29: validate a Discord snowflake id. Discord ids are unsigned 64-bit
-/// integers serialized as decimal strings (17-20 digits in practice). We accept
-/// any all-ASCII-digit string of a sane length and reject anything else so it
-/// cannot be smuggled into the request path.
-fn is_discord_snowflake(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 20
-        && s.bytes().all(|b| b.is_ascii_digit())
-        // A snowflake is non-zero; "0" is not a real channel.
-        && s.bytes().any(|b| b != b'0')
-}
-
-async fn send_channel_text(
-    channel: &str,
-    chat_id: &str,
-    token: &str,
-    text: &str,
-) -> Result<(), String> {
-    let client = notify_http_client();
-    match channel {
-        "telegram" => {
-            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-            let resp = client
-                .post(&url)
-                .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
-                .send()
-                .await
-                .map_err(|e| format!("telegram send: {}", crate::secret_redact::redact_secrets(&e.to_string())))?;
-            if !resp.status().is_success() {
-                return Err(format!("telegram API {}", resp.status()));
-            }
-            Ok(())
-        }
-        "line" => {
-            let url = "https://api.line.me/v2/bot/message/push";
-            let resp = client
-                .post(url)
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&serde_json::json!({
-                    "to": chat_id,
-                    "messages": [{ "type": "text", "text": text }],
-                }))
-                .send()
-                .await
-                .map_err(|e| format!("line send: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("line API {}", resp.status()));
-            }
-            Ok(())
-        }
-        "discord" => {
-            // L29: the chat_id is interpolated directly into the request path,
-            // so validate it is a Discord snowflake (a positive integer, 17-20
-            // digits in practice) before use. This prevents path traversal /
-            // injection (e.g. "../guilds/..." or query-string smuggling) when the
-            // notify rule's chat_id comes from less-trusted rule config.
-            if !is_discord_snowflake(chat_id) {
-                return Err(format!("invalid discord chat_id (not a snowflake): {chat_id}"));
-            }
-            let url =
-                format!("https://discord.com/api/v10/channels/{chat_id}/messages");
-            let resp = client
-                .post(&url)
-                .header("Authorization", format!("Bot {token}"))
-                .json(&serde_json::json!({ "content": text }))
-                .send()
-                .await
-                .map_err(|e| format!("discord send: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("discord API {}", resp.status()));
-            }
-            Ok(())
-        }
-        other => Err(format!("unsupported channel: {other}")),
-    }
 }
 
 // ─── SQLite event bus poll bridge ───────────────────────────
@@ -2602,20 +2551,14 @@ mod tests {
         );
     }
 
-    /// L29: only numeric, non-zero, sanely-sized snowflakes are accepted.
-    #[test]
-    fn discord_snowflake_validation() {
-        assert!(is_discord_snowflake("123456789012345678")); // 18-digit id
-        assert!(is_discord_snowflake("1")); // minimal non-zero
-        assert!(!is_discord_snowflake("")); // empty
-        assert!(!is_discord_snowflake("0")); // zero
-        assert!(!is_discord_snowflake("00")); // all-zero
-        assert!(!is_discord_snowflake("../guilds/1")); // path traversal
-        assert!(!is_discord_snowflake("123/messages")); // path smuggle
-        assert!(!is_discord_snowflake("123?x=1")); // query smuggle
-        assert!(!is_discord_snowflake("12a45")); // non-digit
-        assert!(!is_discord_snowflake("123456789012345678901")); // 21 digits, too long
-    }
+    // L29: Discord snowflake validation moved to
+    // `duduclaw_core::is_valid_discord_snowflake` (WP-4C unification —
+    // this file's own `is_discord_snowflake` and `send_channel_text` were
+    // removed; `action_notify` now validates via
+    // `channel_sender::is_valid_discord_chat_id`, a thin re-export of the
+    // same core helper, and sends via `channel_sender::create_sender`).
+    // Coverage for the validator itself lives in
+    // `duduclaw-core/src/match_utils.rs`'s `snowflake_*` tests.
 
     #[test]
     fn eval_simple_eq() {

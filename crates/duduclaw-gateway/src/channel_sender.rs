@@ -417,8 +417,17 @@ pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn C
 /// no traversal / injection characters). Shared by every caller that builds a
 /// `ChannelTarget` for Discord from external input (reminders, autopilot
 /// notify rules, the MCP `send_message` tool).
+///
+/// Thin re-export of the single duduclaw-core implementation (WP-4C — this
+/// used to be its own weaker check with no length cap or all-zero rejection,
+/// duplicating `autopilot_engine::is_discord_snowflake`'s stricter logic).
+/// Kept as a named function here (rather than switching every call site to
+/// `duduclaw_core::is_valid_discord_snowflake` directly) because this name is
+/// already part of the crate's public surface — re-exported through
+/// `reminder_scheduler::is_valid_discord_chat_id` and imported by
+/// `duduclaw-cli`'s MCP handler.
 pub fn is_valid_discord_chat_id(chat_id: &str) -> bool {
-    !chat_id.is_empty() && chat_id.chars().all(|c| c.is_ascii_digit())
+    duduclaw_core::is_valid_discord_snowflake(chat_id)
 }
 
 /// Resolve the [`ChannelTarget`] for a `(channel, chat_id)` pair by reading
