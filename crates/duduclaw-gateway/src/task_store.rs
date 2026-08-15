@@ -21,7 +21,7 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
-     pause_reason";
+     pause_reason, plan_pending";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -209,6 +209,27 @@ pub struct TaskRow {
     /// to `Unknown` = 「需要人工確認」.
     #[serde(default)]
     pub pause_reason: Option<String>,
+
+    // ── I-1c "想一想" plan-first mode (2026-08) ─────────────────────────
+    /// A generated execution plan awaiting human approval
+    /// ([`crate::goal_plan::apply_plan_first_result`]). Deliberately a
+    /// SEPARATE column from `judge_feedback` (which also carries a copy of
+    /// the same text purely for display, so the existing "why is this
+    /// parked" surfaces — dashboard chip, channel decision card — show it
+    /// with zero further change): `resolve_needs_human`'s `retry` arm
+    /// overwrites `judge_feedback` with the human's own (often empty)
+    /// approval note, which would silently lose the plan before the next
+    /// dispatch ever read it. This column is untouched by that write, so it
+    /// survives approval and lets
+    /// [`crate::goal_loop::GoalLoopDriver::enqueue_work`] inject the
+    /// approved plan into the very first execution round — then clear this
+    /// column so it is injected exactly once, not on every later round.
+    /// `None` for every task that never went through plan-first (the
+    /// overwhelming majority), and for a plan-first task once its plan has
+    /// been consumed by that first dispatch (or the task never got a plan at
+    /// all — the planner-failure fail-closed path never sets this).
+    #[serde(default)]
+    pub plan_pending: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -267,6 +288,7 @@ impl TaskRow {
             risk_boundary: None,
             acceptance_criteria_baseline: None,
             pause_reason: None,
+            plan_pending: None,
         }
     }
 }
@@ -766,6 +788,11 @@ impl TaskStore {
             // WHY a task parked `needs_human`, as a closed-set token. Nullable
             // on purpose — every pre-existing row reads back as `Unknown`.
             ("pause_reason", "pause_reason TEXT"),
+            // I-1c "想一想" plan-first mode: a generated plan awaiting human
+            // approval, surviving `resolve_needs_human`'s retry write (which
+            // overwrites `judge_feedback`) so the approved plan reaches the
+            // first execution round.
+            ("plan_pending", "plan_pending TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -856,10 +883,11 @@ impl TaskStore {
                  max_retries, goal_mode, acceptance_criteria, result_summary, judge_feedback,
                  goal_id, lease_renewed_at, source_channel, source_chat_id,
                  revision_round, diminishing, agent_seconds, source_discord_guild_id,
-                 deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason)
+                 deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
+                 plan_pending)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
             params![
                 row.id,
                 row.title,
@@ -897,6 +925,7 @@ impl TaskStore {
                 row.risk_boundary,
                 row.acceptance_criteria_baseline,
                 row.pause_reason,
+                row.plan_pending,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -1681,6 +1710,24 @@ impl TaskStore {
             )
             .map_err(|e| format!("mark needs_human: {e}"))?;
         Ok(n > 0)
+    }
+
+    /// I-1c "想一想": consume the pending plan-first plan after
+    /// [`crate::goal_loop::GoalLoopDriver::enqueue_work`] has injected it into
+    /// a round's dispatch payload, so it is injected exactly once (the first
+    /// round after approval) rather than on every subsequent round. Not
+    /// gated on task status — the caller (the driver, right after a
+    /// successful enqueue) already knows this is the correct moment; a
+    /// failed clear here is harmless (the plan is simply re-injected next
+    /// dispatch, which repeats guidance rather than losing anything).
+    pub async fn clear_plan_pending(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE tasks SET plan_pending = NULL WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("clear plan_pending: {e}"))?;
+        Ok(())
     }
 
     /// P2a: apply a human decision to a `needs_human` goal task from a channel
@@ -2835,6 +2882,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         risk_boundary: row.get(34)?,
         acceptance_criteria_baseline: row.get(35)?,
         pause_reason: row.get(36)?,
+        plan_pending: row.get(37)?,
     })
 }
 
@@ -4722,6 +4770,70 @@ mod tests {
             let got = store.get_task("old").await.unwrap().unwrap();
             assert!(got.pause_reason.is_none());
         }
+    }
+
+    // ── I-1c "想一想" plan-first: `plan_pending` round-trip + survival ──
+
+    /// `plan_pending` round-trips through insert/read like every other
+    /// column, and is `None` when never set (the overwhelming majority of
+    /// tasks never go through plan-first).
+    #[tokio::test]
+    async fn plan_pending_round_trips_and_defaults_to_none() {
+        let (store, _dir) = temp_store();
+        let mut t = pending_task("p1");
+        t.plan_pending = Some("- 步驟一\n- 步驟二".into());
+        store.insert_task(&t).await.unwrap();
+        assert_eq!(
+            store.get_task("p1").await.unwrap().unwrap().plan_pending.as_deref(),
+            Some("- 步驟一\n- 步驟二")
+        );
+
+        store.insert_task(&pending_task("p2")).await.unwrap();
+        assert!(store.get_task("p2").await.unwrap().unwrap().plan_pending.is_none());
+    }
+
+    /// The whole point of the separate column: `resolve_needs_human`'s
+    /// `retry` arm overwrites `judge_feedback` (with the human's own,
+    /// possibly-empty, approval note) but must NEVER touch `plan_pending` —
+    /// otherwise the approved plan would vanish before the next dispatch
+    /// ever reads it.
+    #[tokio::test]
+    async fn plan_pending_survives_a_needs_human_retry_that_clears_judge_feedback() {
+        let (store, _dir) = temp_store();
+        let mut t = goal_review_task("g1");
+        t.status = "needs_human".into();
+        t.judge_feedback = Some("- 步驟一\n- 步驟二".into());
+        t.plan_pending = Some("- 步驟一\n- 步驟二".into());
+        store.insert_task(&t).await.unwrap();
+
+        // Human approves with no extra note (the common "同意執行" click).
+        assert!(store.resolve_needs_human("g1", "retry", "").await.unwrap());
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "pending");
+        assert!(
+            got.judge_feedback.is_none(),
+            "an empty approval note clears judge_feedback as usual"
+        );
+        assert_eq!(
+            got.plan_pending.as_deref(),
+            Some("- 步驟一\n- 步驟二"),
+            "plan_pending must survive the retry write untouched"
+        );
+    }
+
+    /// `clear_plan_pending` is the driver's one-time-injection consumer —
+    /// idempotent, unconditional on status.
+    #[tokio::test]
+    async fn clear_plan_pending_nulls_the_column() {
+        let (store, _dir) = temp_store();
+        let mut t = pending_task("p1");
+        t.plan_pending = Some("plan text".into());
+        store.insert_task(&t).await.unwrap();
+
+        store.clear_plan_pending("p1").await.unwrap();
+        assert!(store.get_task("p1").await.unwrap().unwrap().plan_pending.is_none());
+        // Idempotent — clearing an already-clear column is a no-op, not an error.
+        store.clear_plan_pending("p1").await.unwrap();
     }
 
     // ── H22: latest activity timestamp (the progress signal) ────────────

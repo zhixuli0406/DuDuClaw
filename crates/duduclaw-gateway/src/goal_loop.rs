@@ -138,18 +138,18 @@ impl AutonomyLevel {
     /// Read `agent.toml [capabilities] autonomy_level` for one agent. A missing
     /// file, missing key, or malformed toml ⇒ `Approver` (fail-safe: the
     /// conservative level, never the most-autonomous one).
+    ///
+    /// Goes through the shared typed parse point
+    /// ([`duduclaw_core::agent_toml`]) rather than a hand-rolled `toml::Value`
+    /// walk. The value stays a raw `String` on
+    /// [`duduclaw_core::types::CapabilitiesConfig`] precisely so that
+    /// [`Self::from_toml_str`]'s lenient "unknown ⇒ Approver" mapping keeps
+    /// running here instead of becoming a hard deserialization error.
     pub fn for_agent(home_dir: &Path, agent_id: &str) -> Self {
-        let path = home_dir.join("agents").join(agent_id).join("agent.toml");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return AutonomyLevel::Approver;
-        };
-        let Ok(value) = toml::from_str::<toml::Value>(&text) else {
-            return AutonomyLevel::Approver;
-        };
-        value
-            .get("capabilities")
-            .and_then(|c| c.get("autonomy_level"))
-            .and_then(|v| v.as_str())
+        duduclaw_core::agent_toml::load_for_agent(home_dir, agent_id)
+            .capabilities
+            .autonomy_level
+            .as_deref()
             .map(AutonomyLevel::from_toml_str)
             .unwrap_or(AutonomyLevel::Approver)
     }
@@ -2142,7 +2142,8 @@ impl GoalLoopDriver {
     /// Enqueue a work message for `task` onto `message_queue.db` — the same rail
     /// the heartbeat's task-board pull uses, so the existing dispatcher routes it
     /// to the agent unchanged. Carries `judge_feedback` (if any) so a rejected
-    /// task is retried *with* the reviewer's feedback.
+    /// task is retried *with* the reviewer's feedback, and (I-1c) an approved
+    /// plan-first plan so the very first round after approval executes it.
     async fn enqueue_work(&self, task: &TaskRow, iter: u32, state_text: &str) -> Result<(), String> {
         let marker = format!("[goal-loop task_id={} iter={iter}]", task.id);
         // I-3a: a task continued from `done`/`failed`/`cancelled` via the
@@ -2166,6 +2167,22 @@ impl GoalLoopDriver {
                     )
                 }
             }
+            _ => String::new(),
+        };
+        // I-1c "想一想": a plan generated at goal-create time and approved via
+        // the same needs_human `retry` a human uses for any other pause —
+        // `plan_pending` is the ONE column that action does not overwrite
+        // (see the field's doc comment on `TaskRow`), so its presence here
+        // reliably means "this is the first round after approval". Rendered
+        // as its own block (not folded into `feedback_block`, which is about
+        // review/continuation, not a plan the agent has not started yet).
+        let plan_block = match task.plan_pending.as_deref() {
+            Some(p) if !p.trim().is_empty() => format!(
+                "\n\n這是你先前為此任務擬定、已獲人工核准的執行計畫,請依此計畫開始執行\
+                 (仍會經過驗收判官檢核,計畫本身不是免驗收的保證):\n\
+                 <execution_plan>\n{}\n</execution_plan>",
+                goal_state::xml_escape(p)
+            ),
             _ => String::new(),
         };
         let criteria_block = match task.acceptance_criteria.as_deref() {
@@ -2202,7 +2219,7 @@ impl GoalLoopDriver {
              請使用 MCP 工具 `tasks_claim` 認領這項任務,執行後用 `tasks_complete` \
              回報結果(務必在 result_summary 寫清楚你做了什麼、產出在哪),\
              系統會由驗收判官檢核是否達成驗收標準。若受阻無法完成,使用 `tasks_block` \
-             說明原因。{feedback_block}",
+             說明原因。{feedback_block}{plan_block}",
             task.id, task.title, task.description,
         );
 
@@ -2232,7 +2249,24 @@ impl GoalLoopDriver {
             turn_id: None,
             session_id: None,
         };
-        self.queue.enqueue(&msg).await
+        let result = self.queue.enqueue(&msg).await;
+        // I-1c: the plan has now been injected into this round's payload —
+        // consume it so it is not re-injected on every later round. Cleared
+        // only after a successful enqueue (an enqueue failure leaves it in
+        // place, so the next tick's retry still carries the plan). A failed
+        // clear is logged and otherwise harmless: the plan is simply
+        // re-injected next dispatch, which repeats guidance rather than
+        // losing anything.
+        if result.is_ok() && task.plan_pending.is_some() {
+            if let Err(e) = self.store.clear_plan_pending(&task.id).await {
+                warn!(
+                    task = %task.id,
+                    error = %e,
+                    "goal loop: failed to clear plan_pending after injecting it — will re-inject next dispatch (harmless)"
+                );
+            }
+        }
+        result
     }
 
     /// P5: push one progress line to the goal's source conversation, deduped by
@@ -2606,6 +2640,68 @@ impl GoalLoopDriver {
 mod tests {
     use super::*;
     use crate::task_store::TaskRow;
+
+    // ── R5: `[capabilities] autonomy_level` direction, pinned ────────────
+    //
+    // absent / malformed / wrong-typed / unrecognised ⇒ `Approver` — the
+    // conservative level, NEVER the most-autonomous one. Two separate
+    // fallbacks point the same way on purpose: the missing-key fallback here
+    // and `from_toml_str`'s unknown-string fallback. The value stays a raw
+    // String on the typed section so the second one keeps running instead of
+    // a strict serde enum making a typo fatal to the whole `AgentConfig`
+    // (which would drop the agent from the registry entirely).
+
+    fn home_with_agent(agent_id: &str, body: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join(agent_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), body).unwrap();
+        home
+    }
+
+    #[test]
+    fn default_direction_autonomy_level_defaults_to_approver_never_operator() {
+        for body in [
+            "",                                            // empty file
+            "[capabilities]\n",                            // section, no key
+            "[capabilities]\ncomputer_use = true\n",       // sibling only
+            "[capabilities]\nautonomy_level = \"oprator\"\n", // typo
+            "[capabilities]\nautonomy_level = \"\"\n",     // blank
+            "[capabilities]\nautonomy_level = 3\n",        // wrong type
+            "capabilities = \"scalar\"\n",                 // wrong-typed section
+            "not toml [[[",                                // malformed file
+        ] {
+            let home = home_with_agent("a", body);
+            assert_eq!(
+                AutonomyLevel::for_agent(home.path(), "a"),
+                AutonomyLevel::Approver,
+                "for {body:?}"
+            );
+        }
+
+        // Missing agent directory entirely — same direction.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            AutonomyLevel::for_agent(empty.path(), "nope"),
+            AutonomyLevel::Approver
+        );
+    }
+
+    #[test]
+    fn default_direction_autonomy_level_recognised_values_still_apply() {
+        for (raw, want) in [
+            ("operator", AutonomyLevel::Operator),
+            ("Collaborator", AutonomyLevel::Collaborator), // case-insensitive
+            (" consultant ", AutonomyLevel::Consultant),   // trimmed
+            ("observer", AutonomyLevel::Observer),
+        ] {
+            let home = home_with_agent(
+                "a",
+                &format!("[capabilities]\nautonomy_level = \"{raw}\"\n"),
+            );
+            assert_eq!(AutonomyLevel::for_agent(home.path(), "a"), want, "for {raw:?}");
+        }
+    }
 
     fn driver(store: Arc<TaskStore>, queue: Arc<MessageQueue>, cfg: GoalLoopConfig) -> GoalLoopDriver {
         GoalLoopDriver::new(store, queue, cfg)
@@ -3118,6 +3214,97 @@ mod tests {
         assert!(
             !pending[0].payload.contains("遵循當地法規"),
             "explicit risk_boundary replaces, not appends to, the baseline"
+        );
+    }
+
+    // ── I-1c "想一想" plan-first: end-to-end through the driver ──────────
+    //
+    // These simulate exactly what `handlers.rs::handle_tasks_goal_create` +
+    // `goal_plan::apply_plan_first_result` produce on the `Ok` branch — a task
+    // born directly in `needs_human` with `plan_pending` set — without going
+    // through the real (network-calling) planner, matching this file's own
+    // testing convention (the concrete LLM caller is exercised by live
+    // verification, not a unit test; see `goal_plan.rs`'s `StubCaller` tests
+    // for the generation logic itself).
+    fn plan_first_pending_task(id: &str, agent: &str, plan: &str) -> TaskRow {
+        let mut t = goal_task(id, agent);
+        t.status = "needs_human".into();
+        t.pause_reason = Some(crate::pause_reason::PauseReason::BlockedNeedsDecision.as_str().into());
+        t.judge_feedback = Some(plan.into());
+        t.plan_pending = Some(plan.into());
+        t
+    }
+
+    /// A plan awaiting approval must NEVER execute — the whole point of
+    /// "想一想" is that nothing runs before a human decides. `needs_human` is
+    /// not one of the driver's dispatch-candidate statuses
+    /// (`todo`/`pending`/`revising`), so this is really testing that the
+    /// plan-first creation path (parking directly in `needs_human`) actually
+    /// keeps the task out of the loop — not a new guard, the existing
+    /// candidate-status filter already provides it.
+    #[tokio::test]
+    async fn plan_pending_task_is_not_dispatched_before_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store
+            .insert_task(&plan_first_pending_task("g1", "alice", "- 查資料\n- 寫報告"))
+            .await
+            .unwrap();
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        assert!(
+            queue.pending_messages(10).await.unwrap().is_empty(),
+            "a plan awaiting human approval must not execute"
+        );
+        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "needs_human");
+    }
+
+    /// Approving the plan (the dashboard/channel "重試" action on a
+    /// `needs_human` task — no new button kind) must both start execution AND
+    /// carry the approved plan into that very first round's prompt; the plan
+    /// is then consumed so a later round never repeats it.
+    #[tokio::test]
+    async fn approving_a_pending_plan_dispatches_it_into_round_one_then_consumes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store
+            .insert_task(&plan_first_pending_task("g1", "alice", "- 查資料\n- 寫報告"))
+            .await
+            .unwrap();
+
+        // Human clicks "重試" (= approve and start) — the SAME resolution
+        // path any other needs_human task uses, with no note.
+        assert!(store.resolve_needs_human("g1", "retry", "").await.unwrap());
+        let approved = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(approved.status, "pending");
+        assert_eq!(
+            approved.plan_pending.as_deref(),
+            Some("- 查資料\n- 寫報告"),
+            "plan_pending must have survived the approval write"
+        );
+
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+        d.tick_once().await.unwrap();
+
+        let dispatched = queue.pending_messages(10).await.unwrap();
+        assert_eq!(dispatched.len(), 1, "round 1 must dispatch once approved");
+        assert!(
+            dispatched[0].payload.contains("查資料") && dispatched[0].payload.contains("寫報告"),
+            "the approved plan must reach round 1's prompt: {}",
+            dispatched[0].payload
+        );
+        assert!(
+            dispatched[0].payload.contains("<execution_plan>"),
+            "the plan is rendered as its own distinct block, not folded into judge feedback"
+        );
+
+        // Consumed — a later round (e.g. a judge rejection re-dispatch) must
+        // not keep repeating the same plan block forever.
+        assert!(
+            store.get_task("g1").await.unwrap().unwrap().plan_pending.is_none(),
+            "plan_pending must be cleared after being injected once"
         );
     }
 

@@ -146,6 +146,41 @@ describe('AssignSheet', () => {
     });
   });
 
+  it('想一想 mode sends plan_first and still lands on the created task', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'tasks.goal_create') {
+        return Promise.resolve({
+          task: { id: 'gt-9', title: 'x' },
+          iteration_cap: 8,
+          dispatch_enabled: true,
+          plan_first: true,
+        });
+      }
+      return Promise.resolve({});
+    });
+    const user = userEvent.setup();
+    renderWithProviders(<AssignSheet />);
+    act(() => useAssignStore.getState().openAssign());
+    await user.type(
+      await screen.findByLabelText('What should the AI employee do?'),
+      'Sort the feedback',
+    );
+    await user.click(screen.getByRole('radio', { name: 'Plan first' }));
+    await user.click(screen.getByRole('button', { name: 'Generate plan' }));
+
+    await waitFor(() => {
+      expect(mockWsClient.call).toHaveBeenCalledWith(
+        'tasks.goal_create',
+        expect.objectContaining({
+          agent_id: 'scout',
+          description: 'Sort the feedback',
+          plan_first: true,
+        }),
+      );
+    });
+    expect(mockNavigate).toHaveBeenCalledWith('/goals?task=gt-9');
+  });
+
   it('問一問 mode goes to the chat page instead of filing a task', async () => {
     const user = userEvent.setup();
     renderWithProviders(<AssignSheet />);

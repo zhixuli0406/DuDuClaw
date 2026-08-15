@@ -138,12 +138,24 @@ export function NeedsHumanTaskPanel({
           <div className="space-y-3">
             {task.description && <p className="text-sm text-foreground">{task.description}</p>}
 
-            {/* The judge's / dispatcher's escalation reason — "看決定的依據" (§D.7). */}
-            {task.judge_feedback && (
-              <p className="flex items-start gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
-                <MessageSquareWarning className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-                <span>{task.judge_feedback}</span>
-              </p>
+            {/* I-1c: a 想一想 task carries a plan awaiting approval — shown as
+                its own labelled card rather than the generic escalation-reason
+                line below (which would otherwise duplicate the same text). */}
+            {task.plan_pending ? (
+              <div className="space-y-1 rounded-lg bg-muted px-3 py-2">
+                <p className="text-xs font-medium text-muted-foreground">
+                  {t('tasks.planFirst.hint')}
+                </p>
+                <p className="whitespace-pre-wrap text-sm text-foreground">{task.plan_pending}</p>
+              </div>
+            ) : (
+              // The judge's / dispatcher's escalation reason — "看決定的依據" (§D.7).
+              task.judge_feedback && (
+                <p className="flex items-start gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+                  <MessageSquareWarning className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+                  <span>{task.judge_feedback}</span>
+                </p>
+              )
             )}
           </div>
         </TabsPanel>

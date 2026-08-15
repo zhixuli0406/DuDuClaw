@@ -39,11 +39,16 @@ import { ConnectorChips } from './ConnectorChips';
  * `/goals` 交辦任務, and the agent card menu. Mounted once in `MainLayout` and
  * driven by `assign-store`.
  *
- * Two modes, both existing paths — nothing new was invented:
+ * Three modes:
  * - 問一問 (`ask`)  → `/chat` with the draft carried over. A conversation; no
  *   task is filed and no loop starts.
  * - 交辦   (`assign`) → `tasks.goal_create`, i.e. the autonomous goal loop with
  *   the MAV acceptance judge. This is the default.
+ * - 想一想 (`plan`, I-1c — WorkBuddy Plan mode) → `tasks.goal_create` with
+ *   `plan_first: true`: the same request, but the backend generates a plan
+ *   and parks the task `needs_human` for approval instead of dispatching it.
+ *   `TaskDetailPage` renders the pending plan; approving is the SAME 重試
+ *   action any other `needs_human` task uses (no new button kind was added).
  *
  * The four-element guide (目標／輸入／輸出格式／約束含完成標準) is a collapsed
  * hint block plus placeholders, never a required form — a non-technical user
@@ -147,7 +152,12 @@ export function AssignSheet() {
     navigate(to, { state: { draft: goalText } });
   };
 
-  const submitAssign = async () => {
+  /** Backs both 交辦 (`assign`) and 想一想 (`plan`) — the only difference is
+   *  `plan_first`, which the backend uses to park the task `needs_human` for
+   *  approval instead of dispatching it immediately (I-1c). Same request
+   *  shape, same landing page — the task detail page renders the pending
+   *  plan for the `plan` case (see `TaskDetailPage`). */
+  const submitAssign = async (planFirst: boolean) => {
     const trimmedDuration = durationHours.trim();
     const parsedDuration = trimmedDuration ? Number(trimmedDuration) : undefined;
     if (
@@ -167,12 +177,17 @@ export function AssignSheet() {
         duration_hours: parsedDuration,
         risk_boundary: riskBoundary.trim() || undefined,
         require_beliefs: requireBeliefs || undefined,
+        plan_first: planFirst || undefined,
       });
-      toast.success(
-        intl.formatMessage({ id: 'goals.create.success' }, { cap: result.iteration_cap }),
-      );
-      if (!result.dispatch_enabled) {
-        toast.error(intl.formatMessage({ id: 'goals.create.dispatchOff' }));
+      if (result.plan_first) {
+        toast.success(intl.formatMessage({ id: 'assign.mode.plan.success' }));
+      } else {
+        toast.success(
+          intl.formatMessage({ id: 'goals.create.success' }, { cap: result.iteration_cap }),
+        );
+        if (!result.dispatch_enabled) {
+          toast.error(intl.formatMessage({ id: 'goals.create.dispatchOff' }));
+        }
       }
       closeAssign();
       // Land on the task that was just created, not on a generic list.
@@ -187,11 +202,12 @@ export function AssignSheet() {
   const handleSubmit = () => {
     if (!canSubmit || submitting) return;
     if (mode === 'ask') submitAsk();
-    else void submitAssign();
+    else void submitAssign(mode === 'plan');
   };
 
   const submitLabel = intl.formatMessage({
-    id: mode === 'ask' ? 'assign.submitAsk' : 'assign.submit',
+    id:
+      mode === 'ask' ? 'assign.submitAsk' : mode === 'plan' ? 'assign.submitPlan' : 'assign.submit',
   });
 
   return (
@@ -203,7 +219,8 @@ export function AssignSheet() {
         </DialogHeader>
 
         <div className="space-y-4">
-          {/* Mode — the two existing execution paths, named from the user's side. */}
+          {/* Mode — the three execution paths, named from the user's side
+              (I-1c added 想一想 alongside the existing 問一問／交辦). */}
           <div className="space-y-1.5">
             <span className="text-xs font-medium text-muted-foreground">
               {intl.formatMessage({ id: 'assign.mode' })}
@@ -216,6 +233,7 @@ export function AssignSheet() {
                 options={[
                   { value: 'ask', label: intl.formatMessage({ id: 'assign.mode.ask' }) },
                   { value: 'assign', label: intl.formatMessage({ id: 'assign.mode.assign' }) },
+                  { value: 'plan', label: intl.formatMessage({ id: 'assign.mode.plan' }) },
                 ]}
               />
               <p className="text-xs text-muted-foreground">
@@ -268,7 +286,9 @@ export function AssignSheet() {
             )}
           </div>
 
-          {mode === 'assign' && (
+          {/* 想一想 still creates a goal task (with the same acceptance
+              contract, once approved) — only 問一問 skips these fields. */}
+          {mode !== 'ask' && (
             <>
               {/* 約束／完成標準 */}
               <div className="space-y-1.5">

@@ -107,12 +107,12 @@ pub(crate) async fn channel_token(home_dir: &Path, agent_id: &str, channel: &str
         return present.then(String::new);
     }
 
+    // WP-H1: the cascade returns `None` for "not configured" — the resolver
+    // has no empty-string state left to re-check.
     if let Some(tok) =
         crate::config_crypto::resolve_agent_channel_token_via_reports_to(home_dir, agent_id, channel)
     {
-        if !tok.is_empty() {
-            return Some(tok);
-        }
+        return Some(tok.expose_owned());
     }
     let field = crate::otp_delivery::token_field(channel)?;
     crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field)

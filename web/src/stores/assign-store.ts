@@ -14,12 +14,16 @@ import { create } from 'zustand';
  * "open, with these seeds".
  */
 
-/** Which of the two existing execution paths the panel submits to. */
+/** Which of the three execution paths the panel submits to. */
 export type AssignMode =
   /** 問一問 — a plain conversation on `/chat`; nothing is filed, nothing loops. */
   | 'ask'
   /** 交辦 — `tasks.goal_create`, i.e. the autonomous goal loop. */
-  | 'assign';
+  | 'assign'
+  /** 想一想 (I-1c, WorkBuddy Plan mode) — `tasks.goal_create` with
+   *  `plan_first: true`: a plan is generated and parked for approval before
+   *  any execution starts. */
+  | 'plan';
 
 export interface AssignPrefill {
   /** Preselect an AI employee (agent `name`). */
