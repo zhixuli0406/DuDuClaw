@@ -1385,18 +1385,40 @@ impl AutopilotEngine {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "notify.text required".to_string())?;
         let text = with_perception_banner(banner, render_template(text_template, fields));
-        let candidates = resolve_channel_tokens(&self.home_dir, channel).await?;
-        // Global token first, then per-agent (same fallback the login-OTP
-        // deliverer uses) — try each until one send succeeds so an
-        // agent-scoped-bot deployment can still notify.
-        let mut last_err = String::new();
-        for token in &candidates {
-            match send_channel_text(channel, chat_id, token, &text).await {
-                Ok(()) => return Ok(()),
-                Err(e) => last_err = e,
+
+        // telegram/line/discord/slack keep the multi-candidate (global +
+        // per-agent) token fallback the 2026-08-13 login-OTP outage fix
+        // added (`config_crypto::channel_dm_token_candidates`) — an
+        // agent-scoped-bot deployment can still notify even when the global
+        // token is unset.
+        if matches!(channel, "telegram" | "line" | "discord" | "slack") {
+            let candidates = resolve_channel_tokens(&self.home_dir, channel).await?;
+            let mut last_err = String::new();
+            for token in &candidates {
+                match send_channel_text(channel, chat_id, token, &text).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last_err = e,
+                }
             }
+            return Err(last_err);
         }
-        Err(last_err)
+
+        // Every other bot-pushable channel (whatsapp/feishu/googlechat/
+        // teams/wecom/dingtalk) routes through the same
+        // `channel_sender::resolve_channel_target` + `create_sender` path
+        // `reminder_scheduler::send_channel_message` uses — previously this
+        // function's hardcoded 4-channel whitelist rejected all six with
+        // "unsupported notify.channel", silently dropping notify actions for
+        // agents on those channels (same defect class as
+        // `goal_notify::channel_token`'s BUG-1). WebChat and unknown
+        // channels are refused inside `resolve_channel_target`.
+        let target =
+            crate::channel_sender::resolve_channel_target(&self.home_dir, channel, chat_id)
+                .await?;
+        crate::channel_sender::create_sender(&target, notify_http_client().clone())
+            .send_text(&text)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// P2-2 `proactive_notify`: route a *system-initiated* notification through
@@ -1842,6 +1864,13 @@ fn is_safe_skill_name(name: &str) -> bool {
 
 // ─── Channel send helpers ───────────────────────────────────
 
+/// Global-then-per-agent token candidates for the four channels whose bot
+/// token shape supports `config_crypto::channel_dm_token_candidates`'s
+/// fallback (2026-08-13 login-OTP outage fix). Every other bot-pushable
+/// channel (whatsapp/feishu/googlechat/teams/wecom/dingtalk) has no
+/// per-agent-token concept and instead resolves through
+/// `channel_sender::resolve_channel_target` directly in `action_notify` —
+/// this function is deliberately NOT the place to add them.
 async fn resolve_channel_tokens(home_dir: &Path, channel: &str) -> Result<Vec<String>, String> {
     let field = match channel {
         "telegram" => "telegram_bot_token",

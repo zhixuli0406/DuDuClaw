@@ -413,6 +413,157 @@ pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn C
     }
 }
 
+/// Validate a Discord channel ID (must be a numeric snowflake — plain digits,
+/// no traversal / injection characters). Shared by every caller that builds a
+/// `ChannelTarget` for Discord from external input (reminders, autopilot
+/// notify rules, the MCP `send_message` tool).
+pub fn is_valid_discord_chat_id(chat_id: &str) -> bool {
+    !chat_id.is_empty() && chat_id.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Resolve the [`ChannelTarget`] for a `(channel, chat_id)` pair by reading
+/// credentials from `config.toml` (`home_dir`). This is the single shared
+/// resolution path for every "push a message to a channel" caller —
+/// `reminder_scheduler::send_channel_message`, `autopilot_engine`'s `notify`
+/// action, and the MCP `send_message` tool all call this instead of each
+/// hand-rolling their own per-channel token lookup (previously three
+/// independent hardcoded whitelists, each missing a different subset of the
+/// 10 bot-pushable channels).
+///
+/// Mirrors `cron_scheduler.rs::deliver_cron_result`'s self-configuring-
+/// channel handling (WeCom/DingTalk/Google Chat/Teams read multi-field
+/// credentials straight from `home_dir` at send time — the sender ignores
+/// `ChannelTarget.token` for those four, so "is there a token" becomes "is
+/// the marker field set", same as `goal_notify::channel_token`'s BUG-1 fix).
+///
+/// WebChat is deliberately refused rather than routed through the generic
+/// factory: it is a session-scoped WebSocket connection with no persistent
+/// bot identity, and [`create_sender`]'s WebChat arm built without an
+/// `event_tx` silently no-ops `send_text` — a background scheduler / rule
+/// engine / stateless MCP call with no live connection reference must not
+/// report that as a successful delivery.
+pub async fn resolve_channel_target(
+    home_dir: &std::path::Path,
+    channel: &str,
+    chat_id: &str,
+) -> Result<ChannelTarget, String> {
+    if channel == "webchat" {
+        return Err(
+            "webchat is not supported here — no persistent session to deliver into".to_string(),
+        );
+    }
+
+    if sender_self_configures(channel) {
+        let marker = self_config_marker_field(channel)
+            .expect("self-configuring channel must declare a marker field");
+        let present =
+            crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
+                .await
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        if !present {
+            return Err(format!(
+                "channel {channel} is not configured (missing `{marker}` in config.toml [channels])"
+            ));
+        }
+        return Ok(ChannelTarget {
+            channel_type: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            token: String::new(), // factory-built {channel} sender ignores this
+            extra_id: None,
+        });
+    }
+
+    if channel == "whatsapp" {
+        let token = crate::config_crypto::read_encrypted_config_field(
+            home_dir,
+            "channels",
+            "whatsapp_access_token",
+        )
+        .await
+        .unwrap_or_default();
+        let phone_id = crate::config_crypto::read_encrypted_config_field(
+            home_dir,
+            "channels",
+            "whatsapp_phone_number_id",
+        )
+        .await
+        .unwrap_or_default();
+        if token.is_empty() || phone_id.is_empty() {
+            return Err("whatsapp_access_token / whatsapp_phone_number_id not configured".to_string());
+        }
+        return Ok(ChannelTarget {
+            channel_type: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            token,
+            extra_id: Some(phone_id),
+        });
+    }
+
+    if channel == "feishu" {
+        let app_id =
+            crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "feishu_app_id")
+                .await
+                .unwrap_or_default();
+        let app_secret = crate::config_crypto::read_encrypted_config_field(
+            home_dir,
+            "channels",
+            "feishu_app_secret",
+        )
+        .await
+        .unwrap_or_default();
+        if app_id.is_empty() || app_secret.is_empty() {
+            return Err("feishu_app_id / feishu_app_secret not configured".to_string());
+        }
+        // Feishu's messages API needs a short-lived tenant_access_token, not
+        // the raw app_id/app_secret — fetched fresh per call (this path is
+        // not hot enough to need caching, mirrors dispatcher.rs's identical
+        // forward-path fetch).
+        let http = reqwest::Client::new();
+        let resp = http
+            .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+            .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
+            .send()
+            .await
+            .map_err(|e| format!("feishu token: {e}"))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("feishu token parse: {e}"))?;
+        let token = body
+            .get("tenant_access_token")
+            .and_then(|v| v.as_str())
+            .ok_or("feishu: no tenant_access_token in response")?
+            .to_string();
+        return Ok(ChannelTarget {
+            channel_type: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            token,
+            extra_id: None,
+        });
+    }
+
+    // telegram / line / discord / slack — single `<channel>_bot_token`
+    // field, per `otp_delivery::token_field`'s canonical mapping.
+    if channel == "discord" && !is_valid_discord_chat_id(chat_id) {
+        return Err(format!("Invalid Discord channel ID: '{chat_id}' (must be numeric)"));
+    }
+    let field = crate::otp_delivery::token_field(channel)
+        .ok_or_else(|| format!("Unknown channel: {channel}"))?;
+    let token = crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field)
+        .await
+        .unwrap_or_default();
+    if token.is_empty() {
+        return Err(format!("{field} not configured"));
+    }
+    Ok(ChannelTarget {
+        channel_type: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        token,
+        extra_id: None,
+    })
+}
+
 // ===========================================================================
 // 1. Telegram
 // ===========================================================================
