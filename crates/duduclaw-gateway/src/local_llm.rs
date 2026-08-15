@@ -262,7 +262,9 @@ pub(crate) async fn try_local_tool_loop(
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| provider.model())
         .to_string();
-    let mut req = ChatRequest::new(model);
+    // Cloned because `model` is still needed after `req` is moved into the
+    // tool loop (WP-6E probe attribution).
+    let mut req = ChatRequest::new(model.clone());
     let system = system_prompt.trim();
     if !system.is_empty() {
         // Local servers (vLLM APC / SGLang RadixAttention) prefix-cache
@@ -280,14 +282,24 @@ pub(crate) async fn try_local_tool_loop(
     let policy = capabilities.map(|c| c.policy.as_slice()).unwrap_or(&empty_policy);
     let guarded = duduclaw_llm::PolicyExecutor::new(&registry, policy, agent_id);
 
-    match duduclaw_llm::run_tool_loop(
-        &provider,
+    // WP-6E: Code Mode Phase 0 measurement gate
+    // (`commercial/docs/DESIGN-code-mode-2026-08.md` §8.1) — beneficiary #3 of
+    // the design's §2 list. Pure observation; forwards requests/responses
+    // verbatim and only counts.
+    let probe = crate::tool_loop_probe::ToolLoopProbe::new(&provider);
+    let loop_result = duduclaw_llm::run_tool_loop(
+        &probe,
         req,
         &guarded,
         duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
     )
-    .await
-    {
+    .await;
+    probe.finish_and_record(
+        agent_id,
+        crate::tool_loop_probe::ProbePath::LocalInference,
+        &model,
+    );
+    match loop_result {
         Ok(resp) => {
             let text = resp.text();
             if text.trim().is_empty() {
