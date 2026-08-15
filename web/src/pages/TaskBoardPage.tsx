@@ -4,6 +4,7 @@ import { useNavigate, useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAssignStore } from '@/stores/assign-store';
 import {
   PageHeader,
   Button,
@@ -53,6 +54,7 @@ import {
   Check,
   X,
   ChevronDown,
+  UserRoundPlus,
 } from 'lucide-react';
 
 // ── Preferences (localStorage, §5.4 view memory) ────────────
@@ -693,6 +695,7 @@ function DisplayPopover({
 export function TaskBoardPage() {
   const intl = useIntl();
   const navigate = useNavigate();
+  const openAssign = useAssignStore((s) => s.openAssign);
   const [searchParams, setSearchParams] = useSearchParams();
   // `error` was unread across this whole file (P05 Blocker, phase-4 audit):
   // every failed read and write was silent, and a failed delete still closed
@@ -735,7 +738,10 @@ export function TaskBoardPage() {
       .catch(() => setFlow(null));
   }, [fetchTasks, fetchAgents]);
 
-  // Open the create modal when routed here with `?new=1` (Sidebar / MobileBottomNav).
+  // Open the record-only create modal when routed here with `?new=1`. The
+  // sidebar / mobile ＋ stopped pointing here in UX plan I-1a (they open the
+  // AssignSheet now); the param stays for existing bookmarks and for the
+  // employee-detail "＋" deep links below.
   useEffect(() => {
     if (searchParams.get('new') === '1') setShowCreate(true);
   }, [searchParams]);
@@ -1013,9 +1019,17 @@ export function TaskBoardPage() {
         <h1 className="truncate text-sm font-medium">{intl.formatMessage({ id: 'nav.tasks' })}</h1>
         <span className="font-mono text-xs tabular-nums text-muted-foreground">{filteredTasks.length}</span>
         <div className="ml-auto flex items-center gap-2">
-          <Button variant="brand" size="sm" onClick={openCreate}>
+          {/* Two distinct actions, deliberately not the same weight (UX plan
+              I-1a). 新增任務 files a passive card for the human's own tracking
+              and never dispatches; 交辦任務 hands the work to an AI employee
+              and starts the loop. Same board, different intent. */}
+          <Button variant="outline" size="sm" onClick={openCreate}>
             <Plus />
             <span className="hidden sm:inline">{intl.formatMessage({ id: 'tasks.create' })}</span>
+          </Button>
+          <Button variant="brand" size="sm" onClick={() => openAssign()}>
+            <UserRoundPlus />
+            <span className="hidden sm:inline">{intl.formatMessage({ id: 'assign.submit' })}</span>
           </Button>
         </div>
       </PageHeader>
@@ -1089,9 +1103,11 @@ export function TaskBoardPage() {
             icon={KanbanSquare}
             title={intl.formatMessage({ id: 'tasks.empty' })}
             action={
-              <Button variant="brand" size="sm" onClick={openCreate}>
-                <Plus />
-                {intl.formatMessage({ id: 'tasks.create' })}
+              // An empty board is where the real first step matters: hand
+              // something to an AI employee, not file a card for yourself.
+              <Button variant="brand" size="sm" onClick={() => openAssign()}>
+                <UserRoundPlus />
+                {intl.formatMessage({ id: 'assign.submit' })}
               </Button>
             }
           />

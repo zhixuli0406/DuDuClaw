@@ -343,8 +343,15 @@ export const navGroups: NavGroup[] = [
       // disclosure, same mechanism as `/forks`) is the honest fix — it shows
       // up once there is actually something to draw, on EVERY edition.
       { to: '/org', icon: Users2, label: 'nav.team', desc: 'nav.team.desc', minRole: 'manager', requiresData: 'org' },
-      // 專家包 — install/manage bundled AI teams; experts.* RPCs are admin-only.
-      { to: '/experts', icon: Package, label: 'nav.experts', desc: 'nav.experts.desc', minRole: 'admin' },
+      // AI 團隊（原「專家包」，P2-a-nav 2026-08-15）— install/manage bundled AI
+      // teams. Previously `minRole: 'admin'` kept 22 ready-made industry
+      // teams invisible to every non-admin viewer (design doc walkthrough 5,
+      // `DESIGN-dashboard-ux-workbuddy-2026-08.md` §1 走查5) — dropped so it
+      // sits in the 一般層 like its 公司-group peers (`/skills`, `/memory`,
+      // `/widgets`, …). The install action's own permission gate
+      // (`experts.install_builtin` etc.) is untouched: seeing the card is not
+      // the same as being allowed to install it.
+      { to: '/experts', icon: Package, label: 'nav.experts', desc: 'nav.experts.desc' },
       // Widget 工坊 — custom dashboard cards (AI-built / HTML / shared).
       { to: '/widgets', icon: LayoutGrid, label: 'nav.widgets', desc: 'nav.widgets.desc' },
       // 桌寵工作室 — photo → interactive desktop pet. Desktop app only
@@ -414,6 +421,12 @@ export const personalPrimaryItems: NavItem[] = pickItems([
   // AI 員工 back on the primary rail for Personal too (2026-08-04, D11).
   '/agents',
   '/world',
+  // AI 團隊（原「專家包」，P2-a-nav 2026-08-15）— promoted out of 進階 (see
+  // `personalAdvancedGroup` below, where the same route is now REMOVED —
+  // leaving it in both places would render the row twice). 22 ready-made
+  // industry teams were previously undiscoverable on Personal: admin-gated
+  // AND buried at the bottom of a collapsed group (design doc walkthrough 5).
+  '/experts',
   '/pet-studio',
 ]);
 
@@ -424,9 +437,13 @@ export const personalPrimaryItems: NavItem[] = pickItems([
  * Order (WP-NAV, 2026-08-12) mirrors the Enterprise 工作 → 公司 reading order
  * exactly, so the same surfaces never appear in two different sequences across
  * editions: the work cluster first (任務看板 leading it per WP14), then the
- * company cluster (成長 → 組織架構 → 專家包 → Widget 工坊). Within the work
+ * company cluster (成長 → 組織架構 → Widget 工坊). Within the work
  * cluster the same frequency slope applies — daily surfaces, oversight pair,
  * then the two occasional rows (分支決戰 → OS).
+ *
+ * AI 團隊（原「專家包」）left this group for `personalPrimaryItems`
+ * (P2-a-nav, 2026-08-15) — 22 ready-made industry teams should not sit
+ * behind a collapsed 進階 section.
  */
 export const personalAdvancedGroup: NavGroup = {
   label: 'navGroup.advanced',
@@ -446,9 +463,10 @@ export const personalAdvancedGroup: NavGroup = {
     // holds in the Enterprise 公司 group. D6: the org chart is folded here
     // rather than on the primary rail; it is a progressive-disclosure surface
     // (`requiresData: 'org'`), not a daily one.
+    // `/experts` (AI 團隊) moved OUT of this group to `personalPrimaryItems`
+    // (P2-a-nav 2026-08-15) — do not add it back here, it would render twice.
     '/growth',
     '/org',
-    '/experts',
     '/widgets',
   ]),
 };

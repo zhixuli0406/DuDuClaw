@@ -1,14 +1,14 @@
-import { NavLink, useNavigate } from 'react-router';
+import { NavLink } from 'react-router';
 import { useIntl } from 'react-intl';
 import { Plus } from 'lucide-react';
-import { useSystemStore } from '@/stores/system-store';
+import { useAssignStore } from '@/stores/assign-store';
 import { cn } from '@/lib/utils';
 import { mobileNavItems, type NavItem } from './nav-model';
 
 /**
  * MobileBottomNav — Zone A quick access on small screens (§4.3). Slots:
- * 儀表板 / 對話 / ＋交辦（center raised action, links to the task board's create
- * intent） / 對話紀錄 / 任務. Hidden at md+ (the sidebar takes over). Two balanced
+ * 儀表板 / 對話 / ＋交辦（center raised action, opens the AssignSheet） /
+ * 對話紀錄 / 任務. Hidden at md+ (the sidebar takes over). Two balanced
  * side groups (2 left / 2 right) flank the centre ＋交辦; the ＋ remains the quick
  * create entry.
  *
@@ -38,10 +38,10 @@ function BottomNavLink({ item }: { item: NavItem }) {
 
 export function MobileBottomNav() {
   const intl = useIntl();
-  const navigate = useNavigate();
-  // Personal IA (2026-07-29 client feedback round 2): the centre ＋交辦 quick
-  // action is task-board chrome — hidden on Personal like the sidebar button.
-  const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
+  // UX plan I-1a: 交辦 is the primary action of both editions, so the centre ＋
+  // is no longer hidden on Personal (it was collateral damage of the
+  // 2026-07-29 "hide task-board chrome" round).
+  const openAssign = useAssignStore((s) => s.openAssign);
 
   // Split the side items around the center ＋交辦 action. The center is a
   // fixed-width slot flanked by two equal-flex groups, so the raised ＋ button
@@ -63,22 +63,21 @@ export function MobileBottomNav() {
       </div>
 
       {/* Center raised action: ＋交辦 — a fixed-width slot kept horizontally
-          centred by the equal-flex groups on either side. */}
-      {!isPersonal && (
-        <div className="flex w-16 shrink-0 items-center justify-center">
-          <button
-            type="button"
-            // TODO(v2-V5): route to the task board's create intent until a global
-            // create-task modal exists.
-            onClick={() => navigate('/tasks?new=1')}
-            aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
-            title={intl.formatMessage({ id: 'sidebar.newTask' })}
-            className="-mt-6 grid size-14 place-items-center rounded-full bg-brand text-brand-foreground shadow-[var(--menu-shadow)] ring-4 ring-sidebar transition-transform active:translate-y-px active:scale-95"
-          >
-            <Plus className="size-6" />
-          </button>
-        </div>
-      )}
+          centred by the equal-flex groups on either side. Opens the one
+          AssignSheet (UX plan I-1a); it used to route to the task board's
+          `?new=1` create-a-card intent, which the code itself flagged as a
+          placeholder and which never started the autonomous loop. */}
+      <div className="flex w-16 shrink-0 items-center justify-center">
+        <button
+          type="button"
+          onClick={() => openAssign()}
+          aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
+          title={intl.formatMessage({ id: 'sidebar.newTask' })}
+          className="-mt-6 grid size-14 place-items-center rounded-full bg-brand text-brand-foreground shadow-[var(--menu-shadow)] ring-4 ring-sidebar transition-transform active:translate-y-px active:scale-95"
+        >
+          <Plus className="size-6" />
+        </button>
+      </div>
 
       <div className="flex flex-1 items-stretch">
         {right.map((item) => (

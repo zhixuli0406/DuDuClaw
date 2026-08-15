@@ -19,6 +19,7 @@ import { useAuthStore } from '@/stores/auth-store';
 import { useApprovalsStore } from '@/stores/approvals-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
+import { useAssignStore } from '@/stores/assign-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useGrowthStore } from '@/stores/growth-store';
 import { useThemeStore } from '@/stores/theme-store';
@@ -469,7 +470,7 @@ function EditionCard() {
  */
 export function AppSidebar() {
   const intl = useIntl();
-  const navigate = useNavigate();
+  const openAssign = useAssignStore((s) => s.openAssign);
   const { state, isMobile } = useSidebar();
   const collapsed = state === 'collapsed' && !isMobile;
 
@@ -540,28 +541,30 @@ export function AppSidebar() {
     <>
       <SidebarHeader>
         <CompanySwitcher collapsed={collapsed} />
-        {/* Personal IA (2026-07-29 client feedback round 2): the task-board
-            quick-create button and the search trigger are work-management
-            chrome — hidden on Personal along with the board itself (still
-            reachable via 進階 → 任務看板 and the ⌘K shortcut). */}
-        {!isPersonal &&
-          (collapsed ? (
-            <Button
-              variant="brand"
-              size="icon"
-              className="mx-auto"
-              onClick={() => navigate('/tasks?new=1')}
-              title={intl.formatMessage({ id: 'sidebar.newTask' })}
-              aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
-            >
-              <Plus />
-            </Button>
-          ) : (
-            <Button variant="brand" className="w-full" onClick={() => navigate('/tasks?new=1')}>
-              <Plus />
-              {intl.formatMessage({ id: 'sidebar.newTask' })}
-            </Button>
-          ))}
+        {/* UX plan I-1a: the primary action is 交辦任務 and it belongs to BOTH
+            editions. The 2026-07-29 "hide work-management chrome on Personal"
+            round took this button down with the task board, which left the
+            edition aimed at non-technical users with no primary action at all;
+            it also used to route to the board's `?new=1` create-a-card intent,
+            which never starts the autonomous loop. It now opens the one
+            AssignSheet. The search trigger stays Personal-hidden (I-5). */}
+        {collapsed ? (
+          <Button
+            variant="brand"
+            size="icon"
+            className="mx-auto"
+            onClick={() => openAssign()}
+            title={intl.formatMessage({ id: 'sidebar.newTask' })}
+            aria-label={intl.formatMessage({ id: 'sidebar.newTask' })}
+          >
+            <Plus />
+          </Button>
+        ) : (
+          <Button variant="brand" className="w-full" onClick={() => openAssign()}>
+            <Plus />
+            {intl.formatMessage({ id: 'sidebar.newTask' })}
+          </Button>
+        )}
         {!isPersonal && <SearchTrigger collapsed={collapsed} />}
       </SidebarHeader>
 
