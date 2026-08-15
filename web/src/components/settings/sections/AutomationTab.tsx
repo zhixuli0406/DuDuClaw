@@ -17,6 +17,11 @@ import { AutonomyNote } from '@/components/AutonomyNote';
 // dispatch.policy enum accepted by the gateway's system.update_config.
 const DISPATCH_POLICIES = ['fixed_hierarchy', 'round_robin', 'llm_select'] as const;
 
+// goal_loop.resume_on_restart enum accepted by the gateway's
+// system.update_config — kept in "recommended first" order (pause is the
+// WP-E default) so the select's natural order matches the safer choice.
+const RESUME_ON_RESTART_OPTIONS = ['pause', 'auto'] as const;
+
 /** Extract the body of a top-level TOML `[section]` from the masked config
  *  string (up to the next `[` header or EOF). Section-scoped so a common key
  *  name (e.g. `enabled`) is read from the right table. */
@@ -112,6 +117,11 @@ export function AutomationTab() {
   // [goal_loop]
   const [plannerEnabled, setPlannerEnabled] = useState(false);
   const [iterationCapSimple, setIterationCapSimple] = useState(3);
+  // resume_on_restart defaults to "pause" gateway-side since WP-E (2026-08).
+  // Unlike its siblings above, this is a boot-only-read field — it is
+  // intentionally NOT part of the hot-reload story described by
+  // `hotReloadHint` below, so it carries its own inline restart note.
+  const [resumeOnRestart, setResumeOnRestart] = useState('pause');
   // [dispatch] — enabled defaults ON since v1.59 (gateway-side default flip)
   const [dispatchEnabled, setDispatchEnabled] = useState(true);
   const [dispatchPolicy, setDispatchPolicy] = useState('fixed_hierarchy');
@@ -146,6 +156,7 @@ export function AutomationTab() {
       const gl = tomlSection(raw, 'goal_loop');
       setPlannerEnabled(boolIn(gl, 'planner_enabled', false));
       setIterationCapSimple(intIn(gl, 'iteration_cap_simple', 3));
+      setResumeOnRestart(strIn(gl, 'resume_on_restart', 'pause'));
       const dp = tomlSection(raw, 'dispatch');
       setDispatchEnabled(boolIn(dp, 'enabled', true));
       setDispatchPolicy(strIn(dp, 'policy', 'fixed_hierarchy'));
@@ -191,7 +202,11 @@ export function AutomationTab() {
     setSaveError(null);
     try {
       const res = await api.system.updateConfig({
-        goal_loop: { planner_enabled: plannerEnabled, iteration_cap_simple: iterationCapSimple },
+        goal_loop: {
+          planner_enabled: plannerEnabled,
+          iteration_cap_simple: iterationCapSimple,
+          resume_on_restart: resumeOnRestart,
+        },
         dispatch: { enabled: dispatchEnabled, policy: dispatchPolicy },
         topology_evolution: { enabled: topologyEnabled },
         knowledge_guard: { enabled: kgEnabled, window_secs: kgWindowSecs, max_per_subject: kgMaxPerSubject },
@@ -216,6 +231,9 @@ export function AutomationTab() {
 
   const policyOptions: SelectOption[] = DISPATCH_POLICIES.map((v) => ({
     value: v, label: intl.formatMessage({ id: `settings.automation.policy.${v}` }), raw: v,
+  }));
+  const resumeOnRestartOptions: SelectOption[] = RESUME_ON_RESTART_OPTIONS.map((v) => ({
+    value: v, label: intl.formatMessage({ id: `settings.automation.resumeOnRestart.${v}` }), raw: v,
   }));
 
   return (
@@ -267,6 +285,17 @@ export function AutomationTab() {
             description={t('settings.automation.topologyEnabled.help')}
             checked={topologyEnabled}
             onChange={setTopologyEnabled}
+          />
+          {/* resume_on_restart is boot-only-read (gateway process restart,
+              not the abort+respawn hot reload the other rows in this card
+              get) — it gets its own restart note instead of relying on the
+              shared hotReloadHint paragraph below, which does not apply to it. */}
+          <RowSelect
+            label={t('settings.automation.resumeOnRestart')}
+            description={t('settings.automation.resumeOnRestart.help')}
+            value={resumeOnRestart}
+            onChange={setResumeOnRestart}
+            options={resumeOnRestartOptions}
           />
         </SettingsCard>
         <AutonomyNote id="automation" />
