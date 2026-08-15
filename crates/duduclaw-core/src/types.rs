@@ -1292,6 +1292,15 @@ pub struct NoiseBandSection {
     #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cases: Option<f64>,
+    /// WP-4E: the *held-out* half of the case dimension, which the commit gate
+    /// compares independently of the visible half. Absent ⇒ the accessor
+    /// derives `cases / 2` (a held-out fence is deliberately stricter than the
+    /// visible one); an explicit value is clamped to `<= cases` there, because
+    /// a wider held-out band would re-open the masking hole this key exists to
+    /// close.
+    #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holdout: Option<f64>,
     #[serde(deserialize_with = "crate::lenient::opt_float_strict")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub judge: Option<f64>,

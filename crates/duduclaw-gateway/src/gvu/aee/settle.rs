@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::info;
 
-use crate::gvu::verifier_measure::{CaseScore, MeasureVector};
+use crate::gvu::verifier_measure::{derived_holdout_band, CaseScore, MeasureVector, NoiseBand};
 use crate::playbook::delta::PlaybookDelta;
 use crate::playbook::gene::EvalCaseRef;
 
@@ -73,6 +73,35 @@ pub enum SuiteVerdict {
     Regressed { before: f64, after: f64 },
     /// One side had no cases at all.
     Insufficient,
+}
+
+/// The two case tolerances the suite fence needs, frozen at commit time.
+///
+/// WP-4E: the fence used to be a single `f64` (the `cases` band). It now needs
+/// the held-out band too — and it must be the *same* number the commit gate
+/// used, not a second policy. Both constructors below funnel through
+/// [`NoiseBand`] / [`derived_holdout_band`] for exactly that reason.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaseBands {
+    /// Tolerance for the mixed and visible means.
+    pub cases: f64,
+    /// Stricter tolerance for the held-out mean.
+    pub holdout: f64,
+}
+
+impl CaseBands {
+    /// Straight from the band the commit gate ran with.
+    pub fn from_noise_band(b: &NoiseBand) -> Self {
+        Self { cases: b.cases, holdout: b.holdout }
+    }
+
+    /// A pending row written before WP-4E recorded only `cases`. Reconstruct
+    /// the held-out tolerance through the same derivation `NoiseBand` uses, so
+    /// an in-flight observation window that spans the upgrade settles under
+    /// the documented default rather than under a silently different rule.
+    pub fn from_cases_only(cases: f64) -> Self {
+        Self { cases, holdout: derived_holdout_band(cases) }
+    }
 }
 
 /// Mean of the cases in `refs`, or `None` when none of them ran.
@@ -122,15 +151,56 @@ pub fn entry_verdict(
 }
 
 /// Global regression fence over every non-held-out **and** held-out case.
-pub fn suite_verdict(before: &MeasureVector, after: &MeasureVector, band: f64) -> SuiteVerdict {
+///
+/// WP-4E — three fences, same shape as the commit gate
+/// (`verifier_measure::dimensions`), and for the same reason: one mixed mean
+/// let a large visible-set gain pay for a held-out-set loss inside a single
+/// band, which is precisely what the held-out subset exists to detect. The
+/// legacy mixed fence is kept verbatim and checked FIRST, so every rejection
+/// the old code produced is still produced, with the same reported numbers;
+/// the visible and held-out fences can only *add* trips. A side that has no
+/// held-out (or no visible) case simply skips that fence — an agent whose
+/// suite has no held-out case is byte-identical to the pre-WP-4E behaviour.
+pub fn suite_verdict(
+    before: &MeasureVector,
+    after: &MeasureVector,
+    bands: CaseBands,
+) -> SuiteVerdict {
     let (Some(b), Some(a)) = (before.cases_mean(), after.cases_mean()) else {
         return SuiteVerdict::Insufficient;
     };
-    if a < b - band {
-        SuiteVerdict::Regressed { before: b, after: a }
-    } else {
-        SuiteVerdict::Pass { before: b, after: a }
+    // Legacy fence, unchanged and first.
+    if a < b - bands.cases {
+        return SuiteVerdict::Regressed { before: b, after: a };
     }
+    // Sub-fences, in the same order `dimensions()` reports them.
+    for (name, band, pair) in [
+        (
+            "cases_holdout",
+            bands.holdout,
+            (before.holdout_cases_mean(), after.holdout_cases_mean()),
+        ),
+        (
+            "cases_visible",
+            bands.cases,
+            (before.visible_cases_mean(), after.visible_cases_mean()),
+        ),
+    ] {
+        let (Some(sb), Some(sa)) = pair else {
+            continue; // present on one side only ⇒ not comparable
+        };
+        if sa < sb - band {
+            info!(
+                fence = name,
+                before = sb,
+                after = sa,
+                band,
+                "AEE settle: sub-fence tripped — the mixed suite mean alone would have passed"
+            );
+            return SuiteVerdict::Regressed { before: sb, after: sa };
+        }
+    }
+    SuiteVerdict::Pass { before: b, after: a }
 }
 
 /// Evaluate every live entry in `snapshot` against the two score sets.
@@ -387,13 +457,120 @@ mod tests {
 
         let bv = MeasureVector { cases: before, ..Default::default() };
         let av = MeasureVector { cases: after, ..Default::default() };
-        let suite = suite_verdict(&bv, &av, 0.05);
+        let suite = suite_verdict(&bv, &av, CaseBands::from_cases_only(0.05));
         assert!(matches!(suite, SuiteVerdict::Regressed { .. }));
 
         let (deltas, report) = finalise(&obs, &suite, "a");
         assert!(report.suite_regressed);
         assert_eq!(report.confirmed, 1, "the local confirm is still REPORTED…");
         assert!(deltas.is_empty(), "…but not honoured — this is the over-fitting signature");
+    }
+
+    // ── WP-4E: the suite fence splits visible / held-out too ─────────────
+
+    fn hs(case: &str, score: f64) -> CaseScore {
+        CaseScore { case: case.to_string(), score, held_out: true }
+    }
+
+    /// The commit gate's masking scenario, replayed at settlement time.
+    #[test]
+    fn settle_fence_catches_a_held_out_loss_hidden_by_a_visible_gain() {
+        let bands = CaseBands::from_cases_only(0.05); // holdout = 0.025
+        // 4 visible cases 0.5 → 1.0, 40 held-out cases 1.0 → 0.95.
+        // Mixed mean is 42/44 on both sides: the legacy fence sees nothing.
+        let mut before: Vec<CaseScore> =
+            vec![cs("s/v0", 1.0), cs("s/v1", 1.0), cs("s/v2", 0.0), cs("s/v3", 0.0)];
+        let mut after: Vec<CaseScore> =
+            vec![cs("s/v0", 1.0), cs("s/v1", 1.0), cs("s/v2", 1.0), cs("s/v3", 1.0)];
+        for i in 0..40 {
+            before.push(hs(&format!("s/_holdout/h{i}"), 1.0));
+            after.push(hs(&format!("s/_holdout/h{i}"), if i < 2 { 0.0 } else { 1.0 }));
+        }
+        let bv = MeasureVector { cases: before.clone(), ..Default::default() };
+        let av = MeasureVector { cases: after.clone(), ..Default::default() };
+        assert_eq!(bv.cases_mean(), av.cases_mean(), "the mixed mean is unmoved");
+
+        // OLD behaviour: the same scores with the held-out flag cleared are
+        // exactly what the single-mean fence used to compare — it passes.
+        let clear = |v: &[CaseScore]| MeasureVector {
+            cases: v.iter().map(|c| CaseScore { held_out: false, ..c.clone() }).collect(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            suite_verdict(&clear(&before), &clear(&after), bands),
+            SuiteVerdict::Pass { .. }
+        ));
+
+        // NEW behaviour: the held-out fence trips and the whole candidate is
+        // rolled back.
+        match suite_verdict(&bv, &av, bands) {
+            SuiteVerdict::Regressed { before: b, after: a } => {
+                assert_eq!(b, 1.0);
+                assert!((a - 0.95).abs() < 1e-9, "reports the held-out means, not the mixed ones");
+            }
+            other => panic!("expected a held-out regression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settle_fence_is_unchanged_when_no_case_is_held_out() {
+        let bands = CaseBands::from_cases_only(0.05);
+        let before = vec![cs("s/a", 1.0), cs("s/b", 1.0), cs("s/c", 1.0), cs("s/d", 1.0)];
+        // A single failure out of four = 0.25 drop ⇒ regression, reported with
+        // the mixed means exactly as before WP-4E.
+        let worse = vec![cs("s/a", 1.0), cs("s/b", 1.0), cs("s/c", 1.0), cs("s/d", 0.0)];
+        let bv = MeasureVector { cases: before.clone(), ..Default::default() };
+        assert_eq!(
+            suite_verdict(&bv, &MeasureVector { cases: worse, ..Default::default() }, bands),
+            SuiteVerdict::Regressed { before: 1.0, after: 0.75 }
+        );
+        // Unchanged ⇒ Pass, still carrying the mixed means.
+        assert_eq!(
+            suite_verdict(&bv, &bv, bands),
+            SuiteVerdict::Pass { before: 1.0, after: 1.0 }
+        );
+        // An improvement is never a regression.
+        let poor = MeasureVector {
+            cases: vec![cs("s/a", 0.0), cs("s/b", 0.0), cs("s/c", 0.0), cs("s/d", 0.0)],
+            ..Default::default()
+        };
+        assert!(matches!(suite_verdict(&poor, &bv, bands), SuiteVerdict::Pass { .. }));
+    }
+
+    #[test]
+    fn settle_fence_skips_a_dimension_that_exists_on_one_side_only() {
+        let bands = CaseBands::from_cases_only(0.05);
+        // `before` has no held-out case (the bootstrap-champion shape), so the
+        // held-out fence has no baseline and is skipped rather than invented.
+        let before = MeasureVector {
+            cases: vec![cs("s/a", 1.0), cs("s/b", 1.0)],
+            ..Default::default()
+        };
+        let after = MeasureVector {
+            cases: vec![cs("s/a", 1.0), cs("s/b", 1.0), hs("s/_holdout/h", 1.0)],
+            ..Default::default()
+        };
+        assert!(matches!(suite_verdict(&before, &after, bands), SuiteVerdict::Pass { .. }));
+        // …and an empty side is still Insufficient, not a silent pass.
+        assert_eq!(
+            suite_verdict(&MeasureVector::default(), &after, bands),
+            SuiteVerdict::Insufficient
+        );
+    }
+
+    #[test]
+    fn settle_bands_come_from_the_commit_gate_not_a_second_policy() {
+        // An explicit operator override, as `NoiseBand::from_agent_dir` would
+        // have produced it.
+        let band = NoiseBand { cases: 0.08, holdout: 0.01, ..NoiseBand::default() };
+        let from_gate = CaseBands::from_noise_band(&band);
+        assert_eq!(from_gate.cases, 0.08);
+        assert_eq!(from_gate.holdout, 0.01, "an explicit override survives to settlement");
+        // A legacy row without the column derives, it does not guess.
+        assert_eq!(
+            CaseBands::from_cases_only(0.08),
+            CaseBands { cases: 0.08, holdout: 0.04 }
+        );
     }
 
     #[test]

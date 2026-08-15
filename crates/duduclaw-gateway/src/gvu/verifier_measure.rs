@@ -7,7 +7,10 @@
 //! answer trips a forbidden pattern) — see [`MeasureVector::zeroed`].
 //!
 //! Dimensions (§2.3):
-//! - `cases` — one deterministic pass/fail per eval case actually run
+//! - `cases` — one deterministic pass/fail per eval case actually run,
+//!   compared as the mixed mean plus two independent fences
+//!   ([`DIM_CASES_VISIBLE`] / [`DIM_CASES_HOLDOUT`], WP-4E) so a visible-set
+//!   gain cannot pay for a held-out-set loss inside one noise band
 //! - `judge` — the former L3 LLM judge, now `Option<f64>`; **a failed judge
 //!   call is `None`, never `0.0`** (infrastructure failure must not
 //!   masquerade as a quality regression)
@@ -96,6 +99,22 @@ impl MeasureVector {
             return None;
         }
         Some(visible.iter().map(|c| c.score).sum::<f64>() / visible.len() as f64)
+    }
+
+    /// Mean of the held-out case dimension alone — the half the Generator
+    /// never sees, and therefore the half that carries the anti-gaming signal.
+    ///
+    /// WP-4E: kept separate from [`Self::cases_mean`] on purpose. A suite is
+    /// usually dominated by visible cases, so averaging the two together lets a
+    /// large visible gain pay for a held-out loss (`AutoDesign`,
+    /// arXiv:2608.13560, keeps the two conditions independent for exactly this
+    /// reason). `None` when no held-out case ran.
+    pub fn holdout_cases_mean(&self) -> Option<f64> {
+        let held: Vec<&CaseScore> = self.cases.iter().filter(|c| c.held_out).collect();
+        if held.is_empty() {
+            return None;
+        }
+        Some(held.iter().map(|c| c.score).sum::<f64>() / held.len() as f64)
     }
 
     /// Aggregate used ONLY for logging / dashboard. The commit gate compares
@@ -358,6 +377,14 @@ pub struct NoiseBand {
     /// [`NOISE_BAND_CASES_MAX`]: a wider band means the *cases* are
     /// nondeterministic, and the thing to fix is the case, not the band.
     pub cases: f64,
+    /// WP-4E: the band applied to the **held-out** case sub-dimension alone.
+    ///
+    /// Deliberately stricter than [`Self::cases`] (default: half of it). The
+    /// held-out subset is the only measurement the Generator cannot see, so it
+    /// is the only one whose "unchanged" claim is worth much — a tolerance as
+    /// wide as the visible one would spend that signal on noise absorption.
+    /// [`Self::from_agent_dir`] never lets it exceed `cases`.
+    pub holdout: f64,
     /// An LLM judge on identical input varies materially run to run.
     pub judge: f64,
     /// Fully deterministic — zero band.
@@ -370,11 +397,33 @@ pub struct NoiseBand {
 /// are unstable. Enforced by [`NoiseBand::from_agent_dir`] on read.
 pub const NOISE_BAND_CASES_MAX: f64 = 0.10;
 
+/// Design §2.4.2's suggested `cases` starting value.
+const NOISE_BAND_CASES_DEFAULT: f64 = 0.05;
+
+/// The held-out band's default is *derived* from the visible one, so the
+/// "half as tolerant" relationship survives a `cases` override instead of
+/// silently decoupling from it.
+///
+/// The single policy point: the settle-time fence
+/// (`aee::settle::CaseBands::from_cases_only`) reconstructs a legacy pending
+/// row's held-out tolerance through this same function rather than growing a
+/// second, drifting copy of the rule.
+pub fn derived_holdout_band(cases: f64) -> f64 {
+    cases / 2.0
+}
+
 impl Default for NoiseBand {
     fn default() -> Self {
         // Design §2.4.2 suggested starting values — PENDING EMPIRICAL
         // CALIBRATION (2σ over 20 repeats). Do not cite these as tuned.
-        Self { cases: 0.05, judge: 0.15, anti_sycophancy: 0.0, novelty: 0.05, relevance: 0.10 }
+        Self {
+            cases: NOISE_BAND_CASES_DEFAULT,
+            holdout: derived_holdout_band(NOISE_BAND_CASES_DEFAULT),
+            judge: 0.15,
+            anti_sycophancy: 0.0,
+            novelty: 0.05,
+            relevance: 0.10,
+        }
     }
 }
 
@@ -383,7 +432,9 @@ impl NoiseBand {
     ///
     /// Missing file / malformed TOML / absent table → [`Default`]. Every key
     /// is individually optional. `cases` is clamped to
-    /// [`NOISE_BAND_CASES_MAX`].
+    /// [`NOISE_BAND_CASES_MAX`]; `holdout` defaults to half the *effective*
+    /// `cases` band and is clamped to `[0, cases]` — it may be made stricter,
+    /// never looser, than the visible half (WP-4E).
     ///
     /// Goes through the shared typed parse point
     /// ([`duduclaw_core::agent_toml`]). The fields use `opt_float_strict`, so
@@ -398,6 +449,13 @@ impl NoiseBand {
             .noise_band;
         if let Some(v) = raw.cases {
             band.cases = v.clamp(0.0, NOISE_BAND_CASES_MAX);
+            // Re-derive so widening the visible band does not silently leave
+            // the held-out fence at the old default (or, worse, wider than the
+            // visible one).
+            band.holdout = derived_holdout_band(band.cases);
+        }
+        if let Some(v) = raw.holdout {
+            band.holdout = v.max(0.0).min(band.cases);
         }
         if let Some(v) = raw.judge {
             band.judge = v.max(0.0);
@@ -417,6 +475,8 @@ impl NoiseBand {
     fn for_dimension(&self, dim: &str) -> f64 {
         match dim {
             "cases" => self.cases,
+            DIM_CASES_VISIBLE => self.cases,
+            DIM_CASES_HOLDOUT => self.holdout,
             "judge" => self.judge,
             "anti_sycophancy" => self.anti_sycophancy,
             "novelty" => self.novelty,
@@ -431,7 +491,8 @@ impl NoiseBand {
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum CommitVerdict {
     /// Every comparable dimension is `>= champion - band`, and at least one
-    /// is `> champion + band`.
+    /// **non-fence** dimension is `> champion + band` (see
+    /// [`FENCE_ONLY_DIMENSIONS`]).
     Improves,
     /// Every comparable dimension is within `± band`. Committable (AVO P7) —
     /// with the §2.4.3 anti-drift companions attached.
@@ -456,14 +517,49 @@ impl CommitVerdict {
     }
 }
 
+/// The visible half of the eval-case signal. Same band as `cases`.
+pub const DIM_CASES_VISIBLE: &str = "cases_visible";
+/// The held-out half. Stricter band ([`NoiseBand::holdout`]).
+pub const DIM_CASES_HOLDOUT: &str = "cases_holdout";
+
+/// Dimensions that may **veto** a commit but may never *promote* one.
+///
+/// WP-4E adds two case sub-dimensions as fences. Letting them set `any_better`
+/// would turn ties into `Improves` — which resets the §2.4.3 anti-drift
+/// counter, skips the forced observation window and clears the held-out
+/// rotation flag. A hardening change must not switch safety companions off as
+/// a side effect, so the Improves/Matches classification stays driven by
+/// exactly the dimensions that drove it before.
+const FENCE_ONLY_DIMENSIONS: [&str; 2] = [DIM_CASES_VISIBLE, DIM_CASES_HOLDOUT];
+
 /// Extract the comparable scalar dimensions of a vector.
 ///
 /// `judge = None` is simply absent — a dimension present on only one side is
 /// not comparable and is skipped, never scored as 0.
+///
+/// **WP-4E — the eval-case signal is emitted three ways, on purpose.**
+/// `cases` (the mixed mean) is kept verbatim as the legacy fence, and
+/// [`DIM_CASES_VISIBLE`] / [`DIM_CASES_HOLDOUT`] are added beside it. The
+/// mixed mean alone let "visible集大幅改善 + held-out集小幅退步" average out
+/// inside one noise band, which is precisely the gaming pattern the held-out
+/// subset exists to catch; the split gives the held-out half its own, stricter
+/// condition (AutoDesign arXiv:2608.13560 keeps the two conditions
+/// independent). Dropping the mixed dimension instead of keeping it would have
+/// been a *loosening* in two places — the reported dimension name for a
+/// no-held-out agent would change, and the bootstrap champion (measured with
+/// `include_holdout: false`, `aee::run`) would lose its only comparison
+/// against a candidate's held-out failures, since a dimension present on one
+/// side only is skipped. Extra fences can only ever add rejections.
 fn dimensions(v: &MeasureVector) -> BTreeMap<&'static str, f64> {
     let mut m = BTreeMap::new();
     if let Some(c) = v.cases_mean() {
         m.insert("cases", c);
+    }
+    if let Some(c) = v.visible_cases_mean() {
+        m.insert(DIM_CASES_VISIBLE, c);
+    }
+    if let Some(c) = v.holdout_cases_mean() {
+        m.insert(DIM_CASES_HOLDOUT, c);
     }
     if let Some(j) = v.judge {
         m.insert("judge", j);
@@ -478,6 +574,9 @@ fn dimensions(v: &MeasureVector) -> BTreeMap<&'static str, f64> {
 ///
 /// `champion = None` is the bootstrap case: any non-`Invalid` candidate
 /// becomes the first champion.
+///
+/// Every dimension may veto (`< champion - band` ⇒ `Regresses`), but the
+/// WP-4E case fences may not promote — see [`FENCE_ONLY_DIMENSIONS`].
 pub fn commit_verdict(
     candidate: &MeasureVector,
     champion: Option<&MeasureVector>,
@@ -516,7 +615,7 @@ pub fn commit_verdict(
                 candidate: *c_val,
             };
         }
-        if *c_val > h_val + b {
+        if *c_val > h_val + b && !FENCE_ONLY_DIMENSIONS.contains(dim) {
             any_better = true;
         }
     }
@@ -770,6 +869,236 @@ mod tests {
             commit_verdict(&candidate, Some(&champion), &band),
             CommitVerdict::Regresses { ref dimension, .. } if dimension == "cases"
         ));
+    }
+
+    // ── WP-4E: visible / held-out are separate fences ────────────────────
+
+    /// Build a vector from explicit visible + held-out score lists.
+    fn split_vec(judge: Option<f64>, visible: &[f64], holdout: &[f64]) -> MeasureVector {
+        let mut cases: Vec<CaseScore> = visible
+            .iter()
+            .enumerate()
+            .map(|(i, s)| CaseScore { case: format!("s/v{i}"), score: *s, held_out: false })
+            .collect();
+        cases.extend(holdout.iter().enumerate().map(|(i, s)| CaseScore {
+            case: format!("s/_holdout/h{i}"),
+            score: *s,
+            held_out: true,
+        }));
+        MeasureVector {
+            cases,
+            judge,
+            anti_sycophancy: 1.0,
+            novelty: 1.0,
+            relevance: 1.0,
+            hard_zero: false,
+        }
+    }
+
+    /// Exactly what the pre-WP-4E gate saw: one mixed `cases` dimension. The
+    /// same scores with every held-out flag cleared collapse to that single
+    /// comparison, so this is the old behaviour, reproduced rather than
+    /// asserted from memory.
+    fn as_legacy_mixed(v: &MeasureVector) -> MeasureVector {
+        let mut out = v.clone();
+        for c in &mut out.cases {
+            c.held_out = false;
+        }
+        out
+    }
+
+    #[test]
+    fn visible_gain_can_no_longer_mask_a_held_out_regression() {
+        let band = NoiseBand::default(); // cases 0.05, holdout 0.025
+        // 4 visible cases 0.50 → 1.00 (a big, real gain);
+        // 40 held-out cases 1.00 → 0.95 (a small, real loss).
+        // Mixed mean is 42/44 on BOTH sides — the loss is perfectly hidden.
+        let champion = split_vec(Some(0.7), &[1.0, 1.0, 0.0, 0.0], &[1.0; 40]);
+        let mut cand_holdout = [1.0f64; 40];
+        cand_holdout[0] = 0.0;
+        cand_holdout[1] = 0.0;
+        let candidate = split_vec(Some(0.7), &[1.0, 1.0, 1.0, 1.0], &cand_holdout);
+        assert_eq!(
+            champion.cases_mean(),
+            candidate.cases_mean(),
+            "the scenario only bites when the mixed mean is unmoved"
+        );
+        assert_eq!(candidate.visible_cases_mean(), Some(1.0));
+        assert_eq!(candidate.holdout_cases_mean(), Some(0.95));
+
+        // OLD behaviour (mixed dimension only): a tie, and a tie commits.
+        let legacy = commit_verdict(
+            &as_legacy_mixed(&candidate),
+            Some(&as_legacy_mixed(&champion)),
+            &band,
+        );
+        assert_eq!(legacy, CommitVerdict::Matches);
+        assert!(legacy.is_committable(), "this is the hole WP-4E closes");
+
+        // NEW behaviour: the held-out fence catches it.
+        match commit_verdict(&candidate, Some(&champion), &band) {
+            CommitVerdict::Regresses { dimension, champion: h, candidate: c } => {
+                assert_eq!(dimension, DIM_CASES_HOLDOUT);
+                assert_eq!(h, 1.0);
+                assert!((c - 0.95).abs() < 1e-9);
+            }
+            other => panic!("expected a held-out regression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_held_out_loss_paid_for_by_a_visible_gain_that_lifts_the_mixed_mean() {
+        // The nastier variant: the mixed mean actually IMPROVES, so the old
+        // gate did not merely tie — it read the candidate as an improvement.
+        let band = NoiseBand::default();
+        let champion = split_vec(Some(0.7), &[1.0, 0.0, 0.0, 0.0], &[1.0; 20]);
+        let mut cand_holdout = [1.0f64; 20];
+        cand_holdout[0] = 0.0;
+        let candidate = split_vec(Some(0.7), &[1.0, 1.0, 1.0, 1.0], &cand_holdout);
+        assert!(candidate.cases_mean() > champion.cases_mean());
+        assert_eq!(
+            commit_verdict(&as_legacy_mixed(&candidate), Some(&as_legacy_mixed(&champion)), &band),
+            CommitVerdict::Improves
+        );
+        assert!(matches!(
+            commit_verdict(&candidate, Some(&champion), &band),
+            CommitVerdict::Regresses { ref dimension, .. } if dimension == DIM_CASES_HOLDOUT
+        ));
+    }
+
+    #[test]
+    fn held_out_band_is_stricter_than_the_visible_one() {
+        let band = NoiseBand::default();
+        assert!(band.holdout < band.cases);
+        // A 0.04 drop: inside the visible band (0.05), outside the held-out
+        // one (0.025). 100 cases so one flip is exactly 0.01.
+        let mut dipped = [1.0f64; 100];
+        for s in dipped.iter_mut().take(4) {
+            *s = 0.0;
+        }
+        let champ_visible = split_vec(Some(0.7), &[1.0; 100], &[]);
+        let cand_visible = split_vec(Some(0.7), &dipped, &[]);
+        assert_eq!(
+            commit_verdict(&cand_visible, Some(&champ_visible), &band),
+            CommitVerdict::Matches,
+            "the visible half keeps its own, wider tolerance"
+        );
+
+        // The identical 0.04 drop, this time on the held-out half.
+        let champ_holdout = split_vec(Some(0.7), &[1.0], &[1.0; 100]);
+        let cand_holdout = split_vec(Some(0.7), &[1.0], &dipped);
+        assert!(matches!(
+            commit_verdict(&cand_holdout, Some(&champ_holdout), &band),
+            CommitVerdict::Regresses { ref dimension, .. } if dimension == DIM_CASES_HOLDOUT
+        ));
+    }
+
+    #[test]
+    fn no_held_out_case_means_the_verdict_is_unchanged_label_included() {
+        // Compatibility floor: an agent whose suite has no held-out case must
+        // behave EXACTLY as before — same verdict, same reported dimension
+        // name (`cases`, not `cases_visible`), same Improves/Matches split.
+        let band = NoiseBand::default();
+        let champion = split_vec(Some(0.7), &[1.0, 1.0, 0.0, 0.0], &[]);
+        assert_eq!(champion.holdout_cases_mean(), None);
+
+        // Regression → still reported against the legacy `cases` dimension.
+        let worse = split_vec(Some(0.7), &[1.0, 0.0, 0.0, 0.0], &[]);
+        assert_eq!(
+            commit_verdict(&worse, Some(&champion), &band),
+            CommitVerdict::Regresses {
+                dimension: "cases".to_string(),
+                champion: 0.5,
+                candidate: 0.25
+            }
+        );
+        // Tie / improvement classification is untouched.
+        let same = split_vec(Some(0.7), &[1.0, 1.0, 0.0, 0.0], &[]);
+        assert_eq!(commit_verdict(&same, Some(&champion), &band), CommitVerdict::Matches);
+        let better = split_vec(Some(0.7), &[1.0, 1.0, 1.0, 0.0], &[]);
+        assert_eq!(commit_verdict(&better, Some(&champion), &band), CommitVerdict::Improves);
+        // …and it matches the legacy single-dimension computation row for row.
+        for cand in [&worse, &same, &better] {
+            assert_eq!(
+                commit_verdict(cand, Some(&champion), &band),
+                commit_verdict(
+                    &as_legacy_mixed(cand),
+                    Some(&as_legacy_mixed(&champion)),
+                    &band
+                ),
+                "no-held-out agents must not notice WP-4E at all"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_out_gain_alone_does_not_manufacture_an_improves() {
+        // The new fences may veto, never promote: turning a tie into an
+        // `Improves` would reset the anti-drift counter and skip the forced
+        // observation window (§2.4.3).
+        let band = NoiseBand::default();
+        let champion = split_vec(Some(0.7), &[1.0, 1.0, 1.0, 1.0], &[0.0; 4]);
+        let candidate = split_vec(Some(0.7), &[1.0, 1.0, 1.0, 1.0], &[1.0; 4]);
+        // The mixed mean rose too, so this one legitimately improves…
+        assert_eq!(commit_verdict(&candidate, Some(&champion), &band), CommitVerdict::Improves);
+
+        // …but a held-out-only gain that leaves the mixed mean inside its band
+        // stays a tie: 4 held-out cases 0.0 → 1.0 moves the mixed mean by
+        // 4/104 = 0.038 < 0.05, so the legacy dimension says "tie".
+        let champ = split_vec(Some(0.7), &[1.0; 100], &[0.0; 4]);
+        let cand = split_vec(Some(0.7), &[1.0; 100], &[1.0; 4]);
+        assert!(cand.cases_mean().unwrap() - champ.cases_mean().unwrap() < band.cases);
+        let flat = commit_verdict(&cand, Some(&champ), &band);
+        assert_eq!(
+            flat,
+            CommitVerdict::Matches,
+            "a fence must not promote a tie into an Improves"
+        );
+        let d = anti_drift(&flat, AntiDriftState::default());
+        assert!(d.force_observation_window && d.holdout_rotation_due);
+    }
+
+    #[test]
+    fn holdout_band_defaults_to_half_of_the_effective_cases_band() {
+        // Absent key → half the default.
+        let dir = band_dir("[evolution.noise_band]\njudge = 0.2\n");
+        let band = NoiseBand::from_agent_dir(dir.path());
+        assert_eq!(band.holdout, NoiseBand::default().cases / 2.0);
+
+        // A `cases` override re-derives it.
+        let dir = band_dir("[evolution.noise_band]\ncases = 0.08\n");
+        let band = NoiseBand::from_agent_dir(dir.path());
+        assert_eq!(band.cases, 0.08);
+        assert_eq!(band.holdout, 0.04);
+
+        // Explicit value honoured.
+        let dir = band_dir("[evolution.noise_band]\ncases = 0.08\nholdout = 0.01\n");
+        assert_eq!(NoiseBand::from_agent_dir(dir.path()).holdout, 0.01);
+
+        // Never looser than the visible band, never negative.
+        let dir = band_dir("[evolution.noise_band]\ncases = 0.04\nholdout = 0.9\n");
+        let band = NoiseBand::from_agent_dir(dir.path());
+        assert_eq!(band.holdout, 0.04, "clamped down to the visible band");
+        let dir = band_dir("[evolution.noise_band]\nholdout = -1.0\n");
+        assert_eq!(NoiseBand::from_agent_dir(dir.path()).holdout, 0.0);
+    }
+
+    #[test]
+    fn holdout_band_wrong_type_or_integer_falls_back_to_the_derived_default() {
+        // Same `opt_float_strict` quirk as its section-mates: an integer
+        // literal is ignored rather than widening a commit gate.
+        for body in [
+            "[evolution.noise_band]\nholdout = 1\n",
+            "[evolution.noise_band]\nholdout = \"0.01\"\n",
+            "[evolution.noise_band]\nholdout = true\n",
+            "[evolution.noise_band]\n",
+            "",
+        ] {
+            let dir = band_dir(body);
+            let band = NoiseBand::from_agent_dir(dir.path());
+            assert_eq!(band, NoiseBand::default(), "for {body:?}");
+            assert_eq!(band.holdout, band.cases / 2.0);
+        }
     }
 
     #[test]
