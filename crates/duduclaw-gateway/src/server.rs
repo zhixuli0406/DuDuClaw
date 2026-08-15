@@ -1650,6 +1650,25 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // I-2b provenance backfill (2026-08-15): files archived before the
+    // artifacts ledger existed carry no origin, so `/files` and the task
+    // 「產物」tab would show them as history-less rows forever. The pass is
+    // idempotent — a file that already has a row is skipped — so it runs every
+    // boot and costs one directory listing per agent after the first time.
+    // Attribution is evidence-only: what `task_changes.jsonl` can place gets a
+    // task id, everything else is recorded honestly as 來源不明.
+    {
+        let report = crate::artifacts::backfill(&home_dir);
+        if report.added() > 0 {
+            info!(
+                scanned = report.scanned,
+                attributed = report.attributed,
+                unknown = report.unknown,
+                "I-2b artifact provenance backfill applied"
+            );
+        }
+    }
+
     // WP10 one-time migration (2026-08-04): undo the PTY-pool settings the
     // dashboard's agent edit page wrote WITHOUT user consent between v1.44 and
     // v1.49. Must run BEFORE `pty_runtime::init` so the first reply of this
@@ -3229,7 +3248,11 @@ async fn handle_files_list(
                 .into_response();
         }
     };
-    let files = crate::files_api::list_files(&dir);
+    let mut files = crate::files_api::list_files(&dir);
+    // I-2b: join the provenance ledger so the panel can say which task / AI
+    // staff member delivered a file versus which files a human sent in.
+    let index = crate::artifacts::provenance_index(&state.home_dir, agent);
+    crate::files_api::attach_provenance(&mut files, &index);
     Json(serde_json::json!({ "files": files })).into_response()
 }
 

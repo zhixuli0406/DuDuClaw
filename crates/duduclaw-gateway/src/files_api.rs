@@ -17,6 +17,10 @@ use std::time::UNIX_EPOCH;
 use serde::Serialize;
 
 /// A single listable attachment file.
+///
+/// The three provenance fields (I-2b) are filled from the artifacts ledger by
+/// [`attach_provenance`]; a file with no ledger row keeps them `None`, which
+/// the dashboard renders as 「來源不明」 rather than guessing a direction.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct FileEntry {
     /// Bare filename (no directory component).
@@ -25,6 +29,19 @@ pub struct FileEntry {
     pub size: u64,
     /// Last-modified time as Unix epoch milliseconds (`0` when unavailable).
     pub mtime: u64,
+    /// `declared` / `swept` / `uploaded` / `unknown` — see
+    /// `artifacts::ArtifactOrigin`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// The task this file was delivered for, when the ledger recorded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Goal-loop round, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    /// The original filename before the `<ts>_` archive prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// True when `id` is a valid agent directory name.
@@ -110,11 +127,33 @@ pub fn list_files(dir: &Path) -> Vec<FileEntry> {
             name,
             size: meta.len(),
             mtime,
+            origin: None,
+            task_id: None,
+            round: None,
+            display_name: None,
         });
     }
     // Newest first; stable tie-break on name.
     out.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.name.cmp(&b.name)));
     out
+}
+
+/// I-2b: fill each listed file's provenance from the artifacts ledger index
+/// (`archived_name → provenance`). Files with no row are left untouched — the
+/// listing never invents an origin for a file whose history we do not have.
+pub fn attach_provenance(
+    files: &mut [FileEntry],
+    index: &std::collections::BTreeMap<String, crate::artifacts::FileProvenance>,
+) {
+    for f in files.iter_mut() {
+        let Some(p) = index.get(&f.name) else { continue };
+        f.origin = Some(p.origin.as_str().to_string());
+        f.task_id = p.task_id.clone();
+        f.round = p.round;
+        if !p.display_name.is_empty() {
+            f.display_name = Some(p.display_name.clone());
+        }
+    }
 }
 
 /// Why a requested download could not be served.
@@ -363,6 +402,36 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "a.txt");
         assert_eq!(files[0].size, 1);
+    }
+
+    #[test]
+    fn provenance_is_attached_only_where_the_ledger_knows() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("1_a.docx"), b"a").unwrap();
+        fs::write(tmp.path().join("2_b.pdf"), b"bb").unwrap();
+        let mut files = list_files(tmp.path());
+
+        let mut index = std::collections::BTreeMap::new();
+        index.insert(
+            "1_a.docx".to_string(),
+            crate::artifacts::FileProvenance {
+                origin: crate::artifacts::ArtifactOrigin::Declared,
+                task_id: Some("task-1".into()),
+                round: Some(2),
+                display_name: "a.docx".into(),
+                channel: Some("telegram".into()),
+            },
+        );
+        attach_provenance(&mut files, &index);
+
+        let a = files.iter().find(|f| f.name == "1_a.docx").unwrap();
+        assert_eq!(a.origin.as_deref(), Some("declared"));
+        assert_eq!(a.task_id.as_deref(), Some("task-1"));
+        assert_eq!(a.round, Some(2));
+        assert_eq!(a.display_name.as_deref(), Some("a.docx"));
+        // Unknown to the ledger ⇒ left blank, never guessed.
+        let b = files.iter().find(|f| f.name == "2_b.pdf").unwrap();
+        assert!(b.origin.is_none() && b.task_id.is_none() && b.display_name.is_none());
     }
 
     #[test]
