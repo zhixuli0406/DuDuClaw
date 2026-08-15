@@ -74,7 +74,39 @@ pub(crate) fn agent_notify_target(home_dir: &Path, agent_id: &str) -> Option<(St
 ///
 /// `pub(crate)`: also reused by `skill_gap_digest` (WP2.6 P1), which pushes to
 /// the same `[proactive]` destination with the same token cascade.
+///
+/// Self-configuring channels (`wecom`/`dingtalk`/`googlechat`/`teams`, see
+/// [`crate::channel_sender::sender_self_configures`]) never have a
+/// `<channel>_bot_token`-shaped value — their senders pull multi-field
+/// credentials (service-account JSON, app id/password, corpid+corpsecret)
+/// straight from `home_dir` at send time, always globally (there is no
+/// per-agent scoping for these four: `googlechat.rs`/`msteams.rs`/`wecom.rs`/
+/// `dingtalk.rs` all read `config.toml` directly, never `agent.toml`). Both
+/// branches below therefore missed them entirely — the `reports_to` cascade
+/// walks `agent.toml [channels.<ch>] bot_token`, which these channels never
+/// populate, and `otp_delivery::token_field` returns `None` for all four, so
+/// `channel_token` short-circuited to `None` and every caller (`notify_agent_
+/// plain`, `notify_goal_needs_human`, `notify_goal_observer`, `notify_goal_
+/// kickoff`, `notify_goal_progress`) silently reported `NotifyOutcome::
+/// NoTarget` for an agent whose `[proactive]` destination WAS one of these
+/// four channels, even when the channel was fully configured. The correct
+/// "is there a token" question for these four is "is the marker field set"
+/// (mirrors `cron_scheduler.rs::deliver_cron_result`'s identical check). The
+/// returned placeholder is never read as a real token: every caller either
+/// routes through [`send_plain_text`] (dispatches these four via their
+/// dedicated constructors, ignoring the token) or `decision_notify::
+/// deliver_now` (no button codec exists for any of the four, so it degrades
+/// to the same plain-text path).
 pub(crate) async fn channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> Option<String> {
+    if crate::channel_sender::sender_self_configures(channel) {
+        let marker = crate::channel_sender::self_config_marker_field(channel)?;
+        let present = crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
+            .await
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        return present.then(String::new);
+    }
+
     if let Some(tok) =
         crate::config_crypto::resolve_agent_channel_token_via_reports_to(home_dir, agent_id, channel)
     {
@@ -238,6 +270,11 @@ pub enum GoalProgress {
     NeedsHuman,
     /// The goal is waiting on a kickoff approval before its first dispatch.
     Kickoff,
+    /// H22: the task has been running for `minutes` with no observable
+    /// progress signal. Pure notification — the loop does NOT intervene,
+    /// escalate, or re-dispatch because of it (the stall / iteration / wall
+    /// clock guards remain the only things that act).
+    NoProgressReport { minutes: i64 },
 }
 
 /// Resolve the SOURCE conversation of a goal task — the `source_channel` /
@@ -370,10 +407,17 @@ fn progress_body(task: &TaskRow, progress: &GoalProgress) -> String {
             )
         }
         GoalProgress::NeedsHuman => {
-            format!("🧭 目標 #{short} 卡住了，需要你的決定（已另外推送審批按鈕）。")
+            // H11: name the class here too — this mirror line is often the
+            // only thing a person reads in the launching conversation.
+            let pause = crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
+                .label_zh();
+            format!("🧭 目標 #{short} 卡住了（{pause}），需要你的決定（已另外推送審批按鈕）。")
         }
         GoalProgress::Kickoff => {
             format!("⏳ 目標 #{short} 需先核准才會開始自主執行：{title}")
+        }
+        GoalProgress::NoProgressReport { minutes } => {
+            format!("⏱️ 目標 #{short} 已執行 {minutes} 分鐘未回報進度，仍在執行中：{title}")
         }
     }
 }
@@ -459,6 +503,7 @@ fn needs_human_body(task: &TaskRow, trajectory: Option<&str>, channel: &str) -> 
          🧭 自主目標任務卡住，需要您的決定\n\
          任務：{title}\n\
          目標：{goal}\n\
+         類型：{pause}\n\
          卡住原因：{reason}\n\
          編號：{id}\n\
          {trajectory_block}\n\
@@ -466,6 +511,12 @@ fn needs_human_body(task: &TaskRow, trajectory: Option<&str>, channel: &str) -> 
         prefix = crate::decision_notify::reason_prefix(DecisionSource::Goal),
         title = task.title,
         goal = duduclaw_core::truncate_chars(&task.description, 200),
+        // H11: the closed classification, one phrase, above the free text —
+        // the reason line below can be several sentences of judge/evaluator
+        // prose, so this is what a person actually triages on. Unclassified
+        // and legacy rows read as 「需要人工確認」 (never a guessed class).
+        pause = crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
+            .label_zh(),
         reason = duduclaw_core::truncate_chars(reason, 300),
         id = task.id,
     )
@@ -724,9 +775,15 @@ pub async fn notify_goal_observer(home_dir: &Path, task: &TaskRow, resolution: &
         "🤖 自主目標任務結束（Observer 全自動模式，不等待人工）\n\
          任務：{title}\n\
          結果：{resolution}\n\
+         類型：{pause}\n\
          原因：{reason}\n\
          編號：{id}",
         title = task.title,
+        // H11: same classification line as the buttoned card — an Observer
+        // agent's human never gets to decide, so the one notice they DO get
+        // must say what kind of stop this was.
+        pause = crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
+            .label_zh(),
         reason = duduclaw_core::truncate_chars(reason, 300),
         id = task.id,
     );
@@ -2147,6 +2204,46 @@ mod tests {
         assert!(!body.contains("若核准，接下來預計"));
     }
 
+    /// H11: the card names the pause CLASS on its own line, above the
+    /// free-text reason. An unclassified / legacy task still gets a line —
+    /// 「需要人工確認」 — rather than a silently missing field.
+    #[test]
+    fn needs_human_body_names_the_pause_class() {
+        let mut t = mk_task("g1");
+        t.judge_feedback = Some("goal-loop iteration cap".into());
+
+        t.pause_reason = Some("budget_exhausted".into());
+        let body = needs_human_body(&t, None, "telegram");
+        assert!(body.contains("類型：次數或時限用盡"), "{body}");
+        // The free text is still there — the class is triage, not a replacement.
+        assert!(body.contains("卡住原因：goal-loop iteration cap"), "{body}");
+        // Class above the detail, matching how a person reads the card.
+        assert!(body.find("類型：").unwrap() < body.find("卡住原因：").unwrap());
+
+        t.pause_reason = None;
+        assert!(
+            needs_human_body(&t, None, "telegram").contains("類型：需要人工確認"),
+            "a legacy row must degrade to the safe class, not to a blank line"
+        );
+        t.pause_reason = Some("something-this-build-never-heard-of".into());
+        assert!(needs_human_body(&t, None, "telegram").contains("類型：需要人工確認"));
+    }
+
+    /// H11 + H22: the two progress lines added alongside the existing phases.
+    #[test]
+    fn progress_body_renders_pause_class_and_no_progress_report() {
+        let mut t = mk_task("abcdef0123456789");
+        t.pause_reason = Some("blocked_needs_decision".into());
+        let stuck = progress_body(&t, &GoalProgress::NeedsHuman);
+        assert!(stuck.contains("等你決策"), "{stuck}");
+        assert!(stuck.contains("#abcdef01"));
+
+        let report = progress_body(&t, &GoalProgress::NoProgressReport { minutes: 37 });
+        assert!(report.contains("37 分鐘"), "{report}");
+        assert!(report.contains("未回報進度"), "{report}");
+        assert!(report.contains("仍在執行中"), "a report must not read as a failure: {report}");
+    }
+
     #[test]
     fn needs_human_body_starts_with_the_reason_prefix() {
         // W1-6: the very first line is the canonical reason vocabulary, the
@@ -2546,6 +2643,153 @@ mod tests {
                 NotifyOutcome::NoTarget
             );
         }
+    }
+
+    // ── BUG-1 regression: `channel_token` must resolve self-configuring
+    //    channels (wecom/dingtalk/googlechat/teams) via their marker field,
+    //    not the `<channel>_bot_token` cascade they never populate. Before
+    //    the fix, every one of `notify_agent_plain` / `notify_goal_progress`
+    //    / `notify_goal_needs_human` / `notify_goal_observer` /
+    //    `notify_goal_kickoff` silently reported `NoTarget` for an agent
+    //    whose `[proactive]` destination was one of these four channels,
+    //    even when fully configured. ──
+
+    /// Direct unit coverage of the resolver itself (fast, no I/O beyond the
+    /// temp config files) — the root-cause fix.
+    #[tokio::test]
+    async fn channel_token_self_configuring_marker_present_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[channels]\n\
+             googlechat_service_account_json = \"marker-only\"\n\
+             teams_app_password = \"marker-only\"\n\
+             wecom_corp_secret = \"marker-only\"\n\
+             dingtalk_app_secret = \"marker-only\"\n",
+        )
+        .unwrap();
+        for ch in ["googlechat", "teams", "wecom", "dingtalk"] {
+            assert!(
+                channel_token(dir.path(), "alice", ch).await.is_some(),
+                "{ch}: marker set ⇒ must resolve to Some"
+            );
+        }
+    }
+
+    /// A genuinely unconfigured self-configuring channel must stay an honest
+    /// `None` — the fix changes the CRITERION (marker vs. bot_token), not
+    /// the fail-closed posture.
+    #[tokio::test]
+    async fn channel_token_self_configuring_marker_absent_stays_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // No config.toml at all.
+        for ch in ["googlechat", "teams", "wecom", "dingtalk"] {
+            assert_eq!(
+                channel_token(dir.path(), "alice", ch).await,
+                None,
+                "{ch}: no marker ⇒ must stay None"
+            );
+        }
+    }
+
+    /// The `reports_to`/global `<channel>_bot_token` cascade must never be
+    /// consulted for self-configuring channels — a stray `bot_token` under
+    /// the agent's own `[channels.<ch>]` (which these four channels never
+    /// actually populate) must not be mistaken for "configured", and its
+    /// absence must not make a marker-set channel fall through to `None`.
+    #[tokio::test]
+    async fn channel_token_self_configuring_ignores_bot_token_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents").join("alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // Noise: a bot_token field these channels never read.
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[channels.googlechat]\nbot_token = \"unused-noise\"\n",
+        )
+        .unwrap();
+        // No marker in config.toml ⇒ still None — proves the bot_token noise
+        // above was never what resolved it.
+        assert_eq!(channel_token(dir.path(), "alice", "googlechat").await, None);
+
+        // Now set the real marker — resolves, independent of the agent-level
+        // bot_token noise still sitting there.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[channels]\ngooglechat_service_account_json = \"marker-only\"\n",
+        )
+        .unwrap();
+        assert!(channel_token(dir.path(), "alice", "googlechat").await.is_some());
+    }
+
+    /// End-to-end through `notify_agent_plain` (same `channel_token` +
+    /// `send_plain_text` pipeline `notify_goal_needs_human` /
+    /// `notify_goal_observer` / `notify_goal_kickoff` all share — chosen
+    /// over `notify_goal_needs_human` here because that path also invokes
+    /// the D2 forward-trajectory utility LLM call, which this suite has no
+    /// existing coverage exercising live and would make the test depend on
+    /// host CLI/auth state; the token-resolution defect being verified is
+    /// entirely upstream of that call). The malformed service-account JSON
+    /// below makes the real Google Chat send fail deterministically WITHOUT
+    /// a network round-trip (`serde_json::from_str` fails first inside
+    /// `GoogleChatCreds::from_service_account_json`) — landing on
+    /// `SendFailed` proves the push reached the real send attempt instead of
+    /// being silently skipped as `NoTarget`.
+    #[tokio::test]
+    async fn notify_agent_plain_googlechat_marker_present_reaches_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        seed_notify_target(home, "alice", "googlechat", "spaces/AAAA");
+        std::fs::write(
+            home.join("config.toml"),
+            "[channels]\ngooglechat_service_account_json = \"not-a-real-service-account\"\n",
+        )
+        .unwrap();
+
+        let outcome =
+            notify_agent_plain(home, "alice", NotifyLevel::Fyi, "evolution.consolidate", "測試").await;
+        assert_eq!(
+            outcome,
+            NotifyOutcome::SendFailed,
+            "must reach the send attempt (and fail there), not short-circuit to NoTarget"
+        );
+    }
+
+    /// Same shape for Teams — routed through `create_teams_sender` →
+    /// `msteams::send_text_to_conversation`, which fails fast with "no
+    /// stored conversation reference" (no network call) since this test
+    /// home never received an inbound Teams message.
+    #[tokio::test]
+    async fn notify_agent_plain_teams_marker_present_reaches_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        seed_notify_target(home, "bob", "teams", "19:someconv@thread.tacv2");
+        std::fs::write(
+            home.join("config.toml"),
+            "[channels]\nteams_app_password = \"marker-only\"\n",
+        )
+        .unwrap();
+
+        let outcome =
+            notify_agent_plain(home, "bob", NotifyLevel::Fyi, "evolution.consolidate", "測試").await;
+        assert_eq!(
+            outcome,
+            NotifyOutcome::SendFailed,
+            "must reach the send attempt (and fail there), not short-circuit to NoTarget"
+        );
+    }
+
+    /// Regression guard the other way: no marker configured at all ⇒ the
+    /// push must still be an honest `NoTarget`, never a false `Sent`.
+    #[tokio::test]
+    async fn notify_agent_plain_googlechat_marker_absent_stays_no_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        seed_notify_target(home, "alice", "googlechat", "spaces/AAAA");
+        // No config.toml at all.
+        let outcome =
+            notify_agent_plain(home, "alice", NotifyLevel::Fyi, "evolution.consolidate", "測試").await;
+        assert_eq!(outcome, NotifyOutcome::NoTarget);
     }
 
     // ── W3-1 (D5/D4): pushes into a taken-over conversation are deferred to
