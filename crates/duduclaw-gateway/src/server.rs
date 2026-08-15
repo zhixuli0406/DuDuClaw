@@ -3416,6 +3416,25 @@ async fn handle_files_preview(
             .into_response();
     }
 
+    // WP-4G: office documents are zip containers, and the file being previewed
+    // may be an attachment a stranger sent into a channel. LibreOffice is a
+    // recursive-descent OOXML parser with no resource ceiling of its own — a
+    // zip bomb or a deeply-nested part would take out the host, not just the
+    // conversion. Gate BEFORE the process is spawned; fail-closed on violation.
+    let limits = crate::document_limits::DocumentLimits::from_home(&state.home_dir);
+    if let Err(v) = crate::document_limits::guard_document_path(&path, &limits) {
+        tracing::warn!(
+            file = %q.name,
+            violation = v.kind(),
+            "files preview: refused — document exceeds inbound resource limits"
+        );
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({ "error": v.user_message(&q.name) })),
+        )
+            .into_response();
+    }
+
     // Cache: <home>/cache/preview/<agent|_shared>/<stem>.pdf, valid while it
     // is newer than the source file.
     let cache_dir = crate::files_api::preview_cache_dir(&state.home_dir, agent);
