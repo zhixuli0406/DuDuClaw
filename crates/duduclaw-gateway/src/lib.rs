@@ -91,6 +91,7 @@ pub mod autopilot_notify;
 pub mod autopilot_screen;
 pub mod cep_matcher;
 pub mod tick_config;
+pub mod tick_headers;
 pub mod tick_source;
 pub mod tick_source_poll;
 pub mod tick_source_ws;

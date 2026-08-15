@@ -4,6 +4,14 @@
 //! - `local`  — in-process AES-256-GCM encrypted store (dev / testing)
 //! - `vault`  — HashiCorp Vault KV v2 HTTP API (production)
 //! - `env`    — reads from process environment variables (CI / override)
+//! - `keychain` — OS-native credential store (WP-H1 P1; needs `--features keychain`)
+//! - `file`   — a mounted secret file (WP-H1 P1; Docker / Kubernetes)
+//! - `onepassword` / `infisical` — hosted secret managers
+//!
+//! [`SecretBackend::is_local`] splits these into the ones that need no network
+//! (`env` / `keychain` / `file`, resolvable from synchronous call sites and
+//! never cached) and the ones that do — the distinction the credentials
+//! doctrine's caching rule is built on.
 //!
 //! ## URI Scheme
 //!
@@ -13,6 +21,8 @@
 //! secret://vault/brave_search
 //! secret://local/figma_token
 //! secret://env/MY_API_KEY
+//! secret://keychain/duduclaw/telegram      # <service>/<account>
+//! secret://file//run/secrets/tg_token      # the second slash starts the path
 //! ```
 //!
 //! ## Config (`~/.duduclaw/config.toml`)
@@ -47,13 +57,17 @@
 //! for callers without a `home_dir`.
 
 mod env;
+mod file;
 mod infisical;
+pub mod keychain;
 mod local;
 mod onepassword;
 mod vault;
 
 pub use env::EnvSecretAdapter;
+pub use file::FileSecretAdapter;
 pub use infisical::InfisicalAdapter;
+pub use keychain::KeychainSecretAdapter;
 pub use local::LocalSecretAdapter;
 pub use onepassword::OnePasswordConnectAdapter;
 pub use vault::VaultHttpAdapter;
@@ -81,6 +95,30 @@ pub enum SecretBackend {
     OnePassword,
     /// Infisical.
     Infisical,
+    /// OS-native credential store (WP-H1 P1) — macOS Keychain, Windows
+    /// Credential Manager, Linux Secret Service. No server, no network.
+    Keychain,
+    /// A file on disk (WP-H1 P1) — Docker `/run/secrets/*`, Kubernetes
+    /// projected volumes. No server, no network.
+    File,
+}
+
+impl SecretBackend {
+    /// Whether resolving this backend needs network I/O.
+    ///
+    /// The doctrine's caching rule keys off exactly this split
+    /// (`DESIGN-credentials-doctrine-2026-08.md` §2.4): local backends are read
+    /// fresh every single time, network backends are the ones allowed a TTL.
+    /// It is also what lets a synchronous call site resolve a reference at all
+    /// — `env` / `keychain` / `file` need no runtime, so they are answerable
+    /// everywhere, while `vault` / `onepassword` / `infisical` fail closed off
+    /// the async path.
+    pub fn is_local(&self) -> bool {
+        matches!(
+            self,
+            SecretBackend::Env | SecretBackend::Keychain | SecretBackend::File
+        )
+    }
 }
 
 impl fmt::Display for SecretBackend {
@@ -91,6 +129,8 @@ impl fmt::Display for SecretBackend {
             SecretBackend::Env => write!(f, "env"),
             SecretBackend::OnePassword => write!(f, "onepassword"),
             SecretBackend::Infisical => write!(f, "infisical"),
+            SecretBackend::Keychain => write!(f, "keychain"),
+            SecretBackend::File => write!(f, "file"),
         }
     }
 }
@@ -138,6 +178,11 @@ impl SecretUri {
             "env" => SecretBackend::Env,
             "onepassword" | "1password" | "op" => SecretBackend::OnePassword,
             "infisical" => SecretBackend::Infisical,
+            "keychain" => SecretBackend::Keychain,
+            // `secret://file//run/secrets/tg_token`: the split above consumed
+            // the separator, so `name` keeps its own leading `/` and is the
+            // absolute path the adapter expects.
+            "file" => SecretBackend::File,
             other => {
                 return Err(DuDuClawError::Security(format!(
                     "unknown secret backend '{other}' in URI: {uri}"
@@ -399,10 +444,12 @@ impl SecretManagerConfig {
             "env" => SecretBackend::Env,
             "onepassword" | "1password" | "op" => SecretBackend::OnePassword,
             "infisical" => SecretBackend::Infisical,
+            "keychain" => SecretBackend::Keychain,
+            "file" => SecretBackend::File,
             other => {
                 return Err(DuDuClawError::Security(format!(
                     "unknown secret_manager backend '{other}' \
-                     (expected local|vault|env|onepassword|infisical)"
+                     (expected local|vault|env|keychain|file|onepassword|infisical)"
                 )))
             }
         };
@@ -423,6 +470,8 @@ impl SecretManagerConfig {
         match backend {
             SecretBackend::Local => Ok(Box::new(LocalSecretAdapter::new_ephemeral())),
             SecretBackend::Env => Ok(Box::new(EnvSecretAdapter::new())),
+            SecretBackend::Keychain => Ok(Box::new(KeychainSecretAdapter::new())),
+            SecretBackend::File => Ok(Box::new(FileSecretAdapter::new(home_dir))),
             SecretBackend::Vault => {
                 let token = self.resolved_vault_token(home_dir).ok_or_else(|| {
                     DuDuClawError::Security(

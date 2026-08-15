@@ -26,6 +26,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use duduclaw_security::secret_manager::SecretManagerConfig;
+use duduclaw_security::secret_ref::{Secret, SecretRef};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -76,8 +78,11 @@ impl BridgeAction {
 pub struct BridgeConfig {
     /// The deployed web-app `/exec` URL.
     pub url: String,
-    /// Shared secret, already decrypted. Never logged, never echoed.
-    pub secret: String,
+    /// Shared secret, already resolved. Typed as
+    /// [`duduclaw_security::secret_ref::Secret`] so `Debug` cannot print it and
+    /// it is zeroized on drop — this struct used to derive a `Debug` that
+    /// rendered the shared secret in full.
+    pub secret: Secret,
 }
 
 impl BridgeConfig {
@@ -108,18 +113,17 @@ pub enum BridgeError {
     Unsupported(String),
 }
 
-/// Parse `[integrations.google_apps_script]` from an already-read `config.toml`.
+/// Pull `(url, raw_secret_field)` out of `[integrations.google_apps_script]`.
 ///
-/// `decrypt` resolves the stored secret, mirroring how channel bot tokens are
-/// handled: an encrypted value if the operator saved one, otherwise the literal
-/// string. Injected so this stays a pure, testable function.
+/// Pure and resolution-free: the second element is whatever the operator typed
+/// — ciphertext, plaintext, or a `secret://…` reference — so the caller decides
+/// how to resolve it. Splitting this out is what lets the resolution be `async`
+/// (and therefore reach Vault/1Password/Infisical) while the parsing rules stay
+/// synchronously testable.
 ///
 /// Returns `Ok(None)` when the section is absent. Present-but-broken is an
 /// error, never a silent `None` — a typo must not quietly disable the bridge.
-pub fn parse_config<F>(raw_toml: &str, decrypt: F) -> Result<Option<BridgeConfig>, BridgeError>
-where
-    F: Fn(&str) -> String,
-{
+pub fn parse_bridge_section(raw_toml: &str) -> Result<Option<(String, String)>, BridgeError> {
     let Ok(table) = raw_toml.parse::<toml::Table>() else {
         return Ok(None);
     };
@@ -145,24 +149,57 @@ where
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or(BridgeError::MissingSecret)?;
-    let secret = decrypt(secret);
-    if secret.trim().is_empty() {
-        return Err(BridgeError::MissingSecret);
-    }
+        .ok_or(BridgeError::MissingSecret)?
+        .to_string();
 
+    Ok(Some((url, secret)))
+}
+
+/// Parse the section and resolve its secret with an injected resolver.
+///
+/// `resolve` returns `Option<Secret>` rather than `String`: "resolved to
+/// nothing" is now a state the type system can express, so the old
+/// `if secret.trim().is_empty()` guard is gone.
+pub fn parse_config<F>(raw_toml: &str, resolve: F) -> Result<Option<BridgeConfig>, BridgeError>
+where
+    F: Fn(&str) -> Option<Secret>,
+{
+    let Some((url, stored)) = parse_bridge_section(raw_toml)? else {
+        return Ok(None);
+    };
+    let secret = resolve(&stored).ok_or(BridgeError::MissingSecret)?;
     Ok(Some(BridgeConfig { url, secret }))
 }
 
-/// Read + decrypt the bridge config for a DuDuClaw home. Unreadable config is
+/// Read + resolve the bridge config for a DuDuClaw home. Unreadable config is
 /// "not configured" (same fail-safe posture as the other integration gates).
-pub fn config_for_home(home_dir: &Path) -> Result<Option<BridgeConfig>, BridgeError> {
-    let Ok(raw) = std::fs::read_to_string(home_dir.join("config.toml")) else {
+///
+/// WP-H1 P1 — the sixth hand-rolled decrypt dialect used to live here:
+/// `decrypt_value(stored).unwrap_or_else(|| stored.to_string())`. That fallback
+/// meant a `secret = "secret://vault/apps_script"` reference was POSTed to the
+/// deployed script **as the shared secret**, so the bridge failed
+/// `unauthorized` while the reference itself travelled over the wire. Routing
+/// through [`SecretRef::from_single`] fixes both halves: the reference resolves
+/// (including through a network backend, which is why this is now `async`), and
+/// an unresolvable one is `MissingSecret` rather than a literal.
+pub async fn config_for_home(home_dir: &Path) -> Result<Option<BridgeConfig>, BridgeError> {
+    let Ok(raw) = tokio::fs::read_to_string(home_dir.join("config.toml")).await else {
         return Ok(None);
     };
-    parse_config(&raw, |stored| {
-        crate::config_crypto::decrypt_value(stored, home_dir).unwrap_or_else(|| stored.to_string())
-    })
+    let Some((url, stored)) = parse_bridge_section(&raw)? else {
+        return Ok(None);
+    };
+    let sm_cfg: SecretManagerConfig = raw
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|t| t.get("secret_manager").cloned())
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_default();
+    let secret = SecretRef::from_single(&stored)
+        .resolve(&sm_cfg, home_dir)
+        .await
+        .ok_or(BridgeError::MissingSecret)?;
+    Ok(Some(BridgeConfig { url, secret }))
 }
 
 /// Host of a URL, lowercased. `None` when the URL does not parse.
@@ -227,7 +264,7 @@ pub async fn call(
         .map_err(|e| BridgeError::RequestFailed(e.to_string()))?;
 
     let body = BridgeRequest {
-        secret: &config.secret,
+        secret: config.secret.expose(),
         action: action.as_str(),
         params: &params,
     };
@@ -274,8 +311,8 @@ mod tests {
 
     const GOOD_URL: &str = "https://script.google.com/macros/s/AKfycbx123/exec";
 
-    fn plain(s: &str) -> String {
-        s.to_string()
+    fn plain(s: &str) -> Option<Secret> {
+        Secret::new(s)
     }
 
     #[test]
@@ -326,12 +363,12 @@ mod tests {
         );
         let cfg = parse_config(&toml, |s| {
             assert_eq!(s, "ENCRYPTED");
-            "plaintext-secret".to_string()
+            Secret::new("plaintext-secret")
         })
         .unwrap()
         .unwrap();
         assert_eq!(cfg.url, GOOD_URL);
-        assert_eq!(cfg.secret, "plaintext-secret");
+        assert_eq!(cfg.secret.expose(), "plaintext-secret");
     }
 
     #[test]
@@ -346,20 +383,72 @@ mod tests {
         assert!(matches!(parse_config(&toml, plain), Err(BridgeError::MissingSecret)));
     }
 
+    /// WP-H1 P1 — the dialect-6 bug. Before the `SecretRef` rewrite the stored
+    /// field was handed to the deployed script verbatim whenever it failed to
+    /// decrypt, so a `secret://` reference travelled over the wire *as* the
+    /// shared secret.
+    #[test]
+    fn a_secret_reference_never_becomes_the_shared_secret() {
+        let toml = format!(
+            "[integrations.google_apps_script]\nurl = \"{GOOD_URL}\"\n\
+             secret = \"secret://vault/apps_script\"\n"
+        );
+        // The section still parses — it is the *resolution* that must refuse.
+        let (_, stored) = parse_bridge_section(&toml).unwrap().unwrap();
+        assert_eq!(stored, "secret://vault/apps_script");
+        let resolved = SecretRef::from_single(&stored).resolve_sync(Path::new("/nonexistent-home"));
+        assert!(
+            resolved.is_none(),
+            "a network reference must fail closed, never resolve to itself"
+        );
+    }
+
+    #[test]
+    fn a_local_secret_reference_resolves_instead_of_being_sent_literally() {
+        let var = format!("DUDUCLAW_GAS_SECRET_{}", std::process::id());
+        // SAFETY: process-unique variable name, set and removed within this test.
+        unsafe { std::env::set_var(&var, "resolved-shared-secret") };
+        let toml = format!(
+            "[integrations.google_apps_script]\nurl = \"{GOOD_URL}\"\n\
+             secret = \"secret://env/{var}\"\n"
+        );
+        let cfg = parse_config(&toml, |s| {
+            SecretRef::from_single(s).resolve_sync(Path::new("/nonexistent-home"))
+        });
+        unsafe { std::env::remove_var(&var) };
+        assert_eq!(
+            cfg.unwrap().unwrap().secret.expose(),
+            "resolved-shared-secret"
+        );
+    }
+
+    #[test]
+    fn bridge_config_debug_does_not_print_the_secret() {
+        let cfg = BridgeConfig {
+            url: GOOD_URL.into(),
+            secret: Secret::new("hunter2").unwrap(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("hunter2"), "leaked secret: {dbg}");
+    }
+
     #[test]
     fn parse_config_rejects_a_secret_that_decrypts_to_nothing() {
         let toml = format!(
             "[integrations.google_apps_script]\nurl = \"{GOOD_URL}\"\nsecret = \"CORRUPT\"\n"
         );
         assert!(matches!(
-            parse_config(&toml, |_| String::new()),
+            parse_config(&toml, |_| None),
             Err(BridgeError::MissingSecret)
         ));
     }
 
     #[test]
     fn describe_never_includes_the_secret() {
-        let cfg = BridgeConfig { url: GOOD_URL.into(), secret: "hunter2".into() };
+        let cfg = BridgeConfig {
+            url: GOOD_URL.into(),
+            secret: Secret::new("hunter2").unwrap(),
+        };
         let d = cfg.describe();
         assert!(!d.contains("hunter2"), "leaked secret: {d}");
         assert!(d.contains("script.google.com"), "{d}");

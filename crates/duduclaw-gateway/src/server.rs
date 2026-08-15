@@ -1334,6 +1334,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             let tick_cfg = crate::tick_config::TickConfig::from_home(&home_dir);
             let handles = crate::tick_source::spawn_tick_sources(
                 &tick_cfg,
+                &home_dir,
                 ap_tx.clone(),
                 tick_hub.clone(),
                 events_bus.clone(),

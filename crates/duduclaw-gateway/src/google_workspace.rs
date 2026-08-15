@@ -519,7 +519,7 @@ pub async fn resolve_backend(home_dir: &Path) -> Result<GoogleBackend, GoogleAut
     match get_valid_google_token(home_dir).await {
         Ok(token) => Ok(GoogleBackend::Direct(token)),
         Err(direct_err) => {
-            match google_apps_script::config_for_home(home_dir) {
+            match google_apps_script::config_for_home(home_dir).await {
                 Ok(Some(cfg)) => Ok(GoogleBackend::AppsScript(cfg)),
                 // A broken bridge config is reported as-is: the operator wrote
                 // that section on purpose, so its error is more useful than the

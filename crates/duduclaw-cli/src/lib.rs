@@ -291,7 +291,14 @@ enum Commands {
     Status,
 
     /// Run system diagnostics
-    Doctor,
+    Doctor {
+        /// Delete plaintext credential fields in `config.toml` that already
+        /// have an encrypted `_enc` twin (WP-H1 P1). Every field is listed and
+        /// confirmed before anything is removed — deleting a credential is
+        /// irreversible, so this never runs as a side effect of an upgrade.
+        #[arg(long)]
+        fix_residue: bool,
+    },
 
     /// Expose the dashboard remotely via a Cloudflare quick tunnel
     /// (no account needed; prints the assigned URL + the allowed_origins
@@ -1518,7 +1525,7 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         },
         Commands::Gateway => cmd_run_server(true).await,
         Commands::Status => cmd_status().await,
-        Commands::Doctor => cmd_doctor().await,
+        Commands::Doctor { fix_residue } => cmd_doctor(fix_residue).await,
         Commands::Tunnel => tunnel::cmd_tunnel(&duduclaw_home()).await,
         Commands::Org { command } => match command {
             OrgCommands::Show => cmd_org_show(),
@@ -4553,8 +4560,115 @@ fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Res
     Ok(())
 }
 
-async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
+/// `duduclaw doctor --fix-residue` (WP-H1 P1) — delete plaintext credential
+/// fields that already have an encrypted `_enc` twin.
+///
+/// Deliberately an explicit, interactive, operator-terminal action:
+///
+/// - it **lists every field it would delete first** and requires a typed `y`,
+///   because removing a credential is irreversible and the design's §3 P1 rule
+///   is that this must never happen silently as part of an upgrade;
+/// - it only ever touches fields whose ciphertext twin is confirmed present
+///   (`strip_twin_residue`'s single rule) — a plaintext secret with no twin is
+///   reported and left alone, since guessing how to encrypt an unfamiliar
+///   field risks writing a corrupt `config.toml`;
+/// - it backs the file up before writing and takes the same cross-process
+///   advisory lock the gateway's own writers do, because the gateway may be
+///   running while this executes.
+fn cmd_doctor_fix_residue(home: &std::path::Path) -> duduclaw_core::error::Result<()> {
+    use duduclaw_core::error::DuDuClawError;
+
+    let config_path = home.join("config.toml");
+    let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+        DuDuClawError::Config(format!("讀不到 {}:{e}", config_path.display()))
+    })?;
+    let table: toml::Table = raw
+        .parse()
+        .map_err(|e| DuDuClawError::Config(format!("config.toml 解析失敗:{e}")))?;
+
+    let findings = duduclaw_gateway::security_posture::find_plaintext_secrets(&table);
+    let cleanable: Vec<&str> = findings
+        .iter()
+        .filter(|f| f.has_enc_twin)
+        .map(|f| f.path.as_str())
+        .collect();
+    let manual: Vec<&str> = findings
+        .iter()
+        .filter(|f| !f.has_enc_twin)
+        .map(|f| f.path.as_str())
+        .collect();
+
+    println!("DuDuClaw 憑證殘留清理");
+    println!("{}", "=".repeat(40));
+
+    if !manual.is_empty() {
+        println!("\n以下欄位是明文但「沒有」加密孿生,本指令不會動它們:");
+        for p in &manual {
+            println!("  - {p}");
+        }
+        println!("  請到儀表板重新輸入一次以加密,或改成 secret:// 參照。");
+    }
+
+    if cleanable.is_empty() {
+        println!("\n✓ 沒有可清理的明文殘留。");
+        return Ok(());
+    }
+
+    println!("\n即將「刪除」以下明文欄位(它們的加密孿生已存在,讀取路徑本來就只用加密值):");
+    for p in &cleanable {
+        println!("  - {p}");
+    }
+    println!("\n這個動作不可逆。要繼續嗎? [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| DuDuClawError::Config(format!("讀取確認輸入失敗:{e}")))?;
+    if !matches!(answer.trim(), "y" | "Y") {
+        println!("已取消,設定檔未變更。");
+        return Ok(());
+    }
+
+    // Back up before mutating — timestamped, owner-only where the OS supports it.
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let backup_path = home.join(format!("config.toml.bak.{ts}"));
+    std::fs::write(&backup_path, raw.as_bytes())
+        .map_err(|e| DuDuClawError::Config(format!("備份設定檔失敗:{e}")))?;
+    if let Err(e) = duduclaw_core::platform::set_owner_only(&backup_path) {
+        eprintln!("警告:備份檔權限收緊失敗:{e}");
+    }
+
+    let mut table = table;
+    let removed = duduclaw_gateway::security_posture::strip_twin_residue(&mut table);
+    let content = toml::to_string_pretty(&table)
+        .map_err(|e| DuDuClawError::Config(format!("序列化 config.toml 失敗:{e}")))?;
+
+    // config.toml is written by the running gateway too — advisory lock plus
+    // temp+rename, matching `security.credential_cleanup`'s discipline.
+    duduclaw_core::with_file_lock(&config_path, || {
+        let tmp = config_path.with_extension("toml.tmp");
+        std::fs::write(&tmp, content.as_bytes())?;
+        std::fs::rename(&tmp, &config_path)
+    })
+    .map_err(|e| DuDuClawError::Config(format!("寫回 config.toml 失敗:{e}")))?;
+
+    println!("\n✓ 已刪除 {} 個明文欄位:", removed.len());
+    for p in &removed {
+        println!("  - {p}");
+    }
+    println!("備份:{}", backup_path.display());
+    println!("設定檔內容改變後,執行中的 gateway 會在下次讀取時採用。");
+    Ok(())
+}
+
+async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
+
+    // WP-H1 P1 — `--fix-residue` is a maintenance action, not a diagnostic:
+    // it runs on its own and returns, so a run that deletes user data can
+    // never be mistaken for (or buried inside) an ordinary health printout.
+    if fix_residue {
+        return cmd_doctor_fix_residue(&home);
+    }
 
     println!("DuDuClaw Doctor");
     println!("{}", "=".repeat(40));
@@ -4623,6 +4737,21 @@ async fn cmd_doctor() -> duduclaw_core::error::Result<()> {
     // loopback without ever sending a proxy header).
     if let Some(message) = duduclaw_gateway::doctor_probes::local_auto_login_exposure(&home) {
         checks.push(("本機自動登入曝險".into(), CheckStatus::Warn, message));
+    }
+
+    // Check 2d (WP-H1 P1): the credential audit — every field's `describe()`
+    // verdict rolled into one line, so plaintext residue and unresolvable
+    // `secret://` references stop being discoverable only by hand-reading
+    // config.toml. Shares `security_posture::credential_inventory` with the
+    // dashboard's `security.credential_inventory` RPC.
+    {
+        let audit = duduclaw_gateway::doctor_probes::credential_audit(&home);
+        let status = if audit.is_clean() {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Warn
+        };
+        checks.push(("憑證來源體檢".into(), status, audit.summary()));
     }
 
     // Check 3: Claude Code CLI

@@ -504,6 +504,50 @@ export interface CredentialCleanupResult {
   message?: string;
 }
 
+// ── Credential inventory (WP-H1 P1) ──
+// `security.credential_inventory` is the structured answer to "which settings
+// use a secret:// reference, which are still plaintext or _enc". It is built
+// from `describe()`, which never resolves a credential and never holds one, so
+// there is no value in this payload to mask.
+/** Where a credential's value comes from. `ambiguous` is a lone field that is
+ *  either ciphertext or plaintext and cannot be told apart without decrypting
+ *  (the legacy `[integrations.*] secret` shape). */
+export type CredentialSourceKind =
+  | 'unset'
+  | 'inline'
+  | 'legacy'
+  | 'env'
+  | 'keychain'
+  | 'file'
+  | 'vault'
+  | 'onepassword'
+  | 'infisical'
+  | 'local'
+  | 'ambiguous';
+export interface CredentialEntry {
+  /** TOML path of the logical field, e.g. "channels.telegram_bot_token" or
+   *  "agents.<id>.channels.discord.bot_token". Never a value. */
+  path: string;
+  configured: boolean;
+  source: CredentialSourceKind;
+  /** Non-secret description: "encrypted(keyfile)", "env:TG_TOKEN",
+   *  "keychain:duduclaw/telegram", "plaintext(legacy)". */
+  source_label: string;
+  /** False for external references — those rotate in their own backend. */
+  writable: boolean;
+  /** A plaintext twin sits next to an encrypted twin (design §1.5). */
+  residue: boolean;
+}
+export interface CredentialInventoryReport {
+  entries: CredentialEntry[];
+  total: number;
+  configured: number;
+  /** Fields sourced from an external `secret://` reference. */
+  referenced: number;
+  residue: number;
+  plaintext: number;
+}
+
 // ── Delegation permissions (WP21 §2.8) ──
 /** How the gateway decides whether one AI staffer may hand work to another. */
 export type DelegationPolicy = 'department' | 'hierarchy' | 'open';
@@ -4734,6 +4778,10 @@ export const api = {
      *  for manual handling (see `CredentialFinding.has_enc_twin`). */
     credentialCleanup: () =>
       client.call('security.credential_cleanup') as Promise<CredentialCleanupResult>,
+    /** Every credential field with its source verdict — no values, and no
+     *  backend round-trips (WP-H1 P1). */
+    credentialInventory: () =>
+      client.call('security.credential_inventory') as Promise<CredentialInventoryReport>,
   },
   audit: {
     unifiedLog: (params?: {

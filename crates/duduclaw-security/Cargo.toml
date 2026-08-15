@@ -20,3 +20,10 @@ unicode-normalization = "0.1"
 unicode-script = "0.5"
 unicode-segmentation = "1.12"
 regex = "1"
+
+[features]
+default = []
+# WP-H1 P1 — `secret://keychain/<service>/<account>`. A pure passthrough to
+# `duduclaw-core`'s own optional `keyring` dependency; no new crate is added.
+# Off by default so the standard build links no native credential-store code.
+keychain = ["duduclaw-core/keychain"]

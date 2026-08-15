@@ -128,6 +128,14 @@ pub enum SourceKind {
     OnePassword,
     /// `secret://infisical/NAME`.
     Infisical,
+    /// `secret://keychain/SERVICE/ACCOUNT` — OS-native credential store.
+    Keychain,
+    /// `secret://file//absolute/path` — Docker / Kubernetes mounted secret.
+    File,
+    /// A lone field holding either ciphertext or plaintext, indistinguishable
+    /// without a decrypt attempt. Reported honestly rather than guessed at —
+    /// `describe()` never decrypts.
+    Ambiguous,
 }
 
 impl SourceKind {
@@ -138,6 +146,8 @@ impl SourceKind {
             SecretBackend::Env => SourceKind::Env,
             SecretBackend::OnePassword => SourceKind::OnePassword,
             SecretBackend::Infisical => SourceKind::Infisical,
+            SecretBackend::Keychain => SourceKind::Keychain,
+            SecretBackend::File => SourceKind::File,
         }
     }
 
@@ -146,7 +156,7 @@ impl SourceKind {
     fn writable(self) -> bool {
         matches!(
             self,
-            SourceKind::Unset | SourceKind::Inline | SourceKind::Legacy
+            SourceKind::Unset | SourceKind::Inline | SourceKind::Legacy | SourceKind::Ambiguous
         )
     }
 }
@@ -202,6 +212,9 @@ enum RefSource {
     Reference(SecretUri),
     /// A bare plaintext credential.
     Legacy(String),
+    /// A single field that is *either* ciphertext or plaintext and cannot be
+    /// told apart without attempting a decrypt (see [`SecretRef::from_single`]).
+    Ambiguous(String),
 }
 
 /// What the config file holds for one credential field.
@@ -262,6 +275,40 @@ impl SecretRef {
         Self::classify(enc, Some(plain).filter(|s| !s.is_empty()))
     }
 
+    /// Classify a **single** field that may hold either ciphertext or a
+    /// plaintext value — the older `[integrations.*] secret = "…"` shape, which
+    /// never grew a `_enc` twin.
+    ///
+    /// Semantics match the hand-rolled readers this replaces ("try to decrypt;
+    /// if that fails the string *is* the value") with one correction: a value
+    /// that fails to decrypt and turns out to be a `secret://…` reference is
+    /// now resolved as a reference instead of being handed to the remote
+    /// service as the credential.
+    ///
+    /// There is no residue concept here — one field cannot be its own twin —
+    /// so [`Self::has_residue`] is always `false`.
+    pub fn from_single(value: &str) -> Self {
+        let value = value.trim();
+        if value.is_empty() {
+            return Self {
+                chain: Vec::new(),
+                residue: false,
+            };
+        }
+        // A reference is unambiguous, so skip the decrypt attempt entirely
+        // (base64-shaped ciphertext and a `secret://` URI cannot collide).
+        if value.starts_with("secret://") {
+            return Self {
+                chain: vec![Self::plain_source(value)],
+                residue: false,
+            };
+        }
+        Self {
+            chain: vec![RefSource::Ambiguous(value.to_string())],
+            residue: false,
+        }
+    }
+
     /// A single plaintext value: reference if it uses the scheme, else legacy.
     ///
     /// A malformed `secret://` (unknown backend, missing name) is **not**
@@ -303,6 +350,10 @@ impl SecretRef {
                 (SourceKind::Unset, "unset(invalid-reference)".to_string())
             }
             RefSource::Legacy(_) => (SourceKind::Legacy, "plaintext(legacy)".to_string()),
+            RefSource::Ambiguous(_) => (
+                SourceKind::Ambiguous,
+                "encrypted-or-plaintext(single field)".to_string(),
+            ),
             RefSource::Reference(uri) => (
                 SourceKind::from_backend(&uri.backend),
                 format!("{}:{}", uri.backend, uri.name),
@@ -348,6 +399,20 @@ impl SecretRef {
                         return LocalOutcome::Resolved(secret);
                     }
                 }
+                RefSource::Ambiguous(value) => {
+                    // Try it as ciphertext; whatever comes out may itself be a
+                    // reference, exactly as for a real `_enc` field. A decrypt
+                    // failure means the field was plaintext all along.
+                    if let Some(plain) = crate::keyfile::decrypt_keyfile_value(value, home_dir) {
+                        match Self::deref_once(&plain, home_dir) {
+                            LocalOutcome::Unset => continue,
+                            other => return other,
+                        }
+                    }
+                    if let Some(secret) = Secret::new(value.clone()) {
+                        return LocalOutcome::Resolved(secret);
+                    }
+                }
                 RefSource::Reference(uri) => return Self::resolve_uri_local(uri, home_dir),
             }
         }
@@ -373,9 +438,12 @@ impl SecretRef {
         }
     }
 
-    /// Resolve a URI that needs no network: `env` today. Everything else is
-    /// handed back to the caller as [`LocalOutcome::NeedsBackend`].
-    fn resolve_uri_local(uri: &SecretUri, _home_dir: &Path) -> LocalOutcome {
+    /// Resolve a URI that needs no network — `env`, `keychain` and `file`
+    /// (P1). Everything else is handed back as [`LocalOutcome::NeedsBackend`].
+    ///
+    /// The split is [`SecretBackend::is_local`], not an ad-hoc match arm, so
+    /// adding a backend forces the author to declare which side it is on.
+    fn resolve_uri_local(uri: &SecretUri, home_dir: &Path) -> LocalOutcome {
         match uri.backend {
             SecretBackend::Env => match std::env::var(&uri.name) {
                 Ok(v) => match Secret::new(v) {
@@ -397,7 +465,47 @@ impl SecretRef {
                     LocalOutcome::Unset
                 }
             },
-            _ => LocalOutcome::NeedsBackend(uri.clone()),
+            SecretBackend::Keychain => {
+                match crate::secret_manager::KeychainSecretAdapter::new().get_blocking(&uri.name) {
+                    Ok(v) => Self::wrap_or_warn_empty(v, "secret://keychain", &uri.name),
+                    Err(e) => {
+                        // The name is a service/account pair, never a value.
+                        tracing::warn!(entry = %uri.name, "secret://keychain reference could not be resolved: {e}");
+                        LocalOutcome::Unset
+                    }
+                }
+            }
+            SecretBackend::File => {
+                match crate::secret_manager::FileSecretAdapter::new(home_dir)
+                    .read_blocking(&uri.name)
+                {
+                    Ok(v) => Self::wrap_or_warn_empty(v, "secret://file", &uri.name),
+                    Err(e) => {
+                        tracing::warn!(path = %uri.name, "secret://file reference could not be resolved: {e}");
+                        LocalOutcome::Unset
+                    }
+                }
+            }
+            SecretBackend::Local
+            | SecretBackend::Vault
+            | SecretBackend::OnePassword
+            | SecretBackend::Infisical => LocalOutcome::NeedsBackend(uri.clone()),
+        }
+    }
+
+    /// A backend answered — turn its value into a `Secret`, or say out loud
+    /// that the entry exists but is blank. Silence here is what produced the
+    /// 2026-08-13 "token was moved and everything went quiet" incident.
+    fn wrap_or_warn_empty(value: String, scheme: &str, name: &str) -> LocalOutcome {
+        match Secret::new(value) {
+            Some(s) => LocalOutcome::Resolved(s),
+            None => {
+                tracing::warn!(
+                    entry = %name,
+                    "{scheme} reference resolved to an empty value — treating as unset"
+                );
+                LocalOutcome::Unset
+            }
         }
     }
 
@@ -422,13 +530,23 @@ impl SecretRef {
         }
     }
 
-    /// Resolution for call sites that cannot `await` yet.
+    /// Resolution for call sites that cannot `await`.
     ///
-    /// Identical to [`Self::resolve`] for inline / legacy / `secret://env`
-    /// sources. A network-backed reference is **refused** with a warning
-    /// instead of resolved — fail-closed, and above all never returning the
-    /// literal `secret://…` string. Async-ifying the remaining sync call sites
-    /// is a P1 item.
+    /// Identical to [`Self::resolve`] for every source
+    /// [`SecretBackend::is_local`] accepts — inline ciphertext, legacy
+    /// plaintext, `secret://env`, `secret://keychain` and `secret://file`. A
+    /// network-backed reference (vault / 1Password / Infisical) is **refused**
+    /// with a warning instead of resolved: fail-closed, and above all never
+    /// returning the literal `secret://…` string.
+    ///
+    /// P1 status: the two call sites where a network backend genuinely
+    /// mattered were async-ified (the Apps Script bridge config, the reminder
+    /// scheduler's channel tokens). The ones that remain synchronous —
+    /// per-agent channel tokens on the bot-start paths, `decrypt_config_field`,
+    /// `inference.toml`'s `api_key` — keep this fail-closed behaviour by
+    /// design; the P1 backends they most need (`keychain`, `file`) are local,
+    /// so a desktop or container deployment loses nothing by it. Converting
+    /// them is deferred, not forgotten.
     pub fn resolve_sync(&self, home_dir: &Path) -> Option<Secret> {
         match self.resolve_local(home_dir) {
             LocalOutcome::Resolved(secret) => Some(secret),
@@ -667,6 +785,117 @@ mod tests {
         let got = r.resolve_sync(home.path());
         unsafe { std::env::remove_var(&var) };
         assert_eq!(got.unwrap().expose(), "via-pointer");
+    }
+
+    // ── P1: keychain / file references ──────────────────────────
+
+    #[test]
+    fn file_reference_resolves_synchronously_from_the_home_secrets_root() {
+        let home = TempHome::new();
+        std::fs::create_dir_all(home.path().join("secrets")).unwrap();
+        let p = home.path().join("secrets").join("tg");
+        std::fs::write(&p, "file-token\n").unwrap();
+        let r = SecretRef::classify(None, Some(&format!("secret://file/{}", p.display())));
+        assert_eq!(r.resolve_sync(home.path()).unwrap().expose(), "file-token");
+        let st = r.describe();
+        assert_eq!(st.source, SourceKind::File);
+        assert!(st.configured);
+        assert!(!st.writable, "a mounted file is rotated by its mounter");
+    }
+
+    #[test]
+    fn file_reference_outside_the_roots_is_unset_not_literal() {
+        let home = TempHome::new();
+        let p = home.path().join("loose-secret");
+        std::fs::write(&p, "should-not-be-read").unwrap();
+        let r = SecretRef::classify(None, Some(&format!("secret://file/{}", p.display())));
+        assert!(
+            r.resolve_sync(home.path()).is_none(),
+            "containment failure must be unset, never the path or the contents"
+        );
+        // Still reported as configured — the reference exists; it is the
+        // resolve that failed, and `describe()` deliberately does not resolve.
+        assert!(r.describe().configured);
+    }
+
+    #[test]
+    fn file_and_keychain_uris_round_trip_through_display() {
+        use crate::secret_manager::SecretUri;
+        for s in [
+            "secret://file//run/secrets/tg_token",
+            "secret://keychain/duduclaw/telegram",
+        ] {
+            assert_eq!(SecretUri::parse(s).unwrap().to_string(), s);
+        }
+    }
+
+    #[test]
+    fn keychain_reference_describes_without_touching_the_os() {
+        let home = TempHome::new();
+        let r = SecretRef::classify(None, Some("secret://keychain/duduclaw/telegram"));
+        let st = r.describe();
+        assert_eq!(st.source, SourceKind::Keychain);
+        assert_eq!(st.source_label, "keychain:duduclaw/telegram");
+        assert!(st.configured && !st.writable);
+        // In a build without the `keychain` feature the lookup fails loudly and
+        // yields unset — never the URI itself.
+        #[cfg(not(feature = "keychain"))]
+        assert!(r.resolve_sync(home.path()).is_none());
+        let _ = home;
+    }
+
+    // ── P1: the ambiguous single-field dialect ──────────────────
+
+    #[test]
+    fn from_single_reads_ciphertext_then_falls_back_to_plaintext() {
+        let home = TempHome::new();
+        let enc = home.encrypt("decrypted-value");
+        assert_eq!(
+            SecretRef::from_single(&enc)
+                .resolve_sync(home.path())
+                .unwrap()
+                .expose(),
+            "decrypted-value"
+        );
+        // Not ciphertext at all → the field *is* the value (legacy behaviour).
+        assert_eq!(
+            SecretRef::from_single("literal-shared-secret")
+                .resolve_sync(home.path())
+                .unwrap()
+                .expose(),
+            "literal-shared-secret"
+        );
+        assert!(SecretRef::from_single("   ").resolve_sync(home.path()).is_none());
+        assert!(!SecretRef::from_single("").describe().configured);
+    }
+
+    /// The dialect-6 bug: a single-field credential holding a network
+    /// reference used to be sent to the remote service verbatim.
+    #[test]
+    fn from_single_never_returns_a_reference_as_the_value() {
+        let home = TempHome::new();
+        let r = SecretRef::from_single("secret://vault/apps_script_shared_secret");
+        assert!(r.resolve_sync(home.path()).is_none());
+        assert_eq!(r.describe().source, SourceKind::Vault);
+
+        let var = format!("DUDUCLAW_SINGLE_FIELD_{}", std::process::id());
+        // SAFETY: process-unique variable name, set and removed within this test.
+        unsafe { std::env::set_var(&var, "from-env-single") };
+        let got = SecretRef::from_single(&format!("secret://env/{var}")).resolve_sync(home.path());
+        unsafe { std::env::remove_var(&var) };
+        assert_eq!(got.unwrap().expose(), "from-env-single");
+    }
+
+    #[test]
+    fn from_single_never_reports_residue() {
+        let home = TempHome::new();
+        let enc = home.encrypt("v");
+        assert!(!SecretRef::from_single(&enc).has_residue());
+        assert_eq!(
+            SecretRef::from_single(&enc).describe().source,
+            SourceKind::Ambiguous,
+            "describe must not pretend to know which of the two it is"
+        );
     }
 
     // ── describe ────────────────────────────────────────────────
