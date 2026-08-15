@@ -6,7 +6,7 @@
 
 </div>
 
-DuDuClaw は、Claude Code・Codex・Gemini などの AI コマンドラインツールを Telegram・LINE・Discord をはじめとする 9 つのメッセージングプラットフォームにつなぎ、あなたを覚えて自ら成長する 24 時間稼働の AI アシスタントに変えます。
+DuDuClaw は、Claude Code・Codex・Gemini などの AI コマンドラインツールを、Telegram・LINE・Discord をはじめとする 9 つのメッセージングアプリに常駐し、納品前には独立した判定役の検証を通過し、使った費用を一円単位で記録する AI社員に変えます。
 
 必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳は Claude・Codex・Gemini・Antigravity、あるいは任意の OpenAI 互換 API へいつでも切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
 

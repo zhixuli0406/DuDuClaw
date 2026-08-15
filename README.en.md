@@ -6,7 +6,7 @@
 
 </div>
 
-DuDuClaw connects AI command-line tools like Claude Code, Codex, and Gemini to nine messaging platforms (Telegram, LINE, Discord, and more), turning them into an always-on AI assistant that remembers you and improves itself over time.
+DuDuClaw turns Claude Code, Codex, and Gemini into AI employees who actually deliver: they staff nine messaging apps like Telegram, LINE, and Discord, an independent judge reviews their work before it ships, and every dollar they spend gets logged.
 
 All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain for Claude, Codex, Gemini, Antigravity, or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
 

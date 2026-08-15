@@ -6,7 +6,7 @@
 
 </div>
 
-DuDuClaw 把 Claude Code、Codex、Gemini 這些 AI 指令列工具,接上 Telegram、LINE、Discord 等九個通訊平台,變成一個 24 小時值班、會記得你、會自我改進的 AI 助理。
+DuDuClaw 把 Claude Code、Codex、Gemini 這類 AI 指令列工具，變成公司裡交得出東西的 AI 員工：常駐 Telegram、LINE、Discord 等九個通訊軟體，交件前有獨立判官驗收，花掉的每一塊錢都記在帳上。
 
 你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦要用 Claude、Codex、Gemini、Antigravity 還是任何 OpenAI 相容 API 隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
 
