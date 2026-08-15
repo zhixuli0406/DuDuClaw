@@ -41,9 +41,10 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::lenient::{TomlFlag, TomlNumber, Tri};
 use crate::types::{
-    CapabilitiesConfig, ForkSection, GuardrailsSection, MemoryConfig, OsWatchSection,
-    RuntimeSection,
+    CapabilitiesConfig, ForkSection, GuardrailsSection, MemoryConfig, NoiseBandSection,
+    OsWatchSection, RuntimeSection,
 };
 #[cfg(test)]
 use crate::types::PolicyEffect;
@@ -75,6 +76,153 @@ pub struct ModelSectionView {
     pub delegation_routing: Option<bool>,
 }
 
+/// The `[agent]` identity keys the former shadow readers consumed.
+///
+/// A narrow projection rather than [`crate::types::AgentInfo`] for the same
+/// reason as [`ModelSectionView`]: `AgentInfo`'s fields are required, so it
+/// cannot participate in a total deserialization, and giving them serde
+/// defaults would loosen `AgentConfig` itself.
+///
+/// Carried as `Option<AgentSectionView>` on [`AgentTomlSections`] because the
+/// **presence of the `[agent]` table is load-bearing** for two readers:
+/// `export_to::read_agent` and `budget::agent_display_name` both bail out
+/// entirely when `table.get("agent").and_then(|v| v.as_table())` is `None`.
+/// Collapsing "no `[agent]` table" into "an all-empty one" would turn a
+/// skipped export into an export of a blank agent.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct AgentSectionView {
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub name: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub display_name: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub role: Option<String>,
+    /// Raw lifecycle status. Kept as `String` (not
+    /// [`crate::types::AgentStatus`]) because the reader it replaces mapped an
+    /// unrecognised value to `None` (indeterminate) rather than erroring.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub status: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub reports_to: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub icon: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub trigger: Option<String>,
+}
+
+/// The `[budget]` keys `gateway::budget` consumed.
+///
+/// Narrow projection of [`crate::types::BudgetConfig`] (whose fields are
+/// required, so it cannot deserialize totally) with one extra property the
+/// typed struct does not have: every field is **three-state**. `budget`'s
+/// reader logs a loud `warn!` for a present-but-wrong-typed key ("a config
+/// typo must not silently disable a cost control") and stays silent for an
+/// absent one, so [`crate::lenient::Tri`] — not `Option` — is what preserves
+/// it. The int-vs-float distinction is preserved for the same reason: an
+/// integer is clamped, a float is rounded.
+///
+/// All arithmetic (clamping, rounding, the `min(100)` on the warn threshold)
+/// deliberately stays in the accessor.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct BudgetSectionView {
+    #[serde(deserialize_with = "crate::lenient::tri")]
+    pub monthly_limit_cents: Tri<TomlNumber>,
+    #[serde(deserialize_with = "crate::lenient::tri")]
+    pub warn_threshold_percent: Tri<TomlNumber>,
+    #[serde(deserialize_with = "crate::lenient::tri")]
+    pub daily_cap_cents: Tri<TomlNumber>,
+    /// `hard_stop` tolerates an integer (`1`/`0`) with a warning, so it needs
+    /// [`TomlFlag`] rather than a plain `bool`.
+    #[serde(deserialize_with = "crate::lenient::tri")]
+    pub hard_stop: Tri<TomlFlag>,
+}
+
+/// The `[evolution]` keys the four GVU/AEE shadow readers consumed.
+///
+/// Narrow projection of [`crate::types::EvolutionConfig`] (required fields ⇒
+/// no total parse). `evolution_view_matches_typed_evolution_config` locks the
+/// two against drift the same way `ModelSectionView` is locked.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct EvolutionSectionView {
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub legacy_soul_evolution: Option<bool>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub strategy: Option<String>,
+    /// Integer literals ARE accepted here — the opposite of `[fork]`'s budget
+    /// quirk. See [`crate::lenient::opt_number_lossy`].
+    #[serde(deserialize_with = "crate::lenient::opt_number_lossy")]
+    pub aee_settle_hours: Option<f64>,
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub noise_band: NoiseBandSection,
+}
+
+/// `agent.toml [skills]` — the curated recommendation list.
+///
+/// A section [`crate::types::AgentConfig`] does not model at all, so this view
+/// has no typed twin to drift from. Read by
+/// `duduclaw_agent::skill_recommend`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct SkillsSectionView {
+    /// Missing / non-array ⇒ empty. Entry validation (`hub/slug` shape,
+    /// path-traversal rejection) stays in the accessor — it is a safety
+    /// policy, not a file-format rule.
+    #[serde(deserialize_with = "crate::lenient::string_vec")]
+    pub recommended: Vec<String>,
+}
+
+/// `agent.toml [mcp]` — per-agent external MCP servers.
+///
+/// Another section `AgentConfig` does not model. Read by
+/// `gateway::mcp_external`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct McpSectionView {
+    #[serde(deserialize_with = "crate::lenient::lenient_vec")]
+    pub external: Vec<ExternalMcpEntryView>,
+}
+
+/// One `[[mcp.external]]` entry, as raw as the reader it replaces.
+///
+/// Every semantic decision (preset resolution, the exactly-one-transport
+/// rule, `env://` / `secret://` credential resolution, the fail-closed skip on
+/// a wrong-typed tool filter) stays in `gateway::mcp_external` — this type
+/// only stops that module from walking a `toml::Value` by hand.
+///
+/// The two tool-filter fields are [`Tri`], not `Vec<String>`: they are the one
+/// place where "absent" and "present but wrong type" must NOT converge, since
+/// converging them would turn a typo into a silently permissive allowlist.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct ExternalMcpEntryView {
+    /// Missing / wrong-typed ⇒ `None` ⇒ the accessor's `true` (opt-out flag).
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub enabled: Option<bool>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub preset: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub name: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub command: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub url: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub bearer_token: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::string_vec")]
+    pub args: Vec<String>,
+    #[serde(deserialize_with = "crate::lenient::string_map")]
+    pub env: Vec<(String, String)>,
+    #[serde(deserialize_with = "crate::lenient::string_map")]
+    pub headers: Vec<(String, String)>,
+    #[serde(deserialize_with = "crate::lenient::tri_string_vec")]
+    pub allowed_tools: Tri<Vec<String>>,
+    #[serde(deserialize_with = "crate::lenient::tri_string_vec")]
+    pub denied_tools: Tri<Vec<String>>,
+}
+
 /// Every `agent.toml` section the migrated readers touch, in one tolerant
 /// parse.
 ///
@@ -102,6 +250,18 @@ pub struct AgentTomlSections {
     pub memory: MemoryConfig,
     #[serde(deserialize_with = "crate::lenient::or_default")]
     pub model: ModelSectionView,
+    /// `None` distinguishes "no `[agent]` table" from "an empty one" — see
+    /// [`AgentSectionView`].
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub agent: Option<AgentSectionView>,
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub budget: BudgetSectionView,
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub evolution: EvolutionSectionView,
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub skills: SkillsSectionView,
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub mcp: McpSectionView,
 }
 
 /// Parse the sections out of an `agent.toml` string.
@@ -390,6 +550,211 @@ max_branches = "many"
             "delegation_routing",
             "decision_continuity",
             "decision_ttl_days",
+        ] {
+            assert!(!out.contains(key), "{key} must not be materialized:\n{out}");
+        }
+    }
+
+    // ── 2nd-pass views: drift guards + presence semantics ────────────────
+
+    /// Drift guard, same role as `model_view_matches_typed_model_config`: the
+    /// narrow [`EvolutionSectionView`] and the typed
+    /// [`crate::types::EvolutionConfig`] must read the same `[evolution]` keys
+    /// with the same results, including the two OPPOSITE numeric quirks
+    /// (`aee_settle_hours` accepts an integer, `noise_band.*` does not).
+    #[test]
+    fn evolution_view_matches_typed_evolution_config() {
+        let text = format!(
+            "{BASE}\n[model]\npreferred = \"m\"\nfallback = \"f\"\naccount_pool = []\n\
+             [evolution.extra_ignored]\nx = 1\n"
+        )
+        .replace(
+            "skill_token_budget = 500",
+            "skill_token_budget = 500\n\
+             legacy_soul_evolution = true\n\
+             strategy = \"innovate\"\n\
+             aee_settle_hours = 48\n",
+        )
+            + "\n[evolution.noise_band]\ncases = 0.02\njudge = 3\n";
+
+        let full_cfg: crate::types::AgentConfig = toml::from_str(&text).unwrap();
+        let view = parse(&text).evolution;
+        assert_eq!(view.legacy_soul_evolution, full_cfg.evolution.legacy_soul_evolution);
+        assert_eq!(view.strategy, full_cfg.evolution.strategy);
+        assert_eq!(view.aee_settle_hours, full_cfg.evolution.aee_settle_hours);
+        assert_eq!(view.noise_band, full_cfg.evolution.noise_band);
+
+        // And the quirks themselves, spelled out.
+        assert_eq!(view.aee_settle_hours, Some(48.0), "integer literal accepted");
+        assert_eq!(view.noise_band.cases, Some(0.02));
+        assert_eq!(
+            view.noise_band.judge, None,
+            "an integer literal is IGNORED for noise_band (as_float-only quirk)"
+        );
+    }
+
+    /// The `[agent]` section's *presence* is load-bearing for two readers
+    /// (`export_to::read_agent`, `budget::agent_display_name`), so the view
+    /// must distinguish "no table" from "an empty table". A wrong-typed
+    /// section reads as absent, matching `as_table()` returning `None`.
+    #[test]
+    fn agent_section_presence_is_distinguishable_from_emptiness() {
+        assert!(parse("").agent.is_none(), "no table ⇒ None");
+        assert!(
+            parse("agent = \"scalar\"\n").agent.is_none(),
+            "wrong-typed section reads as absent, like as_table() → None"
+        );
+        assert!(parse("this is not toml {{{").agent.is_none());
+
+        let empty = parse("[agent]\n").agent.expect("an empty table is still a table");
+        assert_eq!(empty, AgentSectionView::default());
+
+        let full = parse(
+            "[agent]\nname = \"a\"\ndisplay_name = \"A\"\nrole = \"specialist\"\n\
+             status = \"active\"\nreports_to = \"boss\"\nicon = \"x\"\ntrigger = \"@a\"\n",
+        )
+        .agent
+        .unwrap();
+        assert_eq!(full.name.as_deref(), Some("a"));
+        assert_eq!(full.status.as_deref(), Some("active"));
+        assert_eq!(full.reports_to.as_deref(), Some("boss"));
+
+        // A wrong-typed key inside the table degrades to None, never fatal.
+        let typo = parse("[agent]\nname = 42\ndisplay_name = \"A\"\n").agent.unwrap();
+        assert_eq!(typo.name, None);
+        assert_eq!(typo.display_name.as_deref(), Some("A"));
+    }
+
+    /// `[budget]`'s view is three-state because the accessor warns only for
+    /// the wrong-typed case, and keeps int/float apart because the accessor
+    /// clamps one and rounds the other.
+    #[test]
+    fn budget_view_keeps_absent_wrong_typed_int_and_float_apart() {
+        let absent = parse("").budget;
+        assert_eq!(absent.monthly_limit_cents, Tri::Absent);
+        assert_eq!(absent.hard_stop, Tri::Absent);
+
+        let b = parse(
+            "[budget]\nmonthly_limit_cents = 5000\ndaily_cap_cents = 100.0\n\
+             warn_threshold_percent = \"80\"\nhard_stop = 1\n",
+        )
+        .budget;
+        assert_eq!(b.monthly_limit_cents, Tri::Value(TomlNumber::Int(5000)));
+        assert_eq!(b.daily_cap_cents, Tri::Value(TomlNumber::Float(100.0)));
+        assert_eq!(b.warn_threshold_percent, Tri::WrongType);
+        assert_eq!(b.hard_stop, Tri::Value(TomlFlag::Int(1)));
+
+        // A scalar `budget` and an absent one converge on all-Absent, which is
+        // what makes the accessor's single "inert" result correct for both.
+        assert_eq!(parse("budget = 1\n").budget, BudgetSectionView::default());
+    }
+
+    /// `[[mcp.external]]`'s tool filters are the one place where absent and
+    /// wrong-typed must NOT converge — see `ExternalMcpEntryView`.
+    #[test]
+    fn mcp_external_view_flags_wrong_typed_tool_filters() {
+        assert!(parse("").mcp.external.is_empty());
+        assert!(parse("[mcp]\nexternal = \"nope\"\n").mcp.external.is_empty());
+
+        let e = &parse(
+            "[[mcp.external]]\nname = \"s\"\ncommand = \"npx\"\n\
+             args = [\"-y\", 3, \"pkg\"]\n\
+             env = { A = \"1\", B = 2 }\n\
+             allowed_tools = [\"t\", 9]\n\
+             denied_tools = \"oops\"\n",
+        )
+        .mcp
+        .external[0];
+        assert_eq!(e.name.as_deref(), Some("s"));
+        assert_eq!(e.enabled, None, "absent ⇒ None ⇒ the accessor's `true`");
+        assert_eq!(e.args, vec!["-y".to_string(), "pkg".to_string()]);
+        assert_eq!(e.env, vec![("A".to_string(), "1".to_string())]);
+        assert_eq!(
+            e.allowed_tools,
+            Tri::Value(vec!["t".to_string()]),
+            "a mixed array is filtered, not flagged"
+        );
+        assert_eq!(
+            e.denied_tools,
+            Tri::WrongType,
+            "a scalar where an array belongs must stay distinguishable"
+        );
+
+        // A non-table element degrades to an all-default entry rather than
+        // failing the whole list and losing its well-formed siblings.
+        let entries = parse("[mcp]\nexternal = [\"scalar\", { name = \"ok\" }]\n").mcp.external;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ExternalMcpEntryView::default());
+        assert_eq!(entries[1].name.as_deref(), Some("ok"));
+    }
+
+    /// `[skills]` has no typed twin on `AgentConfig`, so this only pins the
+    /// leniency: absent / non-array / mixed-array all behave as the raw walk
+    /// did.
+    #[test]
+    fn skills_view_is_lenient_about_everything() {
+        assert!(parse("").skills.recommended.is_empty());
+        assert!(parse("[skills]\n").skills.recommended.is_empty());
+        assert!(parse("skills = 1\n").skills.recommended.is_empty());
+        assert!(parse("[skills]\nrecommended = \"x\"\n").skills.recommended.is_empty());
+        assert_eq!(
+            parse("[skills]\nrecommended = [\"a\", 2, \"b\"]\n").skills.recommended,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    /// `allowed_tools` / `denied_tools` moved onto `lenient::string_vec` so
+    /// the tolerant and strict paths agree — and, more importantly, so one
+    /// stray non-string element can no longer fail `AgentConfig` outright and
+    /// delete the agent from the registry.
+    #[test]
+    fn tool_allow_deny_lists_drop_bad_elements_instead_of_losing_the_agent() {
+        let text = format!(
+            "{}\n[capabilities]\nallowed_tools = [\"Bash\", 7]\ndenied_tools = \"WebFetch\"\n",
+            minimal()
+        );
+        let loose = parse(&text);
+        assert_eq!(loose.capabilities.allowed_tools, vec!["Bash".to_string()]);
+        assert!(loose.capabilities.denied_tools.is_empty(), "non-array ⇒ empty");
+
+        let strict: crate::types::AgentConfig =
+            toml::from_str(&text).expect("a stray element must not lose the agent");
+        assert_eq!(strict.capabilities.allowed_tools, loose.capabilities.allowed_tools);
+        assert_eq!(strict.capabilities.denied_tools, loose.capabilities.denied_tools);
+    }
+
+    /// `auto_approve_install` is fail-CLOSED while its section-mates are
+    /// fail-safe-empty. Pin the asymmetry at the schema level too.
+    #[test]
+    fn auto_approve_install_is_none_unless_explicitly_written() {
+        assert_eq!(parse("").capabilities.auto_approve_install, None);
+        assert_eq!(parse("[capabilities]\n").capabilities.auto_approve_install, None);
+        assert_eq!(
+            parse("[capabilities]\nauto_approve_install = \"true\"\n")
+                .capabilities
+                .auto_approve_install,
+            None,
+            "wrong type ⇒ None ⇒ the accessor's false ⇒ gate stays on"
+        );
+        assert_eq!(
+            parse("[capabilities]\nauto_approve_install = true\n")
+                .capabilities
+                .auto_approve_install,
+            Some(true)
+        );
+    }
+
+    /// The 2nd-pass keys must not be materialized on rewrite either — same
+    /// contract as `absent_sections_are_not_materialized_on_rewrite`.
+    #[test]
+    fn second_pass_keys_are_not_materialized_on_rewrite() {
+        let cfg: crate::types::AgentConfig = toml::from_str(&minimal()).unwrap();
+        let out = toml::to_string_pretty(&cfg).unwrap();
+        for key in [
+            "auto_approve_install",
+            "legacy_soul_evolution",
+            "aee_settle_hours",
+            "noise_band",
         ] {
             assert!(!out.contains(key), "{key} must not be materialized:\n{out}");
         }

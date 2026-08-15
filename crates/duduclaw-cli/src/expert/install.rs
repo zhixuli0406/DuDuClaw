@@ -757,11 +757,8 @@ pub async fn cmd_export(home: &Path, slug: &str, format: &str, out: Option<&Path
     for agent_id in &rec.agents {
         let agent_dir = home.join("agents").join(agent_id);
         let soul = std::fs::read_to_string(agent_dir.join("SOUL.md")).unwrap_or_default();
-        let toml_tbl = std::fs::read_to_string(agent_dir.join("agent.toml"))
-            .ok()
-            .and_then(|c| c.parse::<toml::Table>().ok())
-            .unwrap_or_default();
-        let (model, tools, disallowed) = extract_agent_frontmatter(&toml_tbl);
+        let sections = duduclaw_core::agent_toml::load(&agent_dir);
+        let (model, tools, disallowed) = extract_agent_frontmatter(&sections);
         let mut fm = String::from("---\n");
         fm.push_str(&format!("name: {agent_id}\n"));
         if let Some(m) = model {
@@ -808,30 +805,21 @@ pub async fn cmd_export(home: &Path, slug: &str, format: &str, out: Option<&Path
 }
 
 /// Pull `[model] preferred` + `[capabilities] allowed/denied_tools` back out
-/// of an agent.toml table for plugin-format frontmatter.
+/// of an agent.toml for plugin-format frontmatter.
+///
+/// Goes through the shared typed parse point
+/// ([`duduclaw_core::agent_toml`]) rather than a hand-rolled `toml::Value`
+/// walk. Missing directions are unchanged: an absent/unreadable/malformed
+/// file, an absent section, or a wrong-typed value all yield `None` / an
+/// empty list, and a mixed array still keeps only its string elements.
 fn extract_agent_frontmatter(
-    table: &toml::value::Table,
+    sections: &duduclaw_core::agent_toml::AgentTomlSections,
 ) -> (Option<String>, Vec<String>, Vec<String>) {
-    let model = table
-        .get("model")
-        .and_then(|m| m.as_table())
-        .and_then(|m| m.get("preferred"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let str_array = |key: &str| -> Vec<String> {
-        table
-            .get("capabilities")
-            .and_then(|c| c.as_table())
-            .and_then(|c| c.get(key))
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    (model, str_array("allowed_tools"), str_array("denied_tools"))
+    (
+        sections.model.preferred.clone(),
+        sections.capabilities.allowed_tools.clone(),
+        sections.capabilities.denied_tools.clone(),
+    )
 }
 
 // ─────────────────────────── small utils ───────────────────────────
@@ -863,5 +851,59 @@ struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// R5: `extract_agent_frontmatter`'s directions, pinned.
+///
+/// This reader feeds Claude Code plugin frontmatter, and every field is
+/// fail-*open* (absent ⇒ the key is simply omitted from the frontmatter):
+/// a missing model line or an empty tools line is a benign export, whereas
+/// refusing to export would strand the whole plugin bundle over one typo.
+///
+/// The mixed-array case is the one worth pinning: the raw walk used
+/// `filter_map(as_str)` and kept the good elements, so `allowed_tools` /
+/// `denied_tools` are read through `lenient::string_vec` rather than a strict
+/// `Vec<String>` — which also means a stray element no longer fails
+/// `AgentConfig` outright and deletes the agent from the registry.
+#[cfg(test)]
+mod frontmatter_direction_tests {
+    use super::extract_agent_frontmatter;
+
+    fn fm(body: &str) -> (Option<String>, Vec<String>, Vec<String>) {
+        extract_agent_frontmatter(&duduclaw_core::agent_toml::parse(body))
+    }
+
+    #[test]
+    fn default_direction_frontmatter_omits_what_it_cannot_read() {
+        for body in [
+            "",                                       // empty file
+            "[agent]\nname = \"a\"\n",                // unrelated section only
+            "[model]\n",                              // section, no key
+            "[model]\npreferred = 42\n",              // wrong type
+            "model = \"scalar\"\n",                   // wrong-typed section
+            "[capabilities]\nallowed_tools = \"Bash\"\n", // non-array
+            "not toml [[[",                           // malformed file
+        ] {
+            let (model, tools, disallowed) = fm(body);
+            if body.contains("preferred = 42") || !body.contains("preferred") {
+                assert!(model.is_none(), "model omitted for {body:?}");
+            }
+            assert!(tools.is_empty(), "tools omitted for {body:?}");
+            assert!(disallowed.is_empty(), "disallowedTools omitted for {body:?}");
+        }
+    }
+
+    #[test]
+    fn default_direction_frontmatter_filters_mixed_arrays_instead_of_dropping_them() {
+        let (model, tools, disallowed) = fm(
+            "[model]\npreferred = \"claude-sonnet-4-6\"\n\
+             [capabilities]\n\
+             allowed_tools = [\"Bash\", 7, \"Read\"]\n\
+             denied_tools = [\"WebFetch\"]\n",
+        );
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(tools, vec!["Bash".to_string(), "Read".to_string()]);
+        assert_eq!(disallowed, vec!["WebFetch".to_string()]);
     }
 }

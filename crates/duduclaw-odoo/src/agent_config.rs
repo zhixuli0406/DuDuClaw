@@ -87,13 +87,39 @@ impl AgentOdooConfig {
             && self.unblock_models.is_empty()
     }
 
-    /// Parse from a `agent.toml` table — looks for the `[odoo]` section.
-    /// Returns `None` when the section is absent (the common case).
-    pub fn from_agent_toml(table: &toml::Table) -> Option<Self> {
-        let block = table.get("odoo")?;
-        // Use try_into so a malformed [odoo] block surfaces as None; the
-        // gateway logs the failure and falls back to the global config.
-        let cfg: AgentOdooConfig = block.clone().try_into().ok()?;
+    /// Parse from raw `agent.toml` text — looks for the `[odoo]` section.
+    /// Returns `None` when the file is unparseable or the section is absent
+    /// (the common case), and also when the block is present but malformed:
+    /// the gateway logs the failure and falls back to the global config.
+    ///
+    /// **Why this is not `duduclaw_core::agent_toml::AgentTomlSections`.**
+    /// That is the workspace's single typed `agent.toml` parse point, and
+    /// `[odoo]` belongs on it — but `duduclaw-odoo` *depends on*
+    /// `duduclaw-core`, so putting [`AgentOdooConfig`] there would invert the
+    /// dependency. What is portable is the discipline: this is a total,
+    /// section-isolated serde parse (a wrong-typed unrelated section cannot
+    /// make it fail), not a hand-rolled `toml::Value` walk, and it reads the
+    /// text rather than requiring the caller to hand over a parsed table.
+    pub fn from_agent_toml(raw: &str) -> Option<Self> {
+        /// Section-isolating wrapper: only `[odoo]` is described, and it is
+        /// `Option` so an absent **or** malformed block yields `None` without
+        /// disturbing anything else in the file.
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[serde(default)]
+            odoo: Option<AgentOdooConfig>,
+        }
+
+        // `toml::from_str` on the wrapper would still fail if `[odoo]` itself
+        // is malformed, so parse the block through a two-step: the whole file
+        // first (any valid TOML), then the section.
+        let wrap: Wrap = match toml::from_str::<Wrap>(raw) {
+            Ok(w) => w,
+            // Either the file is not valid TOML at all, or `[odoo]` is
+            // malformed — both were `None` before.
+            Err(_) => return None,
+        };
+        let cfg = wrap.odoo?;
         if cfg.is_empty() { None } else { Some(cfg) }
     }
 
@@ -261,11 +287,47 @@ mod tests {
         assert!(!cfg.permits_model("res.partner"));
     }
 
+    // ── R5: `[odoo]` direction, pinned ───────────────────────────────────
+    //
+    // absent file text / malformed TOML / absent `[odoo]` / malformed
+    // `[odoo]` / an all-default (vacuous) block ⇒ None ⇒ the agent inherits
+    // the GLOBAL `config.toml [odoo]`. Never a partially-applied override:
+    // half-applied ERP credentials are worse than none, because the agent
+    // would connect as the wrong service account rather than failing loudly.
+
+    #[test]
+    fn default_direction_odoo_block_falls_back_to_global_on_anything_unusable() {
+        for raw in [
+            "",                                   // empty file
+            "[agent]\nname = \"foo\"\n",          // no [odoo]
+            "[odoo]\n",                           // vacuous block
+            "odoo = 1\n",                         // wrong-typed section
+            "[odoo]\nallowed_models = 42\n",      // malformed block
+            "[odoo]\ncompany_ids = [\"one\"]\n",  // wrong element type
+            "not toml [[[",                       // malformed file
+        ] {
+            assert!(
+                AgentOdooConfig::from_agent_toml(raw).is_none(),
+                "must fall back to global for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_direction_unrelated_sections_never_affect_the_odoo_block() {
+        // The parse is section-isolated: unknown sections are ignored, so an
+        // unrelated key (even a wrong-typed one, as long as the file is valid
+        // TOML) cannot take the override down.
+        let raw = "[agent]\nname = 42\n[whatever]\nx = [1, \"two\"]\n\
+                   [odoo]\nprofile = \"alpha\"\n";
+        let cfg = AgentOdooConfig::from_agent_toml(raw).expect("override survives");
+        assert_eq!(cfg.profile.as_deref(), Some("alpha"));
+    }
+
     #[test]
     fn from_agent_toml_returns_none_when_no_block() {
         let raw = "[agent]\nname = \"foo\"\n";
-        let table: toml::Table = raw.parse().unwrap();
-        assert!(AgentOdooConfig::from_agent_toml(&table).is_none());
+        assert!(AgentOdooConfig::from_agent_toml(raw).is_none());
     }
 
     #[test]
@@ -275,8 +337,7 @@ mod tests {
             profile = \"alpha\"\n\
             username = \"alpha_user\"\n\
         ";
-        let table: toml::Table = raw.parse().unwrap();
-        let cfg = AgentOdooConfig::from_agent_toml(&table).expect("present");
+        let cfg = AgentOdooConfig::from_agent_toml(raw).expect("present");
         assert_eq!(cfg.profile.as_deref(), Some("alpha"));
         assert_eq!(cfg.username.as_deref(), Some("alpha_user"));
         assert!(cfg.allowed_models.is_empty());
@@ -292,8 +353,7 @@ mod tests {
             allowed_actions = [\"read\", \"write:crm.lead\"]\n\
             company_ids = [1, 2]\n\
         ";
-        let table: toml::Table = raw.parse().unwrap();
-        let cfg = AgentOdooConfig::from_agent_toml(&table).expect("present");
+        let cfg = AgentOdooConfig::from_agent_toml(raw).expect("present");
         assert_eq!(cfg.allowed_models.len(), 2);
         assert_eq!(cfg.allowed_actions.len(), 2);
         assert_eq!(cfg.company_ids, vec![1, 2]);
@@ -304,16 +364,14 @@ mod tests {
         // Operator wrote `[odoo]` then nothing — should be treated as absent
         // so we don't pin a vacuous override.
         let raw = "[odoo]\n";
-        let table: toml::Table = raw.parse().unwrap();
-        assert!(AgentOdooConfig::from_agent_toml(&table).is_none());
+        assert!(AgentOdooConfig::from_agent_toml(raw).is_none());
     }
 
     #[test]
     fn from_agent_toml_returns_none_for_malformed_block() {
         // `allowed_models` should be a list of strings.
         let raw = "[odoo]\nallowed_models = 42\n";
-        let table: toml::Table = raw.parse().unwrap();
-        assert!(AgentOdooConfig::from_agent_toml(&table).is_none());
+        assert!(AgentOdooConfig::from_agent_toml(raw).is_none());
     }
 
     #[test]

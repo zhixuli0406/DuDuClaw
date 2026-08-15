@@ -234,26 +234,33 @@ pub(crate) struct ContractSummary {
     pub must_always: Vec<String>,
 }
 
-fn tstr(t: &toml::value::Table, key: &str) -> String {
-    t.get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+/// `Option<String>` → the trimmed string, treating absent / wrong-typed as
+/// empty.
+///
+/// Replaces the former `tstr(&toml::value::Table, key)` helper: the `[agent]`
+/// / `[model]` fields now arrive already typed from the shared parse point, so
+/// the only remaining step is the trim-and-default that `tstr` also did.
+fn ostr(v: Option<&String>) -> String {
+    v.map(|s| s.trim()).unwrap_or_default().to_string()
 }
 
 /// Read one agent directory defensively (missing/odd fields never panic).
 /// Returns `None` when `agent.toml` is absent or unparseable.
+///
+/// Goes through the shared typed parse point
+/// ([`duduclaw_core::agent_toml`]). The `Option<AgentSectionView>` shape is
+/// what preserves the `?` below: an `agent.toml` with **no `[agent]` table**
+/// still skips the agent (reported as "缺失或無法解析") instead of exporting a
+/// blank one. Note the deliberate asymmetry kept from the raw reader — an
+/// absent `[model]` section is fine (empty model), an absent `[agent]` one is
+/// not.
 fn read_agent(home: &Path, id: &str) -> Option<ExportedAgent> {
     let dir = home.join("agents").join(id);
-    let raw = std::fs::read_to_string(dir.join("agent.toml")).ok()?;
-    let table: toml::value::Table = raw.parse::<toml::Table>().ok()?;
-    let agent = table.get("agent").and_then(|v| v.as_table())?;
-    let model = table
-        .get("model")
-        .and_then(|v| v.as_table())
-        .map(|m| tstr(m, "preferred"))
-        .unwrap_or_default();
+    // A missing file, a malformed one, and a file with no `[agent]` table all
+    // land on `None` here — the same three bail-outs the raw reader had.
+    let sections = duduclaw_core::agent_toml::load(&dir);
+    let agent = sections.agent.as_ref()?;
+    let model = ostr(sections.model.preferred.as_ref());
 
     let soul = std::fs::read_to_string(dir.join("SOUL.md")).ok();
     let contract = read_contract(&dir.join("CONTRACT.toml"));
@@ -277,19 +284,19 @@ fn read_agent(home: &Path, id: &str) -> Option<ExportedAgent> {
     skill_dirs.sort();
 
     let display_name = {
-        let d = tstr(agent, "display_name");
+        let d = ostr(agent.display_name.as_ref());
         if d.is_empty() { id.to_string() } else { d }
     };
     Some(ExportedAgent {
         slug: id.to_string(),
         display_name,
         role: {
-            let r = tstr(agent, "role");
+            let r = ostr(agent.role.as_ref());
             if r.is_empty() { "specialist".into() } else { r }
         },
-        reports_to_raw: tstr(agent, "reports_to"),
-        icon: tstr(agent, "icon"),
-        trigger: tstr(agent, "trigger"),
+        reports_to_raw: ostr(agent.reports_to.as_ref()),
+        icon: ostr(agent.icon.as_ref()),
+        trigger: ostr(agent.trigger.as_ref()),
         model,
         soul,
         contract,
@@ -992,6 +999,74 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── R5: `read_agent`'s `[agent]` / `[model]` directions, pinned ──────
+    //
+    //   no agent.toml / malformed / no `[agent]` table ⇒ None ⇒ the agent is
+    //                 SKIPPED and reported as "缺失或無法解析". Exporting a
+    //                 blank agent instead would silently ship a broken bundle.
+    //   an absent `[model]` section, by contrast, is FINE (empty model).
+    //                 The asymmetry between the two sections is deliberate —
+    //                 which is why the shared view carries `[agent]` as an
+    //                 `Option` and `[model]` as a plain struct.
+    //   every string field trims, and blank / wrong-typed falls through to
+    //                 that field's own fallback (id, "specialist", or empty).
+
+    fn agent_home(body: Option<&str>) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents").join("worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(b) = body {
+            std::fs::write(dir.join("agent.toml"), b).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn default_direction_read_agent_skips_when_the_agent_table_is_unusable() {
+        for body in [
+            None,                            // no agent.toml at all
+            Some("not toml [[["),            // malformed
+            Some(""),                        // valid TOML, no [agent]
+            Some("[model]\npreferred = \"m\"\n"), // other sections only
+            Some("agent = \"scalar\"\n"),    // wrong-typed section
+        ] {
+            let home = agent_home(body);
+            assert!(
+                read_agent(home.path(), "worker").is_none(),
+                "must skip for {body:?}"
+            );
+        }
+
+        // An EMPTY `[agent]` table is a table — it exports, with fallbacks.
+        let home = agent_home(Some("[agent]\n"));
+        let a = read_agent(home.path(), "worker").expect("an empty table still exports");
+        assert_eq!(a.display_name, "worker", "blank display_name ⇒ the id");
+        assert_eq!(a.role, "specialist", "blank role ⇒ the documented default");
+        assert!(a.reports_to_raw.is_empty());
+        assert!(a.model.is_empty(), "an absent [model] is fine, unlike [agent]");
+    }
+
+    #[test]
+    fn default_direction_read_agent_trims_and_tolerates_wrong_types() {
+        let home = agent_home(Some(
+            "[agent]\n\
+             display_name = \"  Worker  \"\n\
+             role = \"  \"\n\
+             reports_to = 42\n\
+             icon = \"🤖\"\n\
+             trigger = \" @Worker \"\n\
+             [model]\n\
+             preferred = \"  claude-sonnet-4-6  \"\n",
+        ));
+        let a = read_agent(home.path(), "worker").expect("exports");
+        assert_eq!(a.display_name, "Worker", "trimmed");
+        assert_eq!(a.role, "specialist", "whitespace-only ⇒ the default");
+        assert_eq!(a.reports_to_raw, "", "wrong type ⇒ empty, never fatal");
+        assert_eq!(a.icon, "🤖");
+        assert_eq!(a.trigger, "@Worker");
+        assert_eq!(a.model, "claude-sonnet-4-6", "trimmed");
+    }
 
     fn agent_fixture() -> ExportedAgent {
         ExportedAgent {

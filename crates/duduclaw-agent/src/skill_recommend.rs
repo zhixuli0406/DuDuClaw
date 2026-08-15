@@ -79,19 +79,15 @@ pub fn parse_entry(raw: &str) -> Option<RecommendedSkill> {
 /// Lenient: any parse failure / absent section ⇒ empty list. Unsafe entries
 /// are dropped (fail-safe), not errored.
 pub fn parse_recommended_from_toml(content: &str) -> Vec<RecommendedSkill> {
-    let Ok(value) = content.parse::<toml::Value>() else {
-        return Vec::new();
-    };
-    let Some(list) = value
-        .get("skills")
-        .and_then(|s| s.get("recommended"))
-        .and_then(|v| v.as_array())
-    else {
-        return Vec::new();
-    };
-    list.iter()
-        .filter_map(|v| v.as_str())
-        .filter_map(parse_entry)
+    // Shared typed parse point (R2 unification). Malformed TOML, an absent
+    // `[skills]` table, an absent / non-array `recommended`, and non-string
+    // elements inside it all degrade exactly as the raw walk did — to an empty
+    // list, or to the list minus the bad elements.
+    duduclaw_core::agent_toml::parse(content)
+        .skills
+        .recommended
+        .iter()
+        .filter_map(|s| parse_entry(s))
         .collect()
 }
 
@@ -107,6 +103,54 @@ pub fn read_recommended(dir: &Path) -> Vec<RecommendedSkill> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── R5: `[skills] recommended` direction, pinned ─────────────────────
+    //
+    // malformed TOML / absent `[skills]` / absent or non-array `recommended`
+    // ⇒ EMPTY. Non-string elements, and entries that fail `parse_entry`'s
+    // safety check, are DROPPED rather than erroring — a bad recommendation
+    // must cost that one entry, never the whole list (and never the agent).
+
+    #[test]
+    fn default_direction_recommended_is_empty_for_anything_unusable() {
+        for body in [
+            "",                                    // empty file
+            "[agent]\nname = \"x\"\n",             // no [skills]
+            "[skills]\n",                          // section, no key
+            "[skills]\nrecommended = \"one\"\n",   // non-array
+            "[skills]\nrecommended = []\n",        // explicit empty
+            "skills = 1\n",                        // wrong-typed section
+            "not toml [[[",                        // malformed file
+        ] {
+            assert!(
+                parse_recommended_from_toml(body).is_empty(),
+                "for {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_direction_bad_entries_are_dropped_not_fatal() {
+        // The raw walk did `filter_map(as_str)` then `filter_map(parse_entry)`
+        // — a non-string element and an unsafe slug each cost one entry.
+        let got = parse_recommended_from_toml(
+            "[skills]\nrecommended = [\"good-skill\", 42, \"../escape\", \"also-good\"]\n",
+        );
+        let slugs: Vec<&str> = got.iter().map(|r| r.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["good-skill", "also-good"]);
+    }
+
+    #[test]
+    fn default_direction_read_recommended_missing_file_is_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "duduclaw-skillrec-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.join("agent.toml"));
+        assert!(read_recommended(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_bare_and_qualified_entries() {

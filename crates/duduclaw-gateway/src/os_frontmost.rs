@@ -38,27 +38,18 @@ use crate::autopilot_engine::AutopilotEvent;
 
 /// Read `[os_watch] frontmost_poll_secs` from an agent's `agent.toml`.
 ///
-/// Additive raw-TOML parse (same pattern as `os_events::read_os_watch_config`
-/// / `approval_required_tools`) — never touches the serde `AgentConfig`
-/// struct, so this new key can't break existing configs. Returns `None` (do
-/// not poll) when the file/table/key is absent, malformed, non-positive, or
-/// the value doesn't parse as an integer. `0` is an explicit "disabled" value,
-/// not an error.
+/// Goes through the shared typed parse point
+/// ([`duduclaw_core::agent_toml`]) — the key is typed on
+/// [`duduclaw_core::types::OsWatchSection`], so it is now visible to
+/// `AgentConfig` (and survives the `agent_update` round-trip) while keeping
+/// the tolerance of the raw walk it replaces. Returns `None` (do not poll)
+/// when the file/table/key is absent, malformed, non-positive, or the value
+/// doesn't parse as an integer. `0` is an explicit "disabled" value, not an
+/// error.
 pub fn read_frontmost_poll_secs(agent_dir: &Path) -> Option<u64> {
-    let path = agent_dir.join("agent.toml");
-    let text = std::fs::read_to_string(&path).ok()?;
-    let value: toml::Value = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(?path, error = %e, "malformed agent.toml — [os_watch] frontmost_poll_secs ignored");
-            return None;
-        }
-    };
-    let secs = value
-        .get("os_watch")?
-        .as_table()?
-        .get("frontmost_poll_secs")?
-        .as_integer()?;
+    let secs = duduclaw_core::agent_toml::load(agent_dir)
+        .os_watch
+        .frontmost_poll_secs?;
     if secs <= 0 { None } else { Some(secs as u64) }
 }
 
@@ -351,6 +342,45 @@ pub async fn init_frontmost_polling(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── R5: `[os_watch] frontmost_poll_secs` direction, pinned ───────────
+    //
+    // absent / malformed / wrong-typed / non-positive ⇒ None ⇒ DO NOT POLL.
+    // Polling reads the user's frontmost application, so "we couldn't read
+    // the config" must never resolve to "start observing anyway"; `0` is an
+    // explicit disable, not an error. Note this is the OPPOSITE convention
+    // from `[capabilities] grant_ttl_secs`, where `0` means "use the
+    // default" — same-shaped key, deliberately different direction.
+
+    #[test]
+    fn default_direction_frontmost_poll_never_polls_on_a_bad_config() {
+        for body in [
+            "",                                        // empty file
+            "[os_watch]\n",                            // section, no key
+            "[os_watch]\nfrontmost_poll_secs = 0\n",   // explicit disable
+            "[os_watch]\nfrontmost_poll_secs = -5\n",  // negative
+            "[os_watch]\nfrontmost_poll_secs = \"60\"\n", // wrong type
+            "[os_watch]\nfrontmost_poll_secs = 60.5\n",   // float ⇒ not an int
+            "os_watch = \"scalar\"\n",                 // wrong-typed section
+            "not valid toml [[[",                      // malformed file
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+            assert!(
+                read_frontmost_poll_secs(dir.path()).is_none(),
+                "must not poll for {body:?}"
+            );
+        }
+
+        // A well-formed positive value is the ONLY thing that starts polling.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[os_watch]\nfrontmost_poll_secs = 90\n",
+        )
+        .unwrap();
+        assert_eq!(read_frontmost_poll_secs(dir.path()), Some(90));
+    }
 
     #[test]
     fn read_frontmost_poll_secs_absent_is_none() {

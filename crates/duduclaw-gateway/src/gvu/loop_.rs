@@ -85,16 +85,9 @@ pub(crate) const LEGACY_JUDGE_FLOOR: f64 = 0.7;
 /// config would mean a config typo silently re-enables the write surface
 /// WP1.1 closed.
 pub fn agent_legacy_soul_evolution(agent_dir: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(agent_dir.join("agent.toml")) else {
-        return false;
-    };
-    let Ok(value) = raw.parse::<toml::Value>() else {
-        return false;
-    };
-    value
-        .get("evolution")
-        .and_then(|e| e.get("legacy_soul_evolution"))
-        .and_then(|v| v.as_bool())
+    duduclaw_core::agent_toml::load(agent_dir)
+        .evolution
+        .legacy_soul_evolution
         .unwrap_or(false)
 }
 
@@ -1403,6 +1396,52 @@ mod gate_tests {
     #[test]
     fn free_baseline_constant_is_three() {
         assert_eq!(FREE_MAX_GENERATIONS, 3);
+    }
+}
+
+/// R5: `[evolution] legacy_soul_evolution` direction, pinned.
+///
+/// absent / malformed / wrong-typed ⇒ `false` ⇒ AEE. This points the
+/// **opposite** way from the other `[evolution]` gates in this file, and the
+/// asymmetry is deliberate: AEE is the path that cannot write SOUL.md at all,
+/// so falling back to the legacy writer on an unreadable config would let a
+/// config typo silently re-open the write surface WP1.1 closed. Only an
+/// explicit `true` selects the legacy path.
+#[cfg(test)]
+mod legacy_soul_evolution_tests {
+    use super::agent_legacy_soul_evolution;
+
+    fn dir_with(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("agent.toml"), body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn default_direction_legacy_soul_evolution_is_off_unless_explicit() {
+        for body in [
+            "",                                            // empty file
+            "[evolution]\n",                               // section, no key
+            "[evolution]\ngvu_enabled = true\n",           // sibling only
+            "[evolution]\nlegacy_soul_evolution = false\n", // explicit off
+            "[evolution]\nlegacy_soul_evolution = \"true\"\n", // wrong type
+            "[evolution]\nlegacy_soul_evolution = 1\n",     // wrong type
+            "evolution = \"scalar\"\n",                    // wrong-typed section
+            "not toml [[[",                                // malformed file
+        ] {
+            let dir = dir_with(body);
+            assert!(
+                !agent_legacy_soul_evolution(dir.path()),
+                "the SOUL.md write path must stay closed for {body:?}"
+            );
+        }
+
+        // Missing file entirely — same direction.
+        let empty = tempfile::TempDir::new().unwrap();
+        assert!(!agent_legacy_soul_evolution(empty.path()));
+
+        let on = dir_with("[evolution]\nlegacy_soul_evolution = true\n");
+        assert!(agent_legacy_soul_evolution(on.path()));
     }
 }
 
