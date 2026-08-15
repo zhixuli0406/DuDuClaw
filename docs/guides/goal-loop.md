@@ -359,6 +359,8 @@ judge_timeout_secs = 120   # 預設 120
 
 想拿 `duduclaw eval` 當判官的話，直接把 `judge_command` 指向包一層 `duduclaw eval` 的腳本即可，不需要另一個模式。
 
+**子行程會繼承 gateway 的完整環境變數。** `judge_command` 是用平台的 process spawn 直接執行（`tokio::process::Command`），沒有做 `env_clear()` 或任何白名單過濾——你指定的判官程式看得到 gateway 行程當下的整組環境變數，這包含 gateway 用來呼叫 LLM 供應商、通道 API 的那些密鑰。這不是把資料傳給判官（判官吃的輸入只有上面那份 stdin JSON），而是判官程式本身有能力讀取這些環境變數（例如惡意或寫壞的程式去讀 `std::env::vars()`）。這不是漏洞，是這個 seam 目前的設計取捨：**只指向你自己信任、來源清楚的程式**，不要指向第三方或未經審查的執行檔；需要更嚴格隔離（例如判官行程完全看不到 gateway 密鑰）的話，把 `judge_command` 包成一支先自行清空環境變數、再重新注入判官實際需要的少數變數的 wrapper 腳本。
+
 ## 驗收判官紀律
 
 MAV 判官與第一階段評估器的 prompt 都內建幾條紀律，治的是「判官自己製造假駁回，讓正確的工作卡死」這個活測抓到過的失敗模式：
