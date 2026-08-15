@@ -1869,14 +1869,13 @@ fn resolve_tick_field_name(cfg: &crate::prediction::belief::BeliefConfig, subjec
 
 /// True when `id` is a valid agent directory name.
 ///
-/// Allowlist: lowercase alphanumeric + `-` + `_`, 1-64 chars, must not
-/// start with `.`. Blocks traversal characters (`/`, `\`, `.`) and any
-/// Unicode surprise. Mirrors `duduclaw-cli::is_valid_agent_id` semantics.
+/// WP-4I (2026-08): this used to be an independent hand-rolled copy;
+/// semantics were byte-identical to [`duduclaw_core::is_valid_agent_id`]
+/// (allowlist: ASCII alphanumeric of either case + `-` + `_`, 1-64 chars —
+/// blocks every traversal character `/`, `\`, `.` and any Unicode surprise),
+/// so it now delegates there directly instead of re-implementing the rule.
 fn is_safe_agent_id(id: &str) -> bool {
-    if id.is_empty() || id.len() > 64 {
-        return false;
-    }
-    id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    duduclaw_core::is_valid_agent_id(id)
 }
 
 /// True when `name` is a valid skill file stem — same allowlist as agent
@@ -2773,17 +2772,10 @@ mod tests {
         assert!(row_to_event("run.at_risk", "not json").is_some());
     }
 
-    #[test]
-    fn safe_agent_id_rejects_traversal() {
-        assert!(is_safe_agent_id("agnes"));
-        assert!(is_safe_agent_id("agent-01"));
-        assert!(is_safe_agent_id("agent_01"));
-        assert!(!is_safe_agent_id("../etc"));
-        assert!(!is_safe_agent_id("agent/sub"));
-        assert!(!is_safe_agent_id(".hidden"));
-        assert!(!is_safe_agent_id(""));
-        assert!(!is_safe_agent_id(&"a".repeat(100)));
-    }
+    // WP-4I (2026-08): `is_safe_agent_id` now delegates straight to
+    // `duduclaw_core::is_valid_agent_id`, whose own test module
+    // (`agent_id_tests` in duduclaw-core/src/lib.rs) covers empty/traversal/
+    // CJK/over-length/mixed-case/underscore — no need to duplicate here.
 
     #[test]
     fn safe_skill_name_rejects_traversal() {

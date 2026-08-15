@@ -5452,13 +5452,14 @@ async fn cmd_agent_create(
 }
 
 /// Validate agent ID is safe for filesystem paths (no traversal).
+///
+/// WP-4I (2026-08): used to be an independent hand-rolled copy of the
+/// lowercase-slug rule (byte-identical to `duduclaw-gateway::handlers`'s
+/// copy, up to a dead `!id.contains("..")` check — impossible to trigger
+/// once the charset already excludes `.`) — now delegates to
+/// [`duduclaw_core::is_valid_new_agent_id`], the single authoritative copy.
 fn is_valid_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !id.starts_with('-')
-        && !id.ends_with('-')
-        && !id.contains("..")
+    duduclaw_core::is_valid_new_agent_id(id)
 }
 
 /// Normalise an arbitrary source name into a filesystem-safe agent id

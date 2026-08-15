@@ -46,15 +46,12 @@ pub struct FileEntry {
 
 /// True when `id` is a valid agent directory name.
 ///
-/// Allowlist: ASCII alphanumeric + `-` + `_`, 1-64 chars. Blocks every
-/// traversal character (`/`, `\`, `.`) and any Unicode surprise. Mirrors
-/// `autopilot_engine::is_safe_agent_id` / `duduclaw-cli::is_valid_agent_id`.
+/// WP-4I (2026-08): was an independent hand-rolled copy, byte-identical to
+/// [`duduclaw_core::is_valid_agent_id`] (ASCII alphanumeric of either case +
+/// `-` + `_`, 1-64 chars, blocking every traversal character and any Unicode
+/// surprise) — now delegates there directly.
 pub fn is_safe_agent_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    duduclaw_core::is_valid_agent_id(id)
 }
 
 /// True when `name` is a *bare* filename safe to join onto a directory.
@@ -302,6 +299,10 @@ mod tests {
 
     #[test]
     fn agent_id_allowlist() {
+        // Smoke test that the delegation to `duduclaw_core::is_valid_agent_id`
+        // (WP-4I 2026-08) is wired correctly; the exhaustive cases (empty,
+        // traversal, CJK, over-length, mixed-case, underscore) live in that
+        // function's own `agent_id_tests` module in duduclaw-core/src/lib.rs.
         assert!(is_safe_agent_id("assistant"));
         assert!(is_safe_agent_id("agent-1_x"));
         assert!(!is_safe_agent_id(""));
