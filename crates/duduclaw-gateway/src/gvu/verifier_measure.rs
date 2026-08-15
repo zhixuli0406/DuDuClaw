@@ -546,10 +546,21 @@ const FENCE_ONLY_DIMENSIONS: [&str; 2] = [DIM_CASES_VISIBLE, DIM_CASES_HOLDOUT];
 /// condition (AutoDesign arXiv:2608.13560 keeps the two conditions
 /// independent). Dropping the mixed dimension instead of keeping it would have
 /// been a *loosening* in two places — the reported dimension name for a
-/// no-held-out agent would change, and the bootstrap champion (measured with
-/// `include_holdout: false`, `aee::run`) would lose its only comparison
-/// against a candidate's held-out failures, since a dimension present on one
-/// side only is skipped. Extra fences can only ever add rejections.
+/// no-held-out agent would change, and any champion whose stored vector has no
+/// held-out entries would lose its only comparison against a candidate's
+/// held-out failures, since a dimension present on one side only is skipped.
+/// Extra fences can only ever add rejections.
+///
+/// **WP-5A footnote.** That second case used to include *every* freshly
+/// bootstrapped champion (`aee::run` measured the baseline with
+/// `include_holdout: false` while the candidate used `true`). The bootstrap is
+/// now measured with held-out included, so both sides are the same shape from
+/// round one. What remains is the genuinely legacy set: champion rows written
+/// before that fix, and agents whose suite simply has no held-out case. For
+/// those, `cases_holdout` stays absent-on-one-side (skipped) and the mixed
+/// `cases` fence is what still catches a held-out collapse — which is exactly
+/// why it is kept. Such a row self-heals on its next commit, because the
+/// committed candidate's own (held-out-inclusive) vector becomes the champion.
 fn dimensions(v: &MeasureVector) -> BTreeMap<&'static str, f64> {
     let mut m = BTreeMap::new();
     if let Some(c) = v.cases_mean() {

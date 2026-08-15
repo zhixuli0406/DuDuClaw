@@ -299,6 +299,22 @@ where
     // call, same dimensions) — a hand-assembled baseline vector would make
     // dimensions that are not actually comparable look comparable, and the
     // first real candidate would "regress" against numbers nothing produced.
+    //
+    // **WP-5A — `include_holdout: true`, matching the candidate below.**
+    // This measurement used to exclude held-out cases while the candidate
+    // measurement included them, which made the very first comparison of an
+    // agent's life an apples-to-oranges one: the champion's `cases` dimension
+    // was a visible-only mean and the candidate's was a mixed mean, so the
+    // same suite could read as an improvement or a regression purely from the
+    // held-out share — and `cases_holdout` (WP-4E's anti-gaming fence) was
+    // skipped outright, because a dimension present on one side only is not
+    // comparable. Aligning the two costs one extra replay of the held-out
+    // subset, once per agent, with zero LLM calls (this call passes
+    // `judge: None`, and the scorer runs `duduclaw eval --replay --no-judge`);
+    // leaving it misaligned would mean every agent's first evolution round is
+    // permanently unfenced. Held-out case *names* still never reach a prompt:
+    // what leaves this block is a scalar vector, and the inner loop keeps its
+    // own `include_holdout: false` (§3.5).
     let mut champion = live_champion(&champions, agent_id);
     if champion.is_none() {
         let base_contents: Vec<String> = live_contents(&base);
@@ -316,7 +332,9 @@ where
             &ScoreRequest {
                 agent_id: agent_id.to_string(),
                 cases: Vec::new(),
-                include_holdout: false,
+                // Same shape as the candidate's measurement below — see the
+                // WP-5A note above.
+                include_holdout: true,
             },
         )
         .await;
