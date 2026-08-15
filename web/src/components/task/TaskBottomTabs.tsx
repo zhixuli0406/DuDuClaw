@@ -1,12 +1,13 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import {
-  MessagesSquare,
   Activity,
+  MessagesSquare,
   SendHorizonal,
   UserRound,
   Loader2,
   FileDiff,
+  FolderOpen,
   Package,
 } from 'lucide-react';
 import {
@@ -17,28 +18,58 @@ import {
   Empty,
   ActorAvatar,
 } from '@/components/mds';
+import { useAuthStore } from '@/stores/auth-store';
 import { timeAgo } from '@/lib/format';
 import type { ActivityEvent, TaskComment } from '@/lib/api';
 import type { AssigneeOption } from './AssigneePopover';
-import { TaskChangesPanel } from './TaskChangesPanel';
-import { TaskArtifactsPanel } from './TaskArtifactsPanel';
+import { TaskChangesList } from './TaskChangesPanel';
+import { TaskArtifactsList } from './TaskArtifactsPanel';
+import { TaskFilesPanel } from './TaskFilesPanel';
+import { useTaskArtifacts, useTaskChanges } from './useTaskEvidence';
 
 /**
- * TaskBottomTabs — the spec §5.3 式1 footer tabs on the detail page (line variant).
+ * TaskBottomTabs — the I-2a four-tab footer on the detail page
+ * (`DESIGN-dashboard-ux-workbuddy-2026-08.md` §3.2), superseding the earlier
+ * two-tab (對話／活動) and interim four-tab (產物／對話／活動／變更) layouts.
  *
- *  · 對話 (Discussion): a live timeline mixing human comments (L2) with the
- *    task's system activity, sorted by time. The composer posts a comment via
- *    `onAddComment`; comment rows lead with a person marker, activity rows keep
- *    the employee avatar.
- *  · 活動 (Activity): the task-filtered activity stream only.
- *  · 變更 (Changes, WP-F): the file effects the task's rounds actually left
- *    behind, so "接受結果前先做一輪檢查" works on the detail page too, not just
- *    on the Inbox decision card. Lazily mounted — the RPC only fires when the
- *    tab is opened.
- *  · 產物 (Deliverables, I-2b): what the task actually handed over — the one
- *    thing the detail page could never answer (走查 2 卡點 1: 看得到跑了幾輪，
- *    看不到東西在哪). Listed first because it is what the assigner came for;
- *    also lazily mounted.
+ * Tab order matches the design doc's mockup exactly — 產物 first ("what the
+ * assigner came for"), then 檔案, 變更, 過程:
+ *
+ *  · 產物 (Artifacts, I-2b): the curated hand-over — what this task actually
+ *    delivered. Default-selected tab, per "產物置首".
+ *  · 檔案 (Files, I-2a new): the raw `attachments/` inventory for this task,
+ *    grouped 收到的／做出來的／來源不明 — see `TaskFilesPanel`.
+ *  · 變更 (Changes, WP-F/P2-c): the file effects this task's rounds actually
+ *    left behind, shared verbatim with the Inbox approval card's diff tab.
+ *  · 過程 (Process): the design doc merges 「現行「活動」＋「對話」」 into one
+ *    chronological stream — this is that merge, replacing the old separate
+ *    Discussion/Activity tabs (the discussion tab already interleaved the two;
+ *    only the redundant activity-only view is now gone).
+ *
+ * Doc note (I-2a scope decision): the design's ASCII mockup separately
+ * annotates 描述／子任務／雙時鐘／輪次時間軸 (above the tab strip) as
+ * "現有內容不動" (unchanged), while its prose says 過程 also absorbs the
+ * round timeline. Those two parts of the same doc pull in different
+ * directions. This implementation keeps the round-by-round timeline where it
+ * already is, above the tabs in `TaskDetailPage` — unchanged, per the
+ * diagram — because that keeps judge verdicts and rejection feedback
+ * unconditionally visible without an extra click, which strengthens rather
+ * than weakens the "審批動線不許變長" requirement. See the WP-5F report for
+ * the full discrepancy note.
+ *
+ * ## Badge / fetch strategy
+ *
+ * 產物 and 變更 fetch EAGERLY (via `useTaskArtifacts`/`useTaskChanges`, not
+ * gated by tab selection) so their counts can badge the tab before it is ever
+ * opened — "分頁帶計數 badge 幫助使用者判斷要不要點進去" only works if the
+ * count is already known. Both hooks feed the same reusable
+ * `TaskArtifactsList`/`TaskChangesList` pure components the third/fourth-wave
+ * panels already export, so the fetch is lifted without duplicating any
+ * row-rendering logic and without firing the RPC twice. 檔案 has no design-
+ * mandated badge, so it stays lazy (`TaskFilesPanel` fetches only once
+ * opened). Every `TabsPanel` sets `keepMounted` so switching tabs never
+ * unmounts a panel — no re-fetch, no lost scroll position, per I-2a's
+ * "分頁切換保留各分頁捲動位置與載入狀態" requirement.
  */
 
 type TimelineItem =
@@ -60,42 +91,11 @@ function Ago({ ts }: { ts: string }) {
   return <span className="font-mono text-xs tabular-nums text-muted-foreground">{timeAgo(ts)}</span>;
 }
 
-function ActivityTimeline({
-  events,
-  agents,
-}: {
-  events: ReadonlyArray<ActivityEvent>;
-  agents: ReadonlyArray<AssigneeOption>;
-}) {
-  const intl = useIntl();
-  if (events.length === 0) {
-    return <Empty icon={Activity} title={intl.formatMessage({ id: 'tasks.activity.empty' })} />;
-  }
-  return (
-    <ol className="space-y-3 py-2">
-      {events.map((ev) => {
-        const agent = agents.find((a) => a.name === ev.agent_id);
-        return (
-          <li key={ev.id} className="flex items-start gap-2.5">
-            <ActorAvatar actorType="agent" size="md" name={agent?.display_name ?? ev.agent_id} />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm text-foreground">{ev.summary}</p>
-              <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
-                <span className="truncate">{agent?.display_name ?? ev.agent_id}</span>
-                <Ago ts={ev.timestamp} />
-              </div>
-            </div>
-          </li>
-        );
-      })}
-    </ol>
-  );
-}
-
-type BottomTab = 'artifacts' | 'discussion' | 'activity' | 'changes';
+type BottomTab = 'artifacts' | 'files' | 'changes' | 'process';
 
 export function TaskBottomTabs({
   taskId,
+  agentId,
   events,
   comments,
   agents,
@@ -103,8 +103,13 @@ export function TaskBottomTabs({
   currentUserId,
   currentUserName,
 }: {
-  /** Enables the 產物 (I-2b) and 變更 (WP-F) tabs. Omit and neither renders. */
+  /** Enables the 產物 / 檔案 / 變更 tabs. Omit and none of the three render —
+   *  only 過程 (which needs no task id) is left. */
   taskId?: string;
+  /** The task's assignee (`assigned_to`) — resolves the 檔案 tab's
+   *  `/api/files` bucket. Omit/empty and that tab shows an honest
+   *  "no assigned AI staff member" state instead of guessing. */
+  agentId?: string | null;
   events: ReadonlyArray<ActivityEvent>;
   comments: ReadonlyArray<TaskComment>;
   agents: ReadonlyArray<AssigneeOption>;
@@ -113,11 +118,25 @@ export function TaskBottomTabs({
   currentUserName?: string;
 }) {
   const intl = useIntl();
-  const [tab, setTab] = useState<BottomTab>('discussion');
+  const jwt = useAuthStore((s) => s.jwt);
+  // I-2a: 產物 first — "產物置首", the design doc's own framing that this is
+  // what the assigner actually came for.
+  const [tab, setTab] = useState<BottomTab>('artifacts');
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
+  // 檔案 has no badge, so unlike artifacts/changes it stays lazily mounted —
+  // fetched only once the user actually opens it, then kept mounted (see
+  // `keepMounted` below) so a later switch away and back never re-fetches.
+  const [filesVisited, setFilesVisited] = useState(false);
+  useEffect(() => {
+    if (tab === 'files') setFilesVisited(true);
+  }, [tab]);
 
-  // Merge comments + activity into one chronological (oldest → newest) stream.
+  const artifactsState = useTaskArtifacts(taskId);
+  const changesState = useTaskChanges(taskId);
+
+  // Merge comments + activity into one chronological (oldest → newest) stream
+  // — this IS the 過程 tab's content.
   const merged = useMemo<readonly TimelineItem[]>(() => {
     const list: TimelineItem[] = [
       ...comments.map((c) => ({ kind: 'comment' as const, ts: c.created_at, comment: c })),
@@ -153,39 +172,73 @@ export function TaskBottomTabs({
 
   return (
     <Tabs variant="line" value={tab} onValueChange={(v) => setTab(v as BottomTab)}>
-      <TabsList className="border-b border-surface-border">
+      {/* Mobile: many labels in a narrow viewport → horizontal swipe instead
+       *  of wrap/clip. Tabs keep their intrinsic width (`shrink-0`) so the
+       *  strip overflows into a scroll container rather than squeezing. */}
+      <TabsList className="overflow-x-auto border-b border-surface-border">
         {taskId && (
-          <TabsTab value="artifacts">
+          <TabsTab value="artifacts" className="shrink-0">
             <Package />
             {intl.formatMessage({ id: 'tasks.tab.artifacts' })}
+            {count(artifactsState.data?.artifacts?.length ?? 0)}
           </TabsTab>
         )}
-        <TabsTab value="discussion">
-          <MessagesSquare />
-          {intl.formatMessage({ id: 'tasks.tab.discussion' })}
-          {count(comments.length)}
-        </TabsTab>
-        <TabsTab value="activity">
-          <Activity />
-          {intl.formatMessage({ id: 'tasks.tab.activity' })}
-          {count(events.length)}
-        </TabsTab>
         {taskId && (
-          <TabsTab value="changes">
+          <TabsTab value="files" className="shrink-0">
+            <FolderOpen />
+            {intl.formatMessage({ id: 'tasks.tab.files' })}
+          </TabsTab>
+        )}
+        {taskId && (
+          <TabsTab value="changes" className="shrink-0">
             <FileDiff />
             {intl.formatMessage({ id: 'tasks.tab.changes' })}
+            {count(changesState.data?.changes?.length ?? 0)}
           </TabsTab>
         )}
+        <TabsTab value="process" className="shrink-0">
+          <Activity />
+          {intl.formatMessage({ id: 'tasks.tab.process' })}
+          {count(merged.length)}
+        </TabsTab>
       </TabsList>
 
-      {/* I-2b: mounted only while selected, so the RPC is paid for on demand. */}
+      {/* keepMounted on every panel: switching tabs must never unmount one —
+       *  that would both re-fire the eager artifacts/changes fetch (defeats
+       *  the badge-sharing point above) and reset each panel's scroll
+       *  position (I-2a requirement). */}
       {taskId && (
-        <TabsPanel value="artifacts">
-          {tab === 'artifacts' && <TaskArtifactsPanel taskId={taskId} />}
+        <TabsPanel value="artifacts" keepMounted>
+          <TaskArtifactsList
+            artifacts={artifactsState.data?.artifacts ?? []}
+            inferredCount={artifactsState.data?.inferred_count ?? 0}
+            truncated={artifactsState.data?.truncated ?? false}
+            loading={artifactsState.loading}
+            error={artifactsState.error}
+            jwt={jwt}
+          />
         </TabsPanel>
       )}
 
-      <TabsPanel value="discussion">
+      {taskId && (
+        <TabsPanel value="files" keepMounted>
+          {filesVisited && <TaskFilesPanel taskId={taskId} agentId={agentId} />}
+        </TabsPanel>
+      )}
+
+      {taskId && (
+        <TabsPanel value="changes" keepMounted>
+          <TaskChangesList
+            changes={changesState.data?.changes ?? []}
+            distinctPaths={changesState.data?.distinct_paths ?? 0}
+            truncated={changesState.data?.truncated ?? false}
+            loading={changesState.loading}
+            error={changesState.error}
+          />
+        </TabsPanel>
+      )}
+
+      <TabsPanel value="process" keepMounted>
         <div className="space-y-3">
           {merged.length === 0 ? (
             <Empty icon={MessagesSquare} title={intl.formatMessage({ id: 'tasks.discussion.empty' })} />
@@ -253,17 +306,6 @@ export function TaskBottomTabs({
           </div>
         </div>
       </TabsPanel>
-
-      <TabsPanel value="activity">
-        <ActivityTimeline events={events} agents={agents} />
-      </TabsPanel>
-
-      {/* WP-F: mounted only while selected, so the RPC is paid for on demand. */}
-      {taskId && (
-        <TabsPanel value="changes">
-          {tab === 'changes' && <TaskChangesPanel taskId={taskId} />}
-        </TabsPanel>
-      )}
     </Tabs>
   );
 }

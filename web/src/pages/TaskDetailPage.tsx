@@ -591,9 +591,10 @@ export function TaskDetailPage() {
           <span className="font-mono tabular-nums">{timeAgo(task.updated_at)}</span>
         </p>
 
-        {/* Bottom tabs (discussion / activity) */}
+        {/* Bottom tabs — I-2a 產物／檔案／變更／過程 */}
         <TaskBottomTabs
           taskId={task.id}
+          agentId={task.assigned_to}
           events={taskActivities}
           comments={taskComments}
           agents={agents}
