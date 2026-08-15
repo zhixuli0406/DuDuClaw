@@ -21719,6 +21719,42 @@ impl MethodHandler {
                     }
                 }
             }
+            // WP-5D judge seam: `[dispatch] judge` (easy — `review_goal_tasks`
+            // re-reads it per reviewed task, exactly like `two_stage_judge`, so
+            // no driver respawn is needed for the switch to take effect).
+            //
+            // Deliberately NOT settable here: `judge_command` /
+            // `judge_timeout_secs`. Those name an executable, and this RPC is
+            // reachable from the dashboard; keeping them file-only (where
+            // `org_field_guard` already DENIES agent writes to
+            // `<home>/config.toml`) means no dashboard or agent path can point
+            // the judge seam at an arbitrary binary. Value set is enumerated
+            // here and validated again by `JudgeMode::from_config_str` at read
+            // time — an unknown value falls back to `mav`, the strongest
+            // verifier.
+            if let Some(v) = dp.get("judge").and_then(|v| v.as_str()) {
+                match crate::judge_mode::JudgeMode::from_config_str(v) {
+                    Some(mode) => {
+                        let section = table
+                            .entry("dispatch")
+                            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                            .as_table_mut()
+                            .unwrap();
+                        section
+                            .insert("judge".into(), toml::Value::String(mode.as_str().into()));
+                        changes.push(format!(
+                            "dispatch.judge = \"{}\" (hot reload)",
+                            mode.as_str()
+                        ));
+                    }
+                    None => {
+                        return WsFrame::error_response(
+                            "",
+                            "Invalid dispatch.judge. Valid: mav, evaluator_only, external, human_only",
+                        );
+                    }
+                }
+            }
         }
 
         // [memory] graph_embed_seed (easy — re-read on every memory RPC)
@@ -36315,6 +36351,61 @@ mod d6_curation_tests {
         assert!(
             !home.path().join("config.toml").exists(),
             "no partial write on validation failure"
+        );
+    }
+
+    /// WP-5D judge seam: `[dispatch] judge` accepts exactly the four
+    /// enumerated modes and persists the canonical token
+    /// `JudgeMode::from_home` reads back. Two hard boundaries are asserted
+    /// here because they are the seam's security posture:
+    /// - an unknown value is REJECTED at write time (the read path
+    ///   additionally falls back to `mav`, so both layers fail safe);
+    /// - `judge_command` / `judge_timeout_secs` are NOT settable through this
+    ///   RPC at all — they name an executable, and this method is reachable
+    ///   from the dashboard.
+    #[tokio::test]
+    async fn system_update_config_judge_seam_whitelist() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        for mode in ["mav", "evaluator_only", "external", "human_only"] {
+            let f = handler
+                .handle_system_update_config(json!({ "dispatch": { "judge": mode } }))
+                .await;
+            assert!(frame_ok(&f), "{mode} must be accepted");
+            assert_eq!(
+                crate::judge_mode::JudgeMode::from_home(Some(home.path())),
+                crate::judge_mode::JudgeMode::from_config_str(mode).unwrap(),
+                "{mode} must round-trip through config.toml"
+            );
+        }
+
+        // Unknown value → rejected, and the last good value survives.
+        let bad = handler
+            .handle_system_update_config(json!({ "dispatch": { "judge": "eval_backed" } }))
+            .await;
+        assert!(!frame_ok(&bad), "unknown judge mode must be rejected");
+        assert_eq!(
+            crate::judge_mode::JudgeMode::from_home(Some(home.path())),
+            crate::judge_mode::JudgeMode::HumanOnly
+        );
+
+        // The command is operator-only: this RPC must never write it (the key
+        // is simply not in the `[dispatch]` whitelist, so the payload carries
+        // no recognized change at all).
+        let _ = handler
+            .handle_system_update_config(json!({
+                "dispatch": { "judge_command": ["/bin/sh", "-c", "echo pwned"] }
+            }))
+            .await;
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(
+            !raw.contains("judge_command"),
+            "judge_command must never be settable over RPC: {raw}"
+        );
+        assert_eq!(
+            crate::judge_mode::ExternalJudgeConfig::from_home(Some(home.path())),
+            None
         );
     }
 

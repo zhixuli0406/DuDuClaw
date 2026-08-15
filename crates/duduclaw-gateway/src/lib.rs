@@ -344,6 +344,11 @@ pub mod goal_tool_streak;
 // ── D4: pluggable dispatch policy (agent selection = data) + LLMCompiler-style
 //        goal decomposition (planner → dependency DAG) ──
 pub mod dispatch_policy;
+// ── WP-5D: the acceptance judge as a REAL seam ("everything is a plugin"
+//        design §2 row 8 / §6-P1) — `[dispatch] judge` selects
+//        mav | evaluator_only | external | human_only; every failure path
+//        falls back to `mav`, the strongest verifier ──
+pub mod judge_mode;
 // ── D5: semi-automatic topology evolution (edge optimization, human-gated) ──
 pub mod topology_evolution;
 pub mod goal_plan;
