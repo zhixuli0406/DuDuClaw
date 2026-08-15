@@ -69,6 +69,7 @@ pub use snapshot::{PendingFailureNote, PlaybookSnapshot};
 
 use serde::Serialize;
 
+use crate::gvu::knob_snapshot::KnobSnapshot;
 use crate::gvu::verifier_measure::CommitVerdict;
 
 /// §3.2.4 — one AEE round's audit record.
@@ -100,6 +101,15 @@ pub struct AeeRoundRecord {
     /// Degradation flags — an absent eval dimension must be visible in the
     /// audit trail, not inferred from a missing field.
     pub case_dimension_available: bool,
+    /// WP-6A / A2 (`commercial/docs/DESIGN-evolution-harness-knobs-2026-08.md`
+    /// §7.2-A2) — the harness-knob values in effect for this round. Purely
+    /// observational (see [`crate::gvu::knob_snapshot`]): never read back by
+    /// any decision in this loop, only carried into telemetry so a future
+    /// retrospective read has "what happened" and "under which settings" in
+    /// the same row. `None` only for rounds recorded via [`Self::skipped`]
+    /// before any per-agent context was resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knobs: Option<KnobSnapshot>,
 }
 
 impl AeeRoundRecord {
@@ -131,6 +141,9 @@ impl AeeRoundRecord {
             skipped: Some(reason.as_str().to_string()),
             exit: "skipped".to_string(),
             case_dimension_available: false,
+            // Skipped rounds return before `agent_dir`/`home_dir` are
+            // resolved into a snapshot — see the field doc above.
+            knobs: None,
         }
     }
 

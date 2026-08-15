@@ -133,7 +133,11 @@ pub enum AuditEventType {
     /// `metadata`: `crate::gvu::aee::AeeRoundRecord` — `{"intent", "strategy",
     /// "trigger", "round_seq", "inner_rounds", "llm_calls", "deltas_proposed",
     /// "deltas_applied", "gate_rejections", "verdict", "skipped", "exit",
-    /// "case_dimension_available"}`.
+    /// "case_dimension_available", "knobs"}`. `knobs` (WP-6A / A2,
+    /// `commercial/docs/DESIGN-evolution-harness-knobs-2026-08.md` §7.2-A2)
+    /// is a read-only snapshot of the harness knobs in effect for the round
+    /// (`crate::gvu::knob_snapshot::KnobSnapshot`) — absent on rounds
+    /// recorded before per-agent context was resolved.
     ///
     /// Recording `intent` is the point: without it, a strategy-mix
     /// misconfiguration is invisible in hindsight — the exact failure mode
