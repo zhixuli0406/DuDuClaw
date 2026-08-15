@@ -221,8 +221,23 @@ impl ChatRequest {
                 };
             }
         }
+        total + self.estimate_tool_schema_tokens()
+    }
+
+    /// The tool-schema half of [`Self::estimate_input_tokens`], on its own.
+    ///
+    /// Same formula, single definition — [`Self::estimate_input_tokens`] calls
+    /// this, so the two can never drift. Exists for the Code Mode Phase 0
+    /// measurement gate (`duduclaw-gateway::tool_loop_probe`), which needs the
+    /// numerator "how much of a request is just tool descriptions" separately
+    /// from the total. Same caveat as the parent: a CJK-aware heuristic, not a
+    /// provider tokenizer.
+    pub fn estimate_tool_schema_tokens(&self) -> u64 {
+        let mut total = 0u64;
         for tool in &self.tools {
-            total += estimate_tokens(&tool.description) + estimate_tokens(&tool.input_schema.to_string()) + 8;
+            total += estimate_tokens(&tool.description)
+                + estimate_tokens(&tool.input_schema.to_string())
+                + 8;
         }
         total
     }
@@ -373,6 +388,29 @@ mod tests {
         req.messages.push(ChatMessage::user("b".repeat(40)));
         // 400/4 + 40/4 = 110
         assert_eq!(req.estimate_input_tokens(), 110);
+        // No tools ⇒ the schema half contributes nothing.
+        assert_eq!(req.estimate_tool_schema_tokens(), 0);
+    }
+
+    #[test]
+    fn tool_schema_tokens_are_the_tools_only_half_of_the_input_estimate() {
+        let mut req = ChatRequest::new("deepseek/deepseek-v3.2");
+        req.system.push(SystemBlock::uncached("s".repeat(40))); // 10
+        req.messages.push(ChatMessage::user("u".repeat(40))); // 10
+        req.tools.push(ToolDef {
+            name: "memory_search".into(),
+            description: "d".repeat(80), // 20
+            input_schema: serde_json::json!({"a": "bbbb"}),
+        });
+
+        let schema = req.estimate_tool_schema_tokens();
+        // description 20 + serialized schema + the flat 8/tool overhead.
+        assert_eq!(
+            schema,
+            20 + estimate_tokens(&serde_json::json!({"a": "bbbb"}).to_string()) + 8
+        );
+        // Single formula: total − non-tool part == the schema half exactly.
+        assert_eq!(req.estimate_input_tokens(), 10 + 10 + schema);
     }
 
     #[test]
