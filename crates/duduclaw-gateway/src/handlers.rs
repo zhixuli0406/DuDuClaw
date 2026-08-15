@@ -4849,6 +4849,17 @@ impl MethodHandler {
                 let _ = check_agent!(AccessLevel::Viewer);
                 self.handle_agents_status(params).await
             }
+            // ── WP-6F P1: agent presets ("職務組合"), read-only —────────
+            // no switching UI in P1 (design §9); binding is CLI-only via
+            // `duduclaw preset bind`.
+            "presets.list" => {
+                require_manager!();
+                self.handle_presets_list().await
+            }
+            "presets.status" => {
+                let _ = check_agent!(AccessLevel::Viewer);
+                self.handle_presets_status(params).await
+            }
             "agents.create" => {
                 require_admin!();
                 self.handle_agents_create(params).await
@@ -6058,6 +6069,34 @@ impl MethodHandler {
                 self.handle_approvals_decide(params, ctx).await
             }
 
+            // ── Agent Mail (P2-d) — 信箱 ────────────────────
+            // Same gate as the approval centre: mail is real customer
+            // correspondence and confirming a send is a real-world act.
+            "mail.status" => {
+                require_manager!();
+                self.handle_mail_status().await
+            }
+            "mail.list" => {
+                require_manager!();
+                self.handle_mail_list(params).await
+            }
+            "mail.read" => {
+                require_manager!();
+                self.handle_mail_read(params, ctx).await
+            }
+            "mail.archive" => {
+                require_manager!();
+                self.handle_mail_archive(params, ctx).await
+            }
+            "mail.outbox" => {
+                require_manager!();
+                self.handle_mail_outbox(params).await
+            }
+            "mail.decide" => {
+                require_manager!();
+                self.handle_mail_decide(params, ctx).await
+            }
+
             // ── D5 topology evolution: routing overrides + pending reroute proposals ──
             "topology.list" => {
                 require_manager!();
@@ -6436,6 +6475,8 @@ impl MethodHandler {
                 "tools": [
                     { "name": "agents.list", "description": "List all registered agents" },
                     { "name": "agents.status", "description": "Get agent status" },
+                    { "name": "presets.list", "description": "WP-6F: list agent presets (\"職務組合\") under ~/.duduclaw/presets/" },
+                    { "name": "presets.status", "description": "WP-6F: one agent's current preset binding + live resolution outcome (read-only, P1)" },
                     { "name": "agents.create", "description": "Create a new agent" },
                     { "name": "agents.delegate", "description": "Delegate a task" },
                     { "name": "agents.pause", "description": "Pause an agent" },
@@ -6596,6 +6637,58 @@ impl MethodHandler {
             }
             None => WsFrame::error_response("", &format!("Agent not found: {agent_id}")),
         }
+    }
+
+    /// WP-6F P1 — `presets.list`: every preset under `~/.duduclaw/presets/`,
+    /// read-only (design §9 P1 scope excludes any switching UI). A preset
+    /// that fails to parse is still listed (with an `error` field) rather
+    /// than silently dropped, matching `duduclaw preset list`'s CLI twin.
+    async fn handle_presets_list(&self) -> WsFrame {
+        let ids = duduclaw_core::preset::list_presets(&self.home_dir);
+        let items: Vec<Value> = ids
+            .into_iter()
+            .map(|id| match duduclaw_core::preset::load_preset(&self.home_dir, &id) {
+                Ok(p) => json!({
+                    "id": id,
+                    "version": p.meta.version,
+                    "label": p.meta.label,
+                    "description": p.meta.description,
+                }),
+                Err(e) => json!({ "id": id, "error": e.to_string() }),
+            })
+            .collect();
+        WsFrame::ok_response("", json!({ "presets": items }))
+    }
+
+    /// WP-6F P1 — `presets.status`: one agent's current preset binding +
+    /// live resolution outcome + which fields its own `agent.toml` overrides
+    /// (design §1 R1.4 "已覆寫"). Read-only — binding writes are CLI-only in
+    /// P1 (`duduclaw preset bind`), see `preset_cmd` module docs.
+    async fn handle_presets_status(&self, params: Value) -> WsFrame {
+        let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let reg = self.registry.read().await;
+        let Some(agent) = reg.get(agent_id) else {
+            return WsFrame::error_response("", &format!("Agent not found: {agent_id}"));
+        };
+        let resolution = match &agent.preset_resolution {
+            duduclaw_core::preset::PresetResolution::Unbound => json!({ "state": "unbound" }),
+            duduclaw_core::preset::PresetResolution::Applied {
+                preset_id, version, label, changed_fields, ..
+            } => json!({
+                "state": "applied",
+                "preset_id": preset_id,
+                "version": version,
+                "label": label,
+                "changed_fields": changed_fields,
+            }),
+            duduclaw_core::preset::PresetResolution::Unresolved { preset_id, version, reason } => json!({
+                "state": "unresolved",
+                "preset_id": preset_id,
+                "version": version,
+                "reason": reason,
+            }),
+        };
+        WsFrame::ok_response("", json!({ "agent_id": agent_id, "resolution": resolution }))
     }
 
     /// Cloud-tier resource cap. Returns `Some(message)` when the active tier
@@ -22641,49 +22734,16 @@ impl MethodHandler {
         // Encrypt the key
         let encrypted = crate::config_crypto::encrypt_value(key, &self.home_dir);
 
-        let mut account = toml::map::Map::new();
-        account.insert("id".into(), toml::Value::String(id.into()));
-        account.insert("type".into(), toml::Value::String(auth_type.into()));
-        account.insert(
-            "monthly_budget_cents".into(),
-            toml::Value::Integer(budget_cents as i64),
-        );
-        account.insert("priority".into(), toml::Value::Integer(priority as i64));
-        // WP-H1 P1 — write ONE of the two, never both.
-        //
-        // This line used to store the plaintext *and* the ciphertext side by
-        // side, which is precisely how the 2026-08-15 incident got made
-        // (`DESIGN-credentials-doctrine-2026-08.md` §1.5): the read paths only
-        // ever consume `<field>_enc`, so the plaintext was inert — and being
-        // inert, nothing ever cleaned it up, while `system.config`'s
-        // array-of-tables masking gap let it be read straight back out. The
-        // channel write path has always done the right thing here (it *removes*
-        // the plaintext key after encrypting, `handlers.rs` channel closure);
-        // this brings `[[accounts]]` into line.
-        //
-        // Plaintext is written only when encryption is impossible (no writable
-        // keyfile) — refusing outright would leave an operator unable to add an
-        // account at all, so it degrades loudly instead.
-        let key_field = if auth_type == "oauth" {
-            "oauth_token"
-        } else {
-            "anthropic_api_key"
-        };
-        match &encrypted {
-            Some(enc) => {
-                account.insert(format!("{key_field}_enc"), toml::Value::String(enc.clone()));
-            }
-            None => {
-                warn!(
-                    id,
-                    field = key_field,
-                    "could not encrypt account credential (no writable keyfile) — storing it as \
-                     plaintext in config.toml; run `duduclaw doctor` after fixing the keyfile"
-                );
-                account.insert(key_field.into(), toml::Value::String(key.into()));
-            }
+        let entry = build_account_entry(id, auth_type, budget_cents, priority, key, encrypted.as_deref());
+        if entry.plaintext_fallback {
+            warn!(
+                id,
+                field = entry.key_field,
+                "could not encrypt account credential (no writable keyfile) — storing it as \
+                 plaintext in config.toml; run `duduclaw doctor` after fixing the keyfile"
+            );
         }
-        arr.push(toml::Value::Table(account));
+        arr.push(toml::Value::Table(entry.table));
 
         // Atomic write
         let tmp_path = config_path.with_extension("toml.tmp");
@@ -27288,6 +27348,82 @@ impl MethodHandler {
 
 // ── Standalone helpers ────────────────────────────────────────
 
+/// The `[[accounts]]` TOML entry `handle_accounts_add` is about to push, plus
+/// whether the credential had to fall back to plaintext.
+struct NewAccountEntry {
+    table: toml::map::Map<String, toml::Value>,
+    /// `true` when `encrypted` was `None` and the credential was stored in
+    /// plaintext — the caller uses this to decide whether to log the
+    /// "no writable keyfile" warning (kept out of this pure function so it
+    /// stays free of side effects and easy to unit test).
+    plaintext_fallback: bool,
+    /// The TOML field name the credential was written under (`oauth_token`
+    /// for `type = "oauth"`, `anthropic_api_key` otherwise) — echoed back so
+    /// the caller's warning names the right field without recomputing it.
+    key_field: &'static str,
+}
+
+/// Build one `[[accounts]]` entry (WP-6C — extracted from `handle_accounts_add`
+/// so the encrypt-vs-plaintext decision is unit-testable without a full
+/// `MethodHandler` fixture).
+///
+/// WP-H1 P1 — write ONE of `<field>_enc` / `<field>`, never both.
+///
+/// This used to store the plaintext *and* the ciphertext side by side, which
+/// is precisely how the 2026-08-15 incident got made
+/// (`DESIGN-credentials-doctrine-2026-08.md` §1.5): the read paths only ever
+/// consume `<field>_enc`, so the plaintext was inert — and being inert,
+/// nothing ever cleaned it up, while `system.config`'s array-of-tables
+/// masking gap let it be read straight back out. The channel write path has
+/// always done the right thing here (it *removes* the plaintext key after
+/// encrypting, `handlers.rs` channel closure); this brings `[[accounts]]`
+/// into line.
+///
+/// Plaintext is written only when encryption is impossible (no writable
+/// keyfile, i.e. `encrypted` is `None`) — refusing outright would leave an
+/// operator unable to add an account at all, so it degrades loudly instead
+/// (via [`NewAccountEntry::plaintext_fallback`]).
+fn build_account_entry(
+    id: &str,
+    auth_type: &str,
+    budget_cents: u64,
+    priority: u64,
+    key: &str,
+    encrypted: Option<&str>,
+) -> NewAccountEntry {
+    let mut account = toml::map::Map::new();
+    account.insert("id".into(), toml::Value::String(id.into()));
+    account.insert("type".into(), toml::Value::String(auth_type.into()));
+    account.insert(
+        "monthly_budget_cents".into(),
+        toml::Value::Integer(budget_cents as i64),
+    );
+    account.insert("priority".into(), toml::Value::Integer(priority as i64));
+
+    let key_field = if auth_type == "oauth" {
+        "oauth_token"
+    } else {
+        "anthropic_api_key"
+    };
+
+    let plaintext_fallback = match encrypted {
+        Some(enc) => {
+            account.insert(format!("{key_field}_enc"), toml::Value::String(enc.to_string()));
+            false
+        }
+        None => {
+            account.insert(key_field.into(), toml::Value::String(key.into()));
+            true
+        }
+    };
+
+    NewAccountEntry {
+        table: account,
+        plaintext_fallback,
+        key_field,
+    }
+}
+
 /// Platform allowlist for the migrate RPCs. Only the three importer targets
 /// the CLI understands are accepted; anything else is rejected before we ever
 /// spawn a subprocess (fail-closed).
@@ -30112,6 +30248,295 @@ impl MethodHandler {
     /// Board-only kinds (WP17 StrategicPlan/AgentHire) require admin — the
     /// dashboard's fail-closed stand-in for board rights until a board-user model
     /// lands. Records `dashboard:<user_id>` as the decider for audit.
+    // ── Agent Mail (P2-d) — 信箱 RPC ────────────────────────────────────
+    //
+    // Six read/act RPCs over `crate::mail`. The one thing worth calling out:
+    // `mail.decide` does NOT own a decision store. It looks the draft's
+    // `approval_id` up in the same `ApprovalBroker` the approval centre uses
+    // and calls the same `decide`, so a mail confirmed from the 信箱 page, the
+    // approval inbox, or the buttons pushed to a chat channel all land in one
+    // auditable row — and the actual transmission still only ever happens in
+    // `mail_worker::settle_outbox`, never here.
+
+    async fn handle_mail_status(&self) -> WsFrame {
+        let home = self.home_dir.clone();
+        let payload = tokio::task::spawn_blocking(move || {
+            let cfg = crate::mail::MailConfig::from_home(&home);
+            let smtp = crate::mail_worker::resolve_smtp_config(&home);
+            json!({
+                "enabled": cfg.enabled,
+                "auto_trigger": cfg.auto_trigger,
+                "gmail_enabled": cfg.gmail_enabled,
+                "dropfolder_enabled": cfg.dropfolder_enabled,
+                "poll_interval_secs": cfg.poll_interval_secs,
+                "default_agent": cfg.default_agent,
+                // Never the credentials — only whether a send is possible at
+                // all, so the page can say "approved mail cannot go out yet".
+                "smtp_configured": smtp.is_some(),
+                "sender_allowlist_count": cfg.allowed_senders.len(),
+                "recipient_allowlist_count": cfg.allowed_recipients.len(),
+                "inbound_dir": crate::mail::inbound_dir(&home).to_string_lossy(),
+            })
+        })
+        .await;
+        match payload {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &format!("mail status: {e}")),
+        }
+    }
+
+    async fn handle_mail_list(&self, params: Value) -> WsFrame {
+        let agent = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(a) = agent.as_deref()
+            && !is_valid_agent_id(a)
+        {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        let include_archived = params
+            .get("include_archived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(crate::mail::DEFAULT_QUERY_LIMIT);
+
+        let home = self.home_dir.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            crate::mail::list_inbox(&home, agent.as_deref(), include_archived, limit)
+        })
+        .await;
+        match rows {
+            Ok(items) => {
+                // The list carries a snippet, not the body: a long thread must
+                // not be paid for on every page render, and the full text is
+                // one `mail.read` away.
+                let messages: Vec<Value> = items
+                    .iter()
+                    .map(|m| {
+                        json!({
+                            "mail_id": m.mail_id,
+                            "agent_id": m.agent_id,
+                            "from": m.from,
+                            "subject": m.subject,
+                            "snippet": duduclaw_core::truncate_chars(&m.body, 160),
+                            "received_at": m.received_at,
+                            "source": m.source,
+                            "read": m.read,
+                            "archived": m.archived,
+                            "handled": m.triggered,
+                            "flagged": m.suspicious,
+                            "risk_score": m.risk_score,
+                        })
+                    })
+                    .collect();
+                WsFrame::ok_response("", json!({ "count": messages.len(), "messages": messages }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("mail list: {e}")),
+        }
+    }
+
+    async fn handle_mail_read(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(mail_id) = params
+            .get("mail_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return WsFrame::error_response("", "mail_id is required");
+        };
+        let home = self.home_dir.clone();
+        let by = format!("dashboard:{}", ctx.user_id);
+        let result = tokio::task::spawn_blocking(move || {
+            let item = crate::mail::get_inbox_item(&home, &mail_id)?;
+            crate::mail::mark_read(&home, &mail_id, &by);
+            Some(item)
+        })
+        .await;
+        match result {
+            Ok(Some(m)) => WsFrame::ok_response(
+                "",
+                json!({
+                    "mail_id": m.mail_id,
+                    "agent_id": m.agent_id,
+                    "from": m.from,
+                    "subject": m.subject,
+                    "body": m.body,
+                    "received_at": m.received_at,
+                    "source": m.source,
+                    "read": true,
+                    "archived": m.archived,
+                    "handled": m.triggered,
+                    "flagged": m.suspicious,
+                    "risk_score": m.risk_score,
+                }),
+            ),
+            Ok(None) => WsFrame::error_response("", "mail not found"),
+            Err(e) => WsFrame::error_response("", &format!("mail read: {e}")),
+        }
+    }
+
+    async fn handle_mail_archive(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(mail_id) = params
+            .get("mail_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return WsFrame::error_response("", "mail_id is required");
+        };
+        let home = self.home_dir.clone();
+        let by = format!("dashboard:{}", ctx.user_id);
+        let ok = tokio::task::spawn_blocking(move || crate::mail::mark_archived(&home, &mail_id, &by))
+            .await;
+        match ok {
+            Ok(true) => WsFrame::ok_response("", json!({ "ok": true })),
+            Ok(false) => WsFrame::error_response("", "mail not found"),
+            Err(e) => WsFrame::error_response("", &format!("mail archive: {e}")),
+        }
+    }
+
+    async fn handle_mail_outbox(&self, params: Value) -> WsFrame {
+        let agent = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(a) = agent.as_deref()
+            && !is_valid_agent_id(a)
+        {
+            return WsFrame::error_response("", "Invalid agent_id format");
+        }
+        // An unrecognised status filter shows everything rather than silently
+        // showing nothing — an empty list must mean "no such mail", never
+        // "your filter was a typo".
+        let status = match params.get("status").and_then(|v| v.as_str()) {
+            Some("pending") => Some(crate::mail::OutboxStatus::Pending),
+            Some("sent") => Some(crate::mail::OutboxStatus::Sent),
+            Some("rejected") => Some(crate::mail::OutboxStatus::Rejected),
+            Some("failed") => Some(crate::mail::OutboxStatus::Failed),
+            _ => None,
+        };
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(crate::mail::DEFAULT_QUERY_LIMIT);
+
+        let home = self.home_dir.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            crate::mail::list_outbox(&home, agent.as_deref(), status, limit)
+        })
+        .await;
+        match rows {
+            Ok(items) => {
+                let drafts: Vec<Value> = items
+                    .iter()
+                    .map(|m| {
+                        json!({
+                            "mail_id": m.mail_id,
+                            "agent_id": m.agent_id,
+                            "to": m.to,
+                            "subject": m.subject,
+                            "body": m.body,
+                            "created_at": m.created_at,
+                            "status": m.status.as_str(),
+                            "approval_id": m.approval_id,
+                            "in_reply_to": m.in_reply_to,
+                            "note": m.note,
+                            "settled_at": m.settled_at,
+                        })
+                    })
+                    .collect();
+                WsFrame::ok_response("", json!({ "count": drafts.len(), "drafts": drafts }))
+            }
+            Err(e) => WsFrame::error_response("", &format!("mail outbox: {e}")),
+        }
+    }
+
+    async fn handle_mail_decide(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(mail_id) = params
+            .get("mail_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return WsFrame::error_response("", "mail_id is required");
+        };
+        let Some(approve) = params.get("approve").and_then(|v| v.as_bool()) else {
+            // Deliberately not defaulted: "approve" is a send decision, and a
+            // missing field must never read as either answer.
+            return WsFrame::error_response("", "approve (true/false) is required");
+        };
+
+        let home = self.home_dir.clone();
+        let lookup_id = mail_id.clone();
+        let draft = tokio::task::spawn_blocking(move || {
+            crate::mail::list_outbox(&home, None, None, crate::mail::MAX_QUERY_LIMIT)
+                .into_iter()
+                .find(|d| d.mail_id == lookup_id)
+        })
+        .await;
+        let draft = match draft {
+            Ok(Some(d)) => d,
+            Ok(None) => return WsFrame::error_response("", "draft not found"),
+            Err(e) => return WsFrame::error_response("", &format!("mail decide: {e}")),
+        };
+        if draft.status != crate::mail::OutboxStatus::Pending {
+            return WsFrame::error_response(
+                "",
+                &format!("這封信已經是 {} 狀態，不能再改決定。", draft.status.as_str()),
+            );
+        }
+        if draft.approval_id.is_empty() {
+            return WsFrame::error_response("", "這封草稿沒有對應的審核紀錄，無法確認。");
+        }
+
+        let broker = match crate::approval::ApprovalBroker::open(&self.home_dir) {
+            Ok(b) => b,
+            Err(e) => return WsFrame::error_response("", &format!("open approvals: {e}")),
+        };
+        let approval_id = crate::approval::ApprovalId::from(draft.approval_id.clone());
+        // Confirm the row really is the mail approval it claims to be before
+        // deciding it — otherwise a crafted mail_id could be used to decide an
+        // unrelated approval through this narrower gate.
+        match broker.get(&approval_id).await {
+            Ok(Some(rec)) if rec.action_kind == crate::mail::OUTBOUND_ACTION_KIND => {}
+            Ok(Some(_)) => {
+                return WsFrame::error_response("", "審核紀錄與這封信不相符，已拒絕操作。")
+            }
+            Ok(None) => return WsFrame::error_response("", "找不到對應的審核紀錄。"),
+            Err(e) => return WsFrame::error_response("", &format!("approval lookup: {e}")),
+        }
+
+        let decided_by = format!("dashboard:{}", ctx.user_id);
+        if let Err(e) = broker.decide(&approval_id, approve, &decided_by).await {
+            return WsFrame::error_response("", &format!("decide: {e}"));
+        }
+        // The worker performs (or refuses) the transmission on its next tick.
+        // Saying "已寄出" here would be exactly the kind of self-reported
+        // completion this project treats as a bug.
+        WsFrame::ok_response(
+            "",
+            json!({
+                "ok": true,
+                "mail_id": mail_id,
+                "approved": approve,
+                "state": if approve { "approved_queued" } else { "rejected" },
+            }),
+        )
+    }
+
     async fn handle_approvals_decide(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let id = match params.get("id").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -36647,6 +37072,152 @@ mod d6_curation_tests {
         assert!(data["unlocked"].is_boolean());
     }
 
+    // ── Agent Mail (P2-d) ────────────────────────────────────────────────
+
+    /// Every `mail.*` RPC is manager-gated (approval-centre tier).
+    #[tokio::test]
+    async fn mail_rpcs_deny_a_plain_employee() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext {
+            user_id: "u1".to_string(),
+            email: "u1@test.local".to_string(),
+            role: UserRole::Employee,
+            agent_access: std::collections::HashMap::new(),
+        };
+        for method in ["mail.status", "mail.list", "mail.read", "mail.archive", "mail.outbox", "mail.decide"] {
+            let frame = handler.handle(method, json!({}), &ctx).await;
+            assert!(!frame_ok(&frame), "{method} must deny a plain employee: {frame:?}");
+        }
+    }
+
+    /// A fresh home has no `[mail]` section: status reports the feature off
+    /// and the lists come back empty — never an error, never a fabricated row.
+    #[tokio::test]
+    async fn mail_status_and_lists_are_fail_safe_on_a_fresh_home() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        let frame = handler.handle("mail.status", json!({}), &ctx).await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        let data = frame_data(&frame);
+        assert_eq!(data["enabled"], json!(false));
+        assert_eq!(data["auto_trigger"], json!(false), "到達即觸發 defaults off");
+        assert_eq!(data["smtp_configured"], json!(false));
+
+        for (method, key) in [("mail.list", "messages"), ("mail.outbox", "drafts")] {
+            let frame = handler.handle(method, json!({}), &ctx).await;
+            assert!(frame_ok(&frame), "{method}: {frame:?}");
+            assert_eq!(frame_data(&frame)[key].as_array().map(Vec::len), Some(0));
+        }
+    }
+
+    /// `approve` is a send decision: a missing flag must read as neither
+    /// answer, and an unknown draft must not be invented.
+    #[tokio::test]
+    async fn mail_decide_requires_an_explicit_flag_and_a_real_draft() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        let no_flag = handler
+            .handle("mail.decide", json!({ "mail_id": "out-1" }), &ctx)
+            .await;
+        assert!(!frame_ok(&no_flag), "missing approve must be refused");
+
+        let no_draft = handler
+            .handle("mail.decide", json!({ "mail_id": "out-1", "approve": true }), &ctx)
+            .await;
+        assert!(!frame_ok(&no_draft), "unknown draft must be refused");
+    }
+
+    /// `mail.decide` is a narrower gate onto the shared approval store. It must
+    /// only ever decide a row whose `action_kind` really is the mail kind —
+    /// otherwise a crafted draft could be used to approve something else.
+    #[tokio::test]
+    async fn mail_decide_refuses_an_approval_of_another_kind() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let foreign = broker
+            .request("sales", "mcp_install", "install something", json!({}), 3600)
+            .await
+            .unwrap();
+        let cfg = crate::mail::MailConfig::default();
+        crate::mail::record_outbox_draft(
+            home.path(),
+            &cfg,
+            "sales",
+            "client@example.com",
+            "s",
+            "b",
+            foreign.as_str(),
+            None,
+        );
+
+        let frame = handler
+            .handle(
+                "mail.decide",
+                json!({ "mail_id": crate::mail::list_outbox(home.path(), None, None, 10)[0].mail_id, "approve": true }),
+                &ctx,
+            )
+            .await;
+        assert!(!frame_ok(&frame), "cross-kind decision must be refused: {frame:?}");
+        // And the foreign approval is still pending — untouched.
+        let rec = broker.get(&foreign).await.unwrap().unwrap();
+        assert_eq!(rec.status, crate::approval::ApprovalStatus::Pending);
+    }
+
+    /// A confirmed draft is reported as queued, never as sent: the actual
+    /// transmission happens later in `mail_worker::settle_outbox`.
+    #[tokio::test]
+    async fn mail_decide_reports_queued_not_sent_and_refuses_a_second_decision() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+
+        let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+        let approval = broker
+            .request("sales", crate::mail::OUTBOUND_ACTION_KIND, "寄信", json!({}), 3600)
+            .await
+            .unwrap();
+        let cfg = crate::mail::MailConfig::default();
+        let mail_id = crate::mail::record_outbox_draft(
+            home.path(),
+            &cfg,
+            "sales",
+            "client@example.com",
+            "報價回覆",
+            "附上報價單。",
+            approval.as_str(),
+            None,
+        );
+
+        let frame = handler
+            .handle("mail.decide", json!({ "mail_id": mail_id, "approve": true }), &ctx)
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert_eq!(frame_data(&frame)["state"], "approved_queued");
+
+        // The draft is still `pending` in the ledger — only the worker moves it.
+        assert_eq!(
+            crate::mail::list_outbox(home.path(), None, None, 10)[0].status,
+            crate::mail::OutboxStatus::Pending
+        );
+        // The decision itself is terminal in the broker, so a flip is refused.
+        assert_eq!(
+            broker.get(&approval).await.unwrap().unwrap().status,
+            crate::approval::ApprovalStatus::Approved
+        );
+        let again = handler
+            .handle("mail.decide", json!({ "mail_id": mail_id, "approve": false }), &ctx)
+            .await;
+        assert!(!frame_ok(&again), "a decided approval must not be flippable");
+    }
+
     /// `experts.install_builtin` rejects unsafe industry slugs BEFORE license
     /// checks or any subprocess spawn (path-traversal fence).
     #[tokio::test]
@@ -37247,9 +37818,15 @@ mod channels_add_enc_only_tests {
         );
         let enc = tg["bot_token_enc"].as_str().unwrap();
         assert_eq!(
-            crate::config_crypto::resolve_agent_token(&Some(enc.to_string()), "", home.path())
-                .map(|s| s.expose_owned())
-                .unwrap_or_default(),
+            crate::config_crypto::resolve_agent_token(
+                &Some(enc.to_string()),
+                "",
+                home.path(),
+                &duduclaw_security::secret_manager::SecretManagerConfig::default(),
+            )
+            .await
+            .map(|s| s.expose_owned())
+            .unwrap_or_default(),
             tg_token,
             "enc-only roundtrip must recover the original token"
         );
@@ -37495,6 +38072,7 @@ mod channels_test_rpc_tests {
             skills: vec![],
             contract: Default::default(),
             dir: std::path::PathBuf::new(),
+            preset_resolution: Default::default(),
         };
         assert!(agent_has_own_channel_token(&agent, "discord"));
         assert!(!agent_has_own_channel_token(&agent, "telegram"));
@@ -41435,5 +42013,181 @@ mod wp_h1_mask_sensitive_fields_tests {
         let before = table.clone();
         MethodHandler::mask_keyed_secret_tables(&mut table);
         assert_eq!(table, before);
+    }
+}
+
+/// WP-6C — regression coverage for `handle_accounts_add`'s WP-4A behaviour
+/// change (encrypt succeeds ⇒ write only `_enc`; encrypt fails ⇒ degrade to
+/// plaintext + warn), deferred at the time because it needed a full
+/// `MethodHandler` fixture. Per WP-6C's stated priority, the write-shape
+/// decision is extracted into the pure [`build_account_entry`] and covered
+/// with fast no-I/O unit tests first; one lightweight `MethodHandler`-based
+/// integration test (the fixture turned out cheap — `MethodHandler::new` is
+/// already the standard pattern used throughout this file) covers the
+/// remaining end-to-end property that a pure function can't: an existing
+/// account surviving a second `accounts.add` untouched.
+#[cfg(test)]
+mod accounts_add_tests {
+    use super::*;
+
+    // ── build_account_entry: pure, no I/O ───────────────────────
+
+    #[test]
+    fn encryption_success_writes_only_the_enc_field() {
+        let entry = build_account_entry("acct-1", "api_key", 5000, 1, "sk-plain-key", Some("cipher-blob"));
+        assert!(!entry.plaintext_fallback);
+        assert_eq!(entry.key_field, "anthropic_api_key");
+        assert_eq!(
+            entry.table.get("anthropic_api_key_enc").and_then(|v| v.as_str()),
+            Some("cipher-blob")
+        );
+        assert!(
+            entry.table.get("anthropic_api_key").is_none(),
+            "plaintext twin must not be written when encryption succeeded: {:?}",
+            entry.table
+        );
+        assert_eq!(entry.table.get("id").and_then(|v| v.as_str()), Some("acct-1"));
+        assert_eq!(
+            entry.table.get("monthly_budget_cents").and_then(|v| v.as_integer()),
+            Some(5000)
+        );
+        assert_eq!(entry.table.get("priority").and_then(|v| v.as_integer()), Some(1));
+    }
+
+    #[test]
+    fn encryption_failure_falls_back_to_plaintext_and_flags_it() {
+        let entry = build_account_entry("acct-2", "api_key", 5000, 1, "sk-plain-key", None);
+        assert!(entry.plaintext_fallback, "caller must be told to warn");
+        assert_eq!(entry.key_field, "anthropic_api_key");
+        assert_eq!(
+            entry.table.get("anthropic_api_key").and_then(|v| v.as_str()),
+            Some("sk-plain-key")
+        );
+        assert!(
+            entry.table.get("anthropic_api_key_enc").is_none(),
+            "no _enc twin when encryption never ran: {:?}",
+            entry.table
+        );
+    }
+
+    #[test]
+    fn oauth_type_uses_the_oauth_token_field_name() {
+        let ok = build_account_entry("acct-oauth", "oauth", 0, 1, "oauth-secret", Some("cipher"));
+        assert_eq!(ok.key_field, "oauth_token");
+        assert_eq!(
+            ok.table.get("oauth_token_enc").and_then(|v| v.as_str()),
+            Some("cipher")
+        );
+        assert!(ok.table.get("anthropic_api_key_enc").is_none());
+
+        let fallback = build_account_entry("acct-oauth-2", "oauth", 0, 1, "oauth-secret", None);
+        assert_eq!(
+            fallback.table.get("oauth_token").and_then(|v| v.as_str()),
+            Some("oauth-secret")
+        );
+    }
+
+    #[test]
+    fn every_non_credential_field_is_present_regardless_of_encryption_outcome() {
+        for encrypted in [Some("cipher"), None] {
+            let entry = build_account_entry("acct-x", "api_key", 12345, 7, "key", encrypted);
+            assert_eq!(entry.table.get("id").and_then(|v| v.as_str()), Some("acct-x"));
+            assert_eq!(entry.table.get("type").and_then(|v| v.as_str()), Some("api_key"));
+            assert_eq!(
+                entry.table.get("monthly_budget_cents").and_then(|v| v.as_integer()),
+                Some(12345)
+            );
+            assert_eq!(entry.table.get("priority").and_then(|v| v.as_integer()), Some(7));
+        }
+    }
+
+    // ── handle_accounts_add: end-to-end, MethodHandler fixture ──
+
+    async fn added_account(home: &std::path::Path, id: &str) -> WsFrame {
+        let handler = MethodHandler::new(home.to_path_buf()).await;
+        handler
+            .handle_accounts_add(json!({
+                "id": id,
+                "type": "api_key",
+                "key": format!("sk-{id}-secret"),
+                "priority": 1,
+                "monthly_budget_cents": 5000,
+            }))
+            .await
+    }
+
+    #[tokio::test]
+    async fn accounts_add_round_trip_writes_enc_only() {
+        let home = tempfile::tempdir().unwrap();
+        let res = added_account(home.path(), "acct-a").await;
+        assert!(matches!(res, WsFrame::Response { ok: true, .. }), "{res:?}");
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        let accounts = table["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        let acct = accounts[0].as_table().unwrap();
+        assert_eq!(acct.get("id").and_then(|v| v.as_str()), Some("acct-a"));
+        assert!(acct.get("anthropic_api_key_enc").and_then(|v| v.as_str()).is_some());
+        assert!(
+            acct.get("anthropic_api_key").is_none(),
+            "plaintext credential must not be persisted alongside a successful \
+             encryption: {acct:?}"
+        );
+    }
+
+    /// The property a pure-function test can't reach: adding a second account
+    /// must not perturb the first one's entry at all.
+    #[tokio::test]
+    async fn existing_accounts_are_unaffected_by_a_new_add() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            added_account(home.path(), "acct-a").await,
+            WsFrame::Response { ok: true, .. }
+        ));
+        let raw_after_first = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let table_after_first: toml::Table = raw_after_first.parse().unwrap();
+        let first_entry = table_after_first["accounts"].as_array().unwrap()[0].clone();
+
+        assert!(matches!(
+            added_account(home.path(), "acct-b").await,
+            WsFrame::Response { ok: true, .. }
+        ));
+        let raw_after_second = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let table_after_second: toml::Table = raw_after_second.parse().unwrap();
+        let accounts = table_after_second["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 2, "both accounts must be present: {accounts:?}");
+        assert_eq!(
+            accounts[0], first_entry,
+            "the first account's entry must be byte-for-byte unchanged after a \
+             second accounts.add: before={first_entry:?} after={:?}",
+            accounts[0]
+        );
+        assert_eq!(accounts[1].as_table().unwrap().get("id").and_then(|v| v.as_str()), Some("acct-b"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_id_is_rejected_without_touching_the_existing_entry() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            added_account(home.path(), "dup-id").await,
+            WsFrame::Response { ok: true, .. }
+        ));
+        let raw_before = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let res = handler
+            .handle_accounts_add(json!({
+                "id": "dup-id",
+                "type": "api_key",
+                "key": "sk-second-attempt",
+                "priority": 1,
+                "monthly_budget_cents": 5000,
+            }))
+            .await;
+        assert!(matches!(res, WsFrame::Response { ok: false, .. }), "{res:?}");
+
+        let raw_after = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert_eq!(raw_before, raw_after, "a rejected duplicate must not touch config.toml");
     }
 }

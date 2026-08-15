@@ -15,6 +15,7 @@ mod playbook_export;      // WP2.2/B4 batch: gene JSON export CLI (`duduclaw pla
 mod eval_scaffold;        // WP2.1: free-tier eval draft bootstrap (`duduclaw eval-scaffold`)
 mod playbook_migrate;     // WP1.4: SOUL.md → playbook migration drafts (`duduclaw playbook migrate-soul`)
 mod portability;          // Personal-edition data portability: export/import ~/.duduclaw
+mod preset_cmd;           // WP-6F: `duduclaw preset` — agent preset ("職務組合") CLI surface
 mod tunnel;               // B5 (ecosystem): `duduclaw tunnel` — Cloudflare quick-tunnel wizard
 mod premium_templates;    // Licensed industry templates (commercial/templates-premium), gated by premium_templates feature
 mod mcp;
@@ -219,28 +220,6 @@ fn encrypt_api_key(api_key: &str, home: &PathBuf) -> Option<String> {
     engine.encrypt_string(api_key).ok()
 }
 
-/// Decrypt a base64-encoded API key from config.toml.
-pub fn decrypt_api_key_from_config(home: &PathBuf) -> Option<String> {
-    let config_path = home.join("config.toml");
-    let content = std::fs::read_to_string(&config_path).ok()?;
-    let table: toml::Table = content.parse().ok()?;
-    let api = table.get("api")?.as_table()?;
-
-    // Check encrypted first
-    if let Some(enc) = api.get("anthropic_api_key_enc").and_then(|v| v.as_str())
-        && !enc.is_empty() {
-            let key = load_or_create_keyfile(home);
-            if let Ok(engine) = duduclaw_security::crypto::CryptoEngine::new(&key)
-                && let Ok(plain) = engine.decrypt_string(enc)
-                    && !plain.is_empty() {
-                        return Some(plain);
-                    }
-        }
-    // Fallback: plaintext (backwards compat)
-    let plain = api.get("anthropic_api_key")?.as_str()?;
-    if plain.is_empty() { None } else { Some(plain.to_string()) }
-}
-
 #[derive(Parser)]
 #[command(name = "duduclaw", about = "DuDuClaw - Multi-Agent Orchestration CLI")]
 #[command(version)]
@@ -309,6 +288,14 @@ enum Commands {
     Org {
         #[command(subcommand)]
         command: OrgCommands,
+    },
+
+    /// Manage AI 員工職務組合 (agent presets) — named, versioned configuration
+    /// bundles an agent can reference (`~/.duduclaw/presets/`). See
+    /// `commercial/docs/DESIGN-agent-presets-2026-08.md`.
+    Preset {
+        #[command(subcommand)]
+        command: PresetCommands,
     },
 
     /// Manage the DuDuClaw background service
@@ -422,6 +409,12 @@ enum Commands {
     /// Show the security posture report (score + checklist of active
     /// protections and actionable gaps).
     Security,
+
+    /// Cost / token telemetry reports.
+    Cost {
+        #[command(subcommand)]
+        command: CostCommands,
+    },
 
     /// Red-team an agent: synthesize jailbreak prompts from its `CONTRACT.toml`
     /// `must_not` boundaries and report which the deterministic input-guard
@@ -885,6 +878,16 @@ enum AgentCommands {
         /// gemini; CLAUDE.md is always written for compatibility).
         #[arg(long)]
         runtime: Option<String>,
+
+        /// WP-6F: bind the new agent to this preset ("職務組合") id right
+        /// after scaffolding — `agent.toml` fields the scaffold already
+        /// writes (`[agent]` identity, `[model] account_pool`, …) always win
+        /// over the preset's values. A bad/unknown preset id fails the
+        /// create (fail-closed): the agent is left scaffolded either way,
+        /// but you'll see the resolution error and can retry the bind with
+        /// `duduclaw preset bind`.
+        #[arg(long)]
+        preset: Option<String>,
     },
 
     /// Inspect agent details
@@ -967,6 +970,71 @@ enum OrgCommands {
         /// Show what would change without writing
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+/// WP-6F P1 — `duduclaw preset`: agent preset ("職務組合") store maintenance.
+///
+/// P1 ships no switching UI or version-flow tooling (see
+/// `preset_cmd` module docs) — this is the one write path for binding an
+/// agent to a preset. Refuses to run from inside an agent session, same as
+/// `org sync`: a binding changes what tools/model an agent runs with, so
+/// letting an agent bind itself would be a self-escalation channel.
+#[derive(Subcommand)]
+enum PresetCommands {
+    /// List presets available under `~/.duduclaw/presets/`
+    List,
+
+    /// Show one preset's metadata and resolved config
+    Show {
+        /// Preset id (directory name under `~/.duduclaw/presets/`)
+        id: String,
+    },
+
+    /// Bind an AI 員工 to a preset — the agent's `agent.toml` fields it
+    /// already writes explicitly always win over the preset's values.
+    Bind {
+        /// Agent directory name
+        #[arg(long)]
+        agent: String,
+
+        /// Preset id to bind to
+        #[arg(long)]
+        preset: String,
+
+        /// Optional free-text reason, recorded in the audit trail
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+
+    /// Remove an AI 員工's preset binding — the agent goes back to running
+    /// entirely on its own `agent.toml`
+    Unbind {
+        /// Agent directory name
+        #[arg(long)]
+        agent: String,
+
+        /// Optional free-text reason, recorded in the audit trail
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+
+    /// Show an AI 員工's current binding and live resolution outcome
+    /// (applied / unresolved-degraded / unbound)
+    Status {
+        /// Agent directory name
+        agent: String,
+    },
+
+    /// Copy the built-in department-kit presets (converted from
+    /// `commercial/templates-premium/teams/_departments/`) into
+    /// `~/.duduclaw/presets/`. Gated by the existing `premium_templates`
+    /// license feature — no new gate.
+    #[command(name = "install-builtin")]
+    InstallBuiltin {
+        /// Overwrite presets already present locally
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1110,6 +1178,29 @@ enum MemoryCommands {
 }
 
 #[derive(Subcommand)]
+enum CostCommands {
+    /// Code Mode Phase 0 measurement gate
+    /// (`commercial/docs/DESIGN-code-mode-2026-08.md` §8.1).
+    ///
+    /// Reports the three numbers the design demands before any engine work —
+    /// tool-schema share, provider calls per turn, and cache hit rate — off
+    /// the three beneficiary paths (openai-compat / direct API / local
+    /// inference), then evaluates the four go/no-go criteria and prints a
+    /// verdict. Read-only.
+    ToolLoop {
+        /// Window in days (default 30).
+        #[arg(long, default_value_t = 30)]
+        days: u64,
+        /// Restrict to one agent id.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Emit machine-readable JSON instead of the report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum PlaybookCommands {
     /// Export one agent's active playbook entries as a GEP-gene-shaped JSON
     /// array (`commercial/docs/DESIGN-evolution-v3-aee.md` §1.4, D5=B: local
@@ -1206,6 +1297,30 @@ enum EvolutionCommands {
         #[arg(long)]
         agent: Option<String>,
         /// Print decisions without modifying the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Clear the AEE §2.4.3 companion-3 held-out rotation flag
+    /// (`ChampionStore::holdout_rotation_due`) for one agent.
+    ///
+    /// The AEE commit gate raises this flag on a tie-commit as an anti-drift
+    /// signal (`gvu/champion.rs`): the held-out case subset should be
+    /// reshuffled before the next round, but ONLY an operator may do that —
+    /// letting the examinee (the agent's own evolution engine) reshuffle its
+    /// own exam is exactly the reward-hacking entry point WP-4E closed.
+    /// `ChampionStore::clear_holdout_rotation` had zero call sites until this
+    /// command — once raised, nothing ever cleared it. See
+    /// `commercial/docs/DESIGN-evolution-harness-knobs-2026-08.md` §7.2-A3.
+    ///
+    /// Example:
+    ///     duduclaw evolution clear-holdout-rotation --agent agnes --dry-run
+    ///     duduclaw evolution clear-holdout-rotation --agent agnes
+    ClearHoldoutRotation {
+        /// Agent whose held-out rotation flag to inspect/clear.
+        #[arg(long)]
+        agent: String,
+        /// Print the current flag state without changing anything.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1512,8 +1627,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 icon,
                 trigger,
                 runtime,
+                preset,
             }) => {
-                cmd_agent_create(&name, display_name, role, reports_to, icon, trigger, runtime)
+                cmd_agent_create(&name, display_name, role, reports_to, icon, trigger, runtime, preset)
                     .await
             }
             Some(AgentCommands::Inspect { agent }) => cmd_agent_inspect(&agent).await,
@@ -1530,6 +1646,16 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Org { command } => match command {
             OrgCommands::Show => cmd_org_show(),
             OrgCommands::Sync { agent, dry_run } => cmd_org_sync(agent.as_deref(), dry_run),
+        },
+        Commands::Preset { command } => match command {
+            PresetCommands::List => preset_cmd::cmd_preset_list(),
+            PresetCommands::Show { id } => preset_cmd::cmd_preset_show(&id),
+            PresetCommands::Bind { agent, preset, reason } => {
+                preset_cmd::cmd_preset_bind(&agent, &preset, &reason).await
+            }
+            PresetCommands::Unbind { agent, reason } => preset_cmd::cmd_preset_unbind(&agent, &reason).await,
+            PresetCommands::Status { agent } => preset_cmd::cmd_preset_status(&agent),
+            PresetCommands::InstallBuiltin { force } => preset_cmd::cmd_preset_install_builtin(force),
         },
         Commands::Service { command } => {
             match command {
@@ -1591,6 +1717,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         Commands::Restore { file, force } => cmd_restore(file, force).await,
         Commands::Redteam { agent, out } => cmd_redteam(agent, out).await,
         Commands::Security => cmd_security_posture().await,
+        Commands::Cost { command } => match command {
+            CostCommands::ToolLoop { days, agent, json } => cmd_cost_tool_loop(days, agent, json),
+        },
         Commands::Import { file, force } => cmd_import_data(file, force).await,
         Commands::McpServer => cmd_mcp_server().await,
         Commands::DesktopRecordWorker { dir, interval_ms, max_seconds } => {
@@ -1828,6 +1957,71 @@ async fn cmd_evolution(
                     d.post.positive_feedback_ratio,
                 );
             }
+            Ok(())
+        }
+
+        EvolutionCommands::ClearHoldoutRotation { agent, dry_run } => {
+            use duduclaw_gateway::gvu::champion::ChampionStore;
+            use duduclaw_security::audit::{append_audit_event, AuditEvent, Severity};
+
+            if !is_valid_agent_id(&agent) {
+                return Err(DuDuClawError::Agent(
+                    "Agent name must be lowercase alphanumeric with hyphens".to_string(),
+                ));
+            }
+
+            let evo_db = home_dir.join("evolution.db");
+            let store = ChampionStore::new(&evo_db);
+
+            let Some(champion) = store.get(&agent) else {
+                println!(
+                    "Agent '{agent}' has no reigning champion yet — nothing to clear."
+                );
+                return Ok(());
+            };
+
+            println!(
+                "  agent={}  holdout_rotation_due={}  round_seq={}  established_at={}",
+                agent,
+                champion.holdout_rotation_due,
+                champion.round_seq,
+                champion.established_at.to_rfc3339(),
+            );
+
+            if !champion.holdout_rotation_due {
+                println!("  (flag already clear — no change)");
+                return Ok(());
+            }
+
+            if dry_run {
+                println!("  (dry run — flag left set, no changes written)");
+                return Ok(());
+            }
+
+            store.clear_holdout_rotation(&agent).map_err(|e| {
+                DuDuClawError::Agent(format!(
+                    "Failed to clear holdout_rotation_due for '{agent}': {e}"
+                ))
+            })?;
+
+            // §3.8-style audit trail (same shape as `log_failsafe_change`):
+            // this is a machine-raised, human-cleared flag, and per §7.2-A3
+            // the flag's whole reason for existing is that the clear must be
+            // attributable to an operator action, not a self-clear.
+            append_audit_event(
+                home_dir,
+                &AuditEvent::new(
+                    "gvu_holdout_rotation_cleared",
+                    agent.as_str(),
+                    Severity::Warning,
+                    serde_json::json!({
+                        "round_seq": champion.round_seq,
+                        "source": "cli",
+                    }),
+                ),
+            );
+
+            println!("  ✔ holdout_rotation_due cleared for agent '{agent}'.");
             Ok(())
         }
     }
@@ -2697,6 +2891,37 @@ mod resolve_hook_caller_tests {
             dry.contains("管理者"),
             "--dry-run must be refused too (it is a probe of the same authority): {dry}"
         );
+    }
+
+    /// WP-6F P1 — `duduclaw preset bind`/`unbind` must refuse from inside an
+    /// agent session, same reasoning as `org sync`'s refusal
+    /// (`refuse_preset_write_in_agent_session`'s doc comment): a binding
+    /// changes what tools/model an agent runs with, so letting an agent bind
+    /// itself would be a self-escalation channel. This fires BEFORE any
+    /// filesystem access, so it needs no `DUDUCLAW_HOME` fixture.
+    #[tokio::test]
+    async fn preset_bind_and_unbind_refuse_inside_an_agent_session() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(duduclaw_core::ENV_AGENT_ID, "sales-rep");
+        }
+
+        let bind_err = super::preset_cmd::cmd_preset_bind("clinic-sales", "sales-followup", "")
+            .await
+            .unwrap_err()
+            .to_string();
+        let unbind_err = super::preset_cmd::cmd_preset_unbind("clinic-sales", "")
+            .await
+            .unwrap_err()
+            .to_string();
+        clear_env();
+
+        for msg in [&bind_err, &unbind_err] {
+            assert!(msg.contains("sales-rep"), "{msg}");
+            assert!(msg.contains("管理者"), "{msg}");
+        }
     }
 
     #[test]
@@ -4224,6 +4449,27 @@ async fn cmd_agent_inspect(name: &str) -> duduclaw_core::error::Result<()> {
     println!("  Preferred:   {}", model.preferred);
     println!("  Fallback:    {}", model.fallback);
     println!();
+    println!("Preset (WP-6F 職務組合):");
+    match &agent.preset_resolution {
+        duduclaw_core::preset::PresetResolution::Unbound => {
+            println!("  (none — running entirely on its own agent.toml)");
+        }
+        duduclaw_core::preset::PresetResolution::Applied {
+            preset_id, version, label, changed_fields, ..
+        } => {
+            println!("  Bound:       {preset_id} v{version} ({label})");
+            if changed_fields.is_empty() {
+                println!("  Overrides:   (none)");
+            } else {
+                println!("  Overrides:   {}", changed_fields.join(", "));
+            }
+        }
+        duduclaw_core::preset::PresetResolution::Unresolved { preset_id, version, reason } => {
+            println!("  ⚠️ Bound to {preset_id} v{version} but UNRESOLVED: {reason}");
+            println!("  Running on its own agent.toml only (fail-closed).");
+        }
+    }
+    println!();
     println!("Budget:");
     println!("  Monthly:     {} cents", budget.monthly_limit_cents);
     println!("  Warn at:     {}%", budget.warn_threshold_percent);
@@ -5370,6 +5616,7 @@ async fn cmd_agent_create(
     icon_opt: Option<String>,
     trigger_opt: Option<String>,
     runtime_opt: Option<String>,
+    preset_opt: Option<String>,
 ) -> duduclaw_core::error::Result<()> {
     use console::style;
     use std::str::FromStr;
@@ -5443,6 +5690,23 @@ async fn cmd_agent_create(
         agent_name,
         agent_dir.display()
     );
+
+    // WP-6F P1: scaffold-time preset reference. Deliberately AFTER the
+    // scaffold write, not before — `preset::bind` reads the just-written
+    // `agent.toml` to compute `changed_fields` (R1.4), so identity/model
+    // fields the scaffold sets always show up correctly as overrides rather
+    // than as an empty diff against a file that doesn't exist yet.
+    if let Some(preset_ref) = preset_opt.as_deref() {
+        if let Err(e) = preset_cmd::cmd_preset_bind(&agent_name, preset_ref, "agent create --preset").await {
+            println!(
+                "  {} 套用職務組合「{preset_ref}」失敗:{e}\n  \
+                 AI 員工已建立,只是尚未套用職務組合——可稍後執行\n  \
+                 `duduclaw preset bind --agent {agent_name} --preset {preset_ref}` 重試。",
+                style("⚠️").yellow()
+            );
+        }
+    }
+
     println!(
         "  {} {}",
         style("→").cyan(),
@@ -5981,6 +6245,37 @@ async fn cmd_gdpr_erase(
             None => String::new(),
         }
     );
+    Ok(())
+}
+
+/// `duduclaw cost tool-loop` — the Code Mode Phase 0 measurement gate report
+/// (`commercial/docs/DESIGN-code-mode-2026-08.md` §8.1).
+///
+/// Read-only and synchronous: it opens the probe table inside the existing
+/// `cost_telemetry.db`, aggregates the window, evaluates the four criteria and
+/// prints the verdict. An empty store is reported as "zero usage / cannot
+/// conclude", never as a decision.
+fn cmd_cost_tool_loop(
+    days: u64,
+    agent: Option<String>,
+    json: bool,
+) -> duduclaw_core::error::Result<()> {
+    use duduclaw_gateway::tool_loop_probe as probe;
+
+    let home = duduclaw_home();
+    let summary = probe::summarize(&home, days, agent.as_deref())
+        .map_err(duduclaw_core::error::DuDuClawError::Gateway)?;
+    let report = probe::evaluate_gate(&summary);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&probe::report_json(&summary, &report, days))
+                .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+        );
+    } else {
+        print!("{}", probe::render_report(&summary, &report, days));
+    }
     Ok(())
 }
 

@@ -391,15 +391,31 @@ impl OpenAiCompatRuntime {
         // task-local that claude_runner.rs (WP-A4) and codex/gemini (T10)
         // use, so `dispatcher.rs`'s bridging logic doesn't need a
         // runtime-specific branch.
-        let loop_outcome = duduclaw_llm::run_tool_loop_with_provenance(
-            &provider,
+        // WP-6E: Code Mode Phase 0 measurement gate
+        // (`commercial/docs/DESIGN-code-mode-2026-08.md` §8.1). A pure
+        // observation decorator layered OVER the billing tap — it forwards
+        // every request/response verbatim and only counts rounds, tool-schema
+        // tokens and provider-reported cache reads. This path is beneficiary
+        // #1 of the design's §2 list, so it is the primary measurement site.
+        let probe = crate::tool_loop_probe::ToolLoopProbe::new(&provider);
+        let loop_result = duduclaw_llm::run_tool_loop_with_provenance(
+            &probe,
             req,
             &guarded,
             duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
             duduclaw_llm::ProvenanceConfig::default(),
         )
-        .await
-        .map_err(|e| format!("openai-compat tool loop error: {e}"))?;
+        .await;
+        // Recorded BEFORE the `?`: a turn that died mid-loop still measured
+        // real provider rounds, and dropping it would bias the gate toward
+        // short, cheap turns.
+        probe.finish_and_record(
+            &context.agent_id,
+            crate::tool_loop_probe::ProbePath::OpenAiCompat,
+            &context.model,
+        );
+        let loop_outcome =
+            loop_result.map_err(|e| format!("openai-compat tool loop error: {e}"))?;
         // R1: `LoopToolCall` already carries masked+capped result/input text
         // (masking happens inside `duduclaw-llm::tool_loop`, which already
         // depends on `duduclaw-security` for `PolicyExecutor`) — carried
@@ -654,37 +670,47 @@ async fn resolve_provider_config(
     let config_path = home_dir.join("config.toml");
     if let Ok(content) = tokio::fs::read_to_string(&config_path).await {
         if let Ok(table) = content.parse::<toml::Table>() {
+            // WP-6C follow-up (#1): this used to be an 8th hand-rolled
+            // decrypt-or-plaintext dialect with no `secret://` awareness at
+            // all — an `api_key = "secret://vault/…"` reference was returned
+            // verbatim and sent to the vendor **as the bearer token** (the
+            // same class of bug WP-H1/WP-6C fixed everywhere else). Converged
+            // onto the single `SecretRef` resolver: `[secret_manager]` is
+            // read from the same already-parsed table (no extra disk read),
+            // and this function is `async fn` on every call path (both
+            // `execute()` and `execute_sse_streaming()` already `.await` it),
+            // so a network-backed reference (Vault / 1Password / Infisical)
+            // resolves for real instead of failing closed.
+            let sm_cfg: duduclaw_security::secret_manager::SecretManagerConfig = table
+                .get("secret_manager")
+                .cloned()
+                .and_then(|v| v.try_into().ok())
+                .unwrap_or_default();
             if let Some(accounts) = table.get("accounts").and_then(|a| a.as_array()) {
                 for acc in accounts {
                     let provider = acc.get("provider").and_then(|p| p.as_str()).unwrap_or("");
                     let base_url = acc.get("base_url").and_then(|u| u.as_str());
 
                     if !provider.is_empty() {
-                        // Try encrypted field first (api_key_enc), fall back to plaintext api_key
-                        let api_key_opt: Option<String> = acc
-                            .get("api_key_enc")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .and_then(|enc_val| {
-                                let key = crate::config_crypto::load_keyfile_public(home_dir)?;
-                                let engine =
-                                    duduclaw_security::crypto::CryptoEngine::new(&key).ok()?;
-                                engine.decrypt_string(enc_val).ok()
-                            });
-
-                        // Fall back to plaintext api_key with a warning
-                        let api_key_opt = api_key_opt.or_else(|| {
-                            let plain = acc.get("api_key").and_then(|k| k.as_str())?;
-                            if plain.is_empty() {
-                                return None;
-                            }
+                        let secret_ref = duduclaw_security::secret_ref::SecretRef::from_typed(
+                            acc.get("api_key_enc").and_then(|v| v.as_str()),
+                            acc.get("api_key").and_then(|v| v.as_str()).unwrap_or(""),
+                        );
+                        // Same warning as before, gated on the same condition
+                        // (a bare plaintext key, not `_enc` and not a
+                        // `secret://` reference) instead of firing on every
+                        // encrypted-field-decrypt-failure fallback.
+                        if secret_ref.describe().source == duduclaw_security::secret_ref::SourceKind::Legacy {
                             tracing::warn!(
                                 provider,
                                 "OpenAI-compat account uses plaintext api_key; \
                                  migrate to api_key_enc for better security"
                             );
-                            Some(plain.to_string())
-                        });
+                        }
+                        let api_key_opt = secret_ref
+                            .resolve(&sm_cfg, home_dir)
+                            .await
+                            .map(|s| s.expose_owned());
 
                         if let Some(key) = api_key_opt {
                             let url = base_url
@@ -1195,6 +1221,158 @@ mod tests {
             model_used: "m".into(),
             provider: "scripted".into(),
         }
+    }
+
+    // ── resolve_provider_config: secret:// convergence (coordinator #1) ────
+
+    /// Every env var `resolve_provider_config`'s steps 1-3 consult, ahead of
+    /// `[[accounts]]` in `config.toml` — guarded so a real key on the host
+    /// running the test suite can never short-circuit before the account
+    /// array under test is even reached.
+    fn provider_env_guard_vars() -> [&'static str; 6] {
+        PROVIDERS
+            .iter()
+            .map(|p| -> &'static str {
+                match p.name {
+                    "minimax" => "MINIMAX_API_KEY",
+                    "deepseek" => "DEEPSEEK_API_KEY",
+                    "openrouter" => "OPENROUTER_API_KEY",
+                    "groq" => "GROQ_API_KEY",
+                    "openai" => "OPENAI_API_KEY",
+                    "xai" => "XAI_API_KEY",
+                    other => panic!("unmapped provider preset in test guard: {other}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
+    }
+
+    /// Removes every provider-env-var short-circuit for the duration of
+    /// `f`, restoring the host's original values afterward (even on panic).
+    async fn with_provider_env_guarded<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let vars = provider_env_guard_vars();
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        // SAFETY: test-local env mutation; every value is restored below
+        // (including on the panic path, via a drop guard).
+        struct Restore(Vec<(&'static str, Option<String>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (v, val) in &self.0 {
+                    unsafe {
+                        match val {
+                            Some(s) => std::env::set_var(v, s),
+                            None => std::env::remove_var(v),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore(saved);
+        unsafe {
+            for v in vars {
+                std::env::remove_var(v);
+            }
+        }
+        f().await
+    }
+
+    /// The dialect-8 bug this fix kills: before convergence onto `SecretRef`,
+    /// an `api_key = "secret://vault/…"` reference with no `_enc` twin fell
+    /// straight into the plaintext branch and was returned **verbatim** —
+    /// exactly the credential that would then ride out as the `Authorization`
+    /// bearer token to the vendor. With no `[secret_manager]` vault token
+    /// configured, resolution must fail closed (no account found), and above
+    /// all the literal `secret://` string must never surface anywhere in the
+    /// outcome.
+    #[tokio::test]
+    async fn secret_reference_never_becomes_the_bearer_token_literal() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[[accounts]]\nprovider = \"test-vault-provider\"\n\
+             api_key = \"secret://vault/openai-compat-test\"\n",
+        )
+        .unwrap();
+
+        let result =
+            with_provider_env_guarded(|| resolve_provider_config(home.path(), "tester", None))
+                .await;
+
+        match &result {
+            Ok((key, url, provider)) => panic!(
+                "must not resolve without a configured vault backend — got a literal \
+                 credential instead: key={key:?} url={url:?} provider={provider:?}"
+            ),
+            Err(e) => {
+                assert!(
+                    !e.contains("secret://"),
+                    "error text must not leak the reference either: {e}"
+                );
+            }
+        }
+    }
+
+    /// The other half of the fix: a reference a `SecretRef` sync-local
+    /// backend genuinely *can* satisfy (`secret://env/…`) must actually
+    /// resolve to the real value — this is a convergence onto the shared
+    /// resolver, not a blanket new fail-closed regression.
+    #[tokio::test]
+    async fn secret_env_reference_resolves_to_the_real_key() {
+        let home = tempfile::tempdir().unwrap();
+        let var = format!("DUDUCLAW_OACOMPAT_TEST_{}", std::process::id());
+        // SAFETY: process-unique env var name, set and removed within this test.
+        unsafe { std::env::set_var(&var, "resolved-provider-key") };
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "[[accounts]]\nprovider = \"test-env-provider\"\n\
+                 base_url = \"https://example.test/v1\"\n\
+                 api_key = \"secret://env/{var}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let result =
+            with_provider_env_guarded(|| resolve_provider_config(home.path(), "tester", None))
+                .await;
+        // SAFETY: matches the set_var above.
+        unsafe { std::env::remove_var(&var) };
+
+        let (key, url, provider) = result.expect("env-backed secret:// reference must resolve");
+        assert_eq!(key, "resolved-provider-key");
+        assert_eq!(url, "https://example.test/v1");
+        assert_eq!(provider, "test-env-provider");
+    }
+
+    /// Parity check: an `_enc` twin still round-trips through the keyfile
+    /// exactly as before the convergence (WP-H1 P0 acceptance bar).
+    #[tokio::test]
+    async fn encrypted_api_key_still_round_trips() {
+        let home = tempfile::tempdir().unwrap();
+        let enc = crate::config_crypto::encrypt_value("enc-provider-key", home.path())
+            .expect("encrypt_value");
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "[[accounts]]\nprovider = \"test-enc-provider\"\n\
+                 base_url = \"https://example.test/v1\"\n\
+                 api_key_enc = \"{enc}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let result =
+            with_provider_env_guarded(|| resolve_provider_config(home.path(), "tester", None))
+                .await;
+
+        let (key, ..) = result.expect("_enc field must still resolve");
+        assert_eq!(key, "enc-provider-key");
     }
 
     #[tokio::test]
