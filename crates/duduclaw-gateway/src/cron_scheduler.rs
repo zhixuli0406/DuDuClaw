@@ -692,7 +692,7 @@ async fn deliver_cron_result(
 async fn resolve_channel_token(home_dir: &Path, agent_id: &str, channel: &str) -> String {
     if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
         home_dir, agent_id, channel,
-    ) {
+    ).await {
         return tok.expose_owned();
     }
 

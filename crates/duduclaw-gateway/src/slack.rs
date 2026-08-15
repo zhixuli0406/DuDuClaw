@@ -70,6 +70,10 @@ pub async fn start_slack_bots(
     let mut results = Vec::new();
     let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Loaded once for the whole bot-start pass (WP-6C) — every per-agent
+    // resolve below shares it rather than re-reading config.toml per agent.
+    let sm_cfg = duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(home_dir).await;
+
     // Collect per-agent tokens FIRST so the global Socket Mode connection can
     // defer to them. A Slack bot token bound to a specific agent is more
     // specific than the generic global connection, which routes via
@@ -84,8 +88,8 @@ pub async fn start_slack_bots(
                 if let Some(slack) = &channels.slack {
                     // WP-H1: Slack needs BOTH tokens; `None` from either is
                     // "not configured" — the resolver has no empty-string state.
-                    let app = crate::config_crypto::resolve_agent_token(&slack.app_token_enc, &slack.app_token, home_dir);
-                    let bot = crate::config_crypto::resolve_agent_token(&slack.bot_token_enc, &slack.bot_token, home_dir);
+                    let app = crate::config_crypto::resolve_agent_token(&slack.app_token_enc, &slack.app_token, home_dir, &sm_cfg).await;
+                    let bot = crate::config_crypto::resolve_agent_token(&slack.bot_token_enc, &slack.bot_token, home_dir, &sm_cfg).await;
                     if let (Some(app), Some(bot)) = (app, bot) {
                         tokens.push((
                             agent.config.agent.name.clone(),

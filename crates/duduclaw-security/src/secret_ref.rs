@@ -539,14 +539,27 @@ impl SecretRef {
     /// with a warning instead of resolved: fail-closed, and above all never
     /// returning the literal `secret://…` string.
     ///
-    /// P1 status: the two call sites where a network backend genuinely
-    /// mattered were async-ified (the Apps Script bridge config, the reminder
-    /// scheduler's channel tokens). The ones that remain synchronous —
-    /// per-agent channel tokens on the bot-start paths, `decrypt_config_field`,
-    /// `inference.toml`'s `api_key` — keep this fail-closed behaviour by
-    /// design; the P1 backends they most need (`keychain`, `file`) are local,
-    /// so a desktop or container deployment loses nothing by it. Converting
-    /// them is deferred, not forgotten.
+    /// P1 status (closed out by WP-6C, 2026-08): every production call site
+    /// that used to be stuck on this fail-closed path now runs on an async
+    /// context and calls [`Self::resolve`] instead — the Apps Script bridge
+    /// config and the reminder scheduler's channel tokens (both async-ified
+    /// earlier, under WP-4A), and, as of WP-6C, the per-agent channel token
+    /// bot-start paths (`telegram.rs` / `discord.rs` / `slack.rs`
+    /// `start_*_bots()`, `resolve_agent_channel_token_via_reports_to` and its
+    /// `reports_to` cascade callers), `duduclaw-gateway`'s
+    /// `dispatcher::forward_to_channel` delegation-forward path (via the new
+    /// `config_crypto::decrypt_config_field_async`), and
+    /// `duduclaw-inference`'s `inference.toml` `[openai_compat] api_key`
+    /// (`OpenAiCompatConfig::resolved_api_key`).
+    ///
+    /// This method itself is not removed — `duduclaw-gateway`'s
+    /// `config_crypto::decrypt_config_field` keeps a synchronous twin for any
+    /// future genuinely-synchronous caller (none exists in production today)
+    /// and this module's own tests exercise the fail-closed contract
+    /// directly. A *real* synchronous dead end (no tokio runtime reachable at
+    /// all, e.g. very early process bootstrap before the gateway's runtime
+    /// exists) would still need this method; none of the call sites converted
+    /// here turned out to be one.
     pub fn resolve_sync(&self, home_dir: &Path) -> Option<Secret> {
         match self.resolve_local(home_dir) {
             LocalOutcome::Resolved(secret) => Some(secret),

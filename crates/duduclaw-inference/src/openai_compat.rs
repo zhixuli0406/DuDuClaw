@@ -50,13 +50,18 @@ fn default_duduclaw_home() -> std::path::PathBuf {
 
 impl OpenAiCompatBackend {
     /// Construct using the standard `~/.duduclaw` home dir for key resolution.
-    pub fn new(config: OpenAiCompatConfig) -> Self {
+    pub async fn new(config: OpenAiCompatConfig) -> Self {
         let home = default_duduclaw_home();
-        Self::new_with_home(config, &home)
+        Self::new_with_home(config, &home).await
     }
 
     /// Construct, resolving `api_key_enc` against an explicit `home_dir`.
-    pub fn new_with_home(config: OpenAiCompatConfig, home_dir: &std::path::Path) -> Self {
+    ///
+    /// Async since WP-6C — both call sites (`InferenceManager::init` /
+    /// `create_backend`) already run on the crate's tokio runtime, so key
+    /// resolution can now reach a network-backed `secret://` reference
+    /// instead of failing closed on it.
+    pub async fn new_with_home(config: OpenAiCompatConfig, home_dir: &std::path::Path) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()
@@ -66,7 +71,7 @@ impl OpenAiCompatBackend {
         let chat_url = format!("{base}/chat/completions");
         let models_url = format!("{base}/models");
 
-        let resolved_api_key = config.resolved_api_key(home_dir);
+        let resolved_api_key = config.resolved_api_key(home_dir).await;
 
         Self {
             config,
