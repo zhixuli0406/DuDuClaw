@@ -22,6 +22,15 @@ const DISPATCH_POLICIES = ['fixed_hierarchy', 'round_robin', 'llm_select'] as co
 // WP-E default) so the select's natural order matches the safer choice.
 const RESUME_ON_RESTART_OPTIONS = ['pause', 'auto'] as const;
 
+// dispatch.judge enum accepted by the gateway's system.update_config (WP-5D
+// seam, crates/duduclaw-gateway/src/judge_mode.rs). NOTE: `judge_command` /
+// `judge_timeout_secs` are deliberately NOT here and never sent to the RPC —
+// they name an executable and stay file-only (config.toml, operator-edited).
+// An unknown string is rejected by the gateway (falls back to "mav" — the
+// strongest of the four — with a warning), so this list must stay in sync
+// with `JudgeMode::from_config_str`.
+const JUDGE_MODES = ['mav', 'evaluator_only', 'external', 'human_only'] as const;
+
 /** Extract the body of a top-level TOML `[section]` from the masked config
  *  string (up to the next `[` header or EOF). Section-scoped so a common key
  *  name (e.g. `enabled`) is read from the right table. */
@@ -125,6 +134,8 @@ export function AutomationTab() {
   // [dispatch] — enabled defaults ON since v1.59 (gateway-side default flip)
   const [dispatchEnabled, setDispatchEnabled] = useState(true);
   const [dispatchPolicy, setDispatchPolicy] = useState('fixed_hierarchy');
+  // [dispatch] judge — who adjudicates "is this task actually done" (WP-6B).
+  const [judgeMode, setJudgeMode] = useState('mav');
   // [topology_evolution]
   const [topologyEnabled, setTopologyEnabled] = useState(false);
   // [knowledge_guard]
@@ -160,6 +171,7 @@ export function AutomationTab() {
       const dp = tomlSection(raw, 'dispatch');
       setDispatchEnabled(boolIn(dp, 'enabled', true));
       setDispatchPolicy(strIn(dp, 'policy', 'fixed_hierarchy'));
+      setJudgeMode(strIn(dp, 'judge', 'mav'));
       setTopologyEnabled(boolIn(tomlSection(raw, 'topology_evolution'), 'enabled', false));
       const kg = tomlSection(raw, 'knowledge_guard');
       setKgEnabled(boolIn(kg, 'enabled', true));
@@ -207,7 +219,7 @@ export function AutomationTab() {
           iteration_cap_simple: iterationCapSimple,
           resume_on_restart: resumeOnRestart,
         },
-        dispatch: { enabled: dispatchEnabled, policy: dispatchPolicy },
+        dispatch: { enabled: dispatchEnabled, policy: dispatchPolicy, judge: judgeMode },
         topology_evolution: { enabled: topologyEnabled },
         knowledge_guard: { enabled: kgEnabled, window_secs: kgWindowSecs, max_per_subject: kgMaxPerSubject },
         memory: { graph_embed_seed: graphEmbedSeed },
@@ -234,6 +246,9 @@ export function AutomationTab() {
   }));
   const resumeOnRestartOptions: SelectOption[] = RESUME_ON_RESTART_OPTIONS.map((v) => ({
     value: v, label: intl.formatMessage({ id: `settings.automation.resumeOnRestart.${v}` }), raw: v,
+  }));
+  const judgeModeOptions: SelectOption[] = JUDGE_MODES.map((v) => ({
+    value: v, label: intl.formatMessage({ id: `settings.automation.judgeMode.${v}` }), raw: v,
   }));
 
   return (
@@ -280,6 +295,16 @@ export function AutomationTab() {
             onChange={setDispatchPolicy}
             options={policyOptions}
           />
+          {/* dispatch.judge (WP-6B) — who adjudicates "is this task actually
+              done". Re-read on every acceptance decision, so this is hot: no
+              restart note needed here (unlike resumeOnRestart below). */}
+          <RowSelect
+            label={t('settings.automation.judgeMode')}
+            description={t('settings.automation.judgeMode.help')}
+            value={judgeMode}
+            onChange={setJudgeMode}
+            options={judgeModeOptions}
+          />
           <RowSwitch
             label={t('settings.automation.topologyEnabled')}
             description={t('settings.automation.topologyEnabled.help')}
@@ -298,6 +323,24 @@ export function AutomationTab() {
             options={resumeOnRestartOptions}
           />
         </SettingsCard>
+        {/* Quick mode trades away the second review layer — surface that as
+            a visibly different (amber, not the neutral secondary tone used
+            elsewhere on this page) risk callout instead of burying it in the
+            select's own description text. */}
+        {judgeMode === 'evaluator_only' && (
+          <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-700 dark:text-amber-300">
+            {t('settings.automation.judgeMode.evaluatorOnlyRisk')}
+          </div>
+        )}
+        {/* judge_command names an executable and is deliberately NOT settable
+            via system.update_config (file-only, operator-edited config.toml)
+            — tell the operator where to go instead of leaving an unexplained
+            gap where an input field would otherwise be. */}
+        {judgeMode === 'external' && (
+          <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
+            {t('settings.automation.judgeMode.externalHint')}
+          </p>
+        )}
         <AutonomyNote id="automation" />
         <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
           {t('settings.automation.hotReloadHint')}
