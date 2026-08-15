@@ -65,9 +65,33 @@
 - 驗收中
 - 未通過 → 修正後重試（附驗收判官回饋摘要）
 - 完成 ✅（附結果摘要）
-- 卡住 → 需要你決定（同時另外推送審批按鈕）
+- 卡住 → 需要你決定（同時另外推送審批按鈕，附暫停原因分類，見下方「needs_human 按鈕語意」）
 
 同一任務同一狀態不會重複推播。來源對話不存在時，退回 AI 員工的 `[proactive]` 頻道；兩者都沒有時只寫入儀表板 Activity Feed，不打擾你。
+
+### 逾時進度通報
+
+任務被認領（`in_progress`）後，如果超過 `[goal_loop] progress_report_minutes`（預設 10 分鐘）都沒有任何可觀察的進度訊號（以 Activity Feed 事件為準——`updated_at` 欄位會被 lease renewer 定期刷新，不能拿來當作「有在動」的證據），驅動器會推一則「已執行 X 分鐘未回報進度，仍在執行中」的通知（Activity Feed ＋來源對話），同一輪最多發一次。
+
+這**純粹是通報，不是介入**：不會重派工、不升級、不取消任務——真正會動手的仍然只有 `stalled_secs`（重派）、`iteration_cap`（轉人工）、`wall_clock_hours`（轉人工）這幾條既有護欄。設成 `0`（或任何負數）整個功能關閉，且關閉時不花任何額外查詢。
+
+---
+
+## 工具連擊 advisory（tool streak）
+
+自主迴圈裡，AI 員工偶爾會卡在「對同一個工具、帶同一組參數，一次又一次呼叫」的迴圈——結果早就拿到了，卻沒有意識到自己在重複。這與下方「停滯偵測」不同：停滯偵測要連續兩整輪（派工→驗收）才能發現卡住，工具連擊 advisory 看的是**單一輪內**的工具呼叫序列，能在判官介入之前就先提醒。
+
+判定依據是同工具、同一組**遮罩後**參數（沿用稽核紀錄本來就做過的機密遮罩）的連續呼叫次數，門檻與提醒逐級加重：
+
+| 連續次數 | 提醒內容 |
+|------|------|
+| 3 次 | 建議先重讀上一次的執行結果，確認是否已取得所需資訊，避免重複呼叫浪費輪次 |
+| 5 次 | 目前的做法可能沒有進展，建議換一個方法或角度切入 |
+| 8 次 | 強烈建議停止重複嘗試：直接收斂目前已取得的結果回報，或改用 `tasks_block` 說明受阻原因並求助 |
+
+提醒文字會注入**下一輪**派工的 `<state>` 區塊，零 LLM 成本、**純 advisory**——不會擋下、重試或否決任何一次工具呼叫或派工，是否要照做由 AI 員工自己判斷。提醒本身刻意排除在 `state_hash` 之外，不會干擾既有的（狀態, 行動）震盪偵測。
+
+設定 `config.toml [goal_loop] tool_streak_advisory`（預設 `true`）可整體關閉。
 
 ---
 
@@ -121,6 +145,7 @@ enabled = true          # 啟用自主派工引擎（含 goal loop 驅動器）�
 policy = "fixed_hierarchy"  # 派工策略（選哪個 AI 員工接任務）。見下方「派工策略」。預設 fixed_hierarchy
 grounding_precheck_enabled = true  # 驗收前的證據落地預檢（見「證據落地預檢」）。預設 true
 two_stage_judge = true  # 驗收前先跑便宜的第一階段評估（見「兩段式驗收裁決」）。預設 true
+admission = "queue"     # 子代理（ephemeral spawn）撞並發上限時的處置，"queue" 或 "fail"。預設 queue（見下方「ephemeral spawn 准入排隊」）
 
 [task_forward_model]    # 任務層前瞻模型（見同名章節）。預設整組關閉
 enabled = false
@@ -134,6 +159,8 @@ tick_secs = 30           # 驅動器輪詢週期（秒）。預設 30
 stalled_secs = 600       # 派工後未被認領視為停滯、可重派的秒數。預設 600
 planner_enabled = false  # 開啟後允許把目標拆成帶依賴的子任務 DAG（見「平行子任務」）。預設 false
 resume_on_restart = "pause"  # gateway 重啟時 in-flight 目標任務的處置，"auto" 或 "pause"（見「重啟行為」）。預設 pause，可在儀表板「設定 → 自動化」切換
+progress_report_minutes = 10  # 已認領任務多久沒進度訊號才通報一次，`0` 關閉（見「逾時進度通報」）。預設 10
+tool_streak_advisory = true   # 同工具同參數連擊 3/5/8 次時是否注入提醒（見「工具連擊 advisory」）。預設 true
 
 [dispatch_guard]        # 回饋路徑斷路器（防再生型無限迴圈）
 window_secs = 60        # 滑動窗長度（秒）。預設 60
@@ -169,6 +196,28 @@ max_hop_depth = 5       # 委派鏈跨行程 re-spawn 的深度上限。預設 5
 | `llm_select` | 由工具用 LLM 從名冊挑最合適的員工。**失敗關閉**：輸出不在名冊內、或解析/LLM 失敗，一律退回 `fixed_hierarchy` 的結果，絕不派給捏造的員工。不硬編碼任何模型名（走設定的工具用 runtime）。 |
 
 名冊 = `<home>/agents/` 下的員工目錄。名冊為空時，`round_robin` / `llm_select` 都退回原指派（不孤兒化）。改派會寫回任務的 `assigned_to`，讓 heartbeat 拉取與活動記錄一致。
+
+---
+
+## 子代理准入排隊（ephemeral spawn admission）
+
+目標拆解、委派等路徑有時會需要開一個短命的子代理（ephemeral spawn）。撞到並發上限（`ephemeral_max_active`，預設 32）時，`config.toml [dispatch] admission` 決定怎麼處理這次超限請求：
+
+| 值 | 行為 |
+|------|------|
+| `queue` | **預設**。有界 FIFO 排隊——請求不會憑空消失，等有空位釋放就依序執行。每張排隊券帶 TTL（`queue_item_ttl_secs`，預設 600 秒），逾期直接丟棄並記一筆稽核；佇列本身有深度上限（`queue_max_depth`，預設 64），滿了就明確拒絕（避免無界佇列本身變成新的失控風險）。發起請求的 turn／session 結束時，屬於它的排隊券會一併作廢，不會讓一個早就結束的流程突然冒出遲到的子代理。 |
+| `fail` | 舊行為：超限直接拒絕，不排隊。 |
+
+`ephemeral_max_active` 本身遵守「可調但不可為 0」——設成 `0` 會被鉗到 `1` 並記一筆警告，並發上限永遠不能被設定成完全關閉。
+
+```toml
+# config.toml
+[dispatch]
+admission = "queue"           # "queue"（預設）或 "fail"
+queue_max_depth = 64          # 佇列深度上限，超過即拒絕
+queue_item_ttl_secs = 600     # 排隊券存活秒數，逾期丟棄並稽核
+ephemeral_max_active = 32     # 並發上限，0 會被鉗到 1
+```
 
 ---
 
@@ -322,7 +371,26 @@ gateway 重啟或崩潰復原後，還在跑的目標任務預設會轉成 `need
 
 ## needs_human 按鈕語意
 
-任務轉「需人工」時（達派工上限 / 牆鐘超時 / 連續兩輪駁回且 gap 指紋相同 / 驗收判官在重試預算耗盡時仍不通過 / 上游依賴子任務卡住而繼承升級 / `resume_on_restart = "pause"` 時 gateway 重啟），會推送四顆按鈕到 AI 員工的控制頻道：
+任務轉「需人工」時（達派工上限 / 牆鐘超時 / 連續兩輪駁回且 gap 指紋相同 / 驗收判官在重試預算耗盡時仍不通過 / 上游依賴子任務卡住而繼承升級 / `resume_on_restart = "pause"` 時 gateway 重啟），會推送四顆按鈕到 AI 員工的控制頻道。
+
+### 暫停原因分類（pause_reason）
+
+「需人工」不再是單一個桶子。除了既有的自由文字 `judge_feedback`（判官或評估器的完整回饋，可能好幾句話），每次轉人工的當下，同時會蓋上一個六選一的**封閉分類**——這是給你一眼分辨「這是什麼類型的卡住」用的，`judge_feedback` 才是逐句細節：
+
+| 分類 token | UI 文案 |
+|------|------|
+| `no_progress` | 卡住沒進展 |
+| `budget_exhausted` | 次數或時限用盡 |
+| `blocked_needs_decision` | 等你決策 |
+| `infra` | 系統問題 |
+| `restart` | 系統重啟後暫停 |
+| `unknown` | 需要人工確認 |
+
+分類在**觸發現場**靜態標記（每個轉人工的路徑各自標記自己的類別），絕不從 `judge_feedback` 的 LLM 敘述反解——模型自己的措辭不可靠、也不該被拿來當路由依據。未分類、遇到辨識不出的舊值，或這個欄位上線前就存在的舊任務，一律讀成 `unknown`（「需要人工確認」）：一個分不清類型的卡住，寧可讓你多看一眼，不能被誤判成一個看似明確、其實是猜的分類。
+
+顯示位置：`/goals` 看板卡片與任務詳情頁的分類 chip、通道 needs_human 審批訊息裡的「類型」一行（Observer 全自動模式的純通知也有）。任務被人工決定（重試 / 標記完成 / 放棄）後，分類欄會清空，不會殘留到下一次卡住。
+
+### 按鈕
 
 | 按鈕 | 動作 |
 |------|------|

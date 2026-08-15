@@ -250,3 +250,6 @@ Not evolution toggles, but part of the same learn-and-verify surface:
 | `config.toml [dispatch] two_stage_judge` | `true` | [goal-loop.md](./goal-loop.md) — cheap first-stage evaluator before the MAV acceptance panel |
 | `config.toml [goal_loop] resume_on_restart` | `"pause"` | [goal-loop.md](./goal-loop.md) — escalates in-flight goal tasks to `needs_human` on gateway restart; set `"auto"` to resume them instead. Dashboard: Settings → Automation |
 | `config.toml [task_forward_model] enabled` | `false` | [goal-loop.md](./goal-loop.md) — task-level predict-act-verify world model |
+| `config.toml [goal_loop] progress_report_minutes` | `10` | [goal-loop.md](./goal-loop.md) — notifies (never intervenes) when a claimed goal task has shown no progress signal for this many minutes; `0` disables |
+| `config.toml [goal_loop] tool_streak_advisory` | `true` | [goal-loop.md](./goal-loop.md) — injects an escalating advisory hint after 3/5/8 identical consecutive tool calls in one round; zero LLM cost, never blocks |
+| `config.toml [dispatch] admission` | `"queue"` | [goal-loop.md](./goal-loop.md) — over-capacity ephemeral sub-agent spawns durably FIFO-queue instead of failing immediately; set `"fail"` for the pre-H19 hard-reject behavior |

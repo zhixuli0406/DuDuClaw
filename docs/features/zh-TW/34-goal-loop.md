@@ -57,12 +57,15 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 | 跨程序斷路器(`dispatch_guard`) | 60 s 滑動視窗內 20 次派工 | 冷卻拒絕 |
 | 委派 hop 深度 | 5 | 拒絕派工 |
 | gateway 重啟時的復活行為(`resume_on_restart`) | `pause`(**預設**)——開機把所有 in-flight `goal_mode` 任務轉 `needs_human`(原因 `gateway_restart`) | `auto` 時重啟後 in-flight 任務照常接續(這項設定出現前的唯一行為);可在 `config.toml` 或儀表板「設定→自動化」切換(`system.update_config` 只收 `"auto"`/`"pause"`) |
+| 逾時進度通報(`progress_report_minutes`) | 已認領任務靜默 10 分鐘(以 Activity Feed 訊號為準,不是會被 lease renewer 定期刷新的 `updated_at`) | 推一則「仍在執行、未回報進度」通知到 Activity Feed ＋來源對話,同一輪最多一次——不重派工、不升級、不取消;`0` 關閉 |
+| 工具連擊 advisory(`tool_streak_advisory`) | 單一輪內對同一工具、同一組(遮罩後)參數連續呼叫 3／5／8 次 | 逐級加重的 zh-TW 提醒注入下一輪 `<state>` 區塊——零 LLM 成本、純 advisory,不會擋下或否決任何呼叫;排除在震盪偵測的狀態雜湊之外 |
+| ephemeral spawn 准入(`[dispatch] admission`) | 撞到並發上限(`ephemeral_max_active`,預設 32) | `"queue"`(**預設**)有界 FIFO 持久排隊而非直接拒絕(佇列深度上限、每張票 TTL、全數落稽核);`"fail"` 退回 H19 之前的立即拒絕 |
 
 全部在 `config.toml` 的 `[goal_loop]` / `[dispatch_guard]` / `[dispatch]` 之下,區段缺席時使用內建預設。
 
 ## needs_human 升級
 
-任務停在 `needs_human` 時,`goal_notify.rs` 往來源對話推送一則帶四個動作的審批訊息——**重試 / 標記完成 / 中止 / 交給我**(fallback 到該 agent 的 `[proactive]` 控制通道)。一則訊息主要動作上限 3 個,因此重試/標記完成留在主要層,中止/交給我收進各平台自己的次要層:Telegram、Discord 各是第二排按鈕,Slack 是原生 `overflow` 選單;LINE 沒有對應的次要選單機制,這兩個動作不會出現在 LINE 的快速回覆裡,改以文字說明並附儀表板連結。其他無按鈕通道用文字 fallback,儀表板也有一欄 needs_human 看板。
+任務停在 `needs_human` 時,除了既有的自由文字 `judge_feedback`,同時會蓋上一個六選一的封閉分類 `pause_reason`——`no_progress`／`budget_exhausted`／`blocked_needs_decision`／`infra`／`restart`／`unknown`,在觸發現場靜態標記(絕不從判官/評估器的敘述反解)。`/goals` 看板與任務詳情頁渲染成分類 chip,通道審批訊息多一行「類型」;未分類或既有舊任務一律讀成 `unknown`(安全預設)。`goal_notify.rs` 往來源對話推送一則帶四個動作的審批訊息——**重試 / 標記完成 / 中止 / 交給我**(fallback 到該 agent 的 `[proactive]` 控制通道)。一則訊息主要動作上限 3 個,因此重試/標記完成留在主要層,中止/交給我收進各平台自己的次要層:Telegram、Discord 各是第二排按鈕,Slack 是原生 `overflow` 選單;LINE 沒有對應的次要選單機制,這兩個動作不會出現在 LINE 的快速回覆裡,改以文字說明並附儀表板連結。其他無按鈕通道用文字 fallback,儀表板也有一欄 needs_human 看板。
 
 **交給我**只認領任務(`claimed_by`),不解決它——任務仍留在 `needs_human`,而驅動器的派工候選查詢本就不看這個狀態,所以不需要額外的狀態轉換就已經停止自動重試。這是目前實作的第一層(停止自動迴圈＋標記＋收斂卡片);把整段對話控制權轉交給人是後續階段的功能,尚未實作。
 
