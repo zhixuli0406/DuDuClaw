@@ -2881,7 +2881,7 @@ async fn forward_to_channel(
             let token = resolve_forward_token(
                 home_dir, originating_agent, chain_root_agent, "telegram",
                 &config, "telegram_bot_token_enc", "telegram_bot_token",
-            );
+            ).await;
             if token.is_empty() {
                 return Err("telegram_bot_token not configured".into());
             }
@@ -2928,7 +2928,7 @@ async fn forward_to_channel(
             let token = resolve_forward_token(
                 home_dir, originating_agent, chain_root_agent, "line",
                 &config, "line_channel_token_enc", "line_channel_token",
-            );
+            ).await;
             if token.is_empty() {
                 return Err("line_channel_token not configured".into());
             }
@@ -2963,7 +2963,7 @@ async fn forward_to_channel(
             let token = resolve_forward_token(
                 home_dir, originating_agent, chain_root_agent, "discord",
                 &config, "discord_bot_token_enc", "discord_bot_token",
-            );
+            ).await;
             if token.is_empty() {
                 return Err("discord_bot_token not configured".into());
             }
@@ -2985,7 +2985,7 @@ async fn forward_to_channel(
             let token = resolve_forward_token(
                 home_dir, originating_agent, chain_root_agent, "slack",
                 &config, "slack_bot_token_enc", "slack_bot_token",
-            );
+            ).await;
             if token.is_empty() {
                 return Err("slack_bot_token not configured".into());
             }
@@ -3008,9 +3008,10 @@ async fn forward_to_channel(
         }
         "whatsapp" => {
             let config_table = config.as_table().ok_or("config.toml is not a table")?;
-            let token = crate::config_crypto::decrypt_config_field(
+            let token = crate::config_crypto::decrypt_config_field_async(
                 config_table, "channels", "whatsapp_access_token", home_dir,
             )
+            .await
             .map(|s| s.expose_owned())
             .unwrap_or_default();
             let phone_id = config_table
@@ -3043,14 +3044,16 @@ async fn forward_to_channel(
         }
         "feishu" => {
             let config_table = config.as_table().ok_or("config.toml is not a table")?;
-            let app_id = crate::config_crypto::decrypt_config_field(
+            let app_id = crate::config_crypto::decrypt_config_field_async(
                 config_table, "channels", "feishu_app_id", home_dir,
             )
+            .await
             .map(|s| s.expose_owned())
             .unwrap_or_default();
-            let app_secret = crate::config_crypto::decrypt_config_field(
+            let app_secret = crate::config_crypto::decrypt_config_field_async(
                 config_table, "channels", "feishu_app_secret", home_dir,
             )
+            .await
             .map(|s| s.expose_owned())
             .unwrap_or_default();
             if app_id.is_empty() || app_secret.is_empty() {
@@ -3161,7 +3164,12 @@ async fn forward_to_channel(
 /// Empty string from the global fallback is treated the same as "no
 /// token configured" by the caller — `forward_to_channel` emits its
 /// own `<channel>_bot_token not configured` error in that case.
-fn resolve_forward_token(
+///
+/// Async since WP-6C — every call site already runs on the gateway's tokio
+/// runtime (`forward_to_channel`, the typing-guard resolvers below, and their
+/// tests), so the whole cascade can now resolve a network-backed `secret://`
+/// reference instead of failing closed on it.
+async fn resolve_forward_token(
     home_dir: &Path,
     callback_agent_id: &str,
     origin_agent: Option<&str>,
@@ -3175,7 +3183,7 @@ fn resolve_forward_token(
         home_dir,
         callback_agent_id,
         channel,
-    ) {
+    ).await {
         return tok.expose_owned();
     }
     // 3: origin_agent + its reports_to cascade (covers the case where
@@ -3183,12 +3191,12 @@ fn resolve_forward_token(
     if let Some(root) = origin_agent.filter(|s| !s.is_empty() && *s != callback_agent_id) {
         if let Some(tok) = crate::config_crypto::resolve_agent_channel_token_via_reports_to(
             home_dir, root, channel,
-        ) {
+        ).await {
             return tok.expose_owned();
         }
     }
     // 4: global fallback.
-    get_config_token(config, enc_key, plain_key, home_dir)
+    get_config_token(config, enc_key, plain_key, home_dir).await
 }
 
 /// Look up the origin_agent for a message_id. Used by
@@ -3219,7 +3227,12 @@ fn lookup_origin_agent(home_dir: &Path, message_id: &str) -> Option<String> {
 /// classifies through the one shared `SecretRef`. `plain_key` must be the
 /// `<field>` whose `<field>_enc` is `enc_key`; the pairing is asserted so a
 /// mismatched call cannot silently read the wrong field.
-fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
+///
+/// Async since WP-6C, using [`config_crypto::decrypt_config_field_async`] so a
+/// global channel token that is itself a network-backed `secret://` reference
+/// resolves instead of failing closed (the caller already parsed `config`, so
+/// this reuses it rather than re-reading `config.toml`).
+async fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
     debug_assert_eq!(
         enc_key,
         format!("{plain_key}_enc"),
@@ -3228,7 +3241,8 @@ fn get_config_token(config: &toml::Value, enc_key: &str, plain_key: &str, home_d
     let Some(table) = config.as_table() else {
         return String::new();
     };
-    crate::config_crypto::decrypt_config_field(table, "channels", plain_key, home_dir)
+    crate::config_crypto::decrypt_config_field_async(table, "channels", plain_key, home_dir)
+        .await
         .map(|s| s.expose_owned())
         .unwrap_or_default()
 }
@@ -3371,7 +3385,7 @@ async fn build_typing_guard_for_message(
     let token = resolve_forward_token(
         home_dir, &callback_agent, origin_agent, "telegram",
         &config, "telegram_bot_token_enc", "telegram_bot_token",
-    );
+    ).await;
     let guard = crate::channel_typing::typing_guard_for(
         forward_http().clone(), "telegram", &channel_id, thread_id.as_deref(), &token,
     );
@@ -3415,7 +3429,7 @@ async fn build_typing_guard_for_sqlite_message(
     let token = resolve_forward_token(
         home_dir, assigned_agent, None, "telegram",
         &config, "telegram_bot_token_enc", "telegram_bot_token",
-    );
+    ).await;
     crate::channel_typing::typing_guard_for(
         forward_http().clone(), "telegram", &source_chat_id, None, &token,
     )
@@ -4106,8 +4120,8 @@ bot_token = "{token}"
         std::fs::write(home.join("config.toml"), content).unwrap();
     }
 
-    #[test]
-    fn resolve_token_prefers_callback_agent_when_it_has_one() {
+    #[tokio::test]
+    async fn resolve_token_prefers_callback_agent_when_it_has_one() {
         let tmp = tempfile::tempdir().unwrap();
         write_agent_with_channel_token(tmp.path(), "duduclaw-tl", "discord", "TL_OWN_TOKEN");
         write_agent_with_channel_token(tmp.path(), "agnes", "discord", "AGNES_TOKEN");
@@ -4118,12 +4132,12 @@ bot_token = "{token}"
         let token = resolve_forward_token(
             tmp.path(), "duduclaw-tl", Some("agnes"), "discord",
             &config, "discord_bot_token_enc", "discord_bot_token",
-        );
+        ).await;
         assert_eq!(token, "TL_OWN_TOKEN");
     }
 
-    #[test]
-    fn resolve_token_cascades_to_chain_root_when_callback_agent_has_none() {
+    #[tokio::test]
+    async fn resolve_token_cascades_to_chain_root_when_callback_agent_has_none() {
         // The production bug: TL has no [channels.discord], only agnes
         // does, but the thread belongs to agnes. v1.8.19 fell back to
         // the (stale) global token → 401. v1.8.20 cascades to agnes.
@@ -4137,7 +4151,7 @@ bot_token = "{token}"
         let token = resolve_forward_token(
             tmp.path(), "duduclaw-tl", Some("agnes"), "discord",
             &config, "discord_bot_token_enc", "discord_bot_token",
-        );
+        ).await;
         assert_eq!(
             token, "AGNES_TOKEN",
             "Nested sub-agent forward should inherit chain-root's per-agent token, \
@@ -4145,8 +4159,8 @@ bot_token = "{token}"
         );
     }
 
-    #[test]
-    fn resolve_token_falls_back_to_global_when_neither_agent_has_one() {
+    #[tokio::test]
+    async fn resolve_token_falls_back_to_global_when_neither_agent_has_one() {
         let tmp = tempfile::tempdir().unwrap();
         // Neither agent has a [channels.discord] block.
         write_global_config(tmp.path(), "discord_bot_token", "GLOBAL_ONLY");
@@ -4156,12 +4170,12 @@ bot_token = "{token}"
         let token = resolve_forward_token(
             tmp.path(), "duduclaw-tl", Some("agnes"), "discord",
             &config, "discord_bot_token_enc", "discord_bot_token",
-        );
+        ).await;
         assert_eq!(token, "GLOBAL_ONLY");
     }
 
-    #[test]
-    fn resolve_token_no_infinite_self_loop_when_origin_equals_callback() {
+    #[tokio::test]
+    async fn resolve_token_no_infinite_self_loop_when_origin_equals_callback() {
         // Edge case: callback_agent_id == origin_agent (same agent). The
         // cascade must not double-query or infinite-loop; just skip the
         // chain-root tier and go straight to global.
@@ -4173,12 +4187,12 @@ bot_token = "{token}"
         let token = resolve_forward_token(
             tmp.path(), "agnes", Some("agnes"), "discord",
             &config, "discord_bot_token_enc", "discord_bot_token",
-        );
+        ).await;
         assert_eq!(token, "GLOBAL_TOKEN");
     }
 
-    #[test]
-    fn resolve_token_handles_missing_origin_agent() {
+    #[tokio::test]
+    async fn resolve_token_handles_missing_origin_agent() {
         // `lookup_origin_agent` can return None (DB missing, row missing,
         // NULL origin). Cascade must still work: callback_agent_id →
         // (no root hop) → global.
@@ -4190,7 +4204,7 @@ bot_token = "{token}"
         let token = resolve_forward_token(
             tmp.path(), "duduclaw-tl", None, "discord",
             &config, "discord_bot_token_enc", "discord_bot_token",
-        );
+        ).await;
         assert_eq!(token, "GLOBAL_TOKEN");
     }
 

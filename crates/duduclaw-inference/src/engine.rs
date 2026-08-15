@@ -121,7 +121,7 @@ impl InferenceEngine {
                     model,
                 };
                 *self.backend.write().await =
-                    Some(Arc::new(OpenAiCompatBackend::new_with_home(compat, &self.home_dir)));
+                    Some(Arc::new(OpenAiCompatBackend::new_with_home(compat, &self.home_dir).await));
             }
         }
 
@@ -151,7 +151,7 @@ impl InferenceEngine {
             return Ok(Box::new(OpenAiCompatBackend::new_with_home(
                 compat.clone(),
                 &self.home_dir,
-            )));
+            ).await));
         }
 
         let backend_type = self.config.backend.unwrap_or(hw.recommended_backend);
@@ -540,11 +540,10 @@ impl InferenceEngine {
         // Only the configured endpoint may carry a key; manager-discovered
         // llamafile/Exo servers are keyless local processes.
         let api_key = match source {
-            crate::adapter::CompatSource::Config => self
-                .config
-                .openai_compat
-                .as_ref()
-                .and_then(|c| c.resolved_api_key(&self.home_dir)),
+            crate::adapter::CompatSource::Config => match self.config.openai_compat.as_ref() {
+                Some(c) => c.resolved_api_key(&self.home_dir).await,
+                None => None,
+            },
             crate::adapter::CompatSource::Manager => None,
         };
         Some(crate::adapter::CompatEndpoint { base_url, model, api_key })

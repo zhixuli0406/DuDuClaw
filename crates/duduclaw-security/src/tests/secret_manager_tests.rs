@@ -216,6 +216,49 @@ vault_token = "hvs.abc"
     assert_eq!(config.effective_vault_mount(), "secret");
 }
 
+// ─── SecretManagerConfig::load_from_home (WP-6C) ───────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static LOAD_FROM_HOME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn load_from_home_temp_dir(label: &str) -> std::path::PathBuf {
+    let n = LOAD_FROM_HOME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("duduclaw-smcfg-{label}-{}-{n}", std::process::id()))
+}
+
+#[tokio::test]
+async fn test_load_from_home_reads_secret_manager_section() {
+    let home = load_from_home_temp_dir("ok");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "[secret_manager]\nbackend = \"vault\"\nvault_addr = \"http://vault.local:8200\"\n",
+    )
+    .unwrap();
+    let cfg = SecretManagerConfig::load_from_home(&home).await;
+    assert_eq!(cfg.backend, "vault");
+    assert_eq!(cfg.vault_addr.as_deref(), Some("http://vault.local:8200"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn test_load_from_home_missing_file_is_default() {
+    let home = load_from_home_temp_dir("missing");
+    // Deliberately do not create the directory or config.toml.
+    let cfg = SecretManagerConfig::load_from_home(&home).await;
+    assert_eq!(cfg.backend, "local");
+}
+
+#[tokio::test]
+async fn test_load_from_home_malformed_toml_is_default() {
+    let home = load_from_home_temp_dir("bad");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.toml"), "not valid = = toml").unwrap();
+    let cfg = SecretManagerConfig::load_from_home(&home).await;
+    assert_eq!(cfg.backend, "local");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 // ─── Env backend via SecretUri ─────────────────────────────────────────────
 
 #[tokio::test]

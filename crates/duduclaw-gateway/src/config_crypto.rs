@@ -15,17 +15,40 @@
 //!   honoured only by the async [`read_encrypted_config_field`]; every
 //!   synchronous path (per-agent channel tokens, the `reports_to` cascade, the
 //!   raw-table reader) handed the URI back verbatim and it was sent to the
-//!   vendor API as the bot token. Synchronous paths resolve inline ciphertext,
-//!   legacy plaintext and `secret://env/…`; a reference to a *network* backend
-//!   fails closed with a warning there (never a literal) and resolves normally
-//!   on the async path.
+//!   vendor API as the bot token. WP-H1 made those paths resolve inline
+//!   ciphertext, legacy plaintext and `secret://env/…`, with a reference to a
+//!   *network* backend failing closed with a warning there (never a literal).
+//!   WP-6C (2026-08) finished the job: every production caller of the
+//!   per-agent token / `reports_to` cascade helpers below now runs on the
+//!   gateway's tokio runtime and reaches full network-backend resolution
+//!   too — [`resolve_agent_token`], [`read_agent_channel_token`], and
+//!   [`resolve_agent_channel_token_via_reports_to`] are `async fn`. Only
+//!   [`decrypt_config_field`] keeps a synchronous, fail-closed-on-network
+//!   twin ([`decrypt_config_field_async`] is its async counterpart) for any
+//!   future genuinely-synchronous caller.
 //! - **"Empty" is not a value.** Resolvers return `Option<Secret>`, and
 //!   `Secret` cannot hold the empty string, so callers no longer each decide
 //!   what `""` means.
 
 use std::path::Path;
 
+use duduclaw_security::secret_manager::SecretManagerConfig;
 use duduclaw_security::secret_ref::{Secret, SecretRef, SecretStatus};
+
+/// Extract `[secret_manager]` from a config table already sitting in memory.
+///
+/// Shared by [`decrypt_config_field_async`] and [`read_encrypted_config_field`]
+/// so the "how do I turn a parsed table into a `SecretManagerConfig`" step
+/// exists exactly once here (the disk-reading half — when a caller has only a
+/// `home_dir` and no table yet — is
+/// [`duduclaw_security::secret_manager::SecretManagerConfig::load_from_home`]).
+fn secret_manager_config_from_table(table: &toml::Table) -> SecretManagerConfig {
+    table
+        .get("secret_manager")
+        .cloned()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_default()
+}
 
 /// Load the AES-256 keyfile from `~/.duduclaw/.keyfile`.
 /// Used by GVU encryption, the ObservationFinalizer CLI, and other internal
@@ -143,12 +166,23 @@ pub fn encrypt_value(plaintext: &str, home_dir: &Path) -> Option<String> {
 /// nothing is configured; the six call sites that used to re-check
 /// `!token.is_empty()` after this call no longer need to, and Discord's
 /// hand-inlined copy of this logic is gone (WP-H1 P0).
-pub(crate) fn resolve_agent_token(
+///
+/// Async since WP-6C: every `start_*_bots()` caller already runs on the
+/// gateway's tokio runtime, so this now resolves network-backed `secret://`
+/// references (Vault / 1Password / Infisical) instead of failing closed on
+/// them. `sm_cfg` is threaded in rather than loaded here because callers
+/// resolve this once per agent in a loop — loading it inside would mean one
+/// `config.toml` read per agent (per channel, for Slack's two tokens) instead
+/// of one per `start_*_bots()` call.
+pub(crate) async fn resolve_agent_token(
     encrypted: &Option<String>,
     plaintext: &str,
     home_dir: &Path,
+    sm_cfg: &SecretManagerConfig,
 ) -> Option<Secret> {
-    SecretRef::from_typed(encrypted.as_deref(), plaintext).resolve_sync(home_dir)
+    SecretRef::from_typed(encrypted.as_deref(), plaintext)
+        .resolve(sm_cfg, home_dir)
+        .await
 }
 
 /// Non-secret status of a per-agent channel credential: configured / source /
@@ -297,8 +331,14 @@ pub fn describe_config_field(
 ///
 /// The plaintext twin may hold a `secret://<backend>/<name>` reference:
 /// `secret://env/…` resolves here; a network-backed reference fails closed with
-/// a warning (it needs [`read_encrypted_config_field`], which can `await`).
+/// a warning (it needs [`decrypt_config_field_async`] or
+/// [`read_encrypted_config_field`], which can `await`).
 /// Either way the URI itself is never returned as if it were the credential.
+///
+/// Retained for any genuinely-synchronous caller (none exists in production as
+/// of WP-6C — every real call site that used to reach this now goes through
+/// [`decrypt_config_field_async`]) and exercised directly by this module's own
+/// tests, which assert the fail-closed behaviour on a network reference.
 pub fn decrypt_config_field(
     table: &toml::Table,
     section: &str,
@@ -306,6 +346,30 @@ pub fn decrypt_config_field(
     home_dir: &Path,
 ) -> Option<Secret> {
     let raw = config_secret_ref(table, section, field_base).resolve_sync(home_dir)?;
+    Some(apply_field_repairs(field_base, raw))
+}
+
+/// Async twin of [`decrypt_config_field`] (WP-6C) for callers already holding
+/// a parsed table on an async call path: resolves a network-backed
+/// `secret://` reference (Vault / 1Password / Infisical) instead of failing
+/// closed.
+///
+/// `table` supplies both the field being read and the `[secret_manager]`
+/// section describing how to reach a network backend — the same table
+/// [`read_encrypted_config_field`] would otherwise re-read from disk, so a
+/// caller that already parsed `config.toml` (e.g. `dispatcher.rs`'s
+/// delegation-forward path, which needs the table for other fields too) does
+/// not pay for a second read just to gain network-backend support.
+pub async fn decrypt_config_field_async(
+    table: &toml::Table,
+    section: &str,
+    field_base: &str,
+    home_dir: &Path,
+) -> Option<Secret> {
+    let sm_cfg = secret_manager_config_from_table(table);
+    let raw = config_secret_ref(table, section, field_base)
+        .resolve(&sm_cfg, home_dir)
+        .await?;
     Some(apply_field_repairs(field_base, raw))
 }
 
@@ -338,20 +402,12 @@ pub async fn read_encrypted_config_field(
     section: &str,
     field_base: &str,
 ) -> Option<String> {
-    use duduclaw_security::secret_manager::SecretManagerConfig;
-
     let config_path = home_dir.join("config.toml");
     let content = tokio::fs::read_to_string(&config_path).await.ok()?;
     let table: toml::Table = content.parse().ok()?;
-    let sm_cfg: SecretManagerConfig = table
-        .get("secret_manager")
-        .cloned()
-        .and_then(|v| v.try_into().ok())
-        .unwrap_or_default();
-    let resolved = config_secret_ref(&table, section, field_base)
-        .resolve(&sm_cfg, home_dir)
-        .await?;
-    Some(apply_field_repairs(field_base, resolved).expose_owned())
+    decrypt_config_field_async(&table, section, field_base, home_dir)
+        .await
+        .map(Secret::expose_owned)
 }
 
 // ─── Per-agent channel token + reports_to cascade ───────────
@@ -359,12 +415,18 @@ pub async fn read_encrypted_config_field(
 /// Read a single agent's `[channels.<channel>] bot_token(_enc)` from its
 /// `agent.toml`. Returns `None` when the file is missing or the agent
 /// has no token for that channel.
-pub fn read_agent_channel_token(
+///
+/// Async since WP-6C — see [`resolve_agent_channel_token_via_reports_to`] for
+/// why `sm_cfg` is a parameter rather than loaded inside.
+pub async fn read_agent_channel_token(
     home_dir: &Path,
     agent_id: &str,
     channel: &str,
+    sm_cfg: &SecretManagerConfig,
 ) -> Option<Secret> {
-    agent_channel_token_ref(home_dir, agent_id, channel)?.resolve_sync(home_dir)
+    agent_channel_token_ref(home_dir, agent_id, channel)?
+        .resolve(sm_cfg, home_dir)
+        .await
 }
 
 /// The [`SecretRef`] for one agent's `[channels.<channel>] bot_token(_enc)`.
@@ -449,11 +511,19 @@ const MAX_REPORTS_TO_HOPS: usize = 8;
 ///
 /// Tracks visited ids in a `HashSet` and bails at `MAX_REPORTS_TO_HOPS`,
 /// so a misconfigured loop (`a → b → a`) cannot wedge the resolver.
-pub fn resolve_agent_channel_token_via_reports_to(
+///
+/// Async since WP-6C: every production caller (`goal_notify`,
+/// `dispatcher::resolve_forward_token`, `cron_scheduler::resolve_channel_token`)
+/// already runs on the gateway's tokio runtime, so this can now resolve a
+/// network-backed `secret://` reference instead of failing closed on it.
+/// `[secret_manager]` is loaded once up front (not per hop) since the chain
+/// can walk up to `MAX_REPORTS_TO_HOPS` agents.
+pub async fn resolve_agent_channel_token_via_reports_to(
     home_dir: &Path,
     agent_id: &str,
     channel: &str,
 ) -> Option<Secret> {
+    let sm_cfg = SecretManagerConfig::load_from_home(home_dir).await;
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current = agent_id.to_string();
     for _ in 0..MAX_REPORTS_TO_HOPS {
@@ -466,7 +536,7 @@ pub fn resolve_agent_channel_token_via_reports_to(
             );
             return None;
         }
-        if let Some(tok) = read_agent_channel_token(home_dir, &current, channel) {
+        if let Some(tok) = read_agent_channel_token(home_dir, &current, channel, &sm_cfg).await {
             return Some(tok);
         }
         match read_reports_to(home_dir, &current) {
@@ -517,8 +587,10 @@ pub async fn channel_dm_token_candidates(home_dir: &Path, channel: &str) -> Vec<
         Err(_) => Vec::new(),
     };
     ids.sort();
+    // Loaded once, not per agent — this can iterate every agent directory.
+    let sm_cfg = SecretManagerConfig::load_from_home(home_dir).await;
     for id in ids {
-        if let Some(tok) = read_agent_channel_token(home_dir, &id, channel) {
+        if let Some(tok) = read_agent_channel_token(home_dir, &id, channel, &sm_cfg).await {
             let tok = tok.expose_owned();
             if !out.contains(&tok) {
                 out.push(tok);
@@ -777,73 +849,73 @@ mod tests {
         )
     }
 
-    #[test]
-    fn resolves_own_token_when_present() {
+    #[tokio::test]
+    async fn resolves_own_token_when_present() {
         let home = TempHome::new();
         home.write_agent("xianwen-pm", &agent_toml("xianwen-pm", "xianwen-tl", Some("own-token")));
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord");
+        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord").await;
         assert_eq!(tok.map(|t| t.expose_owned()).as_deref(), Some("own-token"));
     }
 
-    #[test]
-    fn resolves_parent_token_when_self_empty() {
+    #[tokio::test]
+    async fn resolves_parent_token_when_self_empty() {
         let home = TempHome::new();
         home.write_agent("xianwen-pm", &agent_toml("xianwen-pm", "xianwen-tl", None));
         home.write_agent("xianwen-tl", &agent_toml("xianwen-tl", "agnes", None));
         home.write_agent("agnes", &agent_toml("agnes", "", Some("agnes-bot-token")));
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord");
+        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord").await;
         assert_eq!(tok.map(|t| t.expose_owned()).as_deref(), Some("agnes-bot-token"));
     }
 
-    #[test]
-    fn returns_none_when_chain_has_no_token() {
+    #[tokio::test]
+    async fn returns_none_when_chain_has_no_token() {
         let home = TempHome::new();
         home.write_agent("a", &agent_toml("a", "b", None));
         home.write_agent("b", &agent_toml("b", "c", None));
         home.write_agent("c", &agent_toml("c", "", None));
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "a", "discord");
+        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "a", "discord").await;
         assert!(tok.is_none());
     }
 
-    #[test]
-    fn stops_at_first_token_not_farthest_ancestor() {
+    #[tokio::test]
+    async fn stops_at_first_token_not_farthest_ancestor() {
         // xianwen-pm has no token; xianwen-tl has a token; agnes also has one.
         // Cascade should return xianwen-tl's (the nearest ancestor).
         let home = TempHome::new();
         home.write_agent("xianwen-pm", &agent_toml("xianwen-pm", "xianwen-tl", None));
         home.write_agent("xianwen-tl", &agent_toml("xianwen-tl", "agnes", Some("tl-token")));
         home.write_agent("agnes", &agent_toml("agnes", "", Some("agnes-token")));
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord");
+        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "xianwen-pm", "discord").await;
         assert_eq!(tok.map(|t| t.expose_owned()).as_deref(), Some("tl-token"));
     }
 
-    #[test]
-    fn cycle_detection_returns_none_without_stack_overflow() {
+    #[tokio::test]
+    async fn cycle_detection_returns_none_without_stack_overflow() {
         let home = TempHome::new();
         home.write_agent("a", &agent_toml("a", "b", None));
         home.write_agent("b", &agent_toml("b", "a", None)); // cycle
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "a", "discord");
+        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "a", "discord").await;
         assert!(tok.is_none());
     }
 
-    #[test]
-    fn missing_agent_toml_returns_none() {
+    #[tokio::test]
+    async fn missing_agent_toml_returns_none() {
         let home = TempHome::new();
         // No agent files at all.
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "ghost", "discord");
+        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "ghost", "discord").await;
         assert!(tok.is_none());
     }
 
-    #[test]
-    fn reports_to_empty_string_is_treated_as_root() {
+    #[tokio::test]
+    async fn reports_to_empty_string_is_treated_as_root() {
         let home = TempHome::new();
         home.write_agent("solo", &agent_toml("solo", "", None));
-        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "solo", "discord");
+        let tok = resolve_agent_channel_token_via_reports_to(home.path(), "solo", "discord").await;
         assert!(tok.is_none());
     }
 
-    #[test]
-    fn different_channel_keys_are_independent() {
+    #[tokio::test]
+    async fn different_channel_keys_are_independent() {
         // Agent configures only Telegram; Discord lookup should fall through.
         let home = TempHome::new();
         let tg_body = "[agent]\nname = \"x\"\nreports_to = \"\"\n\
@@ -851,11 +923,12 @@ mod tests {
         home.write_agent("x", tg_body);
         assert_eq!(
             resolve_agent_channel_token_via_reports_to(home.path(), "x", "telegram")
+                .await
                 .map(|t| t.expose_owned())
                 .as_deref(),
             Some("tg-tok")
         );
-        assert!(resolve_agent_channel_token_via_reports_to(home.path(), "x", "discord").is_none());
+        assert!(resolve_agent_channel_token_via_reports_to(home.path(), "x", "discord").await.is_none());
     }
 
     // ─── MED-B: enc-only fields (no plaintext copy) stay readable ──
@@ -1128,10 +1201,11 @@ mod wp_h1_credentials_doctrine_tests {
 
     /// Before WP-H1 every one of these returned the URI string itself, which
     /// was then sent to Telegram / Discord / Slack as the bot token.
-    #[test]
-    fn sync_paths_never_return_a_secret_uri_as_the_token() {
+    #[tokio::test]
+    async fn sync_paths_never_return_a_secret_uri_as_the_token() {
         let home = TempHome::new();
         let reference = "secret://vault/telegram_bot_token";
+        let sm_cfg = SecretManagerConfig::default();
 
         // (a) raw config table
         let table: toml::Table =
@@ -1140,7 +1214,7 @@ mod wp_h1_credentials_doctrine_tests {
         assert!(got.is_none(), "config field leaked a secret:// literal");
 
         // (b) per-agent typed token (telegram.rs / slack.rs / discord.rs)
-        let got = resolve_agent_token(&None, reference, home.path());
+        let got = resolve_agent_token(&None, reference, home.path(), &sm_cfg).await;
         assert!(got.is_none(), "agent token leaked a secret:// literal");
 
         // (c) per-agent channel token + reports_to cascade
@@ -1156,30 +1230,33 @@ mod wp_h1_credentials_doctrine_tests {
             ),
         );
         assert!(
-            read_agent_channel_token(home.path(), "boss", "discord").is_none(),
+            read_agent_channel_token(home.path(), "boss", "discord", &sm_cfg).await.is_none(),
             "per-agent token leaked a secret:// literal"
         );
         assert!(
-            resolve_agent_channel_token_via_reports_to(home.path(), "kid", "discord").is_none(),
+            resolve_agent_channel_token_via_reports_to(home.path(), "kid", "discord").await.is_none(),
             "reports_to cascade leaked a secret:// literal"
         );
     }
 
     /// The other half of the fix: a reference that a sync path *can* satisfy.
-    #[test]
-    fn sync_paths_resolve_env_references() {
+    #[tokio::test]
+    async fn sync_paths_resolve_env_references() {
         let home = TempHome::new();
         let var = format!("DUDUCLAW_WPH1_SYNC_{}", std::process::id());
         // SAFETY: process-unique name, set and removed inside this test.
         unsafe { std::env::set_var(&var, "env-token") };
         let reference = format!("secret://env/{var}");
+        let sm_cfg = SecretManagerConfig::default();
 
         let table: toml::Table =
             format!("[channels]\ndiscord_bot_token = \"{reference}\"\n").parse().unwrap();
         let from_config = decrypt_config_field(&table, "channels", "discord_bot_token", home.path())
             .map(|s| s.expose_owned());
         let from_agent =
-            resolve_agent_token(&None, &reference, home.path()).map(|s| s.expose_owned());
+            resolve_agent_token(&None, &reference, home.path(), &sm_cfg)
+                .await
+                .map(|s| s.expose_owned());
 
         home.write_agent(
             "solo",
@@ -1190,6 +1267,7 @@ mod wp_h1_credentials_doctrine_tests {
         );
         let from_cascade =
             resolve_agent_channel_token_via_reports_to(home.path(), "solo", "discord")
+                .await
                 .map(|s| s.expose_owned());
         unsafe { std::env::remove_var(&var) };
 
@@ -1200,11 +1278,12 @@ mod wp_h1_credentials_doctrine_tests {
 
     // ─── Empty-value semantics collapsed onto Option ────────────
 
-    #[test]
-    fn empty_inputs_are_none_not_empty_strings() {
+    #[tokio::test]
+    async fn empty_inputs_are_none_not_empty_strings() {
         let home = TempHome::new();
-        assert!(resolve_agent_token(&None, "", home.path()).is_none());
-        assert!(resolve_agent_token(&Some(String::new()), "", home.path()).is_none());
+        let sm_cfg = SecretManagerConfig::default();
+        assert!(resolve_agent_token(&None, "", home.path(), &sm_cfg).await.is_none());
+        assert!(resolve_agent_token(&Some(String::new()), "", home.path(), &sm_cfg).await.is_none());
         let table: toml::Table = "[channels]\ndiscord_bot_token = \"\"\n".parse().unwrap();
         assert!(decrypt_config_field(&table, "channels", "discord_bot_token", home.path()).is_none());
     }
@@ -1212,12 +1291,15 @@ mod wp_h1_credentials_doctrine_tests {
     /// The typed `agent.toml` structs cannot express "present but blank", so an
     /// enc-only agent channel must still resolve — the exact case
     /// `handlers.rs`'s enc-only round-trip test covers.
-    #[test]
-    fn typed_enc_only_agent_token_survives_the_blank_plaintext() {
+    #[tokio::test]
+    async fn typed_enc_only_agent_token_survives_the_blank_plaintext() {
         let home = TempHome::new();
         let enc = encrypt_value("enc-only-agent-token", home.path()).unwrap();
+        let sm_cfg = SecretManagerConfig::default();
         assert_eq!(
-            resolve_agent_token(&Some(enc), "", home.path()).map(|s| s.expose_owned()),
+            resolve_agent_token(&Some(enc), "", home.path(), &sm_cfg)
+                .await
+                .map(|s| s.expose_owned()),
             Some("enc-only-agent-token".to_string())
         );
     }

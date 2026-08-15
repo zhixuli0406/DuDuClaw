@@ -237,6 +237,10 @@ pub async fn start_telegram_bots(
     let mut results = Vec::new();
     let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Loaded once for the whole bot-start pass (WP-6C) — every per-agent
+    // resolve below shares it rather than re-reading config.toml per agent.
+    let sm_cfg = duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(home_dir).await;
+
     // Collect per-agent tokens FIRST so the global poller can defer to them.
     let agent_tokens: Vec<(String, String)> = {
         let reg = ctx.registry.read().await;
@@ -247,8 +251,8 @@ pub async fn start_telegram_bots(
                     // WP-H1: the resolver returns `None` for "not configured";
                     // there is no empty-string state left to re-check here.
                     if let Some(token) = crate::config_crypto::resolve_agent_token(
-                        &tg.bot_token_enc, &tg.bot_token, home_dir,
-                    ) {
+                        &tg.bot_token_enc, &tg.bot_token, home_dir, &sm_cfg,
+                    ).await {
                         // WP12: repair a stored token whose ':' was lost before
                         // it reaches dedup — otherwise the same bot could be
                         // seen as two different tokens.

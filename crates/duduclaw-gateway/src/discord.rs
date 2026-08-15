@@ -312,6 +312,10 @@ pub async fn start_discord_bots(
     let mut results: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Loaded once for the whole bot-start pass (WP-6C) — every per-agent
+    // resolve below shares it rather than re-reading config.toml per agent.
+    let sm_cfg = duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(home_dir).await;
+
     // Collect per-agent tokens first so we know whether the global token is
     // the only path or a legacy fallback — this lets us demote a 401 on the
     // global token to info-level when per-agent bots will cover Discord anyway.
@@ -329,7 +333,8 @@ pub async fn start_discord_bots(
                         &discord.bot_token_enc,
                         &discord.bot_token,
                         home_dir,
-                    ) {
+                        &sm_cfg,
+                    ).await {
                         tokens.push((agent.config.agent.name.clone(), token.expose_owned()));
                     }
                 }

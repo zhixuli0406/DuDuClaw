@@ -237,15 +237,24 @@ impl OpenAiCompatConfig {
     /// bearer token**: every request failed 401 while the operator's secret
     /// backend layout travelled in an `Authorization` header. Routing through
     /// the shared [`duduclaw_security::secret_ref::SecretRef`] resolves the
-    /// reference instead (`env` / `keychain` / `file` here — a network backend
-    /// fails closed with a warning, never a literal, since this call site is
-    /// synchronous).
-    pub fn resolved_api_key(&self, home_dir: &std::path::Path) -> Option<String> {
+    /// reference instead.
+    ///
+    /// Async since WP-6C: both call sites
+    /// (`OpenAiCompatBackend::new_with_home`, `InferenceManager::compat_endpoint`)
+    /// already run on the crate's tokio runtime, so this now also resolves a
+    /// network-backed reference (Vault / 1Password / Infisical) instead of
+    /// failing closed on it — `[secret_manager]` is read from
+    /// `<home_dir>/config.toml` (`inference.toml` has no such section of its
+    /// own).
+    pub async fn resolved_api_key(&self, home_dir: &std::path::Path) -> Option<String> {
+        let sm_cfg =
+            duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(home_dir).await;
         duduclaw_security::secret_ref::SecretRef::from_typed(
             self.api_key_enc.as_deref(),
             self.api_key.as_deref().unwrap_or(""),
         )
-        .resolve_sync(home_dir)
+        .resolve(&sm_cfg, home_dir)
+        .await
         .map(|s| s.expose_owned())
     }
 }
@@ -539,54 +548,58 @@ mod openai_compat_key_tests {
         }
     }
 
-    #[test]
-    fn enc_key_resolves_to_plaintext() {
+    #[tokio::test]
+    async fn enc_key_resolves_to_plaintext() {
         let home = TempHome::new();
         let engine = home.with_keyfile();
         let enc = engine.encrypt_string("sk-encrypted").unwrap();
         let c = cfg(Some("sk-plain"), Some(&enc));
-        assert_eq!(c.resolved_api_key(home.path()).as_deref(), Some("sk-encrypted"));
+        assert_eq!(c.resolved_api_key(home.path()).await.as_deref(), Some("sk-encrypted"));
     }
 
-    #[test]
-    fn plaintext_only_returns_plaintext() {
+    #[tokio::test]
+    async fn plaintext_only_returns_plaintext() {
         let home = TempHome::new();
         let c = cfg(Some("sk-plain"), None);
-        assert_eq!(c.resolved_api_key(home.path()).as_deref(), Some("sk-plain"));
+        assert_eq!(c.resolved_api_key(home.path()).await.as_deref(), Some("sk-plain"));
     }
 
-    #[test]
-    fn neither_returns_none() {
+    #[tokio::test]
+    async fn neither_returns_none() {
         let home = TempHome::new();
         let c = cfg(None, None);
-        assert!(c.resolved_api_key(home.path()).is_none());
+        assert!(c.resolved_api_key(home.path()).await.is_none());
     }
 
-    #[test]
-    fn enc_failure_falls_back_to_plaintext() {
+    #[tokio::test]
+    async fn enc_failure_falls_back_to_plaintext() {
         // No keyfile present → cannot decrypt enc → fall back to plaintext.
         let home = TempHome::new();
         let c = cfg(Some("sk-plain"), Some("garbage"));
-        assert_eq!(c.resolved_api_key(home.path()).as_deref(), Some("sk-plain"));
+        assert_eq!(c.resolved_api_key(home.path()).await.as_deref(), Some("sk-plain"));
     }
 
     /// WP-H1 P1 — the dialect-7 bug: a `secret://` reference used to be
     /// returned as the bearer token.
-    #[test]
-    fn a_secret_reference_resolves_and_never_becomes_the_bearer_token() {
+    #[tokio::test]
+    async fn a_secret_reference_resolves_and_never_becomes_the_bearer_token() {
         let home = TempHome::new();
         let var = format!("DUDUCLAW_INFER_KEY_{}", std::process::id());
         // SAFETY: process-unique variable name, set and removed within this test.
         unsafe { std::env::set_var(&var, "sk-from-env") };
         let c = cfg(Some(&format!("secret://env/{var}")), None);
-        let got = c.resolved_api_key(home.path());
+        let got = c.resolved_api_key(home.path()).await;
         unsafe { std::env::remove_var(&var) };
         assert_eq!(got.as_deref(), Some("sk-from-env"));
 
-        // A network-backed reference cannot be fetched from this synchronous
-        // path — it must read as "no key", never as the URI itself.
+        // A network-backed reference with no `[secret_manager]` vault_token
+        // configured (this `TempHome` has no `config.toml` at all, so
+        // `SecretManagerConfig::load_from_home` falls back to `::default()`)
+        // still reads as "no key" — fail-soft, never the URI itself — even
+        // though this path is async since WP-6C and can in principle reach a
+        // real Vault server once one is configured.
         let c = cfg(Some("secret://vault/deepseek"), None);
-        assert_eq!(c.resolved_api_key(home.path()), None);
+        assert_eq!(c.resolved_api_key(home.path()).await, None);
     }
 
     #[test]

@@ -330,6 +330,28 @@ impl SecretManagerConfig {
         Ok(wrapper.secret_manager)
     }
 
+    /// Load `[secret_manager]` from `<home_dir>/config.toml`, async (WP-6C).
+    ///
+    /// The canonical replacement for the hand-rolled "read config.toml, parse
+    /// `[secret_manager]`" loader that had accreted independently in
+    /// `duduclaw-gateway::tick_headers`, `duduclaw-agent::account_rotator`, and
+    /// (as of WP-6C) `duduclaw-gateway::config_crypto` /
+    /// `duduclaw-inference::config` — new async call sites should prefer this
+    /// over adding an N+1th copy.
+    ///
+    /// Fail-safe like every existing copy: a missing file, an unreadable file,
+    /// or a malformed `[secret_manager]` table all yield [`Self::default`]
+    /// (backend `"local"`) rather than an error — a broken secret-manager
+    /// config must never block credential resolution for the *local* backends
+    /// ([`SecretBackend::is_local`]) a caller may only need.
+    pub async fn load_from_home(home_dir: &std::path::Path) -> Self {
+        let config_path = home_dir.join("config.toml");
+        let Ok(content) = tokio::fs::read_to_string(&config_path).await else {
+            return Self::default();
+        };
+        Self::from_toml_str(&content).unwrap_or_default()
+    }
+
     /// Effective Vault address (falls back to `http://127.0.0.1:8200`).
     pub fn effective_vault_addr(&self) -> &str {
         self.vault_addr

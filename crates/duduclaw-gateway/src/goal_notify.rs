@@ -111,6 +111,7 @@ pub(crate) async fn channel_token(home_dir: &Path, agent_id: &str, channel: &str
     // has no empty-string state left to re-check.
     if let Some(tok) =
         crate::config_crypto::resolve_agent_channel_token_via_reports_to(home_dir, agent_id, channel)
+            .await
     {
         return Some(tok.expose_owned());
     }
