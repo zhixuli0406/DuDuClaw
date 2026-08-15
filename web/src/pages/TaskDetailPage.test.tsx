@@ -148,3 +148,75 @@ describe('TaskDetailPage — 等你決定 (WP-A §2-6)', () => {
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
   });
 });
+
+// ── I-3a: 已完成／失敗可續推 — a goal-mode task that already reached a
+// terminal state can take a follow-up message and get reopened for another
+// round instead of being a dead end (design doc §3.3).
+
+const GOAL_DONE: TaskInfo = { ...TASK, status: 'done', goal_mode: true };
+const GOAL_FAILED: TaskInfo = { ...TASK, status: 'failed', goal_mode: true };
+const GOAL_CANCELLED: TaskInfo = { ...TASK, status: 'cancelled', goal_mode: true };
+const BOARD_DONE: TaskInfo = { ...TASK, status: 'done', goal_mode: false };
+
+describe('TaskDetailPage — 接著做 (I-3a)', () => {
+  it('renders the continue panel for a done goal task', () => {
+    mockWsClient.call.mockResolvedValue({ tasks: [GOAL_DONE], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [GOAL_DONE], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.getByRole('textbox', { name: 'Continue' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeInTheDocument();
+  });
+
+  it('renders the continue panel for a failed goal task', () => {
+    mockWsClient.call.mockResolvedValue({ tasks: [GOAL_FAILED], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [GOAL_FAILED], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.getByRole('textbox', { name: 'Continue' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeInTheDocument();
+  });
+
+  it('renders the continue panel for a cancelled goal task', () => {
+    mockWsClient.call.mockResolvedValue({ tasks: [GOAL_CANCELLED], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [GOAL_CANCELLED], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.getByRole('textbox', { name: 'Continue' })).toBeInTheDocument();
+  });
+
+  it('hides the continue panel for a done task that is not goal-mode (an ordinary board task)', () => {
+    mockWsClient.call.mockResolvedValue({ tasks: [BOARD_DONE], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [BOARD_DONE], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.queryByRole('textbox', { name: 'Continue' })).toBeNull();
+  });
+
+  it('hides the continue panel for a live (non-terminal) goal task', () => {
+    const live: TaskInfo = { ...TASK, status: 'in_progress', goal_mode: true };
+    mockWsClient.call.mockResolvedValue({ tasks: [live], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [live], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.queryByRole('textbox', { name: 'Continue' })).toBeNull();
+  });
+
+  it('disables submit until a message is typed, then routes through tasks.goal_decide with action: continue', async () => {
+    const user = userEvent.setup();
+    mockWsClient.call.mockResolvedValue({ tasks: [GOAL_DONE], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [GOAL_DONE], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+
+    const submitBtn = screen.getByRole('button', { name: 'Continue' });
+    expect(submitBtn).toBeDisabled();
+
+    await user.type(screen.getByRole('textbox', { name: 'Continue' }), 'Please also email the summary to Sam');
+    expect(submitBtn).toBeEnabled();
+
+    mockWsClient.call.mockResolvedValueOnce({ ok: true, message: 'queued', task: GOAL_DONE });
+    await user.click(submitBtn);
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_decide', {
+        task_id: 'task-aaaa1111',
+        action: 'continue',
+        message: 'Please also email the summary to Sam',
+      }),
+    );
+  });
+});

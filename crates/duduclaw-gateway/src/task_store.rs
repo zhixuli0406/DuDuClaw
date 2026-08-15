@@ -22,6 +22,19 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline";
 
+/// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
+/// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
+/// "接著做" follow-up message apart from a genuine judge-rejection feedback
+/// string and phrase the next dispatch prompt correctly. An unprintable
+/// (NUL-delimited) prefix — never appears in real judge text or a pasted
+/// human note — so a message that happens to start with the same words is
+/// never misclassified. Never surfaced to a user: every dashboard view that
+/// renders `task.judge_feedback` is gated on `status IN ('failed',
+/// 'needs_human')`, and `continue_from_terminal` always leaves the row in
+/// `pending`; the marker is fully overwritten the moment the task next
+/// passes through `accept_review`/`reject_review`.
+pub(crate) const CONTINUE_MESSAGE_PREFIX: &str = "\u{0}duduclaw:continue\u{0}";
+
 // ── Task row ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1664,6 +1677,59 @@ impl TaskStore {
                 .map_err(|e| format!("resolve needs_human (abort): {e}"))?,
             other => return Err(format!("unknown needs_human decision: {other}")),
         };
+        Ok(n == 1)
+    }
+
+    /// I-3a: reopen a `done` / `failed` / `cancelled` **goal-mode** task for
+    /// another round, carrying the user's follow-up message into the next
+    /// dispatch's prompt — WorkBuddy's "a finished/failed task can take a
+    /// follow-up message" pattern (`DESIGN-dashboard-ux-workbuddy-2026-08.md`
+    /// §3.3, backlog item I-3a). Deliberately a separate method from
+    /// [`Self::resolve_needs_human`] rather than widening its `retry` arm:
+    /// that method also backs the **channel** decision buttons
+    /// ([`crate::goal_notify::apply_needs_human`]), and a channel card is
+    /// only ever rendered while a task sits in `needs_human` — widening its
+    /// WHERE clause would let a stale button, pressed after the task later
+    /// reached `done` through a legitimate unrelated path, silently reopen
+    /// it. This method is reachable only from the dashboard's explicit
+    /// "接著做" action (`tasks.goal_decide` with `action: "continue"`).
+    ///
+    /// `message` is required (unlike the optional `note` on
+    /// `resolve_needs_human`'s retry) — "continue with nothing to add" is
+    /// just `retry`, which already exists for `needs_human`. The message is
+    /// stamped with [`CONTINUE_MESSAGE_PREFIX`] so the next dispatch's
+    /// prompt-builder ([`crate::goal_loop::GoalLoopDriver::enqueue_work`])
+    /// can tell it apart from a genuine judge-rejection `judge_feedback` and
+    /// phrase the two differently — without the marker, a continued task
+    /// would be told "your last round failed review", which is simply false
+    /// for a task that had actually succeeded.
+    ///
+    /// `revision_round` / `agent_seconds` / `diminishing` are deliberately
+    /// left untouched so the round counter and dual-clock history continue
+    /// rather than reset (the design doc's "iteration 計數延續"
+    /// requirement) — same reasoning as `resolve_needs_human`'s retry arm,
+    /// which never touches them either. `completed_at` IS cleared: a
+    /// `pending` task carrying a stale completion timestamp from a previous
+    /// `done` round would misrepresent the row.
+    pub async fn continue_from_terminal(&self, id: &str, message: &str) -> Result<bool, String> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err("接著做需要附上訊息".into());
+        }
+        let stamped = format!("{CONTINUE_MESSAGE_PREFIX}{message}");
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let n = conn
+            .execute(
+                "UPDATE tasks
+                    SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
+                        lease_expires_at = NULL, result_summary = NULL, completed_at = NULL,
+                        judge_feedback = ?2, updated_at = ?3
+                  WHERE id = ?1 AND status IN ('done', 'failed', 'cancelled')
+                    AND COALESCE(goal_mode, 0) = 1",
+                params![id, stamped, now],
+            )
+            .map_err(|e| format!("continue from terminal: {e}"))?;
         Ok(n == 1)
     }
 
@@ -4495,6 +4561,83 @@ mod tests {
         let store = TaskStore::open(dir.path()).unwrap();
         let changed = store.claim_needs_human("ghost", "channel:telegram:1").await.unwrap();
         assert!(!changed);
+    }
+
+    // ── I-3a: continue_from_terminal ("接著做") ─────────────────────────
+
+    #[tokio::test]
+    async fn continue_from_terminal_reopens_done_failed_and_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        for (id, status) in [("g-done", "done"), ("g-failed", "failed"), ("g-cancelled", "cancelled")] {
+            let mut t = goal_review_task(id);
+            t.status = status.into();
+            t.completed_at = Some("2026-08-01T00:00:00Z".into());
+            t.claimed_by = Some("worker".into());
+            store.insert_task(&t).await.unwrap();
+
+            let changed = store.continue_from_terminal(id, "再補一份摘要").await.unwrap();
+            assert!(changed, "{status} must be reopenable");
+            let got = store.get_task(id).await.unwrap().unwrap();
+            assert_eq!(got.status, "pending");
+            assert!(got.claimed_by.is_none(), "a stale claim must be cleared");
+            assert!(got.completed_at.is_none(), "a stale completion timestamp must be cleared");
+            assert!(got.judge_feedback.as_deref().unwrap().contains("再補一份摘要"));
+        }
+    }
+
+    #[tokio::test]
+    async fn continue_from_terminal_preserves_revision_round_for_iteration_continuity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.status = "failed".into();
+        t.revision_round = 4;
+        store.insert_task(&t).await.unwrap();
+
+        store.continue_from_terminal("g1", "再試一次").await.unwrap();
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.revision_round, 4, "the round counter must continue, not reset");
+    }
+
+    #[tokio::test]
+    async fn continue_from_terminal_rejects_a_blank_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.status = "done".into();
+        store.insert_task(&t).await.unwrap();
+
+        let err = store.continue_from_terminal("g1", "   ").await.unwrap_err();
+        assert!(err.contains("訊息"), "got: {err}");
+        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "done");
+    }
+
+    #[tokio::test]
+    async fn continue_from_terminal_fails_closed_on_non_terminal_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.status = "needs_human".into();
+        store.insert_task(&t).await.unwrap();
+
+        let changed = store.continue_from_terminal("g1", "再多做一點").await.unwrap();
+        assert!(!changed, "needs_human already has its own retry/done/abort path");
+        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "needs_human");
+    }
+
+    #[tokio::test]
+    async fn continue_from_terminal_fails_closed_on_non_goal_mode_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = goal_review_task("g1");
+        t.status = "done".into();
+        t.goal_mode = false;
+        store.insert_task(&t).await.unwrap();
+
+        let changed = store.continue_from_terminal("g1", "再多做一點").await.unwrap();
+        assert!(!changed, "an ordinary board task must not be reopenable via this path");
+        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "done");
     }
 
     #[tokio::test]

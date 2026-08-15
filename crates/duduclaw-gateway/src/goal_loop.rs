@@ -81,7 +81,7 @@ use crate::goal_visit_graph::GoalVisitGraph;
 use crate::message_queue::{MessageQueue, MessageStatus, QueueMessage};
 use crate::prediction::task_forward::{GoalKind, RoundPhase, TaskStateKey};
 use crate::prediction::task_forward_store::TaskForwardModel;
-use crate::task_store::{parse_depends_on, ActivityRow, TaskRow, TaskStore};
+use crate::task_store::{parse_depends_on, ActivityRow, TaskRow, TaskStore, CONTINUE_MESSAGE_PREFIX};
 
 // `catch_unwind` for futures — same extension trait
 // `subagent_prediction::spawn_record` uses (design R5: forward-model
@@ -2047,11 +2047,27 @@ impl GoalLoopDriver {
     /// task is retried *with* the reviewer's feedback.
     async fn enqueue_work(&self, task: &TaskRow, iter: u32, state_text: &str) -> Result<(), String> {
         let marker = format!("[goal-loop task_id={} iter={iter}]", task.id);
+        // I-3a: a task continued from `done`/`failed`/`cancelled` via the
+        // dashboard's "接著做" action stamps `judge_feedback` with
+        // `CONTINUE_MESSAGE_PREFIX` (see `TaskStore::continue_from_terminal`)
+        // instead of a real judge verdict. Telling the agent "上一輪驗收未
+        // 通過" would be false for a task that had actually succeeded, so
+        // this is rendered as a distinct follow-up-instruction block.
         let feedback_block = match task.judge_feedback.as_deref() {
-            Some(fb) if !fb.trim().is_empty() => format!(
-                "\n\n上一輪驗收未通過,驗收判官的回饋如下,請據此修正後再回報:\n\
-                 <judge_feedback>\n{fb}\n</judge_feedback>"
-            ),
+            Some(fb) if !fb.trim().is_empty() => {
+                if let Some(user_msg) = fb.strip_prefix(CONTINUE_MESSAGE_PREFIX) {
+                    format!(
+                        "\n\n這項任務先前已結束(完成或失敗),使用者要求你接著做,補充指示如下\
+                         (這一輪的結果仍會經過驗收判官檢核):\n\
+                         <user_message>\n{user_msg}\n</user_message>"
+                    )
+                } else {
+                    format!(
+                        "\n\n上一輪驗收未通過,驗收判官的回饋如下,請據此修正後再回報:\n\
+                         <judge_feedback>\n{fb}\n</judge_feedback>"
+                    )
+                }
+            }
             _ => String::new(),
         };
         let criteria_block = match task.acceptance_criteria.as_deref() {

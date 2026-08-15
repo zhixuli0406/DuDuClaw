@@ -1369,6 +1369,49 @@ pub(crate) async fn apply_needs_human_from_dashboard(
     Ok(format!("{}此目標任務。", verb.label()))
 }
 
+/// I-3a: dashboard-only counterpart of [`apply_needs_human_from_dashboard`]
+/// for the "接著做" action — reopen a goal task already in a **terminal**
+/// state (`done` / `failed` / `cancelled`), carrying a required follow-up
+/// message, instead of resolving a pending `needs_human` intervention. Same
+/// authorization boundary as the caller (`handlers.rs::handle_tasks_goal_decide`
+/// — Operator ACL on the task's assigned agent, i.e. dashboard operators and
+/// anyone with access to the task's owning agent) and the same audit trail
+/// shape (one Activity Feed event). Unlike `apply_needs_human_from_dashboard`
+/// there is no outstanding buttoned channel card to collapse — a terminal
+/// task has none — so this never calls `spawn_dashboard_collapse`.
+pub(crate) async fn apply_continue_from_dashboard(
+    home_dir: &Path,
+    decider: &str,
+    task_id: &str,
+    message: &str,
+) -> Result<String, String> {
+    let store = TaskStore::open(home_dir).map_err(|e| format!("開啟任務資料庫失敗：{e}"))?;
+    let task = store.get_task(task_id).await.map_err(|e| e.to_string())?;
+    let Some(task) = task else {
+        return Err("找不到此任務".into());
+    };
+    if !task.goal_mode {
+        return Err("只有目標任務可以接著做".into());
+    }
+    let changed = store.continue_from_terminal(task_id, message).await?;
+    if !changed {
+        return Ok("此任務目前的狀態不允許接著做（可能已被他人變更）。".into());
+    }
+    let summary = format!(
+        "人工對已結束的目標任務「{}」下達接著做指示（來自儀表板，{decider}）",
+        task.title
+    );
+    append_activity(
+        &store,
+        "goal_loop.human_decision.continue",
+        &task.assigned_to,
+        Some(task_id),
+        &summary,
+    )
+    .await;
+    Ok("已重新投入下一輪，稍後可在任務詳情查看結果。".into())
+}
+
 /// Spawn a best-effort, fire-and-forget attempt to retire a settled
 /// needs_human task's channel cards. Detached so a slow or unreachable
 /// channel API can never delay or fail the decision that already landed.
@@ -1695,6 +1738,76 @@ mod tests {
         assert!(acts
             .iter()
             .any(|a| a.event_type == "goal_loop.human_decision.takeover"));
+    }
+
+    /// I-3a: the dashboard "接著做" action reopens a `done` goal task with a
+    /// follow-up message and logs it to the Activity Feed — the same shape
+    /// as `apply_needs_human_from_dashboard`'s retry, but for a terminal
+    /// task instead of a pending `needs_human` intervention.
+    #[tokio::test]
+    async fn dashboard_continue_reopens_a_done_task_and_logs_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = mk_task("g3");
+        t.status = "done".into();
+        t.goal_mode = true;
+        t.completed_at = Some("2026-08-01T00:00:00Z".into());
+        store.insert_task(&t).await.unwrap();
+
+        let msg = apply_continue_from_dashboard(dir.path(), "dashboard:u1", "g3", "請補寄一份給李總")
+            .await
+            .unwrap();
+        assert!(!msg.is_empty());
+        let got = store.get_task("g3").await.unwrap().unwrap();
+        assert_eq!(got.status, "pending");
+        assert!(got.judge_feedback.as_deref().unwrap().contains("請補寄一份給李總"));
+        let acts = store.list_activity_for_task("g3", 10).await.unwrap();
+        assert!(acts
+            .iter()
+            .any(|a| a.event_type == "goal_loop.human_decision.continue"));
+    }
+
+    /// A second continue press after the task already left the terminal
+    /// state (now `pending`) is a polite no-op, not an error — same
+    /// fail-closed idempotency as every other decision path here.
+    #[tokio::test]
+    async fn dashboard_continue_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = mk_task("g4");
+        t.status = "failed".into();
+        t.goal_mode = true;
+        store.insert_task(&t).await.unwrap();
+
+        apply_continue_from_dashboard(dir.path(), "dashboard:u1", "g4", "先這樣")
+            .await
+            .unwrap();
+        let msg2 = apply_continue_from_dashboard(dir.path(), "dashboard:u1", "g4", "再加一句")
+            .await
+            .unwrap();
+        assert!(msg2.contains("不允許接著做") || msg2.contains("已被他人變更"), "got: {msg2}");
+        // The second call's message must not have overwritten the first.
+        let got = store.get_task("g4").await.unwrap().unwrap();
+        assert!(got.judge_feedback.as_deref().unwrap().contains("先這樣"));
+    }
+
+    /// A non-goal-mode (ordinary board) task must never be reopenable
+    /// through this path — the RPC layer's `tasks.goal_decide` is meant for
+    /// goal-loop tasks only.
+    #[tokio::test]
+    async fn dashboard_continue_refuses_a_non_goal_mode_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(dir.path()).unwrap();
+        let mut t = mk_task("g5");
+        t.status = "done".into();
+        t.goal_mode = false;
+        store.insert_task(&t).await.unwrap();
+
+        let err = apply_continue_from_dashboard(dir.path(), "dashboard:u1", "g5", "再做一次")
+            .await
+            .unwrap_err();
+        assert!(err.contains("目標任務"), "got: {err}");
+        assert_eq!(store.get_task("g5").await.unwrap().unwrap().status, "done");
     }
 
     #[test]
