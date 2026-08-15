@@ -148,7 +148,33 @@ pub async fn save_attachment_to_disk(
 /// The generalisation of [`save_attachment_to_disk`]: `base_dir` may be the
 /// shared home dir (legacy fallback) or a per-agent dir
 /// ([`agent_attachment_base`]). The returned path is absolute.
+/// Every caller of this function is an *inbound* path (a channel handing us a
+/// file a human sent in), so the saved file is recorded as
+/// [`crate::artifacts::ArtifactOrigin::Uploaded`] — I-2b provenance, written
+/// once at the single chokepoint rather than at eight channel call sites.
+///
+/// The outbound `📎DELIVER:` archive in `office_docs` must NOT be labelled that
+/// way, so it uses [`save_attachment_in_base_untracked`] and records its own
+/// (declared / swept) origin.
 pub async fn save_attachment_in_base(
+    base_dir: &std::path::Path,
+    data: &[u8],
+    filename: &str,
+) -> Result<std::path::PathBuf, String> {
+    let path = save_attachment_in_base_untracked(base_dir, data, filename).await?;
+    crate::artifacts::record_saved(
+        base_dir,
+        &path,
+        filename,
+        data.len() as u64,
+        &crate::artifacts::SaveContext::uploaded(None),
+    );
+    Ok(path)
+}
+
+/// [`save_attachment_in_base`] without the provenance row — for callers that
+/// know the file's real origin and record it themselves.
+pub async fn save_attachment_in_base_untracked(
     base_dir: &std::path::Path,
     data: &[u8],
     filename: &str,

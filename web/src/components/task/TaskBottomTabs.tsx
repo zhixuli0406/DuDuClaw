@@ -1,6 +1,14 @@
 import { useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { MessagesSquare, Activity, SendHorizonal, UserRound, Loader2, FileDiff } from 'lucide-react';
+import {
+  MessagesSquare,
+  Activity,
+  SendHorizonal,
+  UserRound,
+  Loader2,
+  FileDiff,
+  Package,
+} from 'lucide-react';
 import {
   Tabs,
   TabsList,
@@ -13,6 +21,7 @@ import { timeAgo } from '@/lib/format';
 import type { ActivityEvent, TaskComment } from '@/lib/api';
 import type { AssigneeOption } from './AssigneePopover';
 import { TaskChangesPanel } from './TaskChangesPanel';
+import { TaskArtifactsPanel } from './TaskArtifactsPanel';
 
 /**
  * TaskBottomTabs — the spec §5.3 式1 footer tabs on the detail page (line variant).
@@ -26,6 +35,10 @@ import { TaskChangesPanel } from './TaskChangesPanel';
  *    behind, so "接受結果前先做一輪檢查" works on the detail page too, not just
  *    on the Inbox decision card. Lazily mounted — the RPC only fires when the
  *    tab is opened.
+ *  · 產物 (Deliverables, I-2b): what the task actually handed over — the one
+ *    thing the detail page could never answer (走查 2 卡點 1: 看得到跑了幾輪，
+ *    看不到東西在哪). Listed first because it is what the assigner came for;
+ *    also lazily mounted.
  */
 
 type TimelineItem =
@@ -79,7 +92,7 @@ function ActivityTimeline({
   );
 }
 
-type BottomTab = 'discussion' | 'activity' | 'changes';
+type BottomTab = 'artifacts' | 'discussion' | 'activity' | 'changes';
 
 export function TaskBottomTabs({
   taskId,
@@ -90,7 +103,7 @@ export function TaskBottomTabs({
   currentUserId,
   currentUserName,
 }: {
-  /** WP-F: enables the 變更 tab. Omit and the tab is not rendered. */
+  /** Enables the 產物 (I-2b) and 變更 (WP-F) tabs. Omit and neither renders. */
   taskId?: string;
   events: ReadonlyArray<ActivityEvent>;
   comments: ReadonlyArray<TaskComment>;
@@ -141,6 +154,12 @@ export function TaskBottomTabs({
   return (
     <Tabs variant="line" value={tab} onValueChange={(v) => setTab(v as BottomTab)}>
       <TabsList className="border-b border-surface-border">
+        {taskId && (
+          <TabsTab value="artifacts">
+            <Package />
+            {intl.formatMessage({ id: 'tasks.tab.artifacts' })}
+          </TabsTab>
+        )}
         <TabsTab value="discussion">
           <MessagesSquare />
           {intl.formatMessage({ id: 'tasks.tab.discussion' })}
@@ -158,6 +177,13 @@ export function TaskBottomTabs({
           </TabsTab>
         )}
       </TabsList>
+
+      {/* I-2b: mounted only while selected, so the RPC is paid for on demand. */}
+      {taskId && (
+        <TabsPanel value="artifacts">
+          {tab === 'artifacts' && <TaskArtifactsPanel taskId={taskId} />}
+        </TabsPanel>
+      )}
 
       <TabsPanel value="discussion">
         <div className="space-y-3">

@@ -173,7 +173,15 @@ pub async fn process_deliverables(
 
     let mut notes: Vec<String> = Vec::new();
     for raw in &paths {
-        if let Err(e) = deliver_one(raw, agent_dir, home_dir, sender).await {
+        if let Err(e) = deliver_one(
+            raw,
+            agent_dir,
+            home_dir,
+            sender,
+            crate::artifacts::ArtifactOrigin::Declared,
+        )
+        .await
+        {
             warn!(path = %raw, error = %e, "📎DELIVER: delivery failed — degrading to text");
             notes.push(format!("⚠️ 檔案傳送失敗，已生成於 {raw}（{e}）"));
         }
@@ -188,11 +196,17 @@ pub async fn process_deliverables(
 
 /// Validate, read, and send one delivered file. Errors are the honest-degrade
 /// signal for [`process_deliverables`].
+///
+/// `origin` (I-2b) is how the deliverable was identified — the agent's own
+/// `📎DELIVER:` declaration, or the undeclared sweep recovering it. It is
+/// recorded alongside the archived copy so the dashboard can tell a hand-over
+/// from a file a human sent in, instead of showing one flat directory.
 async fn deliver_one(
     raw: &str,
     agent_dir: &Path,
     home_dir: &Path,
     sender: &dyn ChannelSender,
+    origin: crate::artifacts::ArtifactOrigin,
 ) -> Result<(), String> {
     let path = validate_deliver_path(raw, agent_dir, home_dir)?;
 
@@ -226,10 +240,29 @@ async fn deliver_one(
     let attach_base = std::fs::canonicalize(agent_dir.join("attachments"))
         .unwrap_or_else(|_| agent_dir.join("attachments"));
     if !path.starts_with(&attach_base) {
-        if let Err(e) = media::save_attachment_in_base(agent_dir, &data, filename).await {
-            warn!(path = %path.display(), error = %e, "📎DELIVER: archive copy failed — delivery continues");
+        // I-2b: archive WITHOUT the inbound-upload provenance the shared
+        // helper stamps, then record this hand-over's real origin (declared /
+        // swept) plus the channel it went out on and where it was produced.
+        match media::save_attachment_in_base_untracked(agent_dir, &data, filename).await {
+            Ok(saved) => crate::artifacts::record_saved(
+                agent_dir,
+                &saved,
+                filename,
+                data.len() as u64,
+                &crate::artifacts::SaveContext::delivered(
+                    origin,
+                    Some(sender.channel_type()),
+                    &path,
+                ),
+            ),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "📎DELIVER: archive copy failed — delivery continues");
+            }
         }
     }
+    // A file already living in `attachments/` keeps whatever provenance it was
+    // first recorded with (an inbound upload the agent is handing back is still
+    // the human's file) — re-labelling it here would rewrite history.
 
     sender
         .send_document(&data, filename, mime)
@@ -380,7 +413,15 @@ pub async fn sweep_undeclared_deliverables(
     let mut sent = 0usize;
     for path in candidates {
         let raw = path.to_string_lossy();
-        match deliver_one(&raw, agent_dir, home_dir, sender).await {
+        match deliver_one(
+            &raw,
+            agent_dir,
+            home_dir,
+            sender,
+            crate::artifacts::ArtifactOrigin::Swept,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!(path = %path.display(), "deliver sweep: sent undeclared produced file");
                 sent += 1;
@@ -591,6 +632,60 @@ mod tests {
         let count = std::fs::read_dir(&attach_dir).unwrap().count();
         assert_eq!(count, 1);
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// I-2b: the archive copy must carry the hand-over's provenance, so the
+    /// dashboard can tell a delivered file from a file the user sent in.
+    #[tokio::test]
+    async fn deliverable_archive_records_declared_provenance() {
+        let home = std::env::temp_dir().join(format!("dd-prov-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("sales");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let file = agent_dir.join("summary.xlsx");
+        std::fs::write(&file, b"real xlsx bytes").unwrap();
+
+        let sender = RecordingSender {
+            docs: Arc::new(Mutex::new(Vec::new())),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+        let reply = format!("已完成彙總。\n📎DELIVER:{}", file.to_str().unwrap());
+        let _ = process_deliverables(&reply, &agent_dir, &home, &sender).await;
+
+        let idx = crate::artifacts::provenance_index(&home, Some("sales"));
+        assert_eq!(idx.len(), 1, "exactly one provenance row: {idx:?}");
+        let p = idx.values().next().unwrap();
+        assert_eq!(p.origin, crate::artifacts::ArtifactOrigin::Declared);
+        assert_eq!(p.display_name, "summary.xlsx");
+        assert_eq!(p.channel.as_deref(), Some("recording"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The sweep's recovery is recorded as such — 「掃描回收」 is a different
+    /// fact from 「員工主動交付」 and the UI shows which one happened.
+    #[tokio::test]
+    async fn swept_deliverable_is_recorded_as_swept() {
+        let home = std::env::temp_dir().join(format!("dd-prov-sweep-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("ops");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("總覽.docx"), b"docx-bytes").unwrap();
+        let sender = RecordingSender {
+            docs: Arc::new(Mutex::new(Vec::new())),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+        assert_eq!(
+            sweep_undeclared_deliverables(&agent_dir, &home, &sender).await,
+            1
+        );
+        let idx = crate::artifacts::provenance_index(&home, Some("ops"));
+        assert_eq!(idx.len(), 1);
+        assert_eq!(
+            idx.values().next().unwrap().origin,
+            crate::artifacts::ArtifactOrigin::Swept
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
