@@ -271,18 +271,53 @@ pub fn parse(text: &str) -> AgentTomlSections {
     toml::from_str(text).unwrap_or_default()
 }
 
-/// Load the sections from `<agent_dir>/agent.toml`.
+/// Load the sections from `<agent_dir>/agent.toml` — or, when the agent has
+/// a resolved preset binding, from the materialized `agent.resolved.toml`
+/// artifact instead (WP-6F, agent presets P1).
 ///
-/// A missing / unreadable / malformed file yields all-defaults — every shadow
-/// reader this replaces degraded the same way, and none of them distinguished
-/// "no file" from "no key".
+/// # Why this is the preset integration point
+///
+/// This function is the **one** place all twelve formerly-shadow readers
+/// (capability grants, guardrails, MCP external servers, GVU noise-band,
+/// planner, research, skill recommendations, …) converge on. Before preset
+/// support existed, the module docs above already called this out as the
+/// risk: "any future assembly layer that resolves configuration before
+/// handing it downstream (preset / kit overlays) would be silently bypassed
+/// by every one of [the shadow readers]". Redirecting *here* — rather than
+/// touching all twelve call sites — means every one of them sees
+/// preset-resolved values automatically, with zero changes to any of those
+/// modules (several of which are off-limits to unrelated concurrent work).
+///
+/// # Byte-identical fallback (R1.2)
+///
+/// An agent with no preset binding never has a `agent.resolved.toml` (see
+/// `duduclaw-agent::registry::load_agent`, which only writes one on a
+/// successful [`crate::preset::PresetResolution::Applied`] and deletes any
+/// stale one otherwise) — so this reads exactly `agent.toml`, exactly as
+/// before this module existed.
 ///
 /// Reads on every call by design; see the module docs.
 pub fn load(agent_dir: &Path) -> AgentTomlSections {
+    if let Some(resolved) = resolved_override_path(agent_dir) {
+        if let Ok(text) = std::fs::read_to_string(&resolved) {
+            return parse(&text);
+        }
+    }
     match std::fs::read_to_string(agent_dir.join("agent.toml")) {
         Ok(text) => parse(&text),
         Err(_) => AgentTomlSections::default(),
     }
+}
+
+/// `<home>/agent_resolved/<agent_id>.toml` for the agent at `agent_dir`, or
+/// `None` when `agent_dir` is not the standard `<home>/agents/<id>` layout
+/// (ephemeral scaffolds, test fixtures) — see
+/// `crate::preset::agent_home_dir` for why that case is deliberately
+/// unsupported rather than guessed.
+fn resolved_override_path(agent_dir: &Path) -> Option<std::path::PathBuf> {
+    let home = crate::preset::agent_home_dir(agent_dir)?;
+    let agent_id = agent_dir.file_name()?.to_str()?;
+    Some(crate::preset::agent_resolved_path(&home, agent_id))
 }
 
 /// Load the sections for `<home_dir>/agents/<agent_id>/agent.toml`.
@@ -485,6 +520,46 @@ decision_ttl_days = 3
         let s = load(&dir);
         assert_eq!(s.runtime, RuntimeSection::default());
         assert_eq!(s.guardrails, GuardrailsSection::default());
+    }
+
+    /// WP-6F (agent presets P1): when `agent.resolved.toml` exists next to a
+    /// standard `<home>/agents/<id>/agent.toml`, `load` must prefer it — this
+    /// is the single choke point every shadow reader is redirected through.
+    #[test]
+    fn load_prefers_the_resolved_artifact_when_present() {
+        // `tempfile::tempdir()` (not a fixed `std::env::temp_dir()` path):
+        // a hardcoded name here would risk colliding with a concurrently
+        // running test under cargo's default parallel test execution — this
+        // module's own `missing_file_yields_defaults` predates that lesson,
+        // but every new test in this codebase should get a private dir.
+        let home_tmp = tempfile::tempdir().unwrap();
+        let home = home_tmp.path();
+        let agent_dir = home.join("agents").join("bob");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"), "[runtime]\nprovider = \"claude\"\n").unwrap();
+
+        // No resolved artifact yet ⇒ reads agent.toml (R1.2 fallback).
+        assert_eq!(load(&agent_dir).runtime.provider.as_deref(), Some("claude"));
+
+        let resolved_path = crate::preset::agent_resolved_path(home, "bob");
+        std::fs::create_dir_all(resolved_path.parent().unwrap()).unwrap();
+        std::fs::write(&resolved_path, "[runtime]\nprovider = \"codex\"\n").unwrap();
+
+        assert_eq!(
+            load(&agent_dir).runtime.provider.as_deref(),
+            Some("codex"),
+            "must prefer the resolved artifact once it exists"
+        );
+    }
+
+    /// Non-standard layouts (ephemeral scaffolds, ad-hoc dirs) must not guess
+    /// a resolved path — falls straight through to the raw `agent.toml`.
+    #[test]
+    fn load_ignores_resolved_lookup_for_non_standard_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("agent.toml"), "[runtime]\nprovider = \"gemini\"\n").unwrap();
+        assert_eq!(load(dir).runtime.provider.as_deref(), Some("gemini"));
     }
 
     /// A wrong-typed key must not fail the parse — before this migration such

@@ -2273,6 +2273,22 @@ async fn build_reply_with_session_inner(
             }
         }
 
+        // WP-6F (agent presets P1): the agent-visible preset line — placed
+        // BEFORE working_state (design §3.2: "preset 行接在它前面即可"). Tail
+        // placement, after CACHE_SPLIT_MARKER — a preset switch must be
+        // visible to the agent, never silently baked into the cached prefix.
+        {
+            let home = ctx.home_dir.clone();
+            let aid = agent_id.clone();
+            if let Ok(Some(section)) = tokio::task::spawn_blocking(move || {
+                crate::preset_prompt::build_preset_section(&home, &aid)
+            })
+            .await
+            {
+                prompt = format!("{prompt}\n\n{section}");
+            }
+        }
+
         // Cross-wake working state: the agent's authoritative key-value
         // posture + handoff note (working_state.rs, D3 ghost-memory fix).
         // Placed BEFORE the recent-actions feed — standing authority first,

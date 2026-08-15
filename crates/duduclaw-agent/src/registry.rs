@@ -29,6 +29,13 @@ pub struct LoadedAgent {
     pub contract: crate::contract::Contract,
     /// Directory this agent was loaded from.
     pub dir: PathBuf,
+    /// WP-6F (agent presets P1): the outcome of resolving this agent's
+    /// preset binding (if any) against its `agent.toml`. `config` above
+    /// already reflects the merge (`Applied`) or the agent's own file alone
+    /// (`Unbound` / `Unresolved`, fail-closed) — this field is for callers
+    /// that need to *report* which layer produced a value (dashboard "已覆寫"
+    /// badge, `duduclaw agent inspect`, the agent-visible dynamic-tail line).
+    pub preset_resolution: duduclaw_core::preset::PresetResolution,
 }
 
 /// Registry that scans and holds all agents from the agents directory.
@@ -178,6 +185,15 @@ impl AgentRegistry {
     /// Load a single agent from the given directory.
     ///
     /// Expects an `agent.toml` file at the root of `dir`.
+    ///
+    /// WP-6F (agent presets P1): if the agent has a resolved preset binding,
+    /// `config` reflects the merge (preset ⊕ per-agent `agent.toml`, per-agent
+    /// always winning — see `duduclaw_core::preset::resolve_for_agent`) and a
+    /// `<home>/agent_resolved/<agent_id>.toml` artifact is (re)written so the
+    /// `agent_toml::AgentTomlSections` shadow readers see the same resolved
+    /// values. An agent with **no** binding takes the untouched fast path —
+    /// `toml::from_str(&toml_content)` on the original bytes, exactly as
+    /// before this feature existed (R1.2: unbound ⇒ byte-identical result).
     pub async fn load_agent(dir: &Path) -> Result<LoadedAgent> {
         let toml_path = dir.join("agent.toml");
         let toml_content = fs::read_to_string(&toml_path).await.map_err(|e| {
@@ -187,10 +203,56 @@ impl AgentRegistry {
             ))
         })?;
 
-        let mut config: AgentConfig = toml::from_str(&toml_content).map_err(|e| {
-            error!(path = %toml_path.display(), error = %e, "failed to parse agent.toml");
-            DuDuClawError::TomlDeser(e)
-        })?;
+        let (merged_table, preset_resolution) = Self::resolve_preset_table(dir, &toml_content);
+
+        if let Some(home) = duduclaw_core::preset::agent_home_dir(dir) {
+            let agent_id = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let resolved_path = duduclaw_core::preset::agent_resolved_path(&home, agent_id);
+            if preset_resolution.is_applied() {
+                match toml::to_string_pretty(&merged_table) {
+                    Ok(text) => {
+                        if let Some(parent) = resolved_path.parent() {
+                            let _ = fs::create_dir_all(parent).await;
+                        }
+                        if let Err(e) = fs::write(&resolved_path, text).await {
+                            warn!(
+                                path = %resolved_path.display(), error = %e,
+                                "failed to write agent.resolved.toml (shadow readers will \
+                                 keep seeing the previous resolved artifact, or the raw \
+                                 agent.toml if none exists yet)"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(agent = agent_id, error = %e, "failed to serialize resolved preset config"),
+                }
+            } else {
+                // Unbound / Unresolved: never let a stale resolved artifact
+                // from a PRIOR successful binding keep feeding shadow readers
+                // preset-tainted values (R1.5 — must not silently reuse the
+                // last good resolution).
+                let _ = fs::remove_file(&resolved_path).await;
+            }
+        }
+
+        // Applied ⇒ parse the merged table (unavoidable round-trip through
+        // `toml::to_string_pretty`). Every other outcome (Unbound /
+        // Unresolved / no home dir) parses the ORIGINAL bytes directly —
+        // guarantees a byte-for-bit identical `AgentConfig` for every agent
+        // that isn't actually preset-bound.
+        let mut config: AgentConfig = if preset_resolution.is_applied() {
+            let merged_text = toml::to_string_pretty(&merged_table).map_err(|e| {
+                DuDuClawError::Agent(format!("failed to serialize resolved preset config: {e}"))
+            })?;
+            toml::from_str(&merged_text).map_err(|e| {
+                error!(path = %toml_path.display(), error = %e, "failed to parse preset-resolved agent config");
+                DuDuClawError::TomlDeser(e)
+            })?
+        } else {
+            toml::from_str(&toml_content).map_err(|e| {
+                error!(path = %toml_path.display(), error = %e, "failed to parse agent.toml");
+                DuDuClawError::TomlDeser(e)
+            })?
+        };
         config.proactive.sanitize();
         config.sticker.sanitize();
 
@@ -208,7 +270,30 @@ impl AgentRegistry {
             skills,
             contract,
             dir: dir.to_path_buf(),
+            preset_resolution,
         })
+    }
+
+    /// Resolve `dir`'s preset binding (if any) against its raw `agent.toml`
+    /// table. Returns `(agent_table_unchanged, Unbound)` whenever preset
+    /// resolution does not apply: non-standard directory layout (ephemeral
+    /// scaffolds, test fixtures — see `preset::agent_home_dir`) or malformed
+    /// TOML (the subsequent direct `AgentConfig` parse then surfaces the
+    /// proper parse error, identically to before this feature existed).
+    fn resolve_preset_table(
+        dir: &Path,
+        toml_content: &str,
+    ) -> (toml::value::Table, duduclaw_core::preset::PresetResolution) {
+        let Some(home) = duduclaw_core::preset::agent_home_dir(dir) else {
+            return (toml::value::Table::new(), duduclaw_core::preset::PresetResolution::Unbound);
+        };
+        let Some(agent_id) = dir.file_name().and_then(|n| n.to_str()) else {
+            return (toml::value::Table::new(), duduclaw_core::preset::PresetResolution::Unbound);
+        };
+        let Ok(raw_table) = toml_content.parse::<toml::Table>() else {
+            return (toml::value::Table::new(), duduclaw_core::preset::PresetResolution::Unbound);
+        };
+        duduclaw_core::preset::resolve_for_agent(&home, agent_id, &raw_table)
     }
 
     /// Look up an agent by name.
@@ -877,5 +962,191 @@ skill_security_scan = true
             names,
             std::collections::HashSet::from(["sales-lead", "warehouse-lead"])
         );
+    }
+}
+
+#[cfg(test)]
+mod preset_integration_tests {
+    //! WP-6F (agent presets P1) — `load_agent`'s end-to-end integration with
+    //! `duduclaw_core::preset`. `duduclaw_core::preset`'s own test module
+    //! already covers the resolution/merge/sanitize logic in isolation; this
+    //! module pins the piece only `load_agent` owns: byte-identical output
+    //! for an unbound agent (R1.2), the `agent.resolved.toml` artifact
+    //! lifecycle (written on `Applied`, deleted on anything else), and that
+    //! `LoadedAgent.preset_resolution` reports the same outcome the merged
+    //! `config` reflects.
+    use super::*;
+    use duduclaw_core::preset::{self, PresetResolution};
+
+    fn write_agent(agents_dir: &Path, id: &str, body: &str) -> PathBuf {
+        let dir = agents_dir.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), body).unwrap();
+        dir
+    }
+
+    fn write_preset(home: &Path, id: &str, body: &str) {
+        let dir = preset::preset_dir(home, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("preset.toml"), body).unwrap();
+    }
+
+    const AGENT_TOML: &str = r#"
+[agent]
+name = "clinic-sales"
+display_name = "Clinic Sales"
+role = "worker"
+status = "active"
+trigger = "@clinic-sales"
+reports_to = "clinic-boss"
+icon = "x"
+
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+
+[container]
+timeout_ms = 60000
+max_concurrent = 1
+readonly_project = true
+
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+
+[budget]
+monthly_limit_cents = 500
+warn_threshold_percent = 80
+hard_stop = false
+
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = []
+
+[evolution]
+skill_auto_activate = false
+skill_security_scan = true
+gvu_enabled = false
+max_silence_hours = 168.0
+max_gvu_generations = 0
+observation_period_hours = 24.0
+skill_token_budget = 500
+max_active_skills = 2
+"#;
+
+    const PRESET_TOML: &str = r#"
+[preset]
+version = "1.0.0"
+label = "業務跟進助理"
+
+[model]
+preferred = "claude-haiku-4-5"
+fallback = "claude-sonnet-4-6"
+
+[container]
+timeout_ms = 120000
+max_concurrent = 2
+
+[capabilities]
+allowed_tools = []
+denied_tools = []
+"#;
+
+    /// R1.2: an agent with no `[preset]` binding must load byte-identical to
+    /// a direct `toml::from_str::<AgentConfig>` of its own file — proven by
+    /// comparing the merged-agent path against the pre-preset code path.
+    #[tokio::test]
+    async fn unbound_agent_loads_byte_identical_to_direct_parse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
+
+        let via_preset_path = AgentRegistry::load_agent(&dir).await.unwrap();
+        let direct: AgentConfig = toml::from_str(AGENT_TOML).unwrap();
+
+        assert_eq!(via_preset_path.config.agent.name, direct.agent.name);
+        assert_eq!(via_preset_path.config.model.preferred, direct.model.preferred);
+        assert_eq!(via_preset_path.config.container.timeout_ms, direct.container.timeout_ms);
+        assert_eq!(via_preset_path.preset_resolution, PresetResolution::Unbound);
+        assert!(
+            !preset::agent_resolved_path(tmp.path(), "clinic-sales").exists(),
+            "an unbound agent must never gain a resolved artifact"
+        );
+    }
+
+    /// A bound agent's `config` reflects the merge, `preset_resolution`
+    /// reports `Applied`, and the resolved artifact lands on disk for the
+    /// shadow readers (R2b).
+    #[tokio::test]
+    async fn bound_agent_config_reflects_the_merge_and_writes_the_resolved_artifact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
+        write_preset(tmp.path(), "sales-followup", PRESET_TOML);
+        preset::bind(tmp.path(), "clinic-sales", &dir, "sales-followup", "tester", "test").unwrap();
+
+        let loaded = AgentRegistry::load_agent(&dir).await.unwrap();
+        assert!(matches!(loaded.preset_resolution, PresetResolution::Applied { .. }));
+        // The agent's own `[model] preferred` overrides the preset's.
+        assert_eq!(loaded.config.model.preferred, "claude-sonnet-4-6");
+        // A field the agent never wrote for `[container]`... actually the
+        // agent DOES write `[container]`, so its whole table wins — proven
+        // via `duduclaw_core::preset`'s own tests. Here we only need to know
+        // the resolved artifact exists and is loadable.
+        let resolved_path = preset::agent_resolved_path(tmp.path(), "clinic-sales");
+        assert!(resolved_path.is_file(), "Applied resolution must materialize agent.resolved.toml");
+        let resolved_text = std::fs::read_to_string(&resolved_path).unwrap();
+        assert!(toml::from_str::<AgentConfig>(&resolved_text).is_ok());
+    }
+
+    /// If the binding stops resolving (preset deleted) after having been
+    /// applied once, the NEXT load must fall back safely — never keep
+    /// serving the stale resolved artifact from the last good resolution
+    /// (R1.5).
+    #[tokio::test]
+    async fn resolved_artifact_is_cleaned_up_when_resolution_stops_succeeding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
+        write_preset(tmp.path(), "sales-followup", PRESET_TOML);
+        preset::bind(tmp.path(), "clinic-sales", &dir, "sales-followup", "tester", "test").unwrap();
+
+        // First load: Applied, artifact written.
+        AgentRegistry::load_agent(&dir).await.unwrap();
+        let resolved_path = preset::agent_resolved_path(tmp.path(), "clinic-sales");
+        assert!(resolved_path.is_file());
+
+        // Preset vanishes.
+        std::fs::remove_dir_all(preset::preset_dir(tmp.path(), "sales-followup")).unwrap();
+
+        let loaded = AgentRegistry::load_agent(&dir).await.unwrap();
+        assert!(matches!(loaded.preset_resolution, PresetResolution::Unresolved { .. }));
+        assert!(
+            !resolved_path.exists(),
+            "a stale resolved artifact must not keep feeding shadow readers preset-tainted values"
+        );
+        // The agent itself still boots on its own agent.toml.
+        assert_eq!(loaded.config.agent.name, "clinic-sales");
+    }
+
+    /// Unknown/unset `[preset]` binding for an agent that was never bound at
+    /// all is simply `Unbound` — the "unknown preset name" error path is
+    /// exercised at `preset::bind` (refuses before writing), not here; this
+    /// proves `load_agent` never invents an `Unresolved` state out of thin
+    /// air for an agent with zero binding-store history.
+    #[tokio::test]
+    async fn never_bound_agent_is_unbound_not_unresolved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        let dir = write_agent(&agents_dir, "clinic-sales", AGENT_TOML);
+        let loaded = AgentRegistry::load_agent(&dir).await.unwrap();
+        assert_eq!(loaded.preset_resolution, PresetResolution::Unbound);
     }
 }

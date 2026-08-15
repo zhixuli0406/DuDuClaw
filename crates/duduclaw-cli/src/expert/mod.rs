@@ -324,16 +324,13 @@ fn map_model(raw: &str) -> (Option<String>, bool) {
 
 /// Deep-merge `overlay` into `base` (overlay wins on scalar clashes; tables
 /// merge recursively). Used to fold `agent.partial.toml` onto the scaffold.
-fn merge_toml(base: &mut toml::value::Table, overlay: &toml::value::Table) {
-    for (k, v) in overlay {
-        match (base.get_mut(k), v) {
-            (Some(toml::Value::Table(bt)), toml::Value::Table(ot)) => merge_toml(bt, ot),
-            _ => {
-                base.insert(k.clone(), v.clone());
-            }
-        }
-    }
-}
+///
+/// Relocated to `duduclaw_core::toml_merge` (WP-6F, agent presets P1) so
+/// `duduclaw-core::preset` can use the identical merge semantics without a
+/// reverse crate dependency — this is a thin re-export, kept under the same
+/// local name so every existing call site (including `expert::install`'s
+/// `use super::merge_toml`) is unchanged.
+use duduclaw_core::toml_merge::merge_toml;
 
 /// Read `<home>/agents/<id>/agent.toml`, apply `mutate`, write back atomically.
 fn patch_agent_toml(
