@@ -14,9 +14,11 @@
 /goal status
 ```
 
-這會在 Task Board 上建立一個 `goal_mode` 任務,蓋上來源通道與聊天室的戳記,進度會推回發起它的那段對話。省略 `||` 段落時,目標描述本身就是驗收基準;可選的第三段 `outcome:<spec>` 加上一份機器可驗的產出契約(JSON Schema 子集或 workdir 檔案 glob),在判官*之前*以零 LLM 成本、確定性地執行——結構上不合格的產出直接彈回修改,不花一次判官呼叫。
+這會在 Task Board 上建立一個 `goal_mode` 任務,蓋上來源通道與聊天室的戳記,進度會推回發起它的那段對話。省略 `||` 段落時,目標描述本身就是驗收基準,回覆同時會附一段四要素引導(目標/輸入/輸出格式/約束)與 3-5 條 outcome 式驗收標準建議,幫助下次交付得更精確;可選的第三段 `outcome:<spec>` 加上一份機器可驗的產出契約(JSON Schema 子集或 workdir 檔案 glob),在判官*之前*以零 LLM 成本、確定性地執行——結構上不合格的產出直接彈回修改,不花一次判官呼叫。
 
-整個功能是 opt-in:`config.toml` 沒有 `[dispatch] enabled = true` 就什麼都不會跑。
+驗收標準在建立當下就會凍結成不可變的基準,判官與下方的第一階段評估器一律讀這份凍結基準;agent 身分呼叫 `tasks_update` 想改自己 goal 任務的驗收標準會被拒絕並留審計紀錄,只有儀表板操作者能編輯顯示用的可變副本(但不會回頭改變凍結基準)。
+
+派工引擎自 v1.59 起**預設開啟**(閒置時只做週期性 SQLite 輪詢,零 LLM 成本);不想要時在 `config.toml` 設 `[dispatch] enabled = false`,或到儀表板「設定 → 自動化」關閉「派工引擎」開關(免重啟熱生效)。
 
 ## Driver
 
@@ -32,7 +34,11 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 ## 驗收判官——絕不採信自我宣告
 
-「完成」只由 verifier 宣告,不由 worker。agent 回報完成後,任務進入 `review`,`DispatchEngine` 跑一個**三面向 MAV 判官團**——正確性、完整性、安全性——一次 LLM 呼叫,走帳號輪替器。三項全過才算通過;解析失敗或判官錯誤會把任務停在 `needs_human`,絕不自動通過(fail-closed)。這是對經典 loop trap(agent 自述成功、系統照單全收)的防禦。
+「完成」只由 verifier 宣告,不由 worker。agent 回報完成後,任務進入 `review`。先跑一個便宜的**第一階段評估器**——無工具、單次 LLM 呼叫,輸出三選一 JSON 判定(`continue`／`candidate_complete`／`blocked`):`continue` 跳過判官團,直接拿評估器的 `next_step` 當回饋重新派工(計入迭代上限);`blocked` 直接轉 `needs_human`;只有 `candidate_complete` 才進下面的判官團。評估器故障(逾時/解析失敗/呼叫錯誤)一律降級直接跑判官團,絕不因此自動通過或自動拒絕。設定 `[dispatch] two_stage_judge`(預設 `true`;`false` 退回每輪都跑判官團的舊行為)。
+
+進判官團後,`DispatchEngine` 跑一個**三面向 MAV 判官團**——正確性、完整性、安全性——一次 LLM 呼叫,走帳號輪替器。三項全過才算通過;解析失敗、面板 JSON 截斷/畸形、或判官錯誤都會把任務停在 `needs_human`,絕不自動通過(fail-closed)——截斷的 JSON 片段不會再落到舊版單一 token 掃描器,不會被片段裡剛好出現的 `pass` 字樣誤判通過。這是對經典 loop trap(agent 自述成功、系統照單全收)的防禦。
+
+判官團 prompt 也內建四條紀律(無 config 開關,永遠套用):**反棘輪**(驗收標準沒變時不得每輪找新毛病)、**只稽核不自建證據**(只能比對 agent 提交的證據與工具稽核摘要,不得自行想像補寫)、**反契約外擴張**(驗收標準沒寫的事項不得作為駁回理由)、**agent 自稱完成不是證據**。
 
 判官深度隨目標難度縮放(本地、零 LLM 的啟發式):簡單的單步目標用兩面向檢查(正確性 + 安全性)與較低的迭代上限;困難目標用完整判官團。安全面向在任何深度都不會被拿掉。
 
@@ -45,12 +51,14 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 | 迭代上限(每任務派工數) | 8(困難目標)、3(簡單目標) | `needs_human` |
 | 自建立起算的 wall clock | 24 h | `needs_human` |
 | 並行目標任務數 | 3 | 排隊,不派工 |
-| 震盪偵測 | 連續兩次近乎相同的駁回回饋 | 提前 `needs_human` |
+| 停滯偵測 | 連續兩輪駁回回饋的 **gap 指紋**相同(從回饋抽取 `path:line` 引用與反引號關鍵詞正規化而成,不是逐字比對——換句話說的同一個 gap 也算;抽不到任何引用/關鍵詞才退回逐字比對) | 提前 `needs_human` |
+| 提前收工偵測 | 九條 zh+en 正則比對 agent 最後一段非空文字(如自簽 `VERDICT:`、「請稍後再來查看」、「請你審核一下」) | 記遙測與 activity 事件,提示帶進下一輪判官/評估器輸入——不會自己駁回或卡住任務 |
 | In-flight 去重 | 已派工但未認領的任務在停滯逾時(600 s)前不重新排入 | 重新派工 |
 | 跨程序斷路器(`dispatch_guard`) | 60 s 滑動視窗內 20 次派工 | 冷卻拒絕 |
 | 委派 hop 深度 | 5 | 拒絕派工 |
+| gateway 重啟時的復活行為(`resume_on_restart`) | `pause`(**預設**)——開機把所有 in-flight `goal_mode` 任務轉 `needs_human`(原因 `gateway_restart`) | `auto` 時重啟後 in-flight 任務照常接續(這項設定出現前的唯一行為);可在 `config.toml` 或儀表板「設定→自動化」切換(`system.update_config` 只收 `"auto"`/`"pause"`) |
 
-全部在 `config.toml` 的 `[goal_loop]` / `[dispatch_guard]` 之下,區段缺席時使用內建預設。
+全部在 `config.toml` 的 `[goal_loop]` / `[dispatch_guard]` / `[dispatch]` 之下,區段缺席時使用內建預設。
 
 ## needs_human 升級
 

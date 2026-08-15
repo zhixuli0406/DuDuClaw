@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Added
+- **兩段式驗收裁決（two-stage judge）**：goal 任務進入 `review` 時，先跑一個便宜的第一階段評估——無工具、單次 LLM 呼叫、JSON 三值 `continue`/`candidate_complete`/`blocked`——只有判定為完成候選才會進到既有三面向 MAV 判官團，多數還沒做完的輪次不再需要付一次完整判官呼叫。`continue` 直接用評估器給的下一步當回饋重新派工（計入迭代上限，走既有駁回路徑）；`blocked` 直接轉 `needs_human`，不必假裝走完一輪判官。**任何故障（逾時／解析失敗／呼叫錯誤）一律降級直接跑 MAV 判官，絕不因為第一階段故障就自動通過或拒絕**。新設定 `config.toml [dispatch] two_stage_judge`（預設 `true`）。
+- **驗收判官紀律條款**：MAV 判官 prompt 新增四條規則——反棘輪（驗收標準沒變時不得每輪找新毛病）、只稽核不自建證據（判官只能比對 agent 提交的證據與工具稽核摘要，不得自行想像或補寫）、反契約外擴張（不得拿驗收標準以外的要求當駁回理由）、agent 自稱完成不是證據。治的是「判官假陽性讓正確工作卡死」這個先前活測抓到過的失敗模式。
+- **停滯偵測改用 gap 指紋比對**：新模組 `goal_gap_fingerprint.rs`，從駁回回饋抽取 `path:line` 引用與反引號關鍵詞、正規化（暫存路徑歸一、大小寫忽略、去重排序）成一組指紋，讓「換句話說的同一個 gap」也能被判定為同一次卡住，不再只有逐字相同才算。抽不到任何引用時退回既有逐字比對（行為相容）。連續兩輪同指紋才轉 `needs_human` 的門檻沒有變。
+- **提前收工偵測（bail detection）**：新模組 `goal_bail_detect.rs`，九條 zh+en 正則比對 agent 回合最後一段非空文字（「無法繼續」「已放棄」「請稍後再來查看」「自簽 VERDICT」「已提交待審」……）。命中會記一筆 Activity Feed 事件、累加 Prometheus `goal_loop_bail_pattern_total{pattern}`，並把提示帶進下一輪派工的 `<state>` 區塊、第一階段評估器輸入、MAV 判官輸入——純粹是訊號與提醒，不會自己駁回或卡住任務。
+- **重啟不自動復活（`resume_on_restart`）**：新設定 `[goal_loop] resume_on_restart = "auto" | "pause"`（機制首次上線時預設 `auto`、行為不變；同一批次內的預設翻轉見下方「Changed」）。設成 `pause` 後，gateway 每次啟動會把所有還在跑的 `goal_mode` 任務轉 `needs_human`（原因 `gateway_restart`），走既有的通道通知，不會在流程重啟或崩潰復原後悄悄接著跑一個沒人重新確認過的目標。
+- **交接契約結構化欄位（`working_state_handoff`）**：新增可選欄位 `status`（`continue`/`complete`/`blocked`）＋`next_steps`／`evidence`／`blocker`，帶 `status` 時強制校驗——`continue` 要非空 `next_steps` 且不能有 `blocker`；`complete` 要非空 `evidence` 且不能有 `blocker`/`next_steps`；`blocked` 要非空 `blocker`。合併後總位元組數超過 `config.toml [memory] working_state_handoff_max_bytes`（預設 16384，CJK 安全計算）**整筆拒絕，絕不截斷**——截斷可能剛好刪掉讓交接可信的那段證據或下一步，卻仍看起來像一份權威交接。純文字交接（不帶任何新欄位）行為完全不變。
+- **needs_human 決策卡「變更」分頁（批准前看得見改動）**：收件匣的「等你決定」卡片與任務詳情頁新增「變更」分頁，列出這個任務歷輪實際動過的檔案——路徑（可一鍵複製）、操作類型（新建／覆寫、修改、刪除、指令）、時間、輪次、成功或失敗，以及沿用稽核紀錄遮罩結果的摘要片段。證據來自兩條既有軌跡：執行期原生工具事件（Write／Edit／NotebookEdit／檔案效果明顯的 shell 指令）在每輪派工後落成 `task_changes.jsonl`（以任務 id 歸屬、0600、8MB 輪替、每輪上限 50 筆），MCP 稽核紀錄（`shared_wiki_write` 等）則沿用判官 `<tool_activity>` 同一套「認領→驗收時間窗＋執行者」歸屬。失敗與被攔截的呼叫一併列出並標記——那正是即時查詢工具狀態看不到的一半。**查無即誠實回空**：沒有紀錄時顯示「此任務沒有留下檔案變更紀錄」，不以敘述硬湊。新 RPC `tasks.changes`（唯讀，與 `tasks.comments`／`tasks.iterations` 同一套任務範圍權限閘）。目前顯示「動過哪些檔案」，尚非逐行 before/after diff（需寫入前快照，列為後續項）。
+- **目標契約凍結＋四要素引導**：`/goal` 與 `tasks.goal_create` 建立目標時，把驗收標準凍結成不可變的 `acceptance_criteria_baseline`；判官與第一階段評估器一律讀這份 baseline，不讀事後可能被改動的欄位。只有儀表板操作者可經 `tasks.update` 編輯顯示用的可變副本（新能力——但這不會回頭改動判官仍在檢核的 baseline，是刻意設計，避免驗收門檻被悄悄放水或收緊）。`/goal` 沒帶 `||` 驗收標準時仍照常建立任務，但確認訊息會多附一段「目標／輸入／輸出格式／約束」四要素引導與 3-5 條 outcome 式驗收標準建議；`planner_enabled` 的子任務拆解 prompt 也同步補上同一套契約紀律（寫結果不寫作法、標準精簡到 3-5 條、範圍外事項列為 Non-goals 而非驗收項）。
+
+### Changed
+- **`resume_on_restart` 預設由 `auto` 改為 `pause`**：`[goal_loop] resume_on_restart`（見上方「重啟不自動復活」）先前以 opt-in 上線、預設 `auto`（行為不變）；現在預設翻轉成 `pause`——gateway 每次重啟（非預期崩潰、部署重啟）都會把還在跑的 `goal_mode` 任務轉 `needs_human`，等你按下重試才會繼續，不再悄悄接續一個沒人重新確認過的目標。想改回舊行為，把 `config.toml [goal_loop] resume_on_restart` 設回 `"auto"`，或到儀表板「設定 → 自動化」的「gateway 重啟後的進行中目標任務」切換（`system.update_config` 已加入白名單，只收 `"auto"`/`"pause"` 兩值）——這項設定只在 gateway 下次真正重啟時生效，儲存當下不會立即套用。
+- **`[dispatch] two_stage_judge` 預設開啟**：goal 任務 `review` 流程從單段式判官預設變成先跑第一階段評估器才進 MAV 判官團（見上方「兩段式驗收裁決」）；設 `= false` 可退回舊行為。
+- **MAV 判官 prompt 套用新紀律條款**：無 config 開關，即刻套用到所有 goal 任務（見上方「驗收判官紀律條款」）。
+- **停滯偵測的比對依據**：從駁回回饋逐字比對改成 gap 指紋比對，無 config 開關（見上方「停滯偵測改用 gap 指紋比對」）——同一卡點換句話說也會被抓到，可能比過去更早觸發 `needs_human`。
+- **agent 不能再修改自己 goal 任務的驗收標準**：先前 agent 身分呼叫 MCP `tasks_update` 可直接改掉 goal 任務的 `acceptance_criteria`；現在一律拒絕並留審計紀錄（`goal_contract_frozen`，見上方「目標契約凍結」）。
+
+### Fixed
+- **驗收判官 JSON 面板截斷時的假陽性風險**：面板 JSON 被截斷成不完整片段時，先前會落回舊版單一 `PASS`/`FAIL` 掃描器，若片段裡剛好帶著 `pass` 字樣就可能誤判通過；現在截斷或畸形 JSON 一律直接判定失敗（fail-closed），絕不再落到舊版掃描器。
+- **驗收判官 `PASS` 誤判**：舊版掃描器只要回覆第一行「任何位置」出現 `PASS` 字樣就算通過（例如 `[THE, RESULT, DOES, NOT, PASS, …]` 這種列表也會被誤判為通過）。現在要求 `PASS` 必須是第一行「開頭」的 token 才算數。
+
+### Security
+- **WhatsApp webhook 簽章驗證改為 fail-closed**：先前 `app_secret` 為空時會完全跳過簽章驗證、照常處理 inbound 訊息（webhook 對外裸奔）；現在空 secret、缺簽章 header、驗章失敗一律回 401 拒收，並在啟動時對「已啟用但未設 App Secret」的通道記明確警告。**行為變更**：沒設 App Secret 的部署升級後會收不到 WhatsApp 訊息，到儀表板通道設定補上 App Secret 即恢復——這是刻意的 fail-closed，與 LINE／Feishu 既有行為對齊。
+- **`system.config` RPC 遮罩補上巢狀遞迴**：敏感欄位遮罩先前不深入 `[[accounts]]` 這類 array-of-tables，其中的 `oauth_token` 等值可經儀表板 RPC 原樣讀出；現在遮罩完整遞迴 tables／arrays／arrays-of-tables。全 repo 同類掃描確認其餘結構化遮罩實作皆已正確處理陣列，此為唯一缺口。
+
 ## [1.59.0] - 2026-08-15 — 信念迴圈×目標契約＋排程可靠性修復
 
 ### Added

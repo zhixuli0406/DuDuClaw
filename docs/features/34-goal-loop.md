@@ -16,6 +16,8 @@ The goal loop (v1.37) turns one-shot Q&A into "give a goal → agent loops to co
 
 This creates a `goal_mode` task on the Task Board, stamped with the source channel and chat so progress pushes back to the conversation that started it. Omit the `||` part and the goal description itself becomes the acceptance baseline; an optional third `outcome:<spec>` segment adds a machine-checkable output contract (JSON Schema subset or workdir file globs) that runs deterministically, at zero LLM cost, *before* the judge — structurally deficient output bounces straight back to revision without spending a judge call.
 
+Acceptance criteria are frozen into an immutable baseline the moment the goal is created — every judge call (both the first-stage evaluator and the panel) reads that baseline, never a field an agent could edit later. An agent-identity `tasks_update` call is refused (with an audit entry) if it tries to change the acceptance criteria on a `goal_mode` task; only a dashboard operator can still edit the display copy, and doing so does not retroactively change what the frozen baseline judges against. Skip the `||` criteria and the confirmation reply also nudges you toward a sharper contract next time: a four-element prompt (goal / inputs / output format / constraints) plus a suggestion to write 3–5 outcome-style criteria.
+
 The dispatch engine behind this is **on by default since v1.59** (it idles at a periodic SQLite poll until a goal task exists; the acceptance judge only spends an LLM call when a goal actually reaches review). To opt out, set `config.toml [dispatch] enabled = false` — or flip the「派工引擎」switch in Settings → Automation, which hot-applies without a restart.
 
 ## The Driver
@@ -32,7 +34,11 @@ On rejection the task returns to `pending` carrying the judge's feedback; the ve
 
 ## The Acceptance Judge — Never Self-Report
 
-"Done" is only ever declared by the verifier, not the worker. When the agent reports completion, the task enters `review` and `DispatchEngine` runs a **three-aspect MAV panel** — correctness, completeness, safety — in one LLM call through the account rotator. All three must pass; a parse failure or judge error parks the task as `needs_human`, never auto-accepts (fail-closed). This is the defense against the classic loop trap where an agent narrates success and the system believes it.
+"Done" is only ever declared by the verifier, not the worker. When the agent reports completion, the task enters `review`. A cheap **first-stage evaluator** runs first — one tool-less LLM call returning a three-way JSON decision (`continue` / `candidate_complete` / `blocked`). `continue` skips the panel and re-dispatches immediately with the evaluator's `next_step` as feedback (counts against the iteration cap); `blocked` goes straight to `needs_human`; only `candidate_complete` reaches the full panel below. Any evaluator failure (timeout, parse error, transport error) degrades straight to the panel — it never auto-accepts or auto-rejects on its own malfunction. Config: `[dispatch] two_stage_judge` (default `true`; `false` reverts to every review going straight to the panel).
+
+Once a round reaches the panel, `DispatchEngine` runs a **three-aspect MAV panel** — correctness, completeness, safety — in one LLM call through the account rotator. All three must pass; a parse failure, a truncated/malformed panel reply, or a judge transport error parks the task as `needs_human`, never auto-accepts (fail-closed) — a truncated JSON fragment can no longer fall through to a legacy token scanner that might misread a stray `pass` substring as an accept. This is the defense against the classic loop trap where an agent narrates success and the system believes it.
+
+The panel prompt also carries four standing discipline clauses, always on (no config gate): **no ratcheting** the bar higher round over round when the criteria haven't changed; **audit, don't author** — the judge may only check the worker's submitted evidence and the tool-activity digest, never invent its own; **no scope creep** — a requirement absent from the acceptance criteria can't be the reason for a rejection; and **a self-reported "done" is not evidence** on its own.
 
 Judge depth scales with goal difficulty (a local, zero-LLM heuristic): simple single-step goals get a two-aspect check (correctness + safety) and a lower iteration cap; hard goals get the full panel. The safety aspect is never dropped at any depth.
 
@@ -45,12 +51,14 @@ Termination is guaranteed by the driver, not by trusting the model:
 | Iteration cap (dispatches per task) | 8 (hard goals), 3 (simple) | `needs_human` |
 | Wall clock from creation | 24 h | `needs_human` |
 | Concurrent goal tasks | 3 | queued, not dispatched |
-| Oscillation detection | two consecutive near-identical rejection feedbacks | early `needs_human` |
+| Stagnation detection | two consecutive rejections with the same **gap fingerprint** (`path:line` citations + backtick key tokens extracted and normalized from the feedback, not raw text equality — a reworded restatement of the same gap still matches; falls back to literal-text comparison only when no citation/token is extractable) | early `needs_human` |
+| Bail-pattern detection | nine zh+en anchored regexes over the agent's last non-empty paragraph (e.g. self-signed `VERDICT:`, "check back later", "ready for review") | telemetry + activity event + a hint folded into the next round's judge/evaluator input — never rejects or blocks on its own |
 | In-flight dedup | dispatched-but-unclaimed tasks are not re-enqueued until a stall timeout (600 s) | re-dispatch |
 | Cross-process circuit breaker (`dispatch_guard`) | 20 dispatches / 60 s sliding window | cooldown refusal |
 | Delegation hop depth | 5 | dispatch refused |
+| Resume on gateway restart (`resume_on_restart`) | `pause` (**default**) escalates every in-flight `goal_mode` task to `needs_human` (reason `gateway_restart`) at boot | `auto` resumes in-flight tasks exactly as before a restart instead; toggle either in `config.toml` or the dashboard's Settings → Automation tab (`system.update_config`, whitelisted to `"auto"`/`"pause"` only) |
 
-All under `[goal_loop]` / `[dispatch_guard]` in `config.toml`, with built-in defaults when the sections are absent.
+All under `[goal_loop]` / `[dispatch_guard]` / `[dispatch]` in `config.toml`, with built-in defaults when the sections are absent.
 
 ## needs_human Escalation
 
