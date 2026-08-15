@@ -1,10 +1,20 @@
 import { useCallback, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
-import { RotateCcw, CheckCircle2, XCircle, ExternalLink, Loader2, MessageSquareWarning } from 'lucide-react';
+import {
+  RotateCcw,
+  CheckCircle2,
+  XCircle,
+  ExternalLink,
+  Loader2,
+  MessageSquareWarning,
+  FileText,
+  FileDiff,
+} from 'lucide-react';
 import { api, type TaskInfo } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
-import { Button } from '@/components/mds';
+import { Button, Tabs, TabsList, TabsTab, TabsPanel } from '@/components/mds';
+import { TaskChangesPanel } from '@/components/task';
 import { DetailShell } from './DetailShell';
 import { TYPE_META } from './meta';
 import { OpenInChannelButton } from './OpenInChannelButton';
@@ -106,18 +116,44 @@ export function NeedsHumanTaskPanel({
   const intl = useIntl();
   const t = useCallback((id: string) => intl.formatMessage({ id }), [intl]);
   const navigate = useNavigate();
+  // WP-F: 說明 (why it stopped) / 變更 (what it already touched). The changes
+  // RPC only fires once the operator opens that tab.
+  const [tab, setTab] = useState<'brief' | 'changes'>('brief');
 
   return (
     <DetailShell icon={TYPE_META.blocked.icon} title={task.title} typeLabel={typeLabel} agentId={task.assigned_to} agentName={agentName}>
-      {task.description && <p className="text-sm text-foreground">{task.description}</p>}
+      <Tabs variant="line" value={tab} onValueChange={(v) => setTab(v as 'brief' | 'changes')}>
+        <TabsList className="border-b border-surface-border">
+          <TabsTab value="brief">
+            <FileText />
+            {t('inbox.needsHuman.tab.brief')}
+          </TabsTab>
+          <TabsTab value="changes">
+            <FileDiff />
+            {t('inbox.needsHuman.tab.changes')}
+          </TabsTab>
+        </TabsList>
 
-      {/* The judge's / dispatcher's escalation reason — "看決定的依據" (§D.7). */}
-      {task.judge_feedback && (
-        <p className="flex items-start gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
-          <MessageSquareWarning className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-          <span>{task.judge_feedback}</span>
-        </p>
-      )}
+        <TabsPanel value="brief">
+          <div className="space-y-3">
+            {task.description && <p className="text-sm text-foreground">{task.description}</p>}
+
+            {/* The judge's / dispatcher's escalation reason — "看決定的依據" (§D.7). */}
+            {task.judge_feedback && (
+              <p className="flex items-start gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+                <MessageSquareWarning className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+                <span>{task.judge_feedback}</span>
+              </p>
+            )}
+          </div>
+        </TabsPanel>
+
+        {/* WP-F (P2-c): the recorded file effects, so the decision rests on what
+            the audit trail shows rather than on the agent's own account. */}
+        <TabsPanel value="changes">
+          {tab === 'changes' && <TaskChangesPanel taskId={task.id} />}
+        </TabsPanel>
+      </Tabs>
 
       <NeedsHumanActions taskId={task.id} onResolved={onResolved} />
 

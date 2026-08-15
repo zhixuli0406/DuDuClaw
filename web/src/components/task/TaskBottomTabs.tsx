@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { MessagesSquare, Activity, SendHorizonal, UserRound, Loader2 } from 'lucide-react';
+import { MessagesSquare, Activity, SendHorizonal, UserRound, Loader2, FileDiff } from 'lucide-react';
 import {
   Tabs,
   TabsList,
@@ -12,6 +12,7 @@ import {
 import { timeAgo } from '@/lib/format';
 import type { ActivityEvent, TaskComment } from '@/lib/api';
 import type { AssigneeOption } from './AssigneePopover';
+import { TaskChangesPanel } from './TaskChangesPanel';
 
 /**
  * TaskBottomTabs — the spec §5.3 式1 footer tabs on the detail page (line variant).
@@ -21,6 +22,10 @@ import type { AssigneeOption } from './AssigneePopover';
  *    `onAddComment`; comment rows lead with a person marker, activity rows keep
  *    the employee avatar.
  *  · 活動 (Activity): the task-filtered activity stream only.
+ *  · 變更 (Changes, WP-F): the file effects the task's rounds actually left
+ *    behind, so "接受結果前先做一輪檢查" works on the detail page too, not just
+ *    on the Inbox decision card. Lazily mounted — the RPC only fires when the
+ *    tab is opened.
  */
 
 type TimelineItem =
@@ -74,7 +79,10 @@ function ActivityTimeline({
   );
 }
 
+type BottomTab = 'discussion' | 'activity' | 'changes';
+
 export function TaskBottomTabs({
+  taskId,
   events,
   comments,
   agents,
@@ -82,6 +90,8 @@ export function TaskBottomTabs({
   currentUserId,
   currentUserName,
 }: {
+  /** WP-F: enables the 變更 tab. Omit and the tab is not rendered. */
+  taskId?: string;
   events: ReadonlyArray<ActivityEvent>;
   comments: ReadonlyArray<TaskComment>;
   agents: ReadonlyArray<AssigneeOption>;
@@ -90,7 +100,7 @@ export function TaskBottomTabs({
   currentUserName?: string;
 }) {
   const intl = useIntl();
-  const [tab, setTab] = useState<'discussion' | 'activity'>('discussion');
+  const [tab, setTab] = useState<BottomTab>('discussion');
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
 
@@ -129,7 +139,7 @@ export function TaskBottomTabs({
     n > 0 ? <span className="font-mono text-xs tabular-nums text-muted-foreground">{n}</span> : null;
 
   return (
-    <Tabs variant="line" value={tab} onValueChange={(v) => setTab(v as 'discussion' | 'activity')}>
+    <Tabs variant="line" value={tab} onValueChange={(v) => setTab(v as BottomTab)}>
       <TabsList className="border-b border-surface-border">
         <TabsTab value="discussion">
           <MessagesSquare />
@@ -141,6 +151,12 @@ export function TaskBottomTabs({
           {intl.formatMessage({ id: 'tasks.tab.activity' })}
           {count(events.length)}
         </TabsTab>
+        {taskId && (
+          <TabsTab value="changes">
+            <FileDiff />
+            {intl.formatMessage({ id: 'tasks.tab.changes' })}
+          </TabsTab>
+        )}
       </TabsList>
 
       <TabsPanel value="discussion">
@@ -215,6 +231,13 @@ export function TaskBottomTabs({
       <TabsPanel value="activity">
         <ActivityTimeline events={events} agents={agents} />
       </TabsPanel>
+
+      {/* WP-F: mounted only while selected, so the RPC is paid for on demand. */}
+      {taskId && (
+        <TabsPanel value="changes">
+          {tab === 'changes' && <TaskChangesPanel taskId={taskId} />}
+        </TabsPanel>
+      )}
     </Tabs>
   );
 }
