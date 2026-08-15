@@ -39,7 +39,7 @@ If `auth_token` is not configured, authentication is disabled.
 | Prefix | Description | Count |
 |--------|-------------|-------|
 | `agents.*` | Agent lifecycle and management | 12 |
-| `channels.*` | Telegram/LINE/Discord management | 5 |
+| `channels.*` | Channel management (11 platforms) | 5 |
 | `accounts.*` | OAuth/API account rotation and budgets | 6 |
 | `memory.*` | Cognitive memory search and browsing | 2 |
 | `skills.*` | Skill ecosystem discovery | 3 |

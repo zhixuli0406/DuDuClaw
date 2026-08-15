@@ -34,7 +34,7 @@ info:
     | Prefix | Description |
     |--------|-------------|
     | `agents.*` | Agent lifecycle and management |
-    | `channels.*` | Channel (Telegram/LINE/Discord) management |
+    | `channels.*` | Channel management (11 platforms) |
     | `accounts.*` | OAuth/API account rotation and budgets |
     | `memory.*` | Cognitive memory search and browsing |
     | `skills.*` | Skill ecosystem discovery |
@@ -566,7 +566,7 @@ paths:
                       properties:
                         type:
                           type: string
-                          enum: [telegram, line, discord]
+                          enum: [telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom, dingtalk, webchat]
                         status:
                           type: string
                           enum: [connected, disconnected, error]
@@ -584,7 +584,7 @@ paths:
               properties:
                 type:
                   type: string
-                  enum: [telegram, line, discord]
+                  enum: [telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom, dingtalk, webchat]
                 token:
                   type: string
                   description: Bot token for the channel
@@ -619,7 +619,7 @@ paths:
               properties:
                 type:
                   type: string
-                  enum: [telegram, line, discord]
+                  enum: [telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom, dingtalk, webchat]
       responses:
         "200":
           description: Channel test result
@@ -648,7 +648,7 @@ paths:
               properties:
                 type:
                   type: string
-                  enum: [telegram, line, discord]
+                  enum: [telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom, dingtalk, webchat]
       responses:
         "200":
           description: Channel removed
@@ -2327,7 +2327,7 @@ tags:
   - name: agents
     description: Agent lifecycle and management
   - name: channels
-    description: Channel (Telegram/LINE/Discord) management
+    description: Channel management (11 platforms)
   - name: accounts
     description: OAuth/API account rotation and budgets
   - name: memory
