@@ -75,6 +75,44 @@ const SCRATCH_SEGMENT_NAMES: &[&str] = &["tmp", "temp", "scratch"];
 /// extracted at all — callers MUST fall back to literal-text comparison in
 /// that case (see module docs' "Fallback contract").
 pub fn gap_fingerprint(feedback: &str) -> Option<String> {
+    let tokens = extract_tokens(feedback);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut normalized: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+    normalized.sort();
+    normalized.dedup();
+    Some(normalized.join("\u{1}"))
+}
+
+/// WP-4F: the human-facing twin of [`gap_fingerprint`] — the same
+/// `path:line` citations and backtick key tokens, but case-preserved and in
+/// original occurrence order (only [`gap_fingerprint`] needs the
+/// lowercased/sorted form, for stable hash comparison). Used to render a
+/// "what's still missing" list (e.g. the goal-loop budget-exhausted
+/// escalation note) and, via its length, to rank rounds by how many concrete
+/// gaps remain (fewer ⇒ closer to done). Deduplication is case-insensitive
+/// (so `goal_loop.rs:120` and `GOAL_LOOP.rs:120` collapse to one entry) but
+/// keeps the first-seen casing. Empty when no citation or key token can be
+/// extracted — same fallback contract as `gap_fingerprint`.
+pub fn gap_tokens(feedback: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for t in extract_tokens(feedback) {
+        if seen.insert(t.to_lowercase()) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Shared extraction pass behind [`gap_fingerprint`] / [`gap_tokens`]:
+/// `path:line[:col]` citations first, then backtick-quoted key tokens,
+/// scratch-path segments normalized, capped at [`MAX_FINGERPRINT_TOKENS`].
+/// Case-preserved, not deduplicated — callers apply their own
+/// normalization/dedup policy on top.
+fn extract_tokens(feedback: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
 
     for cap in CITATION_RE.captures_iter(feedback) {
@@ -85,31 +123,22 @@ pub fn gap_fingerprint(feedback: &str) -> Option<String> {
             None => format!("{path}:{line}"),
         });
         if tokens.len() >= MAX_FINGERPRINT_TOKENS {
+            return tokens;
+        }
+    }
+
+    for cap in KEY_TOKEN_RE.captures_iter(feedback) {
+        let token = cap[1].trim();
+        if token.is_empty() {
+            continue;
+        }
+        tokens.push(normalize_scratch_path(token));
+        if tokens.len() >= MAX_FINGERPRINT_TOKENS {
             break;
         }
     }
 
-    if tokens.len() < MAX_FINGERPRINT_TOKENS {
-        for cap in KEY_TOKEN_RE.captures_iter(feedback) {
-            let token = cap[1].trim();
-            if token.is_empty() {
-                continue;
-            }
-            tokens.push(normalize_scratch_path(token));
-            if tokens.len() >= MAX_FINGERPRINT_TOKENS {
-                break;
-            }
-        }
-    }
-
-    if tokens.is_empty() {
-        return None;
-    }
-
-    let mut normalized: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
-    normalized.sort();
-    normalized.dedup();
-    Some(normalized.join("\u{1}"))
+    tokens
 }
 
 /// Replace scratch/temp-looking path segments with a stable `<scratch>`

@@ -417,6 +417,7 @@ mod tests {
             dispatch_count: 1,
             state_hash: None,
             repeat_streak: None,
+            worker_excerpt: None,
         }
     }
 
