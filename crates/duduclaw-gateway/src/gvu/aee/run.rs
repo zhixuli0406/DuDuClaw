@@ -276,6 +276,9 @@ where
         skipped: None,
         exit: "not_started".to_string(),
         case_dimension_available: false,
+        // WP-6A / A2 — read-only harness-knob snapshot, carried into
+        // telemetry only. See `crate::gvu::knob_snapshot` module docs.
+        knobs: Some(crate::gvu::knob_snapshot::capture(&input.home_dir, input.agent_dir)),
     };
 
     // ── Measure inputs shared by the bootstrap and the candidate ───────────

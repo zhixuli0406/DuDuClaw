@@ -74,3 +74,8 @@ pub mod aee;
 mod tests_gate;
 #[cfg(test)]
 mod tests_measure;
+
+// WP-6A / A2 (2026-08-15, `commercial/docs/DESIGN-evolution-harness-knobs-2026-08.md`
+// §7.2-A2) — read-only harness-knob telemetry snapshot, appended at the end
+// for the same reason as the WP0.x modules above (concurrent sibling edits).
+pub mod knob_snapshot;

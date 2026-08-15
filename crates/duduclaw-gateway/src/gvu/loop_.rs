@@ -501,6 +501,23 @@ impl GvuLoop {
                 "AEE round finished"
             );
 
+            // WP-6A / A2: persist the same record (now including a harness-knob
+            // snapshot) to the durable evolution-events sink — previously the
+            // `AeeRound` schema variant was declared but never emitted, so this
+            // record was only ever visible via `debug!` above. Non-blocking,
+            // purely observational — does not participate in the verdict below.
+            {
+                use crate::evolution_events::{
+                    emitter::EvolutionEventEmitter, schema::Outcome as EvtOutcome,
+                };
+                let evt_outcome = match &result.verdict {
+                    super::aee::AeeVerdict::Committed { .. } => EvtOutcome::Success,
+                    super::aee::AeeVerdict::NotCommitted { .. } => EvtOutcome::Failure,
+                    super::aee::AeeVerdict::Skipped { .. } => EvtOutcome::Suppressed,
+                };
+                EvolutionEventEmitter::global().emit_aee_round(&result.record, evt_outcome);
+            }
+
             // An inner loop that gave up and asked for a human is an operator
             // signal, not a log line: it means the same wall was hit twice and
             // no amount of further rounds will help. Routed through the same

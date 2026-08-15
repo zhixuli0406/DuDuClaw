@@ -437,6 +437,33 @@ impl EvolutionEventEmitter {
         );
     }
 
+    // ── Evolution v3 / AEE: per-round audit trail ────────────────────────────
+
+    /// Emit an `aee_round` event (non-blocking).
+    ///
+    /// Call once per [`crate::gvu::aee::AeeRoundRecord`] — the WP2.3 §3.2.4
+    /// audit record already produced at the end of every AEE round
+    /// (committed, abandoned, or skipped). Previously this record was only
+    /// `tracing::debug!`-logged (`gvu/loop_.rs`), so it never reached any
+    /// durable, queryable sink; wiring it here also carries the WP-6A / A2
+    /// harness-knob snapshot the record now includes
+    /// (`crate::gvu::knob_snapshot`) into the same durable trail, so a later
+    /// retrospective read has both "what happened" and "under which
+    /// settings" in one row. See [`super::schema::AuditEventType::AeeRound`]
+    /// for the metadata shape this schema variant was already declared for.
+    ///
+    /// `outcome`: `Success` when the round committed, `Failure` when it ran
+    /// but nothing committed (gate/commit-gate rejection), `Suppressed` when
+    /// the round never started (cooldown / no material) — matching the
+    /// contract the `AeeRound` schema doc comment already specified.
+    pub fn emit_aee_round(&self, record: &crate::gvu::aee::AeeRoundRecord, outcome: Outcome) {
+        self.spawn(
+            AuditEvent::now(AuditEventType::AeeRound, record.agent_id.as_str(), outcome)
+                .with_trigger_signal(record.trigger.as_str())
+                .with_metadata(record.to_payload()),
+        );
+    }
+
     // ── B3: one-shot CLI shutdown synchronisation ────────────────────────────
 
     /// Wait (bounded by `timeout`) for every audit-write task spawned so far
