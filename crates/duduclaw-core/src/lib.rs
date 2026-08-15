@@ -71,7 +71,7 @@ pub use identity_token::{
     IdentityVerdict, ENV_AGENT_TOKEN, IDENTITY_KEY_FILE, UNTRUSTED_AGENT_ID,
 };
 pub use keychain::{resolve_master_key, KeychainError, MasterKeySource};
-pub use match_utils::{is_valid_egress_host, origin_host_matches, word_contains_ci};
+pub use match_utils::{is_valid_discord_snowflake, is_valid_egress_host, origin_host_matches, word_contains_ci};
 pub use org_field_guard::{
     check_bash_protected_write, check_caller_scope, check_identity_surface_write,
     check_own_soul_write, check_protected_toml_write, classify_identity_surface,

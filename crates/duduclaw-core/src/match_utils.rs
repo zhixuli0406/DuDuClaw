@@ -163,6 +163,31 @@ pub fn is_valid_egress_host(entry: &str) -> bool {
     })
 }
 
+/// Validate a Discord snowflake id (channel/user/message id): a numeric,
+/// non-zero, unsigned 64-bit integer serialized as a decimal string
+/// (17-20 digits in practice; `u64::MAX` is 20 digits).
+///
+/// This is the single source of truth for Discord id validation —
+/// previously two independent implementations existed
+/// (`channel_sender::is_valid_discord_chat_id` accepted any non-empty
+/// all-digit string with no length cap or all-zero check;
+/// `autopilot_engine::is_discord_snowflake` had the length cap and
+/// all-zero check). Both now delegate here.
+///
+/// Rejects, fail-closed:
+///   - empty string
+///   - anything longer than 20 ASCII digits (can't be a real u64 id)
+///   - non-ASCII-digit bytes (rules out path traversal like `../guilds/1`,
+///     query-string smuggling like `123?x=1`, path smuggling like
+///     `123/messages`, and CJK/unicode digit look-alikes)
+///   - all-zero strings (`0`, `00`, …) — `0` is never a real Discord id
+pub fn is_valid_discord_snowflake(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 20
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && s.bytes().any(|b| b != b'0')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +294,44 @@ mod tests {
         assert!(!is_valid_egress_host("a.*.com")); // interior wildcard
         assert!(!is_valid_egress_host("**.com")); // double wildcard
         assert!(!is_valid_egress_host("-bad.com")); // hyphen-edged label
+    }
+
+    // ── is_valid_discord_snowflake (WP-4C unification) ────────────────────
+
+    #[test]
+    fn snowflake_accepts_legal_ids() {
+        assert!(is_valid_discord_snowflake("123456789012345678")); // 18-digit real-shaped id
+        assert!(is_valid_discord_snowflake("1")); // minimal non-zero
+        assert!(is_valid_discord_snowflake("18446744073709551615")); // u64::MAX, 20 digits
+    }
+
+    #[test]
+    fn snowflake_rejects_too_long() {
+        assert!(!is_valid_discord_snowflake("123456789012345678901")); // 21 digits
+    }
+
+    #[test]
+    fn snowflake_rejects_non_numeric() {
+        assert!(!is_valid_discord_snowflake("12a45")); // letter mixed in
+        assert!(!is_valid_discord_snowflake("../guilds/1")); // path traversal
+        assert!(!is_valid_discord_snowflake("123/messages")); // path smuggle
+        assert!(!is_valid_discord_snowflake("123?x=1")); // query smuggle
+    }
+
+    #[test]
+    fn snowflake_rejects_empty() {
+        assert!(!is_valid_discord_snowflake(""));
+    }
+
+    #[test]
+    fn snowflake_rejects_cjk_mixed_in() {
+        assert!(!is_valid_discord_snowflake("123頻道456")); // CJK characters mixed into digits
+        assert!(!is_valid_discord_snowflake("頻道")); // pure CJK, no digits at all
+    }
+
+    #[test]
+    fn snowflake_rejects_all_zero() {
+        assert!(!is_valid_discord_snowflake("0"));
+        assert!(!is_valid_discord_snowflake("00"));
     }
 }

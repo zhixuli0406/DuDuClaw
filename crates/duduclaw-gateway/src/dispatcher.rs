@@ -17,7 +17,7 @@ use crate::claude_runner::{call_claude_for_agent_with_type};
 use duduclaw_agent::registry::AgentRegistry;
 use duduclaw_container::sandbox;
 
-use duduclaw_core::{MAX_DELEGATION_DEPTH, ENV_DELEGATION_DEPTH, ENV_DELEGATION_ORIGIN, ENV_DELEGATION_SENDER, ENV_HOP_DEPTH, truncate_bytes};
+use duduclaw_core::{MAX_DELEGATION_DEPTH, ENV_DELEGATION_DEPTH, ENV_DELEGATION_ORIGIN, ENV_DELEGATION_SENDER, ENV_HOP_DEPTH, is_valid_discord_snowflake, truncate_bytes};
 
 /// Message envelope stored in `bus_queue.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2760,8 +2760,10 @@ fn validate_channel_id(channel_type: &str, id: &str) -> Result<(), String> {
     if !valid {
         return Err(format!("channel_id contains invalid characters for {channel_type}: {id}"));
     }
-    // Discord snowflakes: 17-20 digit numbers
-    if channel_type == "discord" && !id.chars().all(|c| c.is_ascii_digit()) {
+    // Discord snowflakes: 17-20 digit numbers (WP-4C — unified with the
+    // duduclaw-core validator; only this check's implementation changed,
+    // the rest of `validate_channel_id` is untouched).
+    if channel_type == "discord" && !is_valid_discord_snowflake(id) {
         return Err(format!("Discord channel_id must be numeric snowflake, got: {id}"));
     }
     // Telegram chat_id: signed integer (can be negative for groups)
