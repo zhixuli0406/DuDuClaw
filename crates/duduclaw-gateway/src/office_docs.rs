@@ -224,6 +224,15 @@ async fn deliver_one(
         .await
         .map_err(|e| format!("read failed: {e}"))?;
 
+    // WP-4H: zero-LLM delivery gate. Hard failures (empty / magic mismatch /
+    // corrupt zip container) reject the whole delivery here — before
+    // anything is archived or sent — and propagate through this function's
+    // existing `Err` degrade-to-text-note path. Soft signals (placeholder
+    // residue) are logged and let `data` through unchanged.
+    let office_gate_cfg = crate::artifact_gate::OfficeGateConfig::from_home(home_dir);
+    crate::artifact_gate::run_delivery_gate(&path, &data, agent_dir, home_dir, &office_gate_cfg)
+        .await?;
+
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -487,6 +496,22 @@ mod tests {
         }
     }
 
+    /// WP-4H: the delivery gate now rejects docx/xlsx/pptx content whose
+    /// bytes aren't a real zip container, so fixtures for those extensions
+    /// need to be an actual (minimal) well-formed zip — plain placeholder
+    /// bytes like `b"docx"` no longer pass and would make these tests fail
+    /// for the wrong reason (blocked by the gate, not exercising what the
+    /// test is actually about).
+    fn minimal_zip_bytes() -> Vec<u8> {
+        use std::io::Write;
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("test.txt", opts).unwrap();
+        zw.write_all(b"hello").unwrap();
+        zw.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn skill_for_extension_maps_office_family() {
         assert_eq!(skill_for_extension("docx"), Some("docx"));
@@ -573,7 +598,8 @@ mod tests {
         let agent_dir = home.join("agents").join("a");
         std::fs::create_dir_all(&agent_dir).unwrap();
         let file = agent_dir.join("summary.xlsx");
-        std::fs::write(&file, b"real xlsx bytes").unwrap();
+        let data = minimal_zip_bytes();
+        std::fs::write(&file, &data).unwrap();
 
         let docs = Arc::new(Mutex::new(Vec::new()));
         let sender = RecordingSender {
@@ -593,7 +619,7 @@ mod tests {
             sent[0].1,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         );
-        assert_eq!(sent[0].2, "real xlsx bytes".len());
+        assert_eq!(sent[0].2, data.len());
 
         // The deliverable is archived under the agent's attachments/ so the
         // dashboard Files page can list it after delivery.
@@ -615,7 +641,7 @@ mod tests {
         let attach_dir = agent_dir.join("attachments");
         std::fs::create_dir_all(&attach_dir).unwrap();
         let file = attach_dir.join("already.docx");
-        std::fs::write(&file, b"docx").unwrap();
+        std::fs::write(&file, minimal_zip_bytes()).unwrap();
 
         let docs = Arc::new(Mutex::new(Vec::new()));
         let sender = RecordingSender {
@@ -643,7 +669,7 @@ mod tests {
         let agent_dir = home.join("agents").join("sales");
         std::fs::create_dir_all(&agent_dir).unwrap();
         let file = agent_dir.join("summary.xlsx");
-        std::fs::write(&file, b"real xlsx bytes").unwrap();
+        std::fs::write(&file, minimal_zip_bytes()).unwrap();
 
         let sender = RecordingSender {
             docs: Arc::new(Mutex::new(Vec::new())),
@@ -670,7 +696,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("dd-prov-sweep-{}", uuid::Uuid::new_v4()));
         let agent_dir = home.join("agents").join("ops");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("總覽.docx"), b"docx-bytes").unwrap();
+        std::fs::write(agent_dir.join("總覽.docx"), minimal_zip_bytes()).unwrap();
         let sender = RecordingSender {
             docs: Arc::new(Mutex::new(Vec::new())),
             texts: Arc::new(Mutex::new(Vec::new())),
@@ -695,7 +721,11 @@ mod tests {
         let agent_dir = home.join("agents").join("a");
         std::fs::create_dir_all(&agent_dir).unwrap();
         let file = agent_dir.join("out.docx");
-        std::fs::write(&file, b"docx").unwrap();
+        // A valid zip so this test actually reaches `send_document` (and its
+        // simulated failure) rather than being rejected earlier by the
+        // WP-4H delivery gate — the assertions below are about the
+        // send-failure degrade path, not the gate.
+        std::fs::write(&file, minimal_zip_bytes()).unwrap();
 
         let sender = RecordingSender {
             docs: Arc::new(Mutex::new(Vec::new())),
@@ -792,7 +822,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("dd-sweep-send-{}", uuid::Uuid::new_v4()));
         let agent_dir = home.join("agents").join("a");
         std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("總覽.docx"), b"docx-bytes").unwrap();
+        std::fs::write(agent_dir.join("總覽.docx"), minimal_zip_bytes()).unwrap();
         let docs = Arc::new(Mutex::new(Vec::new()));
         let sender = RecordingSender {
             docs: docs.clone(),
@@ -805,6 +835,73 @@ mod tests {
         // Archived copy exists → an immediate second sweep is a no-op.
         let sent2 = sweep_undeclared_deliverables(&agent_dir, &home, &sender).await;
         assert_eq!(sent2, 0, "dedup against the archive must hold");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── WP-4H: delivery gate integration (end-to-end through deliver_one) ──
+
+    /// A hard-failing file (here: 0 bytes) must never reach `send_document`
+    /// or the attachments/ archive, and the reply text must still tell the
+    /// human user why nothing arrived — the existing degrade-to-text-note
+    /// path is how the gate's rejection reaches the user, since the agent's
+    /// own turn has already ended by the time this runs.
+    #[tokio::test]
+    async fn process_deliverables_blocks_empty_file_end_to_end() {
+        let home = std::env::temp_dir().join(format!("dd-gate-e2e-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("a");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let file = agent_dir.join("empty.docx");
+        std::fs::write(&file, b"").unwrap();
+
+        let docs = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender {
+            docs: docs.clone(),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+
+        let reply = format!("已完成。\n📎DELIVER:{}", file.to_str().unwrap());
+        let out = process_deliverables(&reply, &agent_dir, &home, &sender).await;
+
+        // Nothing was sent through the channel.
+        assert!(docs.lock().unwrap().is_empty());
+        // Nothing was archived either — a rejected file isn't a delivery.
+        let archived = std::fs::read_dir(agent_dir.join("attachments"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(archived, 0, "a hard-rejected file must not be archived");
+        // The user still learns something was attempted and why it failed.
+        assert!(out.starts_with("已完成。"));
+        assert!(out.contains("檔案傳送失敗"));
+        assert!(out.contains("空的"), "{out}");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `[office] delivery_gate = false` restores pre-WP-4H behavior: even an
+    /// empty file is sent through untouched.
+    #[tokio::test]
+    async fn process_deliverables_gate_disabled_sends_even_broken_file() {
+        let home = std::env::temp_dir().join(format!("dd-gate-off-e2e-{}", uuid::Uuid::new_v4()));
+        let agent_dir = home.join("agents").join("a");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(&home.join("config.toml"), "[office]\ndelivery_gate = false\n").unwrap();
+        let file = agent_dir.join("empty.docx");
+        std::fs::write(&file, b"").unwrap();
+
+        let docs = Arc::new(Mutex::new(Vec::new()));
+        let sender = RecordingSender {
+            docs: docs.clone(),
+            texts: Arc::new(Mutex::new(Vec::new())),
+            fail_docs: false,
+        };
+
+        let reply = format!("已完成。\n📎DELIVER:{}", file.to_str().unwrap());
+        let out = process_deliverables(&reply, &agent_dir, &home, &sender).await;
+
+        assert_eq!(docs.lock().unwrap().len(), 1, "gate off must let even a broken file through");
+        assert_eq!(out, "已完成。");
+
         let _ = std::fs::remove_dir_all(&home);
     }
 }

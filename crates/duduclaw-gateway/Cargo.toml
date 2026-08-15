@@ -99,8 +99,11 @@ enigo = { version = "0.3", features = ["serde"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 hex = "0.4"
 openssl-sys = { version = "0.9", optional = true }
-
-[target.'cfg(windows)'.dependencies]
+# WP-4H: delivery-gate zip-container integrity check for docx/xlsx/pptx
+# (OOXML packages). Was Windows-only (`updater.rs`'s zip-extraction path);
+# promoted to a normal cross-platform dependency so `artifact_gate.rs` can
+# validate on macOS/Linux too — same crate/version/features, just no longer
+# target-gated.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
