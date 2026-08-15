@@ -93,6 +93,31 @@ pub fn builtin_pack_cache_dir(home: &Path, industry: &str) -> Result<PathBuf, St
     Ok(builtin_cache_dir(home).join(builtin_pack_slug(industry)))
 }
 
+/// Roster member row for the `members[]` catalog field — front desk or
+/// worker, both carry the same human-facing shape (name/display_name/summary
+/// straight from `team.toml`, never re-authored).
+fn member_json(role: &str, name: &str, display_name: &str, summary: &str) -> Value {
+    json!({
+        "role": role,
+        "name": name,
+        "display_name": display_name,
+        "summary": summary,
+    })
+}
+
+/// The agent id a "已安裝" card should link into (`/agents/<name>`), derived
+/// from the actual install record rather than guessed from the manifest —
+/// `front_desk_name`, when given, is preferred if it is really among the
+/// agents this install created; otherwise the first created agent stands in.
+fn lead_agent_name(agents: &[String], front_desk_name: Option<&str>) -> Option<String> {
+    if let Some(name) = front_desk_name
+        && agents.iter().any(|a| a == name)
+    {
+        return Some(name.to_string());
+    }
+    agents.first().cloned()
+}
+
 /// Build the `experts.catalog` payload from a (possibly absent) premium tree
 /// and the current install records. Fail-safe: absent / unreadable premium
 /// dir ⇒ `deployed: false` with an empty list — never an error.
@@ -102,6 +127,15 @@ pub fn builtin_pack_cache_dir(home: &Path, industry: &str) -> Result<PathBuf, St
 /// dashboard can group instead of flattening 22+ cards into one grid.
 /// Standalone packs (premium `experts/<slug>/`, non-`*-team`) list alongside
 /// the industry teams.
+///
+/// P2-a (dashboard "召喚卡片"): team entries also carry `members[]` (front
+/// desk + workers, display_name/summary verbatim from `team.toml`),
+/// `humans[]` / `excluded[]` (the honest "left to a human" disclosure —
+/// already parsed for `templates.roster`, just not surfaced here before),
+/// `examples[]` (author-written `team.toml` `examples`, falling back to the
+/// first few real worker summaries — never LLM-fabricated), and
+/// `lead_agent_name` (once installed, the agent id the "已安裝" state should
+/// link into).
 pub fn builtin_catalog(premium_dir: Option<&Path>, installed: &[InstallRecord]) -> Value {
     let installed_slugs: BTreeSet<&str> = installed.iter().map(|r| r.slug.as_str()).collect();
     let Some(dir) = premium_dir else {
@@ -136,6 +170,65 @@ pub fn builtin_catalog(premium_dir: Option<&Path>, installed: &[InstallRecord]) 
                 })
                 .unwrap_or_default();
             let slug = builtin_pack_slug(&t.industry);
+            let installed_agents = installed
+                .iter()
+                .find(|r| r.slug == slug)
+                .map(|r| r.agents.as_slice())
+                .unwrap_or(&[]);
+            let members: Vec<Value> = manifest
+                .as_ref()
+                .map(|m| {
+                    let mut v = vec![member_json(
+                        "front_desk",
+                        &m.front_desk.name,
+                        &m.front_desk.display_name,
+                        &m.front_desk.summary,
+                    )];
+                    v.extend(
+                        m.workers
+                            .iter()
+                            .map(|w| member_json("worker", &w.name, &w.display_name, &w.summary)),
+                    );
+                    v
+                })
+                .unwrap_or_default();
+            let humans: Vec<Value> = manifest
+                .as_ref()
+                .map(|m| {
+                    m.humans
+                        .iter()
+                        .map(|h| json!({ "title": h.title, "summary": h.summary }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let excluded: Vec<Value> = manifest
+                .as_ref()
+                .map(|m| {
+                    m.excluded
+                        .iter()
+                        .map(|e| json!({ "kit": e.kit, "reason": e.reason }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Author-written examples win; otherwise derive from real worker
+            // summaries (front-desk summary already shown as `description`,
+            // so it is not repeated here). Never invented from scratch.
+            let examples: Vec<String> = manifest
+                .as_ref()
+                .map(|m| {
+                    if !m.examples.is_empty() {
+                        m.examples.clone()
+                    } else {
+                        m.workers
+                            .iter()
+                            .map(|w| w.summary.trim())
+                            .filter(|s| !s.is_empty())
+                            .take(3)
+                            .map(str::to_string)
+                            .collect()
+                    }
+                })
+                .unwrap_or_default();
             json!({
                 "kind": "team",
                 "industry": t.industry,
@@ -147,10 +240,18 @@ pub fn builtin_catalog(premium_dir: Option<&Path>, installed: &[InstallRecord]) 
                 // Roster = front desk + workers.
                 "agents_count": t.worker_count + 1,
                 "installed": installed_slugs.contains(slug.as_str()),
+                "members": members,
+                "humans": humans,
+                "excluded": excluded,
+                "examples": examples,
+                "lead_agent_name": lead_agent_name(
+                    installed_agents,
+                    manifest.as_ref().map(|m| m.front_desk.name.as_str()),
+                ),
             })
         })
         .collect();
-    packs.extend(standalone_catalog_entries(dir, &installed_slugs));
+    packs.extend(standalone_catalog_entries(dir, installed));
     if packs.is_empty() {
         return json!({ "deployed": false, "packs": [] });
     }
@@ -161,7 +262,8 @@ pub fn builtin_catalog(premium_dir: Option<&Path>, installed: &[InstallRecord]) 
 /// everything with an `expert.toml` whose slug is NOT `<industry>-team`
 /// (those are the committed convert-teams outputs, already listed as teams).
 /// Best-effort: an unparsable pack is skipped, never an error.
-fn standalone_catalog_entries(premium_dir: &Path, installed_slugs: &BTreeSet<&str>) -> Vec<Value> {
+fn standalone_catalog_entries(premium_dir: &Path, installed: &[InstallRecord]) -> Vec<Value> {
+    let installed_slugs: BTreeSet<&str> = installed.iter().map(|r| r.slug.as_str()).collect();
     let experts_root = premium_dir.join("experts");
     let Ok(entries) = std::fs::read_dir(&experts_root) else {
         return Vec::new();
@@ -206,6 +308,14 @@ fn standalone_catalog_entries(premium_dir: &Path, installed_slugs: &BTreeSet<&st
         } else {
             e.category.trim()
         };
+        let installed_agents = installed
+            .iter()
+            .find(|r| r.slug == slug)
+            .map(|r| r.agents.as_slice())
+            .unwrap_or(&[]);
+        // Standalone packs carry no per-member summary in `expert.toml`
+        // (`ExpertAgent` has no `summary` field) — no `members[]` to show
+        // honestly, so it is omitted rather than faked from the name alone.
         out.push(json!({
             "kind": "expert",
             "category": category,
@@ -215,6 +325,7 @@ fn standalone_catalog_entries(premium_dir: &Path, installed_slugs: &BTreeSet<&st
             "description": e.description,
             "agents_count": e.agents.len(),
             "installed": installed_slugs.contains(slug.as_str()),
+            "lead_agent_name": lead_agent_name(installed_agents, e.agents.first().map(|a| a.name.as_str())),
         }));
     }
     out
@@ -1478,6 +1589,16 @@ summary = "對外唯一窗口"
 [[workers]]
 kit = "docs-admin"
 name = "foo-docs"
+display_name = "文件助理"
+summary = "歸檔與提醒"
+
+[[humans]]
+title = "店長"
+summary = "決策與對外簽約"
+
+[[excluded]]
+kit = "billing-admin"
+reason = "本店未設帳務職"
 "#,
         )
         .unwrap();
@@ -1504,7 +1625,7 @@ name = "foo-docs"
             display_name: "Foo 產業".into(),
             version: "1.0.0".into(),
             description: String::new(),
-            agents: vec![],
+            agents: vec!["foo-assistant".into(), "foo-docs".into()],
             global_skills: vec![],
             wiki_files: vec![],
             installed_at: crate::expert_admin::now_iso(),
@@ -1518,9 +1639,81 @@ name = "foo-docs"
         assert_eq!(packs[0]["agents_count"], 2);
         assert_eq!(packs[0]["description"], "對外唯一窗口");
         assert_eq!(packs[0]["installed"], true);
+        // P2-a: once installed, the front-desk agent id is the link target.
+        assert_eq!(packs[0]["lead_agent_name"], "foo-assistant");
 
         let v = builtin_catalog(Some(tmp.path()), &[]);
         assert_eq!(v["packs"][0]["installed"], false);
+        assert_eq!(v["packs"][0]["lead_agent_name"], serde_json::Value::Null);
+    }
+
+    /// P2-a: `members[]` mirrors front_desk + workers verbatim, `humans[]` /
+    /// `excluded[]` surface the honest "left to a human" disclosure, and
+    /// `examples[]` falls back to real worker summaries when the manifest
+    /// authors none — never fabricated content.
+    #[test]
+    fn catalog_team_members_humans_excluded_and_examples_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        premium_fixture(tmp.path());
+        let v = builtin_catalog(Some(tmp.path()), &[]);
+        let entry = &v["packs"][0];
+
+        let members = entry["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2, "front desk + 1 worker");
+        assert_eq!(members[0]["role"], "front_desk");
+        assert_eq!(members[0]["name"], "foo-assistant");
+        assert_eq!(members[0]["display_name"], "Foo 總機");
+        assert_eq!(members[0]["summary"], "對外唯一窗口");
+        assert_eq!(members[1]["role"], "worker");
+        assert_eq!(members[1]["name"], "foo-docs");
+        assert_eq!(members[1]["display_name"], "文件助理");
+        assert_eq!(members[1]["summary"], "歸檔與提醒");
+
+        let humans = entry["humans"].as_array().unwrap();
+        assert_eq!(humans.len(), 1);
+        assert_eq!(humans[0]["title"], "店長");
+        assert_eq!(humans[0]["summary"], "決策與對外簽約");
+
+        let excluded = entry["excluded"].as_array().unwrap();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0]["kit"], "billing-admin");
+        assert_eq!(excluded[0]["reason"], "本店未設帳務職");
+
+        // No `examples` authored in the fixture → derived from worker
+        // summaries (front-desk summary is skipped, it is already shown as
+        // `description`).
+        let examples = entry["examples"].as_array().unwrap();
+        assert_eq!(examples, &vec![serde_json::json!("歸檔與提醒")]);
+    }
+
+    #[test]
+    fn catalog_team_examples_prefer_authored_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team = tmp.path().join("teams/foo-team");
+        premium_fixture(tmp.path());
+        let toml = std::fs::read_to_string(team.join("team.toml")).unwrap();
+        // TOML root-level keys must be declared before the first table header
+        // — appending `examples = [...]` after the trailing `[[excluded]]`
+        // section would silently become a field of that array's last entry
+        // instead of `TeamManifest.examples` (this bit the test itself once:
+        // the fallback-to-worker-summary path fired because `examples` never
+        // actually reached the manifest). Insert before `[front_desk]`.
+        let toml = toml.replacen(
+            "\n[front_desk]",
+            "\nexamples = [\"把本週未回覆的名單排跟進順序\", \"產出本月請款通知\"]\n\n[front_desk]",
+            1,
+        );
+        std::fs::write(team.join("team.toml"), toml).unwrap();
+
+        let v = builtin_catalog(Some(tmp.path()), &[]);
+        let examples = v["packs"][0]["examples"].as_array().unwrap();
+        assert_eq!(
+            examples,
+            &vec![
+                serde_json::json!("把本週未回覆的名單排跟進順序"),
+                serde_json::json!("產出本月請款通知"),
+            ]
+        );
     }
 
     /// WP-ORG: team entries carry kind/category/departments; standalone packs
@@ -1573,6 +1766,22 @@ department = "設計"
         assert_eq!(solo["departments"], serde_json::json!(["設計"]));
         assert_eq!(solo["agents_count"], 1);
         assert_eq!(solo["installed"], false);
+        assert_eq!(solo["lead_agent_name"], serde_json::Value::Null);
+
+        // Installed ⇒ links to the actually-created agent, not a guess.
+        let installed = vec![InstallRecord {
+            slug: "cad-helper".into(),
+            kind: crate::expert_admin::PackKind::Native,
+            display_name: "CAD 製圖員".into(),
+            version: "1.0.0".into(),
+            description: String::new(),
+            agents: vec!["drafter".into()],
+            global_skills: vec![],
+            wiki_files: vec![],
+            installed_at: crate::expert_admin::now_iso(),
+        }];
+        let v = builtin_catalog(Some(tmp.path()), &installed);
+        assert_eq!(v["packs"][1]["lead_agent_name"], "drafter");
     }
 
     // ── prompt building ──

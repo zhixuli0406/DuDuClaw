@@ -214,10 +214,154 @@ fn parse_relative_duration(input: &str) -> Result<Duration, String> {
 
 // ── Channel send (shared utility) ───────────────────────────
 
+/// Resolve the `channel_sender::ChannelTarget` for a reminder delivery.
+///
+/// Mirrors `cron_scheduler.rs::deliver_cron_result`'s self-configuring-
+/// channel handling (WeCom/DingTalk/Google Chat/Teams read multi-field
+/// credentials straight from `home_dir` at send time — the sender ignores
+/// `ChannelTarget.token` for those four, so "is there a token" becomes "is
+/// the marker field set", same as `goal_notify::channel_token`'s BUG-1 fix).
+///
+/// WebChat is deliberately refused rather than routed through the generic
+/// factory: it is a session-scoped WebSocket connection with no persistent
+/// bot identity, and `channel_sender::create_sender`'s WebChat arm built
+/// without an `event_tx` silently no-ops `send_text` — a background
+/// scheduler with no live connection reference must not report that as a
+/// successful delivery.
+async fn resolve_channel_target(
+    home_dir: &Path,
+    channel: &str,
+    chat_id: &str,
+) -> Result<crate::channel_sender::ChannelTarget, String> {
+    use crate::channel_sender::{self, ChannelTarget};
+
+    if channel == "webchat" {
+        return Err(
+            "reminders cannot target webchat — no persistent session to deliver into".to_string(),
+        );
+    }
+
+    if channel_sender::sender_self_configures(channel) {
+        let marker = channel_sender::self_config_marker_field(channel)
+            .expect("self-configuring channel must declare a marker field");
+        let present =
+            crate::config_crypto::read_encrypted_config_field(home_dir, "channels", marker)
+                .await
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+        if !present {
+            return Err(format!(
+                "channel {channel} is not configured (missing `{marker}` in config.toml [channels])"
+            ));
+        }
+        return Ok(ChannelTarget {
+            channel_type: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            token: String::new(), // factory-built {channel} sender ignores this
+            extra_id: None,
+        });
+    }
+
+    if channel == "whatsapp" {
+        let token = crate::config_crypto::read_encrypted_config_field(
+            home_dir,
+            "channels",
+            "whatsapp_access_token",
+        )
+        .await
+        .unwrap_or_default();
+        let phone_id = crate::config_crypto::read_encrypted_config_field(
+            home_dir,
+            "channels",
+            "whatsapp_phone_number_id",
+        )
+        .await
+        .unwrap_or_default();
+        if token.is_empty() || phone_id.is_empty() {
+            return Err("whatsapp_access_token / whatsapp_phone_number_id not configured".to_string());
+        }
+        return Ok(ChannelTarget {
+            channel_type: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            token,
+            extra_id: Some(phone_id),
+        });
+    }
+
+    if channel == "feishu" {
+        let app_id =
+            crate::config_crypto::read_encrypted_config_field(home_dir, "channels", "feishu_app_id")
+                .await
+                .unwrap_or_default();
+        let app_secret = crate::config_crypto::read_encrypted_config_field(
+            home_dir,
+            "channels",
+            "feishu_app_secret",
+        )
+        .await
+        .unwrap_or_default();
+        if app_id.is_empty() || app_secret.is_empty() {
+            return Err("feishu_app_id / feishu_app_secret not configured".to_string());
+        }
+        // Feishu's messages API needs a short-lived tenant_access_token, not
+        // the raw app_id/app_secret — fetched fresh per reminder (reminders
+        // fire at most a handful of times a minute; no caching needed,
+        // mirrors dispatcher.rs's identical forward-path fetch).
+        let http = reqwest::Client::new();
+        let resp = http
+            .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+            .json(&serde_json::json!({ "app_id": app_id, "app_secret": app_secret }))
+            .send()
+            .await
+            .map_err(|e| format!("feishu token: {e}"))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("feishu token parse: {e}"))?;
+        let token = body
+            .get("tenant_access_token")
+            .and_then(|v| v.as_str())
+            .ok_or("feishu: no tenant_access_token in response")?
+            .to_string();
+        return Ok(ChannelTarget {
+            channel_type: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            token,
+            extra_id: None,
+        });
+    }
+
+    // telegram / line / discord / slack — single `<channel>_bot_token`
+    // field, per `otp_delivery::token_field`'s canonical mapping.
+    if channel == "discord" && !is_valid_discord_chat_id(chat_id) {
+        return Err(format!("Invalid Discord channel ID: '{chat_id}' (must be numeric)"));
+    }
+    let field = crate::otp_delivery::token_field(channel)
+        .ok_or_else(|| format!("Unknown channel: {channel}"))?;
+    let token = crate::config_crypto::read_encrypted_config_field(home_dir, "channels", field)
+        .await
+        .unwrap_or_default();
+    if token.is_empty() {
+        return Err(format!("{field} not configured"));
+    }
+    Ok(ChannelTarget {
+        channel_type: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        token,
+        extra_id: None,
+    })
+}
+
 /// Send a text message to a channel.  Reads tokens from `config.toml`.
 ///
 /// This is the shared implementation used by both the MCP `send_message`
-/// handler and the `ReminderScheduler`.
+/// handler and the `ReminderScheduler`. Delegates to the unified
+/// `channel_sender::create_sender` factory (all 10 bot-pushable channels —
+/// see [`resolve_channel_target`]'s doc for the WebChat exception) instead
+/// of hand-rolling telegram/line/discord — the previous implementation
+/// rejected every other channel with "Unknown channel", silently dropping
+/// reminders for slack/whatsapp/feishu/googlechat/teams/wecom/dingtalk
+/// agents (same defect class as `goal_notify::channel_token`'s BUG-1).
 pub async fn send_channel_message(
     home_dir: &Path,
     http: &reqwest::Client,
@@ -225,75 +369,11 @@ pub async fn send_channel_message(
     chat_id: &str,
     text: &str,
 ) -> Result<(), String> {
-    let config = read_config(home_dir)
+    let target = resolve_channel_target(home_dir, channel, chat_id).await?;
+    crate::channel_sender::create_sender(&target, http.clone())
+        .send_text(text)
         .await
-        .ok_or_else(|| "Could not read config.toml".to_string())?;
-
-    match channel {
-        "telegram" => {
-            let token = decrypt_channel_token(&config, "telegram_bot_token_enc", "telegram_bot_token", home_dir).await;
-            if token.is_empty() {
-                return Err("telegram_bot_token not configured".to_string());
-            }
-            let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-            let resp = http
-                .post(&url)
-                .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
-                .send()
-                .await
-                .map_err(|_| "Telegram network error".to_string())?;
-            if resp.status().is_success() {
-                Ok(())
-            } else {
-                Err(format!("Telegram API returned {}", resp.status()))
-            }
-        }
-        "line" => {
-            let token = decrypt_channel_token(&config, "line_channel_token_enc", "line_channel_token", home_dir).await;
-            if token.is_empty() {
-                return Err("line_channel_token not configured".to_string());
-            }
-            let resp = http
-                .post("https://api.line.me/v2/bot/message/push")
-                .header("Authorization", format!("Bearer {token}"))
-                .json(&serde_json::json!({
-                    "to": chat_id,
-                    "messages": [{"type": "text", "text": text}]
-                }))
-                .send()
-                .await
-                .map_err(|_| "LINE network error".to_string())?;
-            if resp.status().is_success() {
-                Ok(())
-            } else {
-                Err(format!("LINE API returned {}", resp.status()))
-            }
-        }
-        "discord" => {
-            // Discord channel IDs are numeric snowflakes
-            if chat_id.is_empty() || !chat_id.chars().all(|c| c.is_ascii_digit()) {
-                return Err(format!("Invalid Discord channel ID: '{chat_id}' (must be numeric)"));
-            }
-            let token = decrypt_channel_token(&config, "discord_bot_token_enc", "discord_bot_token", home_dir).await;
-            if token.is_empty() {
-                return Err("discord_bot_token not configured".to_string());
-            }
-            let url = format!("https://discord.com/api/v10/channels/{chat_id}/messages");
-            let resp = http
-                .post(&url)
-                .header("Authorization", format!("Bot {token}"))
-                .json(&serde_json::json!({ "content": text }))
-                .send()
-                .await
-                .map_err(|_| "Discord network error".to_string())?;
-            if resp.status().is_success() {
-                Ok(())
-            } else {
-                Err(format!("Discord API returned {}", resp.status()))
-            }
-        }
-        _ => Err(format!("Unknown channel: {channel}")),
-    }
+        .map_err(|e| e.to_string())
 }
 
 /// Validate a Discord channel ID (must be numeric snowflake).
@@ -1012,6 +1092,178 @@ telegram_bot_token = "secret://vault/tg-token"
             decrypt_channel_token(&config, "discord_bot_token_enc", "discord_bot_token", &home)
                 .await;
         assert_eq!(token, "");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── BUG-2 regression: `send_channel_message` must route through the
+    //    unified `channel_sender` factory for all bot-pushable channels, not
+    //    just telegram/line/discord. Covered here via `resolve_channel_target`
+    //    directly — deterministic and network-free (it stops at config
+    //    resolution; only Feishu's token fetch reaches the network, and only
+    //    on the happy path this suite doesn't exercise). ──
+
+    fn write_config(home: &Path, toml_body: &str) {
+        std::fs::write(home.join("config.toml"), toml_body).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_slack_missing_token_errors() {
+        let home = tmp_home();
+        let err = resolve_channel_target(&home, "slack", "C123").await.unwrap_err();
+        assert!(err.contains("slack_bot_token"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_slack_token_present_resolves() {
+        let home = tmp_home();
+        write_config(&home, "[channels]\nslack_bot_token = \"xoxb-test\"\n");
+        let target = resolve_channel_target(&home, "slack", "C123").await.unwrap();
+        assert_eq!(target.channel_type, "slack");
+        assert_eq!(target.token, "xoxb-test");
+        assert_eq!(target.chat_id, "C123");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Google Chat is self-configuring: "is there a token" is "is the
+    /// marker field set", same criterion as `goal_notify::channel_token`'s
+    /// BUG-1 fix — `ChannelTarget.token` stays empty (the sender ignores it
+    /// and reads `home_dir` directly at send time).
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_googlechat_marker_present_resolves() {
+        let home = tmp_home();
+        write_config(
+            &home,
+            "[channels]\ngooglechat_service_account_json = \"marker-only\"\n",
+        );
+        let target = resolve_channel_target(&home, "googlechat", "spaces/AAAA").await.unwrap();
+        assert_eq!(target.channel_type, "googlechat");
+        assert_eq!(target.token, "", "self-configuring sender ignores this field");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_googlechat_marker_absent_errors() {
+        let home = tmp_home();
+        let err = resolve_channel_target(&home, "googlechat", "spaces/AAAA")
+            .await
+            .unwrap_err();
+        assert!(err.contains("googlechat_service_account_json"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_wecom_marker_present_resolves() {
+        let home = tmp_home();
+        write_config(&home, "[channels]\nwecom_corp_secret = \"marker-only\"\n");
+        let target = resolve_channel_target(&home, "wecom", "zhangsan").await.unwrap();
+        assert_eq!(target.channel_type, "wecom");
+        assert_eq!(target.chat_id, "zhangsan");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_wecom_marker_absent_errors() {
+        let home = tmp_home();
+        let err = resolve_channel_target(&home, "wecom", "zhangsan").await.unwrap_err();
+        assert!(err.contains("wecom_corp_secret"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// WebChat is a session-scoped WebSocket connection with no persistent
+    /// bot identity — a detached background scheduler must refuse it
+    /// explicitly rather than silently no-op through `create_sender`'s
+    /// `WebChatSender` (which drops sends when built without an `event_tx`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_webchat_is_refused_not_silently_dropped() {
+        let home = tmp_home();
+        let err = resolve_channel_target(&home, "webchat", "conn-1").await.unwrap_err();
+        assert!(err.contains("webchat"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_discord_invalid_chat_id_errors() {
+        let home = tmp_home();
+        write_config(&home, "[channels]\ndiscord_bot_token = \"tok\"\n");
+        let err = resolve_channel_target(&home, "discord", "not-numeric")
+            .await
+            .unwrap_err();
+        assert!(err.contains("Invalid Discord channel ID"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_discord_valid_id_resolves() {
+        let home = tmp_home();
+        write_config(&home, "[channels]\ndiscord_bot_token = \"tok\"\n");
+        let target = resolve_channel_target(&home, "discord", "123456789012345678")
+            .await
+            .unwrap();
+        assert_eq!(target.channel_type, "discord");
+        assert_eq!(target.token, "tok");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_whatsapp_missing_fields_errors() {
+        let home = tmp_home();
+        let err = resolve_channel_target(&home, "whatsapp", "+886912345678")
+            .await
+            .unwrap_err();
+        assert!(err.contains("whatsapp_access_token"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_whatsapp_both_fields_present_resolves() {
+        let home = tmp_home();
+        write_config(
+            &home,
+            "[channels]\nwhatsapp_access_token = \"wa-tok\"\nwhatsapp_phone_number_id = \"pnid-1\"\n",
+        );
+        let target = resolve_channel_target(&home, "whatsapp", "+886912345678")
+            .await
+            .unwrap();
+        assert_eq!(target.channel_type, "whatsapp");
+        assert_eq!(target.token, "wa-tok");
+        assert_eq!(target.extra_id.as_deref(), Some("pnid-1"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Feishu needs a fetched tenant_access_token, not the raw
+    /// app_id/app_secret — but the missing-config error must still fire
+    /// BEFORE any network call (deterministic, no live Feishu endpoint
+    /// needed for this test).
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_feishu_missing_config_errors_without_network() {
+        let home = tmp_home();
+        let err = resolve_channel_target(&home, "feishu", "oc_xxx").await.unwrap_err();
+        assert!(err.contains("feishu_app_id"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_target_unknown_channel_errors() {
+        let home = tmp_home();
+        let err = resolve_channel_target(&home, "carrier-pigeon", "x")
+            .await
+            .unwrap_err();
+        assert!(err.contains("Unknown channel"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `send_channel_message` end-to-end for the plain-token path (no
+    /// network needed to reach a deterministic error — an unconfigured
+    /// telegram token fails at resolution, before any HTTP call).
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_channel_message_telegram_missing_token_errors() {
+        let home = tmp_home();
+        let http = reqwest::Client::new();
+        let err = send_channel_message(&home, &http, "telegram", "123", "hi")
+            .await
+            .unwrap_err();
+        assert!(err.contains("telegram_bot_token"), "got: {err}");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
