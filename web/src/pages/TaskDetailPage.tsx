@@ -22,6 +22,7 @@ import {
   DialogDescription,
   DialogFooter,
   DialogClose,
+  Textarea,
   type BreadcrumbSegment,
 } from '@/components/mds';
 import { StatusIcon, InlineEditor, LiveBadge, usePanel } from '@/components/ui';
@@ -48,8 +49,10 @@ import {
   ChevronRight,
   CircleCheck,
   MessageSquareWarning,
+  Loader2,
+  RotateCcw,
 } from 'lucide-react';
-import { toast } from '@/lib/toast';
+import { toast, formatError } from '@/lib/toast';
 
 type TaskSource = 'channel' | 'delegated' | 'manual';
 function taskSource(task: TaskInfo): TaskSource {
@@ -186,6 +189,15 @@ export function TaskDetailPage() {
   // channel buttons offer. The generic status picker never handled it correctly
   // anyway: `pending` (= 重試) was not among its options at all.
   const needsHuman = task?.status === 'needs_human';
+
+  // I-3a "接著做": a goal-mode task that already reached a terminal state
+  // (done / failed / cancelled) can take a follow-up message and be reopened
+  // for another round — WorkBuddy's "already-finished tasks can take a
+  // follow-up message" pattern (design doc §3.3). Unlike WorkBuddy the
+  // reopened round still goes through the MAV judge (see `GoalContinuePanel`'s
+  // hint copy) — this is intentional, not a limitation.
+  const canGoalContinue =
+    !!task?.goal_mode && (task?.status === 'done' || task?.status === 'failed' || task?.status === 'cancelled');
 
   // ── Right-hand PropertiesPanel (shell column, spec §5.3 式1 right 320) ──
   useEffect(() => () => clearPanel(), [clearPanel]);
@@ -409,6 +421,9 @@ export function TaskDetailPage() {
           </section>
         )}
 
+        {/* I-3a: 已完成／失敗／已放棄的目標任務可以「接著做」。 */}
+        {canGoalContinue && <GoalContinuePanel task={task} onContinued={fetchTasks} />}
+
         {/* Description (inline edit, multiline) */}
         <div>
           <h2 className="mb-1 px-1.5 text-xs font-medium text-muted-foreground">
@@ -609,5 +624,64 @@ export function TaskDetailPage() {
         <TaskDoneBurst agentId={burst.agentId} agentName={assigneeAgent?.display_name} onDone={() => setBurst(null)} />
       )}
     </div>
+  );
+}
+
+/**
+ * GoalContinuePanel — I-3a "接著做": a done/failed/cancelled goal task can
+ * take a follow-up message and get reopened for another round instead of
+ * staying a dead end (`DESIGN-dashboard-ux-workbuddy-2026-08.md` §3.3,
+ * backlog item I-3a). The message is required — continuing "with nothing to
+ * add" is what `NeedsHumanActions`' 重試 already does for `needs_human`.
+ * Backed by `tasks.goal_decide` with `action: "continue"`
+ * (`api.tasks.goalContinue`), which reuses the acceptance criteria and risk
+ * boundary already on the task and carries the message into the next
+ * dispatch's prompt as a follow-up instruction — the reopened round still
+ * goes through the same MAV judge as any other round (the hint copy below
+ * says so explicitly, since WorkBuddy's equivalent skips review entirely).
+ */
+function GoalContinuePanel({ task, onContinued }: { task: TaskInfo; onContinued: () => void }) {
+  const intl = useIntl();
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = useCallback(async () => {
+    const trimmed = message.trim();
+    if (!trimmed || busy) return;
+    setBusy(true);
+    try {
+      const r = await api.tasks.goalContinue(task.id, trimmed);
+      toast.success(r.message);
+      setMessage('');
+      onContinued();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    } finally {
+      setBusy(false);
+    }
+  }, [message, busy, task.id, intl, onContinued]);
+
+  return (
+    <section
+      aria-label={intl.formatMessage({ id: 'tasks.continue.title' })}
+      className="space-y-2.5 rounded-xl border border-surface-border bg-muted/40 p-4"
+    >
+      <p className="text-sm font-medium text-foreground">{intl.formatMessage({ id: 'tasks.continue.title' })}</p>
+      <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'tasks.continue.hint' })}</p>
+      <Textarea
+        value={message}
+        onChange={(e) => setMessage(e.target.value)}
+        placeholder={intl.formatMessage({ id: 'tasks.continue.placeholder' })}
+        disabled={busy}
+        rows={2}
+        aria-label={intl.formatMessage({ id: 'tasks.continue.title' })}
+      />
+      <div className="flex justify-end">
+        <Button variant="brand" size="sm" disabled={busy || !message.trim()} onClick={submit}>
+          {busy ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+          {intl.formatMessage({ id: 'tasks.continue.submit' })}
+        </Button>
+      </div>
+    </section>
   );
 }
