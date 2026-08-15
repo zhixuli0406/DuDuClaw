@@ -17,6 +17,7 @@ import { api, type TaskInfo, type GoalTimeline } from '@/lib/api';
 import { timeAgo } from '@/lib/format';
 import { toast, formatError } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAssignStore } from '@/stores/assign-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import {
@@ -25,13 +26,11 @@ import {
   Button,
   Card,
   CardContent,
-  Checkbox,
   CollectionPageState,
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
-  DialogFooter,
   Input,
   Select,
   SelectTrigger,
@@ -39,7 +38,6 @@ import {
   SelectContent,
   SelectItem,
   Spinner,
-  Textarea,
   useErrorMessage,
 } from '@/components/mds';
 
@@ -92,189 +90,6 @@ function GoalStatusBadge({ status }: { status: string }) {
     <span className={`text-xs font-medium ${statusTone(status)}`}>
       {intl.formatMessage({ id: `goals.status.${status}`, defaultMessage: status })}
     </span>
-  );
-}
-
-/** Assign-goal dialog — the dashboard twin of the channel `/goal` command. */
-function CreateGoalDialog({
-  open,
-  onClose,
-  onCreated,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onCreated: () => void;
-}) {
-  const intl = useIntl();
-  const { agents } = useAgentsStore();
-  const [agentId, setAgentId] = useState('');
-  const [description, setDescription] = useState('');
-  const [criteria, setCriteria] = useState('');
-  const [priority, setPriority] = useState('medium');
-  // Goal assignment form v2 (design-market-belief-loop-2026-08.md §6, G1):
-  // both optional — empty duration means "no per-goal deadline" (global
-  // wall-clock applies) and empty risk boundary means "apply baseline"
-  // (local kept as string so the number input can be genuinely empty rather
-  // than coerced to 0).
-  const [durationHours, setDurationHours] = useState('');
-  const [riskBoundary, setRiskBoundary] = useState('');
-  // Belief loop × goal contract gap 3 (design-market-belief-loop-2026-08.md
-  // §3): opt-in that teaches the assigned agent to declare structured
-  // predictions about the goal's measurable indicators.
-  const [requireBeliefs, setRequireBeliefs] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-
-  const submit = async () => {
-    if (!agentId || !description.trim()) return;
-    const trimmedDuration = durationHours.trim();
-    const parsedDuration = trimmedDuration ? Number(trimmedDuration) : undefined;
-    if (parsedDuration !== undefined && (!Number.isFinite(parsedDuration) || parsedDuration < 1 || parsedDuration > 720)) {
-      toast.error(intl.formatMessage({ id: 'goals.create.durationInvalid' }));
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const result = await api.tasks.goalCreate({
-        agent_id: agentId,
-        description: description.trim(),
-        acceptance_criteria: criteria.trim() || undefined,
-        priority: priority as 'low' | 'medium' | 'high' | 'urgent',
-        duration_hours: parsedDuration,
-        risk_boundary: riskBoundary.trim() || undefined,
-        require_beliefs: requireBeliefs || undefined,
-      });
-      toast.success(
-        intl.formatMessage({ id: 'goals.create.success' }, { cap: result.iteration_cap }),
-      );
-      if (!result.dispatch_enabled) {
-        toast.error(intl.formatMessage({ id: 'goals.create.dispatchOff' }));
-      }
-      setDescription('');
-      setCriteria('');
-      setDurationHours('');
-      setRiskBoundary('');
-      setRequireBeliefs(false);
-      onCreated();
-      onClose();
-    } catch (e) {
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'goals.create.title' })}</DialogTitle>
-        </DialogHeader>
-        <div className="space-y-4">
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">{intl.formatMessage({ id: 'goals.create.agent' })}</label>
-            <Select value={agentId} onValueChange={(v) => setAgentId(String(v))}>
-              <SelectTrigger className="w-full">
-                <SelectValue>
-                  {agentId
-                    ? agents.find((a) => a.name === agentId)?.display_name || agentId
-                    : intl.formatMessage({ id: 'goals.create.agentPlaceholder' })}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {agents.map((a) => (
-                  <SelectItem key={a.name} value={a.name}>
-                    {a.display_name || a.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">{intl.formatMessage({ id: 'goals.create.description' })}</label>
-            <Textarea
-              value={description}
-              rows={3}
-              placeholder={intl.formatMessage({ id: 'goals.create.descriptionPlaceholder' })}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">{intl.formatMessage({ id: 'goals.create.criteria' })}</label>
-            <Textarea
-              value={criteria}
-              rows={2}
-              placeholder={intl.formatMessage({ id: 'goals.create.criteriaPlaceholder' })}
-              onChange={(e) => setCriteria(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              {intl.formatMessage({ id: 'goals.create.criteriaHint' })}
-            </p>
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">{intl.formatMessage({ id: 'goals.create.priority' })}</label>
-            <Select value={priority} onValueChange={(v) => setPriority(String(v))}>
-              <SelectTrigger className="w-full">
-                <SelectValue>
-                  {intl.formatMessage({ id: `tasks.priority.${priority}`, defaultMessage: priority })}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {['low', 'medium', 'high', 'urgent'].map((p) => (
-                  <SelectItem key={p} value={p}>
-                    {intl.formatMessage({ id: `tasks.priority.${p}`, defaultMessage: p })}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">{intl.formatMessage({ id: 'goals.create.duration' })}</label>
-            <Input
-              type="number"
-              min={1}
-              max={720}
-              value={durationHours}
-              placeholder={intl.formatMessage({ id: 'goals.create.durationPlaceholder' })}
-              onChange={(e) => setDurationHours(e.target.value)}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">{intl.formatMessage({ id: 'goals.create.riskBoundary' })}</label>
-            <Textarea
-              value={riskBoundary}
-              rows={3}
-              placeholder={intl.formatMessage({ id: 'goals.create.riskBoundaryPlaceholder' })}
-              onChange={(e) => setRiskBoundary(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              {intl.formatMessage({ id: 'goals.create.riskBoundaryHint' })}
-            </p>
-          </div>
-          <div className="space-y-1.5">
-            <label className="flex items-center gap-2 text-sm font-medium text-foreground">
-              <Checkbox
-                checked={requireBeliefs}
-                onCheckedChange={(v) => setRequireBeliefs(v === true)}
-              />
-              {intl.formatMessage({ id: 'goals.create.requireBeliefs' })}
-            </label>
-            <p className="text-xs text-muted-foreground">
-              {intl.formatMessage({ id: 'goals.create.requireBeliefsHint' })}
-            </p>
-          </div>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            {intl.formatMessage({ id: 'common.cancel' })}
-          </Button>
-          <Button variant="brand" onClick={submit} disabled={submitting || !agentId || !description.trim()}>
-            {submitting
-              ? intl.formatMessage({ id: 'goals.create.submitting' })
-              : intl.formatMessage({ id: 'goals.create.submit' })}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }
 
@@ -752,6 +567,12 @@ function GoalCard({
 export function GoalsPage() {
   const intl = useIntl();
   const errorText = useErrorMessage();
+  // UX plan I-1a: 交辦 opens the one shared panel. The seven-field
+  // `CreateGoalDialog` that used to live here was the only form that actually
+  // drove `tasks.goal_create` and nothing in the app linked to it; the
+  // AssignSheet carries every one of its fields (the advanced four behind
+  // 更多設定) and is reachable from every entry point.
+  const openAssign = useAssignStore((s) => s.openAssign);
   const connState = useConnectionStore((s) => s.state);
   const { agents, fetchAgents, loaded: agentsLoaded } = useAgentsStore();
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
@@ -759,7 +580,6 @@ export function GoalsPage() {
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [showCreate, setShowCreate] = useState(false);
   const [agentFilter, setAgentFilter] = useState('');
   const detailTask = searchParams.get('task');
 
@@ -849,7 +669,7 @@ export function GoalsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Button variant="brand" size="sm" onClick={() => setShowCreate(true)}>
+          <Button variant="brand" size="sm" onClick={() => openAssign()}>
             <Plus />
             <span className="hidden sm:inline">{intl.formatMessage({ id: 'goals.assign' })}</span>
           </Button>
@@ -937,7 +757,6 @@ export function GoalsPage() {
         </>
       )}
 
-      <CreateGoalDialog open={showCreate} onClose={() => setShowCreate(false)} onCreated={load} />
       <GoalDetailDialog taskId={detailTask} onClose={() => openDetail(null)} onChanged={load} />
     </div>
   );

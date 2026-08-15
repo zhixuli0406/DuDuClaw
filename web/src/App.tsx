@@ -165,8 +165,12 @@ export function App() {
               {/* Everything else requires at least one agent to exist. */}
               <Route element={<FirstRunGate />}>
               {/* ── Zone A 每日 — open to all authenticated users ──
-                  Home is the single spine: it carries the one-line launcher
-                  hero at the top (former workspace mode was collapsed here). */}
+                  Home is the single spine: a read-only overview (the former
+                  workspace mode was collapsed into it, so `/workspace` renders
+                  the same page). It carries no composer — the 交辦 panel is
+                  global and mounted in `MainLayout` (UX plan I-1a); this
+                  comment used to claim a "launcher hero" that no version of
+                  HomePage ever rendered. */}
               <Route index element={<HomePage />} />
               <Route path="workspace" element={<HomePage />} />
               <Route path="inbox" element={<InboxPage />} />

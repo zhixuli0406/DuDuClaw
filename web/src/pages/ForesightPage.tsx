@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Radar, Target, ArrowRight } from 'lucide-react';
-import { useNavigate } from 'react-router';
 
 import {
   api,
@@ -16,6 +15,7 @@ import {
 import { timeAgo } from '@/lib/format';
 import { toast } from '@/lib/toast';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAssignStore } from '@/stores/assign-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import {
   ActorAvatar,
@@ -709,9 +709,9 @@ function BeliefTab({ agentId }: { agentId: string }) {
 export function ForesightPage() {
   const intl = useIntl();
   const errorText = useErrorMessage();
-  const navigate = useNavigate();
   const connState = useConnectionStore((s) => s.state);
   const { agents, fetchAgents } = useAgentsStore();
+  const openAssign = useAssignStore((s) => s.openAssign);
   const [selectedAgent, setSelectedAgent] = useState('');
   const [summaries, setSummaries] = useState<ForwardAgentSummary[]>([]);
   const [rows, setRows] = useState<ForwardPredictionRow[]>([]);
@@ -795,7 +795,9 @@ export function ForesightPage() {
               ))}
             </SelectContent>
           </Select>
-          <Button variant="outline" size="sm" onClick={() => navigate('/goals')}>
+          {/* UX plan I-1a: same verb, same panel. This used to only hop to
+              /goals and leave the user to find the assign button there. */}
+          <Button variant="outline" size="sm" onClick={() => openAssign()}>
             <Target className="size-3.5" />
             {intl.formatMessage({ id: 'foresight.assignGoal' })}
           </Button>

@@ -4,38 +4,33 @@ import userEvent from '@testing-library/user-event';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { AgentModelPicker } from './AgentModelPicker';
-import { useChatStore } from '@/stores/chat-store';
+import { useAgentsStore } from '@/stores/agents-store';
 
-// Spy on router navigation — "Manage" now deep-links to /agents (the former
-// setMode('dashboard') hop was removed when the shell modes were collapsed).
-const mockNavigate = vi.fn();
-vi.mock('react-router', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('react-router')>();
-  return { ...actual, useNavigate: () => mockNavigate };
-});
+const ROSTER = [
+  { name: 'scout', display_name: 'Scout', icon: '🐾', role: 'main', model: { preferred: 'claude-opus' } },
+  { name: 'nova', display_name: 'Nova', icon: '🛰', role: 'worker', model: { preferred: 'gemini-pro' } },
+];
 
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
-  useChatStore.setState({
-    agentName: 'Scout',
-    agentIcon: '🐾',
-    model: 'claude-opus',
-  });
+  useAgentsStore.setState({ agents: ROSTER as never, loaded: true });
 });
 
 describe('AgentModelPicker', () => {
-  it('shows the active agent and model from session_info', () => {
-    renderWithProviders(<AgentModelPicker />);
+  it('shows the selected AI employee', () => {
+    renderWithProviders(<AgentModelPicker value="scout" onChange={vi.fn()} />);
     expect(screen.getByRole('button', { name: /Scout/ })).toBeInTheDocument();
-    expect(screen.getByText(/claude-opus/)).toBeInTheDocument();
   });
 
-  it('opening the menu and choosing Manage navigates to the Agents page', async () => {
+  it('lists the roster with each employee’s own model and reports the pick', async () => {
+    const onChange = vi.fn();
     const user = userEvent.setup();
-    renderWithProviders(<AgentModelPicker />);
+    renderWithProviders(<AgentModelPicker value="scout" onChange={onChange} />);
     await user.click(screen.getByRole('button', { name: /Scout/ }));
-    await user.click(screen.getByRole('menuitem', { name: /manage agents/i }));
-    expect(mockNavigate).toHaveBeenCalledWith('/agents');
+    // No hardcoded model list: each row shows whatever that agent's own config says.
+    expect(screen.getByText('gemini-pro')).toBeInTheDocument();
+    await user.click(screen.getByRole('menuitemradio', { name: /Nova/ }));
+    expect(onChange).toHaveBeenCalledWith('nova');
   });
 });

@@ -162,10 +162,18 @@ describe('AppSidebar (Multica shell)', () => {
     // Still hidden on Personal: pet studio (desktop-only, and jsdom is not Tauri).
     expect(screen.queryByRole('link', { name: /Pet studio/i })).not.toBeInTheDocument();
 
+    // P2-a-nav (2026-08-15): AI Teams (formerly "Expert Packs", admin-only)
+    // is promoted to the primary rail — visible without expanding 進階, and
+    // exactly once (the design doc explicitly warns "只加不移會重複出現").
+    expect(screen.getAllByRole('link', { name: /^AI Teams$/i })).toHaveLength(1);
+
     // Expanding 進階 reveals the folded work surfaces.
     await user.click(screen.getByText(/^Advanced$/));
     expect(screen.getByRole('link', { name: /Task Board/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Reports/i })).toBeInTheDocument();
+    // AI Teams must NOT also appear in the expanded 進階 section — it left
+    // `personalAdvancedGroup` for `personalPrimaryItems` (P2-a-nav).
+    expect(screen.getAllByRole('link', { name: /^AI Teams$/i })).toHaveLength(1);
 
     // WP-NAV (2026-08-12): the 進階 group reads work cluster → company cluster,
     // the same sequence the Enterprise 工作 / 公司 groups use, so the two
@@ -175,7 +183,7 @@ describe('AppSidebar (Multica shell)', () => {
       .getAllByRole('link')
       .map((el) => el.textContent?.trim())
       .filter(Boolean) as string[];
-    const advSeq = ['Task Board', 'Reports', 'OS', 'Growth', 'Expert Packs', 'Widget Studio'];
+    const advSeq = ['Task Board', 'Reports', 'OS', 'Growth', 'Widget Studio'];
     const advPos = advSeq.map((l) => advanced.indexOf(l));
     expect(advPos.every((i) => i >= 0)).toBe(true);
     expect(advPos).toEqual([...advPos].sort((a, b) => a - b));

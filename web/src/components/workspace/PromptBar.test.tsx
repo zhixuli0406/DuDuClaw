@@ -4,69 +4,61 @@ import userEvent from '@testing-library/user-event';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { PromptBar } from './PromptBar';
-import { useChatStore } from '@/stores/chat-store';
 
-const send = vi.fn();
+const onSubmit = vi.fn();
+const onChange = vi.fn();
+
+function setup(props: Partial<Parameters<typeof PromptBar>[0]> = {}) {
+  return renderWithProviders(
+    <PromptBar value="" onChange={onChange} onSubmit={onSubmit} {...props} />,
+  );
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
-  useChatStore.setState({
-    messages: [],
-    isStreaming: false,
-    sessionId: null,
-    connectionState: 'connected' as never,
-    agentName: 'DuDuClaw',
-    agentIcon: '🐾',
-    model: 'claude',
-    supportsVision: false,
-    send: send as never,
-  });
 });
 
 describe('PromptBar', () => {
-  it('sends trimmed text on Enter and clears the input', async () => {
+  it('reports every keystroke to the owner (controlled)', async () => {
     const user = userEvent.setup();
-    renderWithProviders(<PromptBar />);
-    const box = screen.getByLabelText(/enter a prompt/i);
-    await user.type(box, '  hello world  ');
-    await user.keyboard('{Enter}');
-    expect(send).toHaveBeenCalledTimes(1);
-    expect(send).toHaveBeenCalledWith('hello world', []);
-    expect((box as HTMLTextAreaElement).value).toBe('');
+    setup();
+    await user.type(screen.getByLabelText(/enter a prompt/i), 'hi');
+    expect(onChange).toHaveBeenCalled();
+    expect(onChange.mock.calls.at(-1)?.[0]).toBe('i');
   });
 
-  it('does not send an empty prompt', async () => {
+  it('submits on Enter when there is text', async () => {
     const user = userEvent.setup();
-    renderWithProviders(<PromptBar />);
-    const box = screen.getByLabelText(/enter a prompt/i);
-    box.focus();
+    setup({ value: 'ship it' });
+    screen.getByLabelText(/enter a prompt/i).focus();
     await user.keyboard('{Enter}');
-    expect(send).not.toHaveBeenCalled();
+    expect(onSubmit).toHaveBeenCalledTimes(1);
   });
 
-  it('Shift+Enter inserts a newline instead of sending', async () => {
+  it('does not submit an empty or whitespace-only prompt', async () => {
     const user = userEvent.setup();
-    renderWithProviders(<PromptBar />);
-    const box = screen.getByLabelText(/enter a prompt/i);
-    await user.type(box, 'line1');
+    setup({ value: '   ' });
+    screen.getByLabelText(/enter a prompt/i).focus();
+    await user.keyboard('{Enter}');
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('Shift+Enter inserts a newline instead of submitting', async () => {
+    const user = userEvent.setup();
+    setup({ value: 'line1' });
+    screen.getByLabelText(/enter a prompt/i).focus();
     await user.keyboard('{Shift>}{Enter}{/Shift}');
-    expect(send).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
   });
 
-  it('disables the composer when disconnected', () => {
-    useChatStore.setState({ connectionState: 'disconnected' as never });
-    renderWithProviders(<PromptBar />);
-    const box = screen.getByLabelText(/enter a prompt/i) as HTMLTextAreaElement;
-    expect(box).toBeDisabled();
+  it('disables the composer while the caller is busy', () => {
+    setup({ disabled: true });
+    expect(screen.getByLabelText(/enter a prompt/i)).toBeDisabled();
   });
 
-  it('calls onSent after a successful send', async () => {
-    const onSent = vi.fn();
-    const user = userEvent.setup();
-    renderWithProviders(<PromptBar onSent={onSent} />);
-    const box = screen.getByLabelText(/enter a prompt/i);
-    await user.type(box, 'hi');
-    await user.keyboard('{Enter}');
-    expect(onSent).toHaveBeenCalledTimes(1);
+  it('renders the control row and hides the inline send when the caller owns the CTA', () => {
+    setup({ showSubmit: false, controls: <button type="button">pick</button> });
+    expect(screen.getByRole('button', { name: 'pick' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /send/i })).not.toBeInTheDocument();
   });
 });

@@ -27,11 +27,24 @@ const CONNECTORS: Connector[] = [
 ];
 
 /**
- * Workspace "連接器" control (TODO-genspark-workspace-shell §P2.2). Surfaces the
- * available integrations and how many channels are live, deep-linking into the
- * dashboard. Hidden entirely when the user can see no connector (non-admins).
+ * "資料範圍" control (UX plan I-1b, formerly the workspace 連接器 chip). Surfaces
+ * the integrations an AI employee can reach and how many channels are live,
+ * deep-linking into the dashboard. Hidden entirely when the user can see no
+ * connector (non-admins).
+ *
+ * `onNavigate` exists because the 交辦 panel renders this inside a modal: a bare
+ * `navigate()` would leave the panel stacked over the destination and silently
+ * discard the draft, so the panel passes a handler that closes itself first.
+ * Omitted ⇒ plain navigation, as before. `labelId` lets the panel say 資料範圍
+ * where a standalone use says 連接器.
  */
-export function ConnectorChips() {
+export function ConnectorChips({
+  onNavigate,
+  labelId = 'workspace.connectors',
+}: {
+  onNavigate?: (to: string) => void;
+  labelId?: string;
+} = {}) {
   const intl = useIntl();
   const navigate = useNavigate();
   const status = useSystemStore((s) => s.status);
@@ -68,7 +81,8 @@ export function ConnectorChips() {
 
   const go = (to: string) => {
     setOpen(false);
-    navigate(to);
+    if (onNavigate) onNavigate(to);
+    else navigate(to);
   };
 
   const channelsLive = status?.channels_connected ?? 0;
@@ -83,9 +97,7 @@ export function ConnectorChips() {
         className="flex h-9 items-center gap-1.5 rounded-lg border border-surface-border px-2.5 text-xs font-medium text-muted-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"
       >
         <Plug className="h-4 w-4" />
-        <span className="hidden sm:inline">
-          {intl.formatMessage({ id: 'workspace.connectors', defaultMessage: '連接器' })}
-        </span>
+        <span className="hidden sm:inline">{intl.formatMessage({ id: labelId })}</span>
         {channelsLive > 0 && (
           <span className="rounded-full bg-success/15 px-1.5 text-[10px] font-semibold text-success tabular-nums">
             {channelsLive}

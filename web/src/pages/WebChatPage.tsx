@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
-import { useNavigate, useSearchParams } from 'react-router';
+import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useChatStore, type PendingAttachment } from '@/stores/chat-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useConversationsStore } from '@/stores/conversations-store';
@@ -85,6 +85,21 @@ export function WebChatPage() {
     if (preselect) selectAgent(preselect);
     // Keep the session alive across unmounts — no disconnect here.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 問一問 handoff (UX plan I-1b): the AssignSheet passes its draft through
+  // router state rather than the URL (a goal paragraph does not belong in a
+  // query string). Seeded into the composer, never auto-sent — the user still
+  // reads it and presses send — and consumed once so a back-navigation or a
+  // refresh cannot resurrect an already-sent draft.
+  const location = useLocation();
+  useEffect(() => {
+    const draft = (location.state as { draft?: unknown } | null)?.draft;
+    if (typeof draft !== 'string' || draft.trim().length === 0) return;
+    setInput((prev) => (prev ? prev : draft));
+    navigate(location.pathname + location.search, { replace: true, state: null });
+    inputRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.key]);
 
   // Auto-scroll to bottom on new content.
   useEffect(() => {

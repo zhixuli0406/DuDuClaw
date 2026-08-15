@@ -30,6 +30,7 @@ import {
   type ActivityEvent,
 } from '@/lib/api';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAssignStore } from '@/stores/assign-store';
 import { useAgentAvatarStore } from '@/stores/agent-avatar-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentGlyphState } from '@/stores/agent-activity-store';
@@ -102,6 +103,7 @@ function actorStatus(status: string, archived: boolean, live: boolean): ActorSta
 export function AgentDetailPage() {
   const intl = useIntl();
   const navigate = useNavigate();
+  const openAssign = useAssignStore((s) => s.openAssign);
   const params = useParams();
   const id = params.id ?? '';
   const rawTab = params.tab ?? 'overview';
@@ -379,10 +381,15 @@ export function AgentDetailPage() {
                 <MessageSquare />
                 {intl.formatMessage({ id: 'agentDetail.action.chat' })}
               </Button>
+              {/* UX plan I-1a: 交辦任務 on an employee opens the one shared
+                  panel with that employee preselected. It used to route to the
+                  board's create-a-card intent, so the most explicit "give this
+                  employee work" button in the app produced a passive card that
+                  never dispatched. */}
               <Button
                 variant="brand"
                 size="sm"
-                onClick={() => navigate(`/tasks?new=1&assignee=${encodeURIComponent(id)}`)}
+                onClick={() => openAssign({ agentId: id })}
               >
                 <Plus />
                 {intl.formatMessage({ id: 'agentDetail.action.delegate' })}

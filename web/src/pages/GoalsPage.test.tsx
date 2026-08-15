@@ -44,7 +44,10 @@ describe('GoalsPage', () => {
   it('renders the header and an assign action', async () => {
     renderWithProviders(<GoalsPage />);
     expect(screen.getByRole('heading', { name: 'Goals' })).toBeInTheDocument();
-    expect(screen.getAllByRole('button', { name: /Assign goal/ }).length).toBeGreaterThan(0);
+    // One verb across the app (UX plan I-1a): this button used to say
+    // "Assign goal" and open a page-local seven-field dialog; it now opens the
+    // shared AssignSheet mounted in MainLayout.
+    expect(screen.getAllByRole('button', { name: /Assign task/ }).length).toBeGreaterThan(0);
   });
 
   it('lists only goal_mode tasks, grouped into the needs-you section', async () => {

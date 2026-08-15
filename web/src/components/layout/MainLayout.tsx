@@ -8,6 +8,7 @@ import { TourPrompt } from '@/components/tour/TourPrompt';
 import { SoftLimitBanner } from '@/components/SoftLimitBanner';
 import { LicenseExpiryBanner } from '@/components/LicenseExpiryBanner';
 import { CommandPalette } from '@/components/CommandPalette';
+import { AssignSheet } from '@/components/workspace/AssignSheet';
 import { DevPanel } from '@/components/devpanel';
 import { GrowthMount } from '@/components/growth/GrowthMount';
 import { PanelProvider, PropertiesPanel, CelebrationLayer, usePanel } from '@/components/ui';
@@ -168,6 +169,10 @@ function AppShell() {
       <TourPrompt />
       <GuidedTour />
       <CommandPalette />
+      {/* The one 交辦 panel (UX plan I-1a). Mounted once here so every entry
+          point — sidebar, mobile ＋, task board, /goals, agent cards — opens
+          the same surface instead of three different create forms. */}
+      <AssignSheet />
       {/* W3-4 developer panel (Stripe Workbench pattern E1/E2) — `~`-summoned,
           manager+ only (gated inside the component itself). */}
       <DevPanel />

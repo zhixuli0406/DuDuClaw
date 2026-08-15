@@ -3,9 +3,10 @@ import { useIntl } from 'react-intl';
 import { Link, useNavigate } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useAgentsStore } from '@/stores/agents-store';
+import { useAssignStore } from '@/stores/assign-store';
 import { useTasksStore } from '@/stores/tasks-store';
 import { useSystemStore } from '@/stores/system-store';
-import { api, type AgentDetail } from '@/lib/api';
+import { type AgentDetail } from '@/lib/api';
 import {
   CollectionPageHeader,
   CollectionPageState,
@@ -19,18 +20,11 @@ import {
   ActorAvatar,
   Button,
   Segmented,
-  Textarea,
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-  DialogClose,
   CrossLink,
   type ActorStatus,
   type SegmentedOption,
@@ -116,7 +110,12 @@ export function AgentsPage() {
   const { tasks, fetchTasks } = useTasksStore();
 
   const [scope, setScope] = useState<Scope>('active');
-  const [delegateTarget, setDelegateTarget] = useState<string | null>(null);
+  // UX plan I-1a: "交辦任務" on an employee card opens the one shared panel with
+  // that employee preselected. It used to open a local free-text dialog posting
+  // to `agents.delegate` — a fourth create surface behind the same verb, whose
+  // fire-and-forget bus message left no task to follow and never met the
+  // acceptance judge.
+  const openAssign = useAssignStore((s) => s.openAssign);
   const [offboardTarget, setOffboardTarget] = useState<AgentDetail | null>(null);
 
   // Soft growth hint (B+C): Personal edition, above the recommended size,
@@ -308,7 +307,7 @@ export function AgentsPage() {
               taskCount={agentTaskStats(tasks, agent.name).total}
               onPause={() => void runLifecycle(() => pauseAgent(agent.name), 'agentDetail.rested', agent)}
               onResume={() => void runLifecycle(() => resumeAgent(agent.name), 'agentDetail.resumed', agent)}
-              onDelegate={() => setDelegateTarget(agent.name)}
+              onDelegate={() => openAssign({ agentId: agent.name })}
               onArchive={() => void runLifecycle(() => archiveAgent(agent.name), 'agents.archive.done', agent)}
               onUnarchive={() =>
                 void runLifecycle(() => unarchiveAgent(agent.name), 'agents.unarchive.done', agent)
@@ -318,12 +317,6 @@ export function AgentsPage() {
           ))}
         </ListGridContainer>
       )}
-
-      <DelegateDialog
-        open={delegateTarget !== null}
-        agentName={delegateTarget ?? ''}
-        onClose={() => setDelegateTarget(null)}
-      />
 
       {offboardTarget && (
         <OffboardDialog
@@ -499,76 +492,3 @@ function AgentRow({
 }
 
 /** Delegate-task dialog (Multica-styled). */
-function DelegateDialog({
-  open,
-  agentName,
-  onClose,
-}: {
-  open: boolean;
-  agentName: string;
-  onClose: () => void;
-}) {
-  const intl = useIntl();
-  const [prompt, setPrompt] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [result, setResult] = useState<string | null>(null);
-
-  const handleSubmit = async () => {
-    if (!prompt.trim()) return;
-    setSubmitting(true);
-    try {
-      const res = await api.agents.delegate(agentName, prompt.trim());
-      setResult(intl.formatMessage({ id: 'agents.delegate.success' }, { id: res.message_id }));
-      setPrompt('');
-    } catch {
-      setResult(intl.formatMessage({ id: 'agents.delegate.error' }));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleClose = () => {
-    setResult(null);
-    setPrompt('');
-    onClose();
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={(o) => !o && handleClose()}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>
-            {intl.formatMessage({ id: 'agents.delegate.title' }, { name: agentName })}
-          </DialogTitle>
-        </DialogHeader>
-        <div className="space-y-3">
-          {result && (
-            <div className="rounded-lg bg-success/10 px-3 py-2 text-sm text-success">{result}</div>
-          )}
-          <label className="block text-xs font-medium text-muted-foreground">
-            {intl.formatMessage({ id: 'agents.delegate.taskLabel' })}
-          </label>
-          <Textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder={intl.formatMessage({ id: 'agents.delegate.placeholder' })}
-            rows={4}
-            className="resize-none"
-          />
-        </div>
-        <DialogFooter>
-          <DialogClose
-            render={
-              <Button variant="outline">{intl.formatMessage({ id: 'agents.delegate.close' })}</Button>
-            }
-          />
-          <Button variant="brand" onClick={handleSubmit} disabled={submitting || !prompt.trim()}>
-            {submitting
-              ? intl.formatMessage({ id: 'agents.delegate.submitting' })
-              : intl.formatMessage({ id: 'agents.delegate.submit' })}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
