@@ -1942,6 +1942,36 @@ impl DispatchEngine {
                         // WP3 (PORTICO): task phase closed → auto-revoke its grants.
                         self.revoke_task_grants(&task.id).await;
                         info!(task = %task.id, "goal-mode 驗收通過 → done");
+                        // WP-4B: goal-loop settle archiving — a goal task's
+                        // produced files previously existed only as an
+                        // unarchived `task_changes.jsonl` breadcrumb (no
+                        // download in the 產物 tab). Copy them into the
+                        // agent's attachments/ now that the task is
+                        // accepted, so the same `/api/files` surface the
+                        // declared/swept channel-reply path already uses
+                        // picks them up. Best-effort: failures are logged
+                        // inside the helper and never affect the verdict
+                        // already committed above.
+                        if let Some(home) = self.home_dir.as_deref() {
+                            let worker =
+                                task.claimed_by.clone().unwrap_or_else(|| task.assigned_to.clone());
+                            let archive_report =
+                                crate::artifacts::archive_goal_task_artifacts(home, &task.id, &worker)
+                                    .await;
+                            if archive_report.archived > 0
+                                || archive_report.skipped_oversize > 0
+                                || archive_report.skipped_outside_root > 0
+                            {
+                                info!(
+                                    task = %task.id,
+                                    archived = archive_report.archived,
+                                    already = archive_report.already_archived,
+                                    skipped_oversize = archive_report.skipped_oversize,
+                                    skipped_outside_root = archive_report.skipped_outside_root,
+                                    "WP-4B: goal-loop settle archiving result"
+                                );
+                            }
+                        }
                         observed_outcome =
                             Some(crate::prediction::task_forward::ObservedOutcome::Accepted);
                         judge_feedback_for_settle = Some(v.feedback.clone());
