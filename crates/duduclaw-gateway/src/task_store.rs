@@ -20,7 +20,7 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      claimed_by, claimed_at, lease_expires_at, depends_on, retry_count, max_retries, \
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
-     source_discord_guild_id, deadline_at, risk_boundary";
+     source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline";
 
 // ── Task row ────────────────────────────────────────────────
 
@@ -164,6 +164,24 @@ pub struct TaskRow {
     /// affects every task that never overrode it.
     #[serde(default)]
     pub risk_boundary: Option<String>,
+
+    // ── Goal contract freeze (H9-G, harness-borrowings 2026-08 WP-D) ────
+    /// Immutable snapshot of `acceptance_criteria` taken at goal-creation
+    /// time (`/goal` chat command and `tasks.goal_create` dashboard RPC —
+    /// the only two writers; see those call sites). Once set, this column
+    /// is NEVER updated again by any code path — it is the frozen contract
+    /// the judge evaluates against, so a later edit to the mutable
+    /// `acceptance_criteria` field (operator-only, via `tasks.update`)
+    /// cannot retroactively change what a task is judged on. `None` for
+    /// tasks created before this column existed, or created through a path
+    /// that doesn't freeze a baseline (e.g. the generic `tasks_create` MCP
+    /// tool) — readers fall back to `acceptance_criteria` in that case,
+    /// which for those rows is equally immutable in practice: agent-identity
+    /// callers are refused write access to `acceptance_criteria` on
+    /// `goal_mode` tasks regardless of which path created them (see
+    /// `duduclaw-cli::mcp::handle_tasks_update`).
+    #[serde(default)]
+    pub acceptance_criteria_baseline: Option<String>,
 }
 
 fn empty_deps() -> String {
@@ -220,6 +238,7 @@ impl TaskRow {
             source_discord_guild_id: None,
             deadline_at: None,
             risk_boundary: None,
+            acceptance_criteria_baseline: None,
         }
     }
 }
@@ -712,6 +731,9 @@ impl TaskStore {
             // §6, G1, 2026-08-14): per-goal deadline + risk boundary.
             ("deadline_at", "deadline_at TEXT"),
             ("risk_boundary", "risk_boundary TEXT"),
+            // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D):
+            // immutable snapshot of acceptance_criteria at goal-creation time.
+            ("acceptance_criteria_baseline", "acceptance_criteria_baseline TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -802,10 +824,10 @@ impl TaskStore {
                  max_retries, goal_mode, acceptance_criteria, result_summary, judge_feedback,
                  goal_id, lease_renewed_at, source_channel, source_chat_id,
                  revision_round, diminishing, agent_seconds, source_discord_guild_id,
-                 deadline_at, risk_boundary)
+                 deadline_at, risk_boundary, acceptance_criteria_baseline)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31, ?32, ?33, ?34)",
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
             params![
                 row.id,
                 row.title,
@@ -841,6 +863,7 @@ impl TaskStore {
                 row.source_discord_guild_id,
                 row.deadline_at,
                 row.risk_boundary,
+                row.acceptance_criteria_baseline,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -960,6 +983,18 @@ impl TaskStore {
             opt_field!("assigned_to", "assigned_to");
             opt_field!("blocked_reason", "blocked_reason");
             opt_field!("depends_on", "depends_on");
+            // H9-G goal contract freeze: the mutable acceptance_criteria copy
+            // is updatable here (store layer is identity-agnostic, matching
+            // every other field above) — authorization lives at the caller
+            // boundary. The dashboard RPC path (`handlers.rs::handle_tasks_update`)
+            // is Operator-ACL-gated and forwards this field through. The
+            // agent-facing MCP path (`mcp.rs::handle_tasks_update`) explicitly
+            // refuses to forward this field for `goal_mode` tasks before
+            // reaching this function, so an agent identity can never exercise
+            // this branch on a frozen goal contract. `acceptance_criteria_baseline`
+            // deliberately has NO opt_field entry — no code path updates it
+            // after `insert_task`.
+            opt_field!("acceptance_criteria", "acceptance_criteria");
             if let Some(v) = fields.get("tags").and_then(|v| v.as_str()) {
                 binds.push(v.to_string());
                 sets.push(format!("tags = ?{}", binds.len()));
@@ -2647,6 +2682,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         source_discord_guild_id: row.get(32)?,
         deadline_at: row.get(33)?,
         risk_boundary: row.get(34)?,
+        acceptance_criteria_baseline: row.get(35)?,
     })
 }
 
@@ -4172,6 +4208,63 @@ mod tests {
         let got2 = store.get_task("g2").await.unwrap().unwrap();
         assert!(got2.deadline_at.is_none());
         assert!(got2.risk_boundary.is_none());
+    }
+
+    // ── H9-G goal contract freeze (harness-borrowings 2026-08 WP-D) ─────
+
+    #[tokio::test]
+    async fn acceptance_criteria_baseline_round_trips_through_insert_and_read() {
+        let (store, _dir) = temp_store();
+        let mut t = pending_task("gb1");
+        t.acceptance_criteria = Some("current criteria".into());
+        t.acceptance_criteria_baseline = Some("frozen criteria".into());
+        store.insert_task(&t).await.unwrap();
+
+        let got = store.get_task("gb1").await.unwrap().unwrap();
+        assert_eq!(got.acceptance_criteria.as_deref(), Some("current criteria"));
+        assert_eq!(
+            got.acceptance_criteria_baseline.as_deref(),
+            Some("frozen criteria")
+        );
+
+        // A task that never sets a baseline stays NULL — readers fall back to
+        // `acceptance_criteria` at the consumer layer (dispatch_engine.rs).
+        let plain = pending_task("gb2");
+        store.insert_task(&plain).await.unwrap();
+        let got2 = store.get_task("gb2").await.unwrap().unwrap();
+        assert!(got2.acceptance_criteria_baseline.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_task_can_edit_acceptance_criteria_but_never_touches_the_baseline() {
+        // Store layer is identity-agnostic (authorization lives at the MCP /
+        // dashboard boundary — see mcp.rs::handle_tasks_update and
+        // handlers.rs::handle_tasks_update); this only asserts the SQL-level
+        // invariant: `acceptance_criteria` is updatable, `acceptance_criteria_baseline`
+        // has no write path at all after `insert_task`.
+        let (store, _dir) = temp_store();
+        let mut t = pending_task("gb3");
+        t.acceptance_criteria = Some("original".into());
+        t.acceptance_criteria_baseline = Some("frozen forever".into());
+        store.insert_task(&t).await.unwrap();
+
+        let updated = store
+            .update_task(
+                "gb3",
+                &serde_json::json!({ "acceptance_criteria": "edited by operator" }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.acceptance_criteria.as_deref(),
+            Some("edited by operator")
+        );
+        assert_eq!(
+            updated.acceptance_criteria_baseline.as_deref(),
+            Some("frozen forever"),
+            "the baseline must never change, regardless of who calls update_task"
+        );
     }
 
     #[tokio::test]
