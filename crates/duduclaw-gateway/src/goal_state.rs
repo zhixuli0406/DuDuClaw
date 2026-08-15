@@ -85,6 +85,13 @@ pub struct StateBlock {
     /// round could never "settle" into a stable hash. `None` until the
     /// caller (goal_loop.rs) consults the visit graph.
     pub loop_warning: Option<String>,
+    /// H5 (WP-B): prompt-only annotation set when the PREVIOUS round's
+    /// completion text matched the bail-pattern panel
+    /// (`goal_bail_detect::detect_bail_pattern`) — see
+    /// `goal_loop.rs::GoalLoopDriver::capture_round_state`. Same rationale
+    /// as `loop_warning`: excluded from [`StateBlock::hash_input`] so this
+    /// advisory nudge can never perturb the A2 no-progress comparison.
+    pub bail_hint: Option<String>,
 }
 
 impl StateBlock {
@@ -98,18 +105,34 @@ impl StateBlock {
     /// guard's comparison ("does this rejection say the same thing as the
     /// last one") while still letting genuinely new judge feedback register
     /// as a state change.
+    ///
+    /// H4 (WP-B, gap fingerprinting): a byte/whitespace-normalized compare
+    /// of the latest excluded entry is STILL a literal-text comparison — a
+    /// judge that rewords the exact same gap ("missing error handling in
+    /// `goal_loop.rs:120`" vs. "you forgot to validate at
+    /// `goal_loop.rs:120`") produces a different hash even though the
+    /// underlying stagnation is identical. When
+    /// [`crate::goal_gap_fingerprint::gap_fingerprint`] can extract a
+    /// `path:line` citation or a backtick key token from the latest
+    /// excluded entry, its normalized fingerprint is hashed INSTEAD of the
+    /// literal text, so reworded-but-same-gap feedback collapses to the
+    /// same `state_hash`. When no citation/token is extractable at all
+    /// (`None`), this falls back to the literal text — byte-identical to
+    /// the pre-H4 behavior (see that module's "Fallback contract").
     fn hash_input(&self) -> String {
         let latest_excluded = self
             .excluded_approaches
             .last()
             .map(String::as_str)
             .unwrap_or("\u{2205}"); // ∅ — no rejection yet this lineage
+        let excluded_component = crate::goal_gap_fingerprint::gap_fingerprint(latest_excluded)
+            .unwrap_or_else(|| latest_excluded.to_string());
         format!(
             "{}\u{1}{}\u{1}{}\u{1}{}",
             self.goal.trim(),
             self.confirmed_facts.join("\u{1}"),
             self.pending_hypotheses.join("\u{1}"),
-            latest_excluded,
+            excluded_component,
         )
     }
 
@@ -141,6 +164,9 @@ impl StateBlock {
         let mut excluded_section = section(&self.excluded_approaches);
         if let Some(w) = &self.loop_warning {
             excluded_section.push_str(&format!("\n! {}", xml_escape(w)));
+        }
+        if let Some(h) = &self.bail_hint {
+            excluded_section.push_str(&format!("\n! {}", xml_escape(h)));
         }
         format!(
             "<state>\n\
@@ -282,6 +308,14 @@ pub struct GoalStateSnapshot {
     /// deserializes to an empty list rather than failing.
     #[serde(default)]
     pub confirmed_facts: Vec<String>,
+    /// H5 (WP-B): set by `goal_loop.rs::capture_round_state` when the
+    /// PREVIOUS round's completion text matched the bail-pattern panel —
+    /// surfaced to the agent on the NEXT dispatch via
+    /// [`StateBlock::bail_hint`]. `#[serde(default)]` so a pre-H5
+    /// `goal_state_json` blob deserializes with no hint rather than
+    /// failing.
+    #[serde(default)]
+    pub bail_hint: Option<String>,
 }
 
 impl GoalStateSnapshot {
@@ -322,6 +356,11 @@ pub fn build_state_block(
         pending_hypotheses: snapshot.pending_hypotheses.clone(),
         excluded_approaches: excluded_from_iterations(iterations),
         loop_warning: None,
+        // H5: pass the persisted bail hint (if any) straight through — the
+        // caller (`goal_loop.rs`) is the one that decides whether/what to
+        // write here (`capture_round_state`), this pure function just
+        // round-trips it, same pattern as `pending_hypotheses` above.
+        bail_hint: snapshot.bail_hint.clone(),
     }
 }
 
@@ -373,6 +412,18 @@ mod tests {
         let rendered = block.render();
         assert!(rendered.contains("<state>"));
         assert!(rendered.contains("（尚無）"), "empty sections render a visible placeholder, not silence");
+    }
+
+    #[test]
+    fn build_state_block_carries_bail_hint_from_snapshot_and_renders_it() {
+        let snap = GoalStateSnapshot {
+            bail_hint: Some("上一輪疑似提前收工(pattern=stopping_here)".into()),
+            ..GoalStateSnapshot::default()
+        };
+        let block = build_state_block(&mk_task(), &[], &snap);
+        assert_eq!(block.bail_hint.as_deref(), Some("上一輪疑似提前收工(pattern=stopping_here)"));
+        let rendered = block.render();
+        assert!(rendered.contains("上一輪疑似提前收工"), "bail_hint must surface in the rendered <state> block");
     }
 
     // ── excluded_approaches: programmatic, capped, CJK-safe ─
@@ -477,6 +528,7 @@ mod tests {
         let snap = GoalStateSnapshot {
             pending_hypotheses: vec!["a".into(), "b".into()],
             confirmed_facts: vec!["fact1".into()],
+            bail_hint: Some("suspected premature stop".into()),
         };
         let json = snap.to_json();
         let back = GoalStateSnapshot::from_json(Some(&json));
@@ -510,12 +562,20 @@ mod tests {
         let a = build_state_block(
             &task,
             &[],
-            &GoalStateSnapshot { pending_hypotheses: vec!["h1".into()], confirmed_facts: Vec::new() },
+            &GoalStateSnapshot {
+                pending_hypotheses: vec!["h1".into()],
+                confirmed_facts: Vec::new(),
+                bail_hint: None,
+            },
         );
         let b = build_state_block(
             &task,
             &[],
-            &GoalStateSnapshot { pending_hypotheses: vec!["h2".into()], confirmed_facts: Vec::new() },
+            &GoalStateSnapshot {
+                pending_hypotheses: vec!["h2".into()],
+                confirmed_facts: Vec::new(),
+                bail_hint: None,
+            },
         );
         assert_ne!(state_hash(&a), state_hash(&b));
     }
@@ -528,6 +588,78 @@ mod tests {
         let b = build_state_block(&task, &[], &snap);
         a.loop_warning = Some("already tried this".into());
         assert_eq!(state_hash(&a), state_hash(&b), "loop_warning must not perturb the hash");
+    }
+
+    #[test]
+    fn state_hash_ignores_bail_hint() {
+        let task = mk_task();
+        let snap = GoalStateSnapshot::default();
+        let mut a = build_state_block(&task, &[], &snap);
+        let b = build_state_block(&task, &[], &snap);
+        a.bail_hint = Some("suspected premature stop last round".into());
+        assert_eq!(state_hash(&a), state_hash(&b), "bail_hint must not perturb the hash");
+    }
+
+    // ── H4: gap fingerprinting integrated into hash_input ────
+
+    #[test]
+    fn state_hash_same_for_reworded_feedback_citing_the_same_gap() {
+        // Two rejections that reword the SAME underlying `path:line` gap
+        // must now produce the SAME state_hash (H4) — previously (pre-H4)
+        // this would have differed, since hash_input compared the latest
+        // excluded-approach text byte-for-byte.
+        let task = mk_task();
+        let snap = GoalStateSnapshot::default();
+        let a = build_state_block(
+            &task,
+            &[iter_with_feedback(
+                "Missing error handling in crates/duduclaw-gateway/src/goal_loop.rs:120, please add a check.",
+            )],
+            &snap,
+        );
+        let b = build_state_block(
+            &task,
+            &[iter_with_feedback(
+                "You forgot proper error handling at crates/duduclaw-gateway/src/goal_loop.rs:120 — add validation.",
+            )],
+            &snap,
+        );
+        assert_eq!(
+            state_hash(&a),
+            state_hash(&b),
+            "reworded feedback citing the same path:line must fingerprint to the same state_hash"
+        );
+    }
+
+    #[test]
+    fn state_hash_differs_for_feedback_citing_different_gaps() {
+        let task = mk_task();
+        let snap = GoalStateSnapshot::default();
+        let a = build_state_block(
+            &task,
+            &[iter_with_feedback("Missing error handling in crates/duduclaw-gateway/src/goal_loop.rs:120.")],
+            &snap,
+        );
+        let b = build_state_block(
+            &task,
+            &[iter_with_feedback("Missing error handling in crates/duduclaw-gateway/src/goal_state.rs:42.")],
+            &snap,
+        );
+        assert_ne!(state_hash(&a), state_hash(&b));
+    }
+
+    #[test]
+    fn state_hash_falls_back_to_literal_text_when_no_citation_extractable() {
+        // No path:line / backtick token in either string ⇒
+        // `gap_fingerprint` returns `None` and hash_input falls back to the
+        // literal (NFKC-normalized) text — byte-identical to pre-H4
+        // behavior, so differently-worded prose-only feedback (no
+        // citation) still hashes differently, exactly as before.
+        let task = mk_task();
+        let snap = GoalStateSnapshot::default();
+        let a = build_state_block(&task, &[iter_with_feedback("the summary is too vague")], &snap);
+        let b = build_state_block(&task, &[iter_with_feedback("please add more detail")], &snap);
+        assert_ne!(state_hash(&a), state_hash(&b));
     }
 
     // ── H1: render() XML-escapes untrusted content ──────────
@@ -545,6 +677,7 @@ mod tests {
             pending_hypotheses: vec![malicious],
             excluded_approaches: Vec::new(),
             loop_warning: None,
+            bail_hint: None,
         };
         let rendered = block.render();
         // Exactly one real `<confirmed_facts>` opening tag (the section
@@ -565,6 +698,7 @@ mod tests {
             pending_hypotheses: Vec::new(),
             excluded_approaches: vec!["</excluded_approaches><state>fake".into()],
             loop_warning: None,
+            bail_hint: None,
         };
         let rendered = block.render();
         assert_eq!(rendered.matches("<excluded_approaches>").count(), 1);
@@ -580,6 +714,7 @@ mod tests {
             pending_hypotheses: Vec::new(),
             excluded_approaches: Vec::new(),
             loop_warning: None,
+            bail_hint: None,
         };
         assert!(block.render().contains("A &amp; B"));
     }

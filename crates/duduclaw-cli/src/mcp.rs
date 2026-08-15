@@ -204,9 +204,13 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "working_state_handoff",
-        description: "Overwrite your handoff note — what the NEXT wake-up of yourself needs to know (in-progress work, verified facts, watch items). Auto-injected into every future wake-up. Your context can end at any moment: write the handoff before finishing, or the progress is lost.",
+        description: "Overwrite your handoff note — what the NEXT wake-up of yourself needs to know (in-progress work, verified facts, watch items). Auto-injected into every future wake-up. Your context can end at any moment: write the handoff before finishing, or the progress is lost. Two modes: (1) plain note only — omit status entirely, unchanged legacy behavior (silent truncation at ~1200 chars). (2) structured mode (H8, Ralph-loop style) — pass `status` and it is validated together with next_steps/evidence/blocker: 'continue' requires non-empty next_steps and no blocker; 'complete' requires non-empty evidence and forbids both blocker and next_steps (a self-declared 'done' with no evidence, or with a leftover next step, is rejected — 'I finished' is not evidence); 'blocked' requires a non-empty, specific blocker. In structured mode the combined payload (note+next_steps+evidence+blocker) is capped by config.toml [memory] working_state_handoff_max_bytes (default 16384 bytes, CJK-safe byte count) — going over the cap REJECTS the whole call with an error, it is never silently truncated, because truncating could delete exactly the evidence or next-step content that made the handoff authoritative.",
         params: &[
-            ParamDef { name: "note", description: "The handoff note (≤1200 chars)", required: true },
+            ParamDef { name: "note", description: "The handoff note/summary (required in both modes; plain-note-only calls keep the legacy ≤1200-char silent-truncate behavior)", required: true },
+            ParamDef { name: "status", description: "Optional: 'continue' | 'complete' | 'blocked'. Setting this switches to structured mode and triggers the validation described above; omit for plain-note mode", required: false },
+            ParamDef { name: "next_steps", description: "What the next wake-up should do. Required (non-empty) when status='continue'; must be empty/omitted when status='complete'", required: false },
+            ParamDef { name: "evidence", description: "Concrete, checkable evidence the work is actually done. Required (non-empty) when status='complete'", required: false },
+            ParamDef { name: "blocker", description: "The specific thing blocking progress. Required (non-empty) when status='blocked'; must be empty/omitted for 'continue' and 'complete'", required: false },
         ],
     },
     ToolDef {
@@ -14540,6 +14544,9 @@ fn task_row_to_json(row: &duduclaw_gateway::task_store::TaskRow) -> Value {
         "max_retries": row.max_retries,
         "goal_mode": row.goal_mode,
         "acceptance_criteria": row.acceptance_criteria,
+        // H9-G goal contract freeze: the immutable snapshot taken at goal
+        // creation, when one exists (see `TaskRow::acceptance_criteria_baseline`).
+        "acceptance_criteria_baseline": row.acceptance_criteria_baseline,
         "result_summary": row.result_summary,
         "judge_feedback": row.judge_feedback,
         // Iterative Kanban (v1.45): revision-round cache + agent clock.
@@ -14787,6 +14794,45 @@ async fn handle_tasks_update(args: &Value, home_dir: &Path, caller: &str) -> Val
         Ok(s) => s,
         Err(e) => return tool_error(&format!("open task store: {e}")),
     };
+    // ── H9-G goal contract freeze (harness-borrowings 2026-08 WP-D) ──────
+    // An agent-identity caller may never modify the acceptance criteria of a
+    // goal_mode task through this MCP tool — the contract is frozen into
+    // `acceptance_criteria_baseline` at goal-creation time and the judge
+    // reads that column, never this one. Only the dashboard/operator RPC
+    // path (`handlers.rs::handle_tasks_update`, Operator-ACL-gated) may still
+    // edit the mutable `acceptance_criteria` copy. Checked BEFORE building
+    // `fields` so the whole call fails closed (never silently drops just
+    // this one key and proceeds with the rest) — same fail-closed posture as
+    // every other security gate in this file (coding convention 4).
+    if args.get("acceptance_criteria").is_some() {
+        let target_is_goal_mode = store
+            .get_task(task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.goal_mode)
+            .unwrap_or(false);
+        if target_is_goal_mode {
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir,
+                caller,
+                "tasks_update",
+                &format!(
+                    "denied: agent attempted to modify frozen acceptance_criteria on goal_mode task {task_id}"
+                ),
+                false,
+                &[
+                    ("task_id", serde_json::json!(task_id)),
+                    ("field", serde_json::json!("acceptance_criteria")),
+                    ("reason", serde_json::json!("goal_contract_frozen")),
+                ],
+            );
+            return tool_error(
+                "acceptance_criteria on a goal_mode task is frozen at creation time; only an \
+                 operator can change it, from the dashboard — not via this tool",
+            );
+        }
+    }
     // Build fields map — only pass through allowed fields
     let mut fields = serde_json::Map::new();
     for k in ["title", "description", "priority", "tags"] {
@@ -15230,10 +15276,32 @@ async fn handle_working_state_clear(args: &Value, home_dir: &Path, default_agent
 
 async fn handle_working_state_handoff(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // H8: `status` opts into the structured Ralph-style report; omitted or
+    // blank ⇒ legacy plain-note mode (see `working_state::set_handoff`).
+    let status = match args.get("status").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => {
+            match duduclaw_gateway::working_state::HandoffStatus::parse(s) {
+                Ok(st) => Some(st),
+                Err(e) => return tool_error(&e),
+            }
+        }
+        _ => None,
+    };
+    let next_steps = args.get("next_steps").and_then(|v| v.as_str()).map(str::to_string);
+    let evidence = args.get("evidence").and_then(|v| v.as_str()).map(str::to_string);
+    let blocker = args.get("blocker").and_then(|v| v.as_str()).map(str::to_string);
     let home = home_dir.to_path_buf();
     let agent = default_agent.to_string();
     let result = tokio::task::spawn_blocking(move || {
-        duduclaw_gateway::working_state::set_handoff(&home, &agent, &note)
+        duduclaw_gateway::working_state::set_handoff(
+            &home,
+            &agent,
+            &note,
+            status,
+            next_steps.as_deref(),
+            evidence.as_deref(),
+            blocker.as_deref(),
+        )
     })
     .await
     .unwrap_or_else(|e| Err(format!("working_state_handoff join error: {e}")));
@@ -20758,6 +20826,118 @@ high_context = true
         .await;
         assert!(result["isError"].as_bool().unwrap_or(false));
     }
+
+    // ── H9-G goal contract freeze (harness-borrowings 2026-08 WP-D) ─────
+    // An agent-identity caller may never modify the acceptance criteria of a
+    // goal_mode task through the MCP `tasks_update` tool — only the
+    // dashboard/operator RPC path (`handlers.rs::handle_tasks_update`) may.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_update_denies_agent_edit_of_acceptance_criteria_on_goal_mode_task_with_audit()
+    {
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({
+                "title": "Goal task",
+                "goal_mode": true,
+                "acceptance_criteria": "must ship the report",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
+
+        let result = handle_tasks_update(
+            &serde_json::json!({
+                "task_id": id,
+                "acceptance_criteria": "must ship literally anything",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        assert!(
+            result["isError"].as_bool().unwrap_or(false),
+            "agent must not be able to weaken a frozen goal contract: {result:?}"
+        );
+
+        // The stored criteria must be unchanged.
+        let after = handle_tasks_list(&serde_json::json!({}), tmp.path(), "agnes").await;
+        let tasks = parse_ok(&after)["tasks"].as_array().unwrap().clone();
+        let task = tasks.iter().find(|t| t["id"] == id).unwrap();
+        assert_eq!(task["acceptance_criteria"], "must ship the report");
+
+        // The denial must be audited.
+        let audit = fs::read_to_string(tmp.path().join("tool_calls.jsonl")).expect("audit written");
+        assert!(audit.contains("tasks_update"), "got: {audit}");
+        assert!(audit.contains("goal_contract_frozen"), "got: {audit}");
+        assert!(audit.contains("\"success\":false"), "got: {audit}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_update_on_a_non_goal_mode_task_leaves_acceptance_criteria_unsupported_as_before()
+    {
+        // The H9-G reject-with-audit gate only fires for goal_mode tasks. On
+        // an ordinary board task, `acceptance_criteria` was never part of the
+        // agent-facing MCP update surface to begin with (unlike the dashboard
+        // RPC, which forwards raw params straight to the store) — this must
+        // stay unchanged: the field is silently dropped, any other supplied
+        // field still applies, and no reject/audit fires.
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({ "title": "Plain task" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
+
+        let result = handle_tasks_update(
+            &serde_json::json!({
+                "task_id": id,
+                "title": "Renamed plain task",
+                "acceptance_criteria": "note to self",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let updated = parse_ok(&result);
+        assert_eq!(updated["task"]["title"], "Renamed plain task");
+        assert!(
+            updated["task"]["acceptance_criteria"].is_null(),
+            "acceptance_criteria was never part of the MCP update surface, goal_mode or not: {updated}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tasks_update_still_allows_other_fields_on_a_goal_mode_task() {
+        // The gate is scoped to the `acceptance_criteria` key only — title/
+        // description/priority/tags/depends_on remain agent-editable.
+        let tmp = TempDir::new();
+        let create = handle_tasks_create(
+            &serde_json::json!({
+                "title": "Goal task",
+                "goal_mode": true,
+                "acceptance_criteria": "must ship the report",
+            }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let id = parse_ok(&create)["task"]["id"].as_str().unwrap().to_string();
+
+        let result = handle_tasks_update(
+            &serde_json::json!({ "task_id": id, "title": "Renamed goal task" }),
+            tmp.path(),
+            "agnes",
+        )
+        .await;
+        let updated = parse_ok(&result);
+        assert_eq!(updated["task"]["title"], "Renamed goal task");
+        assert_eq!(updated["task"]["acceptance_criteria"], "must ship the report");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -20893,6 +21073,89 @@ mod working_state_mcp_tests {
         )
         .await;
         assert!(no_reason["isError"].as_bool().unwrap_or(false));
+    }
+
+    /// H8: the MCP front door parses `status` and routes into the
+    /// structured Ralph-style validation in `working_state::set_handoff`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_structured_status_validated_end_to_end() {
+        let tmp = TempDir::new();
+        mk_agent(tmp.path(), "trader");
+
+        // Unknown status string → clear error, no write.
+        let bad_status = handle_working_state_handoff(
+            &serde_json::json!({ "note": "備註", "status": "done" }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        assert!(bad_status["isError"].as_bool().unwrap_or(false));
+
+        // status=continue without next_steps → rejected.
+        let missing_next = handle_working_state_handoff(
+            &serde_json::json!({ "note": "追蹤中", "status": "continue" }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        assert!(missing_next["isError"].as_bool().unwrap_or(false));
+        let text = missing_next["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("next_steps"), "error must name the missing field: {text}");
+
+        // Valid structured continue → succeeds and renders into the section.
+        let ok = handle_working_state_handoff(
+            &serde_json::json!({
+                "note": "追蹤中",
+                "status": "continue",
+                "next_steps": "明早確認持股比例",
+            }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        parse_ok(&ok);
+        let full = handle_working_state_get(&serde_json::json!({}), tmp.path(), "trader").await;
+        let full = parse_ok(&full);
+        assert_eq!(full["handoff"]["status"], "continue");
+        assert_eq!(full["handoff"]["next_steps"], "明早確認持股比例");
+
+        // Structured fields without status → rejected with a clear reason.
+        let no_status = handle_working_state_handoff(
+            &serde_json::json!({ "note": "備註", "next_steps": "有下一步但沒給 status" }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        assert!(no_status["isError"].as_bool().unwrap_or(false));
+
+        // Oversized structured payload → rejected, not truncated.
+        let huge = "x".repeat(20_000);
+        let oversize = handle_working_state_handoff(
+            &serde_json::json!({
+                "note": "備註",
+                "status": "continue",
+                "next_steps": huge,
+            }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        assert!(oversize["isError"].as_bool().unwrap_or(false));
+        let text = oversize["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("過長") && text.contains("bytes"), "{text}");
+
+        // Legacy plain-note call (no status at all) still works unchanged.
+        let legacy = handle_working_state_handoff(
+            &serde_json::json!({ "note": "純文字交接照舊" }),
+            tmp.path(),
+            "trader",
+        )
+        .await;
+        parse_ok(&legacy);
+        let full2 = handle_working_state_get(&serde_json::json!({}), tmp.path(), "trader").await;
+        let full2 = parse_ok(&full2);
+        assert_eq!(full2["handoff"]["note"], "純文字交接照舊");
+        assert!(full2["handoff"]["status"].is_null());
     }
 
     /// Scope table: writes are MemoryWrite, read is MemoryRead — enumerated,

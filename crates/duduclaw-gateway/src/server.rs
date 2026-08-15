@@ -1413,6 +1413,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         );
     }
 
+    // ── H6 (WP-B, `resume_on_restart`): boot-time-only reconciliation ──
+    // Runs regardless of whether the dispatch engine just (re)started above
+    // — a stale in-flight goal left over from a previous process must be
+    // surfaced even if this particular boot happens to have dispatch
+    // disabled, so it does not silently resume the next time dispatch is
+    // re-enabled. No-op unless `[goal_loop] resume_on_restart = "pause"`.
+    // Called exactly once, here, at boot — never from the
+    // `system.update_config` hot-reload paths (see
+    // `MethodHandler::pause_inflight_goal_tasks_on_restart`'s doc comment).
+    let resumed_paused = handler.pause_inflight_goal_tasks_on_restart().await;
+    if resumed_paused > 0 {
+        info!(
+            paused = resumed_paused,
+            "resume_on_restart=pause: escalated in-flight goal tasks to needs_human at boot"
+        );
+    }
+
     // ── D5: semi-automatic topology evolution (human-gated) ───
     // Independent of the dispatch engine: a slow background driver that mines
     // per-(agent, task_class) MAV reject / needs_human / oscillation evidence,

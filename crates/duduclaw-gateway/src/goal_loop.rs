@@ -310,6 +310,14 @@ pub struct GoalLoopConfig {
     /// A dispatched task the agent has not picked up within this many seconds is
     /// considered stalled and may be re-dispatched (counts as an iteration).
     pub stalled_secs: i64,
+    /// H6 (WP-B) / WP-E (2026-08 P1 rollout): `"auto"` or `"pause"`
+    /// (**default since WP-E**). Read as a raw string (not a typed enum) so
+    /// an unrecognized value degrades to the safe default instead of
+    /// failing `GoalLoopConfig` deserialization for the whole `[goal_loop]`
+    /// section — same lenient-string convention
+    /// [`AutonomyLevel::from_toml_str`] uses elsewhere in this file. Resolve
+    /// via [`GoalLoopConfig::resume_on_restart`].
+    pub resume_on_restart: String,
 }
 
 impl Default for GoalLoopConfig {
@@ -322,6 +330,14 @@ impl Default for GoalLoopConfig {
             max_concurrent: 3,
             tick_secs: 30,
             stalled_secs: 600,
+            // WP-E (2026-08 P1 rollout, user-approved spec change): default
+            // flipped from "auto" to "pause". H6 shipped opt-in-only first;
+            // this is the deliberate follow-up so an unattended gateway
+            // restart/crash-recovery no longer silently resumes driving a
+            // goal nobody re-confirmed is still safe. Set back to "auto" in
+            // `config.toml [goal_loop]` (or via the dashboard's Automation
+            // tab) to restore the pre-WP-E behavior.
+            resume_on_restart: "pause".to_string(),
         }
     }
 }
@@ -346,6 +362,120 @@ impl GoalLoopConfig {
             None => Self::default(),
         }
     }
+
+    /// H6: the parsed [`ResumeOnRestart`] policy. Unrecognized / empty /
+    /// whitespace-only values fall back to [`ResumeOnRestart::Auto`] — the
+    /// pre-H6, byte-identical-behavior default.
+    pub fn resume_on_restart(&self) -> ResumeOnRestart {
+        ResumeOnRestart::from_str_lenient(&self.resume_on_restart)
+    }
+}
+
+/// H6: whether the goal loop resumes in-flight goal tasks automatically
+/// after a gateway process restart, or requires human confirmation first.
+///
+/// Two independent harnesses (deepseek-harness's Ralph loop, grok-build's
+/// `goal_tracker.rs`) converged on the same conclusion: a durable
+/// autonomous loop must never resurrect itself after a process restart — an
+/// unattended process crash/redeploy must not silently resume driving a
+/// goal that a human has not re-confirmed is still safe to continue. See
+/// H6 in `commercial/docs/DESIGN-harness-borrowings-2026-08.md`.
+///
+/// H6 shipped with [`GoalLoopConfig`]'s default string set to `"auto"`
+/// (byte-identical to pre-H6 behavior) pending the P1 rollout decision in
+/// that design doc. WP-E (2026-08, user-approved) is that rollout: the
+/// config default is now `"pause"` — see [`GoalLoopConfig::default`]. This
+/// enum's own `#[default]` stays [`ResumeOnRestart::Auto`] deliberately: it
+/// is the fail-safe fallback [`ResumeOnRestart::from_str_lenient`] returns
+/// for an unrecognized/malformed config string, which must never
+/// double-negative into the *stricter* behavior on a typo — that is a
+/// separate concept from "what a fresh install ships with".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResumeOnRestart {
+    /// The driver picks up any non-terminal goal_mode task exactly as if
+    /// the process had never stopped. Pre-H6 behavior; no longer the
+    /// `GoalLoopConfig` default since WP-E, but still the safe fallback for
+    /// an unparseable `resume_on_restart` string (see the enum doc above).
+    #[default]
+    Auto,
+    /// At gateway boot, every non-terminal goal_mode task is escalated to
+    /// `needs_human` (reason `gateway_restart`) instead of being silently
+    /// resumed. See [`pause_inflight_on_restart`].
+    Pause,
+}
+
+impl ResumeOnRestart {
+    /// Unknown / empty / whitespace-only ⇒ [`ResumeOnRestart::Auto`] (the
+    /// safe, behavior-preserving default) — a typo in config must never
+    /// silently switch to the OTHER mode's semantics in either direction.
+    fn from_str_lenient(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pause" => ResumeOnRestart::Pause,
+            _ => ResumeOnRestart::Auto,
+        }
+    }
+}
+
+/// H6: boot-time reconciliation for `resume_on_restart = "pause"`. Scans
+/// every non-terminal (`todo` / `pending` / `revising` / `in_progress` /
+/// `review` / `blocked`) `goal_mode` task and escalates it to `needs_human`
+/// (reason `gateway_restart`), reusing [`GoalLoopDriver::escalate`]'s
+/// well-tested path (grant revocation, activity post, visit-graph /
+/// state-capture cleanup) via a throwaway driver instance — safe because at
+/// boot time no live in-memory in-flight tracking exists yet for any task,
+/// so an empty `inflight` map is equivalent to a freshly-started driver's
+/// real state. The existing `needs_human` channel push then happens
+/// naturally on the driver's own first tick via
+/// [`GoalLoopDriver::reconcile_needs_human`] — no separate notify path is
+/// duplicated here.
+///
+/// No-op (returns `0`) when `resume_on_restart` resolves to `Auto` —
+/// byte-identical to pre-H6 behavior, but note this is no longer the
+/// `GoalLoopConfig` default since WP-E (see [`ResumeOnRestart`]).
+/// Deliberately called ONLY from the gateway boot path, never from a
+/// hot-reload respawn — see the sole caller's doc comment
+/// (`MethodHandler::pause_inflight_goal_tasks_on_restart` in `handlers.rs`)
+/// for why conflating the two would be wrong.
+pub async fn pause_inflight_on_restart(
+    store: Arc<TaskStore>,
+    queue: Arc<MessageQueue>,
+    home_dir: &Path,
+) -> usize {
+    let cfg = GoalLoopConfig::from_home(home_dir);
+    if cfg.resume_on_restart() != ResumeOnRestart::Pause {
+        return 0;
+    }
+    let driver = GoalLoopDriver::new(store.clone(), queue, cfg).with_home_dir(home_dir.to_path_buf());
+    const NON_TERMINAL_STATUSES: &[&str] =
+        &["todo", "pending", "revising", "in_progress", "review", "blocked"];
+    let mut paused = 0usize;
+    for status in NON_TERMINAL_STATUSES {
+        let tasks = match store.tasks_in_status(status).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(%status, error = %e, "goal loop: resume_on_restart scan failed for this status (continuing)");
+                continue;
+            }
+        };
+        for t in tasks {
+            if !t.goal_mode {
+                continue;
+            }
+            let mut dummy_inflight: HashMap<String, InFlight> = HashMap::new();
+            if let Err(e) = driver.escalate(&mut dummy_inflight, &t, "gateway_restart").await {
+                warn!(task = %t.id, error = %e, "goal loop: resume_on_restart escalate failed for this task (continuing)");
+                continue;
+            }
+            paused += 1;
+        }
+    }
+    if paused > 0 {
+        info!(
+            paused,
+            "goal loop: resume_on_restart=pause escalated in-flight goal tasks to needs_human at boot"
+        );
+    }
+    paused
 }
 
 /// Iterative Kanban default `review` WIP limit. The board flags the review
@@ -1926,7 +2056,17 @@ impl GoalLoopDriver {
         };
         let criteria_block = match task.acceptance_criteria.as_deref() {
             Some(c) if !c.trim().is_empty() => {
-                format!("\n• 驗收標準: {c}")
+                // H9-G contract discipline (harness-borrowings 2026-08 WP-D):
+                // reassure the executing agent that the criteria are judged as
+                // written — a different but valid approach is not grounds for
+                // rejection, the bar will not tighten mid-task, and anything
+                // not listed is out of scope rather than an implicit extra
+                // requirement to satisfy.
+                format!(
+                    "\n• 驗收標準: {c}\n\
+                     （驗收標準看的是最終結果,不是實作路徑,用不同但正確的做法達成一樣算數；\
+                     標準已定案,不會在過程中被無故加嚴；沒列在標準內的事不在驗收範圍內。）"
+                )
             }
             _ => String::new(),
         };
@@ -2134,6 +2274,55 @@ impl GoalLoopDriver {
                 None => {}
             }
         }
+
+        // ── H5 (WP-B): bail-pattern panel ──────────────────────
+        // Runs against the SAME `result_summary` read above, before the
+        // race window `DispatchEngine::review_goal_tasks` can clear it (see
+        // "The race this method accepts" above) — a miss here degrades
+        // exactly like the state_update capture does: silently, by design,
+        // no error.
+        if let Some(result_text) = task.result_summary.as_deref() {
+            if let Some(pattern) = crate::goal_bail_detect::detect_bail_pattern(result_text) {
+                self.record_bail_pattern(task, pattern).await;
+            }
+        }
+    }
+
+    /// H5 (WP-B): record one bail-pattern hit — per-pattern telemetry +
+    /// activity feed event + a best-effort hint carried into the NEXT
+    /// dispatch round's `<state>` block (`GoalStateSnapshot.bail_hint`,
+    /// surfaced to the AGENT via `StateBlock::render`).
+    ///
+    /// Note on scope: the source design (H5) also calls for folding this
+    /// signal into "the judge's input". The MAV judge / evaluator prompt is
+    /// built entirely in `dispatch_engine.rs`, which is out of scope for
+    /// this change (a concurrent work package owns it) — so this only
+    /// reaches the goal-loop-owned dispatch prompt for now, not the judge
+    /// prompt itself. Best-effort; a store failure here never blocks the
+    /// driver.
+    async fn record_bail_pattern(&self, task: &TaskRow, pattern: &'static str) {
+        crate::metrics::global_metrics()
+            .goal_loop_bail_pattern_hit(pattern)
+            .await;
+        self.post_activity(
+            "goal_loop.premature_stop_suspected",
+            &task.assigned_to,
+            Some(&task.id),
+            &format!("偵測到疑似提前收工訊號(pattern={pattern}) — {}", task.title),
+        )
+        .await;
+        let hint = format!(
+            "上一輪疑似提前收工(pattern={pattern}),請確認任務是否真的完成,或誠實回報實際受阻原因,勿在未完成時提前結束。"
+        );
+        if let Err(e) = self
+            .store
+            .merge_goal_state_json(&task.id, move |v| {
+                v["bail_hint"] = serde_json::json!(hint);
+            })
+            .await
+        {
+            debug!(task = %task.id, error = %e, "goal loop: bail hint persist failed (non-fatal)");
+        }
     }
 
     /// Best-effort append to the dashboard Activity Feed. A failure here must not
@@ -2180,6 +2369,7 @@ mod tests {
             max_concurrent: 3,
             tick_secs: 30,
             stalled_secs: 600,
+            resume_on_restart: "auto".to_string(),
         }
     }
 
@@ -2748,6 +2938,268 @@ mod tests {
         assert!(
             !acts.iter().any(|a| a.event_type == "goal_loop.oscillation"),
             "no oscillation should be recorded for differing feedback"
+        );
+    }
+
+    // ── H4: gap fingerprinting integrated into the A2 no-progress guard ──
+
+    /// The DoD's "same gap, reworded" case, end to end: two rejections that
+    /// cite the SAME `path:line` but with completely different prose must
+    /// now escalate exactly like literally-identical feedback would — this
+    /// was NOT true before H4 (each reworded rejection produced a distinct
+    /// `state_hash`, so the guard never fired).
+    #[tokio::test]
+    async fn reworded_feedback_citing_the_same_gap_escalates_oscillation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        let cfg = GoalLoopConfig { iteration_cap: 10, iteration_cap_simple: 10, ..small_cfg() };
+        let mut t = goal_task("g1", "alice");
+        t.max_retries = 100;
+        store.insert_task(&t).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), cfg);
+        d.tick_once().await.unwrap();
+
+        agent_round_then_reject(
+            &d,
+            &store,
+            "g1",
+            "Missing error handling in crates/duduclaw-gateway/src/goal_loop.rs:120, please add a check.",
+        )
+        .await;
+        d.tick_once().await.unwrap();
+        assert_ne!(
+            store.get_task("g1").await.unwrap().unwrap().status,
+            "needs_human",
+            "first rejection must not escalate"
+        );
+
+        // Same underlying gap (same path:line), completely reworded prose.
+        agent_round_then_reject(
+            &d,
+            &store,
+            "g1",
+            "You forgot proper error handling at crates/duduclaw-gateway/src/goal_loop.rs:120 — add validation.",
+        )
+        .await;
+        d.tick_once().await.unwrap();
+
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "needs_human", "reworded feedback citing the same gap must still escalate");
+        let (acts, _) = store.list_activity(None, None, 100, 0).await.unwrap();
+        assert!(acts.iter().any(|a| a.event_type == "goal_loop.oscillation"));
+    }
+
+    /// Counterpart: two rejections citing DIFFERENT `path:line` gaps must
+    /// keep retrying, not escalate — the fingerprint must be sensitive to a
+    /// genuinely different gap, not just insensitive to rewording.
+    #[tokio::test]
+    async fn feedback_citing_different_gaps_keeps_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        let cfg = GoalLoopConfig { iteration_cap: 10, iteration_cap_simple: 10, ..small_cfg() };
+        let mut t = goal_task("g1", "alice");
+        t.max_retries = 100;
+        store.insert_task(&t).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), cfg);
+        d.tick_once().await.unwrap();
+
+        agent_round_then_reject(
+            &d,
+            &store,
+            "g1",
+            "Missing error handling in crates/duduclaw-gateway/src/goal_loop.rs:120.",
+        )
+        .await;
+        d.tick_once().await.unwrap();
+
+        agent_round_then_reject(
+            &d,
+            &store,
+            "g1",
+            "Missing error handling in crates/duduclaw-gateway/src/goal_state.rs:42.",
+        )
+        .await;
+        d.tick_once().await.unwrap();
+
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_ne!(got.status, "needs_human", "citations to different gaps must keep retrying");
+    }
+
+    // ── H6: resume_on_restart ──────────────────────────────────
+
+    /// WP-E: direct check that `GoalLoopConfig::default()` resolves to
+    /// `Pause` — the platform default flip, independent of the
+    /// boot-reconciliation behavior exercised by the tests below.
+    #[test]
+    fn goal_loop_config_default_resume_on_restart_is_pause() {
+        assert_eq!(GoalLoopConfig::default().resume_on_restart(), ResumeOnRestart::Pause);
+        assert_eq!(GoalLoopConfig::default().resume_on_restart, "pause");
+    }
+
+    #[tokio::test]
+    async fn resume_on_restart_auto_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        std::fs::write(dir.path().join("config.toml"), "[goal_loop]\nresume_on_restart = \"auto\"\n").unwrap();
+
+        let mut t = goal_task("g1", "alice");
+        t.status = "in_progress".into();
+        store.insert_task(&t).await.unwrap();
+
+        let paused = pause_inflight_on_restart(store.clone(), queue, dir.path()).await;
+        assert_eq!(paused, 0, "explicit auto must never touch any task");
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "in_progress", "task status must be untouched under auto");
+    }
+
+    // WP-E (2026-08 P1 rollout, user-approved spec change — see
+    // `GoalLoopConfig::default`): the platform default for
+    // `resume_on_restart` flipped from "auto" to "pause". This test used to
+    // be named `resume_on_restart_default_config_is_a_noop` and assert the
+    // opposite (paused == 0); it is intentionally rewritten, not just
+    // relabeled, to lock in the new default as a spec change rather than
+    // silently deleting coverage of "what happens with no config.toml at all".
+    #[tokio::test]
+    async fn resume_on_restart_default_config_pauses_inflight_tasks() {
+        // No config.toml at all ⇒ GoalLoopConfig::from_home defaults ⇒ Pause
+        // (WP-E default, was Auto pre-WP-E).
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        let mut t = goal_task("g1", "alice");
+        t.status = "review".into();
+        store.insert_task(&t).await.unwrap();
+
+        let paused = pause_inflight_on_restart(store.clone(), queue, dir.path()).await;
+        assert_eq!(paused, 1, "missing config.toml must default to pause (WP-E default) and escalate the in-flight task");
+        let got = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(got.status, "needs_human", "default pause must escalate the in-flight task at boot");
+    }
+
+    #[tokio::test]
+    async fn resume_on_restart_pause_escalates_inflight_goal_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        std::fs::write(dir.path().join("config.toml"), "[goal_loop]\nresume_on_restart = \"pause\"\n").unwrap();
+
+        // Non-terminal goal_mode tasks across a few different statuses.
+        let mut t1 = goal_task("g1", "alice");
+        t1.status = "in_progress".into();
+        store.insert_task(&t1).await.unwrap();
+
+        let mut t2 = goal_task("g2", "alice");
+        t2.status = "review".into();
+        store.insert_task(&t2).await.unwrap();
+
+        let mut t3 = goal_task("g3", "alice"); // still "todo" — never dispatched
+        store.insert_task(&t3).await.unwrap();
+
+        // A terminal task must NOT be touched.
+        let mut t4 = goal_task("g4", "alice");
+        t4.status = "done".into();
+        store.insert_task(&t4).await.unwrap();
+
+        // A non-goal-mode task in a matching status must NOT be touched.
+        let mut t5 = TaskRow::new(
+            "t5".into(),
+            "ordinary task".into(),
+            "not a goal".into(),
+            "medium".into(),
+            "alice".into(),
+            "system".into(),
+        );
+        t5.status = "in_progress".into();
+        store.insert_task(&t5).await.unwrap();
+
+        let paused = pause_inflight_on_restart(store.clone(), queue, dir.path()).await;
+        assert_eq!(paused, 3, "exactly the 3 non-terminal goal_mode tasks must be paused");
+
+        for id in ["g1", "g2", "g3"] {
+            let got = store.get_task(id).await.unwrap().unwrap();
+            assert_eq!(got.status, "needs_human", "{id} must be escalated");
+            assert_eq!(got.judge_feedback.as_deref(), Some("gateway_restart"));
+        }
+        assert_eq!(store.get_task("g4").await.unwrap().unwrap().status, "done", "terminal task untouched");
+        assert_eq!(
+            store.get_task("t5").await.unwrap().unwrap().status,
+            "in_progress",
+            "non-goal-mode task untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_on_restart_pause_is_idempotent_across_two_boots() {
+        // A second "boot" (e.g. a crash loop) must not re-escalate an
+        // already-`needs_human` task, and must not error.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        std::fs::write(dir.path().join("config.toml"), "[goal_loop]\nresume_on_restart = \"pause\"\n").unwrap();
+
+        let mut t = goal_task("g1", "alice");
+        t.status = "in_progress".into();
+        store.insert_task(&t).await.unwrap();
+
+        let first = pause_inflight_on_restart(store.clone(), queue.clone(), dir.path()).await;
+        assert_eq!(first, 1);
+        let second = pause_inflight_on_restart(store.clone(), queue, dir.path()).await;
+        assert_eq!(second, 0, "an already needs_human task must not be re-escalated");
+    }
+
+    // ── H7: continuation feedback is single-instance, not accumulated ──
+
+    /// Audit finding (H7): `enqueue_work`'s `<judge_feedback>` block is
+    /// built from `task.judge_feedback` alone — a single `Option<String>`
+    /// column that `TaskStore::reject_review`/`accept_review` OVERWRITE on
+    /// every judge verdict (`SET ... judge_feedback = ?5 ...`, never
+    /// concatenated — see `task_store.rs`). There was nothing to change;
+    /// this regression test locks the "already single-instance" finding in
+    /// so a future edit accidentally reintroducing accumulation (e.g.
+    /// appending instead of overwriting) trips a red test immediately.
+    #[tokio::test]
+    async fn continuation_feedback_never_accumulates_across_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+
+        let cfg = GoalLoopConfig { iteration_cap: 10, iteration_cap_simple: 10, ..small_cfg() };
+        let mut t = goal_task("g1", "alice");
+        t.max_retries = 100;
+        store.insert_task(&t).await.unwrap();
+
+        let d = driver(store.clone(), queue.clone(), cfg);
+        d.tick_once().await.unwrap();
+
+        agent_round_then_reject(&d, &store, "g1", "round one feedback: fix the widget shape").await;
+        d.tick_once().await.unwrap(); // re-dispatch carrying round-one feedback
+
+        agent_round_then_reject(&d, &store, "g1", "round two feedback: fix the widget color instead").await;
+        d.tick_once().await.unwrap(); // re-dispatch carrying round-two feedback
+
+        let pending = queue.pending_messages(10).await.unwrap();
+        let latest = pending.last().expect("at least one pending message");
+        // Exactly one `<judge_feedback>` block per payload — never doubled up.
+        assert_eq!(latest.payload.matches("<judge_feedback>").count(), 1);
+        // Isolate the `<judge_feedback>...</judge_feedback>` block itself —
+        // deliberately NOT a whole-payload substring check, because the
+        // SEPARATE `<excluded_approaches>` section of the `<state>` block
+        // intentionally accumulates up to 6 historical rejection reasons
+        // (see `goal_state.rs::excluded_from_iterations`) and legitimately
+        // still contains round-one's text there. The H7 claim under test is
+        // specifically about the single dedicated continuation-feedback
+        // block, not that field.
+        let start = latest.payload.find("<judge_feedback>").expect("judge_feedback block present") + "<judge_feedback>".len();
+        let end = latest.payload[start..].find("</judge_feedback>").expect("judge_feedback close tag present") + start;
+        let feedback_block = &latest.payload[start..end];
+        assert!(
+            feedback_block.contains("round two feedback: fix the widget color instead"),
+            "the <judge_feedback> block must carry the latest feedback"
+        );
+        assert!(
+            !feedback_block.contains("round one feedback: fix the widget shape"),
+            "the <judge_feedback> block must NOT still carry the stale round-one text \
+             (that is the H7 single-instance claim under test) — got: {feedback_block:?}"
         );
     }
 

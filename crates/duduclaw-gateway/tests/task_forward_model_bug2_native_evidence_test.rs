@@ -112,6 +112,7 @@ fn small_cfg() -> GoalLoopConfig {
         max_concurrent: 3,
         tick_secs: 30,
         stalled_secs: 600,
+        resume_on_restart: "auto".to_string(),
     }
 }
 

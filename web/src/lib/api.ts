@@ -1266,6 +1266,28 @@ export interface BeliefStats {
   per_subject: BeliefSubjectStat[];
 }
 
+/** One recorded file effect from a task's rounds (`tasks.changes`).
+ *  `path` carries the touched file — except for `op: 'shell'`, where it is the
+ *  command itself (we never guess which files a shell line touched). */
+export interface TaskChange {
+  path: string;
+  op: 'write' | 'edit' | 'delete' | 'shell';
+  tool_name: string;
+  timestamp: string;
+  success: boolean;
+  /** Masked excerpt produced by the audit layer; never re-read from disk. */
+  snippet: string | null;
+  source: 'native' | 'mcp_audit';
+  round: number | null;
+}
+
+/** `tasks.changes` — the evidence behind the needs_human 「變更」tab. */
+export interface TaskChanges {
+  changes: TaskChange[];
+  distinct_paths: number;
+  truncated: boolean;
+}
+
 /** `tasks.timeline` — one goal task's whole loop story. */
 export interface GoalTimeline {
   task: TaskInfo;
@@ -4922,6 +4944,10 @@ export const api = {
     // verdict per round).
     iterations: (taskId: string) =>
       client.call('tasks.iterations', { task_id: taskId }) as Promise<{ iterations: TaskIteration[] }>,
+    // WP-F (P2-c): file-change evidence for the needs_human 「變更」tab —
+    // what the task's rounds actually wrote/edited/deleted, newest first.
+    changes: (taskId: string, limit?: number) =>
+      client.call('tasks.changes', limit ? { task_id: taskId, limit } : { task_id: taskId }) as Promise<TaskChanges>,
     // Iterative Kanban: per-agent + board flow metrics. Non-admins pass an
     // agent_id and see only that agent's slice.
     flowMetrics: (agentId?: string) =>
