@@ -290,7 +290,8 @@ pub trait ChannelSender: Send + Sync {
 /// Channel identifier for sender construction.
 #[derive(Debug, Clone)]
 pub struct ChannelTarget {
-    /// Channel type: "telegram", "line", "discord", "slack", "whatsapp", "feishu", "webchat"
+    /// Channel type: "telegram", "line", "discord", "slack", "whatsapp",
+    /// "feishu", "googlechat", "teams", "wecom", "dingtalk", "webchat"
     pub(crate) channel_type: String,
     /// Chat/channel/room ID in that platform.
     pub(crate) chat_id: String,
@@ -301,14 +302,15 @@ pub struct ChannelTarget {
 }
 
 /// Channels whose senders resolve their own credentials from global config
-/// at send time (multi-field credentials like corpid+corpsecret+agentid),
-/// so `ChannelTarget.token` is ignored and a `<channel>_bot_token` lookup
+/// at send time (multi-field credentials like corpid+corpsecret+agentid, or
+/// a service-account JSON key / Bot Framework app id+password), so
+/// `ChannelTarget.token` is ignored and a `<channel>_bot_token` lookup
 /// must NOT gate delivery for them (cron notifications, OTP).
 ///
 /// Marker-field presence for these channels is checked via
 /// [`self_config_marker_field`].
 pub fn sender_self_configures(channel_type: &str) -> bool {
-    matches!(channel_type, "wecom" | "dingtalk")
+    matches!(channel_type, "wecom" | "dingtalk" | "googlechat" | "teams")
 }
 
 /// The config.toml `[channels]` field whose presence proves a
@@ -318,6 +320,8 @@ pub fn self_config_marker_field(channel_type: &str) -> Option<&'static str> {
     match channel_type {
         "wecom" => Some("wecom_corp_secret"),
         "dingtalk" => Some("dingtalk_app_secret"),
+        "googlechat" => Some("googlechat_service_account_json"),
+        "teams" => Some("teams_app_password"),
         _ => None,
     }
 }
@@ -361,11 +365,31 @@ pub fn create_sender(target: &ChannelTarget, http: reqwest::Client) -> Box<dyn C
             chat_id: target.chat_id.clone(),
             http,
         }),
-        // WeCom / DingTalk credentials live in global config, not on
-        // `ChannelTarget` (same situation as Teams / Google Chat) — resolve
-        // via the canonical home dir so factory-built senders (cron
-        // notifications, OTP, computer use) deliver instead of silently
-        // falling through to NullSender.
+        // Google Chat / Teams / WeCom / DingTalk credentials all live in
+        // global config, not on `ChannelTarget` (service-account JSON,
+        // Bot Framework app id/password, corpid+corpsecret+agentid — none
+        // of them fit the single-`token` shape). Resolve via the canonical
+        // home dir so factory-built senders (cron notifications, OTP,
+        // computer use) deliver instead of silently falling through to
+        // NullSender — this match previously had no arm for "googlechat" /
+        // "teams" at all, so any caller building a plain `ChannelTarget`
+        // for those two channels got a NullSender whose `send_text` always
+        // returns `Ok(())`, i.e. a message that was never sent looked
+        // identical to one that was (handlers.rs::send_channel_test_message
+        // and goal_notify.rs::send_plain_text each grew a dedicated
+        // workaround to route around this gap via `create_googlechat_sender`
+        // / `create_teams_sender` directly — this arm closes it for every
+        // other caller of the generic factory, e.g. cron_scheduler.rs).
+        "googlechat" => create_googlechat_sender(
+            duduclaw_core::platform::duduclaw_home(),
+            target.chat_id.clone(),
+            target.extra_id.clone().unwrap_or_default(),
+        ),
+        "teams" => create_teams_sender(
+            duduclaw_core::platform::duduclaw_home(),
+            target.chat_id.clone(),
+            target.extra_id.clone().unwrap_or_default(),
+        ),
         "wecom" => Box::new(WeComSender {
             home_dir: duduclaw_core::platform::duduclaw_home(),
             touser: target.chat_id.clone(),
@@ -1567,26 +1591,101 @@ mod tests {
         assert_eq!(sender.channel_type(), "dingtalk");
     }
 
-    /// Cron/OTP token-resolution parity: wecom/dingtalk senders build their
-    /// credentials from global config (corpid+corpsecret+agentid / app key+
-    /// secret), so a `<channel>_bot_token` lookup must not gate their
-    /// delivery. Every token-bearing channel must NOT be flagged
-    /// self-configuring, and each self-configuring channel must declare a
-    /// config marker field for a clear is-it-configured check.
+    /// The confirmed-silent-drop regression: `create_sender` previously had
+    /// no arm for "googlechat" at all, so any caller passing a plain
+    /// `ChannelTarget` (cron notifications, OTP, computer-use) fell through
+    /// to the `_` wildcard and got a `NullSender` — whose `send_text`
+    /// always returns `Ok(())`, so a message that was never sent looked
+    /// identical to a successful send. Must now return the real
+    /// `GoogleChatSender`, never `NullSender`.
     #[test]
-    fn self_configuring_channels_are_exactly_wecom_and_dingtalk() {
+    fn factory_creates_googlechat_not_null() {
+        let target = ChannelTarget {
+            channel_type: "googlechat".into(),
+            chat_id: "spaces/AAAA".into(),
+            token: String::new(),
+            extra_id: None,
+        };
+        let sender = create_sender(&target, reqwest::Client::new());
+        assert_eq!(sender.channel_type(), "googlechat");
+        assert_ne!(sender.channel_type(), "null");
+    }
+
+    /// Same regression, Teams arm.
+    #[test]
+    fn factory_creates_teams_not_null() {
+        let target = ChannelTarget {
+            channel_type: "teams".into(),
+            chat_id: "19:abcdef@thread.tacv2".into(),
+            token: String::new(),
+            extra_id: Some("29:user-id".into()),
+        };
+        let sender = create_sender(&target, reqwest::Client::new());
+        assert_eq!(sender.channel_type(), "teams");
+        assert_ne!(sender.channel_type(), "null");
+    }
+
+    /// The googlechat/teams arms always hand back a real sender regardless
+    /// of whether credentials are actually configured (same shape as every
+    /// other channel — `create_sender` is a cheap struct constructor, it
+    /// never touches disk). The "not configured" signal must surface later,
+    /// as a clear `Err` from an actual send attempt — never a silent `Ok`
+    /// that looks like delivery succeeded.
+    #[tokio::test]
+    async fn googlechat_sender_send_text_fails_clearly_when_not_configured() {
+        let home = tempfile::tempdir().unwrap();
+        let sender =
+            create_googlechat_sender(home.path().to_path_buf(), "spaces/AAAA".into(), String::new());
+        let err = sender.send_text("hi").await.unwrap_err();
+        assert!(!err.0.is_empty(), "expected a non-empty, explicit error message");
+    }
+
+    /// Same "explicit failure, not silent success" behavior for Teams.
+    #[tokio::test]
+    async fn teams_sender_send_text_fails_clearly_when_not_configured() {
+        let home = tempfile::tempdir().unwrap();
+        let sender = create_teams_sender(
+            home.path().to_path_buf(),
+            "19:abcdef@thread.tacv2".into(),
+            String::new(),
+        );
+        let err = sender.send_text("hi").await.unwrap_err();
+        assert!(!err.0.is_empty(), "expected a non-empty, explicit error message");
+    }
+
+    /// Cron/OTP token-resolution parity: wecom/dingtalk/googlechat/teams
+    /// senders all build their credentials from global config
+    /// (corpid+corpsecret+agentid / app key+secret / service-account JSON /
+    /// Bot Framework app id+password), so a `<channel>_bot_token` lookup
+    /// must not gate their delivery. Every token-bearing channel must NOT be
+    /// flagged self-configuring, and each self-configuring channel must
+    /// declare a config marker field for a clear is-it-configured check —
+    /// this is what lets `cron_scheduler::deliver_response` skip its
+    /// "no bot token configured" fail-closed check for these four channels
+    /// instead of treating a fully-configured Google Chat / Teams channel as
+    /// unset (same silent-drop family as the `create_sender` arms above,
+    /// one step earlier in the call chain).
+    #[test]
+    fn self_configuring_channels_are_exactly_the_multi_field_credential_set() {
         assert!(sender_self_configures("wecom"));
         assert!(sender_self_configures("dingtalk"));
+        assert!(sender_self_configures("googlechat"));
+        assert!(sender_self_configures("teams"));
         for ch in [
             "telegram", "line", "discord", "slack", "whatsapp", "feishu", "webchat", "",
             // anchored matching: no substring surprises
-            "wecom2", "xdingtalk",
+            "wecom2", "xdingtalk", "xgooglechat", "teams2",
         ] {
             assert!(!sender_self_configures(ch), "{ch} must not be self-configuring");
         }
 
         assert_eq!(self_config_marker_field("wecom"), Some("wecom_corp_secret"));
         assert_eq!(self_config_marker_field("dingtalk"), Some("dingtalk_app_secret"));
+        assert_eq!(
+            self_config_marker_field("googlechat"),
+            Some("googlechat_service_account_json")
+        );
+        assert_eq!(self_config_marker_field("teams"), Some("teams_app_password"));
         assert_eq!(self_config_marker_field("telegram"), None);
     }
 
