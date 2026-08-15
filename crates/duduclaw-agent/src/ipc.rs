@@ -64,11 +64,13 @@ impl IpcBroker {
     }
 
     /// Validate that an agent ID is safe for filesystem use (no path traversal).
+    ///
+    /// WP-5B (2026-08): this was a byte-for-byte duplicate of
+    /// [`duduclaw_core::is_valid_agent_id`] (`duduclaw-agent` already depends
+    /// on `duduclaw-core` for other helpers, so no new cross-crate dependency
+    /// is introduced by delegating). Now the single authoritative copy.
     fn is_valid_agent_id(s: &str) -> bool {
-        !s.is_empty()
-            && s.len() <= 64
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        duduclaw_core::is_valid_agent_id(s)
     }
 
     /// Send an IPC message from one agent to another.

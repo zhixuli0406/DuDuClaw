@@ -1941,13 +1941,13 @@ fn is_valid_federated_path(path: &str) -> bool {
 }
 
 /// Validate `agent_id` shape — alphanumeric + dash + underscore, ≤ 64 chars.
-/// Matches the gateway's `is_valid_agent_id` checks (review C3).
+///
+/// WP-5B (2026-08): this was a byte-for-byte duplicate of
+/// [`duduclaw_core::is_valid_agent_id`] (`duduclaw-memory` already depends on
+/// `duduclaw-core` for other helpers, so no new cross-crate dependency is
+/// introduced by delegating). Now the single authoritative copy.
 fn is_valid_federated_agent_id(id: &str) -> bool {
-    if id.is_empty() || id.len() > 64 {
-        return false;
-    }
-    id.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    duduclaw_core::is_valid_agent_id(id)
 }
 
 // SQLite `datetime('now')` returns "YYYY-MM-DD HH:MM:SS" without a timezone —

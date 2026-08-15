@@ -57,12 +57,21 @@ pub fn key_path(agent_id: &str, key_dir: &Path) -> PathBuf {
     key_dir.join(format!("{agent_id}.key"))
 }
 
+/// WP-5B (2026-08): previously a hand-rolled duplicate of the same character
+/// class as [`duduclaw_core::is_valid_agent_id`] but with a 128-char cap
+/// instead of 64. Git history shows the 128 was never deliberate — this file
+/// was introduced whole-cloth in the RFC-23 redaction feature (2026-05-14)
+/// and never touched again, with no commit message, comment, or design doc
+/// explaining the wider bound. Every caller (`vault::store` /
+/// `RedactionManager::agent_key`) passes the same `agent_id` used everywhere
+/// else on the platform, which is itself capped at 64 chars at creation time
+/// by `is_valid_new_agent_id` — so no vault key file can legitimately have
+/// ever been minted with an agent_id longer than 64 chars, and tightening
+/// this bound carries no migration risk. Delegates to
+/// [`duduclaw_core::is_valid_agent_id`] (`duduclaw-redaction` already depends
+/// on `duduclaw-core`), the single authoritative "safe for path/log" check.
 fn is_safe_agent_id(agent_id: &str) -> bool {
-    !agent_id.is_empty()
-        && agent_id.len() <= 128
-        && agent_id
-            .bytes()
-            .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_'))
+    duduclaw_core::is_valid_agent_id(agent_id)
 }
 
 #[cfg(unix)]
@@ -117,6 +126,21 @@ mod tests {
         assert!(load_or_generate("../etc/passwd", tmp.path()).is_err());
         assert!(load_or_generate("", tmp.path()).is_err());
         assert!(load_or_generate("agent with space", tmp.path()).is_err());
+    }
+
+    /// WP-5B: `is_safe_agent_id` now delegates to
+    /// `duduclaw_core::is_valid_agent_id`, tightening the length cap from
+    /// 128 to 64. A legitimate platform agent id is always ≤64 chars
+    /// (enforced at creation by `is_valid_new_agent_id`), so this is a
+    /// behavior change only for ids that could never have been minted
+    /// through the normal agent-creation path.
+    #[test]
+    fn agent_id_length_cap_matches_core() {
+        let tmp = TempDir::new().unwrap();
+        let id_64 = "a".repeat(64);
+        let id_65 = "a".repeat(65);
+        assert!(load_or_generate(&id_64, tmp.path()).is_ok());
+        assert!(load_or_generate(&id_65, tmp.path()).is_err());
     }
 
     #[cfg(unix)]

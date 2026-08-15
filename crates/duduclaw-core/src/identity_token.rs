@@ -241,11 +241,17 @@ impl IdentityVerdict {
 
 /// The sentinel caller id substituted for a rejected claim.
 ///
-/// Deliberately not a valid agent id (`is_valid_agent_id` forbids `_`), so it
-/// matches no agent directory, is no one's ancestor, shares no department, and
-/// is not in the system-sender allowlist — every WP21 gate therefore denies it
-/// without any gate needing to know this constant exists. That is the
-/// fail-closed property: a new gate written later inherits it for free.
+/// WP-5B (2026-08): corrected a stale claim in this comment. `_` alone does
+/// NOT make an id invalid — [`crate::is_valid_agent_id`] has always allowed
+/// underscores (it accepts ASCII alphanumerics, `-`, and `_`); a value like
+/// `"__untrusted__"` would pass that check on its own. What actually keeps
+/// this sentinel from ever colliding with a real agent, being treated as
+/// anyone's ancestor, sharing a department, or landing in the system-sender
+/// allowlist is its **double-underscore prefix**: [`crate::is_reserved_agent_id`]
+/// (in `delegation_policy`) reserves any id starting with `__`, and every
+/// WP21 gate denies reserved ids without needing to know this constant
+/// exists. That is the fail-closed property: a new gate written later
+/// inherits it for free.
 pub const UNTRUSTED_AGENT_ID: &str = "__untrusted__";
 
 /// Verify the claimed identity in the current process environment.

@@ -12517,6 +12517,13 @@ fn detect_claimed_authors_in_wiki(content: &str) -> Vec<String> {
 /// `is_valid_agent_id`-equivalent shape: lowercase alphanumeric + `-`,
 /// 2..=64 chars).  Used as a filter before treating a markdown token as
 /// a claimed author.
+///
+/// WP-4I (2026-08) confirmed this is intentionally NOT unified with
+/// `duduclaw_core::is_valid_agent_id` / `is_valid_new_agent_id`: this is a
+/// markdown-authorship heuristic (also requires at least one alphabetic char,
+/// which neither core validator does), not a security gate. Do not use it to
+/// authorize or route based on agent identity — use the core validators for
+/// that.
 fn is_agent_id_shape(s: &str) -> bool {
     let len = s.len();
     if !(2..=64).contains(&len) {
