@@ -139,6 +139,8 @@ async fn personal_edition_keeps_ordinary_methods_working() {
         "approvals.list",
         "audit.unified_log",
         "security.status",
+        "security.credential_hygiene",
+        "security.credential_cleanup",
         "killswitch.get",
         "billing.usage",
         "wiki.pages",

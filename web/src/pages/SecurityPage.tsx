@@ -6,6 +6,7 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
 import { AdvancedSection, ConfirmDialog } from '@/components/settings/controls';
 import { ChipEditor } from '@/components/shared/ChipEditor';
+import { CredentialHygienePanel } from '@/components/CredentialHygienePanel';
 import { toast, formatError } from '@/lib/toast';
 import {
   Card,
@@ -124,6 +125,13 @@ export function SecurityPage() {
           </>
         )}
       </div>
+
+      {/* Credential hygiene (WP-K) — visible to every edition. The 2026-08-15
+          incident (a plaintext oauth_token sitting next to its already-
+          authoritative _enc twin in [[accounts]]) is exactly as relevant to a
+          single-owner Personal install as to an Enterprise one, so unlike the
+          cards below it does not fold behind the Personal AdvancedSection. */}
+      <CredentialHygienePanel onGoToAccounts={() => navigate('/manage/accounts')} />
 
       {isPersonal ? (
         // Personal: everything left (audit log + kill switch) is an

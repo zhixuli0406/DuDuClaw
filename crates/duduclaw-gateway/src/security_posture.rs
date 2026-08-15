@@ -108,6 +108,167 @@ fn any_agent_hard_budget(home_dir: &Path) -> bool {
     false
 }
 
+// ── WP-K: dashboard "credential hygiene" friendly cleanup surface ──────────
+//
+// `has_plaintext_secret` above answers one boolean ("is anything in
+// config.toml plaintext-looking?") for the posture score. The dashboard needs
+// something an operator can *act* on: which field, and is it safe to
+// auto-remove. That safety question is exactly the 2026-08-15 incident
+// (commercial/docs/DESIGN-credentials-doctrine-2026-08.md §1.5): a plaintext
+// `[[accounts]].oauth_token` sat next to its already-authoritative
+// `oauth_token_enc` twin with nothing ever cleaning it up, and — separately —
+// `system.config`'s array-of-tables masking gap meant it could be read back
+// verbatim. The functions below split "plaintext with a confirmed encrypted
+// twin" (pure residue, safe to delete — the twin is what every read path
+// already uses) from "plaintext with no twin" (an unencrypted secret this
+// pass reports but never touches, since guessing how to encrypt an unfamiliar
+// field risks writing a corrupt config.toml).
+
+/// One plaintext-credential finding. Carries a TOML *path* only — never the
+/// value, never even a masked fragment of one (coding convention #4 fail-closed
+/// security gates + this endpoint's whole reason to exist is to be safe to
+/// render on the dashboard).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CredentialFinding {
+    /// Dotted/bracket TOML path to the plaintext field, e.g.
+    /// `"accounts[0].oauth_token"`.
+    pub path: String,
+    /// True when a `<field>_enc` twin already exists alongside it — pure
+    /// residue, safe for `strip_twin_residue` to remove. False means this
+    /// plaintext value has no encrypted counterpart yet; it is reported for
+    /// manual handling only and `strip_twin_residue` will not touch it.
+    pub has_enc_twin: bool,
+    pub severity: Severity,
+}
+
+/// A value under a `*key*`/`*token*`/`*secret*`/`*password*` field name that
+/// looks like a raw provider secret rather than DuDuClaw's own AES/base64
+/// ciphertext. Deliberately the same conservative prefix heuristic as
+/// [`has_plaintext_secret`] (kept as a separate, untouched function so its
+/// existing behavior/tests stay byte-identical) — used here only for the
+/// no-twin case, where twin-existence isn't available as a stronger signal.
+fn looks_like_raw_secret(s: &str) -> bool {
+    s.starts_with("sk-") || s.starts_with("ghp_") || s.starts_with("xoxb-") || s.starts_with("AKIA")
+}
+
+/// Field-name heuristic shared by [`find_plaintext_secrets`] and
+/// [`strip_twin_residue`]: secret-shaped key, excluding `_enc` fields
+/// themselves (those ARE the ciphertext, never a finding).
+fn is_secret_key_name(k: &str) -> bool {
+    let lk = k.to_lowercase();
+    (lk.contains("key") || lk.contains("token") || lk.contains("secret") || lk.contains("password"))
+        && !lk.ends_with("_enc")
+}
+
+/// Walk the entire config tree (any depth, including arrays-of-tables like
+/// `[[accounts]]`) and report every plaintext credential field: either (a) it
+/// has a confirmed `_enc` twin — pure residue — or (b) it has no twin but
+/// looks like a raw provider key. Read-only; never mutates.
+pub fn find_plaintext_secrets(table: &toml::Table) -> Vec<CredentialFinding> {
+    fn walk(t: &toml::Table, path: &str, out: &mut Vec<CredentialFinding>) {
+        for (k, v) in t.iter() {
+            let field_path = if path.is_empty() {
+                k.clone()
+            } else {
+                format!("{path}.{k}")
+            };
+            if is_secret_key_name(k) {
+                if let Some(s) = v.as_str() {
+                    if !s.is_empty() {
+                        let twin_key = format!("{k}_enc");
+                        let has_enc_twin = t
+                            .get(&twin_key)
+                            .and_then(|tv| tv.as_str())
+                            .map(|tv| !tv.is_empty())
+                            .unwrap_or(false);
+                        if has_enc_twin || looks_like_raw_secret(s) {
+                            out.push(CredentialFinding {
+                                path: field_path.clone(),
+                                has_enc_twin,
+                                severity: Severity::High,
+                            });
+                        }
+                    }
+                }
+            }
+            match v {
+                toml::Value::Table(sub) => walk(sub, &field_path, out),
+                toml::Value::Array(arr) => {
+                    for (i, item) in arr.iter().enumerate() {
+                        if let toml::Value::Table(sub) = item {
+                            walk(sub, &format!("{field_path}[{i}]"), out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(table, "", &mut out);
+    out
+}
+
+/// Remove plaintext keys that have a confirmed `_enc` twin — the ONLY case
+/// this pass auto-cleans. Fields with no twin are left completely untouched
+/// (see module docs above for why). Returns the TOML paths removed, for audit
+/// logging — never the values. Idempotent: calling this again on the result
+/// returns an empty vec.
+pub fn strip_twin_residue(table: &mut toml::Table) -> Vec<String> {
+    fn walk(t: &mut toml::Table, path: &str, removed: &mut Vec<String>) {
+        let doomed: Vec<String> = t
+            .iter()
+            .filter_map(|(k, v)| {
+                if !is_secret_key_name(k) {
+                    return None;
+                }
+                let plaintext_present = v.as_str().map(|s| !s.is_empty()).unwrap_or(false);
+                if !plaintext_present {
+                    return None;
+                }
+                let twin_key = format!("{k}_enc");
+                let has_twin = t
+                    .get(&twin_key)
+                    .and_then(|tv| tv.as_str())
+                    .map(|tv| !tv.is_empty())
+                    .unwrap_or(false);
+                has_twin.then(|| k.clone())
+            })
+            .collect();
+        for k in doomed {
+            t.remove(&k);
+            removed.push(if path.is_empty() {
+                k
+            } else {
+                format!("{path}.{k}")
+            });
+        }
+        // Recurse into whatever remains (nested tables + arrays-of-tables).
+        let keys: Vec<String> = t.keys().cloned().collect();
+        for k in keys {
+            let child_path = if path.is_empty() {
+                k.clone()
+            } else {
+                format!("{path}.{k}")
+            };
+            match t.get_mut(&k) {
+                Some(toml::Value::Table(sub)) => walk(sub, &child_path, removed),
+                Some(toml::Value::Array(arr)) => {
+                    for (i, item) in arr.iter_mut().enumerate() {
+                        if let toml::Value::Table(sub) = item {
+                            walk(sub, &format!("{child_path}[{i}]"), removed);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut removed = Vec::new();
+    walk(table, "", &mut removed);
+    removed
+}
+
 /// Compute the security posture from the live home directory.
 pub fn compute_posture(home_dir: &Path) -> PostureReport {
     let cfg = read_config(home_dir);
@@ -260,5 +421,95 @@ mod tests {
         std::fs::write(ad.join("agent.toml"), "[budget]\nhard_stop = true\nmonthly_limit_cents = 100\n").unwrap();
         let r = compute_posture(dir.path());
         assert!(r.checks.iter().find(|c| c.id == "budget_hard_stop").unwrap().passed);
+    }
+
+    // ── WP-K: find_plaintext_secrets / strip_twin_residue ──────────────────
+
+    #[test]
+    fn hygiene_clean_config_has_no_findings() {
+        let toml_str = r#"
+            [gateway]
+            auto_update = true
+
+            [[accounts]]
+            id = "a1"
+            oauth_token_enc = "Y2lwaGVydGV4dA=="
+        "#;
+        let table: toml::Table = toml_str.parse().unwrap();
+        let findings = find_plaintext_secrets(&table);
+        assert!(
+            findings.is_empty(),
+            "encrypted-only account must not be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn hygiene_detects_twin_residue_with_array_index_path() {
+        let toml_str = r#"
+            [[accounts]]
+            id = "a1"
+            oauth_token = "sk-ant-oat01-PLAINTEXTLEAK"
+            oauth_token_enc = "Y2lwaGVydGV4dA=="
+        "#;
+        let table: toml::Table = toml_str.parse().unwrap();
+        let findings = find_plaintext_secrets(&table);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, "accounts[0].oauth_token");
+        assert!(findings[0].has_enc_twin);
+        assert_eq!(findings[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn hygiene_flags_no_twin_secret_without_marking_it_cleanable() {
+        let toml_str = r#"
+            [providers]
+            anthropic_api_key = "sk-ant-api03-nolongertwin"
+        "#;
+        let table: toml::Table = toml_str.parse().unwrap();
+        let findings = find_plaintext_secrets(&table);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, "providers.anthropic_api_key");
+        assert!(!findings[0].has_enc_twin);
+
+        // Cleanup must never touch a no-twin field — this pass only removes
+        // confirmed residue.
+        let mut mutable = table.clone();
+        let removed = strip_twin_residue(&mut mutable);
+        assert!(removed.is_empty());
+        assert!(
+            mutable
+                .get("providers")
+                .and_then(|p| p.get("anthropic_api_key"))
+                .is_some(),
+            "no-twin field must survive strip_twin_residue untouched"
+        );
+    }
+
+    #[test]
+    fn strip_twin_residue_removes_plaintext_keeps_enc_and_is_idempotent() {
+        let toml_str = r#"
+            [[accounts]]
+            id = "a1"
+            oauth_token = "sk-ant-oat01-PLAINTEXTLEAK"
+            oauth_token_enc = "Y2lwaGVydGV4dA=="
+        "#;
+        let mut table: toml::Table = toml_str.parse().unwrap();
+        let removed = strip_twin_residue(&mut table);
+        assert_eq!(removed, vec!["accounts[0].oauth_token".to_string()]);
+
+        let accounts = table.get("accounts").unwrap().as_array().unwrap();
+        let acct = accounts[0].as_table().unwrap();
+        assert!(
+            acct.get("oauth_token").is_none(),
+            "plaintext key must be removed, not blanked"
+        );
+        assert_eq!(
+            acct.get("oauth_token_enc").and_then(|v| v.as_str()),
+            Some("Y2lwaGVydGV4dA==")
+        );
+
+        // Idempotent: nothing left to remove on a second pass.
+        let removed_again = strip_twin_residue(&mut table);
+        assert!(removed_again.is_empty());
     }
 }
