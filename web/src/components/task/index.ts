@@ -13,5 +13,8 @@ export { TaskChangesList, TaskChangesPanel } from './TaskChangesPanel';
 // coming 成品畫廊 feeds it a different row source); `TaskArtifactsPanel` adds
 // the per-task fetch.
 export { TaskArtifactsList, TaskArtifactsPanel, artifactIcon } from './TaskArtifactsPanel';
+// I-2a: the 「檔案」tab — same `attachments/` provenance data as `/files`
+// (I-2b), filtered to one task. `TaskFilesList` is pure presentation.
+export { TaskFilesList, TaskFilesPanel, type TaskFileRow } from './TaskFilesPanel';
 export { TaskDoneBurst } from './TaskDoneBurst';
 export { TASK_DONE_XP, celebrateTaskDone } from './task-celebrate';
