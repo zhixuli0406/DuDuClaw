@@ -442,6 +442,15 @@ fn apply_capabilities_to_table(
         section.insert("recording".into(), toml::Value::Boolean(v));
         changes.push(format!("capabilities.recording = {v}"));
     }
+    // ── git_credentials (bool) — opt-in hand-off of the operator's own
+    // SSH/GPG identity to this agent's spawned CLI subprocess (WP-10A).
+    // Default false ⇒ `duduclaw_core::spawn_env`'s WP-8B credential scrub
+    // applies unchanged. Dashboard-facing wiring only (this WP); the actual
+    // spawn-time env grant + audit logging already exist from WP-10A.
+    if let Some(v) = cap.get("git_credentials").and_then(|v| v.as_bool()) {
+        section.insert("git_credentials".into(), toml::Value::Boolean(v));
+        changes.push(format!("capabilities.git_credentials = {v}"));
+    }
     // ── autonomy_level (string) — how much the autonomous goal loop may
     // drive this agent on its own (`goal_loop::AutonomyLevel`). Not a typed
     // `CapabilitiesConfig` field — read straight from this raw TOML key by
@@ -34808,6 +34817,46 @@ policies:
         let json = serde_json::to_value(duduclaw_core::types::CapabilitiesConfig::default())
             .expect("serialize");
         assert_eq!(json.get("recording"), Some(&serde_json::Value::Bool(false)));
+    }
+
+    // ── git_credentials (dashboard toggle, WP-10A follow-up) ──────────────────
+
+    #[test]
+    fn cap_git_credentials_round_trips_into_capabilities_config() {
+        let mut table = toml::Table::new();
+        let changes = apply_capabilities_to_table(
+            &mut table,
+            &json!({ "capabilities": { "git_credentials": true } }),
+        )
+        .expect("apply");
+        let cap = table.get("capabilities").unwrap().as_table().unwrap();
+        assert_eq!(cap.get("git_credentials").unwrap().as_bool(), Some(true));
+        assert!(changes.iter().any(|c| c.contains("git_credentials = true")));
+        // Must deserialize back into a real CapabilitiesConfig.
+        let cfg: duduclaw_core::types::CapabilitiesConfig = cap
+            .clone()
+            .try_into()
+            .expect("deserializes into CapabilitiesConfig");
+        assert!(cfg.git_credentials);
+
+        // Explicit false is also written (operator turning it back off).
+        let mut t2 = toml::Table::new();
+        let changes2 = apply_capabilities_to_table(
+            &mut t2,
+            &json!({ "capabilities": { "git_credentials": false } }),
+        )
+        .expect("apply");
+        assert!(changes2.iter().any(|c| c.contains("git_credentials = false")));
+
+        // Serialization of CapabilitiesConfig carries `git_credentials` so
+        // agents.inspect exposes it to the dashboard (the switch must be able
+        // to reflect the agent's real on-disk state, not just write it).
+        let json = serde_json::to_value(duduclaw_core::types::CapabilitiesConfig::default())
+            .expect("serialize");
+        assert_eq!(
+            json.get("git_credentials"),
+            Some(&serde_json::Value::Bool(false))
+        );
     }
 
     // ── autonomy_level (goal-loop dashboard editor) ───────────────────────────

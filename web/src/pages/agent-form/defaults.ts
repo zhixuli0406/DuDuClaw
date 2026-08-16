@@ -126,6 +126,7 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
   policy: [],
   os_native: false,
   recording: false,
+  git_credentials: false,
   // Conservative default — mirrors the gateway's fail-safe fallback
   // (`goal_loop::AutonomyLevel::for_agent`: missing/unparseable ⇒ Approver),
   // so an agent this form has never touched behaves the same before and

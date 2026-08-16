@@ -4753,5 +4753,8 @@
   "goals.filter.showArchived": "顯示已封存",
   "goals.section.archived": "已封存",
   "goals.section.finishedEmpty": "還沒有已結束的任務。",
-  "goals.section.archivedEmpty": "還沒有已封存的任務。"
+  "goals.section.archivedEmpty": "還沒有已封存的任務。",
+  "agents.cap.gitCredentials": "允許使用 Git／GPG 憑證",
+  "agents.cap.gitCredentials.help": "允許員工的指令使用你本機的 SSH 金鑰推送 git、GPG 金鑰簽署 commit。",
+  "agents.edit.dangerConfirm.gitCredentials": "開啟後，這位 AI 員工執行的指令能用你本機的 SSH 金鑰推送 git、用你的 GPG 金鑰簽章，等同你本人的推送／簽章權限，不只是 git 而已。只給你信任、且確實需要 git push／簽章的員工開啟。"
 }

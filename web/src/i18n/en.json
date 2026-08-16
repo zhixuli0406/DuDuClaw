@@ -4753,5 +4753,8 @@
   "goals.filter.showArchived": "Show archived",
   "goals.section.archived": "Archived",
   "goals.section.finishedEmpty": "No finished tasks yet.",
-  "goals.section.archivedEmpty": "No archived tasks yet."
+  "goals.section.archivedEmpty": "No archived tasks yet.",
+  "agents.cap.gitCredentials": "Allow Git/GPG credentials",
+  "agents.cap.gitCredentials.help": "Let this staffer's commands push git over your local SSH key and sign commits with your GPG key.",
+  "agents.edit.dangerConfirm.gitCredentials": "Once enabled, commands this AI employee runs can push git over your local SSH key and sign commits with your GPG key, effectively your own push/signing identity, not just git. Only grant this to a staffer you trust who genuinely needs git push or GPG signing."
 }
