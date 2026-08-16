@@ -35,6 +35,7 @@ pub mod agent_binding;
 pub mod agent_hook_installer;
 pub mod auth;
 pub mod channel_alerts;
+pub mod channel_capabilities;
 pub mod channel_format;
 pub mod channel_reply;
 pub mod markdown_render;

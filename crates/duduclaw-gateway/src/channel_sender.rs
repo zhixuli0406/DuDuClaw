@@ -261,6 +261,17 @@ pub trait ChannelSender: Send + Sync {
         filename: &str,
         _mime: &str,
     ) -> Result<(), ChannelSendError> {
+        // WP-9B: this default only fires when the concrete sender has no
+        // real `send_document` override — i.e. the channel genuinely has no
+        // native file-upload API wired. Previously this degraded to a text
+        // notice with zero trace, indistinguishable from an unimplemented
+        // override that SHOULD exist. Log it against the capability table so
+        // "known unsupported" and "someone forgot to override" stay visible.
+        crate::channel_capabilities::log_unsupported(
+            self.channel_type(),
+            crate::channel_capabilities::Capability::FileUpload,
+            "send_document: no native override, degrading to text notice",
+        );
         let kb = data.len() / 1024;
         self.send_text(&format!(
             "📎 已生成檔案「{filename}」（約 {kb} KB）。此通道不支援直接傳送檔案，請至 Dashboard 檔案面板下載。"
@@ -1338,6 +1349,11 @@ impl ChannelSender for GoogleChatSender {
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
         // Chat attachment upload needs a multi-step media API; deliver the
         // caption + a size note (fail-soft, consistent with LINE's fallback).
+        crate::channel_capabilities::log_unsupported(
+            self.channel_type(),
+            crate::channel_capabilities::Capability::PhotoUpload,
+            "send_photo: no native image-upload API, degrading to text notice",
+        );
         let msg = format!(
             "{caption}\n(📸 截圖已擷取，共 {} KB — Google Chat 附件上傳尚未支援)",
             png_data.len() / 1024
@@ -1389,6 +1405,11 @@ impl ChannelSender for TeamsSender {
     }
 
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
+        crate::channel_capabilities::log_unsupported(
+            self.channel_type(),
+            crate::channel_capabilities::Capability::PhotoUpload,
+            "send_photo: no native image-upload API, degrading to text notice",
+        );
         let msg = format!(
             "{caption}\n(📸 截圖已擷取，共 {} KB — Teams 圖片附件上傳尚未支援)",
             png_data.len() / 1024
@@ -1491,6 +1512,11 @@ impl ChannelSender for DingTalkSender {
     async fn send_photo(&self, png_data: &[u8], caption: &str) -> Result<(), ChannelSendError> {
         // sessionWebhook has no binary upload; deliver the caption + a size
         // note (fail-soft, consistent with Google Chat / Teams fallback).
+        crate::channel_capabilities::log_unsupported(
+            self.channel_type(),
+            crate::channel_capabilities::Capability::PhotoUpload,
+            "send_photo: sessionWebhook has no binary upload, degrading to text notice",
+        );
         let msg = format!(
             "{caption}\n(📸 截圖已擷取，共 {} KB — 釘釘圖片附件上傳尚未支援)",
             png_data.len() / 1024

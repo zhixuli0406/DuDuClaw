@@ -176,7 +176,24 @@ pub fn typing_guard_for(
             let api_base = format!("https://api.telegram.org/bot{token}");
             Some(telegram_typing(client, api_base, cid, tid))
         }
-        _ => None,
+        _ => {
+            // WP-9B: this helper is deliberately narrower than the channel
+            // capability table — several channels (discord/line/whatsapp/
+            // slack/teams) DO have a typing API (see the module doc table
+            // above and `crate::channel_capabilities`), but their live
+            // handlers resolve the extra per-message context (thread_ts,
+            // inbound message id, …) this cross-cutting cron/dispatch path
+            // doesn't have. `debug!` (not `warn!`) because this path runs on
+            // every dispatch tick for every channel — a `warn!` here would
+            // be log spam for expected, by-design degradation rather than a
+            // signal worth alerting on.
+            crate::channel_capabilities::debug_unsupported(
+                channel_type,
+                crate::channel_capabilities::Capability::TypingIndicator,
+                "typing_guard_for: not wired for this channel's task-dispatch path",
+            );
+            None
+        }
     }
 }
 
