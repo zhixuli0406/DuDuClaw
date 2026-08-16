@@ -2841,12 +2841,9 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path, caller: &str) -> 
         });
     }
 
-    // Validate cron expression before persisting.
-    let normalised_cron = if cron.split_whitespace().count() == 5 {
-        format!("0 {cron}")
-    } else {
-        cron.to_string()
-    };
+    // Validate cron expression before persisting — through the shared
+    // normaliser so validation reads day-of-week exactly like the scheduler.
+    let normalised_cron = duduclaw_core::cron_tz::normalise_cron(cron);
     if normalised_cron.parse::<cron::Schedule>().is_err() {
         return serde_json::json!({
             "content": [{"type": "text", "text": format!("Error: invalid cron expression: {cron}")}],
@@ -2999,13 +2996,15 @@ async fn handle_schedule_task(params: &Value, home_dir: &Path, caller: &str) -> 
 ///
 /// ## Day-of-week convention
 ///
-/// The `cron` crate (0.15) follows the **Quartz** convention, NOT the classic
-/// Unix crontab one: `1` = Sunday … `7` = Saturday, and `0` is not a valid
-/// day. Reading it as Unix (`0` = Sunday) shifts every weekday by one and
-/// produces a confident, wrong sentence — the exact failure this function was
-/// written to avoid. `0` and anything above `7` therefore return `None` so the
-/// receipt falls back to the raw expression instead of guessing.
-/// `humanize_cron_matches_the_cron_crate` pins this against the real scheduler.
+/// User-facing expressions follow the classic Unix crontab convention —
+/// `0` and `7` = Sunday, `1` = Monday … `6` = Saturday. The `cron` crate
+/// itself is Quartz-flavoured (`1` = Sunday), but every parse site routes
+/// through `duduclaw_core::cron_tz::normalise_cron`, which translates the
+/// day-of-week field at parse time, so this function must read the *raw*
+/// expression exactly as a crontab man page would. Anything above `7`
+/// returns `None` so the receipt falls back to the raw expression instead
+/// of guessing. `humanize_cron_matches_the_cron_crate` pins this against
+/// the real scheduler (crate + normaliser together).
 fn humanize_cron_zh(cron: &str) -> Option<String> {
     let f: Vec<&str> = cron.split_whitespace().collect();
     let f: &[&str] = match f.len() {
@@ -3023,8 +3022,8 @@ fn humanize_cron_zh(cron: &str) -> Option<String> {
     }
 
     // 每小時 — "M * * * *". Only when the day-of-week is unrestricted:
-    // "0 * * * 2" fires hourly *on Mondays only*, so calling it "每小時" would
-    // promise the user 24×7 coverage they are not getting.
+    // "0 * * * 2" fires hourly *on Tuesdays only*, so calling it "每小時"
+    // would promise the user 24×7 coverage they are not getting.
     if hour == "*" {
         if dow != "*" {
             return None;
@@ -3044,13 +3043,15 @@ fn humanize_cron_zh(cron: &str) -> Option<String> {
     match dow {
         "*" => Some(format!("每天 {time}")),
         d => {
-            // Quartz: 1 = Sunday … 7 = Saturday.
+            // Unix crontab: 0 and 7 = Sunday, 1 = Monday … 6 = Saturday
+            // (normalise_cron translates to the crate's Quartz ordinals at
+            // parse time, so the raw expression reads as crontab).
             let names = ["日", "一", "二", "三", "四", "五", "六"];
             let idx: usize = d.parse().ok()?;
-            if !(1..=7).contains(&idx) {
+            if idx > 7 {
                 return None;
             }
-            let name = names[idx - 1];
+            let name = names[idx % 7];
             Some(format!("每週{name} {time}"))
         }
     }
@@ -3203,13 +3204,10 @@ async fn handle_update_cron_task(params: &Value, home_dir: &Path) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or(&existing.task);
 
-    // Validate cron expression if changed.
+    // Validate cron expression if changed — same shared normaliser as the
+    // scheduler and creation path.
     if new_cron != existing.cron {
-        let normalised = if new_cron.split_whitespace().count() == 5 {
-            format!("0 {new_cron}")
-        } else {
-            new_cron.to_string()
-        };
+        let normalised = duduclaw_core::cron_tz::normalise_cron(new_cron);
         if normalised.parse::<cron::Schedule>().is_err() {
             return tool_error(&format!("invalid cron expression: {new_cron}"));
         }
@@ -16659,12 +16657,14 @@ mod tests {
     /// **The weekday claim is checked against the scheduler, not against my
     /// reading of it.** Asserting `"0 9 * * 1" == "每週一"` would just restate
     /// the assumption under test; the `cron` crate is Quartz-flavoured
-    /// (1 = Sunday), so that assumption was wrong and the receipt confidently
-    /// named the wrong day.
+    /// (1 = Sunday) while user-facing expressions are Unix crontab
+    /// (0/7 = Sunday) translated by `normalise_cron` at parse time — a
+    /// mismatch on either side names the wrong day with full confidence.
     ///
-    /// Here the oracle is `cron::Schedule` itself: compute the next actual
-    /// fire time the way `CronScheduler` does, read the weekday and clock off
-    /// it, and require the zh-TW sentence to agree.
+    /// Here the oracle is the real pipeline: normalise exactly the way
+    /// `CronScheduler` does, parse with `cron::Schedule`, read the weekday
+    /// and clock off the next actual fire, and require the zh-TW sentence
+    /// to agree.
     #[test]
     fn humanize_cron_matches_the_cron_crate() {
         use chrono::{Datelike, Timelike};
@@ -16682,10 +16682,10 @@ mod tests {
             }
         }
 
-        for dow in 1..=7u32 {
+        for dow in 0..=7u32 {
             let expr = format!("0 9 * * {dow}");
-            // Same 5→6 field normalisation `handle_schedule_task` applies.
-            let schedule: cron::Schedule = format!("0 {expr}")
+            // Same normalisation `handle_schedule_task` applies.
+            let schedule: cron::Schedule = duduclaw_core::cron_tz::normalise_cron(&expr)
                 .parse()
                 .unwrap_or_else(|e| panic!("{expr} must parse: {e}"));
 
@@ -16726,12 +16726,13 @@ mod tests {
     }
 
     /// Reviewer counter-examples, kept as their own case so a regression names
-    /// itself. `0` is not a valid Quartz day-of-week, and an hourly expression
-    /// pinned to one weekday is not "每小時".
+    /// itself. Day-of-week above `7` has no crontab meaning, and an hourly
+    /// expression pinned to one weekday is not "每小時".
     #[test]
     fn humanize_cron_rejects_the_shapes_it_would_describe_wrongly() {
-        // Unix-crontab "0 = Sunday" is not valid here — fall back, don't guess.
-        assert_eq!(humanize_cron_zh("0 9 * * 0"), None);
+        // Unix crontab: both 0 and 7 are Sunday; 8 is nothing — fall back.
+        assert_eq!(humanize_cron_zh("0 9 * * 0").as_deref(), Some("每週日 09:00"));
+        assert_eq!(humanize_cron_zh("0 9 * * 7").as_deref(), Some("每週日 09:00"));
         assert_eq!(humanize_cron_zh("0 9 * * 8"), None);
         // Hourly *restricted to one weekday* must not be sold as plain hourly.
         assert_eq!(humanize_cron_zh("0 * * * 2"), None);

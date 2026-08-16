@@ -778,15 +778,14 @@ fn resolve_task_cron_tz(task: &CronTaskRow) -> Option<chrono_tz::Tz> {
     }
 }
 
-/// Normalise a cron expression to 6-field format (with seconds). If the
-/// expression has 5 fields, prepend "0" for seconds.
+/// Normalise a cron expression to 6-field format (with seconds) and
+/// translate numeric day-of-week from the Unix crontab convention
+/// (`0`/`7` = Sunday, `1-5` = Mon–Fri) to the `cron` crate's Quartz
+/// ordinals (`1` = Sunday). Delegates to the shared
+/// [`duduclaw_core::cron_tz::normalise_cron`] so the scheduler, heartbeat,
+/// and MCP validation all read expressions identically.
 pub fn normalise_cron(expr: &str) -> String {
-    let fields: Vec<&str> = expr.split_whitespace().collect();
-    if fields.len() == 5 {
-        format!("0 {expr}")
-    } else {
-        expr.to_string()
-    }
+    duduclaw_core::cron_tz::normalise_cron(expr)
 }
 
 /// Start the cron scheduler as a background task. Returns the join handle

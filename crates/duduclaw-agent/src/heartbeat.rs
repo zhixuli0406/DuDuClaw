@@ -1165,17 +1165,14 @@ async fn execute_proactive_check(
 
 // ── Helpers ───────────────────────────────────────────────────
 
-/// Parse a cron expression, normalising 5-field to 6-field (prepend seconds=0).
+/// Parse a cron expression via the shared normaliser (5→6 field promotion
+/// plus Unix→Quartz day-of-week translation, same as the cron scheduler).
 fn parse_cron(expr: &str) -> Option<Schedule> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let normalised = if trimmed.split_whitespace().count() == 5 {
-        format!("0 {trimmed}")
-    } else {
-        trimmed.to_string()
-    };
+    let normalised = duduclaw_core::cron_tz::normalise_cron(trimmed);
     match normalised.parse::<Schedule>() {
         Ok(s) => Some(s),
         Err(e) => {
