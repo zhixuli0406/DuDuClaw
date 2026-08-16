@@ -29,7 +29,7 @@
   "activationEvents": [],
   "contributes": {
     "viewsContainers": {
-      "activitybar": [
+      "secondarySidebar": [
         {
           "id": "duduclaw",
           "title": "DuDuClaw",
