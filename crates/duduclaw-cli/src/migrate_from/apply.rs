@@ -81,6 +81,71 @@ pub(super) async fn import_facts(
     }
 }
 
+/// Store one SPO-tagged Semantic memory fact with full temporal metadata
+/// (WP-9A — `claude-code` memory-shard / session-summary imports; the plain
+/// `import_facts` bag-of-strings helper above has no room for a triple).
+///
+/// Two invariants are enforced here, not left to the caller:
+/// - `meta.origin` is unconditionally forced to `"import"` (ceiling 0.7) —
+///   even if a caller passed something else, a migrated fact can never claim
+///   `agent_derived`/`user_direct` trust (I8 non-malleability, design R7).
+/// - `content` is run through the fail-closed injection scanner before any
+///   write; a hit is `SKIPPED(security)` and nothing reaches `memory.db`
+///   (design §3.4 — "不做「照樣匯入但標記」").
+pub(super) async fn store_import_memory(
+    engine: Option<&SqliteMemoryEngine>,
+    ctx: &Ctx,
+    report: &mut Report,
+    agent_id: &str,
+    label: &str,
+    content: &str,
+    tags: Vec<String>,
+    mut meta: duduclaw_memory::TemporalMeta,
+) {
+    let scan = duduclaw_security::input_guard::scan_input(
+        content,
+        duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+    );
+    if scan.blocked {
+        report.skipped(
+            "memory",
+            label,
+            format!(
+                "security: 偵測到注入風險 (risk {}, 規則 {})",
+                scan.risk_score,
+                scan.matched_rules.join("/")
+            ),
+        );
+        return;
+    }
+    if !ctx.apply {
+        report.imported("memory", label);
+        return;
+    }
+    let Some(eng) = engine else {
+        report.skipped("memory", label, "開啟 memory.db 失敗");
+        return;
+    };
+    let entry = MemoryEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: agent_id.to_string(),
+        content: content.to_string(),
+        timestamp: chrono::Utc::now(),
+        tags,
+        embedding: None,
+        layer: MemoryLayer::Semantic,
+        importance: 5.0,
+        access_count: 0,
+        last_accessed: None,
+        source_event: format!("migrate-from-{}", ctx.platform.as_str()),
+    };
+    meta.origin = Some("import".to_string());
+    match eng.store_temporal(agent_id, entry, meta).await {
+        Ok(_) => report.imported("memory", label),
+        Err(e) => report.skipped("memory", label, format!("寫入失敗: {e}")),
+    }
+}
+
 /// Import defensively-parsed cron jobs into the SQLite cron store.
 pub(super) async fn import_cron_jobs(
     ctx: &Ctx,
@@ -429,4 +494,79 @@ pub(super) fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()>
         }
     }
     Ok(())
+}
+
+/// A wiki page to write into an agent's `imported/<platform>/...` namespace
+/// (WP-9A — `claude_code.rs`'s CLAUDE.md → wiki mapping; the module had no
+/// wiki-writing helper before this).
+pub(super) struct ImportedWikiPage {
+    /// Path relative to the agent's `wiki/` dir, e.g.
+    /// `imported/claude-code/global/CLAUDE.md`. Must end in `.md`.
+    pub rel_path: String,
+    pub title: String,
+    /// Already includes the DATA-not-instructions banner — this function
+    /// does not add one, so callers must (mirrors `store_import_memory`,
+    /// which leaves content shaping to the caller too).
+    pub body: String,
+    pub tags: Vec<String>,
+    pub sources: Vec<String>,
+}
+
+/// Write one imported wiki page: `layer: context` (never enters the system
+/// prompt injection budget — `WikiLayer::auto_inject()` only admits
+/// Identity/Core), `trust: 0.3` (same ceiling as the `import` memory origin),
+/// `author: "import"`. Injection-scanned first (fail-closed, same discipline
+/// as `store_import_memory`); dry-run only records the plan.
+pub(super) fn import_wiki_page(ctx: &Ctx, report: &mut Report, agent_id: &str, page: &ImportedWikiPage) {
+    let scan = duduclaw_security::input_guard::scan_input(
+        &page.body,
+        duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+    );
+    if scan.blocked {
+        report.skipped(
+            "wiki",
+            &page.rel_path,
+            format!(
+                "security: 偵測到注入風險 (risk {}, 規則 {})",
+                scan.risk_score,
+                scan.matched_rules.join("/")
+            ),
+        );
+        return;
+    }
+    if !ctx.apply {
+        report.imported("wiki", &page.rel_path);
+        return;
+    }
+    let wiki_dir = ctx.home.join("agents").join(agent_id).join("wiki");
+    let store = duduclaw_memory::WikiStore::new(wiki_dir);
+    if let Err(e) = store.ensure_scaffold() {
+        report.skipped("wiki", &page.rel_path, format!("初始化 wiki 失敗: {e}"));
+        return;
+    }
+    let now = chrono::Utc::now();
+    let wp = duduclaw_memory::WikiPage {
+        path: page.rel_path.clone(),
+        title: page.title.clone(),
+        created: now,
+        updated: now,
+        tags: page.tags.clone(),
+        related: Vec::new(),
+        sources: page.sources.clone(),
+        author: Some("import".to_string()),
+        layer: duduclaw_memory::WikiLayer::Context,
+        trust: 0.3,
+        source_type: duduclaw_memory::SourceType::Unknown,
+        last_verified: None,
+        citation_count: 0,
+        error_signal_count: 0,
+        success_signal_count: 0,
+        do_not_inject: false,
+        body: page.body.clone(),
+    };
+    let content = duduclaw_memory::serialize_page(&wp);
+    match store.write_page_with_author(&page.rel_path, &content, "import") {
+        Ok(()) => report.imported("wiki", &page.rel_path),
+        Err(e) => report.skipped("wiki", &page.rel_path, format!("寫入失敗: {e}")),
+    }
 }

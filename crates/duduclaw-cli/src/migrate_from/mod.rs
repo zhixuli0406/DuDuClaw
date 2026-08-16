@@ -12,6 +12,8 @@
 //! Design spec: `commercial/docs/TODO-migrate-from-2026-07-11.md` (L3).
 
 mod apply;
+mod claude_code;
+mod claude_code_transcript;
 mod hermes;
 mod openclaw;
 mod paperclip;
@@ -33,6 +35,7 @@ pub(crate) enum Platform {
     OpenClaw,
     Hermes,
     Paperclip,
+    ClaudeCode,
 }
 
 impl Platform {
@@ -41,6 +44,7 @@ impl Platform {
             Platform::OpenClaw => "openclaw",
             Platform::Hermes => "hermes",
             Platform::Paperclip => "paperclip",
+            Platform::ClaudeCode => "claude-code",
         }
     }
 }
@@ -51,6 +55,15 @@ pub(crate) struct Ctx {
     pub platform: Platform,
     pub apply: bool,
     pub rename: bool,
+    /// Target agent id (`--agent`). Required for `claude-code`, which imports
+    /// into an existing agent rather than scaffolding a new one (WP-9A §8
+    /// pending-decision 3, option A: one `--agent`, no auto-created agents).
+    pub agent: Option<String>,
+    /// Whether to run the PII redaction pipeline over session-transcript text
+    /// before it is written to `sessions.db` / `memory.db` (`--no-redact` to
+    /// disable). Default `true`. Memory shards are never redacted — they are
+    /// the user's own curated notes (design §3.4).
+    pub redact: bool,
 }
 
 impl Ctx {
@@ -70,20 +83,24 @@ impl Ctx {
 /// object on stdout (consumed by the dashboard `migrate.scan`/`migrate.apply`
 /// RPCs, which spawn this binary). All log noise already routes to stderr, so
 /// stdout stays a clean protocol channel in `--json` mode.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     platform: &str,
     source: Option<PathBuf>,
     apply: bool,
     rename: bool,
     json: bool,
+    agent: Option<String>,
+    no_redact: bool,
 ) -> Result<()> {
     let plat = match platform.trim().to_ascii_lowercase().as_str() {
         "openclaw" | "moltbot" | "clawdbot" => Platform::OpenClaw,
         "hermes" => Platform::Hermes,
         "paperclip" => Platform::Paperclip,
+        "claude-code" | "claudecode" | "claude" => Platform::ClaudeCode,
         other => {
             return Err(DuDuClawError::Config(format!(
-                "未知平台 '{other}'。支援: openclaw / hermes / paperclip"
+                "未知平台 '{other}'。支援: openclaw / hermes / paperclip / claude-code"
             )));
         }
     };
@@ -101,24 +118,44 @@ pub async fn run(
         return Ok(());
     }
 
+    // claude-code imports into an EXISTING agent, never auto-creates one
+    // (design §8 pending-decision 3, option A) — fail fast, matching the
+    // paperclip --source gate above, rather than silently no-op-ing.
+    if plat == Platform::ClaudeCode && agent.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return Err(DuDuClawError::Config(
+            "claude-code 轉移需要 --agent <id> 指定匯入目標 agent（不會自動建立新 agent）".to_string(),
+        ));
+    }
+
     let home = crate::duduclaw_home();
     let ctx = Ctx {
         home,
         platform: plat,
         apply,
         rename,
+        agent,
+        redact: !no_redact,
     };
 
     let mut report = match plat {
         Platform::OpenClaw => openclaw::migrate(&ctx, source).await,
         Platform::Hermes => hermes::migrate(&ctx, source).await,
         Platform::Paperclip => paperclip::migrate(&ctx, source).await,
+        Platform::ClaudeCode => claude_code::migrate(&ctx, source).await,
     }?;
 
     // Always note the v1 honest boundaries so the operator knows the edges.
-    report.note(
-        "v1 不解析對話歷史入 sessions.db；原始 session 檔已原樣歸檔到 imported/<platform>/raw/。",
-    );
+    if plat == Platform::ClaudeCode {
+        report.note(
+            "session 逐字稿已依訊噪比過濾（僅取人類 prompt 與 assistant 最終回覆文字，\
+             丟棄 hook/attachment/thinking/tool_use/tool_result 噪音），寫入 sessions.db（精簡對話）\
+             與 memory.db（零 LLM 摘要）；原始 jsonl 另行逐位元組歸檔於 imported/claude-code/raw/。",
+        );
+    } else {
+        report.note(
+            "v1 不解析對話歷史入 sessions.db；原始 session 檔已原樣歸檔到 imported/<platform>/raw/。",
+        );
+    }
 
     // Apply writes the on-disk markdown archive; capture its path for the report.
     let report_path = if apply {
