@@ -1,50 +1,63 @@
-# 手腕與穿戴：Shortcuts 捷徑、AI 錄音吊墜接入
+# Wrist and wearables: Shortcuts, and AI recording pendant ingestion
 
-> 前置：`duduclaw http-server --bind 127.0.0.1:8765` 已啟動，並用 `duduclaw mcp issue-refresh-token` 或 `~/.duduclaw/mcp_keys.toml` 取得 Bearer key。手機/穿戴要打得到這個位址（家內網 IP 或 Tailscale）。
+> Prerequisite: `duduclaw http-server --bind 127.0.0.1:8765` is already running, and you have a
+> Bearer key from `duduclaw mcp issue-refresh-token` or `~/.duduclaw/mcp_keys.toml`. Your phone
+> or wearable needs to be able to reach that address (a home network IP, or Tailscale).
 
-## 1. iPhone／Apple Watch 捷徑（零上架、零審查）
+## 1. iPhone / Apple Watch Shortcuts (no app store, no review)
 
-Shortcuts 的「取得 URL 內容」就能打 DuDuClaw 的 HTTP API；捷徑開啟「顯示在 Apple Watch」後可放上錶面 complication 一鍵執行。
+Shortcuts' "Get Contents of URL" action can call DuDuClaw's HTTP API directly; turn on
+"Show on Apple Watch" for a shortcut and it becomes a one-tap watch face complication.
 
-**捷徑 A：問 AI 員工**（語音聽寫 → 回覆通知）
-1. 「聽寫文字」
-2. 「取得 URL 內容」：POST `http://<gateway>:8765/mcp/v1/call`
-   - Headers：`Authorization: Bearer <key>`、`Content-Type: application/json`
-   - Body（JSON）：
+**Shortcut A: ask your AI employee** (voice dictation → reply as a notification)
+1. "Dictate Text"
+2. "Get Contents of URL": POST `http://<gateway>:8765/mcp/v1/call`
+   - Headers: `Authorization: Bearer <key>`, `Content-Type: application/json`
+   - Body (JSON):
      ```json
      {"jsonrpc":"2.0","id":"1","method":"tools/call",
       "params":{"name":"send_message","arguments":{"content":"聽寫文字"}}}
      ```
-3. 「顯示通知」帶回應內容。
+3. "Show Notification" with the response content.
 
-**捷徑 B：存一則記憶**：同上，`params.name` 換 `memory_store`、`arguments.content` 帶聽寫文字。
+**Shortcut B: save a memory**: same as above, but swap `params.name` for `memory_store` and put
+the dictated text in `arguments.content`.
 
-> 審批裁決在手腕上更簡單：不用捷徑——直接**回覆** LINE/Telegram 的審批卡打「同意」或「拒絕」即可（四通道支援，見 CHANGELOG）。
+> Approval decisions are even simpler on the wrist: skip the shortcut entirely and just
+> **reply** to the LINE/Telegram approval card with "Agree" (同意) or "Reject" (拒絕) — this
+> works across four channels (see the CHANGELOG).
 
-## 2. Bee 手環（Amazon）——純設定接入
+## 2. Bee wristband (Amazon): configuration only, nothing to build
 
-Bee 官方 CLI 本身就是 MCP server，掛進 agent 的外部 MCP 清單即可，agent 直接查你的對話摘要：
+Bee's official CLI is itself an MCP server, so mounting it into an agent's external MCP list is
+enough; the agent can then query your conversation summaries directly:
 
 ```toml
 # agent.toml
 [[mcp.external]]
 name = "bee"
-command = "bee"          # Bee CLI（照官方文件安裝並登入）
+command = "bee"          # Bee CLI (install and log in per the official docs)
 args = ["mcp"]
-# 工具面照預設 deny-by-default，需要哪些再開
+# Tool surface is deny-by-default as usual; enable only what you need
 allow = ["get_conversations", "get_todos"]
 ```
 
-詳見 [mcp-bridge.md](mcp-bridge.md) 的外部 MCP 掛載說明。
+See [mcp-bridge.md](mcp-bridge.md) for how external MCP mounting works.
 
-## 3. Omi／Plaud——webhook 直灌記憶
+## 3. Omi / Plaud: webhook straight into memory
 
-gateway 的 `POST /ingest/transcript` 是為穿戴廠商 webhook 設計的薄轉接：同一把 Bearer key、同一條 `memory_store` 寫入管線（scope 檢查與來源綁定照常生效）。接受的欄位：`text`／`transcript`／`summary`／`segments[].text`。
+The gateway's `POST /ingest/transcript` is a thin adapter built for wearable-vendor webhooks: it
+shares the same Bearer key and the same `memory_store` write pipeline (scope checks and origin
+binding still apply as normal). Accepted fields: `text` / `transcript` / `summary` /
+`segments[].text`.
 
-- **Omi**：App → Developer → Integration webhook 填
-  `https://<你的公網入口>/ingest/transcript`（需帶 `Authorization: Bearer <key>` 的話用其 header 設定；Omi 版本若不支援自訂 header，前面加一層 Cloudflare Worker 補 header）
-- **Plaud**：Developer Platform → Webhooks 指向同一端點（signed webhook 的驗簽在你的反代層做，或直接依 Bearer key 信任）
-- 手動測試：
+- **Omi**: App → Developer → Integration webhook, set it to
+  `https://<your-public-endpoint>/ingest/transcript` (if you need `Authorization: Bearer <key>`,
+  set it via its header configuration; if your Omi version doesn't support custom headers, put a
+  Cloudflare Worker in front to add the header)
+- **Plaud**: Developer Platform → Webhooks, point it at the same endpoint (do signed-webhook
+  verification at your reverse-proxy layer, or just trust the Bearer key directly)
+- Manual test:
   ```bash
   curl -X POST http://127.0.0.1:8765/ingest/transcript \
     -H "Authorization: Bearer <key>" -H "Content-Type: application/json" \
@@ -52,9 +65,13 @@ gateway 的 `POST /ingest/transcript` 是為穿戴廠商 webhook 設計的薄轉
   # → {"stored":true,...}
   ```
 
-存進去的記憶會標 `wearable,<source>` 標籤與外部來源（信任上限照 v1.41 origin binding，穿戴逐字稿不會被當成高信任事實）。
+Memories written this way carry a `wearable,<source>` tag and an external origin (the trust
+ceiling still follows v1.41 origin binding, so a wearable transcript is never treated as a
+high-trust fact).
 
-## 安全備註
+## Security notes
 
-- key 只授權 MCP 對外白名單工具（memory/wiki/send_message 共 7 個）；掉了就 `duduclaw mcp` 撤銷重發。
-- 公網暴露 `/ingest/transcript` 前，先確認 rate limit（60 req/min/key）與反代層的來源限制。
+- The key only grants access to MCP's external allow-listed tools (memory/wiki/send_message, 7
+  in total); if it leaks, revoke and reissue with `duduclaw mcp`.
+- Before exposing `/ingest/transcript` to the public internet, confirm the rate limit
+  (60 req/min/key) and the origin restrictions at your reverse-proxy layer.

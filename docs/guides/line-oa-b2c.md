@@ -2,7 +2,7 @@
 
 DuduCloud can host several customers' LINE Official Accounts on one gateway. Each
 OA binds to its own agent and carries a credit balance; the customer's end-users
-chat with that agent as an AI 客服 and each reply burns credit.
+chat with that AI customer-service agent, and each reply burns credit.
 
 ## Configure multiple OAs
 

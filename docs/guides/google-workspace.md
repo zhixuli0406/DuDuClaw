@@ -1,13 +1,17 @@
 # Google Workspace integration (all eight services, native)
 
-> **開放狀態（v1.49.0 更新）**：dashboard 的「整合 → Google」分頁預設**已開放**
-> 可見——先前版本為了等原廠 OAuth App 驗證而隱藏，後來確認驗證只擋「自建
-> OAuth client」這一條路，服務帳號網域委派與 Apps Script 橋接都不受影響，
-> 分頁就沒有理由繼續隱藏。但分頁看得到不代表工具會生效：後端仍有獨立總
-> 開關 `config.toml [integrations] google_workspace`，**預設 `false`**，
-> 沒開的話憑證能設定、測試連線也能通過，但工具不會出現在 AI 員工面前，
-> dashboard 上會有明顯的黃色提示。三條接法的選路徑導覽，見
-> [google-workspace-integration.md](google-workspace-integration.md)。
+> **Visibility status (updated in v1.49.0):** the dashboard's **Integrations →
+> Google** tab is now **visible by default**. Earlier versions hid it pending
+> Google's OAuth app verification, but verification turns out to gate only the
+> "bring your own OAuth client" path (domain-wide delegation via service
+> account and the Apps Script bridge are unaffected), so there was no reason to
+> keep the tab hidden. Being visible does not mean the tools are active,
+> though: there is still a separate master switch, `config.toml
+> [integrations] google_workspace`, **defaulting to `false`**. Without it,
+> credentials can be configured and the connection test can pass, but the
+> tools never reach your AI employees, and the dashboard shows a clear yellow
+> warning. For a guided walkthrough of the three credential paths, see
+> [google-workspace-integration.md](google-workspace-integration.md).
 
 > **Design decision (D5, 2026-08-04):** DuDuClaw does not ship shared Google
 > OAuth credentials. Users supply their own OAuth client (or use the DWD /

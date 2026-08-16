@@ -1,35 +1,35 @@
-# 記憶與知識庫使用說明
+# Memory and knowledge base guide
 
-AI 員工會自己記住東西，也可以照你的吩咐把知識整理成頁面。這兩件事在儀表板的「記憶與知識」同一頁，但底層是兩套不同的系統，用法和時機都不一樣。這一頁把完整用法講清楚。
+Your AI employee remembers things on its own, and it can also organize knowledge into pages the way you ask it to. Both live on the same "Memory & Knowledge" (記憶與知識) page in the dashboard, but underneath they are two different systems with different behavior and different timing. This guide covers both in full.
 
-一句話分辨：
+The one-line distinction:
 
-- **記憶**：它自己記下來的。你不用開口，實質對話會自動萃取重點存進去。
-- **知識庫**：整份留下來的文件。你貼章程、SOP、規格書這類長期參考資料時，它會自動整理成一頁；你也可以直接說「記到知識庫」明確指定。知識庫就是 wiki，同一個東西。
+- **Memory**: what it records on its own. You don't have to say anything; real conversation content gets distilled and stored automatically.
+- **Knowledge base**: a full document kept for reference. When you paste in a charter, an SOP, a spec, or similar long-term reference material, it gets organized into a page automatically; you can also say "file this in the knowledge base" to make it explicit. The knowledge base is the wiki, just a different name for the same thing.
 
 ---
 
-## 一、兩者差在哪
+## 1. What's the difference
 
-| | 記憶 | 知識庫（wiki） |
+| | Memory | Knowledge base (wiki) |
 |---|---|---|
-| 怎麼進去 | 自動累積，不用交代 | 貼章程／流程／規格這類文件時自動建檔；也可以明講「寫到知識庫」 |
-| 存成什麼 | 一條一條的事實 | 一頁一頁的 Markdown 文件 |
-| 分類方式 | 系統自動歸類主題 | 目錄（資料夾）＋你給的頁面路徑 |
-| 舊資訊怎麼辦 | 同一件事有新版本會自動接替，保留歷史 | 覆寫整頁；自動建檔的頁面會在頁尾留一行版本紀錄（見 2.4），手動寫入的頁面沒有 |
-| 什麼時候被想起 | 三類自動帶入，其餘要它主動查 | L0/L1 每次自動帶入，L2/L3 要它主動搜尋 |
-| 誰能看到 | 只有這位 AI 員工自己 | 個人知識庫只有自己；共享知識庫全公司可讀 |
-| 適合放什麼 | 對話中冒出來的零散事實、偏好、決策 | 退貨規則、報價流程、產品規格這類要長期查閱的內容 |
+| How it fills up | Accumulates automatically, no instruction needed | Auto-filed when you paste a charter/SOP/spec-type document; or say "write this to the knowledge base" to be explicit |
+| Stored as | Discrete facts | Markdown pages |
+| Categorization | The system sorts by topic automatically | Directories (folders) plus the page path you give it |
+| Handling old information | A new version of the same fact supersedes the old one automatically, with history preserved | Overwrites the whole page; auto-filed pages keep a one-line revision log at the bottom (see 2.4), manually written pages don't |
+| When it gets recalled | Three categories inject automatically, everything else needs an active lookup | L0/L1 auto-inject every turn, L2/L3 need an active search |
+| Who can see it | Only this AI employee | Personal knowledge base is private to the agent; the shared knowledge base is readable company-wide |
+| What belongs here | Scattered facts, preferences, and decisions that surface mid-conversation | Content worth looking up long-term: return policy, quoting process, product specs |
 
-挑選原則很簡單：**要能查、要能改、要給別人看的，寫知識庫；其他讓它自己記就好。**
+The selection rule is simple: **write it to the knowledge base if it needs to be searchable, editable, or shown to other people; let everything else land in memory on its own.**
 
 ---
 
-## 二、知識庫怎麼用
+## 2. Using the knowledge base
 
-### 2.1 建立頁面：在對話裡直接講
+### 2.1 Creating a page: just say it in conversation
 
-不需要進儀表板編輯，也不需要記語法。在任何接通的頻道（LINE / Telegram / Discord / Slack / 網頁對話）對 AI 員工說：
+No need to open the dashboard to edit, and no syntax to memorize. On any connected channel (LINE / Telegram / Discord / Slack / web chat), tell the AI employee:
 
 ```
 幫我把退貨規則記到知識庫：七天內未拆封可退，運費由買方負擔。
@@ -39,173 +39,173 @@ AI 員工會自己記住東西，也可以照你的吩咐把知識整理成頁�
 今天查到的三篇論文重點整理成一頁放知識庫，標題叫「RAG 檢索方法比較」。
 ```
 
-它會建立一頁 Markdown，自動更新索引 `_index.md`，並在 `_log.md` 留一筆操作紀錄。
+It creates a Markdown page, updates the `_index.md` index automatically, and leaves one entry in `_log.md`.
 
-**沒說「知識庫」會怎樣？** 看內容。你貼的如果是章程、標準作業程序、規格書、政策辦法這類長期參考資料，它會自己判斷並建檔（見 2.4）；一般對話、提問、當下的交代則只會以記憶的形式存在。判斷偏保守——它寧可漏建一頁讓你補一句，也不會把閒聊寫成文件。明講「記到知識庫」永遠有效，這條路沒有變。
+**What if you don't say "knowledge base"?** It depends on the content. If what you pasted looks like a charter, an SOP, a spec, a policy, or similar long-term reference material, it judges the content and files it on its own (see 2.4); ordinary conversation, questions, and one-off requests only get stored as memory. The judgment leans conservative: it would rather skip a page and let you ask again than turn small talk into a document. Saying "file this in the knowledge base" explicitly always works — that path hasn't changed.
 
-### 2.2 分類：目錄由它自動選，你也可以指定
+### 2.2 Categories: auto-selected, or you can specify
 
-每個知識庫預設有四個目錄，AI 員工寫入時依內容自己挑：
+Every knowledge base has four default directories, and the AI employee picks one based on content when it writes:
 
-| 目錄 | 放什麼 | 例子 |
+| Directory | What goes here | Example |
 |---|---|---|
-| `entities/` | 人、公司、產品、客戶 | `entities/wang-ming.md` |
-| `concepts/` | 領域概念、流程、原則 | `concepts/return-policy.md` |
-| `sources/` | 原始資料的摘要 | `sources/2026-07-30-rag-papers.md` |
-| `synthesis/` | 跨主題的分析、比較、趨勢 | `synthesis/vendor-comparison.md` |
+| `entities/` | People, companies, products, customers | `entities/wang-ming.md` |
+| `concepts/` | Domain concepts, processes, principles | `concepts/return-policy.md` |
+| `sources/` | Summaries of raw material | `sources/2026-07-30-rag-papers.md` |
+| `synthesis/` | Cross-topic analysis, comparisons, trends | `synthesis/vendor-comparison.md` |
 
-想指定就直接說：「放在 `concepts/` 底下，檔名叫 return-policy」。沒指定時它按上表歸類，檔名用 kebab-case。
+To specify one yourself, just say so: "put it under `concepts/`, filename return-policy." Without an instruction it follows the table above, with filenames in kebab-case.
 
-### 2.3 層級：決定這頁「多常被想起」
+### 2.3 Layers: how often a page gets recalled
 
-每一頁的 YAML frontmatter 有一個 `layer` 欄位，這是知識庫最關鍵的設定：
+Every page's YAML frontmatter has a `layer` field — the single most important setting in the whole knowledge base:
 
-| 層級 | 值 | 行為 |
+| Layer | Value | Behavior |
 |---|---|---|
-| L0 身分 | `identity` | 每次對話都自動帶入 |
-| L1 核心 | `core` | 每次對話都自動帶入 |
-| L2 情境 | `context` | 不自動帶入，搜尋才會用到 |
-| L3 深層 | `deep` | 不自動帶入，搜尋才會用到（**預設值**） |
+| L0 Identity | `identity` | Auto-injected every conversation |
+| L1 Core | `core` | Auto-injected every conversation |
+| L2 Context | `context` | Not auto-injected; surfaces only through search |
+| L3 Deep | `deep` | Not auto-injected; surfaces only through search (**default**) |
 
-沒寫 `layer` 的頁面一律當 L3。所以一頁「寫進去了但它好像沒在用」的知識，多半就是停在 L3。要它每次都記得，在對話裡說「把這頁設成核心層」或「layer 設 core」。
+A page with no `layer` set defaults to L3. So a page that "got written but doesn't seem to get used" is most likely stuck at L3. To make it show up every time, say "set this page to core layer" or "set layer to core" in conversation.
 
-同一頁還有 `trust`（0.0–1.0 信任分數），搜尋排序會依信任分數加權，人工審核過的內容排前面。
+Every page also carries a `trust` score (0.0–1.0). Search ranking weights by this score, so content that's been human-reviewed ranks higher.
 
-### 2.4 自動建檔：不用開口的那條路
+### 2.4 Auto-filing: the path that needs no request
 
-貼一份文件進來、AI 回一句「好的我記下來了」——這種情況以前什麼都不會留下。現在它會先判斷這段文字是不是長期參考資料，是的話自動整理成一頁。
+You paste a document, the AI replies "got it, saved," and until now nothing else would happen. Now it first judges whether the text is long-term reference material, and if so, organizes it into a page automatically.
 
-**判斷依據**（都符合才會建檔，門檻刻意設高）：文件性名詞（章程、辦法、規範、SOP、規格書、手冊…）、條號或編號結構、足夠的長度、標題行。反過來，第一人稱偏好（「我喜歡…」）、時效性交代（「明天提醒我…」）、連續提問都會扣分，不會被當成文件。
+**Criteria** (all must hold; the bar is set deliberately high): document-type nouns (charter, procedures, standard, SOP, spec, manual…), numbered clauses or section structure, sufficient length, a title line. Conversely, first-person preferences ("I like…"), time-bound requests ("remind me tomorrow…"), and back-and-forth questions all count against it and won't be treated as a document.
 
-**自動建檔的頁面放在哪**：你自己這位 AI 員工的知識庫，`auto/` 底下依類型分五個資料夾——章程 `auto/charter/`、流程 `auto/sop/`、規格 `auto/spec/`、政策 `auto/policy/`、其他 `auto/reference/`。你手動整理的目錄（`entities/`、`concepts/`、`sources/`、`synthesis/`）自動建檔永遠不會碰。
+**Where auto-filed pages go**: inside this AI employee's own knowledge base, under `auto/`, split into five folders by type — charter `auto/charter/`, SOP `auto/sop/`, spec `auto/spec/`, policy `auto/policy/`, other `auto/reference/`. Your manually organized directories (`entities/`, `concepts/`, `sources/`, `synthesis/`) are never touched by auto-filing.
 
-**自動頁跟你確認過的頁不一樣**：
+**How an auto-filed page differs from a confirmed one**:
 
-- 頁面開頭有一段提示，說明這頁是自動整理、未經人工確認。
-- 內容逐字保留原文，不會被改寫（章程、合約這類文字失真的代價太高）。
-- **不會自動帶入對話**。自動頁停在 L2 情境層，AI 要主動搜尋才看得到。所以就算它判斷錯了，也不會污染每一次回答。
-- 搜尋排序權重比人工頁低很多。
+- The page opens with a notice stating it was auto-organized and hasn't been confirmed by a person.
+- The content preserves the original text verbatim, never rewritten. The cost of distorting a charter or a contract is too high.
+- **It is never auto-injected into conversation.** Auto-filed pages sit at the L2 context layer, so the AI has to actively search for one to see it. Even a wrong judgment call can't pollute every answer.
+- Search ranking weights it far lower than a human-written page.
 
-**同一份文件貼第二次**會更新同一頁，不會長出第二頁，頁尾的「版本紀錄」會多一行。
+**Pasting the same document a second time** updates the same page rather than creating a duplicate, and the revision log at the bottom gains one more line.
 
-**在哪裡管理**：儀表板「記憶與知識 → 策展台 → 自動建檔」。每一頁可以：
+**Where to manage it**: dashboard → "Memory & Knowledge" (記憶與知識) → "Curation Station" (策展台) → "Auto-filed" (自動建檔). Each page supports:
 
-| 動作 | 效果 |
+| Action | Effect |
 |---|---|
-| 檢視 | 看整頁內容與版本紀錄 |
-| 確認為正式知識 | 這頁升級成你核可的內容，開始每次自動帶入對話 |
-| 分享到共享知識庫 | 複製一份到共享區，其他 AI 員工也讀得到 |
-| 移除 | 這頁從知識庫消失，收進封存區可還原 |
+| "View" (檢視) | See the full page content and revision log |
+| "Confirm as official knowledge" (確認為正式知識) | Promotes the page to content you've approved, so it starts auto-injecting every conversation |
+| "Share to shared knowledge base" (分享到共享知識庫) | Copies the page to the shared area so other AI employees can read it too |
+| "Remove" (移除) | Drops the page from the knowledge base; it moves to the archive and can be restored |
 
-想整個關掉自動建檔：在該 AI 員工的知識庫目錄放一個 `.scope.toml`，宣告 `[namespaces.auto] mode = "operator_only"`，之後就只有你手動寫得進去。
+To turn auto-filing off entirely: drop a `.scope.toml` in that AI employee's knowledge base directory declaring `[namespaces.auto] mode = "operator_only"`. After that, only manual writes go through.
 
-### 2.5 個人知識庫與共享知識庫
+### 2.5 Personal vs. shared knowledge base
 
-- **個人知識庫**：`~/.duduclaw/agents/<員工>/wiki/`，只有這位 AI 員工讀得到。
-- **共享知識庫**：`~/.duduclaw/shared/wiki/`，全公司的 AI 員工都讀得到。公司規章、共用 SOP、產品規格放這裡。
+- **Personal knowledge base**: `~/.duduclaw/agents/<agent>/wiki/`, readable only by this AI employee.
+- **Shared knowledge base**: `~/.duduclaw/shared/wiki/`, readable by every AI employee in the company. Company policy, shared SOPs, and product specs belong here.
 
-要寫到共享區就明說：「這條放共享知識庫，讓大家都看得到。」
+To write to the shared area, say so explicitly: "put this in the shared knowledge base so everyone can see it."
 
-個人版只有一個知識庫，儀表板上不會出現「個人／共享」的分頁切換。
-
----
-
-## 三、什麼時候會取用知識庫
-
-這是最容易誤會的一段。取用分兩種路徑：
-
-**自動帶入（L0 + L1）**：每次對話開始前，系統會把身分層和核心層的頁面依當前問題的相關度排序，在 6 KB 預算內塞進系統提示。同一個對話 session 內，選中的頁面會固定 15 分鐘不換，這樣才吃得到 prompt 快取。你什麼都不用做。
-
-**主動搜尋（L2 + L3）**：其餘頁面要 AI 員工自己判斷「這題該查知識庫」，呼叫搜尋工具找出來。搜尋是全文檢索，依信任分數與來源類型加權排序。
-
-**所以要不要主動提醒？** 一般不用。L0/L1 的內容它每次都看得到；L2/L3 的內容，只要問題裡有關鍵字，它通常會自己去查。
-
-有兩種情況值得補一句：
-
-1. **它答錯或答得含糊**，而你確定知識庫裡有正確答案 → 說「查一下知識庫再回答」。
-2. **問題用詞和頁面用詞差很遠**（例如頁面寫「退貨政策」，你問「東西不想要了怎麼辦」）→ 直接提頁面名稱最快。
+The personal edition has only one knowledge base, so the dashboard doesn't show a "Personal/Shared" (個人／共享) tab switch.
 
 ---
 
-## 四、記憶怎麼用
+## 3. When the knowledge base gets used
 
-### 4.1 它會自動記什麼
+This is the part most likely to cause confusion. There are two retrieval paths.
 
-| 來源 | 記什麼 | 儀表板分類 |
+**Auto-injection (L0 + L1)**: before every conversation turn, the system ranks identity-layer and core-layer pages by relevance to the current question and fits them into the system prompt within a 6 KB budget. Within the same conversation session, the selected pages stay fixed for 15 minutes so prompt caching still applies. You don't have to do anything.
+
+**Active search (L2 + L3)**: everything else depends on the AI employee judging that a question warrants a knowledge-base check, then calling a search tool. Search is full-text, ranked by trust score and source type.
+
+**So should you remind it to check?** Usually not. L0/L1 content is visible to it every time; for L2/L3 content, a matching keyword in your question is usually enough to trigger a search on its own.
+
+Two situations are worth a nudge:
+
+1. **It answers wrong or vaguely**, and you know the knowledge base has the right answer — say "check the knowledge base and answer again."
+2. **Your wording is far from the page's wording** (say, the page says "return policy" and you ask "what if I don't want this anymore") — just naming the page is the fastest fix.
+
+---
+
+## 4. Using memory
+
+### 4.1 What it remembers automatically
+
+| Source | What it captures | Dashboard category |
 |---|---|---|
-| 對話蒸餾 | 實質對話中的事實、決定、偏好 | 依內容歸到工作／客戶／偏好等 |
-| 關鍵事實 | 跨對話重複出現的重點 | 觀察洞察分頁 |
-| 學習訊號 | 預期與實際落差（它答得好不好） | 學習訊號 |
-| 使用足跡 | 你的應用程式使用時長與活躍時段（需開啟） | 使用足跡 |
-| 錯誤歸納 | 同類錯誤累積後歸納出的規則 | 規則與決策 |
+| Conversation distillation | Facts, decisions, and preferences from real conversation | Filed by content under "Work / Client / Preference" (工作／客戶／偏好) |
+| Key facts | Points that recur across multiple conversations | "Observations & Insights" (觀察洞察) tab |
+| Learning signals | Gaps between expected and actual outcomes (how well it answered) | "Learning Signals" (學習訊號) |
+| Usage footprint | Your app usage duration and active hours (opt-in) | "Usage Footprint" (使用足跡) |
+| Mistake generalization | Rules generalized from a cluster of the same kind of mistake | "Rules & Decisions" (規則與決策) |
 
-**不會記的**：打招呼、「好」「收到」這類簡短確認、沒有實質內容的閒聊。系統有一層零成本的分類器先擋掉。
+**What it won't remember**: greetings, short acknowledgments like "OK" or "got it," and small talk with no substantive content. A zero-cost classifier filters these out first.
 
-**重複的也不會再記一次**（v1.53 起）：語意層的新寫入會先跟既有記憶比對相似度，內容幾乎一樣的會被擋下並記錄一筆遙測，避免同一件事累積成幾十條近似記憶稀釋檢索品質。既有記憶的正常更新（改口取代舊說法、再次確認）不受影響；你在儀表板手動整理的記憶也不經過這道閘。想關掉可在 `config.toml` 設 `[memory] novelty_gate = false`（預設開啟）。
+**Duplicates no longer get stored twice** (as of v1.53): a new write at the semantic layer is compared against existing memories for similarity first; near-duplicates get rejected and logged as telemetry, so the same fact doesn't pile up as dozens of near-identical memories that dilute retrieval quality. Normal updates to an existing memory (a correction replacing what was said before, a reconfirmation) aren't affected, and memories you curate manually in the dashboard skip this gate entirely. Turn it off with `[memory] novelty_gate = false` in `config.toml` (on by default).
 
-### 4.2 什麼時候會被想起
+### 4.2 When memories get recalled
 
-三段內容每次對話自動帶入系統提示：
+Three categories are auto-injected into the system prompt every conversation:
 
-- **關於你的關鍵事實**（私人對話才帶，群組共用的 session 會擋掉，避免把個人資訊帶進公開場合）
-- **過去犯過的錯**（未解決的同類錯誤）
-- **學到的規則**（從錯誤歸納出來、通過驗證期的規則，最多三條。v1.53 起，只有附帶實際執行證據的錯誤紀錄才會參與歸納——AI 員工「自己說自己錯了」但查無對應工具紀錄的，不會被拿來產生規則）
+- **Key facts about you** (private conversations only; a shared group session blocks this, so personal information never leaks into a public setting)
+- **Past mistakes** (unresolved mistakes of the same category)
+- **Learned rules** (rules generalized from mistakes that have passed their observation window, capped at three. As of v1.53, only mistake records backed by actual tool-call evidence feed the generalization — an AI employee saying "that was my mistake" with no matching tool record behind it never produces a rule)
 
-其餘記憶要 AI 員工自己判斷需要並執行搜尋。檢索排序同時看相關度、重要性與「多久沒被想起」，常被回想的記憶會活得更久。
+Everything else needs the AI employee to judge that a search is warranted and run it. Retrieval ranking weighs relevance, importance, and how long since a memory was last recalled; memories that get referenced often live longer.
 
-### 4.3 記憶會自己更新
+### 4.3 Memory updates itself
 
-同一個主題有新說法時，舊的那條會被標記為「已被取代」，新的接上去。展開任何一條記憶可以看到完整的取代鏈，也可以查「某個時間點當時的答案是什麼」。所以改口不需要先刪舊的，直接講新的就行。
+When a new statement about the same topic comes in, the old one gets marked "superseded" and the new one takes its place. Expanding any memory shows the full supersession chain, and you can also ask "what was the answer as of a given point in time." So correcting course doesn't require deleting the old entry first; just say the new thing.
 
-### 4.4 刪除記憶
+### 4.4 Deleting a memory
 
-在記憶清單上把滑鼠移到任何一條，右邊會出現垃圾桶圖示，點兩下（第二下是確認）就刪掉。刪掉的記憶立刻從搜尋、瀏覽和對話帶入中消失。
+Hover over any entry in the memory list and a trash icon appears on the right; two clicks (the second confirms) deletes it. A deleted memory disappears immediately from search, browsing, and conversation injection.
 
-底層是軟刪除：資料會移到封存表，管理者仍可從資料庫救回，超過保留期才真正清除。
+Underneath, this is a soft delete: the record moves to an archive table, an administrator can still recover it from the database, and it's only purged for good after the retention window passes.
 
 ---
 
-## 五、該用哪個？
+## 5. Which one should you use?
 
-| 你想做的事 | 做法 |
+| What you want to do | How to do it |
 |---|---|
-| 讓它記住我喜歡簡短回覆 | 直接講，會自動進記憶 |
-| 建立退貨政策讓它每次都照著回 | 寫知識庫，並設 `layer: core` |
-| 整理今天查到的論文重點 | 寫知識庫，放 `sources/` |
-| 全公司 AI 員工都要遵守的規章 | 寫共享知識庫 |
-| 修正它記錯的事 | 直接講新的，舊的會自動被取代 |
-| 移除一條錯誤記憶 | 記憶頁滑鼠移過去點垃圾桶 |
-| 讓它忘記整份知識 | 到知識庫刪除那一頁 |
-| 貼一份公司章程讓它以後查得到 | 直接貼，會自動建檔；在策展台確認為正式知識後每次都會帶入 |
-| 移除一頁自動建檔的內容 | 策展台 → 自動建檔 → 移除 |
+| Have it remember you prefer short replies | Just say so — it lands in memory automatically |
+| Set up a return policy it follows every time | Write it to the knowledge base and set `layer: core` |
+| Organize today's research findings from a few papers | Write it to the knowledge base, under `sources/` |
+| A policy every AI employee in the company must follow | Write it to the shared knowledge base |
+| Correct something it remembered wrong | Just say the correct version — the old one gets superseded automatically |
+| Remove one incorrect memory | Hover over it in the memory list and click the trash icon |
+| Make it forget a whole document | Delete that page from the knowledge base |
+| Paste in a company charter so it can look it up later | Just paste it — it auto-files; once confirmed as official knowledge in the curation station, it injects every time |
+| Remove one auto-filed page | Curation Station → Auto-filed → Remove |
 
 ---
 
-## 六、常見問題
+## 6. FAQ
 
-**Q：知識庫跟 wiki 是不同東西嗎？**
-同一個東西。介面上叫「知識庫」，底層檔案結構與 MCP 工具名稱沿用 wiki。
+**Q: Are the knowledge base and the wiki different things?**
+Same thing. The interface calls it "knowledge base"; the underlying file layout and MCP tool names still use "wiki."
 
-**Q：要跟 AI 員工說「寫到知識庫」嗎？**
-貼章程、SOP、規格書這類文件時不用，它會自己建檔（見 2.4）。其他情況要說。判斷不確定時它偏向不建檔，所以想確保留下頁面，明講一句最快。
+**Q: Do I need to tell the AI employee "write this to the knowledge base"?**
+Not for a charter, SOP, or spec-type document — it auto-files those (see 2.4). For everything else, yes. When the judgment call is uncertain it leans toward not filing, so if you want a page to stick, saying it explicitly is the fastest way.
 
-**Q：知識庫可以分類嗎？還是它會自動分類？**
-兩者都成立。四個預設目錄由它依內容自動選，你也可以指定路徑。層級（L0–L3）預設是 L3，要調就明講。
+**Q: Can the knowledge base be categorized? Or does it categorize itself?**
+Both. The four default directories get chosen automatically based on content, and you can also specify a path yourself. The layer (L0–L3) defaults to L3; say so explicitly to change it.
 
-**Q：什麼狀況下會取用知識庫？要主動提醒嗎？**
-L0/L1 每次自動帶入，L2/L3 靠它主動搜尋。一般不用提醒；答錯或用詞落差大時，說一句「查一下知識庫」最有效。
+**Q: When does it actually use the knowledge base? Should I remind it?**
+L0/L1 auto-injects every conversation; L2/L3 relies on it searching on its own. You usually don't need to remind it. When it answers wrong or your wording is far from the page's, saying "check the knowledge base" is the most effective nudge.
 
-**Q：記憶跟知識庫的內容重複了怎麼辦？**
-知識庫優先。系統帶入時會比對，已經出現在知識庫頁面裡的事實不會再從記憶重複帶一次。
+**Q: What happens if memory and the knowledge base overlap?**
+The knowledge base wins. When content gets injected, the system checks for overlap, and a fact already covered by a knowledge base page won't get pulled in again from memory.
 
-**Q：記憶會無限成長嗎？**
-不會。長期沒被回想、重要性低的記憶會逐步封存；被頻繁引用的會留下來。
+**Q: Does memory grow without limit?**
+No. Memories that go unrecalled for a long time and carry low importance get archived progressively; memories that are referenced often stick around.
 
 ---
 
-## 相關文件
+## Related documents
 
-- [`templates/wiki/_schema.md`](../../templates/wiki/_schema.md) — 知識庫頁面格式與 frontmatter 欄位完整定義
-- [`docs/spec/soul-md-spec.md`](../spec/soul-md-spec.md) — SOUL.md 人格檔規格
-- [`docs/guides/evals.md`](evals.md) — 行為回歸測試（驗證記憶與知識庫是否真的影響了回答）
-- [`docs/architecture/overview.md`](../architecture/overview.md) — 記憶引擎與檢索架構
+- [`templates/wiki/_schema.md`](../../templates/wiki/_schema.md) — Full definition of the knowledge base page format and frontmatter fields
+- [`docs/spec/soul-md-spec.md`](../spec/soul-md-spec.md) — SOUL.md persona file spec
+- [`docs/guides/evals.md`](evals.md) — Behavioral regression testing (verifies memory and the knowledge base actually affect answers)
+- [`docs/architecture/overview.md`](../architecture/overview.md) — Memory engine and retrieval architecture

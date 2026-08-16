@@ -1,144 +1,133 @@
-# Docker 安裝指南
+# Docker installation guide
 
-> 適用版本：v1.8.23+
-> 最後更新：2026-04-22
+> Applies to: v1.8.23+
+> Last updated: 2026-04-22
 
-本指南涵蓋以 Docker Compose 部署 DuDuClaw 伺服器的完整流程 ——
-從 port 設定、三大 CLI（Claude / Codex / Gemini）的驗證方式，
-到資料持久化、channel webhook 與自動更新。
+This guide covers the full process of deploying the DuDuClaw server with Docker Compose — port configuration, authentication for all three CLIs (Claude / Codex / Gemini), data persistence, channel webhooks, and auto-updates.
 
-若只是想在本機試跑，請先參考
-[docs/deployment-guide.md §1](deployment-guide.md#1-local-development)
-的原生安裝方式；原生安裝通常啟動更快、除錯更簡單。
-Docker 適合伺服器部署、隔離執行環境、或需要統一環境的團隊。
+If you just want to try DuDuClaw on your own machine, read the native installation steps in
+[docs/deployment-guide.md §1](deployment-guide.md#1-local-development) first; native installation usually starts faster and is easier to debug.
+Docker is a better fit for server deployments, isolated execution environments, or teams that need a consistent environment.
 
 ---
 
-## 1. 概述
+## 1. Overview
 
-DuDuClaw 的 Docker 映像建置於 `container/Dockerfile.server`，採三階段建置：
+The DuDuClaw Docker image is built from `container/Dockerfile.server` using a three-stage build:
 
-| Stage | 內容 |
+| Stage | Contents |
 |-------|------|
-| 1. frontend-builder | `node:22-slim` + 建置 React/TS 前端 |
-| 2. rust-builder | `rust:slim` + 編譯 `duduclaw` release 二進位 |
-| 3. production | `python:3.12-slim` + 三大 AI CLI + Docker CLI + 執行期 |
+| 1. frontend-builder | `node:22-slim` + builds the React/TS frontend |
+| 2. rust-builder | `rust:slim` + compiles the `duduclaw` release binary |
+| 3. production | `python:3.12-slim` + all three AI CLIs + Docker CLI + runtime |
 
-最終映像內建：
+The final image ships with:
 
-- `duduclaw` 主程式（Rust，含 dashboard）
-- `@anthropic-ai/claude-code`、`@openai/codex`、`@google/gemini-cli`（透過 `npm i -g`）
-- `docker.io` CLI（用於呼叫宿主機 Docker daemon 建立 agent sandbox）
-- （選用）Python 3.12 — 僅進階本地推論（MLX / LLMLingua-2，需 `mlx_lm` / `llmlingua`）才需要；Skill 安全掃描與通道回覆已是 Rust-native，不再依賴 Python
+- The `duduclaw` main binary (Rust, includes the dashboard)
+- `@anthropic-ai/claude-code`, `@openai/codex`, `@google/gemini-cli` (installed via `npm i -g`)
+- The `docker.io` CLI (used to call the host Docker daemon to create agent sandboxes)
+- (Optional) Python 3.12: only needed for advanced local inference (MLX / LLMLingua-2, requires `mlx_lm` / `llmlingua`); skill security scanning and channel replies are already Rust-native and no longer depend on Python
 
 ---
 
-## 2. 前置需求
+## 2. Prerequisites
 
-| 項目 | 版本 | 備註 |
+| Item | Version | Notes |
 |------|------|------|
-| Docker Engine | ≥ 24.0 | Linux 建議直接裝原生版；macOS / Windows 用 Docker Desktop 或 Colima |
-| Docker Compose | v2.20+ | 內建於現代 Docker；指令為 `docker compose`，非舊的 `docker-compose` |
-| Git | 任意 | Clone 原始碼用 |
-| 磁碟空間 | ≥ 4 GB | 建置期間會暫用 ~3 GB；成品映像約 ~1.2 GB |
-| Port | `18789` | 預設 gateway port，可改 |
+| Docker Engine | ≥ 24.0 | On Linux, install the native package directly; on macOS/Windows use Docker Desktop or Colima |
+| Docker Compose | v2.20+ | Bundled with modern Docker; the command is `docker compose`, not the legacy `docker-compose` |
+| Git | any | For cloning the source |
+| Disk space | ≥ 4 GB | The build consumes ~3 GB temporarily; the final image is roughly ~1.2 GB |
+| Port | `18789` | Default gateway port, changeable |
 
-若要讓 channel webhook（LINE、WhatsApp、Feishu、Generic Webhook）能收到外部訊息，
-還需要一個 **公開 HTTPS URL**。最簡單的方案是
-[Tailscale Funnel](#11-tailscale-funnel-公開-https-給-webhook) 或
-[Cloudflare Tunnel](deployment-guide.md#4-cloudflare-tunnel-long-term-stable)。
+If you want channel webhooks (LINE, WhatsApp, Feishu, generic webhook) to receive external messages, you also need a **publicly reachable HTTPS URL**. The simplest options are
+[Tailscale Funnel](#11-tailscale-funnel-public-https-for-webhooks) or
+[Cloudflare Tunnel](deployment-guide.md#4-cloudflare-tunnel-long-term-stable).
 
 ---
 
-## 3. 快速開始
+## 3. Quick start
 
 ```bash
-# 1. Clone 原始碼
+# 1. Clone the source
 git clone https://github.com/zhixuli0406/DuDuClaw.git
 cd DuDuClaw
 
-# 2. 建立 .env（依需求填入）
+# 2. Create .env (fill in as needed)
 cp .env.example .env
 $EDITOR .env
 
-# 3. 啟動
+# 3. Start
 docker compose up -d
 
-# 4. 檢視啟動日誌
+# 4. Watch the startup logs
 docker compose logs -f duduclaw
 
-# 5. 驗證
+# 5. Verify
 curl http://localhost:18789/health
 # {"status":"ok","version":"1.8.23", ...}
 
-# 6. 開啟 Dashboard
+# 6. Open the dashboard
 open http://localhost:18789
 ```
 
-首次啟動時 `server-entrypoint.sh` 會偵測到
-`~/.duduclaw/config.toml` 不存在，自動執行 `duduclaw onboard --yes`
-產生基本設定檔（加密儲存 API key 與 channel token）。
+On first boot, `server-entrypoint.sh` detects that `~/.duduclaw/config.toml` doesn't exist and automatically runs `duduclaw onboard --yes` to generate a base config file (API keys and channel tokens are stored encrypted).
 
 ---
 
-## 4. 環境變數（`.env`）
+## 4. Environment variables (`.env`)
 
-`docker-compose.yml` 只會讀取已定義的變數，**缺少的變數會傳入空字串**
-（因為都用 `${VAR:-}` 語法）。下方清單按用途分組。
+`docker-compose.yml` only reads variables that are actually defined — **an unset variable is passed through as an empty string** (every reference uses the `${VAR:-}` syntax). The list below is grouped by purpose.
 
-### 4.1 Runtime 認證（任選其一以上）
+### 4.1 Runtime authentication (set at least one)
 
-| 變數 | 用途 | 備註 |
+| Variable | Purpose | Notes |
 |------|------|------|
-| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code 長效 token | `claude setup-token` 產生，**推薦** — 適合無瀏覽器的容器環境 |
-| `ANTHROPIC_API_KEY` | Claude API key | Fallback，按量計費 |
-| `OPENAI_API_KEY` | Codex / OpenAI-compat API key | Fallback；ChatGPT Plus/Pro OAuth 走 volume |
-| `GEMINI_API_KEY` | Gemini API key | Fallback；Google OAuth 走 volume |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code long-lived token | Generated by `claude setup-token`, **recommended**, fits browser-less container environments |
+| `ANTHROPIC_API_KEY` | Claude API key | Fallback, billed by usage |
+| `OPENAI_API_KEY` | Codex / OpenAI-compat API key | Fallback; ChatGPT Plus/Pro OAuth goes through a volume instead |
+| `GEMINI_API_KEY` | Gemini API key | Fallback; Google OAuth goes through a volume instead |
 
-至少需要其中一組可用。DuDuClaw 會依 `agent.toml [runtime]` 與
-`[model] api_mode` 決定使用哪一個。詳見
-[§6 三大 CLI 驗證設定](#6-三大-cli-驗證設定)。
+At least one of these needs to be available. DuDuClaw decides which one to use based on `agent.toml [runtime]` and `[model] api_mode`. See
+[§6 Authenticating the three CLIs](#6-authenticating-the-three-clis) for details.
 
-### 4.2 Channel Tokens
+### 4.2 Channel tokens
 
-| 變數 | Channel |
+| Variable | Channel |
 |------|---------|
 | `LINE_CHANNEL_TOKEN` / `LINE_CHANNEL_SECRET` | LINE Messaging API |
-| `TELEGRAM_BOT_TOKEN` | Telegram Bot |
-| `DISCORD_BOT_TOKEN` | Discord Bot |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot |
+| `DISCORD_BOT_TOKEN` | Discord bot |
 | `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | Slack Socket Mode |
-| `WHATSAPP_ACCESS_TOKEN` 等 | WhatsApp Cloud API（見 `.env.example`）|
-| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飛書 |
+| `WHATSAPP_ACCESS_TOKEN` and others | WhatsApp Cloud API (see `.env.example`) |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | Feishu |
 
-只需要填入你實際會用到的 channel。沒填的變數不會啟動對應 channel。
+Only fill in the channels you actually plan to use. A channel with no configured variables simply doesn't start.
 
-> `docker-compose.yml` 目前只預設注入 `LINE_*` / `TELEGRAM_*` / `DISCORD_*`
-> 三組 env var。其他 channel 若要透過 env var 傳入，需自行在 compose 檔案的
-> `environment:` 區塊新增；或啟動後改走 **Dashboard → Channels → Add**
-> 做熱新增（推薦 ── 無須重啟 gateway，token 也會立即加密寫入 config）。
+> `docker-compose.yml` currently only injects the `LINE_*` / `TELEGRAM_*` / `DISCORD_*` variable groups by default. To pass in other channels via environment variables, add them yourself under the `environment:` block in the compose file, or add them after startup through **Dashboard → Channels → Add** — a hot-add path that's recommended since it needs no gateway restart and the token is written to the encrypted config immediately.
 
-### 4.3 Bind / Port 相關
+### 4.3 Bind / port settings
 
-| 變數 | 預設 | 說明 |
+| Variable | Default | Description |
 |------|------|------|
-| `DUDUCLAW_BIND` | `0.0.0.0` | Gateway 監聽位址。容器內必須 `0.0.0.0` 外部才打得到 |
-| `DUDUCLAW_ALLOWED_ORIGINS` | （空） | Dashboard WebSocket/CORS 的額外允許 `Origin`，逗號分隔。透過 tailnet／反向代理網域開 dashboard 且 WS 被 403 時填這裡（見 [§13 疑難排解](#dashboard-一直轉圈-websocket-403)）。與 config.toml `[gateway] allowed_origins` 合併 |
+| `DUDUCLAW_BIND` | `0.0.0.0` | Gateway listen address. Inside the container this must stay `0.0.0.0`, or nothing outside the container can reach it |
+| `DUDUCLAW_ALLOWED_ORIGINS` | (empty) | Extra allowed WebSocket/CORS `Origin` values for the dashboard, comma-separated. Fill this in when the dashboard is served through a tailnet or reverse-proxy domain and the WebSocket returns 403 (see [§13 Troubleshooting](#dashboard-spinning-forever-websocket-403)). Merged with `config.toml`'s `[gateway] allowed_origins` |
 
-Port 在 compose 檔內而非 env var，詳見 [§5 Port 設定詳解](#5-port-設定詳解)。
+Port is set in the compose file rather than via env var — see [§5 Port configuration](#5-port-configuration).
 
-### 4.4 其他
+### 4.4 Other
 
-| 變數 | 用途 |
+| Variable | Purpose |
 |------|------|
-| `TS_AUTHKEY` | Tailscale Funnel 開機自動加入 tailnet（搭配 `--profile tailscale`）|
+| `TS_AUTHKEY` | Automatically joins the tailnet on boot for Tailscale Funnel (used with `--profile tailscale`) |
 
 ---
 
-## 5. Port 設定詳解
+## 5. Port configuration
 
-### 5.1 預設
+### 5.1 Default
 
-`docker-compose.yml`：
+`docker-compose.yml`:
 
 ```yaml
 services:
@@ -149,251 +138,240 @@ services:
       - DUDUCLAW_BIND=0.0.0.0
 ```
 
-- **容器內部**：gateway 永遠綁在 `0.0.0.0:18789` — 這是寫死的設計，
-  因為容器本身就是隔離網路空間，綁 localhost 會變成外部無法存取。
-- **宿主機**：`18789:18789` 把宿主機 18789 轉送到容器 18789。
+- **Inside the container**: the gateway always binds to `0.0.0.0:18789`. This is deliberate — the container is already an isolated network namespace, so binding to localhost would make it unreachable from outside.
+- **Host**: `18789:18789` forwards host port 18789 to container port 18789.
 
-### 5.2 改宿主機 port
+### 5.2 Changing the host port
 
-最常見情境是 18789 被佔用或需要多實例。只改左側數字即可：
+The most common case is that 18789 is already taken, or you need multiple instances. Just change the number on the left:
 
 ```yaml
     ports:
-      - "28789:18789"   # 外部改走 28789
+      - "28789:18789"   # external side now uses 28789
 ```
 
-之後 dashboard 與 webhook URL 都要改用新 port：
+After that, both the dashboard and webhook URLs need to switch to the new port:
 
 ```bash
 curl http://localhost:28789/health
 ```
 
-> 右側 `18789`（容器內部 port）**不要動**。改它需要同步改
-> `~/.duduclaw/config.toml` 的 `[gateway] port`，
-> 而 entrypoint 用的是 `--yes` 自動生成，維護成本較高。
+> Don't touch the right-hand `18789` (the container-internal port). Changing it requires also updating `[gateway] port` in `~/.duduclaw/config.toml`, and since the entrypoint auto-generates that file via `--yes`, keeping the two in sync is extra maintenance overhead.
 
-### 5.3 只綁本機（避免曝露給 LAN）
+### 5.3 Binding to localhost only (avoid exposing it to the LAN)
 
-預設 `ports: "18789:18789"` 會綁 `0.0.0.0` — 區網內其他機器也能連。
-若只想本機用（例如搭配反向代理）：
+The default `ports: "18789:18789"` binds to `0.0.0.0`, so other machines on the same network can connect too. If you only want it reachable locally (for example, behind a reverse proxy):
 
 ```yaml
     ports:
       - "127.0.0.1:18789:18789"
 ```
 
-### 5.4 多實例同機
+### 5.4 Multiple instances on one machine
 
-兩份 DuDuClaw 跑在同一台機器：
+Running two DuDuClaw instances on the same machine:
 
 ```bash
-# 目錄 A — 正式
+# Directory A — production
 cd /srv/duduclaw-prod
 # ports: "18789:18789"
 docker compose up -d
 
-# 目錄 B — 測試
+# Directory B — staging
 cd /srv/duduclaw-staging
 # ports: "28789:18789"
-# container_name 也要改，避免衝突
+# also change container_name to avoid a clash
 docker compose up -d
 ```
 
-記得同步改 `container_name`（預設 `duduclaw-server`）避免名稱碰撞。
+Remember to also change `container_name` (default `duduclaw-server`) to avoid a naming collision.
 
 ---
 
-## 6. 三大 CLI 驗證設定
+## 6. Authenticating the three CLIs
 
-三個 runtime 各有兩條認證路徑：**OAuth**（免額外費用，走訂閱方案）
-或 **API Key**（按量付費 fallback）。實務建議「至少裝 OAuth，
-並留一把 API Key 當保險」。
+Each of the three runtimes supports two authentication paths: **OAuth** (no extra cost, runs on your subscription plan) or an **API key** (usage-billed fallback). In practice, set up OAuth first and keep an API key as a backup.
 
-容器內三個 OAuth 狀態目錄都有獨立 named volume：
+Each of the three OAuth state directories inside the container has its own named volume:
 
-| 路徑 | Volume | CLI |
+| Path | Volume | CLI |
 |------|--------|-----|
 | `/home/duduclaw/.claude` | `duduclaw-claude` | Claude Code |
 | `/home/duduclaw/.codex`  | `duduclaw-codex`  | Codex |
 | `/home/duduclaw/.gemini` | `duduclaw-gemini` | Gemini |
 
-這代表 **登入一次後即使容器重建也不需重登**。
+This means **you only need to log in once — rebuilding the container doesn't require logging in again**.
 
 ### 6.1 Claude Code CLI
 
-#### 方法 A — Setup Token（推薦）
+#### Method A: setup token (recommended)
 
-Claude Code 專為自動化場景提供一個長效 token，不需要瀏覽器回呼，
-適合容器 / CI / headless server：
+Claude Code provides a long-lived token built for automation scenarios — no browser callback required, which fits containers, CI, and headless servers:
 
 ```bash
-# 在你「有瀏覽器」的本機電腦上執行（不是容器內）
+# Run this on your own machine (the one with a browser), not inside the container
 npm install -g @anthropic-ai/claude-code
 claude setup-token
-# 依提示完成瀏覽器 OAuth
-# 最後會顯示 CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
+# Follow the prompts to complete OAuth in your browser
+# It prints CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-... at the end
 ```
 
-把產生的 token 寫入 `.env`：
+Write the generated token into `.env`:
 
 ```bash
 # .env
 CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-xxxxxxxx...
 ```
 
-然後：
+Then:
 
 ```bash
 docker compose up -d
 ```
 
-DuDuClaw 啟動時會讀取環境變數，`claude` CLI 認得這個 token
-就會自動登入，不需要進入容器做任何事。Token 有效期 30 天，
-過期前 7 天 DuDuClaw 會在 dashboard 顯示警示。
+DuDuClaw reads the environment variable on startup, and the `claude` CLI recognizes the token and logs in automatically — you don't need to touch the container at all. The token is valid for 30 days; DuDuClaw shows a warning on the dashboard starting 7 days before it expires.
 
-#### 方法 B — 容器內互動登入
+#### Method B: interactive login inside the container
 
-若你有 Pro / Team / Max 訂閱且想用訂閱 quota：
+If you have a Pro / Team / Max subscription and want to use its quota:
 
 ```bash
-# 進入容器
+# Enter the container
 docker compose exec duduclaw bash
 
-# 在容器內執行
+# Run inside the container
 claude auth login
-# 會顯示一個 URL，在本機瀏覽器打開並完成授權
-# 狀態會寫入 /home/duduclaw/.claude/ ── 即 duduclaw-claude volume
+# It prints a URL — open it in your local browser and complete authorization
+# The state is written to /home/duduclaw/.claude/, i.e. the duduclaw-claude volume
 
-# 驗證
+# Verify
 claude auth status
 exit
 ```
 
-容器重啟後狀態仍在（因為 volume）。
+The state survives container restarts, since it lives on the volume.
 
-#### 方法 C — API Key Fallback
+#### Method C: API key fallback
 
-`.env`：
+`.env`:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-這條路徑會**按量計費**，適合當訂閱用盡或帳號被 rate-limit 時的保險。
-DuDuClaw 的 AccountRotator 會自動在多個帳號間輪替，詳見
-[features/07-account-rotation.md](../features/07-account-rotation.md)。
+This path is **billed by usage** and works as a backup once your subscription quota runs out or an account gets rate-limited. DuDuClaw's AccountRotator automatically rotates across multiple accounts — see
+[features/07-account-rotation.md](../features/07-account-rotation.md) for details.
 
-### 6.2 Codex（OpenAI）CLI
+### 6.2 Codex (OpenAI) CLI
 
-#### 方法 A — ChatGPT Plus/Pro OAuth
+#### Method A: ChatGPT Plus/Pro OAuth
 
 ```bash
 docker compose exec duduclaw bash
 codex login
-# 輸入 ChatGPT 帳號密碼或跟著瀏覽器流程走
-# 狀態寫入 /home/duduclaw/.codex/ ── 即 duduclaw-codex volume
+# Enter your ChatGPT credentials or follow the browser flow
+# State is written to /home/duduclaw/.codex/, i.e. the duduclaw-codex volume
 exit
 ```
 
-此方法使用 ChatGPT 訂閱 quota，無額外 API 費用。
+This method uses your ChatGPT subscription quota, with no extra API cost.
 
-#### 方法 B — API Key Fallback
+#### Method B: API key fallback
 
-`.env`：
+`.env`:
 
 ```bash
 OPENAI_API_KEY=sk-proj-...
 ```
 
-按量計費（OpenAI API 定價）。
+Billed by usage, at OpenAI API pricing.
 
-### 6.3 Gemini（Google）CLI
+### 6.3 Gemini (Google) CLI
 
-#### 方法 A — Google OAuth
+#### Method A: Google OAuth
 
 ```bash
 docker compose exec duduclaw bash
 gemini auth
-# 依提示在本機瀏覽器完成 Google 登入
-# 狀態寫入 /home/duduclaw/.gemini/ ── 即 duduclaw-gemini volume
+# Follow the prompts to complete Google login in your local browser
+# State is written to /home/duduclaw/.gemini/, i.e. the duduclaw-gemini volume
 exit
 ```
 
-Google 對 Gemini CLI 目前提供免費額度，適合日常使用。
+Google currently offers a free quota for the Gemini CLI, which is fine for everyday use.
 
-#### 方法 B — API Key Fallback
+#### Method B: API key fallback
 
-`.env`：
+`.env`:
 
 ```bash
 GEMINI_API_KEY=AIza...
 ```
 
-按 Google AI Studio 定價計費。
+Billed at Google AI Studio pricing.
 
-### 6.4 Per-Agent 指定 Runtime
+### 6.4 Per-agent runtime selection
 
-每個 agent 可以在自己的 `agent.toml` 指定要用哪個 runtime：
+Each agent can specify which runtime to use in its own `agent.toml`:
 
 ```toml
 # ~/.duduclaw/agents/my-agent/agent.toml
 
 [runtime]
-preferred = "claude"      # 主 runtime：claude / codex / gemini / openai-compat
-fallback = "gemini"       # Claude 不可用時自動切換
+preferred = "claude"      # primary runtime: claude / codex / gemini / openai-compat
+fallback = "gemini"       # automatically switches over when Claude is unavailable
 ```
 
-完整範例與 failover 策略請見
-[features/13-multi-runtime.md](../features/13-multi-runtime.md)。
+See [features/13-multi-runtime.md](../features/13-multi-runtime.md) for a full example and the failover strategy.
 
-未指定時，`RuntimeRegistry` 啟動掃描 PATH 後挑選第一個可用的 runtime。
+If nothing is specified, `RuntimeRegistry` scans `PATH` on startup and picks the first available runtime.
 
-### 6.5 驗證三個 CLI 都認得出來
+### 6.5 Verify all three CLIs are detected
 
 ```bash
 docker compose exec duduclaw bash
 
-# 三個都應該印出版本
+# All three should print a version
 claude --version
 codex --version
 gemini --version
 
-# Claude 登入狀態
+# Claude login state
 claude auth status
 ```
 
 ---
 
-## 7. 資料持久化（Volumes）
+## 7. Data persistence (volumes)
 
-`docker-compose.yml` 宣告了四個 named volume：
+`docker-compose.yml` declares four named volumes:
 
-| Volume | 內容 | 備份建議 |
+| Volume | Contents | Backup recommendation |
 |--------|------|---------|
-| `duduclaw-data` | 主程式資料：config、agents、memory SQLite、logs、bus_queue.jsonl | **最重要** — 每日備份 |
-| `duduclaw-claude` | Claude CLI OAuth state | 中等 — 遺失需重新 `claude auth login` |
-| `duduclaw-codex`  | Codex OAuth state | 中等 |
-| `duduclaw-gemini` | Gemini OAuth state | 中等 |
+| `duduclaw-data` | Main application data: config, agents, memory SQLite, logs, bus_queue.jsonl | **Most important**, back up daily |
+| `duduclaw-claude` | Claude CLI OAuth state | Moderate — losing it just means running `claude auth login` again |
+| `duduclaw-codex`  | Codex OAuth state | Moderate |
+| `duduclaw-gemini` | Gemini OAuth state | Moderate |
 
-以及掛入的宿主機路徑：
+Plus a mounted host path:
 
-| 路徑 | 用途 | 必要性 |
+| Path | Purpose | Requirement |
 |------|------|-------|
-| `/var/run/docker.sock` | 讓容器呼叫宿主機 Docker daemon 建立 agent sandbox | **必要** ── 用於 container sandbox 隔離執行 |
+| `/var/run/docker.sock` | Lets the container call the host Docker daemon to create agent sandboxes | **Required**, used for container-sandbox isolated execution |
 
-### 7.1 備份
+### 7.1 Backup
 
 ```bash
-# 備份主資料到 tar.gz
+# Back up the main data volume to a tar.gz
 docker run --rm \
   -v duduclaw_duduclaw-data:/source:ro \
   -v $(pwd):/backup \
   alpine tar czf /backup/duduclaw-data-$(date +%F).tar.gz -C /source .
 ```
 
-### 7.2 還原 / 轉移
+### 7.2 Restore / migrate
 
-把備份放到目標機，還原到同名 volume：
+Copy the backup to the target machine, then restore it into a volume of the same name:
 
 ```bash
 docker volume create duduclaw_duduclaw-data
@@ -403,9 +381,9 @@ docker run --rm \
   alpine tar xzf /backup/duduclaw-data-2026-04-22.tar.gz -C /target
 ```
 
-### 7.3 用宿主機目錄取代（進階）
+### 7.3 Replacing volumes with host directories (advanced)
 
-若想方便直接瀏覽資料，可把 named volume 換成 bind mount：
+If you'd rather browse the data directly, you can swap named volumes for bind mounts:
 
 ```yaml
     volumes:
@@ -416,7 +394,7 @@ docker run --rm \
       - /var/run/docker.sock:/var/run/docker.sock
 ```
 
-注意宿主機目錄的 **owner 必須是 UID 1000**（容器內 `duduclaw` 使用者）：
+Note that the host directories **must be owned by UID 1000** (the `duduclaw` user inside the container):
 
 ```bash
 mkdir -p data/{duduclaw,claude,codex,gemini}
@@ -425,242 +403,230 @@ sudo chown -R 1000:1000 data/
 
 ---
 
-## 8. 健康檢查與觀測
+## 8. Health checks and observability
 
-### 8.1 三條 health endpoint
+### 8.1 Three health endpoints
 
-| 路徑 | 用途 | HTTP 200 條件 |
+| Path | Purpose | HTTP 200 condition |
 |------|------|---------------|
-| `/health` | 完整狀態（JSON） | 永遠回 200 + 結構化內容 |
-| `/health/ready` | Readiness probe | agents 已全部載入 |
-| `/health/live`  | Liveness probe | process 還活著 |
+| `/health` | Full status (JSON) | Always returns 200 with structured content |
+| `/health/ready` | Readiness probe | All agents have finished loading |
+| `/health/live`  | Liveness probe | The process is still alive |
 
-Compose 預設用 `/health` 做 healthcheck（每 30s，3 次失敗標 unhealthy）。
+Compose uses `/health` for its healthcheck by default (every 30s, marked unhealthy after 3 consecutive failures).
 
-### 8.2 查看狀態
+### 8.2 Inspecting status
 
 ```bash
-# Container 狀態
+# Container status
 docker compose ps
 
-# 即時 log
+# Live logs
 docker compose logs -f duduclaw
 
-# 最近 100 行
+# Last 100 lines
 docker compose logs --tail=100 duduclaw
 
-# Healthcheck 歷史
+# Healthcheck history
 docker inspect duduclaw-server --format '{{json .State.Health}}' | jq
 ```
 
-### 8.3 Prometheus Metrics
+### 8.3 Prometheus metrics
 
-Gateway 提供 `GET /metrics` 端點，指標清單見
-[docs/deployment-guide.md §8](deployment-guide.md#8-prometheus--grafana-monitoring)。
+The gateway exposes a `GET /metrics` endpoint; see the metrics list at
+[docs/deployment-guide.md §8](deployment-guide.md#8-prometheus--grafana-monitoring).
 
 ---
 
-## 9. Watchtower 自動更新
+## 9. Watchtower auto-update
 
-`docker-compose.yml` 已內建 Watchtower 服務，每小時檢查一次映像更新。
+`docker-compose.yml` ships with a built-in Watchtower service that checks for image updates once an hour.
 
-> **注意**：目前 compose 檔的 `WATCHTOWER_SCOPE=duduclaw` 設定
-> 只會更新**帶有對應 label 的容器**，但 `duduclaw` 服務本身
-> 未設定該 label。若要啟用自動更新，請於 `services.duduclaw` 加上：
+> **Note**: the compose file's current `WATCHTOWER_SCOPE=duduclaw` setting only updates **containers carrying the matching label**, but the `duduclaw` service itself doesn't have that label set. To enable auto-updates, add this under `services.duduclaw`:
 >
 > ```yaml
 >     labels:
 >       - "com.centurylinklabs.watchtower.scope=duduclaw"
 > ```
 >
-> 或移除 `WATCHTOWER_SCOPE`（會更新所有容器，範圍較大）。
+> Or remove `WATCHTOWER_SCOPE` entirely (this updates every container, which is a wider blast radius).
 
-若不想自動更新，直接移除 watchtower 服務區塊即可。
+If you don't want auto-updates at all, just remove the watchtower service block.
 
 ---
 
-## 10. Channel Webhook 需要公開 HTTPS
+## 10. Channel webhooks need a public HTTPS URL
 
-LINE / WhatsApp / Feishu / Generic Webhook 都需要**可從網際網路存取的 HTTPS URL**
-才能收到訊息。若你的 DuDuClaw 跑在家用網路或沒有公網 IP 的伺服器，
-常用方案：
+LINE, WhatsApp, Feishu, and generic webhooks all need **an HTTPS URL reachable from the public internet** to receive messages. If your DuDuClaw instance runs on a home network or a server without a public IP, common options include:
 
-| 方案 | 適用情境 | 成本 | 指引 |
+| Option | Fits | Cost | Guide |
 |------|---------|------|------|
-| Tailscale Funnel | 家用 / 開發 / 臨時 | 免費 | [§11](#11-tailscale-funnel-公開-https-給-webhook) |
-| Cloudflare Tunnel | 長期生產 | 免費（需自有網域） | [deployment-guide §4](deployment-guide.md#4-cloudflare-tunnel-long-term-stable) |
-| ngrok | 快速 demo | 免費版 URL 會變 | [deployment-guide §3](deployment-guide.md#3-ngrok-alternative) |
-| 反向代理（Caddy / Nginx） | 自有公網 IP + 網域 | 需自行維護 | [deployment-guide §5](deployment-guide.md#5-reverse-proxy-caddy--nginx) |
+| Tailscale Funnel | Home / dev / temporary | Free | [§11](#11-tailscale-funnel-public-https-for-webhooks) |
+| Cloudflare Tunnel | Long-term production | Free (requires your own domain) | [deployment-guide §4](deployment-guide.md#4-cloudflare-tunnel-long-term-stable) |
+| ngrok | Quick demos | Free-tier URL changes each time | [deployment-guide §3](deployment-guide.md#3-ngrok-alternative) |
+| Reverse proxy (Caddy / Nginx) | Own public IP + domain | Requires ongoing maintenance | [deployment-guide §5](deployment-guide.md#5-reverse-proxy-caddy--nginx) |
 
 ---
 
-## 11. Tailscale Funnel（公開 HTTPS 給 webhook）
+## 11. Tailscale Funnel (public HTTPS for webhooks)
 
-Compose 已附帶 Tailscale 服務，預設在 `tailscale` profile 下，不自動啟動。
+Compose ships with a Tailscale service, gated behind the `tailscale` profile by default so it doesn't start automatically.
 
-### 11.1 啟用
+### 11.1 Enabling it
 
 ```bash
-# 1. 從 Tailscale admin console 產生 auth key
+# 1. Generate an auth key from the Tailscale admin console
 #    https://login.tailscale.com/admin/settings/keys
-#    建議勾選 "Reusable" + "Ephemeral"
+#    We recommend checking "Reusable" + "Ephemeral"
 
-# 2. 寫入 .env
+# 2. Write it into .env
 echo "TS_AUTHKEY=tskey-auth-xxxxxxx" >> .env
 
-# 3. 啟動 tailscale profile
+# 3. Start the tailscale profile
 docker compose --profile tailscale up -d
 
-# 4. 在 Tailscale admin console 對此機器啟用 Funnel
+# 4. Enable Funnel for this machine in the Tailscale admin console
 #    Machines → duduclaw → Enable Funnel
 
-# 5. 取得 https URL
+# 5. Get the https URL
 docker compose exec tailscale tailscale funnel status
-# https://duduclaw.your-tailnet.ts.net/  ← 這就是 webhook 前綴
+# https://duduclaw.your-tailnet.ts.net/  <- this is the webhook prefix
 ```
 
-LINE webhook URL 填 `https://duduclaw.your-tailnet.ts.net/webhook/line`。
+Set the LINE webhook URL to `https://duduclaw.your-tailnet.ts.net/webhook/line`.
 
-> Tailscale container 目前使用 `image: tailscale/tailscale:latest`，
-> 生產環境建議改 pin 到特定 digest（compose 檔已標註 TODO）。
+> The Tailscale container currently uses `image: tailscale/tailscale:latest`. For production, pin it to a specific digest instead (the compose file already has a TODO noting this).
 
 ---
 
-## 12. 常用指令速查
+## 12. Common command reference
 
 ```bash
-# 啟動 / 停止 / 重啟
+# Start / stop / restart
 docker compose up -d
-docker compose down           # 停止並移除 container（volume 不會刪）
+docker compose down           # stops and removes the container (volumes stay)
 docker compose restart duduclaw
 
-# 重新建置映像（程式碼或 Dockerfile 變更後）
+# Rebuild the image (after code or Dockerfile changes)
 docker compose build --no-cache duduclaw
 docker compose up -d
 
-# 進入容器 shell
+# Enter a container shell
 docker compose exec duduclaw bash
 
-# 跑一次性指令
+# Run a one-off command
 docker compose exec duduclaw duduclaw agent list
 docker compose exec duduclaw duduclaw cost summary
 
-# Log
+# Logs
 docker compose logs -f duduclaw
 docker compose logs --since 1h duduclaw
 
-# 清理
-docker compose down -v        # ⚠️ 連 volume 一起刪 ── 資料全失
-docker system prune -af       # ⚠️ 清掉所有未使用 image / container
+# Cleanup
+docker compose down -v        # WARNING: removes volumes too — all data is lost
+docker system prune -af       # WARNING: removes every unused image / container
 ```
 
 ---
 
-## 13. 疑難排解
+## 13. Troubleshooting
 
-### 容器起來但 `curl localhost:18789/health` 回 Connection refused
+### The container is up, but `curl localhost:18789/health` returns connection refused
 
-**成因**：Gateway 綁在容器內部 localhost，宿主機打不到。
-**檢查**：
+**Cause**: the gateway is bound to localhost inside the container, so the host can't reach it.
+**Check**:
 
 ```bash
 docker compose exec duduclaw env | grep DUDUCLAW_BIND
-# 必須是 DUDUCLAW_BIND=0.0.0.0
+# Must show DUDUCLAW_BIND=0.0.0.0
 ```
 
-若是空字串，把 compose 檔的 `environment:` 區塊補上即可。
+If it's empty, add it under the compose file's `environment:` block.
 
-### `docker compose up` 卡在 `Compiling duduclaw-gateway`
+### `docker compose up` gets stuck at `Compiling duduclaw-gateway`
 
-Rust 編譯很吃 CPU/RAM，**首次**建置在一般筆電上約需 10-20 分鐘。
-後續變更會走 incremental cache，通常 1-2 分鐘。
+Rust compilation is CPU/RAM-heavy — the **first** build typically takes 10-20 minutes on a regular laptop. Later builds use the incremental cache and usually finish in 1-2 minutes.
 
-若記憶體不足（< 4 GB）可能會 OOM killed，建議：
+If you're low on memory (< 4 GB), the build can get OOM-killed. Options:
 
-- 改用 pre-built image（若有提供）
-- 或在宿主機預先 `cargo build --release` 產出二進位，改寫 Dockerfile
-  直接 COPY（進階）
+- Use a pre-built image if one is available
+- Or run `cargo build --release` on the host ahead of time and rewrite the Dockerfile to `COPY` the binary directly (advanced)
 
-### Claude CLI 顯示 "not logged in"
+### The Claude CLI shows "not logged in"
 
-**檢查順序**：
+**Check in this order**:
 
 ```bash
-# 1. Env var 有沒有傳進去
+# 1. Did the env var actually make it in?
 docker compose exec duduclaw env | grep -E "CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY"
 
-# 2. Volume 有沒有掛對
+# 2. Is the volume mounted correctly?
 docker compose exec duduclaw ls -la ~/.claude/
 
-# 3. CLI 本身看得到什麼
+# 3. What does the CLI itself see?
 docker compose exec duduclaw claude auth status
 ```
 
-常見錯誤是忘了 `docker compose up -d` 在修改 `.env` 後**重啟** container
-── env var 只在啟動時注入，熱改無效。
+A common mistake is forgetting to **restart** the container with `docker compose up -d` after editing `.env` — environment variables are only injected at startup, so a hot edit has no effect.
 
-### Dashboard 打得到但 agent 回訊「請先執行 `claude auth status`」
+### The dashboard connects, but the agent replies with "please run `claude auth status`"
 
-這是 v1.8.x 前版本的殘留訊息；v1.8.22+ 已改成依
-`FailureReason` 分類的 zh-TW 訊息。若仍看到：
+This is a leftover message from versions before v1.8.x; v1.8.22+ replaced it with zh-TW messages classified by `FailureReason`. If you're still seeing it:
 
 ```bash
 docker compose exec duduclaw duduclaw --version
-# 確認 1.8.22 以上；若非，拉最新 main + 重 build
+# Confirm it's 1.8.22 or later; if not, pull the latest main and rebuild
 ```
 
-### Dashboard 一直轉圈 WebSocket 403
+### Dashboard spinning forever, WebSocket 403
 
-症狀：透過 tailnet（`*.ts.net`）或反向代理網域開 dashboard，HTTP 頁面正常載入，
-但即時資料一直轉圈圈；瀏覽器 DevTools 的 Network 面板可見 `/ws` 升級回 **403**。
+Symptom: the dashboard loads over HTTP through a tailnet (`*.ts.net`) or reverse-proxy domain, but live data spins forever; the browser DevTools Network panel shows the `/ws` upgrade returning **403**.
 
-原因：WebSocket 的 `Origin` 白名單預設只含 loopback，你的對外網域不在其中。把它
-加進白名單即可：
+Cause: the WebSocket `Origin` allowlist defaults to loopback only, and your external domain isn't in it. Add it to the allowlist:
 
 ```bash
-# compose 的 environment: 或 .env
+# In compose's environment: block, or .env
 DUDUCLAW_ALLOWED_ORIGINS=duduclaw.your-tailnet.ts.net,duduclaw.yourdomain.com
 ```
 
-或寫進 `~/.duduclaw/config.toml`：
+Or add it to `~/.duduclaw/config.toml`:
 
 ```toml
 [gateway]
 allowed_origins = ["duduclaw.your-tailnet.ts.net"]
 ```
 
-重啟後啟動 log 會印出生效的額外 origins。詳見
-[deployment-guide §5 WebSocket Origin 白名單](../deployment-guide.md#websocket-origin-白名單反向代理--tailnet-必讀)。
+After a restart, the startup log prints the extra origins that took effect. See
+[deployment-guide §5 WebSocket origin allowlist](deployment-guide.md#websocket-origin-allowlist-required-reading-for-reverse-proxy-tailnet-setups) for details.
 
-### Channel webhook 沒有觸發 agent
+### Channel webhook isn't triggering the agent
 
-- LINE / WhatsApp / Feishu 需要 HTTPS — 確認 [§10](#10-channel-webhook-需要公開-https) 做好
-- 到 Dashboard → Channels 檢查該 channel 的連線狀態指示燈
-- 看 log：`docker compose logs -f duduclaw | grep -i webhook`
+- LINE / WhatsApp / Feishu need HTTPS — confirm [§10](#10-channel-webhooks-need-a-public-https-url) is set up
+- Check the connection status indicator for that channel under Dashboard → Channels
+- Check the logs: `docker compose logs -f duduclaw | grep -i webhook`
 
-### Container sandbox 無法啟動子 agent
+### Container sandbox can't start a sub-agent
 
-DuDuClaw 會透過 `docker.sock` 呼叫宿主機 Docker daemon 建立隔離容器
-執行 agent tasks。若失敗：
+DuDuClaw calls the host Docker daemon through `docker.sock` to create isolated containers for running agent tasks. If this fails:
 
 ```bash
-# 測試 socket 能否從容器內使用
+# Test whether the socket works from inside the container
 docker compose exec duduclaw docker ps
-# 要能看到宿主機上的 container 清單
+# You should see the container list from the host
 ```
 
-若 Permission denied，多半是 SELinux / AppArmor 擋住。Linux 上可試：
+If you get permission denied, it's usually SELinux/AppArmor blocking it. On Linux, try:
 
 ```yaml
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:rw
     group_add:
-      - "${DOCKER_GID:-999}"   # 對齊宿主機 docker group GID
+      - "${DOCKER_GID:-999}"   # match the host's docker group GID
 ```
 
-### OAuth 狀態在容器重建後消失
+### OAuth state disappears after a container rebuild
 
-確認 volume 確實存在：
+Confirm the volumes actually exist:
 
 ```bash
 docker volume ls | grep duduclaw
@@ -670,14 +636,13 @@ docker volume ls | grep duduclaw
 # duduclaw_duduclaw-gemini
 ```
 
-若缺了某個，表示 compose 檔被改過或曾 `docker compose down -v`，
-重新 `claude auth login` / `codex login` / `gemini auth` 即可。
+If one is missing, the compose file was changed or someone ran `docker compose down -v` at some point — just run `claude auth login` / `codex login` / `gemini auth` again.
 
 ---
 
-## 14. 延伸閱讀
+## 14. Further reading
 
-- 部署方式總覽：[docs/deployment-guide.md](deployment-guide.md)
-- Multi-Runtime 架構：[docs/features/13-multi-runtime.md](../features/13-multi-runtime.md)
-- Account Rotation：[docs/features/07-account-rotation.md](../features/07-account-rotation.md)
-- 開發指南：[docs/development-guide.md](development-guide.md)
+- Deployment overview: [docs/deployment-guide.md](deployment-guide.md)
+- Multi-runtime architecture: [docs/features/13-multi-runtime.md](../features/13-multi-runtime.md)
+- Account rotation: [docs/features/07-account-rotation.md](../features/07-account-rotation.md)
+- Development guide: [docs/development-guide.md](development-guide.md)

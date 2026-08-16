@@ -50,7 +50,7 @@ trait IdentityProvider: Send + Sync {
 
 ### The `Ok(None)` semantic
 
-A crucial design decision: `resolve_by_channel` returns `Ok(None)` when the person is unknown. That is the normal "a stranger sends a message" case and explicitly **not** an error. `Err` is reserved for genuine provider failures — an unreachable upstream, a malformed payload, an IO fault. This distinction is what lets the chained provider degrade gracefully.
+One design decision carries most of the weight: `resolve_by_channel` returns `Ok(None)` when the person is unknown. That is the normal "a stranger sends a message" case and explicitly **not** an error. `Err` is reserved for genuine provider failures — an unreachable upstream, a malformed payload, an IO fault. This distinction is what lets the chained provider degrade gracefully.
 
 ---
 

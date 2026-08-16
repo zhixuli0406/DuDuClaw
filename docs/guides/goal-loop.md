@@ -1,111 +1,111 @@
-# 自主目標迴圈（Goal Loop）
+# Goal loop
 
-在對話裡丟一個目標，AI 員工就會自主規劃、執行、自我驗收，做到完成或卡住時回來通知你。這一頁說明從頻道使用 `/goal` 的方式、自主程度（AutonomyLevel）分級、相關設定鍵，以及卡住轉人工時的按鈕語意。
+Drop a goal into a conversation and the AI employee plans, executes, and self-checks its own work, then comes back to you when it's done or stuck. This page covers the `/goal` command in channels, the AutonomyLevel tiers, the relevant config keys, and what the buttons mean when a task escalates to a human.
 
-派工引擎自 v1.59 起預設開啟（沒有目標任務時只做週期性的 SQLite 輪詢，只有任務真正進入 review 才會花 LLM 呼叫——見下方「兩段式驗收裁決」），一問一答對話完全不受影響。不想要時在 `config.toml` 設 `[dispatch] enabled = false`，或到儀表板「設定 → 自動化」關閉「派工引擎」開關（免重啟熱生效）。
+The dispatch engine has been on by default since v1.59 (with no goal tasks queued it only does periodic SQLite polling; an LLM call only happens once a task actually reaches review — see "Two-stage acceptance judging" below), so plain question-and-answer conversations are completely unaffected. To turn it off, set `[dispatch] enabled = false` in `config.toml`, or flip the "Dispatch engine (派工引擎)" switch under Settings → Automation (設定 → 自動化) on the dashboard (hot-reloads, no restart needed).
 
 ---
 
-## `/goal` 指令
+## The `/goal` command
 
-在任何已接通的頻道（Telegram / Discord / Slack / LINE / …）對 AI 員工輸入：
+Type this to an AI employee in any connected channel (Telegram / Discord / Slack / LINE / …):
 
-| 指令 | 行為 |
+| Command | Behavior |
 |------|------|
-| `/goal <目標描述>` | 建立一個自主目標任務，指派給當前對話的 AI 員工。沒有另外指定驗收標準時，以目標描述本身當作驗收基準。 |
-| `/goal <目標> \|\| <驗收標準>` | 用 `\|\|` 分隔：前半是目標，後半是驗收標準（判官核可的依據）。 |
-| `/goal <目標> \|\| <驗收標準> \|\| outcome:<spec>` | 再加一段結構化產出驗收（見下方「結構化產出驗收」）。交付前先跑零成本的 deterministic 校驗，未達標直接退回修正，不燒判官。 |
-| `/goal status` | 列出當前 AI 員工進行中的目標任務（短碼 / 狀態 / 第幾輪）。 |
-| `/goal` | 顯示用法說明。 |
+| `/goal <goal description>` | Creates an autonomous goal task assigned to the AI employee in the current conversation. With no separate acceptance criteria, the goal description itself becomes the acceptance basis. |
+| `/goal <goal> \|\| <acceptance criteria>` | Split with `\|\|`: the first half is the goal, the second half is the acceptance criteria (what the judge checks against). |
+| `/goal <goal> \|\| <acceptance criteria> \|\| outcome:<spec>` | Adds a layer of structured outcome verification (see "Structured outcome verification" below). A zero-cost deterministic check runs before delivery; anything that fails goes straight back for revision without spending a judge call. |
+| `/goal status` | Lists the AI employee's in-flight goal tasks (short code / status / round number). |
+| `/goal` | Shows usage help. |
 
-**範例**
+**Example**
 
 ```
-/goal 整理這批客戶資料成月報並寄出 || 報表含每月營收圖表，寄到 boss@example.com
-/goal 產出 Q3 月報 || 含每月營收圖表 || outcome:files:report.docx
+/goal Compile this batch of customer data into a monthly report and send it || The report needs a monthly revenue chart, send to boss@example.com
+/goal Produce the Q3 monthly report || Include a monthly revenue chart || outcome:files:report.docx
 ```
 
-建立後會回覆確認訊息，包含任務短碼、上限輪數，以及「完成或卡住會在這裡通知你」。任務進度與需人工的通知會**推回你發起的這個對話**（來源頻道），而不只是 AI 員工的 `[proactive]` 通知頻道。
+Creating a goal returns a confirmation message with the task's short code, its round cap, and a note that "I'll notify you here when it's done or stuck." Progress updates and human-needed notifications are **pushed back to the conversation where you created the goal** (the source channel), not just to the AI employee's `[proactive]` notification channel.
 
-> 若派工引擎被關閉（`[dispatch] enabled = false`），任務仍會建立，但確認訊息會提醒你它不會自動開始執行。
+> If the dispatch engine is off (`[dispatch] enabled = false`), the task is still created, but the confirmation message tells you it won't start running on its own.
 
 ---
 
-## 目標契約：建立時凍結、事後不能悄悄改
+## Goal contract: frozen at creation, never quietly edited later
 
-建立目標的當下，驗收標準會被凍結成一份不可變的基準（`acceptance_criteria_baseline`）。之後所有裁決——第一階段評估器、MAV 驗收判官——一律讀這份凍結基準，不讀事後可能被改動的欄位。這是為了擋掉兩個方向的「悄悄改契約」：AI 員工不能在做的過程中把驗收標準改鬆，操作者也不會誤以為改了儀表板上的欄位就等於重新設定了裁決依據。
+The moment a goal is created, its acceptance criteria are frozen into an immutable baseline (`acceptance_criteria_baseline`). Every subsequent verdict — the first-stage evaluator, the MAV acceptance judge — reads only this frozen baseline, never a field that could have been edited afterward. This blocks contract drift in both directions: the AI employee can't loosen its own acceptance bar mid-task, and an operator can't mistake editing a dashboard field for actually changing what the judges check against.
 
-- **AI 員工不能改**：agent 身分呼叫 MCP `tasks_update` 若帶了 `acceptance_criteria` 想改自己 goal 任務的驗收標準，會被整筆拒絕，並留一筆審計紀錄（原因 `goal_contract_frozen`）。
-- **操作者可以編輯顯示用的副本，但不會回頭改變裁決依據**：儀表板 `tasks.update` 仍可以修改任務上顯示的 `acceptance_criteria`（例如補充說明給人看），但凍結的基準值不會跟著變——判官與評估器繼續照原本建立時的標準裁決。真的要換一組驗收標準，等於是換一個目標。
-- 沒有凍結基準的舊任務（凍結機制上線前建立的）退回讀可變欄位，行為與過去一致。
+- **The AI employee can't change it**: if an agent-identity call to the MCP `tasks_update` tool tries to change `acceptance_criteria` on its own goal task, the whole call is rejected, and an audit entry is logged (reason: `goal_contract_frozen`).
+- **The operator can edit the display copy, but that never changes what gets judged**: the dashboard's `tasks.update` can still edit the `acceptance_criteria` shown on a task (for example, adding a note for a human reader), but the frozen baseline value does not move with it. The judge and the evaluator keep grading against the standard set when the task was created. Changing the acceptance criteria for real means creating a new goal.
+- Older tasks with no frozen baseline (created before this mechanism shipped) fall back to reading the mutable field, unchanged from before.
 
-### 沒指定驗收標準時的引導
+### Guidance when no acceptance criteria are given
 
-`/goal <目標描述>`（不帶 `||`）仍會照常建立任務，目標描述本身當驗收基準，但確認訊息會多附一段提示，幫你想清楚下次要不要補得更精確：
+`/goal <goal description>` (with no `||`) still creates the task as usual, using the goal description itself as the acceptance basis, but the confirmation message adds a hint to help you think through what to specify next time:
 
 ```
-💡 這次沒有另外指定驗收標準，之後想清楚這四件事會更好抓：
- • 目標：要達成什麼
- • 輸入：需要用到哪些資料或素材
- • 輸出格式：成果長什麼樣子（例如 Word／Excel／一段文字／一張圖）
- • 約束：風格、時限等限制，以及「怎樣才算完成」
- 建議補 3-5 條具體、看得出結果的驗收標準（例如「報表含每月營收圖表」而非「做得好」），
- 用 /goal 描述 || 標準 格式重新交付一次即可。
+💡 No separate acceptance criteria this time — next time these four things will make it easier to pin down:
+ • Goal: what needs to be accomplished
+ • Input: what data or material is needed
+ • Output format: what the result should look like (e.g. Word / Excel / a block of text / an image)
+ • Constraints: style, deadlines, and other limits, plus "what counts as done"
+ Try 3-5 concrete, checkable acceptance criteria (e.g. "the report includes a monthly revenue chart" rather than "make it good"),
+ then resubmit with /goal description || criteria.
 ```
 
-有明確帶 `||` 驗收標準時不會出現這段提示。開啟 `planner_enabled` 的子任務拆解也套用同一套紀律：每條驗收標準寫「結果」不寫「做法」（凍結 HOW 會讓走不同但同樣正確路徑的產出被誤判失敗）、精簡到 3-5 條就夠（契約愈肥，子任務愈難收斂）、範圍外的事項列為 Non-goals 而不是硬塞進驗收項。
+This hint doesn't appear when `||` acceptance criteria are given explicitly. Subtask decomposition under `planner_enabled` follows the same discipline: each acceptance criterion states the *result*, not the *method* (freezing HOW would fail a correct output that took a different but equally valid path); keep it to 3-5 criteria (a heavier contract makes subtasks harder to converge); anything out of scope goes under Non-goals instead of being crammed into acceptance criteria.
 
 ---
 
-## 外層進度看板
+## Outer-loop progress board
 
-目標任務的每個狀態轉移都會推一則簡短（一到三行）的進度訊息回來源對話：
+Every state transition on a goal task pushes a short (one-to-three-line) progress message back to the source conversation:
 
-- 開始執行 / 重試（第 N/上限 輪）
-- 驗收中
-- 未通過 → 修正後重試（附驗收判官回饋摘要）
-- 完成 ✅（附結果摘要）
-- 卡住 → 需要你決定（同時另外推送審批按鈕，附暫停原因分類，見下方「needs_human 按鈕語意」）
+- Started / retrying (round N of the cap)
+- In review
+- Rejected → revising and retrying (with a summary of the judge's feedback)
+- Done ✅ (with a result summary)
+- Stuck → needs your decision (also pushes approval buttons, tagged with a pause-reason category — see "needs_human button semantics" below)
 
-同一任務同一狀態不會重複推播。來源對話不存在時，退回 AI 員工的 `[proactive]` 頻道；兩者都沒有時只寫入儀表板 Activity Feed，不打擾你。
+The same task won't push the same state twice. If the source conversation no longer exists, it falls back to the AI employee's `[proactive]` channel; if neither exists, it's written only to the dashboard's Activity Feed, without interrupting you.
 
-### 逾時進度通報
+### Stall-timeout progress reports
 
-任務被認領（`in_progress`）後，如果超過 `[goal_loop] progress_report_minutes`（預設 10 分鐘）都沒有任何可觀察的進度訊號（以 Activity Feed 事件為準——`updated_at` 欄位會被 lease renewer 定期刷新，不能拿來當作「有在動」的證據），驅動器會推一則「已執行 X 分鐘未回報進度，仍在執行中」的通知（Activity Feed ＋來源對話），同一輪最多發一次。
+Once a task is claimed (`in_progress`), if `[goal_loop] progress_report_minutes` (10 minutes by default) passes with no observable progress signal (measured against Activity Feed events — the `updated_at` field is refreshed periodically by the lease renewer and can't be used as evidence of "something is happening"), the driver pushes a single "still running after X minutes with no progress reported" notice (Activity Feed + source conversation), at most once per round.
 
-這**純粹是通報，不是介入**：不會重派工、不升級、不取消任務——真正會動手的仍然只有 `stalled_secs`（重派）、`iteration_cap`（轉人工）、`wall_clock_hours`（轉人工）這幾條既有護欄。設成 `0`（或任何負數）整個功能關閉，且關閉時不花任何額外查詢。
+This is **purely a report, not an intervention**: it doesn't redispatch, escalate, or cancel the task. The guardrails that actually act remain `stalled_secs` (redispatch), `iteration_cap` (escalate to a human), and `wall_clock_hours` (escalate to a human). Setting it to `0` (or any negative number) turns the whole feature off, with zero extra queries when disabled.
 
 ---
 
-## 工具連擊 advisory（tool streak）
+## Tool streak advisory
 
-自主迴圈裡，AI 員工偶爾會卡在「對同一個工具、帶同一組參數，一次又一次呼叫」的迴圈——結果早就拿到了，卻沒有意識到自己在重複。這與下方「停滯偵測」不同：停滯偵測要連續兩整輪（派工→驗收）才能發現卡住，工具連擊 advisory 看的是**單一輪內**的工具呼叫序列，能在判官介入之前就先提醒。
+In the autonomous loop, an AI employee sometimes gets stuck calling the same tool with the same arguments over and over — it already has the result and just hasn't noticed it's repeating itself. This is different from "Stall detection" below: stall detection needs two full rounds (dispatch → review) to notice a stuck task, while the tool streak advisory watches the tool-call sequence **within a single round**, so it can warn before the judge even gets involved.
 
-判定依據是同工具、同一組**遮罩後**參數（沿用稽核紀錄本來就做過的機密遮罩）的連續呼叫次數，門檻與提醒逐級加重：
+The trigger is a run of consecutive calls to the same tool with the same **masked** arguments (reusing the secret-masking the audit trail already does), and the warning escalates by threshold:
 
-| 連續次數 | 提醒內容 |
+| Consecutive calls | Warning |
 |------|------|
-| 3 次 | 建議先重讀上一次的執行結果，確認是否已取得所需資訊，避免重複呼叫浪費輪次 |
-| 5 次 | 目前的做法可能沒有進展，建議換一個方法或角度切入 |
-| 8 次 | 強烈建議停止重複嘗試：直接收斂目前已取得的結果回報，或改用 `tasks_block` 說明受阻原因並求助 |
+| 3 | Suggests re-reading the last result to check whether the needed information is already there, before wasting another round repeating the call |
+| 5 | Notes the current approach may not be making progress, and suggests a different method or angle |
+| 8 | Strongly suggests stopping the repetition: wrap up whatever result is already available and report it, or call `tasks_block` to explain what's blocking and ask for help |
 
-提醒文字會注入**下一輪**派工的 `<state>` 區塊，零 LLM 成本、**純 advisory**——不會擋下、重試或否決任何一次工具呼叫或派工，是否要照做由 AI 員工自己判斷。提醒本身刻意排除在 `state_hash` 之外，不會干擾既有的（狀態, 行動）震盪偵測。
+The reminder is injected into the **next round's** `<state>` block, at zero LLM cost and **purely advisory**: it never blocks, retries, or vetoes a tool call or a dispatch round — whether to act on it is left to the AI employee. The reminder itself is deliberately excluded from `state_hash`, so it doesn't interfere with the existing (state, action) oscillation detection.
 
-設定 `config.toml [goal_loop] tool_streak_advisory`（預設 `true`）可整體關閉。
+`config.toml [goal_loop] tool_streak_advisory` (`true` by default) turns this off entirely when disabled.
 
 ---
 
-## AutonomyLevel 自主程度五級
+## AutonomyLevel: five levels of autonomy
 
-每個 AI 員工的自主程度由 `agent.toml [capabilities] autonomy_level` 一個刻度控制。未設定 / 無法解析 → 預設 **Approver**（保守：只有卡住或需人工才問你）。
+Each AI employee's autonomy level is controlled by a single dial: `agent.toml [capabilities] autonomy_level`. Unset or unparseable defaults to **Approver** (conservative: only asks you when it's stuck or needs a human).
 
-| 級別 | 行為 |
+| Level | Behavior |
 |------|------|
-| `operator` | 迴圈完全不自主驅動；任務建立後靜置，由人手動推進。 |
-| `collaborator` | 第一次派工前需人工核准（kickoff 審批），核准後自主重試到完成。 |
-| `consultant` | 同 collaborator 的 kickoff 審批。 |
-| `approver` | **預設**。無 kickoff 閘；卡住 / 需人工時才轉人工審批。 |
-| `observer` | 全自動；需人工時只通知、不等待（任務自動結束）。 |
+| `operator` | The loop never drives itself; a task sits idle after creation and a human advances it manually. |
+| `collaborator` | Needs human approval before the first dispatch (kickoff approval); once approved, it retries on its own until done. |
+| `consultant` | Same kickoff approval as collaborator. |
+| `approver` | **Default**. No kickoff gate; escalates to a human only when stuck or genuinely needing one. |
+| `observer` | Fully automatic; when it needs a human it only notifies, never waits (the task ends on its own). |
 
 ```toml
 # agent.toml
@@ -115,392 +115,376 @@ autonomy_level = "approver"
 
 ---
 
-## 階段性授權工具（scoped_tools，v1.41）
+## Task-scoped tool grants (scoped_tools, v1.41)
 
-高風險工具可以宣告為「持授權才可用」：列在 `scoped_tools` 的工具，AI 員工沒有拿到有效授權（grant）前一律拒絕，且授權只活在單一任務的生命週期內——任務結束（通過、駁回、轉人工、取消）時全部自動撤銷，不會殘留到下一件事。
+High-risk tools can be declared "usable only with a grant": a tool listed under `scoped_tools` is refused until the AI employee holds a valid grant, and a grant lives only for the lifetime of a single task — it's revoked automatically the moment that task ends (accepted, rejected, escalated to a human, or cancelled), never carrying over to the next one.
 
 ```toml
 # agent.toml
 [capabilities]
-scoped_tools = ["shared_wiki_delete", "odoo_execute"]  # 這些工具需逐任務授權
-grant_ttl_secs = 3600                                   # 授權硬性存活上限（秒），預設 3600
+scoped_tools = ["shared_wiki_delete", "odoo_execute"]  # these tools need a per-task grant
+grant_ttl_secs = 3600                                   # hard cap on how long a grant can live (seconds), default 3600
 ```
 
-取得授權的兩條路：
+Two ways to get a grant:
 
-1. **AI 員工自行申請**：呼叫 MCP 工具 `capability_request { tool, reason, task_id? }`，會轉成一則審批（與其他審批走同一個通知/儀表板介面）；你核准後授權生效，逾時未決視同拒絕。
-2. **目標任務開工時一併授予**：goal 任務的 tags 加 `grant:<工具名>`，kickoff 審批（collaborator/consultant 級）通過時原子性授予，任務結束自動收回。
+1. **The AI employee requests one itself**: calling the MCP tool `capability_request { tool, reason, task_id? }` turns into an approval request (through the same notification/dashboard flow as other approvals); once you approve it the grant takes effect, and an approval left undecided past its deadline counts as denied.
+2. **Granted at goal kickoff**: adding a `grant:<tool name>` tag to a goal task grants it atomically when the kickoff approval (collaborator/consultant level) is approved, and it's reclaimed automatically when the task ends.
 
-判定一律 fail-closed：授權資料庫讀不到就是沒有授權。未列入 `scoped_tools` 的工具完全不受影響。
+The check is always fail-closed: if the grant store can't be read, that's treated as no grant. Tools not listed under `scoped_tools` are completely unaffected.
 
 ---
 
-## 設定鍵
+## Configuration keys
 
-### `config.toml`（全域）
+### `config.toml` (global)
 
 ```toml
 [dispatch]
-enabled = true          # 啟用自主派工引擎（含 goal loop 驅動器）。預設 false
-policy = "fixed_hierarchy"  # 派工策略（選哪個 AI 員工接任務）。見下方「派工策略」。預設 fixed_hierarchy
-grounding_precheck_enabled = true  # 驗收前的證據落地預檢（見「證據落地預檢」）。預設 true
-two_stage_judge = true  # 驗收前先跑便宜的第一階段評估（見「兩段式驗收裁決」）。預設 true
-judge = "mav"           # 由誰做驗收裁決（見「換掉驗收判官」）。mav / evaluator_only / external / human_only。預設 mav
-admission = "queue"     # 子代理（ephemeral spawn）撞並發上限時的處置，"queue" 或 "fail"。預設 queue（見下方「ephemeral spawn 准入排隊」）
+enabled = true          # Enable the autonomous dispatch engine (includes the goal loop driver). Default false
+policy = "fixed_hierarchy"  # Dispatch policy (which AI employee picks up a task). See "Dispatch policy" below. Default fixed_hierarchy
+grounding_precheck_enabled = true  # Grounding precheck before acceptance (see "Grounding precheck"). Default true
+two_stage_judge = true  # Run a cheap first-stage evaluation before acceptance (see "Two-stage acceptance judging"). Default true
+judge = "mav"           # Who makes the acceptance call (see "Swapping the acceptance judge"). mav / evaluator_only / external / human_only. Default mav
+admission = "queue"     # What happens when ephemeral spawns hit the concurrency cap, "queue" or "fail". Default queue (see "Ephemeral spawn admission queueing" below)
 
-[task_forward_model]    # 任務層前瞻模型（見同名章節）。預設整組關閉
+[task_forward_model]    # Task-level forward model (see the section of the same name). Off entirely by default
 enabled = false
 
 [goal_loop]
-iteration_cap = 8        # 困難目標的硬性派工上限，超過 → 轉人工。預設 8
-iteration_cap_simple = 3 # 簡單目標的派工上限（動態判官深度）。預設 3
-wall_clock_hours = 24    # 從建立起算的牆鐘預算（小時），超過 → 轉人工。預設 24
-max_concurrent = 3       # 同時在飛的目標任務上限（防 spawn 風暴）。預設 3
-tick_secs = 30           # 驅動器輪詢週期（秒）。預設 30
-stalled_secs = 600       # 派工後未被認領視為停滯、可重派的秒數。預設 600
-planner_enabled = false  # 開啟後允許把目標拆成帶依賴的子任務 DAG（見「平行子任務」）。預設 false
-resume_on_restart = "pause"  # gateway 重啟時 in-flight 目標任務的處置，"auto" 或 "pause"（見「重啟行為」）。預設 pause，可在儀表板「設定 → 自動化」切換
-progress_report_minutes = 10  # 已認領任務多久沒進度訊號才通報一次，`0` 關閉（見「逾時進度通報」）。預設 10
-tool_streak_advisory = true   # 同工具同參數連擊 3/5/8 次時是否注入提醒（見「工具連擊 advisory」）。預設 true
+iteration_cap = 5        # Hard dispatch cap for hard goals; escalates to a human past this. Default 5
+iteration_cap_simple = 3 # Dispatch cap for simple goals (dynamic judge depth). Default 3
+wall_clock_hours = 24    # Wall-clock budget from creation (hours); escalates to a human past this. Default 24
+max_concurrent = 3       # Cap on goal tasks in flight at once (prevents a spawn storm). Default 3
+tick_secs = 30           # Driver polling interval (seconds). Default 30
+stalled_secs = 600       # Seconds after dispatch with no claim before a task counts as stalled and can be redispatched. Default 600
+planner_enabled = false  # When on, allows splitting a goal into a dependency DAG of subtasks (see "Parallel subtasks"). Default false
+resume_on_restart = "pause"  # What happens to in-flight goal tasks on gateway restart, "auto" or "pause" (see "Restart behavior"). Default pause, switchable under Settings → Automation on the dashboard
+progress_report_minutes = 10  # How long a claimed task can go without a progress signal before one report fires; `0` disables it (see "Stall-timeout progress reports"). Default 10
+tool_streak_advisory = true   # Whether to inject a reminder at 3/5/8 consecutive calls to the same tool with the same arguments (see "Tool streak advisory"). Default true
 
-[dispatch_guard]        # 回饋路徑斷路器（防再生型無限迴圈）
-window_secs = 60        # 滑動窗長度（秒）。預設 60
-max_in_window = 20      # 一個窗內允許的派工次數，超過即熔斷。預設 20
-cooldown_secs = 60      # 熔斷後拒絕派工的冷卻秒數。預設 60
-max_hop_depth = 5       # 委派鏈跨行程 re-spawn 的深度上限。預設 5
+[dispatch_guard]        # Feedback-path circuit breaker (guards against self-reinforcing loops)
+window_secs = 60        # Sliding window length (seconds). Default 60
+max_in_window = 20      # Dispatches allowed within one window before tripping. Default 20
+cooldown_secs = 60      # Cooldown seconds after tripping, during which dispatch is refused. Default 60
+max_hop_depth = 5       # Cap on cross-process re-spawn depth along a delegation chain. Default 5
 ```
 
-所有區塊都可省略；缺省 / 部分設定一律退回上表的內建預設。未知的 `policy` 值一律退回 `fixed_hierarchy` 並記一筆警告。
+All blocks are optional; anything missing or partially set falls back to the built-in defaults above. An unrecognized `policy` value always falls back to `fixed_hierarchy`, logging a warning.
 
 ---
 
-## 平行子任務（依賴 DAG）
+## Parallel subtasks (dependency DAG)
 
-開啟 `[goal_loop] planner_enabled = true` 後，建立目標時會先讓 AI 員工「試著」把目標拆成一組帶依賴標注的子任務（例如：先各自查兩個資料源、再彙整）。拆出來的子任務會各自進 Task Board，`depends_on` 全部完成的子任務會**並行**開跑，各自獨立驗收。並行度仍受 `max_concurrent` 與 `dispatch_guard` 斷路器約束，不會繞過。
+With `[goal_loop] planner_enabled = true`, creating a goal first lets the AI employee "try" splitting it into a set of subtasks annotated with dependencies (for example: query two data sources independently, then merge). The resulting subtasks each land on the Task Board, and any subtask whose `depends_on` list is fully satisfied runs **in parallel**, each checked for acceptance independently. Parallelism is still bounded by `max_concurrent` and the `dispatch_guard` circuit breaker — it never bypasses them.
 
-- **非強制**：模型判斷不需要拆（或回覆無法解析）時，就退回單一任務，行為與關閉時完全一致。
-- **循環依賴防護**：拆出來的計畫若含循環依賴（或索引越界），整份計畫作廢、退回單一任務並記警告——絕不落地一個壞掉的 DAG。
-- **上游卡住不孤兒化**：某個子任務的上游依賴走到 `failed` / `cancelled` / `needs_human`（或依賴不存在），下游會**繼承升級**一起轉人工，讓你看到整條被卡住的分支；上游只是還在跑時，下游該輪凍結、下一輪再看。
+- **Not mandatory**: when the model decides a split isn't needed (or its reply can't be parsed), it falls back to a single task, behaving exactly as if the setting were off.
+- **Cycle protection**: if the resulting plan has a dependency cycle (or an out-of-range index), the whole plan is discarded, falls back to a single task, and a warning is logged. A broken DAG is never allowed to land.
+- **A stuck upstream never orphans its downstream**: if a subtask's upstream dependency lands in `failed` / `cancelled` / `needs_human` (or the dependency doesn't exist), the downstream **inherits the escalation** and also moves to needs-human, so you see the whole stuck branch at once. If the upstream is simply still running, the downstream is frozen for that round and reconsidered the next one.
 
-預期效益以「多資料源查詢型」目標最大；獨立重測顯示加速約 1.25 倍（非論文自報的 3.7 倍），請以 eval 實測為準再推廣。
+The expected payoff is greatest for "multi-source lookup" style goals; an independent re-test measured roughly a 1.25x speedup (not the 3.7x a paper self-reported) — treat eval measurements as the source of truth before generalizing.
 
 ---
 
-## 派工策略（DispatchPolicy）
+## Dispatch policy (DispatchPolicy)
 
-`[dispatch] policy` 決定「選哪個 AI 員工接一項目標任務」。預設 `fixed_hierarchy` 的行為與過去完全相同（派給任務原本指派的員工）。
+`[dispatch] policy` decides which AI employee picks up a goal task. The default `fixed_hierarchy` behaves exactly as before (dispatches to whoever the task was already assigned to).
 
-| 策略 | 行為 |
+| Policy | Behavior |
 |------|------|
-| `fixed_hierarchy` | **預設**。派給任務原本的 `assigned_to`，不改動。零 LLM 成本、完全確定性。 |
-| `round_robin` | 依「任務類別」（有標籤取第一個標籤，否則取優先級）在員工名冊中輪詢分派。狀態僅存記憶體，重啟即從頭。 |
-| `llm_select` | 由工具用 LLM 從名冊挑最合適的員工。**失敗關閉**：輸出不在名冊內、或解析/LLM 失敗，一律退回 `fixed_hierarchy` 的結果，絕不派給捏造的員工。不硬編碼任何模型名（走設定的工具用 runtime）。 |
+| `fixed_hierarchy` | **Default**. Dispatches to the task's existing `assigned_to`, unchanged. Zero LLM cost, fully deterministic. |
+| `round_robin` | Rotates through the roster by "task category" (the first tag if any, otherwise priority). State lives in memory only, resetting on restart. |
+| `llm_select` | An LLM picks the best-fitting AI employee from the roster via a tool call. **Fails closed**: if the output isn't on the roster, or parsing/the LLM call fails, it always falls back to the `fixed_hierarchy` result, never dispatching to a made-up AI employee. No model name is hardcoded; it uses whatever utility runtime is configured. |
 
-名冊 = `<home>/agents/` 下的員工目錄。名冊為空時，`round_robin` / `llm_select` 都退回原指派（不孤兒化）。改派會寫回任務的 `assigned_to`，讓 heartbeat 拉取與活動記錄一致。
+Roster = the AI employee directories under `<home>/agents/`. When the roster is empty, both `round_robin` and `llm_select` fall back to the original assignment (never orphaning a task). A reassignment writes back to the task's `assigned_to`, so heartbeat pulls and the activity log stay consistent.
 
 ---
 
-## 子代理准入排隊（ephemeral spawn admission）
+## Ephemeral spawn admission queueing
 
-目標拆解、委派等路徑有時會需要開一個短命的子代理（ephemeral spawn）。撞到並發上限（`ephemeral_max_active`，預設 32）時，`config.toml [dispatch] admission` 決定怎麼處理這次超限請求：
+Goal decomposition, delegation, and similar paths sometimes need to spin up a short-lived sub-agent (an ephemeral spawn). When that hits the concurrency cap (`ephemeral_max_active`, 32 by default), `config.toml [dispatch] admission` decides how to handle the request that pushed it over the limit:
 
-| 值 | 行為 |
+| Value | Behavior |
 |------|------|
-| `queue` | **預設**。有界 FIFO 排隊——請求不會憑空消失，等有空位釋放就依序執行。每張排隊券帶 TTL（`queue_item_ttl_secs`，預設 600 秒），逾期直接丟棄並記一筆稽核；佇列本身有深度上限（`queue_max_depth`，預設 64），滿了就明確拒絕（避免無界佇列本身變成新的失控風險）。發起請求的 turn／session 結束時，屬於它的排隊券會一併作廢，不會讓一個早就結束的流程突然冒出遲到的子代理。 |
-| `fail` | 舊行為：超限直接拒絕，不排隊。 |
+| `queue` | **Default**. Bounded FIFO queueing: a request never simply vanishes, it runs once a slot frees up, in order. Each queued ticket carries a TTL (`queue_item_ttl_secs`, 600 seconds by default); past that it's dropped and an audit entry is logged. The queue itself has a depth cap (`queue_max_depth`, 64 by default), and a full queue rejects outright (so an unbounded queue can't itself become a new runaway risk). When the turn/session that made the request ends, its queued tickets are voided along with it, so a process that has already finished can't suddenly spawn a late sub-agent. |
+| `fail` | The old behavior: refuse outright past the cap, no queueing. |
 
-`ephemeral_max_active` 本身遵守「可調但不可為 0」——設成 `0` 會被鉗到 `1` 並記一筆警告，並發上限永遠不能被設定成完全關閉。
+`ephemeral_max_active` itself follows "adjustable, but never zero": setting it to `0` clamps it to `1` and logs a warning. The concurrency cap can never be turned fully off.
 
 ```toml
 # config.toml
 [dispatch]
-admission = "queue"           # "queue"（預設）或 "fail"
-queue_max_depth = 64          # 佇列深度上限，超過即拒絕
-queue_item_ttl_secs = 600     # 排隊券存活秒數，逾期丟棄並稽核
-ephemeral_max_active = 32     # 並發上限，0 會被鉗到 1
+admission = "queue"           # "queue" (default) or "fail"
+queue_max_depth = 64          # queue depth cap, rejects past this
+queue_item_ttl_secs = 600     # seconds a queued ticket survives before being dropped and audited
+ephemeral_max_active = 32     # concurrency cap, 0 gets clamped to 1
 ```
 
 ---
 
-## 結構化產出驗收（outcome schema，WP2.4）
+## Structured outcome verification (outcome schema, WP2.4)
 
-`/goal … || outcome:<spec>` 讓你在自由文字的驗收標準之外，再加一層**機器可校驗**的產出契約。當 AI 員工回報完成、任務進入 `review` 時，這層契約會在**驗收判官（LLM）之前**先跑一次 **deterministic、零 LLM 成本**的校驗：
+`/goal … || outcome:<spec>` lets you add a **machine-checkable** deliverable contract on top of free-text acceptance criteria. When the AI employee reports it's done and the task enters `review`, this contract runs a **deterministic, zero-LLM-cost** check **before the acceptance judge**:
 
-- **校驗不通過** → 任務直接退回 `revising`，回饋訊息帶具體缺陷（缺哪個欄位、少哪個檔），**完全不呼叫判官**。這是擋判官假陽性的防線：結構上明顯不合格的產出，不會被過度寬鬆的判官放行，也不浪費一次判官 LLM call。
-- **校驗通過** → 才進判官，且判官 prompt 會附上「結構化產出驗收已通過 deterministic 校驗」的註記，讓判官專注在品質面向。
+- **Check fails** → the task goes straight back to `revising` with feedback naming the specific gap (which field is missing, which file is missing), **without calling the judge at all**. This is a defense against judge false positives: an output with an obvious structural defect never gets waved through by an over-lenient judge, and no judge call is wasted on it.
+- **Check passes** → only then does it reach the judge, and the judge's prompt gets a note that "structured outcome verification already passed its deterministic check," so the judge can focus on quality.
 
-三種 spec 型別：
+Three spec types:
 
-| spec | 意義 |
+| Spec | Meaning |
 |------|------|
-| `outcome:text` | 預設。無結構化契約，行為與未加 outcome 時完全一致（不持久化、判官前不跑任何校驗）。 |
-| `outcome:json:<JSON Schema>` | JSON Schema 子集（`object` / `array` / `string` / `number` / `integer` / `boolean`，支援 `properties` / `required` / `items`）。校驗 AI 員工最終回覆中的 ` ```json ` 區塊（找不到 fenced 區塊則退而解析整段回覆）。缺欄位 / 型別不符都會列成具體缺陷。 |
-| `outcome:files:<glob,glob>` | 斷言 AI 員工工作目錄下有符合每個 glob 的產出檔（支援 `*`／`?`）。例：`outcome:files:report.docx, out/*.pdf`。 |
+| `outcome:text` | Default. No structured contract; behaves exactly as if no outcome were attached (not persisted, no check runs before the judge). |
+| `outcome:json:<JSON Schema>` | A subset of JSON Schema (`object` / `array` / `string` / `number` / `integer` / `boolean`, supporting `properties` / `required` / `items`). Checks the ` ```json ` block in the AI employee's final reply (falling back to parsing the whole reply if no fenced block is found). Missing fields or type mismatches are all listed as specific defects. |
+| `outcome:files:<glob,glob>` | Asserts that a deliverable file matching each glob (`*`/`?` supported) exists under the AI employee's working directory. Example: `outcome:files:report.docx, out/*.pdf`. |
 
-**範例**
+**Example**
 
 ```
-/goal 匯出這季營收數字 || outcome:json:{"type":"object","required":["revenue","month"],"properties":{"revenue":{"type":"number"},"month":{"type":"string"}}}
-/goal 產出季報並存檔 || 需含營收圖表 || outcome:files:report.docx,charts/*.png
+/goal Export this quarter's revenue numbers || outcome:json:{"type":"object","required":["revenue","month"],"properties":{"revenue":{"type":"number"},"month":{"type":"string"}}}
+/goal Produce and save the quarterly report || Must include a revenue chart || outcome:files:report.docx,charts/*.png
 ```
 
-**界線與 fail-closed 行為：**
+**Boundaries and fail-closed behavior:**
 
-- **路徑穿越拒絕**：`files:` 的 glob 若是絕對路徑、家目錄（`~`）、或含 `..` 上層目錄，一律在 `/goal` 建立時就拒絕（fail-closed，任務不建立），校驗時再擋一次。工作目錄基準是 `<home>/agents/<agent>/`。
-- **畸形 spec 拒絕**：`json:` 不是合法 JSON 物件、`files:` 空清單、未知型別前綴 → `/goal` 直接回錯誤、不建立任務（不會靜默降級成 text）。
-- **持久化**：spec 以單一 `outcome:<base64url>` 標籤存在任務既有的 `tags` 欄位（base64url 不含逗號，不與標籤分隔衝突），**不改資料庫 schema**。`text` 不持久化。
-- **與 planner 的關係**：設了 outcome spec 時會略過 `planner_enabled` 的子任務拆分——結構化契約針對單一最終交付物，不套用到每個被拆出的子任務。
-- **判官仍是後盾**：標籤若毀損無法解碼，deterministic 校驗跳過、直接交給判官（判官照樣把關），不會因為觀測性缺口而卡住任務。
+- **Path traversal is refused**: a `files:` glob that's an absolute path, a home directory (`~`), or contains a parent-directory `..` is refused right when `/goal` is created (fail-closed, the task is never created), and checked again at verification time. The working-directory baseline is `<home>/agents/<agent>/`.
+- **Malformed specs are refused**: `json:` that isn't a valid JSON object, an empty `files:` list, or an unrecognized type prefix all make `/goal` return an error immediately, with no task created (never silently degrading to plain text).
+- **Persistence**: the spec is stored as a single `outcome:<base64url>` tag on the task's existing `tags` field (base64url contains no commas, so it can't collide with tag separation), with **no database schema change**. `text` isn't persisted at all.
+- **Relationship to the planner**: setting an outcome spec skips `planner_enabled` subtask decomposition. A structured contract targets a single final deliverable, not each subtask that would otherwise be split out.
+- **The judge is still the backstop**: if the tag is corrupted and can't be decoded, the deterministic check is skipped and it goes straight to the judge (which still gates it as usual). A task is never left stuck because of an observability gap.
 
-## 證據落地預檢（grounding precheck，v1.53）
+## Grounding precheck (v1.53)
 
-AI 員工回報完成、任務進入驗收時，在呼叫驗收判官之前會先跑一道零 LLM 的
-證據預檢：把最終回覆與這次任務實際的工具執行紀錄（稽核日誌裡的工具結果）
-比對。回覆若宣稱查到了什麼、做了什麼，卻找不到任何一段與真實工具結果重疊
-的內容，就直接退回修正，不燒判官。兩個防偽細節：
+When the AI employee reports completion and a task enters review, before the acceptance judge is called it runs a zero-LLM grounding precheck: it compares the final reply against the actual tool-execution record for this task (tool results in the audit log). If the reply claims to have found or done something with no overlapping content in any real tool result, it goes straight back for revision without spending a judge call. Two anti-spoofing details:
 
-- **自我回音不算證據**：像 `tasks_complete` 這類會把 AI 員工自己寫的摘要
-  原樣回傳的工具，列在排除名單上，不能拿自己的話證明自己。
-- **自己餵進去的不算**：AI 員工放進工具呼叫參數裡的文字會從證據中扣除，
-  只有工具真正回傳的內容才算數。
+- **Self-echo doesn't count as evidence**: tools like `tasks_complete`, which echo back the AI employee's own summary verbatim, are on an exclusion list — an AI employee can't use its own words to prove itself.
+- **What it fed in doesn't count either**: text the AI employee itself put into a tool call's arguments is subtracted from the evidence; only what a tool actually returned counts.
 
-`config.toml [dispatch] grounding_precheck_enabled = false` 可關閉。沒有
-任何工具紀錄可比對時（例如純對話型任務），預檢會跳過（Skip），不誤傷。
+`config.toml [dispatch] grounding_precheck_enabled = false` turns this off. When there's no tool record to compare against at all (a purely conversational task, for example), the precheck is skipped (Skip) rather than penalizing the task.
 
 ---
 
-## 任務層前瞻模型（task forward model，v1.53，預設關閉）
+## Task forward model (v1.53, default off)
 
-開啟後，goal loop 在每次派工前會依過往同類任務的統計先「預測」這次執行
-大概會如何（會不會失敗、大概動用哪些工具類別），執行結束後把預測與實際
-觀察比對並記錄成轉移，讓系統對「做這類事會發生什麼」累積出任務層的世界
-模型。所有 runtime（claude / codex / gemini / openai-compat）通用：
+When enabled, before each dispatch the goal loop "predicts" how the run will likely go, based on statistics from past tasks of the same kind (whether it'll fail, roughly which tool categories it'll use). After execution, it compares the prediction against the actual observation and records it as a transition, so the system builds up a task-level world model of "what tends to happen when doing this kind of thing." Works across every runtime (claude / codex / gemini / openai-compat):
 
-- **預測分層退化**：有同類統計用統計、沒有就用整體邊際、再沒有用先驗
-  預設值，冷啟動不花任何 LLM 費用。
-- **觀察誠實分級**：每筆觀察都標記證據保真度（原生工具事件 / 只有稽核
-  日誌 / 無證據），不會把「沒看到」當成「沒發生」。
-- **`<state>` 狀態區塊**：任務進行中，提示裡會注入一個結構化的目前狀態
-  區塊，AI 員工可透過回覆中的狀態更新標籤修訂它；搭配（狀態, 行動）訪問
-  圖，同一狀態重複做同一動作兩次以上會提早轉人工（震盪偵測）。
-- **預示警告**：預測顯示這次派工大機率失敗時，派工提示會附上警告脈絡，
-  但不直接擋下（預測是輔助，不是閘門）。
-- **任務規則歸納**：同型轉移重複出現時，以確定性模板歸納成任務規則注入
-  後續提示（上限 2 條），與其他學習規則共用同一套 helpful/harmful
-  生命週期，表現不好會自動退休。
+- **Layered prediction fallback**: uses matching statistics when available, falls back to overall marginal statistics, then a prior default. Cold start never spends an LLM call.
+- **Honest fidelity grading**: every observation is tagged with its evidence fidelity (native tool events / audit-log-only / no evidence), so "we didn't see it" is never conflated with "it didn't happen."
+- **The `<state>` block**: while a task is running, the prompt gets an injected structured current-state block, which the AI employee can revise via a state-update tag in its reply; paired with a (state, action) visit graph, repeating the same action from the same state more than once escalates early to a human (oscillation detection).
+- **Foresight warnings**: when the prediction says this dispatch is likely to fail, the dispatch prompt gets a warning note attached, but nothing is blocked outright (the prediction assists, it isn't a gate).
+- **Task rule induction**: when the same kind of transition repeats, it's distilled into a deterministic-template task rule injected into future prompts (capped at 2), sharing the same helpful/harmful lifecycle as other learned rules — an underperforming rule retires on its own.
 
 ```toml
 # config.toml
 [task_forward_model]
-enabled = false   # 預設關閉；開啟後整套 predict-act-verify 生效
+enabled = false   # off by default; enabling it activates the full predict-act-verify pipeline
 ```
 
 ---
 
-## 兩段式驗收裁決
+## Two-stage acceptance judging
 
-AI 員工回報完成、任務進入 `review` 之後，不是每次都直接燒一次完整的 MAV 判官團。先跑一個便宜很多的**第一階段評估**：無工具、單次 LLM 呼叫，只輸出三選一的 JSON 判定——
+After the AI employee reports completion and a task enters `review`, it doesn't automatically burn a full MAV judge-panel call every time. A much cheaper **first-stage evaluation** runs first: a single tool-free LLM call that outputs one of three JSON verdicts:
 
-| 判定 | 意思 | 後續動作 |
+| Verdict | Meaning | What happens next |
 |------|------|----------|
-| `continue` | 這輪還沒做完，但方向對 | 跳過 MAV，直接拿評估器給的下一步當回饋重新派工（計入迭代上限） |
-| `blocked` | 卡在外部阻礙（缺權限、缺資料、等第三方……） | 直接轉 `needs_human`，不必假裝走完一輪判官 |
-| `candidate_complete` | 看起來是完成候選 | 才進現行的 MAV 三面向判官團仔細核 |
+| `continue` | Not done this round, but on the right track | Skips MAV — the evaluator's next-step suggestion becomes the feedback for an immediate redispatch (counted against the iteration cap) |
+| `blocked` | Stuck on an external obstacle (missing permission, missing data, waiting on a third party…) | Goes straight to `needs_human`, with no pretense of finishing a judge round |
+| `candidate_complete` | Looks like a completion candidate | Only now does it reach the full three-aspect MAV judge panel for a careful check |
 
-**評估器出任何狀況（逾時、解析失敗、呼叫本身出錯）一律降級直接跑 MAV 判官**——絕不會因為第一階段故障就自動判過或自動判失敗，安全性與沒有這層時完全一樣。設定 `config.toml [dispatch] two_stage_judge`（預設 `true`）；設成 `false` 退回單段式、每輪都跑完整判官團的舊行為。
+**Any failure of the evaluator (timeout, parse failure, the call itself erroring out) always degrades to running the MAV judge directly**: a first-stage failure never auto-passes or auto-fails a task, and safety is identical to not having this layer at all. Set `config.toml [dispatch] two_stage_judge` (`true` by default); setting it to `false` reverts to the old single-stage behavior, running the full panel every round.
 
-## 換掉驗收判官
+## Swapping the acceptance judge
 
-「這件工作算不算完成」是整個平台唯一的放行權力點。預設由平台內建的 MAV 三面向判官團裁決，也可以換成別的實作，用 `config.toml [dispatch] judge` 指定：
+"Is this work actually done" is the platform's single point of release authority. By default, the built-in three-aspect MAV judge panel decides it, but you can swap in a different implementation via `config.toml [dispatch] judge`:
 
-| 值 | 誰來裁決 | 適用情境 |
+| Value | Who decides | When to use |
 |---|---|---|
-| `mav`（預設） | 第一階段評估器 → MAV 三面向判官團 | 一般情況 |
-| `evaluator_only` | 只跑第一階段評估器，`candidate_complete` 直接判過 | 省成本。**驗收強度明顯較弱**：只有一次無工具的便宜呼叫在把關，沒有判官團複核，通過的回饋會自我標註為低成本模式 |
-| `external` | 你自己的程式（`judge_command`） | 想接自家 CI、規則引擎、或第二個模型當判官 |
-| `human_only` | 沒有機器裁決，每個 `review` 任務都轉 `needs_human` | 高風險部署，要求每次交付都經人眼 |
+| `mav` (default) | First-stage evaluator → three-aspect MAV judge panel | The general case |
+| `evaluator_only` | Only the first-stage evaluator runs; `candidate_complete` passes directly | Cost savings. **Noticeably weaker verification**: a single tool-free call is the only gate, with no judge-panel review — a passing verdict self-labels as low-cost mode |
+| `external` | Your own program (`judge_command`) | Wiring in your own CI, a rules engine, or a second model as judge |
+| `human_only` | No machine verdict; every `review` task escalates to `needs_human` | High-risk deployments that require human eyes on every delivery |
 
-寫錯值不會靜默生效：gateway 會警告並回退 `mav`（四個選項裡驗收最嚴的一個）。這個設定每次裁決時重讀，跟 `two_stage_judge` 一樣改完即生效，不必重啟。
+A bad value doesn't quietly take effect: the gateway warns and falls back to `mav` (the strictest of the four options). This setting is re-read on every verdict, and just like `two_stage_judge`, changes take effect immediately without a restart.
 
-### 外部判官（`external`）
+### External judge (`external`)
 
 ```toml
 [dispatch]
 judge = "external"
 judge_command = ["/usr/local/bin/my-judge", "--strict"]
-judge_timeout_secs = 120   # 預設 120
+judge_timeout_secs = 120   # default 120
 ```
 
-平台會執行這支指令，把一份 JSON 從 stdin 餵進去：
+The platform runs this command, feeding a JSON document into stdin:
 
 ```json
 {
   "schema": "duduclaw.judge.v1",
-  "task": "任務描述（已含 <tool_activity> / <risk_boundary> 等區塊）",
-  "acceptance_criteria": "凍結的驗收標準基準",
-  "result": "AI 員工這輪的提交內容",
-  "tool_activity": "工具稽核摘要"
+  "task": "task description (already includes blocks like <tool_activity> / <risk_boundary>)",
+  "acceptance_criteria": "the frozen acceptance-criteria baseline",
+  "result": "the AI employee's submission this round",
+  "tool_activity": "audit summary of tool activity"
 }
 ```
 
-指令要在 stdout 印出一個 JSON 物件當裁決：
+The command prints a JSON object to stdout as its verdict:
 
 ```json
-{"pass": true, "feedback": "驗收條件逐項核對通過"}
+{"pass": true, "feedback": "Every acceptance item checked out"}
 ```
 
-`pass` 收 `true`/`false`，也收 `"pass"`/`"fail"` 字串；`feedback` 可省略。
+`pass` accepts `true`/`false`, as well as the strings `"pass"`/`"fail"`; `feedback` is optional.
 
-三件事值得先知道：
+Three things worth knowing up front:
 
-1. **外部判官出任何狀況都退回 MAV 判官團**，包含逾時、非零離開碼、stdout 不是合法 JSON、`judge_command` 沒設好。降級的方向永遠是變嚴，不會變成放行，每次降級都會寫進 `security_audit.jsonl`（`judge_seam_degraded`）。
-2. **它的輸出被當成不受信資料**。`feedback` 會進到下一輪派工的 prompt，所以會先過注入掃描並截斷；掃描擋下來時整份裁決作廢，改由 MAV 判官團決定。回饋文字前面會標上來源，你在任務時間軸上看得出哪一段話是外部判官說的。
-3. **`judge_command` 只能改檔案，不能從儀表板改**。它指定一支可執行檔，所以 `system.update_config` RPC 只收 `judge`（四個列舉值），不收 `judge_command` 與 `judge_timeout_secs`；AI 員工本身也寫不了 `~/.duduclaw/config.toml`。
+1. **Any failure of the external judge falls back to the MAV judge panel** — including a timeout, a nonzero exit code, stdout that isn't valid JSON, or `judge_command` not being configured. Degradation always moves toward being stricter, never toward waving something through, and every degradation is written to `security_audit.jsonl` (`judge_seam_degraded`).
+2. **Its output is treated as untrusted data.** `feedback` flows into the next dispatch round's prompt, so it's scanned for injection and truncated first; if the scan blocks it, the whole verdict is discarded and the MAV judge panel decides instead. The feedback text is prefixed with its source, so the task timeline shows which line came from the external judge.
+3. **`judge_command` can only be changed by editing a file, never from the dashboard.** It names an executable, so the `system.update_config` RPC only accepts `judge` (the four enum values), never `judge_command` or `judge_timeout_secs`; the AI employee itself has no write access to `~/.duduclaw/config.toml` either.
 
-想拿 `duduclaw eval` 當判官的話，直接把 `judge_command` 指向包一層 `duduclaw eval` 的腳本即可，不需要另一個模式。
+To use `duduclaw eval` as the judge, just point `judge_command` at a script that wraps `duduclaw eval`. No separate mode is needed.
 
-**子行程會繼承 gateway 的完整環境變數。** `judge_command` 是用平台的 process spawn 直接執行（`tokio::process::Command`），沒有做 `env_clear()` 或任何白名單過濾——你指定的判官程式看得到 gateway 行程當下的整組環境變數，這包含 gateway 用來呼叫 LLM 供應商、通道 API 的那些密鑰。這不是把資料傳給判官（判官吃的輸入只有上面那份 stdin JSON），而是判官程式本身有能力讀取這些環境變數（例如惡意或寫壞的程式去讀 `std::env::vars()`）。這不是漏洞，是這個 seam 目前的設計取捨：**只指向你自己信任、來源清楚的程式**，不要指向第三方或未經審查的執行檔；需要更嚴格隔離（例如判官行程完全看不到 gateway 密鑰）的話，把 `judge_command` 包成一支先自行清空環境變數、再重新注入判官實際需要的少數變數的 wrapper 腳本。
+**The subprocess inherits the gateway's full environment.** `judge_command` runs directly through the platform's process-spawn path (`tokio::process::Command`), with no `env_clear()` and no allowlist filtering. Your judge program can see the gateway process's entire environment at the time it's called, including the secrets the gateway uses to call LLM providers and channel APIs. This doesn't mean data is actively handed to the judge (its only input is the stdin JSON shown above); the judge program simply has the *ability* to read those environment variables (for example, a malicious or buggy program reading `std::env::vars()`). This isn't a vulnerability — it's a design tradeoff of this seam today: **only point it at a program you trust and whose source you know**, never a third-party or unreviewed executable. If you need tighter isolation (a judge process that genuinely can't see the gateway's secrets), wrap `judge_command` in a script that clears its own environment first, then re-injects only the handful of variables the judge actually needs.
 
-## 驗收判官紀律
+## Acceptance judge discipline
 
-MAV 判官與第一階段評估器的 prompt 都內建幾條紀律，治的是「判官自己製造假駁回，讓正確的工作卡死」這個活測抓到過的失敗模式：
+Both the MAV judge and the first-stage evaluator have several rules baked into their prompts, targeting a failure mode caught in live testing: a judge inventing its own false rejections and permanently blocking correct work.
 
-- **反棘輪**：驗收標準沒變時，不能每一輪都挑一個新毛病出來——這是讓目標永遠無法完成的典型失敗模式。
-- **只稽核、不自建證據**：判官只能比對 AI 員工提交的證據與工具稽核摘要，不能自己想像、補寫證據，也不能拿「我覺得更好的做法」當標準。
-- **反契約外擴張**：驗收標準沒寫的事項不能被拿來當駁回理由——這是最常見的假駁回，也是明明做對、做在範圍內的工作卡住不前的頭號原因。
-- **agent 自稱完成不是證據**：「已完成」「已處理好」這類自述本身不構成通過理由，判官必須逐項比對驗收標準與實際產出。
+- **Anti-ratchet**: when acceptance criteria haven't changed, the judge can't pick a fresh nitpick every single round. This is the classic pattern that makes a goal impossible to ever finish.
+- **Audit only, never invent evidence**: the judge can only compare the AI employee's submitted evidence against the tool-audit summary; it can't imagine or fabricate evidence of its own, and it can't use "I think there's a better way to do this" as a standard.
+- **No scope creep in rejections**: something the acceptance criteria never mentioned can't be used as grounds for rejection. This is the most common false rejection, and the number one reason correct, in-scope work gets stuck.
+- **The agent's own claim of "done" isn't evidence**: self-reports like "already done" or "already handled" don't by themselves justify a pass; the judge must check the acceptance criteria against the actual output item by item.
 
-這幾條紀律沒有 config 開關，即刻套用到所有 goal 任務。
+These rules have no config switch — they apply immediately to every goal task.
 
-## 動態判官深度（MaAS）
+## Dynamic judge depth (MaAS)
 
-驗收判官的檢核面向數量會隨目標難度縮放，省下不必要的判官 LLM 成本：
+The number of aspects the acceptance judge checks scales with how hard the goal is, saving unnecessary judge LLM cost:
 
-- **簡單目標**（短、單步、無多步/研究/比較/部署/遷移等關鍵詞）：判官只查兩個面向 **correctness + safety**，派工上限用 `iteration_cap_simple`（預設 3）。
-- **困難目標**：完整三面向 MAV panel **correctness + completeness + safety**，派工上限用 `iteration_cap`（預設 8）。
+- **Simple goals** (short, single-step, no keywords like multi-step / research / comparison / deployment / migration): the judge checks only two aspects, **correctness + safety**, and the dispatch cap uses `iteration_cap_simple` (default 3).
+- **Hard goals**: the full three-aspect MAV panel — **correctness + completeness + safety** — with the dispatch cap using `iteration_cap` (default 5).
 
-**safety 面向在任何深度都保留**（失敗關閉精神）：降深度只裁掉 completeness 的細緻度，安全檢核永不裁撤。難度由本地零 LLM 啟發式（長度 + CJK-aware token 估算 + 關鍵詞）判定，判官深度與派工上限用的是同一套判定，兩者一致。
+**Safety is checked at every depth** (fail-closed by design): dropping depth only trims completeness granularity, and the safety check is never cut. Difficulty is judged by a local, zero-LLM heuristic (length + CJK-aware token estimate + keywords); the same judgment drives both judge depth and the dispatch cap, so the two always agree.
 
-### `agent.toml`（每個 AI 員工）
+### `agent.toml` (per AI employee)
 
 ```toml
 [capabilities]
 autonomy_level = "approver"
-irreversible_tools = ["send_email"]          # 一律需人工核准的不可逆工具
-maybe_irreversible_tools = ["Bash", "http_post"]  # 由 judge 判定是否需升人
+irreversible_tools = ["send_email"]          # irreversible tools that always need human approval
+maybe_irreversible_tools = ["Bash", "http_post"]  # the judge decides whether these need escalation
 ```
 
 ---
 
-## 停滯偵測：gap 指紋比對
+## Stall detection: gap fingerprint matching
 
-判斷「連續兩輪卡在同一個地方」不再只看駁回回饋是不是逐字相同。判官每次遣詞用字不一定一樣——「缺少 `goal_loop.rs:120` 的錯誤處理」跟「你忘記在 goal_loop.rs 第 120 行做驗證」講的是同一個 gap，但字串比對會判成兩件不同的事，讓真正卡住的訊號被措辭差異吃掉。
+Deciding "stuck in the same place two rounds in a row" no longer just checks whether the rejection feedback is word-for-word identical. The judge doesn't necessarily phrase things the same way each time — "missing error handling at `goal_loop.rs:120`" and "you forgot to add validation at goal_loop.rs line 120" describe the same gap, but a string comparison would treat them as two different things, letting real stuck-signals get lost in phrasing differences.
 
-現在改抽取駁回回饋裡的 `path:line` 引用與反引號包住的關鍵詞（函式名、變數名、錯誤代號），正規化後（暫存/scratch 路徑歸一成同一個佔位符、忽略大小寫、去重排序）組成一組指紋——同一個 gap 換句話說也會得到同一個指紋。完全抽不到任何引用或關鍵詞時（例如純敘述性的回饋），退回原本的逐字比對，行為相容。連續兩輪同指紋才觸發下面的 `needs_human`，門檻本身沒有變。
+Now it extracts `path:line` references and backtick-quoted keywords (function names, variable names, error codes) from the rejection feedback, normalizes them (scratch/temp paths collapse to the same placeholder, case-insensitive, deduplicated and sorted) into a fingerprint. The same gap, said differently, produces the same fingerprint. When no reference or keyword can be extracted at all (a purely descriptive piece of feedback, for example), it falls back to the original word-for-word comparison, staying behavior-compatible. Two rounds in a row with the same fingerprint trigger the `needs_human` escalation below; the threshold itself hasn't changed.
 
-## 提前收工偵測（bail detection）
+## Bail detection
 
-AI 員工在自主迴圈裡有時會用「聽起來像收尾、但其實沒有被判官驗證過」的話結束這一輪——「我先做到這裡好了」「請稍後再來查看結果」「已提交待審」「VERDICT: PASS」（自己簽的，不是判官簽的）之類。這些話本身不代表工作有錯，只是一種「流程上」的警訊，值得被記錄下來、也值得下一輪多留意一下。
+An AI employee in the autonomous loop sometimes ends a round with something that *sounds* like a wrap-up but was never actually verified by the judge: "I'll stop here for now," "please check back on the result later," "submitted for review," "VERDICT: PASS" (self-signed, not the judge's), and the like. None of these phrases by themselves mean the work is wrong; they're just a process-level signal worth recording and worth extra attention next round.
 
-九條 zh+en 正則只比對 agent 這一輪回覆的**最後一段非空文字**，命中任何一條會：
+Nine zh+en regex patterns check only the **last non-empty block of text** in the agent's reply for this round. A match:
 
-- 記一筆 Activity Feed 事件（`goal_loop.premature_stop_suspected`）
-- 累加 Prometheus 計數器 `goal_loop_bail_pattern_total{pattern="<命中的樣式名>"}`
-- 把提示帶進下一輪派工的 `<state>` 區塊、第一階段評估器的輸入、MAV 判官的輸入——一句中性提醒（「疑似提前收工，請確認任務是否真的完成」），不會替評估器或判官預先下判斷
+- Logs an Activity Feed event (`goal_loop.premature_stop_suspected`)
+- Increments the Prometheus counter `goal_loop_bail_pattern_total{pattern="<matched pattern name>"}`
+- Carries a hint into the next round's `<state>` block, the first-stage evaluator's input, and the MAV judge's input: a neutral note ("possible premature stop, please confirm whether the task is actually complete") that doesn't pre-judge for the evaluator or the judge
 
-這層偵測本身**不會**駁回、卡住或轉人工任何任務——純粹是訊號與提醒，實際要不要判過還是看評估器/判官對證據的判斷。
+This detection layer itself **never** rejects, blocks, or escalates a task. It's purely a signal and a reminder; whether it actually passes still comes down to the evaluator's/judge's read of the evidence.
 
-## 重啟行為（resume_on_restart）
+## Restart behavior (resume_on_restart)
 
-gateway 重啟或崩潰復原後，還在跑的目標任務預設會轉成 `needs_human`（`resume_on_restart = "pause"`，**預設值**）：gateway 每次開機時，會把所有非終態的 `goal_mode` 任務（`todo`/`pending`/`revising`/`in_progress`/`review`/`blocked`）轉成 `needs_human`（原因 `gateway_restart`），走既有的通道通知，等你按下「重試」才會繼續——一次非預期的行程重啟或部署，不會悄悄接著跑一個沒人重新確認過安全的目標。
+After a gateway restart or crash recovery, in-flight goal tasks default to escalating to `needs_human` (`resume_on_restart = "pause"`, **the default**): on every boot, the gateway moves every non-terminal `goal_mode` task (`todo`/`pending`/`revising`/`in_progress`/`review`/`blocked`) to `needs_human` (reason: `gateway_restart`), through the existing channel notification, and waits for you to press "Retry" before it continues. An unplanned process restart or deployment never quietly keeps running a goal that no one has re-confirmed as safe.
 
-想要接續原本更寬鬆的行為，把 `[goal_loop] resume_on_restart` 設成 `"auto"`：還在跑的目標任務會直接接續執行，就像行程從未中斷過一樣（這是這項設定出現前的唯一行為）。
+To keep the looser, original behavior, set `[goal_loop] resume_on_restart` to `"auto"`: in-flight goal tasks pick up right where they left off, as if the process had never been interrupted (this was the only behavior before this setting existed).
 
-不論哪個方向，這個檢查只在 gateway 開機時跑一次，設定熱重載（`system.update_config`）不會觸發它——變更只在下一次 gateway 真正重啟時生效。
+Either way, this check only runs once, at gateway boot; a config hot-reload (`system.update_config`) never triggers it. The change takes effect only on the next real gateway restart.
 
-**儀表板切換**：設定 → 自動化（Automation）分頁的「gateway 重啟後的進行中目標任務」下拉選單可直接切換，不必手動編輯 `config.toml`；`system.update_config` 只接受 `"auto"`/`"pause"` 兩個值，其餘一律拒絕。
-
----
-
-## needs_human 按鈕語意
-
-任務轉「需人工」時（達派工上限 / 牆鐘超時 / 連續兩輪駁回且 gap 指紋相同 / 驗收判官在重試預算耗盡時仍不通過 / 上游依賴子任務卡住而繼承升級 / `resume_on_restart = "pause"` 時 gateway 重啟），會推送四顆按鈕到 AI 員工的控制頻道。
-
-### 暫停原因分類（pause_reason）
-
-「需人工」不再是單一個桶子。除了既有的自由文字 `judge_feedback`（判官或評估器的完整回饋，可能好幾句話），每次轉人工的當下，同時會蓋上一個六選一的**封閉分類**——這是給你一眼分辨「這是什麼類型的卡住」用的，`judge_feedback` 才是逐句細節：
-
-| 分類 token | UI 文案 |
-|------|------|
-| `no_progress` | 卡住沒進展 |
-| `budget_exhausted` | 次數或時限用盡 |
-| `blocked_needs_decision` | 等你決策 |
-| `infra` | 系統問題 |
-| `restart` | 系統重啟後暫停 |
-| `unknown` | 需要人工確認 |
-
-分類在**觸發現場**靜態標記（每個轉人工的路徑各自標記自己的類別），絕不從 `judge_feedback` 的 LLM 敘述反解——模型自己的措辭不可靠、也不該被拿來當路由依據。未分類、遇到辨識不出的舊值，或這個欄位上線前就存在的舊任務，一律讀成 `unknown`（「需要人工確認」）：一個分不清類型的卡住，寧可讓你多看一眼，不能被誤判成一個看似明確、其實是猜的分類。
-
-顯示位置：`/goals` 看板卡片與任務詳情頁的分類 chip、通道 needs_human 審批訊息裡的「類型」一行（Observer 全自動模式的純通知也有）。任務被人工決定（重試 / 標記完成 / 放棄）後，分類欄會清空，不會殘留到下一次卡住。
-
-### 按鈕
-
-| 按鈕 | 動作 |
-|------|------|
-| 重試 | 任務回到待重試（`pending`），下一輪驅動器再派工。 |
-| 標記完成 | 直接標記完成（`done`）。 |
-| 放棄 | 取消任務（`cancelled`）。 |
-| 交給我 | 你接手處理，任務標記由你認領（`claimed_by`）；狀態**仍留在** `needs_human`，所以驅動器本就不會再自動派工（候選查詢只看 `todo`/`pending`/`revising`）——這是目前的實作範圍：停止自動重試＋標記＋收斂卡片。完整把對話控制權轉給你（讓後續訊息不再進 AI 判斷）是下一階段的功能，尚未實作。|
-
-一則訊息的主要動作上限 3 顆，四顆超過此限，因此「放棄」與「交給我」在有次要層級的通道上收進次級：Telegram 是第二排按鈕、Discord 是第二排按鈕、Slack 是原生的 `overflow` 選單；LINE 沒有對應的次要選單機制，這兩個動作不會出現在 LINE 的快速回覆按鈕上，改在訊息裡以文字說明並附儀表板連結。
-
-按鈕決策是**冪等且失敗關閉**的：重試/標記完成/放棄只會從 `needs_human` 狀態轉出，重複按或狀態已變一律無效（no-op）；「交給我」則沒有終態可比對，重複按（甚至換一位有權限的人按）就是重新蓋章認領，不會報錯。`collaborator` / `consultant` 的 kickoff 審批同理，逾時未決＝拒絕（fail-closed）。
-
-自 v1.53 起，轉人工的審批會附上一段**模擬預覽**（simulate-before-act）：若你選擇讓任務繼續，接下來三步大概會發生什麼。模擬產生有 15 秒上限，逾時就不附模擬、照常送出審批（不會因此卡住）；模擬引用的知識庫內容限唯讀 namespace，且模擬敘述本身不能決定某個動作是否可逆（不能自證安全）。儀表板審批卡片會渲染這段預覽。
-
-### 批准前查看變更
-
-模擬預覽講的是「如果放行，接下來可能發生什麼」；「變更」分頁講的是**已經發生了什麼**。儀表板的收件匣決策卡與任務詳情頁都多了一個「變更」分頁，列出這個任務歷輪實際動過的檔案：
-
-| 欄位 | 內容 |
-|------|------|
-| 路徑 | 被寫入／修改／刪除的檔案路徑；`指令` 類型顯示的是那道 shell 指令本身，不會假裝知道它碰了哪些檔案。可一鍵複製。 |
-| 操作 | 新建／覆寫、修改、刪除、指令四種。 |
-| 狀態 | 失敗或被攔截的呼叫也會列出並標記「未成功」——這正是即時查詢工具狀態看不到的那一半。 |
-| 摘要片段 | 寫入內容或指令說明的片段，直接沿用稽核紀錄的遮罩結果（不會為了顯示而重讀原始檔案）。 |
-| 來源 | 執行期工具事件（Write / Edit / NotebookEdit / Bash……）或 MCP 稽核紀錄（`shared_wiki_write` 等）。 |
-
-證據來自兩條既有軌跡：執行期的原生工具事件在每一輪派工後落成檔案變更紀錄（以任務 id 歸屬），MCP 稽核紀錄則沿用判官 `<tool_activity>` 同一套「認領→驗收時間窗＋執行者」歸屬。**查無就是查無**：沒有紀錄時分頁直接顯示「此任務沒有留下檔案變更紀錄」，不會用敘述硬湊。
-
-目前顯示的是「動過哪些檔案、動作是什麼」，還不是逐行的 before/after diff——真 diff 需要在寫入前留快照，屬後續項。
+**Dashboard toggle**: the "In-flight goal tasks on gateway restart (gateway 重啟後的進行中目標任務)" dropdown under Settings → Automation (設定 → 自動化) switches this directly, no need to hand-edit `config.toml`; `system.update_config` accepts only the two values `"auto"`/`"pause"`, rejecting anything else.
 
 ---
 
-## 「想一想」計畫模式（plan-first，I-1c）
+## needs_human button semantics
 
-儀表板的交辦面板除了「問一問」「交辦」，還有第三種模式「想一想」：先讓 AI 員工擬一份執行計畫給你看，你核准後才會真的開始做。
+When a task escalates to "needs a human" (hitting the dispatch cap / wall-clock timeout / two rejected rounds in a row with the same gap fingerprint / the acceptance judge still failing it once the retry budget runs out / an upstream dependency subtask stuck and escalating its inheritance / gateway restart while `resume_on_restart = "pause"`), four buttons are pushed to the AI employee's control channel.
 
-### 建立
+### Pause reason categories (pause_reason)
 
-選「想一想」送出時，前端一樣呼叫 `tasks.goal_create`，只是多帶一個 `plan_first: true`。後端在建立任務的當下（同步、非派工迴圈的一輪）呼叫工具用 LLM，依目標描述與驗收標準產出一份 3-8 條、純文字的執行計畫（不是 JSON，是給人看的敘述）。任務直接誕生在 `needs_human`——沿用既有的 `blocked_needs_decision`（「等你決策」）分類，沒有新增分類——核准前不會進入派工迴圈的候選查詢，所以連一輪都不會跑。
+"Needs a human" is no longer one single bucket. Alongside the existing free-text `judge_feedback` (the judge's or evaluator's full feedback, which can run several sentences), every escalation to a human is now also stamped with a **closed six-way category**. This is meant to give you an at-a-glance read on "what kind of stuck is this," while `judge_feedback` remains the sentence-by-sentence detail:
 
-### 核准與注入
+| Category token | UI text |
+|------|------|
+| `no_progress` | Stuck, no progress (卡住沒進展) |
+| `budget_exhausted` | Out of rounds or time (次數或時限用盡) |
+| `blocked_needs_decision` | Waiting on your decision (等你決策) |
+| `infra` | System problem (系統問題) |
+| `restart` | Paused after a restart (系統重啟後暫停) |
+| `unknown` | Needs a human to check (需要人工確認) |
 
-計畫文字同時寫進兩個地方：
+The category is stamped statically **at the point of the trigger** (each escalation path tags its own category), never reverse-engineered from `judge_feedback`'s LLM prose. A model's own wording isn't reliable and shouldn't be used to drive routing. Anything uncategorized, an unrecognized legacy value, or a task from before this field existed all read as `unknown` ("Needs a human to check"): a stuck task whose type can't be pinned down is better shown to you as ambiguous than misclassified as something specific that's really just a guess.
 
-- `judge_feedback`（既有欄位）——讓「等你決定」卡片、任務詳情頁、通道審批訊息不必改任何顯示邏輯就看得到計畫內容。
-- `plan_pending`（新欄位，I-1c 專用）——與 `judge_feedback` 分開存放，是因為核准動作本身（任何 `needs_human` 任務都通用的「重試」按鈕）會用你的核准備註覆寫 `judge_feedback`；若計畫也存在同一欄位，核准那一刻就會被自己的核准動作蓋掉，永遠傳不到第一輪派工。
+Where it shows up: the category chip on `/goals` board cards and the task-detail page, and a "Type" line in the channel's needs_human approval message (also present in Observer mode's automatic-only notification). Once a human decides the task (retry / mark complete / abandon), the category field clears and doesn't carry over into the next escalation.
 
-核准就是既有的「重試」按鈕，**沒有新增按鈕種類**。核准後任務轉回 `pending`，驅動器下一輪 tick 派工時，會把 `plan_pending` 的內容包成 `<execution_plan>` 區塊注入這一輪的工作提示，讓 AI 員工照計畫開始執行；注入後立刻清空 `plan_pending`，所以計畫只會被貼一次，不會每輪重複出現在提示裡。
+### Buttons
 
-計畫是指引，不是免驗收的保證——執行完成後仍要走與其他目標任務完全相同的兩段式驗收裁決／MAV 判官團，計畫寫的步驟被判官認定不夠、做錯，一樣會被打回重做。
+| Button | Action |
+|------|------|
+| Retry (重試) | The task goes back to pending retry (`pending`); the driver dispatches it again on the next round. |
+| Mark complete (標記完成) | Marks the task done (`done`) directly. |
+| Give up (放棄) | Cancels the task (`cancelled`). |
+| I'll take over (交給我) | You take over; the task is marked as claimed by you (`claimed_by`). Its status **stays** `needs_human`, so the driver already never auto-dispatches it again (the candidate query only looks at `todo`/`pending`/`revising`). That's the current scope of this feature: stop auto-retry, mark it, and collapse the card. Fully handing conversation control to you (so later messages stop reaching AI judgment) is a later-stage feature, not yet implemented. |
 
-### 規劃器失敗時
+A single message allows at most 3 primary actions; four buttons exceed that, so "Give up" and "I'll take over" fold into a secondary tier on channels that support one: a second row of buttons on Telegram, a second row on Discord, a native `overflow` menu on Slack. LINE has no equivalent secondary-menu mechanism, so these two actions don't appear among LINE's quick-reply buttons — they're described in the message text instead, with a dashboard link.
 
-呼叫工具用 LLM 產計畫的過程本身可能失敗（逾時、傳輸錯誤、或回覆整段空白）。這種情況任務照樣 fail-closed 停在 `needs_human`，但分類改成 `infra`（系統問題）而非 `blocked_needs_decision`，且不會帶 `plan_pending`——核准動作在這種任務上永遠只是把任務放行到「沒有計畫可注入」的第一輪，不會有計畫憑空消失或被悄悄跳過的情況。
+Button decisions are **idempotent and fail-closed**: Retry/Mark complete/Give up only transition a task out of `needs_human`; pressing one twice, or after the state has already changed, is a no-op. "I'll take over" has no terminal state to compare against, so pressing it again (even by a different authorized person) just re-stamps the claim; it never errors. Collaborator/consultant kickoff approvals work the same way: left undecided past its deadline counts as denied (fail-closed).
+
+Since v1.53, an escalation to a human comes with a **simulated preview** (simulate-before-act): if you choose to let the task continue, roughly what will happen over the next three steps. The simulation has a 15-second cap; on timeout it's skipped and the approval request goes out as normal (never blocking on it). Knowledge referenced by the simulation is limited to read-only namespaces, and the simulation's narrative can never decide on its own whether an action is reversible (no self-certification). The dashboard's approval card renders this preview.
+
+### Reviewing changes before approval
+
+The simulated preview covers "what might happen if this is allowed to continue"; the "Changes (變更)" tab covers **what has already happened**. Both the dashboard's inbox decision card and the task-detail page have a "Changes" tab listing every file this task has actually touched across its rounds:
+
+| Field | Content |
+|------|------|
+| Path | The path of the file created/modified/deleted; for a `command` type it shows the shell command itself, without pretending to know which files it touched. One-click copy. |
+| Operation | One of create/overwrite, edit, delete, or command. |
+| Status | Failed or blocked calls are also listed and flagged "Failed" — this is exactly the half a live tool-status query can't see. |
+| Summary excerpt | An excerpt of the written content or command description, reusing the audit trail's masked result as-is (it never re-reads the original file just to render this). |
+| Source | Either a native runtime tool event (Write / Edit / NotebookEdit / Bash…) or an MCP audit entry (`shared_wiki_write`, etc). |
+
+The evidence comes from two existing trails: native tool events from execution land as a file-change record after every dispatch round (attributed by task id), and MCP audit entries reuse the same "claim-to-review window plus executor" attribution the judge's `<tool_activity>` already relies on. **No record means no record**: when there's nothing, the tab shows "This task left no file-change record" rather than papering over it with a made-up narrative.
+
+What's shown today is which files were touched and what the operation was, not a line-by-line before/after diff yet. A real diff needs a snapshot taken before the write, which is a later item.
 
 ---
 
-## 終止保證
+## "Think it through" plan-first mode (I-1c)
 
-驅動器（而非模型）掌握硬邊界，卡住的目標不可能無限迴圈：完成訊號只認驗收判官核可（不信任 AI 自評「做完了」）；派工上限、牆鐘上限、並行上限、進度震盪偵測、回饋路徑斷路器各自獨立生效，任何一條踩線即轉人工或熔斷。
+Besides "Just ask (問一問)" and "Assign (交辦)," the dashboard's dispatch panel has a third mode, "Plan first (想一想)": the AI employee drafts an execution plan for you to review first, and only starts working once you approve it.
+
+### Creation
+
+Submitting with "Plan first" selected still calls `tasks.goal_create` on the frontend, just with an extra `plan_first: true`. The backend calls the utility LLM at task-creation time (synchronously, not a round of the dispatch loop) to produce a 3-8 item, plain-text execution plan from the goal description and acceptance criteria (not JSON — prose meant for a person to read). The task is born directly in `needs_human`, reusing the existing `blocked_needs_decision` ("Waiting on your decision") category with no new category added. Before approval it never enters the dispatch loop's candidate query, so not even one round runs.
+
+### Approval and injection
+
+The plan text is written to two places:
+
+- `judge_feedback` (an existing field): so the "waiting on your decision" card, the task-detail page, and the channel approval message can all show the plan content with no display-logic changes needed.
+- `plan_pending` (a new field, I-1c-specific): stored separately from `judge_feedback` because approving (the "Retry" button, generic to any `needs_human` task) overwrites `judge_feedback` with your approval note; if the plan lived in that same field, the moment you approved it, your own approval action would overwrite it, and it would never reach the first dispatch round.
+
+Approval is the existing "Retry" button — no new button type is added. Once approved, the task moves back to `pending`, and on the driver's next tick, `plan_pending`'s content is wrapped into an `<execution_plan>` block and injected into that round's work prompt, so the AI employee starts executing per the plan; `plan_pending` is cleared immediately after injection, so the plan is pasted in exactly once, never repeating in the prompt on later rounds.
+
+A plan is guidance, not a pass that skips acceptance. Once execution finishes it still goes through the exact same two-stage acceptance judging / MAV judge panel as any other goal task — if the judge decides the plan's steps weren't enough, or were wrong, it gets sent back for revision all the same.
+
+### When the planner fails
+
+The utility-LLM call that drafts the plan can itself fail (timeout, a transport error, or an entirely blank reply). In that case the task still fails closed and sits at `needs_human`, but with its category changed to `infra` (system problem) instead of `blocked_needs_decision`, and with no `plan_pending` attached. Approving a task like this only ever releases it into a first round with "no plan to inject," never a plan vanishing or being silently skipped.
+
+---
+
+## Termination guarantee
+
+The driver, not the model, owns the hard boundaries, so a stuck goal can never loop forever: only an acceptance judge's sign-off counts as a completion signal (the AI's own "I'm done" self-report is never trusted); the dispatch cap, wall-clock cap, concurrency cap, progress-oscillation detection, and the feedback-path circuit breaker each apply independently, and hitting any one of them triggers an escalation to a human or a trip of the breaker.

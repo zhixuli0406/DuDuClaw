@@ -177,7 +177,7 @@ This history serves multiple purposes:
 
 ### Zero-Downtime Evolution
 
-The agent never goes offline during a personality update. The atomic rename ensures a seamless transition — one moment the agent uses the old personality, the next moment it uses the new one. No restart, no gap, no partial state.
+The agent never goes offline during a personality update. The atomic rename makes the switch instantaneous: one moment the agent uses the old personality, the next moment it uses the new one. No restart, no gap, no partial state.
 
 ### Reversible by Default
 

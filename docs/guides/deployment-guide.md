@@ -1,10 +1,10 @@
-# DuDuClaw Deployment Guide
+# DuDuClaw deployment guide
 
 > Updated: 2026-03-30 | Version: v0.10.0
 
 ---
 
-## 1. Local Development
+## 1. Local development
 
 ```bash
 # Build
@@ -25,7 +25,7 @@ bind = "127.0.0.1"
 port = 18789
 ```
 
-### Health Check
+### Health check
 
 ```bash
 curl http://localhost:18789/health
@@ -37,7 +37,7 @@ curl http://localhost:18789/health/live   # 200 always (liveness probe)
 
 ---
 
-## 2. Tailscale Funnel (Recommended for LINE Webhook)
+## 2. Tailscale Funnel (recommended for LINE webhook)
 
 LINE Messaging API requires a **public HTTPS URL** for webhooks.
 Tailscale Funnel provides this without a VPS, static IP, or domain.
@@ -67,7 +67,7 @@ tailscale funnel 18789
 4. Enable "Use webhook"
 5. Verify by clicking "Verify" button
 
-### Persistent Funnel
+### Persistent funnel
 
 ```bash
 # Run as background service
@@ -79,7 +79,7 @@ tailscale funnel --bg 18789
 
 ---
 
-## 3. ngrok (Alternative)
+## 3. ngrok (alternative)
 
 ```bash
 # 1. Install
@@ -100,7 +100,7 @@ ngrok http 18789
 
 ---
 
-## 4. Cloudflare Tunnel (Long-term Stable)
+## 4. Cloudflare Tunnel (long-term stable)
 
 Best for production — free, stable URL, no port forwarding.
 
@@ -136,7 +136,7 @@ Set LINE Webhook: `https://duduclaw.yourdomain.com/webhook/line`
 
 ---
 
-## 5. Reverse Proxy (Caddy / Nginx)
+## 5. Reverse proxy (Caddy / Nginx)
 
 ### Caddy (auto TLS)
 
@@ -175,46 +175,58 @@ server {
 }
 ```
 
-### WebSocket Origin 白名單（反向代理 / tailnet 必讀）
+### WebSocket origin allowlist (required reading for reverse proxy / tailnet setups)
 
-Dashboard 的即時連線（WebSocket、WebChat）預設只接受來自
-loopback（`localhost` / `127.0.0.1` / `[::1]`）的瀏覽器 `Origin`。當你透過
-**反向代理網域**或 **Tailscale/tailnet 網址**開啟 dashboard 時，HTTP 頁面會正常
-載入，但 WebSocket 升級會被 403 擋掉、畫面持續轉圈圈。把對外網域加進白名單即可
-解決：
+By default, the dashboard's live connections (WebSocket, WebChat) only accept
+a browser `Origin` from loopback (`localhost` / `127.0.0.1` / `[::1]`). When you
+open the dashboard through a **reverse proxy domain** or a **Tailscale/tailnet
+address**, the HTTP page loads fine, but the WebSocket upgrade gets rejected
+with 403 and the screen spins forever. Add the external domain to the
+allowlist to fix it:
 
 ```toml
 # ~/.duduclaw/config.toml
 [gateway]
-# host、host:port，或含 scheme 的完整 origin 都可（載入時會正規化）
+# host, host:port, or a full origin with scheme all work (normalized on load)
 allowed_origins = ["duduclaw.yourdomain.com", "box.your-tailnet.ts.net"]
 ```
 
-或用環境變數（逗號分隔，與 config.toml 的清單**合併**，不是二選一）：
+Or via an environment variable (comma-separated, merged with the config.toml
+list rather than replacing it):
 
 ```bash
 DUDUCLAW_ALLOWED_ORIGINS="duduclaw.yourdomain.com,box.your-tailnet.ts.net"
 ```
 
-- 內建 loopback 三項永遠有效，不需列出；清單為空時行為與舊版完全一致。
-- 每個項目是**精確**的 host 或 host:port 比對，不支援萬用字元；port-less 項目
-  匹配該 host 的任意 port。後綴攻擊（`duduclaw.yourdomain.com.evil.com`）會被擋。
-- 啟動時會印一行 info log 列出生效的額外 origins，方便排錯。
-- 也可直接在 dashboard **設定 → 系統 → 遠端存取網址**新增／刪除，不必手改 config.toml；
-  **存檔即時生效，不用重開 gateway**（環境變數提供的項目仍會保留）。
+- The three built-in loopback entries are always allowed and don't need to be
+  listed; an empty list behaves exactly like older versions.
+- Each entry is an **exact** host or host:port match — no wildcards. A
+  port-less entry matches that host on any port. Suffix attacks
+  (`duduclaw.yourdomain.com.evil.com`) are rejected.
+- On startup the gateway logs one info line with the active extra origins, for
+  easier troubleshooting.
+- You can also add/remove entries directly from the dashboard under
+  **Settings → System → Remote access URLs**, without touching config.toml —
+  changes take effect immediately on save, no gateway restart needed
+  (entries from the environment variable are preserved either way).
 
-### 通道推播的儀表板深連結（`[dashboard] public_url`）
+### Dashboard deep links in channel push messages (`[dashboard] public_url`)
 
-當 AI 員工在 LINE／Telegram／Slack 等通道推播「請至儀表板處理」的訊息時，會附上一個
-可直接點擊的連結，直達該任務／審批的詳情頁（不是首頁）。這個連結怎麼組出來：
+When an AI employee pushes a "please handle this in the dashboard" message
+over LINE, Telegram, Slack, and similar channels, it attaches a clickable link
+that goes straight to that task's or approval's detail page (not the home
+page). Here's how that link gets built:
 
-1. 優先讀 `config.toml` 的 `[dashboard] public_url`（你對外的網域，例如透過反向代理
-   或 tailnet 開放時使用）；
-2. 沒有設定時，退化為 `http://localhost:<[gateway] port>`——僅在使用者跟 gateway
-   在同一台機器時才會真的打得開；
-3. 兩者都沒有 → 不附連結，訊息文字維持原樣（不會出現空連結）。
+1. It first reads `[dashboard] public_url` from `config.toml` (your external
+   domain — for example, the one exposed through a reverse proxy or tailnet);
+2. If that isn't set, it falls back to `http://localhost:<[gateway] port>`,
+   which only actually opens when the user is on the same machine as the
+   gateway;
+3. If neither is available, no link is attached — the message text stays as
+   is (no empty link appears).
 
-透過反向代理或 tailnet 對外開放 dashboard 時，建議設定 `public_url`：
+When you expose the dashboard externally through a reverse proxy or tailnet,
+set `public_url`:
 
 ```toml
 # ~/.duduclaw/config.toml
@@ -222,11 +234,13 @@ DUDUCLAW_ALLOWED_ORIGINS="duduclaw.yourdomain.com,box.your-tailnet.ts.net"
 public_url = "https://duduclaw.yourdomain.com"
 ```
 
-### Telegram 內的審批詳情卡（`[miniapp] enabled`，試作，預設關閉）
+### In-Telegram approval detail card (`[miniapp] enabled`, experimental, off by default)
 
-`public_url` 是 **https** 時，可以再打開一個試作功能：Telegram 的高風險動作核可卡片
-多一顆「🔎 查看詳情」，在對話裡直接展開完整說明、模擬後果與到期倒數，看完就地按同意
-或拒絕，不用切到瀏覽器。
+When `public_url` is **https**, you can turn on an experimental feature: the
+Telegram card for approving a high-risk action gains a "🔎 View details"
+button that expands the full explanation, a simulated outcome, and an
+expiry countdown right inside the chat — approve or reject on the spot,
+no browser switch needed.
 
 ```toml
 # ~/.duduclaw/config.toml
@@ -234,15 +248,17 @@ public_url = "https://duduclaw.yourdomain.com"
 enabled = true
 ```
 
-`public_url` 不是 https、或卡片送到群組（Telegram 規定這種按鈕只能在私訊出現）時，
-不會附這顆按鈕，卡片與沒開這個功能時完全相同。完整說明與安全模型見
-[docs/features/43-telegram-miniapp.md](../features/43-telegram-miniapp.md)。
+When `public_url` isn't https, or when the card is sent to a group (Telegram
+only allows this kind of button in private chats), the button is omitted and
+the card is identical to having the feature off. Full details and the
+security model are in
+[docs/features/43-telegram-miniapp.md](../features/43-telegram-miniapp.md).
 
 ---
 
 ## 6. Docker Compose
 
-> **→ 詳細版：** [docs/guides/docker.md](./docker.md) — 包含三大 CLI 認證設定、port 詳解、volume 備份、watchtower、疑難排解。
+> **→ Full guide:** [docs/guides/docker.md](./docker.md) — covers the three CLI auth setups, port details, volume backups, watchtower, and troubleshooting.
 
 ```bash
 cd /path/to/DuDuClaw
@@ -282,7 +298,7 @@ services:
 
 ---
 
-## 7. System Service (launchd / systemd)
+## 7. System service (launchd / systemd)
 
 ```bash
 # Install as system service (auto-detects OS)
@@ -318,7 +334,7 @@ Creates the `DuDuClaw` value under
 
 ---
 
-## 8. Auto-Update
+## 8. Auto-update
 
 The gateway checks GitHub Releases every 6 hours and the dashboard
 (Settings → Update) has a manual **Check / Install** flow. Both paths share
@@ -355,7 +371,7 @@ Notes by install method:
 
 ---
 
-## 9. Prometheus + Grafana Monitoring
+## 9. Prometheus + Grafana monitoring
 
 ### Prometheus scrape config
 
@@ -381,7 +397,7 @@ scrape_configs:
 | `duduclaw_failover_total` | Counter | Provider failover events |
 | `duduclaw_budget_remaining_cents` | Gauge | Remaining budget per account |
 
-### Grafana Dashboard
+### Grafana dashboard
 
 Import the following JSON into Grafana (Dashboards > Import):
 
@@ -400,7 +416,7 @@ Import the following JSON into Grafana (Dashboards > Import):
 }
 ```
 
-### Monitoring Quick Start
+### Monitoring quick start
 
 ```bash
 # docker-compose with monitoring
@@ -409,7 +425,7 @@ docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 
 ---
 
-## 10. Enterprise LAN Deployment (employee desktops → company gateway)
+## 10. Enterprise LAN deployment (employee desktops → company gateway)
 
 A common enterprise setup: run one gateway on a shared server and have each
 employee's **desktop app** connect to it over the office network. The desktop
@@ -499,7 +515,7 @@ addresses are accepted (fail-closed).
 
 ---
 
-## Quick Reference
+## Quick reference
 
 | Method | URL | Use Case |
 |--------|-----|----------|

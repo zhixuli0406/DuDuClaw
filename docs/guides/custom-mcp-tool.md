@@ -1,4 +1,4 @@
-# Custom MCP Tool Development Guide
+# Custom MCP tool development guide
 
 > How to add new tools to DuDuClaw's MCP Server
 > Applies to: v0.12.0+
@@ -19,7 +19,7 @@ DuDuClaw MCP Server (crates/duduclaw-cli/src/mcp.rs)
 Tool handlers (gateway, agent, memory, inference, etc.)
 ```
 
-## Step 1: Define the Tool
+## Step 1: Define the tool
 
 Add a new `ToolDef` entry to the `TOOLS` array in `crates/duduclaw-cli/src/mcp.rs`:
 
@@ -42,19 +42,19 @@ ToolDef {
 },
 ```
 
-### Naming Conventions
+### Naming conventions
 
 - Use `snake_case` for tool names
 - Group related tools with a common prefix: `odoo_*`, `model_*`, `cost_*`
 - Keep names concise but descriptive
 
-### Parameter Rules
+### Parameter rules
 
 - `required: true` — Claude Code must provide this parameter
 - `required: false` — optional, tool handler must supply a default
 - All parameters are passed as JSON values (`serde_json::Value`)
 
-## Step 2: Implement the Handler
+## Step 2: Implement the handler
 
 Add a match arm in the `handle_tool_call()` function:
 
@@ -75,7 +75,7 @@ Add a match arm in the `handle_tool_call()` function:
 }
 ```
 
-### Error Handling
+### Error handling
 
 Return errors as structured JSON, not panics:
 
@@ -92,7 +92,7 @@ if input.is_empty() {
 assert!(!input.is_empty());  // Never do this in a tool handler
 ```
 
-### Async Operations
+### Async operations
 
 All tool handlers run in a Tokio async context. Use `.await` for I/O:
 
@@ -110,9 +110,9 @@ All tool handlers run in a Tokio async context. Use `.await` for I/O:
 }
 ```
 
-## Step 3: Test the Tool
+## Step 3: Test the tool
 
-### Unit Test
+### Unit test
 
 Add a test in the same file or a dedicated test module:
 
@@ -137,7 +137,7 @@ mod tests {
 }
 ```
 
-### Manual Test with Claude Code
+### Manual test with Claude Code
 
 ```bash
 # Start the MCP server
@@ -161,13 +161,13 @@ Then configure Claude Code to use DuDuClaw as an MCP server:
 }
 ```
 
-## Step 4: Document the Tool
+## Step 4: Document the tool
 
 Add the tool to the tool listing in `crates/duduclaw-cli/src/mcp.rs` comments and update `docs/CLAUDE.md` if it represents a significant capability.
 
-## Patterns & Best Practices
+## Patterns & best practices
 
-### Accessing Agent State
+### Accessing agent state
 
 Most tools need access to agent config or state:
 
@@ -185,7 +185,7 @@ Most tools need access to agent config or state:
 }
 ```
 
-### Accessing Memory
+### Accessing memory
 
 ```rust
 "memory_tool" => {
@@ -206,7 +206,7 @@ Most tools need access to agent config or state:
 }
 ```
 
-### Rate Limiting
+### Rate limiting
 
 For tools that call external APIs, use rate limiting:
 
@@ -227,7 +227,7 @@ static LIMITER: OnceLock<RateLimiter> = OnceLock::new();
 }
 ```
 
-### Security Checklist
+### Security checklist
 
 Before merging a new tool:
 
@@ -252,9 +252,9 @@ spawn's `--allowedTools` / `--disallowedTools` flags, so a caller that talked
 to the MCP server directly (bypassing the CLI spawn) was unrestricted by
 them.
 
-## JSON-RPC Protocol Reference
+## JSON-RPC protocol reference
 
-### Request Format
+### Request format
 
 ```json
 {
@@ -271,7 +271,7 @@ them.
 }
 ```
 
-### Response Format (Success)
+### Response format (success)
 
 ```json
 {
@@ -288,7 +288,7 @@ them.
 }
 ```
 
-### Response Format (Error)
+### Response format (error)
 
 ```json
 {
@@ -301,7 +301,7 @@ them.
 }
 ```
 
-## Tool Categories
+## Tool categories
 
 When adding tools, follow the existing category naming:
 

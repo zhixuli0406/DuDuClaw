@@ -3,7 +3,7 @@
 > **Status**: Approved (2026-05-05)
 > **Decided by**: lizhixu (project owner)
 > **Discussion trigger**: 2026-05-05 端到端 Discord trace 揭露 4 個結構性問題
-> **Related**: [RFC-21 Identity Resolution](RFC-21-identity-credential-isolation.md), [TODO-gateway-revival-202605.md](../commercial/docs/TODO-gateway-revival-202605.md)
+> **Related**: [RFC-21 Identity Resolution](RFC-21-identity-credential-isolation.md), `TODO-gateway-revival-202605.md` (internal)
 
 ---
 
@@ -273,7 +273,7 @@ Dashboard 顯示「文中聲稱多 agent 共寫但實際只有單 agent caller�
 
 ## Reviewer Notes
 
-此 RFC 由 5/5 真實事件驅動，非紙上談兵。所有「現況」均有 log / db trace 為證據（見 [TODO-gateway-revival-202605.md](../commercial/docs/TODO-gateway-revival-202605.md) 的「端到端驗證」章節）。
+此 RFC 由 5/5 真實事件驅動，非紙上談兵。所有「現況」均有 log / db trace 為證據（見 `TODO-gateway-revival-202605.md` (internal) 的「端到端驗證」章節）。
 
 決策原則一旦寫入 RFC，後續所有 multi-agent 相關 PR 都需檢查是否符合本 RFC 規範。違反時應在 PR description 中明確說明 trade-off。
 

@@ -1,72 +1,88 @@
-# 錄製 → 技能（Recording to Skill）
+# Recording to skill
 
-把一次人工示範（瀏覽器操作或桌面操作）錄下來，蒸餾成一份可重放的 SKILL.md 草稿，
-經管理員審批後安裝成正式技能。適合「教 AI 員工一個查報表 / 填單 SOP」的場景。
+Record a single human demonstration (browser or desktop) and distill it into a
+replayable SKILL.md draft, which becomes a real skill once an admin approves it. Good
+fit for "show the AI employee how to pull a report" or "walk through a form-filling
+SOP" once, then let the agent replay it.
 
-## 前置條件
+## Prerequisites
 
-1. **啟用能力（預設關）**：在目標 agent 的 `agent.toml` 加上：
+1. **Enable the capability (off by default)**: add this to the target agent's
+   `agent.toml`:
 
    ```toml
    [capabilities]
    recording = true
    ```
 
-   沒開這個開關時，五個錄製工具在 MCP dispatch 入口一律被拒（fail-closed）。
-2. **MCP scope**：外部金鑰需帶 `recording` scope（內建 agent 的預設 principal 已含 Admin）。
-3. **瀏覽器錄製**需要 Node.js 與 playwright 模組：
+   Without this switch, all five recording tools are refused at the MCP dispatch entry
+   point (fail-closed).
+2. **MCP scope**: external keys need the `recording` scope (built-in agents' default
+   principal already includes Admin).
+3. **Browser recording** needs Node.js and the playwright module:
 
    ```bash
    npm install -g playwright
    npx playwright install chromium
    ```
 
-   找不到模組時可用環境變數指定：`DUDUCLAW_PLAYWRIGHT_NODE_PATH=/path/to/node_modules`、
-   `DUDUCLAW_NODE=/path/to/node`。
-4. **桌面錄製**目前僅支援 macOS，且需授予「螢幕錄製」權限
-   （系統設定 → 隱私權與安全性 → 螢幕錄製）。
+   If the module can't be found, point to it with environment variables:
+   `DUDUCLAW_PLAYWRIGHT_NODE_PATH=/path/to/node_modules`,
+   `DUDUCLAW_NODE=/path/to/node`.
+4. **Desktop recording** currently supports macOS only, and requires granting Screen
+   Recording permission (System Settings → Privacy & Security → Screen Recording).
 
-## 工具總覽
+## Tool overview
 
-| 工具 | 用途 |
+| Tool | Purpose |
 |------|------|
-| `browser_record_start(url, name?, headless?, max_seconds?)` | 開一個帶 tracing + HAR 的真實瀏覽器，人工示範流程 |
-| `browser_record_stop(id)` | 停止並落地 `trace.zip` / `session.har`（自動脫敏）/ `actions.json` |
-| `desktop_record_start(name?, max_seconds?)` | 桌面錄製：每秒截圖＋前景視窗標題（不記錄鍵入內容） |
-| `desktop_record_stop(id)` | 停止桌面錄製 |
-| `skill_from_recording(id, name?)` | 把錄製蒸餾成 SKILL.md 草稿並送審 |
+| `browser_record_start(url, name?, headless?, max_seconds?)` | Opens a real browser with tracing + HAR enabled for a human to demonstrate a workflow |
+| `browser_record_stop(id)` | Stops recording and writes `trace.zip` / `session.har` (auto-redacted) / `actions.json` |
+| `desktop_record_start(name?, max_seconds?)` | Desktop recording: one screenshot per second + the foreground window title (no keystroke logging) |
+| `desktop_record_stop(id)` | Stops desktop recording |
+| `skill_from_recording(id, name?)` | Distills a recording into a SKILL.md draft and submits it for approval |
 
-錄製檔落在 `~/.duduclaw/recordings/<id>/`（目錄權限 700），並有 30 分鐘
-（可調，上限 2 小時）自動停止的安全上限。
+Recordings land in `~/.duduclaw/recordings/<id>/` (directory permissions 700), with a
+30-minute (configurable, capped at 2 hours) automatic-stop safety limit.
 
-## 典型流程
+## Typical flow
 
-1. 對 agent 說「我示範一次查報表，你錄下來」→ agent 呼叫
-   `browser_record_start(url="https://erp.example.com", name="查月報 SOP")`。
-2. 人在開出來的瀏覽器視窗完成整個流程，關掉視窗或請 agent 呼叫
-   `browser_record_stop(id)`。
-3. agent 呼叫 `skill_from_recording(id)`：
-   - 解析脫敏後的 HAR（非靜態資源的 API 呼叫：method / URL / body 骨架）
-     ＋ UI 操作序列，交給 LLM 蒸餾成 SKILL.md
-     （frontmatter 含 `name` / `trigger` / `skill_type` / `requires_env`）。
-   - 先過確定性安全掃描（含 prompt-injection 規則），High/Critical 風險直接擋下。
-   - 通過後寫入隔離草稿區 `~/.duduclaw/skills-drafts/<id>/SKILL.md` 並建立審批單。
-4. 管理員在 dashboard 審批中心核准 → 技能自動安裝生效；駁回則留在草稿區。
+1. Tell the agent "I'll show you how to pull the report — record it," and the agent
+   calls `browser_record_start(url="https://erp.example.com", name="monthly report SOP")`.
+2. The human completes the whole workflow in the opened browser window, then either
+   closes the window or asks the agent to call `browser_record_stop(id)`.
+3. The agent calls `skill_from_recording(id)`:
+   - It parses the redacted HAR (method / URL / body skeleton for non-static-asset API
+     calls) plus the sequence of UI actions, and hands both to an LLM to distill into a
+     SKILL.md (frontmatter includes `name` / `trigger` / `skill_type` /
+     `requires_env`).
+   - It first runs a deterministic security scan (including prompt-injection rules);
+     any High/Critical finding blocks it outright.
+   - Once it passes, the file is written to the isolated draft area
+     `~/.duduclaw/skills-drafts/<id>/SKILL.md`, and an approval request is created.
+4. An admin approves it in the dashboard's approval center, and the skill installs and
+   activates automatically; a rejection leaves it in the draft area.
 
-## 安全設計
+## Security design
 
-- **不背景靜默錄製**：開始／結束都有明確回覆與 log 訊號。
-- **HAR 脫敏**：`Authorization` / `Cookie` / `Set-Cookie` 等 header 值、所有 cookie 值、
-  token 類 query 參數與 JSON body 欄位，一律替換成 `<env:VAR>` 佔位符；
-  蒸餾出的 SKILL.md 以 `requires_env` 列出需要的環境變數，絕不含真實憑證。
-- **桌面錄製不碰鍵入內容**：只記「切換到哪個視窗」；輸入事件流（rdev）尚未實作。
-- **絕不直接進技能庫**：蒸餾產物一律走自建技能審批管線（草稿隔離區 → 人工核准 → 安裝），
-  安裝時還會再跑一次安全掃描。
+- **No silent background recording**: both start and stop produce an explicit reply
+  and log signal.
+- **HAR redaction**: header values like `Authorization` / `Cookie` / `Set-Cookie`, every
+  cookie value, and any token-like query parameter or JSON body field are all replaced
+  with an `<env:VAR>` placeholder; the distilled SKILL.md lists the needed environment
+  variables under `requires_env` and never contains real credentials.
+- **Desktop recording never touches keystrokes**: it only records which window is in
+  the foreground; an input-event stream (rdev) is not yet implemented.
+- **Never goes straight into the skill library**: every distilled artifact goes through
+  the same self-built skill approval pipeline (isolated draft area → manual approval →
+  install), with another security scan run at install time.
 
-## 已知限制
+## Known limitations
 
-- 桌面錄製目前是「截圖＋前景視窗」降級版：無輸入事件流、蒸餾僅依據視窗切換序列。
-- 桌面重放本質上是 computer use 任務（`skill_type: desktop-sop`），重放時逐步執行、
-  每步截圖驗證、失敗即停。
-- 瀏覽器錄製需要本機可用的 Playwright；`headless=true` 僅適合驗證用途
-  （人工示範請用預設有頭模式）。
+- Desktop recording is currently a degraded "screenshot + foreground window" mode: no
+  input-event stream, and distillation relies solely on the window-switch sequence.
+- Desktop replay is fundamentally a computer-use task (`skill_type: desktop-sop`) —
+  replay executes step by step, verifies each step with a screenshot, and stops on any
+  failure.
+- Browser recording needs a locally available Playwright; `headless=true` is only
+  suitable for verification (use the default headed mode for human demonstrations).

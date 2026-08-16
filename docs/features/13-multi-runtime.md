@@ -193,4 +193,4 @@ Different providers have different pricing. The `LeastCost` rotation strategy ca
 
 ## The Takeaway
 
-The AI landscape is multi-provider. Building on a single CLI is like writing software for a single operating system — it works until it doesn't. The `AgentRuntime` trait abstracts away the differences, letting DuDuClaw treat Claude, Codex, Gemini, and any OpenAI-compatible endpoint as interchangeable backends. Your agents get the best available brain, every time.
+The AI market is multi-provider. Building on a single CLI is like writing software for a single operating system — it works until it doesn't. The `AgentRuntime` trait abstracts away the differences, letting DuDuClaw treat Claude, Codex, Gemini, and any OpenAI-compatible endpoint as interchangeable backends. Your agents get the best available brain, every time.

@@ -1,49 +1,49 @@
-# 實體觸點指南：QR 桌牌、NFC 標籤與 LINE Touch
+# Physical touchpoint guide: QR table cards, NFC tags, and LINE Touch
 
-> 對象：把 AI 員工放上 LINE 的店家與導入夥伴。目標：讓客人在店裡「掃一下」或「碰一下」就跟你的 AI 員工開聊。
-> 前置：通道頁已綁定 LINE 官方帳號（通道頁 →「LINE 加好友 QR」能看到你的 QR 即完成）。
+> Audience: shops and implementation partners putting an AI employee on LINE. Goal: let a customer in the store scan or tap once and start chatting with your AI employee right away.
+> Prerequisite: the Channels page already has a LINE Official Account connected (Channels page → "LINE Add Friend QR" (LINE 加好友 QR) showing your QR code means this step is done).
 
-## 1. QR 桌牌／海報（最低成本，5 分鐘）
+## 1. QR table card or poster (lowest cost, 5 minutes)
 
-1. 儀表板 → 通道 → **LINE 加好友 QR**。
-2. 按「列印海報」直接印（瀏覽器列印可另存 PDF），或「複製連結」貼進自己的設計稿。
-3. 放在櫃台、桌面、包裝或名片上。客人掃碼 → 加好友 → 直接開聊；一對一回覆走 LINE Reply API **不計費**。
+1. Dashboard → Channels → **"LINE Add Friend QR"** (LINE 加好友 QR).
+2. Click "Print poster" (列印海報) to print directly (browser printing can also save as a PDF), or "Copy link" (複製連結) to paste into your own design.
+3. Place it on the counter, tables, packaging, or business cards. A customer scans the code, adds the account as a friend, and starts chatting immediately; one-to-one replies go through the LINE Reply API and **cost nothing**.
 
-## 2. 自製 NFC 桌牌（碰一下就開聊）
+## 2. DIY NFC table card (tap to start chatting)
 
-台灣店家已大量使用「Google 評論 NFC 貼紙」，同一個動作換成你的 AI 員工：
+Shops in Taiwan already use "Google review NFC stickers" widely. The same action works for your AI employee too:
 
-| 材料 | 說明 | 參考成本 |
+| Material | Notes | Reference cost |
 |---|---|---|
-| NFC 標籤 | NTAG213（144 bytes，寫一條網址綽綽有餘） | 零售約 NT$22–35/枚，量產客製含印刷更低 |
-| 寫入 App | NFC Tools（iOS/Android，免費）或任何 NDEF 寫入器 | 免費 |
-| 桌牌 | 壓克力桌牌＋貼紙，或直接用抗金屬 NFC 貼紙 | 數十–百餘元 |
+| NFC tag | NTAG213 (144 bytes, more than enough for one URL) | About NT$22-35 each at retail; bulk custom production with printing costs less |
+| Writer app | NFC Tools (iOS/Android, free) or any NDEF writer | Free |
+| Table card | Acrylic stand plus sticker, or an anti-metal NFC sticker on its own | Tens to a couple hundred NT dollars |
 
-步驟：
-1. 通道頁 →「LINE 加好友 QR」→ **複製連結**（NFC 寫的就是這一條網址）。
-2. NFC Tools → Write → Add a record → URL → 貼上 → Write，手機貼近標籤完成寫入。
-3. **建議鎖定（Lock）標籤**防止被改寫。
-4. 實測：另一支手機靠近 → 應直接跳出加好友頁。
+Steps:
+1. Channels page → "LINE Add Friend QR" (LINE 加好友 QR) → **Copy link** (this is the URL the NFC tag will hold).
+2. NFC Tools → Write → Add a record → URL → paste → Write. Hold the phone near the tag to finish writing.
+3. **Lock the tag** afterward so it cannot be overwritten.
+4. Test it: bring a second phone close; it should jump straight to the add-friend page.
 
-建議桌牌同時印 QR＋放 NFC：iPhone 舊機型與部分 Android 對 NFC 支援不一，QR 是保底。
+Print both a QR code and an NFC tag on the same card: older iPhone models and some Android phones vary in NFC support, so the QR code is the fallback.
 
-## 3. LINE Touch（LINE 官方 NFC 方案）
+## 3. LINE Touch (LINE's official NFC program)
 
-LINE 官方的「碰一下」方案，與自製 NFC 的差異：標籤由 LINE 發行、導向內容可在 OA 後台隨時改（不用換實體標籤）、可導向 LINE MINI App，且有官方行銷資源加持。
+LINE's own "tap" program. Compared with DIY NFC: tags are issued by LINE, the destination can be changed anytime from the OA admin console (no need to swap the physical tag), it can point to a LINE MINI App, and it comes with official marketing support.
 
-**Readiness 檢查清單（依 2026-08 時點資訊）**：
+**Readiness checklist (as of 2026-08)**:
 
-- [ ] **藍盾認證官方帳號**：LINE Touch 前提。自行申請最長回報 30 天、一般約 10 個工作天；經代理商快審約 5 天。
-- [ ] **標籤採購**：LINE Touch NFC 標籤預計 **2026 年 9 月底**起在 OA Shop 開放購買（兩種規格：A6 與 54×85mm）；標籤只能向 LINE 購買，不能自產。
-- [ ] **後台設定**：OA 管理後台（2026-07-22 起開放 LINE Touch 功能區）綁定導向目標——加好友、指定訊息或 MINI App。
-- [ ] **導向建議**：起步直接導「加好友」（即本指南第 1 節同一條連結的官方版）；日後有 MINI App 再升級導向。
+- [ ] **Blue-badge verified Official Account**: a prerequisite for LINE Touch. Applying yourself takes up to 30 days to hear back, typically around 10 business days; expedited review through an agency takes about 5 days.
+- [ ] **Tag purchase**: LINE Touch NFC tags are expected to go on sale in the OA Shop starting **late September 2026** (two sizes: A6 and 54x85mm); tags can only be bought from LINE, not produced on your own.
+- [ ] **Console setup**: the OA admin console (the LINE Touch feature area opened on 2026-07-22) binds the destination: add friend, a specific message, or a MINI App.
+- [ ] **Destination recommendation**: start by pointing to "add friend" (the official version of the same link used in section 1 of this guide); upgrade the destination once a MINI App exists.
 
-自製 NFC vs LINE Touch 怎麼選：**現在就要 → 自製**（本指南第 2 節，今天就能上線）；**要官方後台可改內容／要接 MINI App → LINE Touch**（等 9 月標籤開賣）。兩者不衝突，可先自製、標籤到貨再換。
+Choosing between DIY NFC and LINE Touch: **need it today, go DIY** (section 2 of this guide, live the same day); **need an editable official console, or need a MINI App, go LINE Touch** (wait for tags to go on sale in September). The two are not exclusive: start with DIY, then switch once the tags arrive.
 
-## 4. 導入夥伴（經銷商）備註
+## 4. Notes for implementation partners (resellers)
 
-- 桌牌可聯名：找台灣 NFC 印刷商（客製貼紙／壓克力牌）批量製作，一張桌卡 COGS 約 NT$100–200，可作為導入包附贈品或加購品。
-- 出貨前用自己的手機實測每一批標籤（寫入＋鎖定＋跳轉三步）。
+- Co-branded cards work: partner with a Taiwan NFC print shop (custom stickers or acrylic stands) for bulk production. COGS per table card runs about NT$100-200, which works as a bundled gift or an add-on purchase in an onboarding package.
+- Before shipping, test every batch of tags yourself on your own phone: write, lock, and redirect, all three steps.
 
 ---
-最後更新：2026-08-13。LINE Touch 時程為官方公開資訊之轉述，購買細節以 OA Shop 上架時為準。
+Last updated: 2026-08-13. The LINE Touch timeline restates information LINE has made public; purchase details follow whatever appears in the OA Shop at launch.
