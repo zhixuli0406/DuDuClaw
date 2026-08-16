@@ -3179,15 +3179,25 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
-// ── Dashboard file panel (WP1.4) ─────────────────────────────────
+// ── Dashboard file panel (WP1.4, I-4 search extension) ───────────
 //
 // Two Bearer-JWT-gated endpoints let the dashboard list and download the
 // documents an AI staff member produced/received under its attachments dir:
-//   GET /api/files?agent=<id>                     → JSON [{name,size,mtime}]
+//   GET /api/files?agent=<id>                     → JSON {"files": [...]}
 //   GET /api/files/download?agent=<id>&name=<f>   → streamed file
 // When `agent` is omitted both fall back to the shared `<home>/attachments/`.
 // Path safety lives in `crate::files_api` (allowlist + canonicalize
 // containment, fail-closed); see its unit tests.
+//
+// I-4 ("產物與檔案"): `GET /api/files` additionally accepts, all optional
+// and AND-combined, applied AFTER provenance is attached so `q` can match
+// the ledger's display name / origin too:
+//   q=<text>        search: archived name / display name / origin
+//   task_id=<id>    filter to files the I-2b ledger ties to this task
+//   since=<ms>      inclusive lower bound on mtime, Unix epoch ms
+//   until=<ms>      inclusive upper bound on mtime, Unix epoch ms
+// The response shape is unchanged (`{"files": [...]}`) — these only narrow
+// which rows are included, never add new top-level fields.
 
 /// Authenticate a file request and authorize it for the requested `agent`,
 /// mirroring the per-agent fail-closed gate the dashboard RPC layer applies.
@@ -3236,6 +3246,14 @@ fn authorize_file_access(
 #[derive(serde::Deserialize)]
 struct FilesListQuery {
     agent: Option<String>,
+    /// I-4: search — archived name / display name / origin, case-insensitive.
+    q: Option<String>,
+    /// I-4: filter to files the I-2b ledger ties to this task id.
+    task_id: Option<String>,
+    /// I-4: inclusive lower bound on mtime, Unix epoch ms.
+    since: Option<u64>,
+    /// I-4: inclusive upper bound on mtime, Unix epoch ms.
+    until: Option<u64>,
 }
 
 /// GET /api/files — list attachment files for an agent (or the shared dir).
@@ -3263,6 +3281,17 @@ async fn handle_files_list(
     // staff member delivered a file versus which files a human sent in.
     let index = crate::artifacts::provenance_index(&state.home_dir, agent);
     crate::files_api::attach_provenance(&mut files, &index);
+    // I-4: search / task-relation / date-range filters — applied after
+    // provenance so `q` can match the ledger's display name and origin, not
+    // just the raw on-disk archived name. All optional; the default filter
+    // is a no-op so this is byte-identical to pre-I-4 behavior when unused.
+    let filter = crate::files_api::FileListFilter {
+        query: q.q,
+        task_id: q.task_id,
+        since_ms: q.since,
+        until_ms: q.until,
+    };
+    let files = crate::files_api::filter_files(files, &filter);
     Json(serde_json::json!({ "files": files })).into_response()
 }
 
