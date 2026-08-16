@@ -27597,11 +27597,17 @@ fn build_account_entry(
     }
 }
 
-/// Platform allowlist for the migrate RPCs. Only the three importer targets
-/// the CLI understands are accepted; anything else is rejected before we ever
+/// Platform allowlist for the migrate RPCs. Only the importer targets the
+/// CLI understands are accepted; anything else is rejected before we ever
 /// spawn a subprocess (fail-closed).
+///
+/// WP-9A: `claude-code` requires `--agent <id>` (the CLI hard-errors without
+/// it — see `migrate_from::run`); this RPC does not yet forward an `agent`
+/// param, so a dashboard-triggered `claude-code` run currently fails fast
+/// with that message rather than silently no-op-ing. Wiring the dashboard
+/// agent picker through is tracked as follow-up, not done in this pass.
 fn migrate_platform_allowed(platform: &str) -> bool {
-    matches!(platform, "openclaw" | "hermes" | "paperclip")
+    matches!(platform, "openclaw" | "hermes" | "paperclip" | "claude-code")
 }
 
 /// Validate an optional migrate `source`. `None` is fine (per-platform
@@ -30264,7 +30270,7 @@ impl MethodHandler {
             Some(p) => {
                 return WsFrame::error_response(
                     "",
-                    &format!("unsupported platform '{p}' (expected openclaw/hermes/paperclip)"),
+                    &format!("unsupported platform '{p}' (expected openclaw/hermes/paperclip/claude-code)"),
                 );
             }
             None => return WsFrame::error_response("", "platform is required"),
@@ -33540,15 +33546,17 @@ mod migrate_validation_tests {
     use super::*;
 
     #[test]
-    fn platform_allowlist_only_accepts_three() {
+    fn platform_allowlist_only_accepts_known_platforms() {
         assert!(migrate_platform_allowed("openclaw"));
         assert!(migrate_platform_allowed("hermes"));
         assert!(migrate_platform_allowed("paperclip"));
+        assert!(migrate_platform_allowed("claude-code"));
         // aliases / unknowns are rejected at the RPC boundary (fail-closed)
         assert!(!migrate_platform_allowed("moltbot"));
         assert!(!migrate_platform_allowed("openai"));
         assert!(!migrate_platform_allowed(""));
         assert!(!migrate_platform_allowed("OpenClaw")); // case-sensitive
+        assert!(!migrate_platform_allowed("claudecode")); // alias handled CLI-side only
     }
 
     #[test]

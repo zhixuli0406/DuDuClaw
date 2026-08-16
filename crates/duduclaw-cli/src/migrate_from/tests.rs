@@ -200,6 +200,8 @@ fn malicious_skill_blocked_fail_closed() {
         platform: Platform::Hermes,
         apply: false,
         rename: false,
+        agent: None,
+        redact: true,
     };
     let mut report = Report::new("hermes", "/x", false);
     install_skills(&ctx, &mut report, "agent", &[good.clone(), bad.clone()]);
@@ -264,6 +266,8 @@ async fn end_to_end_openclaw_apply_writes_real_artifacts() {
         platform: Platform::OpenClaw,
         apply: true,
         rename: false,
+        agent: None,
+        redact: true,
     };
     let report = super::openclaw::migrate(&ctx, Some(src)).await.unwrap();
 
@@ -324,6 +328,8 @@ async fn json_output_matches_locked_contract() {
         platform: Platform::OpenClaw,
         apply: false,
         rename: false,
+        agent: None,
+        redact: true,
     };
     let report = super::openclaw::migrate(&ctx, Some(src)).await.unwrap();
 
@@ -499,6 +505,8 @@ async fn agentcompanies_round_trip_preserves_identity_soul_skills_hierarchy() {
         platform: Platform::Paperclip,
         apply: true,
         rename: false,
+        agent: None,
+        redact: true,
     };
     let import_report = super::paperclip::migrate(&ctx, Some(out.clone())).await.unwrap();
     assert!(
@@ -582,6 +590,8 @@ async fn paperclip_package_teams_projects_sidecar_covered() {
         platform: Platform::Paperclip,
         apply: false,
         rename: false,
+        agent: None,
+        redact: true,
     };
     let report = super::paperclip::migrate(&ctx, Some(src)).await.unwrap();
 
@@ -628,6 +638,8 @@ async fn paperclip_rejects_non_package_dir_fail_closed() {
         platform: Platform::Paperclip,
         apply: false,
         rename: false,
+        agent: None,
+        redact: true,
     };
     let err = super::paperclip::migrate(&ctx, Some(junk)).await.unwrap_err();
     let msg = err.to_string();
@@ -644,6 +656,8 @@ fn channel_conflict_not_overwritten() {
         platform: Platform::OpenClaw,
         apply: false,
         rename: false,
+        agent: None,
+        redact: true,
     };
     let mut report = Report::new("openclaw", "/x", false);
     let mut channels = toml::value::Table::new();

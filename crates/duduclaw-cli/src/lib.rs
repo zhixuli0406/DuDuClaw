@@ -307,17 +307,19 @@ enum Commands {
     /// Migrate agent.toml to Claude Code format (.claude/settings.local.json)
     Migrate,
 
-    /// Painlessly migrate from OpenClaw / Hermes / paperclip into DuDuClaw.
+    /// Painlessly migrate from OpenClaw / Hermes / paperclip / Claude Code
+    /// into DuDuClaw.
     ///
     /// Default is a dry-run that prints the migration plan (what would be
     /// imported / skipped and why). Pass `--apply` to actually write.
     #[command(name = "migrate-from")]
     MigrateFrom {
-        /// Source platform: `openclaw`, `hermes`, or `paperclip`.
+        /// Source platform: `openclaw`, `hermes`, `paperclip`, or `claude-code`.
         platform: String,
 
         /// Source directory (defaults per platform; REQUIRED for paperclip,
-        /// which reads an official `paperclipai company export` directory).
+        /// which reads an official `paperclipai company export` directory;
+        /// defaults to `~/.claude` for claude-code).
         #[arg(long)]
         source: Option<PathBuf>,
 
@@ -335,6 +337,20 @@ enum Commands {
         /// stays on stderr so stdout is a clean protocol channel.
         #[arg(long)]
         json: bool,
+
+        /// Target agent id to import into. REQUIRED for `claude-code` — it
+        /// imports into an existing agent and never auto-creates one (run
+        /// `duduclaw agent create` first). Ignored by the other platforms,
+        /// which scaffold their own agent.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Disable the PII redaction pass over `claude-code` session
+        /// transcripts before they are written to `sessions.db` / `memory.db`
+        /// (default: redaction is ON). Memory shards are never redacted
+        /// regardless of this flag — they are the user's own curated notes.
+        #[arg(long)]
+        no_redact: bool,
     },
 
     /// Export your personal-edition data (`~/.duduclaw/`) as a portable
@@ -1668,8 +1684,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             }
         }
         Commands::Migrate => cmd_migrate().await,
-        Commands::MigrateFrom { platform, source, apply, rename, json } => {
-            migrate_from::run(&platform, source, apply, rename, json).await
+        Commands::MigrateFrom { platform, source, apply, rename, json, agent, no_redact } => {
+            migrate_from::run(&platform, source, apply, rename, json, agent, no_redact).await
         }
         Commands::Export { out, format, agent, all, json } => {
             match format.as_deref().map(str::trim) {
