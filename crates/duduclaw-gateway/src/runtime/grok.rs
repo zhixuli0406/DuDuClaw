@@ -628,6 +628,14 @@ impl GrokRuntime {
             env,
             context.agent_dir.clone(),
             std::time::Duration::from_secs(PTY_RETRY_TIMEOUT_SECS),
+            // WP-8B (credentials doctrine P3) added the `clear_env` param to
+            // `invoke_oneshot`; this call site is outside that WP's reviewed
+            // scope (multi-runtime Grok path, not the Claude spawn paths),
+            // so it deliberately keeps `false` — byte-identical prior
+            // behavior (full ambient-env inheritance). Same leak class as
+            // the Claude spawn paths this WP fixed; flagged as a follow-up
+            // candidate, not silently left unmentioned.
+            false,
         )
         .await
         .map_err(|e| format!("grok PTY retry invoke failed: {e}"))?;

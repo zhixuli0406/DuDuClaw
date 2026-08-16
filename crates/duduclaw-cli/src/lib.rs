@@ -5256,6 +5256,11 @@ async fn grok_cli_diagnostic(home: &std::path::Path) {
             env,
             None,
             Duration::from_secs(30),
+            // WP-8B added the `clear_env` param to `invoke_oneshot`; this
+            // call site is an operator-run `duduclaw doctor`-style
+            // diagnostic (not the gateway's automated dispatch path), so it
+            // keeps `false` — byte-identical prior behavior.
+            false,
         )
         .await
         {

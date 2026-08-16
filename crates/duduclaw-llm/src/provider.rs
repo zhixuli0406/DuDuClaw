@@ -55,28 +55,13 @@ impl ApiAuth {
 
 /// Standard environment-variable names per provider id.
 ///
-/// Mirrors (and extends) the gateway's `runtime/openai_compat.rs` PROVIDERS
-/// table so both layers agree on env names. Returns the first non-empty
-/// matching variable.
+/// WP-8B (credentials doctrine P3): thin wrapper over
+/// `duduclaw_core::provider_env` — the single source of truth for provider →
+/// env-var-name mapping, replacing what used to be an independent copy of
+/// the same table (see that module's doc comment for the full history).
+/// Returns the first present + non-empty matching variable.
 pub fn resolve_env_key(provider_id: &str) -> Option<String> {
-    let names: &[&str] = match provider_id {
-        "anthropic" => &["ANTHROPIC_API_KEY"],
-        "openai" => &["OPENAI_API_KEY"],
-        "gemini" | "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "minimax" => &["MINIMAX_API_KEY"],
-        "groq" => &["GROQ_API_KEY"],
-        "together" => &["TOGETHER_API_KEY"],
-        "mistral" => &["MISTRAL_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
-        "xai" => &["XAI_API_KEY"],
-        "qwen" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
-        _ => return None,
-    };
-    names
-        .iter()
-        .filter_map(|n| std::env::var(n).ok())
-        .find(|v| !v.is_empty())
+    duduclaw_core::provider_env::resolve_env_key(provider_id)
 }
 
 /// Split a fully-qualified model id (`"anthropic/claude-sonnet-5"`) into

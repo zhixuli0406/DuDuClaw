@@ -527,17 +527,26 @@ pub fn is_pty_pool_disabled_globally() -> bool {
 ///
 /// Used by the Phase-3.B wedge in `channel_reply.rs` once stream-json parser
 /// extraction lands.
+///
+/// `clear_env`: when `true`, the child sees ONLY `env_vars` (plus the
+/// `NO_COLOR`/`TERM` defaults `oneshot_pty_invoke` always injects) instead
+/// of the gateway's full ambient environment layered under it. WP-8B
+/// (credentials doctrine P3): `spawn_claude_cli_pty_with_env` passes `true`
+/// with an allowlist-seeded `env_vars` so the child never sees the
+/// gateway's vendor `*_API_KEY`s.
 pub async fn invoke_oneshot(
     program: impl Into<String>,
     args: Vec<String>,
     env_vars: HashMap<String, String>,
     work_dir: Option<PathBuf>,
     deadline: Duration,
+    clear_env: bool,
 ) -> Result<OneshotOutput, PtyError> {
     let mut inv = OneshotInvocation::new(program)
         .args(args)
         .envs(env_vars)
-        .deadline(deadline);
+        .deadline(deadline)
+        .clear_env(clear_env);
     if let Some(cwd) = work_dir {
         inv = inv.cwd(cwd);
     }
@@ -1947,6 +1956,7 @@ mod tests {
             HashMap::new(),
             None,
             Duration::from_secs(5),
+            false,
         )
         .await
         .expect("oneshot ok");

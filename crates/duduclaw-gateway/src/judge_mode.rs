@@ -401,6 +401,21 @@ impl ExternalAcceptanceJudge {
 
         let payload = build_external_request(criteria, task, result, tool_activity);
 
+        // WP-8B (credentials doctrine P3, 2026-08) audit note: this spawn is
+        // the SAME leak class the Claude spawn paths in this WP fixed (full
+        // ambient-env inheritance, `tokio::process::Command` default) —
+        // BUT unlike those paths, this one is an already-documented,
+        // deliberate design tradeoff with an operator-facing workaround
+        // (`docs/guides/goal-loop.md` §"子行程會繼承 gateway 的完整環境變數",
+        // added in the wave-5 judge-seam work: "這不是漏洞，是這個 seam
+        // 目前的設計取捨" — operators who want isolation are told to wrap
+        // `judge_command` in a script that clears its own env). Applying
+        // the allowlist here would silently break that documented contract
+        // outside this WP's mandate (`commercial/docs/DESIGN-credentials-doctrine-2026-08.md`
+        // §3 P3 names the agent-CLI spawn paths only, not this one).
+        // Deliberately left untouched — flagged in the WP-8B report as a
+        // same-family follow-up that needs its own decision + doc update,
+        // not a silent fix.
         let mut cmd = tokio::process::Command::new(&self.config.command[0]);
         cmd.args(&self.config.command[1..]);
         cmd.stdin(std::process::Stdio::piped());
