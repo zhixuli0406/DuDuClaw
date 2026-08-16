@@ -410,6 +410,13 @@ pub struct OutboxItem {
     pub in_reply_to: Option<String>,
     pub note: Option<String>,
     pub settled_at: Option<String>,
+    /// WP-7G: the human decider's own free-text reason/comment, captured at
+    /// `mail.decide` time and independent of [`Self::note`] (which is the
+    /// fixed system copy the worker writes when it actually settles the
+    /// draft — "已寄出" / "已由人工拒絕，未寄出。" / an SMTP error). Folded
+    /// from a dedicated `decision_note` ledger row so it survives — and is
+    /// never overwritten by — the later terminal settle row.
+    pub decision_note: Option<String>,
 }
 
 /// The folded mailbox. Both lists are newest-first.
@@ -600,6 +607,7 @@ pub fn read_mailbox(home_dir: &Path) -> Mailbox {
                         in_reply_to: row.in_reply_to.clone(),
                         note: None,
                         settled_at: None,
+                        decision_note: None,
                     },
                 );
             }
@@ -612,6 +620,13 @@ pub fn read_mailbox(home_dir: &Path) -> Mailbox {
                     };
                     it.note = row.note.clone();
                     it.settled_at = Some(row.at.clone());
+                }
+            }
+            // WP-7G: the operator's own decision note, recorded alongside
+            // (never in place of) the terminal settle row above.
+            "decision_note" => {
+                if let Some(it) = outbox.get_mut(&row.mail_id) {
+                    it.decision_note = row.note.clone();
                 }
             }
             _ => {}
@@ -881,6 +896,22 @@ pub fn record_outbox_settled(
     if !note.is_empty() {
         row.note = Some(truncate_chars(note, 400));
     }
+    append_row(home_dir, &row);
+}
+
+/// WP-7G: record the human decider's own free-text note at `mail.decide`
+/// time (approve or reject alike), independent of — and never overwritten
+/// by — the later terminal settle row's fixed system copy. No-op on a
+/// blank/whitespace-only note so an absent `note` param never appends a
+/// hollow ledger row.
+pub fn record_decision_note(home_dir: &Path, mail_id: &str, agent_id: &str, note: &str) {
+    let note = note.trim();
+    if note.is_empty() {
+        return;
+    }
+    let mut row = MailRow::new("decision_note", mail_id);
+    row.agent_id = truncate_bytes(agent_id, FIELD_MAX_BYTES).to_string();
+    row.note = Some(truncate_chars(note, 400));
     append_row(home_dir, &row);
 }
 

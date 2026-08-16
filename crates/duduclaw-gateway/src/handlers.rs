@@ -6620,6 +6620,7 @@ impl MethodHandler {
                     { "name": "analytics.cost_savings", "description": "Monthly cost savings" },
                     { "name": "migrate.scan", "description": "Preview a migration from OpenClaw/Hermes/Paperclip (dry-run)" },
                     { "name": "migrate.apply", "description": "Apply a migration from OpenClaw/Hermes/Paperclip" },
+                    { "name": "search.query", "description": "Cross-source search (⌘K) over conversations, files, memory and knowledge (I-5)" },
                 ]
             }),
         )
@@ -30720,6 +30721,10 @@ impl MethodHandler {
                             "in_reply_to": m.in_reply_to,
                             "note": m.note,
                             "settled_at": m.settled_at,
+                            // WP-7G: the decider's own free-text reason/comment,
+                            // distinct from `note` (the fixed system copy the
+                            // worker writes when it settles the draft).
+                            "decision_note": m.decision_note,
                         })
                     })
                     .collect();
@@ -30744,6 +30749,14 @@ impl MethodHandler {
             // missing field must never read as either answer.
             return WsFrame::error_response("", "approve (true/false) is required");
         };
+        // WP-7G: optional free-text reason/comment from the decider. Blank or
+        // absent is fine — the fixed system copy remains the fallback.
+        let note = params
+            .get("note")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         let home = self.home_dir.clone();
         let lookup_id = mail_id.clone();
@@ -30789,6 +30802,26 @@ impl MethodHandler {
         if let Err(e) = broker.decide(&approval_id, approve, &decided_by).await {
             return WsFrame::error_response("", &format!("decide: {e}"));
         }
+        // WP-7G: the decider's own note, kept independent of (and never
+        // overwritten by) whatever terminal settle row lands later.
+        if let Some(n) = &note {
+            crate::mail::record_decision_note(&self.home_dir, &mail_id, &draft.agent_id, n);
+        }
+        // A rejection has nothing left to transmit, so there is no reason to
+        // wait for the worker's next tick — settle it now. This is also the
+        // only place the operator's actual reason (vs. the fixed system
+        // copy "已由人工拒絕，未寄出。") can reach the ledger's `note` field.
+        if !approve {
+            let settle_note =
+                note.clone().unwrap_or_else(|| "已由人工拒絕，未寄出。".to_string());
+            crate::mail::record_outbox_settled(
+                &self.home_dir,
+                &mail_id,
+                &draft.agent_id,
+                crate::mail::OutboxStatus::Rejected,
+                &settle_note,
+            );
+        }
         // The worker performs (or refuses) the transmission on its next tick.
         // Saying "已寄出" here would be exactly the kind of self-reported
         // completion this project treats as a bug.
@@ -30799,6 +30832,7 @@ impl MethodHandler {
                 "mail_id": mail_id,
                 "approved": approve,
                 "state": if approve { "approved_queued" } else { "rejected" },
+                "note": note,
             }),
         )
     }
@@ -32422,6 +32456,9 @@ fn task_row_to_json(r: &TaskRow) -> Value {
         // store already clears it after the first post-approval dispatch, but
         // a stale value must never render on a task that is no longer paused.
         "plan_pending": (r.status == "needs_human").then(|| r.plan_pending.clone()).flatten(),
+        // I-3b: archive/pin flags for the `/goals` board (task_store.rs).
+        "archived": r.archived,
+        "pinned": r.pinned,
     })
 }
 
@@ -42455,5 +42492,177 @@ mod accounts_add_tests {
 
         let raw_after = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
         assert_eq!(raw_before, raw_after, "a rejected duplicate must not touch config.toml");
+    }
+}
+
+/// WP-7G (batch 2 tail work): three small backend gaps left over from batch
+/// 1 — `task_row_to_json` never surfaced the `archived`/`pinned` columns,
+/// `tools.catalog` never got a `search.query` entry, and `mail.decide` had
+/// no way to record the decider's own reason.
+#[cfg(test)]
+mod wp7g_batch2_tail_tests {
+    use super::*;
+
+    fn frame_ok(f: &WsFrame) -> bool {
+        matches!(f, WsFrame::Response { ok: true, .. })
+    }
+
+    fn frame_data(f: &WsFrame) -> Value {
+        match f {
+            WsFrame::Response { payload: Some(p), .. } => p.clone(),
+            other => panic!("expected a payload: {other:?}"),
+        }
+    }
+
+    // ── #1: task_row_to_json must surface archived/pinned ──────────────
+    #[test]
+    fn task_row_to_json_surfaces_archived_and_pinned() {
+        let mut row = TaskRow::new(
+            "t-wp7g".into(),
+            "title".into(),
+            "desc".into(),
+            "medium".into(),
+            "agent-a".into(),
+            "agent-a".into(),
+        );
+        let v = task_row_to_json(&row);
+        assert_eq!(v["archived"], json!(false), "default archived must reach the JSON: {v}");
+        assert_eq!(v["pinned"], json!(false), "default pinned must reach the JSON: {v}");
+
+        row.archived = true;
+        row.pinned = true;
+        let v = task_row_to_json(&row);
+        assert_eq!(v["archived"], json!(true), "archived=true must reach the dashboard: {v}");
+        assert_eq!(v["pinned"], json!(true), "pinned=true must reach the dashboard: {v}");
+    }
+
+    // ── #2: tools.catalog must list search.query (drift guard) ─────────
+    #[tokio::test]
+    async fn tools_catalog_lists_search_query() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler.handle_tools_catalog(json!({}));
+        assert!(frame_ok(&frame), "{frame:?}");
+        let data = frame_data(&frame);
+        let tools = data["tools"].as_array().expect("tools array");
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(
+            names.contains(&"search.query"),
+            "search.query must be listed in tools.catalog: {names:?}"
+        );
+        // Catch a future copy-paste duplicate at the same time — cheap
+        // insurance against the exact kind of drift this entry fixes.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "tools.catalog must not list the same RPC name twice: {names:?}"
+        );
+    }
+
+    // ── #3: mail.decide's optional `note` reaches the ledger ───────────
+    async fn drafted_mail(home: &std::path::Path) -> (crate::approval::ApprovalBroker, String) {
+        let broker = crate::approval::ApprovalBroker::open(home).unwrap();
+        let approval = broker
+            .request("sales", crate::mail::OUTBOUND_ACTION_KIND, "寄信", json!({}), 3600)
+            .await
+            .unwrap();
+        let cfg = crate::mail::MailConfig::default();
+        let mail_id = crate::mail::record_outbox_draft(
+            home,
+            &cfg,
+            "sales",
+            "client@example.com",
+            "報價回覆",
+            "附上報價單。",
+            approval.as_str(),
+            None,
+        );
+        (broker, mail_id)
+    }
+
+    #[tokio::test]
+    async fn mail_decide_reject_note_lands_in_the_settle_row() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        let (_broker, mail_id) = drafted_mail(home.path()).await;
+
+        let frame = handler
+            .handle(
+                "mail.decide",
+                json!({ "mail_id": mail_id, "approve": false, "note": "客戶尚未簽約，先不寄。" }),
+                &ctx,
+            )
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert_eq!(frame_data(&frame)["note"], "客戶尚未簽約，先不寄。");
+
+        // The reject settles immediately (nothing left to transmit) and the
+        // operator's own reason — not the fixed system copy — lands in the
+        // ledger's terminal note.
+        let item = &crate::mail::list_outbox(home.path(), None, None, 10)[0];
+        assert_eq!(item.status, crate::mail::OutboxStatus::Rejected);
+        assert_eq!(
+            item.note.as_deref(),
+            Some("客戶尚未簽約，先不寄。"),
+            "the operator's reason must reach the settle row, not the system copy"
+        );
+        assert_eq!(item.decision_note.as_deref(), Some("客戶尚未簽約，先不寄。"));
+    }
+
+    #[tokio::test]
+    async fn mail_decide_approve_note_is_kept_separate_from_the_deferred_settle_note() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        let (_broker, mail_id) = drafted_mail(home.path()).await;
+
+        let frame = handler
+            .handle(
+                "mail.decide",
+                json!({ "mail_id": mail_id, "approve": true, "note": "已電話確認，可以寄。" }),
+                &ctx,
+            )
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+
+        // Transmission is still the worker's job — the row must stay pending
+        // (mirrors the pre-existing `mail_decide_reports_queued_not_sent_*`
+        // invariant for the approve path).
+        let item = &crate::mail::list_outbox(home.path(), None, None, 10)[0];
+        assert_eq!(item.status, crate::mail::OutboxStatus::Pending);
+        assert!(
+            item.note.is_none(),
+            "the settle note must not be invented before the worker actually sends"
+        );
+        assert_eq!(
+            item.decision_note.as_deref(),
+            Some("已電話確認，可以寄。"),
+            "the approver's note must still be recorded on the ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_decide_without_a_note_keeps_the_fixed_system_copy() {
+        // Backward-compat: an omitted `note` must not regress the pre-WP-7G
+        // reject-path behavior of a system-authored reason.
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        let (_broker, mail_id) = drafted_mail(home.path()).await;
+
+        let frame = handler
+            .handle("mail.decide", json!({ "mail_id": mail_id, "approve": false }), &ctx)
+            .await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        assert!(frame_data(&frame)["note"].is_null());
+
+        let item = &crate::mail::list_outbox(home.path(), None, None, 10)[0];
+        assert_eq!(item.status, crate::mail::OutboxStatus::Rejected);
+        assert_eq!(item.note.as_deref(), Some("已由人工拒絕，未寄出。"));
+        assert!(item.decision_note.is_none(), "no note param ⇒ no decision_note row");
     }
 }
