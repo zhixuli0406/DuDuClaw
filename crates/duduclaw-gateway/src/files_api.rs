@@ -21,7 +21,7 @@ use serde::Serialize;
 /// The three provenance fields (I-2b) are filled from the artifacts ledger by
 /// [`attach_provenance`]; a file with no ledger row keeps them `None`, which
 /// the dashboard renders as 「來源不明」 rather than guessing a direction.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FileEntry {
     /// Bare filename (no directory component).
     pub name: String,
@@ -151,6 +151,96 @@ pub fn attach_provenance(
             f.display_name = Some(p.display_name.clone());
         }
     }
+}
+
+/// I-4: `/files` search + task/date filters, applied AFTER
+/// [`attach_provenance`] so `query` can match the ledger's display name and
+/// origin, not just the raw on-disk archived name.
+///
+/// All fields optional and AND-combined; the zero-value filter
+/// ([`FileListFilter::is_noop`]) is the identity function, so a plain
+/// `/api/files?agent=` request is byte-identical to pre-I-4 behavior.
+#[derive(Debug, Default, Clone)]
+pub struct FileListFilter {
+    /// Case-insensitive substring match against the archived name, display
+    /// name, and origin (`declared`/`swept`/`uploaded`/`produced`/`unknown`)
+    /// — "檔名/來源" per the I-4 design brief. Empty/whitespace-only is
+    /// treated as absent so an accidental empty query string never turns
+    /// into a "match nothing" surprise.
+    pub query: Option<String>,
+    /// Exact match against the ledger's `task_id` (I-2b `artifacts.jsonl`
+    /// attribution — the same field `tasks.artifacts` reads). A file the
+    /// ledger cannot tie to any task never matches a non-empty filter:
+    /// fail-closed, no guessing, mirroring `collect_task_artifacts`'s
+    /// attribution honesty.
+    pub task_id: Option<String>,
+    /// Inclusive lower bound on `mtime` (Unix epoch milliseconds — the same
+    /// unit [`FileEntry::mtime`] already reports, so no new date-parsing
+    /// surface is introduced).
+    pub since_ms: Option<u64>,
+    /// Inclusive upper bound on `mtime` (Unix epoch milliseconds).
+    pub until_ms: Option<u64>,
+}
+
+impl FileListFilter {
+    /// `true` when every field is absent — the filter changes nothing.
+    fn is_noop(&self) -> bool {
+        self.query.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && self.task_id.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && self.since_ms.is_none()
+            && self.until_ms.is_none()
+    }
+}
+
+/// Apply [`FileListFilter`] to an already-listed (and typically
+/// provenance-attached) file set. Pure, order-preserving, and never widens
+/// the result — an unparseable/empty filter field is simply not applied
+/// rather than matching everything by accident.
+pub fn filter_files(files: Vec<FileEntry>, filter: &FileListFilter) -> Vec<FileEntry> {
+    if filter.is_noop() {
+        return files;
+    }
+    let q_lower = filter
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+    let task_id = filter.task_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    files
+        .into_iter()
+        .filter(|f| {
+            if let Some(q) = &q_lower {
+                let haystack = format!(
+                    "{} {} {}",
+                    f.name,
+                    f.display_name.as_deref().unwrap_or(""),
+                    f.origin.as_deref().unwrap_or("")
+                )
+                .to_lowercase();
+                if !haystack.contains(q.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(tid) = task_id
+                && f.task_id.as_deref() != Some(tid)
+            {
+                return false;
+            }
+            if let Some(since) = filter.since_ms
+                && f.mtime < since
+            {
+                return false;
+            }
+            if let Some(until) = filter.until_ms
+                && f.mtime > until
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
 }
 
 /// Why a requested download could not be served.
@@ -433,6 +523,116 @@ mod tests {
         // Unknown to the ledger ⇒ left blank, never guessed.
         let b = files.iter().find(|f| f.name == "2_b.pdf").unwrap();
         assert!(b.origin.is_none() && b.task_id.is_none() && b.display_name.is_none());
+    }
+
+    fn entry(name: &str, mtime: u64, origin: Option<&str>, task_id: Option<&str>) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            size: 1,
+            mtime,
+            origin: origin.map(str::to_string),
+            task_id: task_id.map(str::to_string),
+            round: None,
+            display_name: None,
+        }
+    }
+
+    #[test]
+    fn filter_noop_is_identity() {
+        let files = vec![entry("a.pdf", 100, None, None)];
+        let out = filter_files(files.clone(), &FileListFilter::default());
+        assert_eq!(out, files);
+        // Whitespace-only / empty strings are also a no-op, never a
+        // "match nothing" trap.
+        let filter = FileListFilter {
+            query: Some("   ".into()),
+            task_id: Some("".into()),
+            ..Default::default()
+        };
+        assert_eq!(filter_files(files.clone(), &filter), files);
+    }
+
+    #[test]
+    fn filter_by_query_matches_name_display_and_origin_case_insensitive() {
+        let mut a = entry("1_a.docx", 100, Some("declared"), None);
+        a.display_name = Some("報告.docx".into());
+        let b = entry("2_b.pdf", 100, Some("uploaded"), None);
+        let files = vec![a, b];
+
+        // Matches on display name (CJK exact substring).
+        let out = filter_files(
+            files.clone(),
+            &FileListFilter { query: Some("報告".into()), ..Default::default() },
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "1_a.docx");
+
+        // Matches on origin, case-insensitively.
+        let out = filter_files(
+            files.clone(),
+            &FileListFilter { query: Some("UPLOADED".into()), ..Default::default() },
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "2_b.pdf");
+
+        // No match ⇒ honest empty, not a fallback to "everything".
+        let out = filter_files(
+            files,
+            &FileListFilter { query: Some("nope".into()), ..Default::default() },
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filter_by_task_id_is_exact_and_fail_closed() {
+        let a = entry("1_a.docx", 100, Some("declared"), Some("task-1"));
+        let b = entry("2_b.pdf", 100, Some("swept"), Some("task-2"));
+        // No ledger row at all ⇒ never matches a non-empty task filter.
+        let c = entry("3_c.txt", 100, None, None);
+        let files = vec![a, b, c];
+
+        let out = filter_files(
+            files,
+            &FileListFilter { task_id: Some("task-1".into()), ..Default::default() },
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "1_a.docx");
+    }
+
+    #[test]
+    fn filter_by_date_range_is_inclusive() {
+        let files = vec![
+            entry("old.pdf", 100, None, None),
+            entry("mid.pdf", 200, None, None),
+            entry("new.pdf", 300, None, None),
+        ];
+        let out = filter_files(
+            files,
+            &FileListFilter { since_ms: Some(200), until_ms: Some(300), ..Default::default() },
+        );
+        let names: Vec<&str> = out.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["mid.pdf", "new.pdf"]);
+    }
+
+    #[test]
+    fn filter_combines_all_axes_with_and() {
+        let mut a = entry("1_report.docx", 500, Some("declared"), Some("task-1"));
+        a.display_name = Some("report.docx".into());
+        let mut b = entry("2_report.docx", 50, Some("declared"), Some("task-1"));
+        b.display_name = Some("report.docx".into()); // same name, outside date window
+        let files = vec![a, b];
+
+        let out = filter_files(
+            files,
+            &FileListFilter {
+                query: Some("report".into()),
+                task_id: Some("task-1".into()),
+                since_ms: Some(400),
+                until_ms: None,
+            },
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "1_report.docx");
     }
 
     #[test]
