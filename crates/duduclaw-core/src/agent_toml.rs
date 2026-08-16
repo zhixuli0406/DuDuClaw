@@ -535,6 +535,30 @@ decision_ttl_days = 3
         assert!(loose.capabilities.policy[0].when.is_empty());
     }
 
+    /// WP-10A: `[capabilities] git_credentials` reads through the shared
+    /// [`CapabilitiesConfig`] type on both entry points — the strict
+    /// `AgentConfig` registry path and this module's tolerant per-call
+    /// `AgentTomlSections` path — with no separate shadow reader. Absent ⇒
+    /// `false` on both; an explicit `true` parses through both.
+    #[test]
+    fn git_credentials_defaults_false_and_parses_true_on_both_paths() {
+        let absent = parse("[capabilities]\nos_native = true\n");
+        assert!(!absent.capabilities.git_credentials);
+
+        // `full()` already builds a fully valid `agent.toml` (required
+        // `[agent]`/`[model]`/... sections) — inject the new key into its
+        // existing `[capabilities]` table rather than hand-rolling a second
+        // minimal document that would have to track every required field.
+        let text = full().replace(
+            "[capabilities]\nos_native = true",
+            "[capabilities]\nos_native = true\ngit_credentials = true",
+        );
+        let strict: crate::types::AgentConfig = toml::from_str(&text).unwrap();
+        let loose = parse(&text);
+        assert!(strict.capabilities.git_credentials);
+        assert!(loose.capabilities.git_credentials);
+    }
+
     #[test]
     fn empty_and_invalid_input_both_yield_defaults() {
         let empty = parse("");

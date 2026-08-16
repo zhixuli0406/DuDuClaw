@@ -718,6 +718,28 @@ pub struct CapabilitiesConfig {
     #[serde(default)]
     pub recording: bool,
 
+    /// Opt-in per-agent authorization to hand the operator's SSH/GPG identity
+    /// to this agent's spawned CLI subprocess (WP-10A, 2026-08). Master
+    /// switch: when `false` (default), `duduclaw_core::spawn_env`'s WP-8B
+    /// credential scrub applies unchanged — the child gets only the base
+    /// allowlist (`PATH`/locale/proxy/…), so `git push` over SSH and a GPG
+    /// commit signature both fail from inside a spawned agent CLI exactly as
+    /// they did after the WP-8B env scrub shipped. When `true`,
+    /// `duduclaw_core::spawn_env::GIT_CREDENTIALS_ENV_ALLOWLIST`
+    /// (`SSH_AUTH_SOCK` / `SSH_AGENT_PID` / `GPG_TTY` / `GNUPGHOME`) is
+    /// additionally carried through from the gateway's own environment, so
+    /// `git`/`ssh`/`gpg` invoked by the agent can reach the operator's running
+    /// `ssh-agent` / GPG keyring. This is a deliberately narrow, explicit
+    /// grant of the operator's own push/signing identity — every spawn that
+    /// actually carries one of these names is audit-logged (env var *names*
+    /// only, never values; see
+    /// `duduclaw_security::audit::log_git_credentials_granted`). This flag is
+    /// not an org field (see `duduclaw_core::org_field_guard`), so it is
+    /// changed through the normal `[capabilities]` write path
+    /// (`agent_update` / dashboard) like every other capability here.
+    #[serde(default)]
+    pub git_credentials: bool,
+
     // ── Formerly-untyped `[capabilities]` keys (R2 unification) ─────────
     //
     // These six lived in the same `[capabilities]` table as the fields above
@@ -920,6 +942,7 @@ impl Default for CapabilitiesConfig {
             native_sandbox: false,
             os_native: false,
             recording: false,
+            git_credentials: false,
             scoped_tools: Vec::new(),
             grant_ttl_secs: None,
             approval_required_tools: Vec::new(),

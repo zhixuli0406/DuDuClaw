@@ -40,6 +40,25 @@
 //! directly. See the DESIGN doc's honesty note in the WP-8B report: this is
 //! "cover the validated set generously", not "exhaustively proven for every
 //! platform".
+//!
+//! ## WP-10A — per-agent git/SSH/GPG credential opt-in (2026-08)
+//!
+//! The WP-8B scrub above is unconditional: an agent that used to `git push`
+//! over SSH, or produce a GPG-signed commit, from inside its spawned CLI lost
+//! that ability the moment `SSH_AUTH_SOCK` / `GNUPGHOME` stopped being
+//! ambiently inherited. Unlike the base allowlist (safe for every agent by
+//! construction — locale, proxy, binary resolution), those two names hand the
+//! agent the **operator's own** push/signing identity, so they cannot simply
+//! be added to [`AGENT_CLI_ENV_ALLOWLIST`] without granting every agent on the
+//! gateway that ability regardless of whether it asked for it.
+//!
+//! [`GIT_CREDENTIALS_ENV_ALLOWLIST`] is the separate, narrower list; it is
+//! only ever added on top of the base allowlist for an agent whose
+//! `agent.toml [capabilities] git_credentials = true` (see
+//! [`crate::types::CapabilitiesConfig::git_credentials`], default `false`).
+//! [`agent_cli_spawn_env_pairs_for`] / [`apply_agent_cli_env_allowlist_for`]
+//! are the capability-aware siblings of the two functions below; every other
+//! agent's spawn stays byte-identical to the WP-8B behavior.
 
 /// Env var names an agent-CLI (or judge-CLI) subprocess is allowed to
 /// inherit from the gateway process, on every platform.
@@ -147,6 +166,105 @@ pub fn apply_agent_cli_env_allowlist(cmd: &mut tokio::process::Command) {
     }
 }
 
+// ── WP-10A: per-agent git/SSH/GPG credential opt-in ──────────────────────
+
+/// Env var names carrying the operator's SSH/GPG identity, additionally
+/// allowlisted for a spawned agent-CLI subprocess ONLY when the owning
+/// agent's `agent.toml [capabilities] git_credentials = true`.
+///
+/// Scoped to exactly what `git push` over an SSH remote and a GPG commit
+/// signature (`git commit -S` / `commit.gpgsign = true`) need:
+/// - `SSH_AUTH_SOCK` / `SSH_AGENT_PID` — talk to the operator's running
+///   `ssh-agent` so `git push` over SSH can authenticate without a
+///   passphrase prompt (a non-interactive `-p`/PTY spawn cannot answer one
+///   anyway).
+/// - `GPG_TTY` / `GNUPGHOME` — `gpg` needs `GPG_TTY` to locate a pinentry
+///   and `GNUPGHOME` to find the operator's keyring on a non-default
+///   install.
+///
+/// Deliberately does NOT include `GIT_*` variables (`GIT_AUTHOR_*` /
+/// `GIT_SSH_COMMAND` / …): none of them are load-bearing for the SSH-push +
+/// GPG-sign path this WP validated, and adding them widens the grant beyond
+/// what was scoped. Extend this list only after confirming a concrete
+/// missing capability, not defensively — see the module doc for why this is
+/// a separate, narrower list from [`AGENT_CLI_ENV_ALLOWLIST`] rather than a
+/// simple addition to it.
+pub const GIT_CREDENTIALS_ENV_ALLOWLIST: &[&str] =
+    &["SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_TTY", "GNUPGHOME"];
+
+/// Snapshot the present + non-empty [`GIT_CREDENTIALS_ENV_ALLOWLIST`] vars
+/// from the gateway's own environment, unconditionally.
+///
+/// This is the raw building block — it does NOT consult any capability
+/// flag. Callers that need the capability gate should use
+/// [`agent_cli_spawn_env_pairs_for`] / [`git_credentials_granted_names`]
+/// instead of calling this directly.
+pub fn git_credentials_env_pairs() -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for name in GIT_CREDENTIALS_ENV_ALLOWLIST {
+        if let Ok(v) = std::env::var(name) {
+            if !v.is_empty() {
+                out.push((*name, v));
+            }
+        }
+    }
+    out
+}
+
+/// The base [`agent_cli_spawn_env_pairs`] set, plus
+/// [`git_credentials_env_pairs`] when `capabilities.git_credentials` is
+/// `true`. `capabilities = None` or `git_credentials = false` is
+/// byte-identical to [`agent_cli_spawn_env_pairs`] alone — the WP-8B scrub
+/// is unchanged for every agent that has not opted in.
+pub fn agent_cli_spawn_env_pairs_for(
+    capabilities: Option<&crate::types::CapabilitiesConfig>,
+) -> Vec<(&'static str, String)> {
+    let mut pairs = agent_cli_spawn_env_pairs();
+    if capabilities.is_some_and(|c| c.git_credentials) {
+        pairs.extend(git_credentials_env_pairs());
+    }
+    pairs
+}
+
+/// The [`GIT_CREDENTIALS_ENV_ALLOWLIST`] names that were actually carried
+/// into a spawn built from [`agent_cli_spawn_env_pairs_for`] /
+/// [`apply_agent_cli_env_allowlist_for`] for `capabilities` — i.e. the
+/// capability is on AND the var is present + non-empty in this process's
+/// environment.
+///
+/// Callers use this to audit-log which credential *names* (never values)
+/// were handed to a subprocess (WP-10A rule: "every spawn that actually
+/// adds them is audit-logged"). Empty when the capability is off, or when
+/// none of the four vars happen to be set ambiently.
+pub fn git_credentials_granted_names(
+    capabilities: Option<&crate::types::CapabilitiesConfig>,
+) -> Vec<&'static str> {
+    if !capabilities.is_some_and(|c| c.git_credentials) {
+        return Vec::new();
+    }
+    git_credentials_env_pairs()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// [`apply_agent_cli_env_allowlist`], but additionally seeding
+/// [`GIT_CREDENTIALS_ENV_ALLOWLIST`] when `capabilities.git_credentials` is
+/// `true`. Returns the git-credential env var *names* that were actually
+/// granted (see [`git_credentials_granted_names`]) so the caller can
+/// audit-log the grant — a non-empty return MUST be logged by the caller,
+/// never silently discarded.
+pub fn apply_agent_cli_env_allowlist_for(
+    cmd: &mut tokio::process::Command,
+    capabilities: Option<&crate::types::CapabilitiesConfig>,
+) -> Vec<&'static str> {
+    cmd.env_clear();
+    for (k, v) in agent_cli_spawn_env_pairs_for(capabilities) {
+        cmd.env(k, v);
+    }
+    git_credentials_granted_names(capabilities)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,7 +274,14 @@ mod tests {
     #[test]
     fn allowlist_never_carries_a_secret_shaped_name() {
         let secret_suffixes = ["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_KEY"];
-        for name in AGENT_CLI_ENV_ALLOWLIST {
+        // WP-10A: `GIT_CREDENTIALS_ENV_ALLOWLIST` is a *reference* list
+        // (socket paths / TTY / directory paths that point AT credentials,
+        // not the credentials themselves — matching e.g. `CLAUDE_CONFIG_DIR`
+        // on the base list), so it must clear the same bar.
+        for name in AGENT_CLI_ENV_ALLOWLIST
+            .iter()
+            .chain(GIT_CREDENTIALS_ENV_ALLOWLIST)
+        {
             for suffix in secret_suffixes {
                 assert!(
                     !name.ends_with(suffix),
@@ -276,6 +401,180 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("TZ", v),
                 None => std::env::remove_var("TZ"),
+            }
+        }
+    }
+
+    // ── WP-10A: per-agent git/SSH/GPG credential opt-in ──────────────────
+
+    fn caps_with_git_credentials(enabled: bool) -> crate::types::CapabilitiesConfig {
+        crate::types::CapabilitiesConfig {
+            git_credentials: enabled,
+            ..Default::default()
+        }
+    }
+
+    /// Guard against a probe env var colliding with something a parallel
+    /// test thread also mutates — reused by every WP-10A test below.
+    fn with_ssh_auth_sock<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("SSH_AUTH_SOCK").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("SSH_AUTH_SOCK", v),
+                None => std::env::remove_var("SSH_AUTH_SOCK"),
+            }
+        }
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("SSH_AUTH_SOCK", v),
+                None => std::env::remove_var("SSH_AUTH_SOCK"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn capability_off_never_adds_git_credential_env_even_when_ambiently_present() {
+        let _g = ENV_LOCK.lock().unwrap();
+        with_ssh_auth_sock(Some("/tmp/agent.sock"), || {
+            let off = caps_with_git_credentials(false);
+            let pairs = agent_cli_spawn_env_pairs_for(Some(&off));
+            assert!(
+                !pairs.iter().any(|(k, _)| *k == "SSH_AUTH_SOCK"),
+                "git_credentials=false must stay byte-identical to the WP-8B base allowlist"
+            );
+            assert!(
+                git_credentials_granted_names(Some(&off)).is_empty(),
+                "nothing should be reported as granted when the capability is off"
+            );
+            // `None` capabilities (agent-less system callers) must behave
+            // identically to an explicit `false`.
+            assert!(git_credentials_granted_names(None).is_empty());
+            assert_eq!(
+                agent_cli_spawn_env_pairs_for(None),
+                agent_cli_spawn_env_pairs(),
+                "None capabilities must be byte-identical to the base allowlist"
+            );
+        });
+    }
+
+    #[test]
+    fn capability_on_adds_git_credential_env_only_when_ambiently_present() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let on = caps_with_git_credentials(true);
+
+        with_ssh_auth_sock(Some("/tmp/agent.sock"), || {
+            let pairs = agent_cli_spawn_env_pairs_for(Some(&on));
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(k, v)| *k == "SSH_AUTH_SOCK" && v == "/tmp/agent.sock"),
+                "git_credentials=true must carry through an ambiently-present SSH_AUTH_SOCK"
+            );
+            let granted = git_credentials_granted_names(Some(&on));
+            assert!(granted.contains(&"SSH_AUTH_SOCK"));
+        });
+
+        with_ssh_auth_sock(None, || {
+            // Capability on, but nothing ambiently set — must not fabricate
+            // a grant (and therefore must not over-claim in the audit log).
+            let pairs = agent_cli_spawn_env_pairs_for(Some(&on));
+            assert!(!pairs.iter().any(|(k, _)| *k == "SSH_AUTH_SOCK"));
+            assert!(!git_credentials_granted_names(Some(&on)).contains(&"SSH_AUTH_SOCK"));
+        });
+    }
+
+    #[test]
+    fn apply_to_command_for_off_excludes_git_credential_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        with_ssh_auth_sock(Some("/tmp/agent.sock"), || {
+            let off = caps_with_git_credentials(false);
+            let mut cmd = tokio::process::Command::new("true");
+            let granted = apply_agent_cli_env_allowlist_for(&mut cmd, Some(&off));
+            assert!(granted.is_empty());
+
+            let std_cmd: &std::process::Command = cmd.as_std();
+            let has_ssh = std_cmd
+                .get_envs()
+                .any(|(k, _)| k == std::ffi::OsStr::new("SSH_AUTH_SOCK"));
+            assert!(
+                !has_ssh,
+                "SSH_AUTH_SOCK must not reach the child command when git_credentials=false"
+            );
+        });
+    }
+
+    #[test]
+    fn apply_to_command_for_on_includes_git_credential_env_and_reports_it() {
+        let _g = ENV_LOCK.lock().unwrap();
+        with_ssh_auth_sock(Some("/tmp/agent.sock"), || {
+            let on = caps_with_git_credentials(true);
+            let mut cmd = tokio::process::Command::new("true");
+            let granted = apply_agent_cli_env_allowlist_for(&mut cmd, Some(&on));
+            assert!(
+                granted.contains(&"SSH_AUTH_SOCK"),
+                "the audit-facing return must name every git-credential env var actually applied"
+            );
+
+            let std_cmd: &std::process::Command = cmd.as_std();
+            let ssh_value = std_cmd
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new("SSH_AUTH_SOCK"))
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_owned());
+            assert_eq!(
+                ssh_value,
+                Some(std::ffi::OsString::from("/tmp/agent.sock")),
+                "SSH_AUTH_SOCK must reach the child command when git_credentials=true"
+            );
+        });
+    }
+
+    /// Live-fire validation (not just `Command` introspection above): actually
+    /// spawn `/bin/sh` and have it print `SSH_AUTH_SOCK` at runtime, matching
+    /// the WP-8B `env -i` live-fire method referenced in the module doc.
+    /// Confirms the real child process — not just the `Command` object we
+    /// built — does/doesn't see the credential depending on the capability.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_spawn_git_credentials_toggle_controls_real_child_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let probe_value = "/tmp/duduclaw-wp10a-livefire.sock";
+        let prev = std::env::var("SSH_AUTH_SOCK").ok();
+        unsafe { std::env::set_var("SSH_AUTH_SOCK", probe_value) };
+
+        async fn run_and_capture(
+            capabilities: Option<&crate::types::CapabilitiesConfig>,
+        ) -> String {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", "printf 'SSH_AUTH_SOCK=[%s]' \"$SSH_AUTH_SOCK\""]);
+            apply_agent_cli_env_allowlist_for(&mut cmd, capabilities);
+            cmd.stdout(std::process::Stdio::piped());
+            let out = cmd.output().await.expect("live spawn of /bin/sh failed");
+            assert!(out.status.success(), "probe child exited non-zero: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        let off = caps_with_git_credentials(false);
+        let off_out = run_and_capture(Some(&off)).await;
+        assert_eq!(
+            off_out, "SSH_AUTH_SOCK=[]",
+            "git_credentials=false: the REAL spawned child must not see SSH_AUTH_SOCK"
+        );
+
+        let on = caps_with_git_credentials(true);
+        let on_out = run_and_capture(Some(&on)).await;
+        assert_eq!(
+            on_out,
+            format!("SSH_AUTH_SOCK=[{probe_value}]"),
+            "git_credentials=true: the REAL spawned child must see the exact SSH_AUTH_SOCK value"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("SSH_AUTH_SOCK", v),
+                None => std::env::remove_var("SSH_AUTH_SOCK"),
             }
         }
     }

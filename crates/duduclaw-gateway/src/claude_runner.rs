@@ -3197,7 +3197,32 @@ fn prepare_claude_cmd(
     // `call_claude_with_env`, applied further below) and every other
     // explicit `cmd.env(...)` call in this function run AFTER this and
     // always win.
-    duduclaw_core::apply_agent_cli_env_allowlist(&mut cmd);
+    //
+    // WP-10A (2026-08): `_for` additionally seeds
+    // `SSH_AUTH_SOCK`/`SSH_AGENT_PID`/`GPG_TTY`/`GNUPGHOME` when this
+    // agent's `agent.toml [capabilities] git_credentials = true` — default
+    // `false` ⇒ byte-identical to the call above. `work_dir` (when set) is
+    // the agent's own directory (`<home>/agents/<agent_id>`, same
+    // derivation as `capability_grants::scoped_disallow_for_agent_dir`), so
+    // the grant can be attributed to the actual owning agent; a `None`
+    // work_dir (agent-less system callers) still applies the capability
+    // gate correctly but attributes to "unknown" if it were ever non-empty
+    // — in practice those callers pass `capabilities = None`, so nothing is
+    // ever granted or logged for them.
+    let git_env_granted =
+        duduclaw_core::apply_agent_cli_env_allowlist_for(&mut cmd, capabilities);
+    if !git_env_granted.is_empty() {
+        let agent_id = work_dir
+            .and_then(|d| d.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let home_dir = work_dir
+            .and_then(|d| d.parent())
+            .and_then(|p| p.parent())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(duduclaw_core::platform::duduclaw_home);
+        duduclaw_security::audit::log_git_credentials_granted(&home_dir, agent_id, &git_env_granted);
+    }
 
     // Set working directory so Claude CLI auto-discovers the agent's
     // .mcp.json and .claude/settings.json from the project root.
