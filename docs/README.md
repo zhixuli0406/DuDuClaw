@@ -101,6 +101,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description |
 |----------|-------------|
 | [todo/TODO-bootstrap-admin-ws-deadlock.md](todo/TODO-bootstrap-admin-ws-deadlock.md) | 🟠 Bootstrap admin deadlock — a fresh containerised install logs in fine yet spins forever, because `must_change_password` blocks the WS handshake and the passwordless escape needs Personal + loopback |
+| [todo/TODO-client-ws-protocol-mismatch.md](todo/TODO-client-ws-protocol-mismatch.md) | 🟠 VS Code / Chrome / Stream Deck send JSON-RPC 2.0 frames the gateway's `WsFrame` protocol rejects — every dashboard RPC dies as a misleading "connection closed" |
+| [todo/TODO-agent-toml-silent-skip.md](todo/TODO-agent-toml-silent-skip.md) | 🟠 One missing `agent.toml` field drops the whole agent with a single WARN — `agents.list` goes empty and `FirstRunGate` shows a working install as brand-new |
 | [todo/TODO-agent-honesty.md](todo/TODO-agent-honesty.md) | Agent honesty / anti-hallucination tasks |
 | [todo/TODO-agent-cross-invocation-continuity.md](todo/TODO-agent-cross-invocation-continuity.md) | Agent 跨 invocation 行動連續性（否認/遺忘自己排程時的行動）修復 |
 | [todo/TODO-dispatch-run-visibility.md](todo/TODO-dispatch-run-visibility.md) | 排程／派工執行紀錄可觀測性——cron 路徑不落 run 紀錄，RunsPage 只看得到頻道對話 |
