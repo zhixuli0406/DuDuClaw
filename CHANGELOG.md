@@ -8,6 +8,8 @@
 - **`/files` 升級「產物與檔案」**：檔案頁加搜尋（檔名/來源）、依任務關聯篩選、日期範圍（`GET /api/files` 新增 `q`/`task_id`/`since`/`until` 參數，全 optional、回傳結構不變）。
 - **任務清單操作集（I-3b）**：`/goals` 每個任務可置頂／歸檔／重新命名（新 RPC `tasks.archive`/`unarchive`/`pin`/`unpin`/`rename`）；`tasks` 表加 `archived`/`pinned` 欄位（冪等 migration）；置頂排序置前、歸檔預設隱藏可切換顯示；先前 20 筆硬截解除，改走 `tasks.list_page` 分頁（limit clamp＋offset＋total）＋載入更多；頂部搜尋框。
 - **`/presets` preset 儀表板（唯讀）**：新頁列出可用 preset 目錄與各 agent 目前綁定、被覆寫欄位（`presets.list`/`presets.status` RPC，admin 限定，preset P1 唯讀範圍）。
+- **runtime 狀態匯入 P0（`duduclaw migrate-from claude-code`，含逐字稿）**：把 Claude Code 的記憶、CLAUDE.md 與對話逐字稿單向匯入 DuDuClaw。memory shard → semantic 記憶＋SPO（`store_temporal` 冪等，`valid_from` 取 frontmatter `modified`）；CLAUDE.md → agent wiki（`layer=context`，不佔系統提示注入預算）；session 逐字稿 → 精簡對話＋零 LLM 摘要（噪音濾除只留人類 prompt＋assistant 最終回覆，丟棄 thinking/tool_use/hook——實測逐字稿有效訊號僅約 1.5%）。匯入內容一律 `origin=import`（trust ≤ 0.7，不偽裝一手觀察）、一律當 DATA、redaction 預設開（`--no-redact` 關）、skill 過 `skill_security_scan` fail-closed。需 `--agent <id>`（缺漏 fail-fast）。真實 `~/.claude` dry-run 活測 53 專案、1114 項可匯、注入掃描正確擋下可疑 shard。仍需人工 `--apply` 才真正寫入。Codex/Gemini 平台為 P1（本機未安裝，未實作）。
+- **通道能力表（plugin P2，消除靜默失效）**：新增 `channel_capabilities.rs` 單一權威表——11 通道 × 7 能力（檔案/照片上傳、互動按鈕、edit-in-place、typing、原生 markdown、引用回覆）＋進度節流秒數；先前散落於各通道的硬編判斷（含 10 處進度節流字面值）收斂到查表。不支援某能力的通道從「靜默 no-op」改為留下結構化 log（`send_document`/`send_photo`/typing fallback），使用者能觀察到為何某功能在某通道未生效。
 - **Agent Mail 拒絕備註**：`mail.decide` 加 optional `note`——拒絕時以操作者原因取代系統文案並即時結算，核准時另記 `decision_note`（保留背景 worker 為唯一寄信/結算者的不變量）；儀表板拒絕動作加備註輸入框。
 
 ### Changed
