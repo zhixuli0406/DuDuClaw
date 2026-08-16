@@ -2707,6 +2707,10 @@ export interface AgentCapabilities {
   os_native?: boolean;
   /** WP3.3 — opt-in recording-to-skill capture (browser/desktop recording). */
   recording?: boolean;
+  /** WP-10A — opt-in hand-off of the operator's own SSH/GPG identity (push +
+   *  commit-signing credentials) to this agent's spawned CLI subprocess.
+   *  Danger-zone capability: default false. */
+  git_credentials?: boolean;
   /** How much the autonomous goal loop may drive this agent on its own. */
   autonomy_level?: AutonomyLevel;
 }

@@ -4753,5 +4753,8 @@
   "goals.filter.showArchived": "アーカイブを表示",
   "goals.section.archived": "アーカイブ済み",
   "goals.section.finishedEmpty": "完了したタスクはまだありません。",
-  "goals.section.archivedEmpty": "アーカイブされたタスクはまだありません。"
+  "goals.section.archivedEmpty": "アーカイブされたタスクはまだありません。",
+  "agents.cap.gitCredentials": "Git／GPG 認証情報の利用を許可",
+  "agents.cap.gitCredentials.help": "この社員のコマンドがローカルの SSH 鍵で git push し、GPG 鍵でコミットに署名できるようにします。",
+  "agents.edit.dangerConfirm.gitCredentials": "有効にすると、このAI社員が実行するコマンドはあなたのローカル SSH 鍵で git push し、GPG 鍵でコミットに署名できるようになります。これは git に限らず、あなた本人のプッシュ／署名権限そのものです。信頼でき、実際に git push や GPG 署名が必要な社員にのみ許可してください。"
 }

@@ -759,6 +759,7 @@ export function EditAgentPage() {
           policy: caps.policy,
           os_native: caps.os_native,
           recording: caps.recording,
+          git_credentials: caps.git_credentials,
           autonomy_level: caps.autonomy_level,
           computer_use_config: { ...caps.computer_use_config },
         };
@@ -1340,6 +1341,7 @@ export function EditAgentPage() {
               <RowSelect label={t('agents.cap.computerUseMode')} description={t('agents.cap.computerUseMode.help')} value={caps.computer_use_mode} onChange={(v) => updateCap('computer_use_mode', v as ComputerUseMode)} options={computerUseModeOptions} />
               <RowSwitch label={t('agents.cap.browserViaBash')} description={t('agents.cap.browserViaBash.help')} checked={caps.browser_via_bash} onChange={guardDanger(t('agents.cap.browserViaBash'), (v) => updateCap('browser_via_bash', v), 'agents.edit.dangerConfirm.browserViaBash')} />
               <RowSwitch label={t('agents.cap.recording')} description={t('agents.cap.recording.help')} checked={caps.recording} onChange={guardDanger(t('agents.cap.recording'), (v) => updateCap('recording', v), 'agents.edit.dangerConfirm.recording')} />
+              <RowSwitch label={t('agents.cap.gitCredentials')} description={t('agents.cap.gitCredentials.help')} checked={caps.git_credentials} onChange={guardDanger(t('agents.cap.gitCredentials'), (v) => updateCap('git_credentials', v), 'agents.edit.dangerConfirm.gitCredentials')} />
             </SettingsCard>
             {caps.computer_use_mode === 'native' && (
               <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.nativeWarning')}</p>

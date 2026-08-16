@@ -273,4 +273,73 @@ describe('EditAgentPage', () => {
       expect(call[1].odoo).not.toHaveProperty('password');
     });
   });
+
+  // WP-10A follow-up — `[capabilities] git_credentials` hands this agent's
+  // spawned CLI subprocess the operator's own SSH/GPG identity, so the
+  // dashboard switch must go through the same danger-confirm gate as
+  // computer_use / browser_via_bash / recording, default unchecked.
+  describe('git_credentials danger-zone switch', () => {
+    it('renders unchecked by default and only writes true after danger confirmation', async () => {
+      const user = userEvent.setup();
+      const updateAgent = vi.fn().mockResolvedValue(undefined);
+      useAgentsStore.setState({ updateAgent } as never);
+
+      renderAt('/agents/my-bot/edit?tab=tools');
+
+      await waitFor(() => {
+        expect(screen.getByRole('heading', { name: 'Tools & permissions', level: 2 })).toBeInTheDocument();
+      });
+
+      const gitSwitch = screen.getByRole('switch', { name: 'Allow Git/GPG credentials' });
+      expect(gitSwitch).not.toBeChecked();
+
+      // Clicking ON must not apply immediately — it opens the shared
+      // danger-confirm dialog instead of flipping the switch right away.
+      await user.click(gitSwitch);
+      expect(gitSwitch).not.toBeChecked();
+      expect(updateAgent).not.toHaveBeenCalled();
+
+      await waitFor(() => {
+        expect(screen.getByText('Confirm high-risk setting')).toBeInTheDocument();
+      });
+      // The specific risk copy (not just the generic "high risk" boilerplate)
+      // must be visible before the operator can confirm. Matched on a phrase
+      // unique to the dialog copy — the row's own help text also mentions
+      // "push git ... sign commits" so a looser match would false-positive
+      // even with the dialog closed.
+      expect(
+        screen.getByText(/effectively your own push\/signing identity, not just git/),
+      ).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Confirm' }));
+
+      await waitFor(() => {
+        expect(gitSwitch).toBeChecked();
+      });
+      await waitFor(
+        () => {
+          expect(updateAgent).toHaveBeenCalledWith(
+            'my-bot',
+            expect.objectContaining({
+              capabilities: expect.objectContaining({ git_credentials: true }),
+            }),
+          );
+        },
+        { timeout: 3000 },
+      );
+    });
+
+    it('prefills a checked state from agents.inspect without re-triggering the confirm dialog', async () => {
+      mockWsClient.call.mockResolvedValue({ ...DETAIL, capabilities: { git_credentials: true } });
+      renderAt('/agents/my-bot/edit?tab=tools');
+
+      const gitSwitch = await screen.findByRole('switch', { name: 'Allow Git/GPG credentials' });
+      await waitFor(() => {
+        expect(gitSwitch).toBeChecked();
+      });
+      // A value merged in from the server must never pop the confirm dialog —
+      // that gate is only for operator-initiated ON clicks.
+      expect(screen.queryByText('Confirm high-risk setting')).not.toBeInTheDocument();
+    });
+  });
 });
