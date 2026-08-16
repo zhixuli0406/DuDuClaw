@@ -20,8 +20,10 @@ pub mod org_field_guard;
 pub mod org_store;
 pub mod platform;
 pub mod preset;
+pub mod provider_env;
 pub mod sensitivity;
 pub mod spawn_admission;
+pub mod spawn_env;
 pub mod takeover_state;
 pub mod text_utils;
 pub mod tool_catalog;
@@ -84,6 +86,9 @@ pub use org_store::{
     OrgDrift, OrgEntry, OrgStore, OrgSyncChange, ORG_SEEDED_FILE, ORG_STORE_FILE, ORG_STORE_SCHEMA,
 };
 pub use platform::{duduclaw_home, duduclaw_instance, expand_tilde, home_dir, mcp_server_key};
+pub use provider_env::{
+    provider_env_key_names, resolve_env_key as resolve_provider_env_key, KNOWN_PROVIDER_IDS,
+};
 pub use sensitivity::{is_private_session, perception_source_sensitivity, Sensitivity};
 pub use spawn_admission::{
     clamp_min_one as spawn_admission_clamp_min_one, dequeue_next as spawn_admission_dequeue_next,
@@ -92,6 +97,9 @@ pub use spawn_admission::{
     AdmissionConfig as SpawnAdmissionConfig, AdmissionMode as SpawnAdmissionMode,
     DequeueResult as SpawnDequeueResult, EnqueueOutcome as SpawnEnqueueOutcome,
     QueuedSpawn,
+};
+pub use spawn_env::{
+    agent_cli_spawn_env_pairs, apply_agent_cli_env_allowlist, AGENT_CLI_ENV_ALLOWLIST,
 };
 pub use takeover_state::{
     BeginOutcome as TakeoverBeginOutcome, BeginRequest as TakeoverBeginRequest, TakeoverConfig,

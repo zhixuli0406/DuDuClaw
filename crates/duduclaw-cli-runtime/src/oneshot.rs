@@ -35,6 +35,15 @@ pub struct OneshotInvocation {
     /// Hard deadline for the whole call. The child is force-killed if it
     /// hasn't exited by then.
     pub deadline: Duration,
+    /// When `false` (the default — unchanged historical behavior), the
+    /// child inherits the parent's full environment, then `env` is layered
+    /// on top. When `true`, the child starts with an empty env and sees
+    /// ONLY `env` (plus the `NO_COLOR`/`TERM` defaults `oneshot_pty_invoke`
+    /// always injects). WP-8B (credentials doctrine P3): callers that spawn
+    /// a security-sensitive CLI (e.g. `claude`) should build `env` from an
+    /// explicit allowlist (`duduclaw_core::spawn_env`) and set this `true`
+    /// so the gateway's ambient vendor `*_API_KEY`s don't leak through.
+    pub clear_env: bool,
 }
 
 impl OneshotInvocation {
@@ -47,6 +56,7 @@ impl OneshotInvocation {
             rows: 24,
             cols: 200,
             deadline: Duration::from_secs(300),
+            clear_env: false,
         }
     }
 
@@ -78,6 +88,13 @@ impl OneshotInvocation {
 
     pub fn deadline(mut self, d: Duration) -> Self {
         self.deadline = d;
+        self
+    }
+
+    /// Opt into a fully-cleared child environment — see the field doc on
+    /// [`OneshotInvocation::clear_env`].
+    pub fn clear_env(mut self, clear: bool) -> Self {
+        self.clear_env = clear;
         self
     }
 }
@@ -112,6 +129,7 @@ pub async fn oneshot_pty_invoke(invocation: OneshotInvocation) -> Result<Oneshot
     let mut pty_cmd = PtyCommand::new(&invocation.program)
         .args(invocation.args.clone())
         .size(invocation.rows, invocation.cols);
+    pty_cmd.clear_env = invocation.clear_env;
     if let Some(cwd) = invocation.cwd.clone() {
         pty_cmd = pty_cmd.cwd(cwd);
     }
@@ -216,6 +234,47 @@ mod tests {
         assert!(out.stdout.contains("hello-oneshot"), "stdout = {:?}", out.stdout);
         assert!(out.bytes > 0);
         assert!(out.elapsed > Duration::ZERO);
+    }
+
+    // WP-8B (credentials doctrine P3): `clear_env` is the mechanism the
+    // gateway's spawn-env allowlist (`duduclaw_core::spawn_env`) relies on
+    // to stop a spawned agent CLI from inheriting the parent's full
+    // environment. Verify the wiring end to end with a real subprocess: an
+    // ambient var NOT included in `invocation.env` must not reach the
+    // child's own environment when `clear_env(true)` is set. Uses an
+    // absolute path to a real `env`-dumping binary so program resolution
+    // doesn't itself depend on `PATH` being present in the cleared env.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_env_true_hides_ambient_vars_not_in_the_map() {
+        let env_bin = ["/usr/bin/env", "/bin/env"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("no `env` binary found at a well-known absolute path");
+
+        // SAFETY: test-only; unique var name avoids clashing with other
+        // process-global env mutations in this crate's test suite.
+        unsafe { std::env::set_var("ONESHOT_CLEAR_ENV_CANARY", "leak-if-visible") };
+
+        let inv = OneshotInvocation::new(env_bin.to_string())
+            .clear_env(true)
+            .deadline(Duration::from_secs(5));
+        let out = oneshot_pty_invoke(inv).await.expect("invoke ok");
+
+        unsafe { std::env::remove_var("ONESHOT_CLEAR_ENV_CANARY") };
+
+        assert!(
+            !out.stdout.contains("ONESHOT_CLEAR_ENV_CANARY"),
+            "clear_env=true must not let an ambient var reach the child's env: {:?}",
+            out.stdout
+        );
+        // Sanity: the injected NO_COLOR/TERM defaults DO still reach the
+        // child (proves the child's env dump isn't just empty/broken).
+        assert!(
+            out.stdout.contains("NO_COLOR"),
+            "expected the always-injected NO_COLOR default in child env: {:?}",
+            out.stdout
+        );
     }
 
     #[tokio::test]

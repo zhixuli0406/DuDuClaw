@@ -152,18 +152,23 @@ impl AgentRuntime for OpenAiCompatRuntime {
     }
 
     async fn is_available(&self) -> bool {
-        // Check if any OpenAI-compatible provider API key is configured
-        const PROVIDER_KEYS: &[&str] = &[
-            "OPENAI_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "MINIMAX_API_KEY",
-            "GROQ_API_KEY",
-            "TOGETHER_API_KEY",
-            "MISTRAL_API_KEY",
-            "OPENROUTER_API_KEY",
-            "XAI_API_KEY",
-        ];
-        PROVIDER_KEYS.iter().any(|k| std::env::var(k).is_ok())
+        // Check if any OpenAI-compatible provider API key is configured.
+        // WP-8B (credentials doctrine P3): derived from the canonical
+        // `duduclaw_core::provider_env` table for every provider this
+        // runtime's `PROVIDERS` preset actually knows how to reach, instead
+        // of a hand-maintained literal list (which had drifted — it used to
+        // include TOGETHER_API_KEY / MISTRAL_API_KEY even though neither
+        // "together" nor "mistral" has a `PROVIDERS` preset, so setting only
+        // one of those two env vars made this return `true` while
+        // `resolve_provider_config`'s env-var steps could never actually use
+        // it — a config.toml `[[accounts]]` entry is the only way those two
+        // providers resolve here, and this env-only probe can't see that
+        // either way).
+        PROVIDERS.iter().any(|p| {
+            duduclaw_core::provider_env::provider_env_key_names(p.name)
+                .iter()
+                .any(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
+        })
     }
 }
 
@@ -628,30 +633,28 @@ async fn resolve_provider_config(
     // 1. If agent specifies a provider, try that first
     if let Some(provider_name) = preferred_provider {
         if let Some(provider) = PROVIDERS.iter().find(|p| p.name == provider_name) {
-            let env_key = format!("{}_API_KEY", provider.name.to_uppercase());
-            if let Ok(key) = std::env::var(&env_key) {
-                if !key.is_empty() {
-                    return Ok((
-                        key,
-                        provider.base_url.to_string(),
-                        provider.name.to_string(),
-                    ));
-                }
-            }
-        }
-    }
-
-    // 2. Check provider-specific env vars
-    for provider in PROVIDERS {
-        let env_key = format!("{}_API_KEY", provider.name.to_uppercase());
-        if let Ok(key) = std::env::var(&env_key) {
-            if !key.is_empty() {
+            if let Some(key) = duduclaw_core::provider_env::resolve_env_key(provider.name) {
                 return Ok((
                     key,
                     provider.base_url.to_string(),
                     provider.name.to_string(),
                 ));
             }
+        }
+    }
+
+    // 2. Check provider-specific env vars (WP-8B: canonical
+    // `duduclaw_core::provider_env` table instead of a re-derived
+    // `{PROVIDER}_API_KEY` string — same names for every provider in this
+    // preset list today, but now shared with the rest of the workspace
+    // instead of independently derived here).
+    for provider in PROVIDERS {
+        if let Some(key) = duduclaw_core::provider_env::resolve_env_key(provider.name) {
+            return Ok((
+                key,
+                provider.base_url.to_string(),
+                provider.name.to_string(),
+            ));
         }
     }
 

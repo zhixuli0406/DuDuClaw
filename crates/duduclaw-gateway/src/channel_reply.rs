@@ -7701,6 +7701,15 @@ async fn spawn_claude_cli_with_env(
 
     let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
 
+    // WP-8B (credentials doctrine P3, 2026-08): stop the child from
+    // inheriting the gateway's full environment — that used to leak every
+    // vendor `*_API_KEY` configured for ANY agent/provider on this gateway
+    // into every `claude` CLI subprocess. Clear the env and seed only the
+    // allowlisted base (see `duduclaw_core::spawn_env`); the `api_key` /
+    // `env_vars` (rotator-resolved) applications further below run AFTER
+    // this and always win.
+    duduclaw_core::apply_agent_cli_env_allowlist(&mut cmd);
+
     // Resume an existing Claude CLI session for multi-turn continuity.
     // Placed before `-p` so the CLI establishes session context first.
     // Session ID is deterministic: SHA-256(duduclaw_session_id + account_id).
@@ -8885,10 +8894,21 @@ async fn spawn_claude_cli_pty_with_env(
         duduclaw_core::agent_toml::resolve_minimal_context(work_dir),
     );
 
-    // Assemble env: API key fallback → caps env vars → caller-provided
-    // rotator env → context propagation (REPLY_CHANNEL, turn/session ids,
-    // DELEGATION_ENV are task-local; mirror the legacy path).
-    let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Assemble env: allowlisted base → API key fallback → caps env vars →
+    // caller-provided rotator env → context propagation (REPLY_CHANNEL,
+    // turn/session ids, DELEGATION_ENV are task-local; mirror the legacy
+    // path). WP-8B (credentials doctrine P3, 2026-08): the portable-pty
+    // child used to inherit the gateway's FULL environment underneath this
+    // map (`PtyCommand::clear_env` defaulted to `false`), leaking every
+    // vendor `*_API_KEY` configured for any agent/provider into this
+    // subprocess too. Seed the map from the same allowlist as the legacy
+    // spawn path (`duduclaw_core::spawn_env`) and pass `clear_env: true`
+    // below so nothing outside this map + the allowlist reaches the child.
+    let mut env: std::collections::HashMap<String, String> =
+        duduclaw_core::agent_cli_spawn_env_pairs()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
     let api_key = if env_vars.is_empty() {
         get_api_key(home_dir).await
     } else {
@@ -8929,23 +8949,29 @@ async fn spawn_claude_cli_pty_with_env(
     {
         env.insert(duduclaw_core::ENV_TRUST_SESSION_ID.to_string(), session_id);
     }
-    // CLAUDECODE removal: portable-pty inherits the parent env, but we
-    // explicitly add an empty marker so any downstream code sees it as
-    // unset. We can't env_remove with portable-pty's CommandBuilder, so
-    // set to empty string — claude CLI treats empty as unset.
+    // CLAUDECODE removal: with `clear_env: true` below the child no longer
+    // inherits the parent env at all, so CLAUDECODE is absent by
+    // construction — this explicit empty marker is now belt-and-suspenders
+    // (kept in case a future caller flips `clear_env` back off).
     env.insert("CLAUDECODE".to_string(), String::new());
 
     let work_dir_owned = work_dir.map(|p| p.to_path_buf());
     let deadline = std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS);
-    let output =
-        match crate::pty_runtime::invoke_oneshot(claude_path, args, env, work_dir_owned, deadline)
-            .await
-        {
-            Ok(out) => out,
-            Err(e) => {
-                return Err(format!("claude CLI PTY spawn error: {e}"));
-            }
-        };
+    let output = match crate::pty_runtime::invoke_oneshot(
+        claude_path,
+        args,
+        env,
+        work_dir_owned,
+        deadline,
+        true, // clear_env — WP-8B: allowlist above is the only ambient env the child sees
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(format!("claude CLI PTY spawn error: {e}"));
+        }
+    };
     drop(prompt_guard); // tempfile lives until here
 
     let parsed = parse_claude_stream_json_complete(&output.stdout)?;
