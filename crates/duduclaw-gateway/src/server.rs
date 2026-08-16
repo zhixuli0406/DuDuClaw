@@ -4257,6 +4257,18 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             }
             Ok(recv_result) => match recv_result {
                 Some(Ok(Message::Text(text))) => {
+                    // A frame that does not deserialize is a *protocol* problem,
+                    // not a credential one. Both used to end at the same
+                    // "auth failed" log, which sent a client-protocol bug
+                    // (JSON-RPC 2.0 frames instead of `WsFrame`) on a long
+                    // detour through credential debugging. Name it here.
+                    if serde_json::from_str::<WsFrame>(&text).is_err() {
+                        warn!(
+                            "WebSocket handshake frame is not a valid WsFrame \
+                             (expected {{\"type\":\"req\",\"method\":\"connect\",…}}) \
+                             — this is a client protocol error, not bad credentials"
+                        );
+                    }
                     match serde_json::from_str::<WsFrame>(&text) {
                         Ok(WsFrame::Request { id, method, params }) if method == "connect" => {
                             // ── JWT authentication (new) ─────────────────────

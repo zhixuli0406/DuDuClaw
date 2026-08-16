@@ -166,15 +166,30 @@ class GatewayClient {
     if (!token) throw new Error('not-authed');
     const sock = new WebSocket(this.wsUrl('/ws'));
     this.rpcSock = sock;
+    // The gateway speaks its own `WsFrame` protocol (see
+    // `crates/duduclaw-gateway/src/protocol.rs`), NOT JSON-RPC 2.0: frames are
+    // tagged `{"type":"req"|"res"|"event"}`, a reply carries `ok` + `payload`
+    // (not `result`), and `error` is a bare JSON value — usually a string.
+    // Server-pushed `event` frames have no `id` and must be ignored here.
     sock.on('message', (raw: Buffer) => {
-      let f: { id?: unknown; result?: unknown; error?: { message?: string } };
+      let f: {
+        type?: string;
+        id?: unknown;
+        ok?: boolean;
+        payload?: unknown;
+        error?: unknown;
+      };
       try { f = JSON.parse(raw.toString('utf8')); } catch { return; }
-      if (f.id == null) return;
+      if (f.type !== 'res' || f.id == null) return;
       const p = this.pending.get(String(f.id));
       if (!p) return;
       this.pending.delete(String(f.id));
-      if (f.error) p.reject(new Error(f.error.message ?? JSON.stringify(f.error)));
-      else p.resolve(f.result);
+      if (f.ok === false) {
+        const msg = typeof f.error === 'string' ? f.error : JSON.stringify(f.error);
+        p.reject(new Error(msg || 'request failed'));
+      } else {
+        p.resolve(f.payload);
+      }
     });
     sock.on('close', () => {
       if (this.rpcSock === sock) { this.rpcSock = undefined; this.rpcReady = undefined; }
@@ -203,7 +218,11 @@ class GatewayClient {
     return new Promise((resolve, reject) => {
       const id = String(++this.rpcSeq);
       this.pending.set(id, { resolve, reject });
-      this.rpcSock?.send(JSON.stringify({ jsonrpc: '2.0', method, params, id }));
+      // `type: 'req'` is required — an untagged frame fails the gateway's
+      // `WsFrame` deserialization, which it treats as a failed handshake and
+      // closes the socket ("WebSocket auth failed"), surfacing here as the
+      // misleading 'connection closed'.
+      this.rpcSock?.send(JSON.stringify({ type: 'req', id, method, params }));
       setTimeout(() => {
         if (this.pending.delete(id)) reject(new Error(`${method} timeout`));
       }, 15000);
