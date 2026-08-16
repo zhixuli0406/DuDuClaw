@@ -19,7 +19,7 @@ scope 隔離已在 RFC-21 §2 落地：`AgentOdooConfig` / `OdooConfigResolver`
 
 客戶調研(§1)給出明確訊號：Odoo 的定位落在 15-50 人的公司，大型企業客戶
 不會只跑 Odoo。要讓 SAP、ERPNext、Twenty 這類系統融進同一個 agent 平台，
-得先有一層 adapter，而不是每接一家 ERP 就複製一次 `OdooConnector` 的血肉。
+得先有一層 adapter，不是每接一家 ERP 就複製一次 `OdooConnector` 的血肉。
 
 範式已經在專案裡跑了半年。`duduclaw-llm` 的 `trait ChatProvider`
 (`crates/duduclaw-llm/src/provider.rs:103`)用 `#[async_trait]` 定義
@@ -31,7 +31,7 @@ OpenAI-compat 四個實作，加上 `ModelRegistry` 這種資料驅動的能力�
 trait 切面的完整規格(方法簽名、`duduclaw-erp` 骨架 crate 的拆分、ERPNext
 實作細節)已由 `commercial/docs/TODO-feature-gaps-2026-07.md` §一 規劃完成，
 那是調研產出。本 ADR 只做一件事：把那份規劃升格為正式決策，並記錄取捨。
-規格不在此重述——執行時兩份文件同時打開。
+規格不在此重述。執行時兩份文件同時打開。
 
 ## Decision
 
@@ -48,7 +48,7 @@ trait 切面的完整規格(方法簽名、`duduclaw-erp` 骨架 crate 的拆分
 
 **Odoo 是第一個實作**：`OdooConnector` 改為 `impl ErpConnector`，行為零變更，
 既有 15 個 MCP tools 的輸出保持 byte-compatible，拿現有測試當回歸網。
-**ERPNext 是第二個實作**，它的作用是驗證這層抽象——第二家接得進來，trait
+**ERPNext 是第二個實作**，它的作用是驗證這層抽象：第二家接得進來，trait
 才算真的抽對了。只有一個實作的 trait 是猜測，兩個才是證據。
 
 **per-agent credential / scope / audit 三件套是 trait 合約的一部分，不是 Odoo
@@ -70,7 +70,7 @@ connector 共享；業務對大型企業客戶有「抽象層就緒、規劃中 
 (見 `docs/features/erp-support-matrix.md`)；MCP tool 命名收斂成 `erp_*`，
 不再洩漏底層是哪家 ERP。
 
-**付出的：** 抽 trait 有立即成本——要拆 `duduclaw-erp` 骨架 crate、把 Odoo
+**付出的：** 抽 trait 有立即成本，要拆 `duduclaw-erp` 骨架 crate、把 Odoo
 改成實作者、驗證 15 個 tools 回歸全綠，而這一切在 ERPNext 真的動工前不產生
 任何對外可見的新功能。誠實的取捨：**現在抽 vs 等第二家再抽**。
 

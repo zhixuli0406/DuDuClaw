@@ -6,28 +6,28 @@
 
 ## 比喻：櫃檯接待員與通訊錄
 
-想像一棟大樓前台坐著一位接待員。當訪客走進來，接待員不會用猜的。他會查閱公司通訊錄——那個權威系統會告訴你「這是 Ruby Lin，客戶 PM，已獲准進入 Alpha 與 Beta 兩個專案」。
+想像一棟大樓前台坐著一位接待員。當訪客走進來，接待員不會用猜的。他會查閱公司通訊錄：那個權威系統會告訴你「這是 Ruby Lin，客戶 PM，已獲准進入 Alpha 與 Beta 兩個專案」。
 
-但通訊錄伺服器偶爾會停機維護。一位稱職的接待員會在抽屜裡放一份列印的名冊——那是上次通訊錄還連得上時的快取副本。當線上系統離線時，他改查那張紙，而不是把所有人都擋在門外。
+但通訊錄伺服器偶爾會停機維護。一位稱職的接待員會在抽屜裡放一份列印的名冊，那是上次通訊錄還連得上時的快取副本。當線上系統離線時，他改查那張紙，不會把所有人都擋在門外。
 
-而且一旦接待員確認了你的身分，他不會讓每個部門再次驗證你。他會在你胸前別上一張 **訪客識別證**，上面寫著你的姓名、角色，以及可進入哪些樓層。你拜訪的每個部門都讀這張證，而不是重新去查通訊錄。
+而且一旦接待員確認了你的身分，他不會讓每個部門再次驗證你。他會在你胸前別上一張 **訪客識別證**，上面寫著你的姓名、角色，以及可進入哪些樓層。你拜訪的每個部門都讀這張證，而非重新去查通訊錄。
 
 DuDuClaw 的身分解析正是如此：
 
 - **通訊錄** 是上游 provider（`NotionIdentityProvider`）。
 - **抽屜裡那份列印名冊** 是 wiki 快取（`WikiCacheIdentityProvider`）。
 - **接待員的後備邏輯** 是 `ChainedProvider`（線上 → 快取）。
-- **訪客識別證** 是注入到 Agent 系統提示中的 `<sender>` 區塊——解析一次，每一輪都讀。
+- **訪客識別證** 是注入到 Agent 系統提示中的 `<sender>` 區塊（解析一次，每一輪都讀）。
 
 ---
 
 ## 要解決的問題
 
-在 RFC-21 §1 之前，DuDuClaw 的 Agent 沒有辦法問「跟我說話的這個人是誰？」唯一可用的機制是對一個事先知道的路徑（例如 `identity/discord-users.md`）呼叫 `shared_wiki_read`。那個檔案只列了兩個人。其他所有人——團隊成員、客戶聯絡人、工程師——都是看不見的陌生人。
+在 RFC-21 §1 之前，DuDuClaw 的 Agent 沒有辦法問「跟我說話的這個人是誰？」唯一可用的機制是對一個事先知道的路徑（例如 `identity/discord-users.md`）呼叫 `shared_wiki_read`。那個檔案只列了兩個人，其他所有人（團隊成員、客戶聯絡人、工程師）都是看不見的陌生人。
 
-Agent 在 SOUL.md 裡宣告了像「拒絕非專案成員」這樣的規則，卻沒有名冊可以拿來評估這條規則，也沒有機制去查詢權威來源。邊界活在散文裡，而不是資料裡。
+Agent 在 SOUL.md 裡宣告了像「拒絕非專案成員」這樣的規則，卻沒有名冊可以拿來評估這條規則，也沒有機制去查詢權威來源。邊界活在散文裡，不在資料裡。
 
-修正之道是 **系統層的權威，而非提示層的建議**：引入 `IdentityProvider` trait，把 wiki 從事實來源降格為透明快取，並把解析出的人物以結構化資料餵進系統提示——讓 SOUL.md 規則變成可評估，而不只是空談。
+修正之道是 **系統層的權威，而非提示層的建議**：引入 `IdentityProvider` trait，把 wiki 從事實來源降格為透明快取，並把解析出的人物以結構化資料餵進系統提示：讓 SOUL.md 規則變成可評估，而不只是空談。
 
 ---
 
@@ -50,7 +50,7 @@ trait IdentityProvider: Send + Sync {
 
 ### `Ok(None)` 的語意
 
-一個關鍵的設計決定：當人物未知時，`resolve_by_channel` 回傳 `Ok(None)`。這是正常的「陌生人傳訊息」情況，明確地 **不是** 錯誤。`Err` 保留給真正的 provider 失敗——上游連不上、payload 格式錯誤、IO 故障。正是這個區分，讓鏈式 provider 能夠優雅降級。
+一個關鍵的設計決定：當人物未知時，`resolve_by_channel` 回傳 `Ok(None)`。這是正常的「陌生人傳訊息」情況，明確地 **不是** 錯誤。`Err` 保留給真正的 provider 失敗：上游連不上、payload 格式錯誤、IO 故障。正是這個區分，讓鏈式 provider 能夠優雅降級。
 
 ---
 
@@ -136,7 +136,7 @@ resolve_by_channel(channel, external_id)
    回傳 Ok(None)   ← Agent 把寄件者視為陌生人，而非硬錯誤
 ```
 
-關鍵特性：當 Notion 連不上時，頻道回覆仍然繼續進行。Agent 只是看不到 `<sender>`，於是把訊息當成來自陌生人——正是接待員退回到列印名冊，絕不鎖上大門。
+關鍵特性：當 Notion 連不上時，頻道回覆仍然繼續進行。Agent 只是看不到 `<sender>`，於是把訊息當成來自陌生人，正如接待員退回到列印名冊，絕不鎖上大門。
 
 `lookup_project_members` 則反轉偏好：它 **先查上游**，因為專案成員資格正是那種會在快取裡漂移的資料。只有在上游出錯時才退回快取（並發出 `tracing::warn!` 讓 operator 注意到這次降級）。
 
@@ -151,7 +151,7 @@ resolve_by_channel(channel, external_id)
 | `person_id` | `String` | 來自事實來源的穩定正規 id（例如 Notion page id）。視為不透明。 |
 | `display_name` | `String` | 人類可讀的名稱，例如「Ruby Lin」。 |
 | `roles` | `Vec<String>` | 領域角色，例如 `["customer-pm", "engineer"]`。 |
-| `project_ids` | `Vec<String>` | 專案成員資格——「拒絕非專案成員」就是拿這個來評估。 |
+| `project_ids` | `Vec<String>` | 專案成員資格：「拒絕非專案成員」就是拿這個來評估。 |
 | `emails` | `Vec<String>` | 相關的 email 位址；可能為空。 |
 | `channel_handles` | `BTreeMap<String, String>` | `{channel-wire-name: external_id}`。用 `BTreeMap` 以確保序列化順序確定。 |
 | `source` | `String` | 產出此記錄的 provider（`"notion"`、`"wiki-cache"`）。會被帶進審計日誌。 |
@@ -178,7 +178,7 @@ identity_resolve { channel, external_id }
   ResolvedPerson JSON   ── 或 ──   null（未知寄件者）
 ```
 
-這道 scope 閘門遵循 DuDuClaw「安全閘門 fail closed」的慣例——沒有 `Scope::IdentityRead` 的金鑰會被拒絕，絕不悄悄放行。
+這道 scope 閘門遵循 DuDuClaw「安全閘門 fail closed」的慣例，沒有 `Scope::IdentityRead` 的金鑰會被拒絕，絕不悄悄放行。
 
 ---
 
@@ -200,9 +200,9 @@ identity_resolve { channel, external_id }
   └─ ... 其餘上下文
 ```
 
-這就是訪客識別證。在這項功能之前，像「拒絕非專案成員」這樣的 SOUL.md 規則，需要 Agent 在推理途中記得去呼叫 `shared_wiki_read`——這一步它常常跳過。現在成員資料已經擺在它眼前，位於高注意力位置，每一輪都在。規則變成可從 Agent 已持有的資料來評估。
+這就是訪客識別證。在這項功能之前，像「拒絕非專案成員」這樣的 SOUL.md 規則，需要 Agent 在推理途中記得去呼叫 `shared_wiki_read`。這一步它常常跳過。現在成員資料已經擺在它眼前，位於高注意力位置，每一輪都在。規則變成可從 Agent 已持有的資料來評估。
 
-當 provider 未設定或寄件者未知時，不會注入 `<sender>` 區塊——Agent 只把訊息當成來自陌生人，套用 SOUL.md 的陌生人處理規則。
+當 provider 未設定或寄件者未知時，不會注入 `<sender>` 區塊，Agent 只把訊息當成來自陌生人，套用 SOUL.md 的陌生人處理規則。
 
 ---
 
@@ -210,11 +210,11 @@ identity_resolve { channel, external_id }
 
 ### 系統層的權威，而非提示層的指望
 
-SOUL.md 指令是盡力而為的——模型可能遵循也可能不遵循。身分解析把邊界搬到可以對照真實資料評估的地方。「拒絕非專案成員」不再是一句提示，而成為對 Agent 真正看得到的 `project_ids` 的檢查。
+SOUL.md 指令是盡力而為的（模型可能遵循，也可能不遵循）。身分解析把邊界搬到可以對照真實資料評估的地方。「拒絕非專案成員」不再是一句提示，而成為對 Agent 真正看得到的 `project_ids` 的檢查。
 
 ### 優雅降級，絕不鎖門
 
-`ChainedProvider` 的軟失敗設計，意味著上游故障是降低保真度（未知寄件者），而不是中斷對話。Notion 的維護視窗不會拖垮你的 Agent——它們退回 wiki 快取，再退回陌生人處理，然後繼續回覆。
+`ChainedProvider` 的軟失敗設計，意味著上游故障是降低保真度（未知寄件者），而非中斷對話。Notion 的維護視窗不會拖垮你的 Agent。它們退回 wiki 快取，再退回陌生人處理，然後繼續回覆。
 
 ### wiki 成為快取，而非事實來源
 
@@ -222,10 +222,10 @@ SOUL.md 指令是盡力而為的——模型可能遵循也可能不遵循。身
 
 ### 以 trait 插拔，而非以 fork
 
-由於每個後端都實作同一個 `IdentityProvider` trait，把 Notion 換成 LDAP 或自訂 HTTP 通訊錄只是更換 provider，而不是重寫頻道回覆路徑。`<sender>` 注入、MCP 工具與 scope 閘門全都維持不變。
+由於每個後端都實作同一個 `IdentityProvider` trait，把 Notion 換成 LDAP 或自訂 HTTP 通訊錄只是更換 provider，而非重寫頻道回覆路徑。`<sender>` 注入、MCP 工具與 scope 閘門全都維持不變。
 
 ---
 
 ## 總結
 
-一位用猜的接待員是個風險。而一位會查通訊錄、在通訊錄停機時退回列印名冊、並替每位訪客別上識別證讓各部門無須重查的接待員——那才是你可以拿來建立規則的系統。DuDuClaw 的身分解析賦予每個 Agent 這樣一位接待員：一個 trait、三種 provider、優雅降級，以及一張 Agent 每輪都會讀的 `<sender>` 識別證。「這個人是誰？」不再是猜測，而成為一次查詢。
+一位用猜的接待員是個風險。而一位會查通訊錄、在通訊錄停機時退回列印名冊、並替每位訪客別上識別證讓各部門無須重查的接待員，才是你可以拿來建立規則的系統。DuDuClaw 的身分解析賦予每個 Agent 這樣一位接待員：一個 trait、三種 provider、優雅降級，以及一張 Agent 每輪都會讀的 `<sender>` 識別證。「這個人是誰？」不再是猜測，而成為一次查詢。

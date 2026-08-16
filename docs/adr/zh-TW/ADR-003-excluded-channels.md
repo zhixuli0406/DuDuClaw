@@ -7,9 +7,9 @@
 ## Context
 
 DuDuClaw 出貨九個通道(Telegram、LINE、Discord、Slack、WhatsApp、Feishu、Google Chat、
-Microsoft Teams、WebChat——數字為本 ADR 撰寫當時的計數;WeCom 與 DingTalk 是後來加入的,
+Microsoft Teams、WebChat:數字為本 ADR 撰寫當時的計數;WeCom 與 DingTalk 是後來加入的,
 使總數增至十一個)。在 2026-07 的通道缺口盤點中,又評估了三個平台,並**刻意排除**。
-把這個決策記錄在此,可以防止同樣的選項每季被重新調查一次——更重要的是,防止有人在
+把這個決策記錄在此,可以防止同樣的選項每季被重新調查一次;更重要的是,防止有人在
 不清楚代價的情況下,悄悄上線一個高風險的非官方依賴。
 
 ## Decision
@@ -20,7 +20,7 @@ Microsoft Teams、WebChat——數字為本 ADR 撰寫當時的計數;WeCom 與 
 
 - 沒有官方 bot API 存在。`signal-cli` 是社群整合路徑。
 - 對先前調研的更正:`signal-cli` 使用的是**官方的 `libsignal`** 函式庫(不是逆向工程
-  出來的協定),但它驅動的仍然是一個*個人*Signal 帳號——沒有經過官方認可的 bot 平台。
+  出來的協定),但它驅動的仍然是一個*個人*Signal 帳號,沒有經過官方認可的 bot 平台。
   這帶有速率限制與帳號被停用的風險,而且 Signal 的服務條款是以人類使用為導向。
 - 結論:相對於個人帳號橋接所帶的營運風險,投資報酬率偏低。只有在 Signal 發布官方
   bot/business API 時才重新評估。
@@ -46,6 +46,6 @@ Microsoft Teams、WebChat——數字為本 ADR 撰寫當時的計數;WeCom 與 
 
 - 這三者被標記為「已評估、已否決」,讓未來的規劃跳過重複盤點。
 - 需要接觸 Signal/Viber 使用者的人,應該透過 Matrix 橋接(Matrix 是另一個獨立、
-  未排除的候選)或 email 來走,而不是走第一方連接器。
+  未排除的候選)或 email 來走,不走第一方連接器。
 - 若任何一個排除條件改變(Signal 推出官方 bot API;Viber 出現免費/低價層),
   以一份取代本 ADR 的新 ADR 重新開啟討論。

@@ -1,6 +1,6 @@
 # 自主目標迴圈
 
-> 在聊天裡丟下一個目標;agent 規劃、執行、由獨立判官驗收直到完成——或者某條硬界限觸發,交給人裁決。
+> 在聊天裡丟下一個目標;agent 規劃、執行、由獨立判官驗收直到完成,或者某條硬界限觸發,交給人裁決。
 
 ---
 
@@ -14,7 +14,7 @@
 /goal status
 ```
 
-這會在 Task Board 上建立一個 `goal_mode` 任務,蓋上來源通道與聊天室的戳記,進度會推回發起它的那段對話。省略 `||` 段落時,目標描述本身就是驗收基準,回覆同時會附一段四要素引導(目標/輸入/輸出格式/約束)與 3-5 條 outcome 式驗收標準建議,幫助下次交付得更精確;可選的第三段 `outcome:<spec>` 加上一份機器可驗的產出契約(JSON Schema 子集或 workdir 檔案 glob),在判官*之前*以零 LLM 成本、確定性地執行——結構上不合格的產出直接彈回修改,不花一次判官呼叫。
+這會在 Task Board 上建立一個 `goal_mode` 任務,蓋上來源通道與聊天室的戳記,進度會推回發起它的那段對話。省略 `||` 段落時,目標描述本身就是驗收基準,回覆同時會附一段四要素引導(目標/輸入/輸出格式/約束)與 3-5 條 outcome 式驗收標準建議,幫助下次交付得更精確;可選的第三段 `outcome:<spec>` 加上一份機器可驗的產出契約(JSON Schema 子集或 workdir 檔案 glob),在判官*之前*以零 LLM 成本、確定性地執行。結構上不合格的產出直接彈回修改,不花一次判官呼叫。
 
 驗收標準在建立當下就會凍結成不可變的基準,判官與下方的第一階段評估器一律讀這份凍結基準;agent 身分呼叫 `tasks_update` 想改自己 goal 任務的驗收標準會被拒絕並留審計紀錄,只有儀表板操作者能編輯顯示用的可變副本(但不會回頭改變凍結基準)。
 
@@ -22,7 +22,7 @@
 
 ## Driver
 
-`GoalLoopDriver`(`goal_loop.rs`)是外層迴圈。每 30 秒(`tick_secs` 可調)找出等待執行的 `goal_mode` 任務,把一則工作訊息排進既有的 message queue——與通道訊息同一條喚醒軌——agent 於是循原封不動的管線認領、執行、完成。閉環如下:
+`GoalLoopDriver`(`goal_loop.rs`)是外層迴圈。每 30 秒(`tick_secs` 可調)找出等待執行的 `goal_mode` 任務,把一則工作訊息排進既有的 message queue(與通道訊息同一條喚醒軌),agent 於是循原封不動的管線認領、執行、完成。閉環如下:
 
 ```
 driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
@@ -30,54 +30,54 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
      └── reject → pending (+judge feedback) ◀── acceptance judge ──▶ pass → done
 ```
 
-被駁回時,任務帶著判官回饋回到 `pending`;下一個 tick 立即把該回饋放進工作訊息重新派工——一個 Generator-Verifier 重試迴圈。每次狀態轉換都往來源對話推一則簡短(1–3 行)進度,同狀態去重。
+被駁回時,任務帶著判官回饋回到 `pending`;下一個 tick 立即把該回饋放進工作訊息重新派工:一個 Generator-Verifier 重試迴圈。每次狀態轉換都往來源對話推一則簡短(1–3 行)進度,同狀態去重。
 
-## 驗收判官——絕不採信自我宣告
+## 驗收判官：絕不採信自我宣告
 
-「完成」只由 verifier 宣告,不由 worker。agent 回報完成後,任務進入 `review`。先跑一個便宜的**第一階段評估器**——無工具、單次 LLM 呼叫,輸出三選一 JSON 判定(`continue`／`candidate_complete`／`blocked`):`continue` 跳過判官團,直接拿評估器的 `next_step` 當回饋重新派工(計入迭代上限);`blocked` 直接轉 `needs_human`;只有 `candidate_complete` 才進下面的判官團。評估器故障(逾時/解析失敗/呼叫錯誤)一律降級直接跑判官團,絕不因此自動通過或自動拒絕。設定 `[dispatch] two_stage_judge`(預設 `true`;`false` 退回每輪都跑判官團的舊行為)。
+「完成」只由 verifier 宣告,不由 worker。agent 回報完成後,任務進入 `review`。先跑一個便宜的**第一階段評估器**(無工具、單次 LLM 呼叫),輸出三選一 JSON 判定(`continue`／`candidate_complete`／`blocked`):`continue` 跳過判官團,直接拿評估器的 `next_step` 當回饋重新派工(計入迭代上限);`blocked` 直接轉 `needs_human`;只有 `candidate_complete` 才進下面的判官團。評估器故障(逾時/解析失敗/呼叫錯誤)一律降級直接跑判官團,絕不因此自動通過或自動拒絕。設定 `[dispatch] two_stage_judge`(預設 `true`;`false` 退回每輪都跑判官團的舊行為)。
 
-進判官團後,`DispatchEngine` 跑一個**三面向 MAV 判官團**——正確性、完整性、安全性——一次 LLM 呼叫,走帳號輪替器。三項全過才算通過;解析失敗、面板 JSON 截斷/畸形、或判官錯誤都會把任務停在 `needs_human`,絕不自動通過(fail-closed)——截斷的 JSON 片段不會再落到舊版單一 token 掃描器,不會被片段裡剛好出現的 `pass` 字樣誤判通過。這是對經典 loop trap(agent 自述成功、系統照單全收)的防禦。
+進判官團後,`DispatchEngine` 跑一個**三面向 MAV 判官團**(正確性、完整性、安全性),一次 LLM 呼叫,走帳號輪替器。三項全過才算通過;解析失敗、面板 JSON 截斷/畸形、或判官錯誤都會把任務停在 `needs_human`,絕不自動通過(fail-closed)。截斷的 JSON 片段不會再落到舊版單一 token 掃描器,不會被片段裡剛好出現的 `pass` 字樣誤判通過。這是對經典 loop trap(agent 自述成功、系統照單全收)的防禦。
 
 判官團 prompt 也內建四條紀律(無 config 開關,永遠套用):**反棘輪**(驗收標準沒變時不得每輪找新毛病)、**只稽核不自建證據**(只能比對 agent 提交的證據與工具稽核摘要,不得自行想像補寫)、**反契約外擴張**(驗收標準沒寫的事項不得作為駁回理由)、**agent 自稱完成不是證據**。
 
 判官深度隨目標難度縮放(本地、零 LLM 的啟發式):簡單的單步目標用兩面向檢查(正確性 + 安全性)與較低的迭代上限;困難目標用完整判官團。安全面向在任何深度都不會被拿掉。
 
-## 硬防護——界限由 driver 持有
+## 硬防護：界限由 driver 持有
 
-終止由 driver 保證,而不是信任模型:
+終止由 driver 保證,不靠信任模型:
 
 | 防護 | 預設 | 觸發時 |
 |---|---|---|
 | 迭代上限(每任務派工數) | 8(困難目標)、3(簡單目標) | `needs_human` |
 | 自建立起算的 wall clock | 24 h | `needs_human` |
 | 並行目標任務數 | 3 | 排隊,不派工 |
-| 停滯偵測 | 連續兩輪駁回回饋的 **gap 指紋**相同(從回饋抽取 `path:line` 引用與反引號關鍵詞正規化而成,不是逐字比對——換句話說的同一個 gap 也算;抽不到任何引用/關鍵詞才退回逐字比對) | 提前 `needs_human` |
-| 提前收工偵測 | 九條 zh+en 正則比對 agent 最後一段非空文字(如自簽 `VERDICT:`、「請稍後再來查看」、「請你審核一下」) | 記遙測與 activity 事件,提示帶進下一輪判官/評估器輸入——不會自己駁回或卡住任務 |
+| 停滯偵測 | 連續兩輪駁回回饋的 **gap 指紋**相同(從回饋抽取 `path:line` 引用與反引號關鍵詞正規化而成,不是逐字比對,換句話說的同一個 gap 也算;抽不到任何引用/關鍵詞才退回逐字比對) | 提前 `needs_human` |
+| 提前收工偵測 | 九條 zh+en 正則比對 agent 最後一段非空文字(如自簽 `VERDICT:`、「請稍後再來查看」、「請你審核一下」) | 記遙測與 activity 事件,提示帶進下一輪判官/評估器輸入,但不會自己駁回或卡住任務 |
 | In-flight 去重 | 已派工但未認領的任務在停滯逾時(600 s)前不重新排入 | 重新派工 |
 | 跨程序斷路器(`dispatch_guard`) | 60 s 滑動視窗內 20 次派工 | 冷卻拒絕 |
 | 委派 hop 深度 | 5 | 拒絕派工 |
-| gateway 重啟時的復活行為(`resume_on_restart`) | `pause`(**預設**)——開機把所有 in-flight `goal_mode` 任務轉 `needs_human`(原因 `gateway_restart`) | `auto` 時重啟後 in-flight 任務照常接續(這項設定出現前的唯一行為);可在 `config.toml` 或儀表板「設定→自動化」切換(`system.update_config` 只收 `"auto"`/`"pause"`) |
-| 逾時進度通報(`progress_report_minutes`) | 已認領任務靜默 10 分鐘(以 Activity Feed 訊號為準,不是會被 lease renewer 定期刷新的 `updated_at`) | 推一則「仍在執行、未回報進度」通知到 Activity Feed ＋來源對話,同一輪最多一次——不重派工、不升級、不取消;`0` 關閉 |
-| 工具連擊 advisory(`tool_streak_advisory`) | 單一輪內對同一工具、同一組(遮罩後)參數連續呼叫 3／5／8 次 | 逐級加重的 zh-TW 提醒注入下一輪 `<state>` 區塊——零 LLM 成本、純 advisory,不會擋下或否決任何呼叫;排除在震盪偵測的狀態雜湊之外 |
+| gateway 重啟時的復活行為(`resume_on_restart`) | `pause`(**預設**):開機把所有 in-flight `goal_mode` 任務轉 `needs_human`(原因 `gateway_restart`) | `auto` 時重啟後 in-flight 任務照常接續(這項設定出現前的唯一行為);可在 `config.toml` 或儀表板「設定→自動化」切換(`system.update_config` 只收 `"auto"`/`"pause"`) |
+| 逾時進度通報(`progress_report_minutes`) | 已認領任務靜默 10 分鐘(以 Activity Feed 訊號為準,不是會被 lease renewer 定期刷新的 `updated_at`) | 推一則「仍在執行、未回報進度」通知到 Activity Feed ＋來源對話,同一輪最多一次,不重派工、不升級、不取消;`0` 關閉 |
+| 工具連擊 advisory(`tool_streak_advisory`) | 單一輪內對同一工具、同一組(遮罩後)參數連續呼叫 3／5／8 次 | 逐級加重的 zh-TW 提醒注入下一輪 `<state>` 區塊(零 LLM 成本、純 advisory),不會擋下或否決任何呼叫;排除在震盪偵測的狀態雜湊之外 |
 | ephemeral spawn 准入(`[dispatch] admission`) | 撞到並發上限(`ephemeral_max_active`,預設 32) | `"queue"`(**預設**)有界 FIFO 持久排隊而非直接拒絕(佇列深度上限、每張票 TTL、全數落稽核);`"fail"` 退回 H19 之前的立即拒絕 |
 
 全部在 `config.toml` 的 `[goal_loop]` / `[dispatch_guard]` / `[dispatch]` 之下,區段缺席時使用內建預設。
 
 ## needs_human 升級
 
-任務停在 `needs_human` 時,除了既有的自由文字 `judge_feedback`,同時會蓋上一個六選一的封閉分類 `pause_reason`——`no_progress`／`budget_exhausted`／`blocked_needs_decision`／`infra`／`restart`／`unknown`,在觸發現場靜態標記(絕不從判官/評估器的敘述反解)。`/goals` 看板與任務詳情頁渲染成分類 chip,通道審批訊息多一行「類型」;未分類或既有舊任務一律讀成 `unknown`(安全預設)。`goal_notify.rs` 往來源對話推送一則帶四個動作的審批訊息——**重試 / 標記完成 / 中止 / 交給我**(fallback 到該 agent 的 `[proactive]` 控制通道)。一則訊息主要動作上限 3 個,因此重試/標記完成留在主要層,中止/交給我收進各平台自己的次要層:Telegram、Discord 各是第二排按鈕,Slack 是原生 `overflow` 選單;LINE 沒有對應的次要選單機制,這兩個動作不會出現在 LINE 的快速回覆裡,改以文字說明並附儀表板連結。其他無按鈕通道用文字 fallback,儀表板也有一欄 needs_human 看板。
+任務停在 `needs_human` 時,除了既有的自由文字 `judge_feedback`,同時會蓋上一個六選一的封閉分類 `pause_reason`:`no_progress`／`budget_exhausted`／`blocked_needs_decision`／`infra`／`restart`／`unknown`,在觸發現場靜態標記(絕不從判官/評估器的敘述反解)。`/goals` 看板與任務詳情頁渲染成分類 chip,通道審批訊息多一行「類型」;未分類或既有舊任務一律讀成 `unknown`(安全預設)。`goal_notify.rs` 往來源對話推送一則帶四個動作的審批訊息(**重試 / 標記完成 / 中止 / 交給我**,fallback 到該 agent 的 `[proactive]` 控制通道)。一則訊息主要動作上限 3 個,因此重試/標記完成留在主要層,中止/交給我收進各平台自己的次要層:Telegram、Discord 各是第二排按鈕,Slack 是原生 `overflow` 選單;LINE 沒有對應的次要選單機制,這兩個動作不會出現在 LINE 的快速回覆裡,改以文字說明並附儀表板連結。其他無按鈕通道用文字 fallback,儀表板也有一欄 needs_human 看板。
 
-**交給我**只認領任務(`claimed_by`),不解決它——任務仍留在 `needs_human`,而驅動器的派工候選查詢本就不看這個狀態,所以不需要額外的狀態轉換就已經停止自動重試。這是目前實作的第一層(停止自動迴圈＋標記＋收斂卡片);把整段對話控制權轉交給人是後續階段的功能,尚未實作。
+**交給我**只認領任務(`claimed_by`),不解決它:任務仍留在 `needs_human`,而驅動器的派工候選查詢本就不看這個狀態,所以不需要額外的狀態轉換就已經停止自動重試。這是目前實作的第一層(停止自動迴圈＋標記＋收斂卡片);把整段對話控制權轉交給人是後續階段的功能,尚未實作。
 
 決策具冪等性且 fail-closed:重試/標記完成/中止只從 `needs_human` 狀態轉出,所以過期或重複按下都是 no-op;交給我沒有終態可比對,重複按(甚至換另一位有權限的人按)就是重新認領,不會報錯。
 
 ## 「想一想」計畫模式(I-1c)
 
-儀表板交辦面板的第三種模式,與「問一問」「交辦」並列。選它時 `tasks.goal_create` 帶 `plan_first: true`:後端不會立刻派工,而是先同步呼叫工具用 LLM,依目標描述與驗收標準產出一份簡短(3-8 條、純文字)的執行計畫,任務直接誕生在 `needs_human`——沿用既有的 `blocked_needs_decision` 分類,沒有新增分類——核准前不會進入驅動器的派工候選查詢,連一輪都不會跑。
+儀表板交辦面板的第三種模式,與「問一問」「交辦」並列。選它時 `tasks.goal_create` 帶 `plan_first: true`:後端不會立刻派工,而是先同步呼叫工具用 LLM,依目標描述與驗收標準產出一份簡短(3-8 條、純文字)的執行計畫,任務直接誕生在 `needs_human`(沿用既有的 `blocked_needs_decision` 分類,沒有新增分類),核准前不會進入驅動器的派工候選查詢,連一輪都不會跑。
 
-計畫存在獨立欄位 `plan_pending`,刻意與 `judge_feedback` 分開:任何 `needs_human` 任務用來恢復執行的「重試」動作會用你的核准備註覆寫 `judge_feedback`,若共用同一欄位,核准當下計畫就會被自己的核准動作洗掉、永遠傳不到第一輪派工。核准就是既有的「重試」按鈕,沒有新增按鈕種類。核准後的第一輪派工會把 `plan_pending` 的內容包成 `<execution_plan>` 區塊注入工作提示,注入後立刻清空,後續輪次不再重複貼。計畫是指引,不是免驗收憑證——執行結果仍要通過與其他目標任務相同的兩段式驗收裁決／MAV 判官團。
+計畫存在獨立欄位 `plan_pending`,刻意與 `judge_feedback` 分開:任何 `needs_human` 任務用來恢復執行的「重試」動作會用你的核准備註覆寫 `judge_feedback`,若共用同一欄位,核准當下計畫就會被自己的核准動作洗掉、永遠傳不到第一輪派工。核准就是既有的「重試」按鈕,沒有新增按鈕種類。核准後的第一輪派工會把 `plan_pending` 的內容包成 `<execution_plan>` 區塊注入工作提示,注入後立刻清空,後續輪次不再重複貼。計畫是指引,不是免驗收憑證;執行結果仍要通過與其他目標任務相同的兩段式驗收裁決／MAV 判官團。
 
-若規劃器呼叫本身失敗(逾時、傳輸錯誤、空回覆),任務照樣 fail-closed 停在 `needs_human`,但分類改成 `infra` 而非 `blocked_needs_decision`,且不帶 `plan_pending`——核准動作永遠不會在沒有計畫的情況下悄悄開始執行。
+若規劃器呼叫本身失敗(逾時、傳輸錯誤、空回覆),任務照樣 fail-closed 停在 `needs_human`,但分類改成 `infra` 而非 `blocked_needs_decision`,且不帶 `plan_pending`,核准動作永遠不會在沒有計畫的情況下悄悄開始執行。
 
 ## 自主等級
 
@@ -100,4 +100,4 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 
 與舊有 `approval_required_tools` 的合併採取其嚴者,既有設定的語意原封不動。
 
-完整操作參考——config key、派工政策、平行子任務 DAG、outcome schema——見 [`docs/guides/goal-loop.md`](../../guides/goal-loop.md)。
+完整操作參考,包括 config key、派工政策、平行子任務 DAG、outcome schema,見 [`docs/guides/goal-loop.md`](../../guides/goal-loop.md)。

@@ -6,17 +6,17 @@
 
 ## 比喻：共享的 Kanban 看板
 
-想像辦公室牆上一塊實體 Kanban 看板。卡片在欄位間移動——*待辦 → 進行中 → 完成*——還有一條*受阻*車道接住卡住的工作。人類產品負責人釘上新卡片。隊友走過來，從「待辦」撕下一張卡片，貼到「進行中」自己的名字底下，站立會議時報告做了什麼。
+想像辦公室牆上一塊實體 Kanban 看板。卡片在欄位間移動（*待辦 → 進行中 → 完成*），還有一條*受阻*車道接住卡住的工作。人類產品負責人釘上新卡片。隊友走過來，從「待辦」撕下一張卡片，貼到「進行中」自己的名字底下，站立會議時報告做了什麼。
 
 現在讓一部分隊友變成 AI agent。它們讀同一塊看板。它們認領同一批卡片。它們發出同樣的站立會議更新。唯一的差別是它們*如何*碰到看板：人類在 web dashboard 上用滑鼠；agent 從自己的推理迴圈裡呼叫工具。
 
-DuDuClaw 的 Task Board 正是如此——一塊由 SQLite 支撐的看板，有兩道門通向它。一道給人類（web dashboard），一道給 agent（MCP 工具）。兩者移動的是同一批卡片。Activity Feed 則是大家都讀的站立會議紀錄。
+DuDuClaw 的 Task Board 正是如此：一塊由 SQLite 支撐的看板，有兩道門通向它。一道給人類（web dashboard），一道給 agent（MCP 工具）。兩者移動的是同一批卡片。Activity Feed 則是大家都讀的站立會議紀錄。
 
 ---
 
 ## 一個儲存層，兩道存取層
 
-看板與動態都活在單一 SQLite 資料庫中（`tasks.db`，WAL 模式，5 秒 busy_timeout 以支援多行程安全）。所有操作都匯流到單一 `TaskStore`——但有兩種截然不同的方式抵達它：
+看板與動態都活在單一 SQLite 資料庫中（`tasks.db`，WAL 模式，5 秒 busy_timeout 以支援多行程安全）。所有操作都匯流到單一 `TaskStore`，但有兩種截然不同的方式抵達它：
 
 ```
    人類                                      AGENT
@@ -45,7 +45,7 @@ DuDuClaw 的 Task Board 正是如此——一塊由 SQLite 支撐的看板，有
                     └─────────────────────┘
 ```
 
-兩道門沒有哪道是「主要」的。人類建立卡片、agent 認領它；agent 建立子任務、人類重新指派它。因為兩者寫的是同一批列，看板永遠是單一事實來源——不需同步、不需鏡像、不會漂移。
+兩道門沒有哪道是「主要」的。人類建立卡片、agent 認領它；agent 建立子任務、人類重新指派它。因為兩者寫的是同一批列，看板永遠是單一事實來源。不需同步、不需鏡像，也不會漂移。
 
 ### Dashboard RPC 集合（人類）
 
@@ -62,7 +62,7 @@ DuDuClaw 的 Task Board 正是如此——一塊由 SQLite 支撐的看板，有
 
 ### MCP 工具集合（agent）
 
-透過 MCP server 暴露給 AI runtime。這些讓 agent 能看到自己的佇列、認領工作、回報進度、完成卡片——全程不需人類介入。
+透過 MCP server 暴露給 AI runtime。這些讓 agent 能看到自己的佇列、認領工作、回報進度、完成卡片，全程不需人類介入。
 
 | MCP 工具 | 用途 |
 |----------|------|
@@ -75,7 +75,7 @@ DuDuClaw 的 Task Board 正是如此——一塊由 SQLite 支撐的看板，有
 | `activity_post` | 發一則進度紀錄，*不*變更任務狀態 |
 | `activity_list` | 讀取近期動態（預設為呼叫者） |
 
-這正是 Multica「Agent 即隊友」設計的核心：agent 不只是你呼叫的一個函式——它是一位會盯著看板、撿起卡片、發站立會議的同事。
+這正是 Multica「Agent 即隊友」設計的核心：agent 不只是你呼叫的一個函式，它是一位會盯著看板、撿起卡片、發站立會議的同事。
 
 ---
 
@@ -112,8 +112,8 @@ DuDuClaw 的 Task Board 正是如此——一塊由 SQLite 支撐的看板，有
 |--------|------|
 | `todo` | 已建立、尚未開始（建立時的預設） |
 | `in_progress` | agent 或人類正在處理 |
-| `blocked` | 卡住——攜帶一個 `blocked_reason` |
-| `done` | 完成——蓋上 `completed_at` |
+| `blocked` | 卡住（攜帶一個 `blocked_reason`） |
+| `done` | 完成（蓋上 `completed_at`） |
 
 ### Priority 值
 
@@ -130,7 +130,7 @@ DuDuClaw 的 Task Board 正是如此——一塊由 SQLite 支撐的看板，有
 
 ## 即時 Activity Feed
 
-每一次有意義的狀態變更都會寫入一列 `activity`，並即時推送給 dashboard 訂閱者。當 web UI 建立卡片或 agent 移動卡片時，gateway 會透過 WebSocket 廣播一個 `activity.new` 事件——所以 Activity Feed 不需重新整理即會更新。
+每一次有意義的狀態變更都會寫入一列 `activity`，並即時推送給 dashboard 訂閱者。當 web UI 建立卡片或 agent 移動卡片時，gateway 會透過 WebSocket 廣播一個 `activity.new` 事件，所以 Activity Feed 不需重新整理即會更新。
 
 ```
 agent 呼叫 tasks_claim
@@ -144,13 +144,13 @@ TaskStore: UPDATE status=in_progress, assigned_to=agent
                                                      （即時動態更新）
 ```
 
-`activity_post` 的存在正是為了讓 agent 能說「仍在處理中，遷移已過半」——*不*變更卡片狀態的站立會議留言，而非欄位移動。
+`activity_post` 的存在正是為了讓 agent 能說「仍在處理中，遷移已過半」。這是*不*變更卡片狀態的站立會議留言，而非欄位移動。
 
 ---
 
 ## 待辦任務自動注入 Prompt
 
-看板不只是 agent *可以*去查的東西——它們未完成的工作會被自動推入它們的上下文。當 gateway 組裝 agent 的 system prompt 時，會建立一個 `## Your Task Queue` 區段：
+看板不只是 agent *可以*去查的東西：它們未完成的工作會被自動推入它們的上下文。當 gateway 組裝 agent 的 system prompt 時，會建立一個 `## Your Task Queue` 區段：
 
 ```
 build_pending_tasks_section(agent_id):
@@ -180,7 +180,7 @@ build_pending_tasks_section(agent_id):
 
 ## 排程器層級的拉取：喚醒閒置 Agent
 
-自動注入涵蓋了*已經*在回覆訊息的 agent。但大多數正式環境的 agent 設定 `heartbeat.enabled = false`，閒置等待直到有頻道訊息抵達——所以指派給它們的卡片永遠不會被撿起。
+自動注入涵蓋了*已經*在回覆訊息的 agent。但大多數正式環境的 agent 設定 `heartbeat.enabled = false`，閒置等待直到有頻道訊息抵達，所以指派給它們的卡片永遠不會被撿起。
 
 `HeartbeatScheduler` 在**排程器層級**解決這點：在每個 30 秒 tick，它掃描*整個* agent registry（不只是啟用 heartbeat 的 agent），並對每個執行 `poll_assigned_tasks`：
 
@@ -212,7 +212,7 @@ poll_assigned_tasks(agent)：
 
 ### 真正的共享工作空間
 
-人類與 agent 不是兩套以同步任務硬接在一起的獨立系統。它們寫的是同一批 SQLite 列。在 dashboard 建立的卡片，正是 agent 透過 MCP 認領的*同一個物件*——只有一塊看板。
+人類與 agent 不是兩套以同步任務硬接在一起的獨立系統。它們寫的是同一批 SQLite 列。在 dashboard 建立的卡片，正是 agent 透過 MCP 認領的*同一個物件*，看板只有一塊。
 
 ### 行為像隊友的 Agent
 
@@ -230,4 +230,4 @@ poll_assigned_tasks(agent)：
 
 ## 總結
 
-一個團隊需要一塊大家都能看見、認領、回報的看板。DuDuClaw 的 Task Board 就是那塊看板——單一 SQLite 儲存層，配上一道人類的門（dashboard RPC）與一道 agent 的門（MCP 工具）、一個用於站立會議的即時 Activity Feed、讓工作中的 agent 永遠看得到自己佇列的 prompt 自動注入，以及一個讓閒置 agent 在工作落到自己名下時仍會被喚醒的排程器層級拉取。這正是把 AI agent 從「你呼叫的函式」轉變為「會撿起卡片的隊友」的關鍵。
+一個團隊需要一塊大家都能看見、認領、回報的看板。DuDuClaw 的 Task Board 就是那塊看板：單一 SQLite 儲存層，配上一道人類的門（dashboard RPC）與一道 agent 的門（MCP 工具）、一個用於站立會議的即時 Activity Feed、讓工作中的 agent 永遠看得到自己佇列的 prompt 自動注入，以及一個讓閒置 agent 在工作落到自己名下時仍會被喚醒的排程器層級拉取。這正是把 AI agent 從「你呼叫的函式」轉變為「會撿起卡片的隊友」的關鍵。

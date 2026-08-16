@@ -1,14 +1,14 @@
 # Evolution Events 系統
 
-> Agent 的飛航資料記錄器——每一次有意義的演化、治理與耐久性事件，都以保證送達的批次機制完整記錄。
+> Agent 的飛航資料記錄器：每一次有意義的演化、治理與耐久性事件，都以保證送達的批次機制完整記錄。
 
 ---
 
 ## 比喻：飛航資料記錄器
 
-飛機上的黑盒子並不負責駕駛飛機。它安靜地待在機尾，把每一個有意義的事件——高度變化、引擎狀態、操縱輸入、警報——記錄到即使墜機也能倖存的一次性寫入媒體上。飛行員飛行途中從不去讀它。但一旦出事，這個記錄器是唯一能說清楚究竟發生了什麼、以什麼順序、為什麼發生的真相來源。
+飛機上的黑盒子並不負責駕駛飛機。它安靜地待在機尾，把每一個有意義的事件（高度變化、引擎狀態、操縱輸入、警報）記錄到即使墜機也能倖存的一次性寫入媒體上。飛行員飛行途中從不去讀它。但一旦出事，這個記錄器是唯一能說清楚究竟發生了什麼、以什麼順序、為什麼發生的真相來源。
 
-Evolution Events 系統就是 DuDuClaw 為 Agent 打造的飛航資料記錄器。它本身不*驅動*演化——驅動演化的是 GVU 迴圈、預測引擎、治理層與耐久性框架。它只是安靜地記錄這些子系統發出的每一個有意義事件：一個技能被啟用、一次安全掃描執行、一條政策被違反、一個斷路器跳閘、一次重試耗盡。每一筆記錄都落入一個只能追加（append-only）的 JSONL 紀錄檔，採用固定的 8 欄位 schema，而且永遠不會阻塞發出事件的那個 Agent。
+Evolution Events 系統就是 DuDuClaw 為 Agent 打造的飛航資料記錄器。它本身不*驅動*演化；驅動演化的是 GVU 迴圈、預測引擎、治理層與耐久性框架。它只是安靜地記錄這些子系統發出的每一個有意義事件：一個技能被啟用、一次安全掃描執行、一條政策被違反、一個斷路器跳閘、一次重試耗盡。每一筆記錄都落入一個只能追加（append-only）的 JSONL 紀錄檔，採用固定的 8 欄位 schema，而且永遠不會阻塞發出事件的那個 Agent。
 
 當營運者數週後打開儀表板的 **Reliability**（可靠性）頁面，想問「為什麼這個 Agent 的成功率下降了？」，答案就來自這個記錄器——不靠記憶，也不靠猜測。
 
@@ -16,7 +16,7 @@ Evolution Events 系統就是 DuDuClaw 為 Agent 打造的飛航資料記錄器�
 
 ## 單一筆記錄的形狀
 
-每一個事件——無論由哪個子系統發出——都序列化成一行 JSONL，欄位完全相同。固定寬度的 schema（沒有缺漏的鍵；缺值序列化為 `null`）讓下游解析器保持簡單。
+每一個事件，無論由哪個子系統發出，都序列化成一行 JSONL，欄位完全相同。固定寬度的 schema（沒有缺漏的鍵；缺值序列化為 `null`）讓下游解析器保持簡單。
 
 ```
 AuditEvent {
@@ -45,7 +45,7 @@ AuditEvent {
 | **Governance（W19-P1）** | `governance_violation`、`governance_approval_requested`、`governance_approval_decided`、`governance_policy_changed`、`governance_quota_reset` | 政策違規、核准工作流程、政策 CRUD、每日配額重置 |
 | **Durability（W19-P1）** | `durability_retry_attempt`、`durability_retry_exhausted`、`durability_circuit_opened`、`durability_circuit_recovered`、`durability_checkpoint_saved`、`durability_dlq_replayed` | 重試嘗試與耗盡、斷路器狀態轉換、檢查點儲存、DLQ 重播 |
 
-`Outcome` 列舉同樣分層：P0 有 `success` / `failure` / `suppressed`；W19-P1 加入 `blocked`、`warned`、`throttled`、`pending`、`approved`、`rejected`、`triggered`、`recovered`——因此一個 `governance_violation` 可以是 `blocked`、一個核准可以是 `pending`、一個 `durability_circuit_opened` 可以是 `triggered`。
+`Outcome` 列舉同樣分層：P0 有 `success` / `failure` / `suppressed`；W19-P1 加入 `blocked`、`warned`、`throttled`、`pending`、`approved`、`rejected`、`triggered`、`recovered`，因此一個 `governance_violation` 可以是 `blocked`、一個核准可以是 `pending`、一個 `durability_circuit_opened` 可以是 `triggered`。
 
 ---
 
@@ -60,7 +60,7 @@ AuditEvent {
 | `query.rs` | 讀取路徑。`AuditEventIndex` 是建立在 JSONL 檔案之上、以 SQLite 為後端的索引快取；`AuditQueryFilter` / `AuditQueryResult` 支援分頁、過濾的讀取。 |
 | `reliability.rs` | 分析層。純函式把原始事件依時間窗口彙整成每個 Agent 的 `ReliabilitySummary`。 |
 
-（第五個檔案 `logger.rs` 是 emitter 寫入時所經過的 JSONL 追加器——以日期 + 10 MB 大小做輪替、寫入錯誤時重試一次、並在持久化前做 metadata 遮蔽。）
+（第五個檔案 `logger.rs` 是 emitter 寫入時所經過的 JSONL 追加器：以日期 + 10 MB 大小做輪替、寫入錯誤時重試一次、並在持久化前做 metadata 遮蔽。）
 
 ---
 
@@ -90,7 +90,7 @@ EvolutionEventLogger.log(event)
 flush() 時 fsync 以確保持久性
 ```
 
-若寫入失敗（輪替過程出問題、暫時性 FS 錯誤），logger 會作廢過期的檔案 handle、重新開啟，並在丟棄記錄前**重試一次**——稽核事件應該能撐過短暫的小故障，而不是憑空消失。
+若寫入失敗（輪替過程出問題、暫時性 FS 錯誤），logger 會作廢過期的檔案 handle、重新開啟，並在丟棄記錄前**重試一次**：稽核事件禁得起短暫的小故障，不會就此無聲消失。
 
 ---
 
@@ -118,8 +118,8 @@ events/*.jsonl  ──（背景同步）──>  AuditEventIndex (SQLite)
 
 `query.rs` 對濫用做了強化：
 
-- **欄位白名單**——每一個可過濾的欄位都必須出現在 `ALLOWED_FILTER_COLS` 中；不在清單內的欄位名稱會被拒絕，封堵任何未來的 SQL 注入向量。
-- **夾限的分頁**——`limit` 被夾限在 `[1, MAX_LIMIT]`，`offset` 也有上界，因此巨大的 OFFSET 無法讓 SQLite 掃描無上限的列數（一道 DoS 防護）。
+- **欄位白名單**：每一個可過濾的欄位都必須出現在 `ALLOWED_FILTER_COLS` 中；不在清單內的欄位名稱會被拒絕，封堵任何未來的 SQL 注入向量。
+- **夾限的分頁**：`limit` 被夾限在 `[1, MAX_LIMIT]`，`offset` 也有上界，因此巨大的 OFFSET 無法讓 SQLite 掃描無上限的列數（一道 DoS 防護）。
 
 ---
 
@@ -137,7 +137,7 @@ ReliabilitySummary（每個 Agent，預設 7 天窗口）
 └─ generated_at           = 計算當下的 RFC3339 時間戳
 ```
 
-每個指標都由一個小型**純函式**（`avg_success_rate`、`task_success_rate`、`skill_adoption_rate`、`fallback_trigger_rate`）以彙總計數算出——這讓它們可以用 fixture 輕鬆做單元測試，且完全不涉及任何 I/O。
+每個指標都由一個小型**純函式**（`avg_success_rate`、`task_success_rate`、`skill_adoption_rate`、`fallback_trigger_rate`）以彙總計數算出。這讓它們可以用 fixture 輕鬆做單元測試，且完全不涉及任何 I/O。
 
 ---
 
@@ -168,7 +168,7 @@ flush 時持久化                  透過 flush() 做 fsync
 
 ### 一份誠實的稽核軌跡
 
-因為 schema 向後相容、紀錄檔只能追加，歷史無法被悄悄改寫。舊記錄的意義永遠等同於它被寫下時的意義——這對治理與安全審查至關重要。
+因為 schema 向後相容、紀錄檔只能追加，歷史無法被悄悄改寫。舊記錄的意義永遠等同於它被寫下時的意義，這對治理與安全審查至關重要。
 
 ### 給營運者答案，而非猜測
 
@@ -182,4 +182,4 @@ Reliability 頁面把成千上萬筆原始事件，化為營運者真正在意�
 
 ## 總結
 
-黑盒子並不負責駕駛飛機——但少了它，每一次事故都是一團謎。Evolution Events 系統對 DuDuClaw 的 Agent 扮演的正是這個角色：一個非阻塞的 emitter、一個帶有重試一次耐久性的輪替 JSONL 紀錄檔、一個以 SQLite 建索引的查詢層，以及一個呈現在儀表板上的可靠性彙整。演化、治理與耐久性全都流經同一個固定的 8 欄位 schema，因此一個 Agent 如何隨時間改變的故事，永遠被記錄、永遠可查詢、永遠能安全地讀取。
+黑盒子並不負責駕駛飛機，但少了它，每一次事故都是一團謎。Evolution Events 系統對 DuDuClaw 的 Agent 扮演的正是這個角色：一個非阻塞的 emitter、一個帶有重試一次耐久性的輪替 JSONL 紀錄檔、一個以 SQLite 建索引的查詢層，以及一個呈現在儀表板上的可靠性彙整。演化、治理與耐久性全都流經同一個固定的 8 欄位 schema，因此一個 Agent 如何隨時間改變的故事，永遠被記錄、永遠可查詢、永遠能安全地讀取。
