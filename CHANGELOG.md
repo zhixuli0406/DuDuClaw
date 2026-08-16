@@ -13,7 +13,7 @@
 - **Agent Mail 拒絕備註**：`mail.decide` 加 optional `note`——拒絕時以操作者原因取代系統文案並即時結算，核准時另記 `decision_note`（保留背景 worker 為唯一寄信/結算者的不變量）；儀表板拒絕動作加備註輸入框。
 
 ### Changed
-- **任務詳情頁統一（I-2c）**：`/goals` 點任務改導向 `/tasks/:id` 正式詳情頁，舊的 goal dialog 移除、內容併入四分頁詳情（驗收/風險/產出/kickoff/輪次＋活動時間軸＋MAV 徽章）；`/goals?task=` 保留為轉址相容層。needs_human 三按鈕審批動線不變，goal 任務旁補上先前 dashboard 漏掉的第 4 顆「交給我」按鈕（對齊通道卡片本有的四按鈕）。
+- **cron 星期欄改用標準 crontab 慣例（行為變更，BREAKING）**：`cron` crate 0.15 的星期欄是 Quartz 慣例（1=週日…7=週六），而 DuDuClaw 先前從未轉譯——使用者照 crontab man page 寫的 `* * 1-5`（意圖週一到五）實際排的是「週日到週四」：週日幽靈觸發＋週五整天靜默跳過（2026-08-16 LWM 實驗實錘：台股休市的週日早上被派了盤前班）。現在 `duduclaw_core::cron_tz::normalise_cron` 在解析時把數字星期從 Unix 慣例（`0`/`7`=週日、`1-5`=週一到五）轉譯成 crate 序數；cron 排程器、heartbeat、MCP 建立/更新驗證、dashboard 驗證全走同一份 normaliser。名字寫法（`MON-FRI`）與 `*`、`*/step` 語意不變；數字範圍展開成明確列表（`6-7`→`1,7`）避免反向範圍。通道回條 `humanize_cron_zh` 同步改讀 Unix 慣例（`0`/`7` 都是週日、`1`=週一）。**升級注意**：先前刻意照 Quartz 慣例寫數字星期的排程升級後會位移一天（想要週日請寫 `0`、`7` 或 `SUN`）；照 crontab 直覺寫的排程（絕大多數）則是升級後才第一次正確。內建「週報彙整」模板（`0 17 * * 5`，標示每週五）先前實際在週四觸發，本次起與標示一致。`/goals` 點任務改導向 `/tasks/:id` 正式詳情頁，舊的 goal dialog 移除、內容併入四分頁詳情（驗收/風險/產出/kickoff/輪次＋活動時間軸＋MAV 徽章）；`/goals?task=` 保留為轉址相容層。needs_human 三按鈕審批動線不變，goal 任務旁補上先前 dashboard 漏掉的第 4 顆「交給我」按鈕（對齊通道卡片本有的四按鈕）。
 - **`task_row_to_json` 輸出 `archived`/`pinned`**：`tasks.list`／`task.updated` 廣播現在帶這兩個狀態欄位。
 
 ### Security
