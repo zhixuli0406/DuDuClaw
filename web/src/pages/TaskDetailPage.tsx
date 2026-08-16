@@ -32,12 +32,20 @@ import {
   TaskBottomTabs,
   TaskDoneBurst,
   celebrateTaskDone,
+  PauseReasonChip,
+  GoalTakeoverButton,
+  GoalContractCards,
+  GoalPendingKickoff,
+  GoalRoundTimeline,
+  GoalRoundBadge,
+  GoalDiminishingBadge,
+  GoalDeadlineBadge,
 } from '@/components/task';
 import { OpenInChannelButton } from '@/components/inbox/OpenInChannelButton';
 import { NeedsHumanActions } from '@/components/inbox/NeedsHumanTaskPanel';
 import { toStatusKey } from '@/lib/task-status';
-import { timeAgo } from '@/lib/format';
-import { api, type TaskInfo, type TaskStatus, type TaskPriority, type TaskIteration } from '@/lib/api';
+import { timeAgo, formatHms, secondsBetween } from '@/lib/format';
+import { api, type TaskInfo, type TaskStatus, type TaskPriority, type GoalTimeline } from '@/lib/api';
 import {
   ArrowLeft,
   Link2,
@@ -51,6 +59,10 @@ import {
   MessageSquareWarning,
   Loader2,
   RotateCcw,
+  Pin,
+  PinOff,
+  Archive,
+  ArchiveRestore,
 } from 'lucide-react';
 import { toast, formatError } from '@/lib/toast';
 
@@ -60,32 +72,6 @@ function taskSource(task: TaskInfo): TaskSource {
   if (task.parent_task_id) return 'delegated';
   return 'manual';
 }
-
-/** Compact H/M/S duration from whole seconds (e.g. 3725 → "1h 2m"). */
-function formatDuration(totalSeconds: number): string {
-  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return '0s';
-  const h = Math.floor(totalSeconds / 3600);
-  const m = Math.floor((totalSeconds % 3600) / 60);
-  const s = Math.floor(totalSeconds % 60);
-  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
-  if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
-  return `${s}s`;
-}
-
-/** Seconds between two RFC3339 stamps (0 if unparseable / negative). */
-function secondsBetween(from?: string | null, to?: string | null): number {
-  if (!from || !to) return 0;
-  const a = Date.parse(from);
-  const b = Date.parse(to);
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
-  return Math.max(0, Math.round((b - a) / 1000));
-}
-
-const VERDICT_TONE: Record<string, string> = {
-  accepted: 'text-success',
-  rejected: 'text-amber-600 dark:text-amber-400',
-  escalated: 'text-destructive',
-};
 
 /** `/tasks/:id` — the Multica IssueDetail flagship (spec §5.3 式1). */
 export function TaskDetailPage() {
@@ -118,7 +104,12 @@ export function TaskDetailPage() {
   const [addSub, setAddSub] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [burst, setBurst] = useState<{ agentId: string } | null>(null);
-  const [iterations, setIterations] = useState<TaskIteration[]>([]);
+  // I-2c: the whole goal-loop story (rounds + activity + pending kickoff +
+  // run linkage) — replaces the plain `tasks.iterations` fetch this page used
+  // before the `/goals?task=` dialog's content was merged in. Best-effort —
+  // a task with no goal rounds simply returns an empty timeline and the
+  // goal-specific sections below render nothing.
+  const [timeline, setTimeline] = useState<GoalTimeline | null>(null);
 
   useEffect(() => {
     fetchTasks();
@@ -130,23 +121,19 @@ export function TaskDetailPage() {
     if (id) fetchComments(id);
   }, [id, fetchComments]);
 
-  // Iterative Kanban: the revision timeline. Best-effort — a task with no goal
-  // rounds simply returns an empty list and the section is hidden.
-  useEffect(() => {
+  const loadTimeline = useCallback(() => {
     if (!id) return;
-    let alive = true;
     api.tasks
-      .iterations(id)
-      .then((r) => {
-        if (alive) setIterations(r?.iterations ?? []);
-      })
-      .catch(() => {
-        if (alive) setIterations([]);
-      });
-    return () => {
-      alive = false;
-    };
+      .timeline(id)
+      .then(setTimeline)
+      .catch(() => setTimeline(null));
   }, [id]);
+
+  useEffect(() => {
+    loadTimeline();
+  }, [loadTimeline]);
+
+  const iterations = timeline?.iterations ?? [];
 
   const task = useMemo(() => tasks.find((t) => t.id === id), [tasks, id]);
   const parent = useMemo(
@@ -241,6 +228,29 @@ export function TaskDetailPage() {
     navigate('/tasks');
   }, [task, removeTask, navigate, clearError, intl]);
 
+  // I-3b: pin/archive from the detail page too — the same actions the
+  // `/goals` list kebab offers, so a task reached directly (a bookmark, a
+  // channel deep-link) is never a dead end for un-archiving it.
+  const togglePin = useCallback(async () => {
+    if (!task) return;
+    try {
+      await (task.pinned ? api.tasks.unpin(task.id) : api.tasks.pin(task.id));
+      await fetchTasks();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    }
+  }, [task, fetchTasks, intl]);
+
+  const toggleArchive = useCallback(async () => {
+    if (!task) return;
+    try {
+      await (task.archived ? api.tasks.unarchive(task.id) : api.tasks.archive(task.id));
+      await fetchTasks();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    }
+  }, [task, fetchTasks, intl]);
+
   const togglePanel = useCallback(() => {
     setSheetOpen(true); // mobile: open the sheet
     toggleCollapsed(); // desktop: toggle the 320px column
@@ -332,6 +342,14 @@ export function TaskDetailPage() {
                   <Link2 />
                   {intl.formatMessage({ id: 'tasks.detail.copyLink' })}
                 </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => void togglePin()}>
+                  {task.pinned ? <PinOff /> : <Pin />}
+                  {intl.formatMessage({ id: task.pinned ? 'goals.action.unpin' : 'goals.action.pin' })}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => void toggleArchive()}>
+                  {task.archived ? <ArchiveRestore /> : <Archive />}
+                  {intl.formatMessage({ id: task.archived ? 'goals.action.unarchive' : 'goals.action.archive' })}
+                </DropdownMenuItem>
                 <DropdownMenuItem variant="destructive" onClick={() => setConfirmRemove(true)}>
                   <Trash2 />
                   {intl.formatMessage({ id: 'tasks.remove' })}
@@ -389,6 +407,9 @@ export function TaskDetailPage() {
           <div className="flex flex-wrap items-center gap-2 px-1.5">
             <StatusIcon status={toStatusKey(task.status)} size="sm" />
             <Badge variant="secondary">{intl.formatMessage({ id: `tasks.source.${source}` })}</Badge>
+            <GoalRoundBadge task={task} />
+            <GoalDiminishingBadge task={task} />
+            <GoalDeadlineBadge task={task} />
             {showLive && <LiveBadge />}
             {assigneeAgent && (
               <span className="ml-1 inline-flex items-center gap-1.5" title={assigneeAgent.display_name}>
@@ -401,6 +422,14 @@ export function TaskDetailPage() {
           </div>
         </div>
 
+        {/* I-2c: a goal task can also be parked awaiting its FIRST dispatch
+            (collaborator/consultant autonomy kickoff gate) — a distinct
+            human node from `needs_human`, so it renders independently of the
+            section below (the two never overlap on one task). */}
+        {task.goal_mode && (
+          <GoalPendingKickoff pendingKickoff={timeline?.pending_kickoff ?? null} onDecided={loadTimeline} />
+        )}
+
         {/* WP-A (§2-6): the one decision surface for a 等你決定 task, identical to
             the inbox's — reason first, then the same three choices.
             I-1c: a task parked with `plan_pending` came from 想一想 mode —
@@ -408,17 +437,25 @@ export function TaskDetailPage() {
             distinct heading + a dedicated plan card instead of the generic
             「卡住原因」 line (which would otherwise duplicate the same text,
             since the server also mirrors the plan into `judge_feedback` for
-            channel/legacy display surfaces). */}
+            channel/legacy display surfaces).
+            I-2c: goal-mode tasks additionally get the H11 pause-reason chip
+            (why it stopped, not just the free-text feedback) and a fourth
+            決策 — 「交給我」take-over — next to the shared 3-button
+            `NeedsHumanActions` (kept unchanged so a non-goal `blocked` task's
+            decision flow is not lengthened). */}
         {needsHuman && (
           <section
             aria-label={intl.formatMessage({ id: 'taskStatus.needs_human' })}
             className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4"
           >
-            <p className="text-sm font-medium text-foreground">
-              {intl.formatMessage({
-                id: task.plan_pending ? 'tasks.planFirst.prompt' : 'tasks.needsHuman.prompt',
-              })}
-            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-sm font-medium text-foreground">
+                {intl.formatMessage({
+                  id: task.plan_pending ? 'tasks.planFirst.prompt' : 'tasks.needsHuman.prompt',
+                })}
+              </p>
+              {task.goal_mode && <PauseReasonChip reason={task.pause_reason} />}
+            </div>
             {task.plan_pending ? (
               <div className="space-y-1.5 rounded-lg bg-surface px-3 py-2.5">
                 <p className="text-xs text-muted-foreground">
@@ -434,12 +471,20 @@ export function TaskDetailPage() {
                 </p>
               )
             )}
-            <NeedsHumanActions taskId={task.id} onResolved={fetchTasks} />
+            <div className="flex flex-wrap items-center gap-2">
+              <NeedsHumanActions taskId={task.id} onResolved={fetchTasks} />
+              {task.goal_mode && <GoalTakeoverButton taskId={task.id} onDecided={fetchTasks} />}
+            </div>
           </section>
         )}
 
         {/* I-3a: 已完成／失敗／已放棄的目標任務可以「接著做」。 */}
         {canGoalContinue && <GoalContinuePanel task={task} onContinued={fetchTasks} />}
+
+        {/* I-2c: goal contract — risk boundary / acceptance criteria / latest
+            result / confirmed facts. Renders nothing for a plain board task
+            or a goal task with no contract fields set. */}
+        <GoalContractCards task={task} />
 
         {/* Description (inline edit, multiline) */}
         <div>
@@ -497,7 +542,14 @@ export function TaskDetailPage() {
           )}
         </div>
 
-        {/* Iterative Kanban: dual clock + revision timeline (goal-mode only). */}
+        {/* Iterative Kanban: dual clock + revision timeline (goal-mode only).
+            I-2c: the round-by-round list itself is now `GoalRoundTimeline`,
+            shared with the (now-removed) `/goals?task=` dialog — it carries
+            everything that page's version had (per-aspect MAV verdicts,
+            redispatch/repeat-state flags, run links, merged loop activity
+            events, the foresight link) plus this page's own dispatched/
+            submitted/judged stage breakdown, so neither side lost anything
+            in the merge. */}
         {(iterations.length > 0 || (task.agent_seconds ?? 0) > 0) && (
           <div>
             <h2 className="mb-2 px-1.5 text-xs font-medium text-muted-foreground">
@@ -511,7 +563,7 @@ export function TaskDetailPage() {
                   {intl.formatMessage({ id: 'tasks.clock.agent' })}
                 </p>
                 <p className="font-mono text-sm font-semibold tabular-nums text-foreground">
-                  {formatDuration(task.agent_seconds ?? 0)}
+                  {formatHms(task.agent_seconds ?? 0)}
                 </p>
               </div>
               <div className="rounded-lg border border-surface-border bg-surface px-3 py-2">
@@ -519,69 +571,12 @@ export function TaskDetailPage() {
                   {intl.formatMessage({ id: 'tasks.clock.cycle' })}
                 </p>
                 <p className="font-mono text-sm font-semibold tabular-nums text-foreground">
-                  {formatDuration(secondsBetween(task.created_at, task.completed_at || task.updated_at))}
+                  {formatHms(secondsBetween(task.created_at, task.completed_at || task.updated_at))}
                 </p>
               </div>
             </div>
 
-            {/* Round-by-round timeline. */}
-            {iterations.length > 0 && (
-              <ol className="space-y-2 px-1.5">
-                {iterations.map((it) => {
-                  const agentSecs = secondsBetween(it.dispatched_at, it.submitted_at);
-                  return (
-                    <li
-                      key={it.round}
-                      className="rounded-lg border border-surface-border bg-surface p-3 text-sm"
-                    >
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium text-foreground">
-                          {intl.formatMessage({ id: 'tasks.badge.round' }, { n: it.round })}
-                        </span>
-                        {it.verdict && (
-                          <Badge
-                            variant="secondary"
-                            className={VERDICT_TONE[it.verdict] ?? 'text-muted-foreground'}
-                          >
-                            {intl.formatMessage({ id: `tasks.verdict.${it.verdict}` })}
-                          </Badge>
-                        )}
-                        {it.submitted_at && (
-                          <span className="ml-auto font-mono text-xs tabular-nums text-muted-foreground">
-                            {formatDuration(agentSecs)}
-                          </span>
-                        )}
-                      </div>
-                      <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-muted-foreground">
-                        <span>
-                          {intl.formatMessage({ id: 'tasks.iterations.dispatched' })}{' '}
-                          <span className="font-mono tabular-nums">{timeAgo(it.dispatched_at)}</span>
-                        </span>
-                        <span>
-                          {intl.formatMessage({ id: 'tasks.iterations.submitted' })}{' '}
-                          <span className="font-mono tabular-nums">
-                            {it.submitted_at
-                              ? timeAgo(it.submitted_at)
-                              : intl.formatMessage({ id: 'tasks.iterations.pending' })}
-                          </span>
-                        </span>
-                        {it.judged_at && (
-                          <span>
-                            {intl.formatMessage({ id: 'tasks.iterations.judged' })}{' '}
-                            <span className="font-mono tabular-nums">{timeAgo(it.judged_at)}</span>
-                          </span>
-                        )}
-                      </div>
-                      {it.verdict === 'rejected' && it.judge_feedback && (
-                        <p className="mt-2 rounded-md bg-amber-500/10 px-2 py-1 text-xs text-amber-700 dark:text-amber-300">
-                          {it.judge_feedback}
-                        </p>
-                      )}
-                    </li>
-                  );
-                })}
-              </ol>
-            )}
+            <GoalRoundTimeline task={task} timeline={timeline} />
           </div>
         )}
 
