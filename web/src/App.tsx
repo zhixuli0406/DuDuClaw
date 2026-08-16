@@ -83,6 +83,7 @@ const PetStudioPage = lazyPage(() => import('./pages/PetStudioPage'), 'PetStudio
 const AboutPage = lazyPage(() => import('./pages/AboutPage'), 'AboutPage');
 const DistributorsPage = lazyPage(() => import('./pages/DistributorsPage'), 'DistributorsPage');
 const OSPage = lazyPage(() => import('./pages/OSPage'), 'OSPage');
+const PresetsPage = lazyPage(() => import('./pages/PresetsPage'), 'PresetsPage');
 // WP9 (2026-08-04 IA rework): full conversation history + the two management
 // surfaces lifted out of billing / settings + the 進階設定 index.
 const ConversationsPage = lazyPage(() => import('./pages/ConversationsPage'), 'ConversationsPage');
@@ -248,6 +249,11 @@ export function App() {
                   are `require_admin!`-gated server-side; this mirrors that. */}
               <Route element={<RoleGuard minRole="admin" />}>
                 <Route path="os" element={<OSPage />} />
+                {/* 職務組合（agent preset P1, WP-7I）— presets.list/presets.status
+                    are read-only RPCs; this mirrors that (no admin RPC gate on
+                    presets.list itself, but preset content is capability/
+                    security-relevant, matching its `/os` neighbour's gate). */}
+                <Route path="presets" element={<PresetsPage />} />
                 {/* 專家包 — expert-pack management; experts.* RPCs are
                     require_admin!-gated server-side, this mirrors that. */}
                 <Route path="experts" element={<ExpertsPage />} />

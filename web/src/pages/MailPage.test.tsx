@@ -166,11 +166,53 @@ describe('MailPage — Agent Mail 信箱 (P2-d)', () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByRole('tab', { name: /Waiting to send/i }));
+    // "Do not send" reveals the note box first (WP-7I) — it does not decide
+    // on its own click, so the refusal has to be confirmed as a second step.
     await user.click(await screen.findByRole('button', { name: /Do not send/i }));
+    expect(decided).not.toHaveBeenCalled();
+    await user.click(await screen.findByRole('button', { name: /Confirm rejection/i }));
 
     await waitFor(() =>
       expect(decided).toHaveBeenCalledWith({ mail_id: 'out-1', approve: false }),
     );
+  });
+
+  it('sends an optional note along with the rejection', async () => {
+    const decided = vi.fn();
+    mockMail({ drafts: [pendingDraft], onDecide: decided });
+    renderPage();
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole('tab', { name: /Waiting to send/i }));
+    await user.click(await screen.findByRole('button', { name: /Do not send/i }));
+    await user.type(
+      screen.getByPlaceholderText(/Reason for this AI employee/i),
+      'Price is out of date, redo with the June rate card',
+    );
+    await user.click(await screen.findByRole('button', { name: /Confirm rejection/i }));
+
+    await waitFor(() =>
+      expect(decided).toHaveBeenCalledWith({
+        mail_id: 'out-1',
+        approve: false,
+        note: 'Price is out of date, redo with the June rate card',
+      }),
+    );
+  });
+
+  it('lets the reviewer back out of the rejection note without deciding anything', async () => {
+    const decided = vi.fn();
+    mockMail({ drafts: [pendingDraft], onDecide: decided });
+    renderPage();
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole('tab', { name: /Waiting to send/i }));
+    await user.click(await screen.findByRole('button', { name: /Do not send/i }));
+    await user.click(await screen.findByRole('button', { name: /^Cancel$/i }));
+
+    // Back to the ordinary two-button state; nothing was decided.
+    expect(await screen.findByRole('button', { name: /Do not send/i })).toBeInTheDocument();
+    expect(decided).not.toHaveBeenCalled();
   });
 
   it('warns that confirming cannot actually send when no SMTP server is configured', async () => {

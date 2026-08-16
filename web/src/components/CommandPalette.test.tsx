@@ -153,3 +153,116 @@ describe('CommandPalette — ID direct-jump (W3-3)', () => {
     }
   });
 });
+
+/**
+ * I-5 — cross-source content search (`search.query`). The admin scope in the
+ * shared `beforeEach` above means these hits don't need an `agent_id` on the
+ * request, so each test's `search.query` mock only needs to check `q`.
+ */
+describe('CommandPalette — content search (I-5)', () => {
+  it('shows content-search hits grouped by source, below the (empty) local matches', async () => {
+    mockIdLookupCalls({
+      'search.query': {
+        query: 'quarterly report',
+        truncated: false,
+        hits: [
+          {
+            source: 'conversation',
+            id: 'sess-1:5',
+            title: '報價單已經寄出了',
+            snippet: '客服對話紀錄',
+            agent_id: 'sales',
+            timestamp: '2026-08-10T00:00:00Z',
+            jump: { session_id: 'sess-1', message_id: 5, role: 'assistant' },
+          },
+          {
+            source: 'artifact',
+            id: 'report.docx',
+            title: 'quarterly report.docx',
+            snippet: 'declared',
+            agent_id: 'sales',
+            timestamp: '2026-08-11T00:00:00Z',
+            jump: { agent_id: 'sales', archived_name: 'report.docx', task_id: 'task-42' },
+          },
+        ],
+      },
+    });
+    renderPalette();
+    fireEvent.change(screen.getByPlaceholderText(/Paste an ID/i), {
+      target: { value: 'quarterly report' },
+    });
+
+    expect(await screen.findByText('quarterly report.docx')).toBeInTheDocument();
+    expect(screen.getByText('報價單已經寄出了')).toBeInTheDocument();
+    expect(screen.getByText('Content search · Conversations')).toBeInTheDocument();
+    expect(screen.getByText('Content search · Files & deliverables')).toBeInTheDocument();
+  });
+
+  it('jumps an artifact hit to /files scoped to its agent and task', async () => {
+    mockIdLookupCalls({
+      'search.query': {
+        query: 'q',
+        truncated: false,
+        hits: [
+          {
+            source: 'artifact',
+            id: 'report.docx',
+            title: 'quarterly report.docx',
+            snippet: 'declared',
+            agent_id: 'sales',
+            timestamp: '2026-08-11T00:00:00Z',
+            jump: { agent_id: 'sales', archived_name: 'report.docx', task_id: 'task-42' },
+          },
+        ],
+      },
+    });
+    renderPalette();
+    fireEvent.change(screen.getByPlaceholderText(/Paste an ID/i), { target: { value: 'quarterly' } });
+
+    const row = await screen.findByText('quarterly report.docx');
+    fireEvent.click(row);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('location-probe')).toHaveTextContent('/files?agent=sales&task=task-42'),
+    );
+  });
+
+  it('jumps a wiki hit to the memory page knowledge tab', async () => {
+    mockIdLookupCalls({
+      'search.query': {
+        query: 'onboarding',
+        truncated: false,
+        hits: [
+          {
+            source: 'wiki',
+            id: 'sop/onboarding.md',
+            title: 'Onboarding SOP',
+            snippet: 'Step 1: …',
+            agent_id: 'hr',
+            timestamp: null,
+            jump: { agent_id: 'hr', path: 'sop/onboarding.md' },
+          },
+        ],
+      },
+    });
+    renderPalette();
+    fireEvent.change(screen.getByPlaceholderText(/Paste an ID/i), { target: { value: 'onboarding' } });
+
+    const row = await screen.findByText('Onboarding SOP');
+    fireEvent.click(row);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('location-probe')).toHaveTextContent('/memory?tab=wiki'),
+    );
+  });
+
+  it('never spends the search.query round trip for a non-admin viewer with no visible AI staff', async () => {
+    useAuthStore.setState({ user: { display_name: 'Employee', role: 'employee' }, bindings: [] } as never);
+    useAgentsStore.setState({ agents: [], loading: false } as never);
+    renderPalette();
+    fireEvent.change(screen.getByPlaceholderText(/Paste an ID/i), { target: { value: 'quarterly' } });
+
+    await new Promise((r) => setTimeout(r, 400));
+    expect(mockWsClient.call.mock.calls.map((c) => c[0])).not.toContain('search.query');
+  });
+});
