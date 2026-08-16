@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Added
+- **上下文膨脹正解（`[runtime] minimal_context`，預設開）**：每次 spawn 官方 CLI 現在帶 `--tools <策展清單>`（只送該 agent 實際會用的內建工具 schema，其餘走 MCP）＋`--setting-sources project,local`（不再把操作者個人全域 `~/.claude/CLAUDE.md`／rules 塞進對客 agent）。本機實測固定開銷 35,892 → 10,974 tokens/次（省 ~69%）。安全：**不用** `--setting-sources ""`（那會停用 cwd `.claude/settings.json` 的 agent-file-guard 安全 hook）；`project,local` 省一樣多 token 但保留 hook。可用 env `DUDUCLAW_MINIMAL_CONTEXT=0`（全域）或 `agent.toml [runtime] minimal_context = false`（每-agent）關閉。行為變更：曾靠操作者全域 CLAUDE.md 塑形對客 agent 的部署升級後會有變（反模式，off-switch 已備）。
+- **⌘K 內容搜尋（`search.query`）**：命令面板新增跨來源內容搜尋——對話、產物、記憶、wiki 聚合查詢，結果依來源分組、點擊跳轉；各來源有結果上限、CJK-safe 截斷。個人版恢復先前缺失的搜尋觸發器。
+- **`/files` 升級「產物與檔案」**：檔案頁加搜尋（檔名/來源）、依任務關聯篩選、日期範圍（`GET /api/files` 新增 `q`/`task_id`/`since`/`until` 參數，全 optional、回傳結構不變）。
+- **任務清單操作集（I-3b）**：`/goals` 每個任務可置頂／歸檔／重新命名（新 RPC `tasks.archive`/`unarchive`/`pin`/`unpin`/`rename`）；`tasks` 表加 `archived`/`pinned` 欄位（冪等 migration）；置頂排序置前、歸檔預設隱藏可切換顯示；先前 20 筆硬截解除，改走 `tasks.list_page` 分頁（limit clamp＋offset＋total）＋載入更多；頂部搜尋框。
+- **`/presets` preset 儀表板（唯讀）**：新頁列出可用 preset 目錄與各 agent 目前綁定、被覆寫欄位（`presets.list`/`presets.status` RPC，admin 限定，preset P1 唯讀範圍）。
+- **Agent Mail 拒絕備註**：`mail.decide` 加 optional `note`——拒絕時以操作者原因取代系統文案並即時結算，核准時另記 `decision_note`（保留背景 worker 為唯一寄信/結算者的不變量）；儀表板拒絕動作加備註輸入框。
+
+### Changed
+- **任務詳情頁統一（I-2c）**：`/goals` 點任務改導向 `/tasks/:id` 正式詳情頁，舊的 goal dialog 移除、內容併入四分頁詳情（驗收/風險/產出/kickoff/輪次＋活動時間軸＋MAV 徽章）；`/goals?task=` 保留為轉址相容層。needs_human 三按鈕審批動線不變，goal 任務旁補上先前 dashboard 漏掉的第 4 顆「交給我」按鈕（對齊通道卡片本有的四按鈕）。
+- **`task_row_to_json` 輸出 `archived`/`pinned`**：`tasks.list`／`task.updated` 廣播現在帶這兩個狀態欄位。
+
+### Fixed
+- **`estimate_tokens` CJK 校準**：從對所有字元一律 `chars/1.5` 改成依 codepoint 分類（CJK 1.306 tok/char、非 CJK 1/3.6，沿用 `duduclaw-llm` 既有 Unicode range），修正約 22% 低估——先前低估會讓 `[budget] max_input_tokens` 壓縮閘觸發過晚。
+- **`--exclude-dynamic-system-prompt-sections` 空操作移除**：該旗標與 `--system-prompt-file` 併用時被 CLI 忽略（活測 total_ctx 帶不帶逐位相同），三處無效使用移除、修正基於錯誤前提的註解。
+- **`handle_tools_list` 依 capability 過濾**：MCP `tools/list` 先前不論呼叫者 capability 一律送全部工具 schema；現在依呼叫者 `allowed_tools`/`denied_tools` 過濾（鏡像 dispatch gate，discoverable ⊆ callable），受限 agent 不再收到無法呼叫的工具宣告。（對 scaffold agent 的激進策展需 MCP 動態擴充/meta-invoke 新功能，DEFER 待拍板。）
+- **docs/features 索引補齊**：37-47 號功能檔先前在英文 README（46-47）與 zh-TW／ja-JP README（37-47）索引缺席，已補齊。
+
 ## [1.60.0] - 2026-08-15 — 三 harness 借鑑收官——可換判官×Agent Mail×交付與附件安全×交辦 UX
 
 ### Added
