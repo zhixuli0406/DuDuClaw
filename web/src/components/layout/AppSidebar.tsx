@@ -547,7 +547,12 @@ export function AppSidebar() {
             edition aimed at non-technical users with no primary action at all;
             it also used to route to the board's `?new=1` create-a-card intent,
             which never starts the autonomous loop. It now opens the one
-            AssignSheet. The search trigger stays Personal-hidden (I-5). */}
+            AssignSheet. The search trigger USED to be Personal-hidden — I-5
+            (2026-08-16) restores it: ⌘K still worked via the global keyboard
+            shortcut on Personal, but there was no discoverable entry point
+            for a mouse/touch user, which is precisely the "個人版恢復搜尋觸發
+            器" gap the I-5 design brief called out. Same component, both
+            editions now. */}
         {collapsed ? (
           <Button
             variant="brand"
@@ -565,7 +570,7 @@ export function AppSidebar() {
             {intl.formatMessage({ id: 'sidebar.newTask' })}
           </Button>
         )}
-        {!isPersonal && <SearchTrigger collapsed={collapsed} />}
+        <SearchTrigger collapsed={collapsed} />
       </SidebarHeader>
 
       <SidebarContent>

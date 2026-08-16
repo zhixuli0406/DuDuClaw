@@ -14,13 +14,18 @@ import {
   Bot,
   ClipboardList,
   Loader2,
+  MessagesSquare,
+  FileText,
+  Brain,
+  BookOpen,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import { fuzzyMatch, highlightSegments } from '@/lib/fuzzy';
-import { api } from '@/lib/api';
+import { api, type SearchHit } from '@/lib/api';
 import { looksLikeIdQuery, findIdMatch, idMatchRoute } from '@/lib/id-lookup';
+import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
 import {
   allManageNav,
   conversationsEntry,
@@ -50,6 +55,110 @@ import { useLocaleStore, localeNames } from '@/i18n';
 /** How long to let the user keep typing/pasting before spending the id-lookup
  *  RPC round-trip (debounce for `IdDirectJump`). */
 const ID_LOOKUP_DEBOUNCE_MS = 200;
+
+/** I-5: debounce before spending the `search.query` round trip. Slightly
+ *  longer than id-lookup — content search fans out across four surfaces
+ *  server-side, so it's worth waiting a beat longer for typing to settle. */
+const CONTENT_SEARCH_DEBOUNCE_MS = 250;
+/** Below this length a content search is almost certainly not intentional
+ *  yet (still typing the first word) — skip the round trip entirely. */
+const CONTENT_SEARCH_MIN_CHARS = 2;
+/** Per-source cap for content-search hits shown in the palette — this list
+ *  already carries nav/entity results, so content hits stay a supplement, not
+ *  the whole picture (open the dedicated page for the full result set). */
+const CONTENT_SEARCH_LIMIT = 5;
+
+/** Icon per `SearchHit.source` for the content-search result rows (I-5). */
+function iconForSearchSource(source: SearchHit['source']): LucideIcon {
+  switch (source) {
+    case 'conversation':
+      return MessagesSquare;
+    case 'artifact':
+      return FileText;
+    case 'memory':
+      return Brain;
+    case 'wiki':
+    case 'shared_wiki':
+      return BookOpen;
+    default:
+      return Search;
+  }
+}
+
+/**
+ * I-5: navigate to the page that owns a content-search hit. Each source has
+ * its own destination shape (`SearchHit.jump`, documented in
+ * `search_index.rs`) since the four surfaces have nothing in common:
+ *
+ * - `conversation` resumes the actual session and lands on `/chat` — reusing
+ *   the exact resume flow the ID-lookup flow below already uses, so a
+ *   content-search hit opens the conversation the same way pasting its id
+ *   would.
+ * - `artifact` jumps to `/files` pre-scoped to the hit's agent/task — both
+ *   params `FilesPage` already reads from the URL (P11 state-as-URL), so no
+ *   other page needs to change for this to work.
+ * - `memory` and `wiki`/`shared_wiki` land on the matching `MemoryPage` tab.
+ *   `MemoryPage` does not (yet) read an `?agent=` param, so this cannot
+ *   pre-select the hit's specific agent/entry — carrying the original query
+ *   into `?q=` (which the memories tab DOES read) is the honest next-best
+ *   thing rather than a silent no-op.
+ */
+function jumpToSearchHit(hit: SearchHit, query: string, navigate: (to: string) => void): void {
+  const jump = hit.jump ?? {};
+  const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+
+  switch (hit.source) {
+    case 'conversation': {
+      const sessionId = str(jump.session_id);
+      if (!sessionId) {
+        navigate('/conversations');
+        break;
+      }
+      void useConversationsStore
+        .getState()
+        .fetch()
+        .then(() => {
+          const session = useConversationsStore.getState().sessions.find((s) => s.session_id === sessionId);
+          if (!session) {
+            navigate('/conversations');
+            return;
+          }
+          return useConversationsStore
+            .getState()
+            .resume(session)
+            .then((ok) => {
+              if (ok) navigate('/chat');
+            });
+        })
+        .catch(() => navigate('/conversations'));
+      break;
+    }
+    case 'artifact': {
+      const params = new URLSearchParams();
+      const agentId = str(jump.agent_id);
+      const taskId = str(jump.task_id);
+      if (agentId) params.set('agent', agentId);
+      if (taskId) params.set('task', taskId);
+      const qs = params.toString();
+      navigate(`/files${qs ? `?${qs}` : ''}`);
+      break;
+    }
+    case 'memory': {
+      const params = new URLSearchParams({ tab: 'memories' });
+      if (query.trim()) params.set('q', query.trim());
+      navigate(`/memory?${params.toString()}`);
+      break;
+    }
+    case 'wiki':
+      navigate('/memory?tab=wiki');
+      break;
+    case 'shared_wiki':
+      navigate('/memory?tab=shared');
+      break;
+    default:
+      break;
+  }
+}
 
 interface Command {
   readonly id: string;
@@ -115,6 +224,15 @@ export function CommandPalette() {
   const agents = useAgentsStore((s) => s.agents);
   const tasks = useTasksStore((s) => s.tasks);
   const logout = useAuthStore((s) => s.logout);
+  // I-5: content search scoping — mirrors FilesPage's convention. Admins
+  // (`scope === 'all'`) may omit `agent_id` (the gateway then searches
+  // conversations/artifacts across every agent; memory/wiki still degrade to
+  // zero hits without one — see `handle_search_query`'s doc comment); every
+  // other role must supply one, so this defaults to the first agent the
+  // viewer can see.
+  const dataScope = useDataScope();
+  const visibleAgentsForSearch = useVisibleAgents();
+  const searchAgentId = visibleAgentsForSearch[0]?.name;
   // Operator/owner binding gates sensitive `operatorOnly` commands (fail-closed).
   const hasOperatorAccess = bindings.some(
     (b) => b.access_level === 'owner' || b.access_level === 'operator',
@@ -126,6 +244,11 @@ export function CommandPalette() {
 
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
+  // I-5: cross-source content search — `search.query` results, appended after
+  // the local nav/entity matches (see the `results` memo below). Kept
+  // separate from `results` itself because it resolves asynchronously.
+  const [contentHits, setContentHits] = useState<readonly SearchHit[]>([]);
+  const [contentSearching, setContentSearching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -148,10 +271,53 @@ export function CommandPalette() {
     if (open) {
       setQuery('');
       setActiveIndex(0);
+      setContentHits([]);
+      setContentSearching(false);
       // Focus after paint so the dialog is mounted.
       requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [open]);
+
+  // I-5: debounced cross-source content search. Skipped entirely for a
+  // non-admin viewer with no visible agent (the RPC would just reject it —
+  // see the doc comment on `handle_search_query` — so this fails quiet on the
+  // client rather than spending a round trip that can only error).
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!open || trimmed.length < CONTENT_SEARCH_MIN_CHARS) {
+      setContentHits([]);
+      setContentSearching(false);
+      return;
+    }
+    if (dataScope !== 'all' && !searchAgentId) {
+      setContentHits([]);
+      setContentSearching(false);
+      return;
+    }
+    let cancelled = false;
+    setContentSearching(true);
+    const timer = setTimeout(() => {
+      api.search
+        .query({
+          q: trimmed,
+          ...(searchAgentId ? { agent_id: searchAgentId } : {}),
+          limit: CONTENT_SEARCH_LIMIT,
+        })
+        .then((res) => {
+          if (!cancelled) setContentHits(res?.hits ?? []);
+        })
+        .catch(() => {
+          if (!cancelled) setContentHits([]);
+        })
+        .finally(() => {
+          if (!cancelled) setContentSearching(false);
+        });
+    }, CONTENT_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [open, query, dataScope, searchAgentId]);
 
   const isPersonal = status?.edition_profile === 'personal';
 
@@ -279,6 +445,7 @@ export function CommandPalette() {
 
   // Empty query → recent routes first, then all commands in natural order.
   const results = useMemo<ScoredCommand[]>(() => {
+    let base: ScoredCommand[];
     if (query.trim() === '') {
       const byRoute = new Map(commands.filter((c) => c.route).map((c) => [c.route!, c]));
       const recentCmds = recent
@@ -292,13 +459,33 @@ export function CommandPalette() {
       const rest = commands
         .filter((c) => !(c.route && recentRoutes.has(c.route)))
         .map((c) => ({ ...c, score: 0, indices: [] as number[] }));
-      return [...recentCmds, ...rest];
+      base = [...recentCmds, ...rest];
+    } else {
+      base = commands
+        .map((c) => scoreCommand(query, c))
+        .filter((c): c is ScoredCommand => c !== null)
+        .sort((a, b) => b.score - a.score);
     }
-    return commands
-      .map((c) => scoreCommand(query, c))
-      .filter((c): c is ScoredCommand => c !== null)
-      .sort((a, b) => b.score - a.score);
-  }, [query, commands, recent, t]);
+    // I-5: content-search hits are already server-matched (no local fuzzy
+    // scoring), so they're appended as-is rather than folded into the scored
+    // sort above. Grouped-by-source below via `groupLabel`, same mechanism as
+    // every other section (X10).
+    if (query.trim().length >= CONTENT_SEARCH_MIN_CHARS && contentHits.length > 0) {
+      const contentCmds: ScoredCommand[] = contentHits.map((hit) => ({
+        id: `content:${hit.source}:${hit.id}`,
+        groupLabel: t(`cmdk.group.content.${hit.source}`),
+        label: hit.title || hit.snippet || hit.id,
+        subtitle: hit.snippet,
+        keywords: '',
+        icon: iconForSearchSource(hit.source),
+        perform: () => jumpToSearchHit(hit, query, navigate),
+        score: 0,
+        indices: [] as number[],
+      }));
+      return [...base, ...contentCmds];
+    }
+    return base;
+  }, [query, commands, recent, t, contentHits, navigate]);
 
   // Keep the active index in range as results shrink/grow.
   useEffect(() => {
@@ -485,6 +672,11 @@ export function CommandPalette() {
                 </>
               ) : idLookup === 'notFound' ? (
                 intl.formatMessage({ id: 'cmdk.idLookup.notFound' }, { query })
+              ) : contentSearching ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                  {t('cmdk.contentSearch.searching')}
+                </>
               ) : (
                 t('cmdk.empty')
               )}

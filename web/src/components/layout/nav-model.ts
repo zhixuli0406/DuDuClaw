@@ -45,6 +45,7 @@ import {
   Download,
   Crosshair,
   Radar as RadarIcon,
+  Layers,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -317,6 +318,13 @@ export const navGroups: NavGroup[] = [
       // polling / footprint / proactive gate). All os.* RPCs are admin-gated
       // server-side (require_admin!); minRole mirrors that here.
       { to: '/os', icon: MonitorCog, label: 'nav.os', desc: 'nav.os.desc', minRole: 'admin' },
+      // 職務組合（agent preset P1 dashboard card, WP-7I 2026-08-16）— read-only
+      // fleet view of available presets + each AI staff member's binding and
+      // overridden fields (design: `DESIGN-agent-presets-2026-08.md` §9 P1
+      // item ⑦). Admin-gated like its `/os` neighbour: preset content
+      // includes capability/security-relevant fields. Switching UI is P2,
+      // not this wave — see the page's own doc comment.
+      { to: '/presets', icon: Layers, label: 'nav.presets', desc: 'nav.presets.desc', minRole: 'admin', newIn: '1.61.0' },
       // 任務看板 — demoted to the tail of the group (2026-08-04 WP14). Enterprise
       // has no 進階 group to fold it into, so "least prominent slot" is the
       // closest equivalent to the Personal treatment.
@@ -481,6 +489,8 @@ export const personalAdvancedGroup: NavGroup = {
     '/reports',
     '/forks',
     '/os',
+    // 職務組合（WP-7I 2026-08-16）— same slot as its Enterprise `/os` neighbour.
+    '/presets',
     // Company cluster. 成長 leads it (高頻・低重要, matrix §4) — same slot it
     // holds in the Enterprise 公司 group. D6: the org chart is folded here
     // rather than on the primary rail; it is a progressive-disclosure surface

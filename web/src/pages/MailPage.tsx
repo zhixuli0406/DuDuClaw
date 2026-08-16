@@ -12,6 +12,7 @@ import {
   TabsList,
   TabsTab,
   TabsPanel,
+  Textarea,
   Dialog,
   DialogContent,
   DialogHeader,
@@ -66,6 +67,11 @@ export function MailPage() {
   const [open, setOpen] = useState<MailMessageFull | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // Which draft's 拒絕 note box is expanded, and what's typed into it so far
+  // (keyed by mail_id — several drafts can be pending at once, each with its
+  // own in-progress note).
+  const [rejectingId, setRejectingId] = useState<string | null>(null);
+  const [rejectNotes, setRejectNotes] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     try {
@@ -112,11 +118,18 @@ export function MailPage() {
     }
   };
 
-  const decide = async (mailId: string, approve: boolean) => {
+  const decide = async (mailId: string, approve: boolean, note?: string) => {
     setBusy(mailId);
     setActionError(null);
     try {
-      await api.mail.decide(mailId, approve);
+      await api.mail.decide(mailId, approve, note);
+      setRejectingId((cur) => (cur === mailId ? null : cur));
+      setRejectNotes((prev) => {
+        if (!(mailId in prev)) return prev;
+        const next = { ...prev };
+        delete next[mailId];
+        return next;
+      });
       await load();
     } catch (e) {
       setActionError(String(e));
@@ -240,7 +253,38 @@ export function MailPage() {
                         </div>
                         <p className="whitespace-pre-wrap text-sm text-muted-foreground">{d.body}</p>
                         {d.note && <p className="text-xs text-muted-foreground">{d.note}</p>}
-                        {d.status === 'pending' && (
+                        {d.status === 'pending' && rejectingId === d.mail_id ? (
+                          <div className="space-y-2">
+                            <Textarea
+                              className="h-16 resize-y"
+                              value={rejectNotes[d.mail_id] ?? ''}
+                              onChange={(e) =>
+                                setRejectNotes((prev) => ({ ...prev, [d.mail_id]: e.target.value }))
+                              }
+                              placeholder={t('mail.action.rejectNote.placeholder')}
+                              autoFocus
+                            />
+                            <div className="flex gap-2">
+                              <Button
+                                size="sm"
+                                variant="destructive"
+                                disabled={busy === d.mail_id}
+                                onClick={() => void decide(d.mail_id, false, rejectNotes[d.mail_id])}
+                              >
+                                <XCircle className="size-3.5" />
+                                {t('mail.action.confirmReject')}
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                disabled={busy === d.mail_id}
+                                onClick={() => setRejectingId(null)}
+                              >
+                                {t('common.cancel')}
+                              </Button>
+                            </div>
+                          </div>
+                        ) : d.status === 'pending' ? (
                           <div className="flex gap-2">
                             <Button
                               size="sm"
@@ -254,13 +298,13 @@ export function MailPage() {
                               size="sm"
                               variant="outline"
                               disabled={busy === d.mail_id}
-                              onClick={() => void decide(d.mail_id, false)}
+                              onClick={() => setRejectingId(d.mail_id)}
                             >
                               <XCircle className="size-3.5" />
                               {t('mail.action.reject')}
                             </Button>
                           </div>
-                        )}
+                        ) : null}
                       </CardContent>
                     </Card>
                   ))

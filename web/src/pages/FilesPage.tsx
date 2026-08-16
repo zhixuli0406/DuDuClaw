@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useUrlState } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
-import { Download, Eye, FolderOpen } from 'lucide-react';
+import { Download, Eye, FolderOpen, Search } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useDataScope, useVisibleAgents } from '@/lib/data-scope';
@@ -12,6 +12,7 @@ import {
   buttonVariants,
   Empty,
   ErrorState,
+  Input,
   Skeleton,
   Select,
   SelectTrigger,
@@ -43,6 +44,15 @@ import {
  * this page joins it — plus a task filter, so 「找回上週的產物」 stops being a
  * scroll through everything. A file the ledger does not know keeps saying
  * 來源不明 rather than being assigned a plausible-looking origin.
+ *
+ * I-4 adds real server round trips for two more filters: a debounced text
+ * search (`q` — matches archived name / display name / origin, same haystack
+ * `files_api::filter_files` already builds) and an inclusive date range
+ * (`since`/`until`, epoch ms). The task filter deliberately stays CLIENT-side
+ * (unchanged from I-2b): it is derived from whatever `q`/date-filtered set the
+ * server already returned, so switching between tasks never needs a second
+ * round trip and the dropdown's option list never collapses to just the
+ * currently-selected task.
  */
 
 /** Sentinel Select value for the shared (agent-less) bucket. */
@@ -103,6 +113,14 @@ export function FilesPage() {
   const [selected, setSelected] = useUrlState('agent', '');
   // I-2b: task filter lives in the URL too, so a shared link keeps the view.
   const [taskFilter, setTaskFilter] = useUrlState('task', '');
+  // I-4: search text + date range also live in the URL (bookmarkable /
+  // shareable, same P11 convention as `agent`/`task`). `q` is committed to the
+  // URL on a short debounce so a fetch does not fire on every keystroke; the
+  // draft input value is tracked separately so typing itself never stalls.
+  const [q, setQ] = useUrlState('q', '');
+  const [qDraft, setQDraft] = useState(q);
+  const [sinceDate, setSinceDate] = useUrlState('since', '');
+  const [untilDate, setUntilDate] = useUrlState('until', '');
   const [files, setFiles] = useState<FileRow[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -110,6 +128,18 @@ export function FilesPage() {
   useEffect(() => {
     fetchAgents();
   }, [fetchAgents]);
+
+  // Keep the draft in sync when `q` changes externally (back/forward nav, a
+  // pasted deep link) without fighting the debounce below.
+  useEffect(() => {
+    setQDraft(q);
+  }, [q]);
+
+  useEffect(() => {
+    if (qDraft === q) return;
+    const t = setTimeout(() => setQ(qDraft), 300);
+    return () => clearTimeout(t);
+  }, [qDraft, q, setQ]);
 
   // Resolve the effective selection once agents load.
   const effective =
@@ -135,11 +165,37 @@ export function FilesPage() {
     [effective],
   );
 
+  // I-4: `<input type="date">` gives a plain `YYYY-MM-DD`, parsed as LOCAL
+  // midnight (no timezone suffix ⇒ local time per the ES2015 Date grammar) so
+  // the boundary matches what `dateFmt` shows the user, not UTC midnight.
+  const sinceMs = useMemo(() => {
+    if (!sinceDate) return undefined;
+    const ms = Date.parse(`${sinceDate}T00:00:00`);
+    return Number.isNaN(ms) ? undefined : ms;
+  }, [sinceDate]);
+  const untilMs = useMemo(() => {
+    if (!untilDate) return undefined;
+    const ms = Date.parse(`${untilDate}T23:59:59.999`);
+    return Number.isNaN(ms) ? undefined : ms;
+  }, [untilDate]);
+
+  /** The listing endpoint alone gets the I-4 filters — download/preview keep
+   *  using plain `buildUrl` (agent + name only). */
+  const buildListUrl = useCallback((): string => {
+    const params = new URLSearchParams();
+    if (effective && effective !== SHARED) params.set('agent', effective);
+    if (q.trim()) params.set('q', q.trim());
+    if (sinceMs !== undefined) params.set('since', String(sinceMs));
+    if (untilMs !== undefined) params.set('until', String(untilMs));
+    const qs = params.toString();
+    return `/api/files${qs ? `?${qs}` : ''}`;
+  }, [effective, q, sinceMs, untilMs]);
+
   const fetchFiles = useCallback(async () => {
     if (!effective) return; // nothing selectable yet
     if (scope !== 'all' && effective === SHARED) return;
     try {
-      const res = await fetch(buildUrl('/api/files'), {
+      const res = await fetch(buildListUrl(), {
         headers: jwt ? { Authorization: `Bearer ${jwt}` } : {},
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -151,7 +207,7 @@ export function FilesPage() {
     } finally {
       setLoaded(true);
     }
-  }, [effective, scope, buildUrl, jwt]);
+  }, [effective, scope, buildListUrl, jwt]);
 
   useEffect(() => {
     setLoaded(false);
@@ -209,6 +265,13 @@ export function FilesPage() {
     return files.filter((f) => f.task_id === taskFilter);
   }, [files, taskFilter]);
 
+  // I-4: whether any filter (search / date range / task) is narrowing the
+  // view — distinguishes "no files exist at all" from "filters matched
+  // nothing" so the empty state never blames an empty bucket on a search.
+  const filtersActive = Boolean(
+    q.trim() || sinceDate || untilDate || (taskFilter && taskFilter !== ALL_TASKS),
+  );
+
   /** Origin label — a file the ledger never saw is honestly 來源不明, not a
    *  guess about who put it there. */
   const originLabel = (f: FileRow) =>
@@ -224,7 +287,39 @@ export function FilesPage() {
         <span className="font-mono text-xs tabular-nums text-muted-foreground">
           {visibleFiles.length}
         </span>
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <div className="relative min-w-40 flex-1 sm:max-w-56 sm:flex-none">
+            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              type="search"
+              value={qDraft}
+              onChange={(e) => setQDraft(e.target.value)}
+              placeholder={intl.formatMessage({ id: 'files.filter.search' })}
+              aria-label={intl.formatMessage({ id: 'files.filter.search' })}
+              className="pl-8"
+            />
+          </div>
+          <div className="flex items-center gap-1">
+            <Input
+              type="date"
+              value={sinceDate}
+              onChange={(e) => setSinceDate(e.target.value)}
+              max={untilDate || undefined}
+              aria-label={intl.formatMessage({ id: 'files.filter.dateFrom' })}
+              className="w-[8.5rem]"
+            />
+            <span className="text-xs text-muted-foreground" aria-hidden="true">
+              –
+            </span>
+            <Input
+              type="date"
+              value={untilDate}
+              onChange={(e) => setUntilDate(e.target.value)}
+              min={sinceDate || undefined}
+              aria-label={intl.formatMessage({ id: 'files.filter.dateTo' })}
+              className="w-[8.5rem]"
+            />
+          </div>
           {taskOptions.length > 0 && (
             <Select
               value={taskFilter || ALL_TASKS}
@@ -296,10 +391,10 @@ export function FilesPage() {
           <Empty
             icon={FolderOpen}
             title={intl.formatMessage({
-              id: files.length > 0 ? 'files.empty.filtered' : 'files.empty',
+              id: filtersActive ? 'files.empty.filtered' : 'files.empty',
             })}
             description={
-              files.length > 0 ? undefined : intl.formatMessage({ id: 'files.empty.hint' })
+              filtersActive ? undefined : intl.formatMessage({ id: 'files.empty.hint' })
             }
           />
         ) : (
