@@ -100,6 +100,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 | Document | Description |
 |----------|-------------|
+| [todo/TODO-bootstrap-admin-ws-deadlock.md](todo/TODO-bootstrap-admin-ws-deadlock.md) | 🟠 Bootstrap admin deadlock — a fresh containerised install logs in fine yet spins forever, because `must_change_password` blocks the WS handshake and the passwordless escape needs Personal + loopback |
 | [todo/TODO-agent-honesty.md](todo/TODO-agent-honesty.md) | Agent honesty / anti-hallucination tasks |
 | [todo/TODO-agent-cross-invocation-continuity.md](todo/TODO-agent-cross-invocation-continuity.md) | Agent 跨 invocation 行動連續性（否認/遺忘自己排程時的行動）修復 |
 | [todo/TODO-dispatch-run-visibility.md](todo/TODO-dispatch-run-visibility.md) | 排程／派工執行紀錄可觀測性——cron 路徑不落 run 紀錄，RunsPage 只看得到頻道對話 |
