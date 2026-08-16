@@ -1,62 +1,70 @@
-# Google 官方 remote MCP 掛載（進階選項，非出貨路徑）
+# Google's official remote MCP mount (advanced option, not the shipped path)
 
-> **先看這裡**：DuDuClaw 對 Google Workspace 的**支援路徑是原生工具**——
-> Gmail / Calendar / Sheets / Drive / Docs / Slides / Forms / Tasks 八個服務
-> 全部走 GA REST API，19 個 MCP 工具，見
-> [google-workspace.md](google-workspace.md)。**一般情況不需要讀本頁。**
+> **Read this first**: DuDuClaw's supported path for Google Workspace is **native
+> tools** — Gmail / Calendar / Sheets / Drive / Docs / Slides / Forms / Tasks, all
+> eight services, all through the GA REST API, 19 MCP tools. See
+> [google-workspace.md](google-workspace.md). **You don't need to read this page
+> for normal use.**
 >
-> 本頁記錄的官方 remote MCP 是**進階選項**，有兩個硬限制：
-> ① 仍是 Developer Preview，需申請資格；② Program Terms 規定 GA 之前
-> **不得讓自家網域／公司以外的終端使用者**透過你的應用使用 Pre-GA API——
-> 也就是**不能出貨給客戶**（除非每個客戶各自申請自己的資格與 GCP 專案）。
-> 因此 2026-07-30 拍板：產品面完全走原生工具，本掛載只保留給自用與願意
-> 自行申請的進階使用者。
+> The official remote MCP documented here is an **advanced option** with two hard
+> constraints: ① it's still a Developer Preview and requires enrollment; ② the
+> Program Terms prohibit letting end users **outside your own domain/organization**
+> use a Pre-GA API through your app before GA — in other words, **you can't ship
+> it to customers** (unless each customer enrolls with their own eligibility and
+> GCP project). Given that, the 2026-07-30 decision was: the product ships
+> entirely on native tools, and this mount is kept only for internal use and for
+> advanced users willing to enroll themselves.
 
-## 八個服務的覆蓋狀況
+## Coverage across the eight services
 
-| 服務 | 原生工具（**出貨路徑**，無資格限制） | 官方 MCP（preview，僅自用） |
+| Service | Native tools (**the shipped path**, no enrollment needed) | Official MCP (preview, internal use only) |
 |---|---|---|
-| Gmail | ✅ 4 工具 | ✅ `preset = "google:gmail"`（13 工具） |
-| Calendar | ✅ 2 | ✅ `google:calendar`（9） |
-| Sheets | ✅ 2 | ✅ `google:sheets`（7） |
-| Drive | ✅ 2 | ✅ `google:drive`（8） |
-| Docs | ✅ 2 | ✅ `google:docs`（2） |
-| Slides | ✅ 1（唯讀） | ✅ `google:slides`（2） |
-| Forms | ✅ 2 | ❌ 官方無 |
-| Tasks | ✅ 4 | ❌ 官方無 |
+| Gmail | ✅ 4 tools | ✅ `preset = "google:gmail"` (13 tools) |
+| Calendar | ✅ 2 | ✅ `google:calendar` (9) |
+| Sheets | ✅ 2 | ✅ `google:sheets` (7) |
+| Drive | ✅ 2 | ✅ `google:drive` (8) |
+| Docs | ✅ 2 | ✅ `google:docs` (2) |
+| Slides | ✅ 1 (read-only) | ✅ `google:slides` (2) |
+| Forms | ✅ 2 | ❌ none official |
+| Tasks | ✅ 4 | ❌ none official |
 
-官方 MCP 的工具面在 Gmail／Drive／Sheets 上比原生豐富（標籤管理、權限查詢、
-公式寫入等），這是它唯一的優勢；代價是 preview 資格與不可出貨。原生工具數
-共 19（含 `google_status`）。
+The official MCP's tool surface is richer than the native tools for Gmail/Drive/Sheets
+(label management, permission queries, formula writes, and more) — that's its only
+advantage; the cost is the preview enrollment and the ban on shipping. The native tool
+count is 19 total (including `google_status`).
 
-Forms 與 Tasks 的「官方無」是查證結果而非推測：`formsmcp.googleapis.com` /
-`tasksmcp.googleapis.com` 實測回 404，Google 的 MCP 文件也完全沒有這兩個服務
-（連 coming soon 都沒有）。另外官方還有 Chat（`preset = "google:chat"`，可用）
-與 People（端點命名不同，未納入 preset）——這兩個目前沒有原生工具對應。
+The "none official" verdict for Forms and Tasks is a verified fact, not a guess:
+`formsmcp.googleapis.com` / `tasksmcp.googleapis.com` both return 404 in practice, and
+Google's MCP documentation doesn't mention either service (not even as "coming soon").
+Separately, Google also offers Chat (`preset = "google:chat"`, usable) and People
+(different endpoint naming, not included in a preset) — neither currently has a native
+tool equivalent.
 
-### 各服務工具清單（實測 `tools/list`）
+### Per-service tool list (from a live `tools/list` call)
 
-- **Gmail**：`search_threads` `get_thread` `get_message` `create_draft`
+- **Gmail**: `search_threads` `get_thread` `get_message` `create_draft`
   `list_drafts` `list_labels` `create_label` `label_message` `unlabel_message`
   `label_thread` `unlabel_thread` `apply_sensitive_message_label`
-  `apply_sensitive_thread_label` — **沒有寄信工具**，最多到草稿。
-- **Calendar**：`list_calendars` `list_events` `get_event` `search_events`
+  `apply_sensitive_thread_label`. **No send-mail tool** — it stops at drafts.
+- **Calendar**: `list_calendars` `list_events` `get_event` `search_events`
   `suggest_time` `create_event` `update_event` `delete_event`
   `respond_to_event`
-- **Drive**：`search_files` `list_recent_files` `get_file_metadata`
+- **Drive**: `search_files` `list_recent_files` `get_file_metadata`
   `get_file_permissions` `read_file_content` `download_file_content`
   `create_file` `copy_file`
-- **Docs**：`read_doc` `update_doc`
-- **Sheets**：`get_spreadsheet` `get_values` `update_values` `update_formulas`
+- **Docs**: `read_doc` `update_doc`
+- **Sheets**: `get_spreadsheet` `get_values` `update_values` `update_formulas`
   `update_spreadsheet` `insert_dimension` `copy_sheet_to_another_spreadsheet`
-- **Slides**：`read_presentation` `update_presentation`
+- **Slides**: `read_presentation` `update_presentation`
 
-## 前置設定（一次性）
+## One-time setup
 
-1. **加入 Developer Preview Program**：<https://developers.google.com/workspace/preview>
-   （免費、數日核准；申請需要 Workspace 帳號）。這批 server **仍是 preview
-   非 GA**，條款限制 Pre-GA API 僅供自家網域/公司內部使用。
-2. **GCP 專案啟用 API**——每個服務要「標準 API + MCP API」兩層：
+1. **Join the Developer Preview Program**: <https://developers.google.com/workspace/preview>
+   (free, approval takes a few days; applying requires a Workspace account). These
+   servers are **still preview, not GA** — the terms restrict Pre-GA API use to your
+   own domain/organization only.
+2. **Enable the APIs on the GCP project** — each service needs both its "standard API"
+   and its "MCP API" layer:
 
    ```bash
    gcloud services enable \
@@ -69,33 +77,36 @@ Forms 與 Tasks 的「官方無」是查證結果而非推測：`formsmcp.google
      --project=PROJECT_ID
    ```
 
-3. **連接 Google 帳號**：dashboard「整合 → Google」。scopes 已涵蓋 Drive /
-   Docs / Sheets / Slides（見 [google-workspace.md](google-workspace.md)）；
-   v1.47 之前連好的帳號需要重新連接一次才會拿到新 scope。
+3. **Connect a Google account**: the dashboard's Integrations → Google (整合 → Google)
+   tab. The scopes already cover Drive/Docs/Sheets/Slides (see
+   [google-workspace.md](google-workspace.md)); accounts connected before v1.47 need to
+   reconnect once to pick up the new scopes.
 
-## 認證怎麼運作
+## How authentication works
 
-`preset` 會把 bearer 設成 `oauth://google`——掛載時取當前有效 access token，
-過期自動用 refresh token 換新。Google 帳號沒連接時**整台 server 被跳過**
-（fail-safe：agent 少了這些工具，但回覆不會失敗）。
+The `preset` sets the bearer to `oauth://google` — at mount time it fetches the current
+valid access token, and refreshes it automatically with the refresh token when it
+expires. When no Google account is connected, **the whole server is skipped**
+(fail-safe: the agent loses those tools, but the reply doesn't fail).
 
-想繞過 dashboard 整合、自備 token 也可以：
+You can also bypass the dashboard integration and bring your own token:
 
 ```toml
 [[mcp.external]]
 preset = "google:sheets"
-bearer_token = "env://MY_GOOGLE_TOKEN"   # 覆蓋 preset 的預設 bearer
+bearer_token = "env://MY_GOOGLE_TOKEN"   # overrides the preset's default bearer
 ```
 
-技術細節：這些是 stateless Streamable HTTP server，DuDuClaw 的 MCP client 原生
-支援。**不需要** `npx mcp-remote` 之類的 stdio proxy——Google 沒有提供官方
-bridge，且其 OAuth 不支援 Dynamic Client Registration，社群 proxy 的預設流程
-會失敗。
+Technical detail: these are stateless Streamable HTTP servers, natively supported by
+DuDuClaw's MCP client. There's **no need** for a stdio proxy like `npx mcp-remote` —
+Google doesn't provide an official bridge, and its OAuth doesn't support Dynamic
+Client Registration, so community proxies' default flow fails.
 
-## 建議收斂工具面
+## Recommendation: narrow the tool surface
 
-官方 server 一次給的工具不少（Drive 8 個、Gmail 13 個），建議用
-`allowed_tools` 只開需要的，並把寫入型工具送進 HITL 審批：
+The official server hands over a lot of tools at once (8 for Drive, 13 for Gmail).
+It's worth using `allowed_tools` to open only what you need, and routing write
+tools through HITL approval:
 
 ```toml
 [[mcp.external]]
@@ -107,17 +118,20 @@ allowed_tools = ["list_events", "suggest_time", "create_event"]
 approval_required_tools = ["create_event", "update_doc", "create_file"]
 ```
 
-## 已知限制
+## Known limitations
 
-- Preview 階段、rate limit 未公開文件化（GCP Console quota 頁可查）。
-- 只有互動式 OAuth，**無 service account / headless 授權路徑**。
-- Gmail 無寄信工具；官方 reference 頁的工具數與實際端點有出入（reference 列
-  10 個、端點實際 13 個）——以 `tools/list` 實測為準。
-- 端點若在 GA 時改名，只需改 `mcp_external.rs` 的 `GOOGLE_MCP_PRESETS`
-  一處（使用者的 `agent.toml` 不必動）。
+- Still preview stage; rate limits aren't publicly documented (check the GCP
+  Console quota page).
+- OAuth is interactive-only — **no service account / headless authorization path**.
+- Gmail has no send-mail tool; the official reference page's tool count doesn't
+  match the live endpoint (the reference lists 10, the endpoint actually has 13)
+  — trust a live `tools/list` call over the docs.
+- If the endpoints get renamed at GA, the only change needed is in
+  `mcp_external.rs`'s `GOOGLE_MCP_PRESETS` — users' `agent.toml` files don't
+  need to change.
 
-參考來源：
-[configure-mcp-servers](https://developers.google.com/workspace/guides/configure-mcp-servers)、
-[Gmail MCP reference](https://developers.google.com/workspace/gmail/api/reference/mcp)、
-[Calendar MCP reference](https://developers.google.com/workspace/calendar/api/v3/reference/mcp)、
-[Developer Preview Program](https://developers.google.com/workspace/preview)。
+Sources:
+[configure-mcp-servers](https://developers.google.com/workspace/guides/configure-mcp-servers),
+[Gmail MCP reference](https://developers.google.com/workspace/gmail/api/reference/mcp),
+[Calendar MCP reference](https://developers.google.com/workspace/calendar/api/v3/reference/mcp),
+[Developer Preview Program](https://developers.google.com/workspace/preview).

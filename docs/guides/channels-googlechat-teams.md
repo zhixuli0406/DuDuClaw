@@ -1,4 +1,4 @@
-# Google Chat & Microsoft Teams Channels
+# Google Chat & Microsoft Teams channels
 
 DuDuClaw supports Google Chat and Microsoft Teams as first-class channels
 (alongside Telegram / LINE / Discord / Slack / WhatsApp / Feishu / WebChat).
@@ -30,7 +30,7 @@ Both channels include:
    and *Join spaces and group conversations*, and set **HTTP endpoint URL**
    to `https://<your-host>/webhook/googlechat`.
 4. Under *Authentication Audience* choose **Project number**.
-5. Configure DuDuClaw (`config.toml`, or dashboard → Channels → 新增
+5. Configure DuDuClaw (`config.toml`, or dashboard → Channels → Add
    `googlechat`):
 
 ```toml

@@ -16,7 +16,7 @@ so regressions are catchable without spending tokens.
 > the **external yardstick**: a fixed, human‑authored set of expected behaviors that
 > a prompt change, a runtime/provider swap, a `claude` CLI upgrade, or a GVU
 > `SOUL.md` rewrite **cannot silently regress**. See
-> [GVU yardstick](#gvu-integration-the-external-yardstick) below.
+> [GVU yardstick](#evolution-integration-the-external-yardstick) below.
 
 ---
 

@@ -1,45 +1,50 @@
-# DocuSeal — 文件簽署工作流
+# DocuSeal — document signing workflow
 
-[DocuSeal](https://github.com/docusealco/docuseal) 是開源的 DocuSign 替代品
-（cloud 或 self-hosted）。DuDuClaw 提供 `duduclaw-docuseal-mcp`——一個開源的
-MCP stdio wrapper，讓 agent 走「生成合約 → 寄送簽署 → 查狀態 → 取回簽署檔」
-全流程。
+[DocuSeal](https://github.com/docusealco/docuseal) is an open-source DocuSign
+alternative (cloud or self-hosted). DuDuClaw ships `duduclaw-docuseal-mcp`, an
+open-source MCP stdio wrapper that lets an agent run the full "generate
+contract → send for signature → check status → retrieve the signed file"
+flow.
 
-## 兩條路，怎麼選
+## Two paths, and how to choose
 
-| 路徑 | 適用 | 認證 |
+| Path | Fits | Auth |
 |---|---|---|
-| **`duduclaw-docuseal-mcp`（本 wrapper）** | cloud（api.docuseal.com / .eu）**與** self-hosted 都支援；工具面較完整（歸檔、重寄、prefill 更新、簽署檔 URL） | `X-Auth-Token` API key |
-| **DocuSeal 官方內建 MCP**（2026-03 起） | 僅 self-hosted；5 個工具（search/load/create template、send、search documents） | 實例 Settings → MCP Server 產生的 Bearer token，`url = "https://<host>/mcp"` 直接掛 [MCP Bridge](mcp-bridge.md) |
+| **`duduclaw-docuseal-mcp` (this wrapper)** | Supports **both** cloud (api.docuseal.com / .eu) and self-hosted; broader tool surface (archiving, resending, prefill updates, signed-document URLs) | `X-Auth-Token` API key |
+| **DocuSeal's official built-in MCP** (since 2026-03) | Self-hosted only; 5 tools (search/load/create template, send, search documents) | Bearer token generated from the instance's Settings → MCP Server, `url = "https://<host>/mcp"` mounted directly via the [MCP Bridge](mcp-bridge.md) |
 
-## wrapper 的 10 個工具
+## The wrapper's 10 tools
 
-`docuseal_list_templates`、`docuseal_get_template`、
-`docuseal_create_template_from_pdf`（base64 或 URL，PDF 內可用
-`{{欄位;role=Signer1;type=signature}}` text tags 自動放欄位）、
-`docuseal_create_submission`（寄送簽署，回每位簽署人的簽署連結 `embed_src`）、
-`docuseal_get_submission`（狀態＋事件＋`audit_log_url`）、
-`docuseal_list_submissions`、`docuseal_archive_submission`、
-`docuseal_get_submission_documents`（完成後的簽署檔下載 URL）、
-`docuseal_resend_submitter_email`、`docuseal_update_submitter`（prefill／改聯絡方式）。
+`docuseal_list_templates`, `docuseal_get_template`,
+`docuseal_create_template_from_pdf` (base64 or URL; text tags like
+`{{field;role=Signer1;type=signature}}` inside the PDF place fields
+automatically),
+`docuseal_create_submission` (send for signature, returns each signer's
+signing link `embed_src`),
+`docuseal_get_submission` (status + events + `audit_log_url`),
+`docuseal_list_submissions`, `docuseal_archive_submission`,
+`docuseal_get_submission_documents` (download URLs for the completed signed
+documents),
+`docuseal_resend_submitter_email`, `docuseal_update_submitter` (prefill /
+contact updates).
 
-## 設定
+## Configuration
 
-環境變數：
+Environment variables:
 
-| 變數 | 說明 |
+| Variable | Description |
 |---|---|
-| `DOCUSEAL_API_KEY` | 必填。cloud 在 <https://console.docuseal.com/api> 取得；self-hosted 在實例 API settings |
-| `DOCUSEAL_BASE_URL` | 選填。預設 `https://api.docuseal.com`；EU cloud `https://api.docuseal.eu`；self-hosted `https://<host>/api` |
+| `DOCUSEAL_API_KEY` | Required. Get it from <https://console.docuseal.com/api> on cloud; from the instance's API settings when self-hosted |
+| `DOCUSEAL_BASE_URL` | Optional. Defaults to `https://api.docuseal.com`; EU cloud is `https://api.docuseal.eu`; self-hosted is `https://<host>/api` |
 
-`agent.toml` 掛載（stdio）：
+Mounting in `agent.toml` (stdio):
 
 ```toml
 [[mcp.external]]
 name = "docuseal"
 command = "duduclaw-docuseal-mcp"
 env = { DOCUSEAL_API_KEY = "secret://local/docuseal_api_key" }
-# self-hosted 加： DOCUSEAL_BASE_URL = "https://sign.example.com/api"
+# self-hosted: also add DOCUSEAL_BASE_URL = "https://sign.example.com/api"
 allowed_tools = [
   "docuseal_list_templates", "docuseal_get_template",
   "docuseal_create_submission", "docuseal_get_submission",
@@ -47,20 +52,23 @@ allowed_tools = [
 ]
 ```
 
-寄送／歸檔屬於對外且半不可逆的動作——建議把 `docuseal_create_submission`、
-`docuseal_archive_submission` 列入 `[capabilities] approval_required_tools`
-走 HITL 審批。
+Sending and archiving are outward-facing, semi-irreversible actions —
+consider putting `docuseal_create_submission` and
+`docuseal_archive_submission` in `[capabilities] approval_required_tools`
+for HITL approval.
 
-## 簽署完成 → 自動通知（webhook）
+## Signature completion → automatic notification (webhook)
 
-DocuSeal 的 webhook 只能在 UI 設定（cloud: Console → Webhooks；self-hosted:
-Settings → Webhooks），API 無法代設。把 `form.completed` /
-`submission.completed` 指向你的自動化入口後，可串 autopilot 規則做「完成即
-通知頻道／建任務」。Payload 外殼是
-`{"event_type", "timestamp", "data"}`；驗簽 header `X-Docuseal-Signature`
-（`<unix_ts>.<hex_hmac>`，HMAC-SHA256 對 `<ts>.<raw_body>`，容差 ±300s）。
+DocuSeal's webhook can only be configured in its UI (cloud: Console →
+Webhooks; self-hosted: Settings → Webhooks) — the API can't set it up for
+you. Point `form.completed` / `submission.completed` at your automation
+entry point, and you can chain an autopilot rule to "notify a channel /
+create a task on completion." The payload envelope is
+`{"event_type", "timestamp", "data"}`; the signature header is
+`X-Docuseal-Signature` (`<unix_ts>.<hex_hmac>`, HMAC-SHA256 over
+`<ts>.<raw_body>`, ±300s tolerance).
 
-## 本機驗證
+## Local verification
 
 ```sh
 cargo build -p duduclaw-docuseal-mcp
@@ -70,5 +78,6 @@ printf '%s\n%s\n' \
   | DOCUSEAL_API_KEY=test ./target/debug/duduclaw-docuseal-mcp
 ```
 
-第二行回應應列出 10 個 `docuseal_*` 工具。實際 API 呼叫（`tools/call`）需要
-有效 key；HTTP 層失敗會以 `isError: true` 回給 agent，不會中斷 server。
+The second response should list all 10 `docuseal_*` tools. Actual API calls
+(`tools/call`) need a valid key; HTTP-layer failures come back to the agent
+as `isError: true` without crashing the server.

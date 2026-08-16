@@ -160,7 +160,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 ```
 docs/                                  # L1 PUBLIC — product & developer documentation
 ├── README.md                          # This index
-├── architecture/                      # System architecture & engine design
+├── architecture/                      # System architecture & engine design (+ ja-JP, zh-TW)
 │   ├── overview.md                    #   Architecture overview
 │   └── evolution-engine.md            #   Evolution Engine spec (legacy GVU + v3 AEE/Playbook)
 ├── rfc/                               # Request-for-Comments design proposals
@@ -169,12 +169,13 @@ docs/                                  # L1 PUBLIC — product & developer docum
 │   ├── RFC-22-multi-agent-coordination-principles.md
 │   ├── RFC-24-decision-continuity.md
 │   └── RFC-26-deep-agents-alignment.md
-├── adr/                               # Architecture Decision Records
+├── adr/                               # Architecture Decision Records (+ ja-JP, zh-TW)
 │   ├── ADR-002-x-duduclaw-capability-negotiation.md
 │   ├── ADR-003-excluded-channels.md
 │   ├── ADR-004-erp-connector-abstraction.md
 │   ├── ADR-005-document-export.md
-│   └── ADR-006-local-ocr.md
+│   ├── ADR-006-local-ocr.md
+│   └── ADR-007-board-governance-mode.md
 ├── todo/                              # Public planning / tracking docs
 │   ├── TODO-agent-honesty.md
 │   └── TODO-rfc26-live-forking.md
@@ -186,7 +187,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 │   ├── soul-md-spec.md                #   SOUL.md format v1.0
 │   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0
 │   └── contract-toml-schema.json
-├── guides/                            # User & developer guides
+├── guides/                            # User & developer guides (+ ja-JP, zh-TW)
 │   ├── deployment-guide.md
 │   ├── development-guide.md
 │   ├── custom-mcp-tool.md

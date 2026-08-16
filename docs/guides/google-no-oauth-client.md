@@ -50,9 +50,10 @@ sign off. Expect questions, and expect some admins to say no.
    to 24 hours.
 4. Configure DuDuClaw, either from the dashboard or by hand.
 
-   **Dashboard** (no restart needed): 管理 → 整合／工具連線 → Google → 憑證方式 →
-   **服務帳號委派**. Fill in the key-file path and the user to impersonate, press
-   儲存, then 測試連線 — it mints a real token, so a green result means the
+   **Dashboard** (no restart needed): Manage (管理) → Integrations (整合／工具連線)
+   → Google → Credential path (憑證方式) → **Service account (服務帳號委派)**.
+   Fill in the key-file path and the user to impersonate, press Save (儲存),
+   then Test connection (測試連線) — it mints a real token, so a green result means the
    admin's authorization has actually landed. The scope list has a copy button
    next to it.
 
@@ -125,8 +126,9 @@ bridge" error rather than an empty result.
    own browser session).
 7. Configure DuDuClaw, either from the dashboard or by hand.
 
-   **Dashboard** (recommended — it encrypts the secret for you): 管理 →
-   整合／工具連線 → Google → 憑證方式 → **Apps Script 橋接**. Paste the `/exec`
+   **Dashboard** (recommended — it encrypts the secret for you): Manage (管理) →
+   Integrations (整合／工具連線) → Google → Credential path (憑證方式) →
+   **Apps Script bridge (Apps Script 橋接)**. Paste the `/exec`
    URL and the secret, press 儲存, then 測試連線 — a green result names the Google
    account the script runs as, which is the fastest way to catch "deployed under
    the wrong login". Editing the URL later without retyping the secret keeps the

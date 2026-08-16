@@ -1,176 +1,177 @@
-# 桌面 App 阻塞項目解除指南(Phase D + Phase 6 手測)
+# Desktop app unblocking guide (Phase D + Phase 6 manual testing)
 
-> 對應 [TODO-genspark-workspace-shell.md](../todo/TODO-genspark-workspace-shell.md) 中標為 `[ ]`(阻塞)
-> 與 `[~]`(已寫未 build 驗證)的項目。這些項目**不是缺程式碼**,而是缺**工具鏈 / 憑證 / 圖形環境 / 第二台機器**。
-> 本文把每個阻塞點拆成「為什麼擋住 → 前置 → 步驟 → 對應 TODO 項驗收」。
+> Corresponds to the items marked `[ ]` (blocked) and `[~]` (written but not build-verified) in
+> [TODO-genspark-workspace-shell.md](../todo/TODO-genspark-workspace-shell.md). What blocks these items
+> is external resources — toolchain, credentials, a graphical environment, a second machine. Not missing code.
+> This guide breaks every blocker into "why it's blocked → prerequisites → steps → matching TODO acceptance criteria."
 >
-> **建議順序**:關卡 A(本機,免費,半天)→ 關卡 E(更新金鑰,免費)→ 關卡 B(macOS 簽章,需付費帳號)
-> → 關卡 C(Windows 簽章)→ 關卡 D(Linux)。A 做完就能自用 + 跑完所有生命週期驗收。
+> **Suggested order**: Gate A (local, free, half a day) → Gate E (update signing key, free) → Gate B (macOS signing, needs a paid account)
+> → Gate C (Windows signing) → Gate D (Linux). Once A is done, you can use the app yourself and run every lifecycle check.
 
 ---
 
-## 關卡 A — 安裝 Tauri 工具鏈,本機跑起來(免簽章)
+## Gate A — install the Tauri toolchain and get it running locally (no signing)
 
-**擋住的項目**:D0 🧪、D1 🧪、D2.1/D2.3/D2.4/D2.5/D2.6 🧪、D5 第 1 項、P6.3 手測 + 截圖。
-**為什麼擋住**:此撰寫環境沒有 Tauri CLI、沒有系統 WebView 開發依賴、沒有顯示器。你的 Mac 三者皆有。
-**成本**:免費。**時間**:約 0.5–1 小時(含首次編譯)。
+**Blocks**: D0 🧪, D1 🧪, D2.1/D2.3/D2.4/D2.5/D2.6 🧪, D5 item 1, P6.3 manual test + screenshots.
+**Why it's blocked**: this writing environment has no Tauri CLI, no system WebView dev dependencies, and no display. Your Mac has all three.
+**Cost**: free. **Time**: about 0.5–1 hour (including the first build).
 
-### A.1 前置安裝(macOS)
+### A.1 Prerequisites (macOS)
 ```bash
-# Xcode Command Line Tools(若未裝)
+# Xcode Command Line Tools (if not installed)
 xcode-select --install
 
-# Rust(若未裝)
+# Rust (if not installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Tauri CLI v2
 cargo install tauri-cli --version "^2" --locked
-cargo tauri --version   # 應印出 tauri-cli 2.x
+cargo tauri --version   # should print tauri-cli 2.x
 ```
-> Windows 另需 WebView2 Runtime(Win11 內建)+ MSVC Build Tools;
-> Linux 需 `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf`。
+> Windows additionally needs the WebView2 Runtime (built into Win11) + MSVC Build Tools;
+> Linux needs `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf`.
 
-### A.2 產生 App 圖示(一次性)
+### A.2 Generate the app icon (one-time)
 ```bash
 cd src-tauri
-# 準備一張 ≥1024×1024 的方形 PNG(🐾 + amber 底),例如放到 web/public/paw-1024.png
+# Prepare a square PNG ≥1024×1024 (🐾 on an amber background), e.g. save it to web/public/paw-1024.png
 cargo tauri icon ../web/public/paw-1024.png
-# 產出 icons/32x32.png、128x128.png、128x128@2x.png、icon.icns、icon.ico
+# Produces icons/32x32.png, 128x128.png, 128x128@2x.png, icon.icns, icon.ico
 ```
 
-### A.3 staged sidecar + 開發模式
+### A.3 Stage the sidecar + dev mode
 ```bash
-# 從 repo 根目錄
-cargo build --release -p duduclaw-cli --bin duduclaw   # 產出 target/release/duduclaw
-scripts/desktop/stage-sidecar.sh                        # 複製成 src-tauri/binaries/duduclaw-<triple>
+# From the repo root
+cargo build --release -p duduclaw-cli --bin duduclaw   # produces target/release/duduclaw
+scripts/desktop/stage-sidecar.sh                        # copies it to src-tauri/binaries/duduclaw-<triple>
 
 cd src-tauri
-cargo tauri dev      # 開發視窗;beforeDevCommand 會自動起 Vite
+cargo tauri dev      # opens the dev window; beforeDevCommand starts Vite automatically
 ```
 
-### A.4 不簽章正式打包(本機驗證體驗)
+### A.4 Unsigned production build (verify locally)
 ```bash
 cd src-tauri
 cargo tauri build
-# 產物:src-tauri/target/release/bundle/{macos,dmg}/...
-# 首次直接開 .app 會被 Gatekeeper 擋(正常,因為還沒簽章)——用下列方式本機放行:
+# Output: src-tauri/target/release/bundle/{macos,dmg}/...
+# Opening the .app directly for the first time gets blocked by Gatekeeper (expected — it isn't signed yet); allow it locally with:
 xattr -dr com.apple.quarantine "target/release/bundle/macos/DuDuClaw.app"
 open "target/release/bundle/macos/DuDuClaw.app"
 ```
 
-### A.5 逐項驗收(對照 TODO)
-| TODO 項 | 怎麼驗 |
+### A.5 Item-by-item acceptance (matches the TODO)
+| TODO item | How to verify |
 | --- | --- |
-| **D0 🧪** | `cargo tauri dev` 起得來、視窗顯示登入頁、送一句 chat 有回應 |
-| **D1 🧪** | (a) 先確保沒有 launchd/CLI gateway → 開 App,應**自啟 sidecar**;(b) 先 `duduclaw run` 佔住 18789 → 開 App,應**附掛不重啟**(Activity Monitor 只看到一個 `duduclaw`) |
-| **D2.1 🧪** | 連續開兩次 App → 只聚焦同一視窗、只有一個 `duduclaw` 進程 |
-| **D2.3 🧪** | 正常退出後 `ps aux | grep duduclaw` 無殘留;`kill -9` App 後重開,應回收舊 pidfile(`~/.duduclaw/desktop-sidecar.pid`)指向的孤兒 |
-| **D2.4 🧪** | 託盤圖示顯示狀態;選單 Start/Stop 能驅動 sidecar;關窗縮回託盤不退出 |
-| **D2.5 🧪** | 手動 `kill <sidecar pid>` → App 應指數退避自動重啟;連殺 5 次以上 → 進 error 態 + 通知,不無限重試 |
-| **D2.6 🧪** | 從 **Finder/Dock**(非終端機)啟動 App → 確認子進程(Claude CLI 等)仍找得到;可在 chat 觸發一個需要 CLI 的動作驗證 |
-| **D5 第 1 項** | `cargo tauri build` 出可執行 App、自啟 sidecar、開工作空間、可送 chat |
-| **P6.3 手測** | 個人版首次落 workspace → 送一句進對話 → 切「進階」見完整儀表板 → 重整後模式記憶留存 |
-| **P6.3 截圖** | light/dark 各截一張,和 Genspark 4.0 並排做 critique |
+| **D0 🧪** | `cargo tauri dev` launches, the window shows the login page, sending one chat message gets a response |
+| **D1 🧪** | (a) First make sure no launchd/CLI gateway is running → open the app; it should **auto-start the sidecar**. (b) First run `duduclaw run` to occupy port 18789 → open the app; it should **attach without restarting it** (Activity Monitor shows only one `duduclaw` process) |
+| **D2.1 🧪** | Open the app twice in a row → only one window gets focus, only one `duduclaw` process exists |
+| **D2.3 🧪** | After a normal quit, `ps aux | grep duduclaw` shows no leftover process; after `kill -9`-ing the app and reopening it, it should reclaim the orphan pointed to by the old pidfile (`~/.duduclaw/desktop-sidecar.pid`) |
+| **D2.4 🧪** | The tray icon shows status; the Start/Stop menu items drive the sidecar; closing the window minimizes to the tray instead of quitting |
+| **D2.5 🧪** | Manually `kill <sidecar pid>` → the app should auto-restart with exponential backoff; after 5+ consecutive kills it should enter an error state and notify, not retry forever |
+| **D2.6 🧪** | Launch the app from **Finder/Dock** (not the terminal) → confirm the child processes (Claude CLI, etc.) are still discoverable; you can trigger a chat action that needs the CLI to verify |
+| **D5 item 1** | `cargo tauri build` produces a runnable app that auto-starts the sidecar, opens the workspace, and can send chat messages |
+| **P6.3 manual test** | On first launch in the personal edition, land on the workspace → send one chat message → switch to "Advanced" to see the full dashboard → the mode choice persists after a refresh |
+| **P6.3 screenshots** | Capture one light and one dark screenshot, and put them side by side with Genspark 4.0 for critique |
 
 ---
 
-## 關卡 E — 產生 Tauri 自動更新簽章金鑰(免費,先做)
+## Gate E — generate the Tauri auto-update signing key (free, do this first)
 
-**擋住的項目**:D4.4(更新 pubkey 佔位字串)。
-**為什麼擋住**:`tauri.conf.json > plugins.updater.pubkey` 目前是 `REPLACE_WITH_...` 佔位;updater 必須有金鑰對才會驗章。在金鑰備妥前,updater 已**整個關閉**(`plugins.updater.active = false` 且 `bundle.createUpdaterArtifacts = false`),否則本機 `cargo tauri build` 會在最後簽 updater artifact 時報 `A public key has been found, but no private key`。
+**Blocks**: D4.4 (replacing the update pubkey placeholder).
+**Why it's blocked**: `tauri.conf.json > plugins.updater.pubkey` is currently the placeholder `REPLACE_WITH_...`, and the updater needs a real key pair before it can verify signatures. Until the key is ready, the updater is **fully disabled** (`plugins.updater.active = false` and `bundle.createUpdaterArtifacts = false`); otherwise a local `cargo tauri build` fails at the final updater-artifact signing step with `A public key has been found, but no private key`.
 
-### 步驟
+### Steps
 ```bash
 cargo tauri signer generate -w ~/.tauri/duduclaw-updater.key
-# 終端會印出 public key,並把私鑰寫到 ~/.tauri/duduclaw-updater.key
+# The terminal prints the public key and writes the private key to ~/.tauri/duduclaw-updater.key
 ```
-1. 把 **public key** 貼進 [src-tauri/tauri.conf.json](../../src-tauri/tauri.conf.json) 的 `plugins.updater.pubkey`。
-2. **同檔把 updater 開回來**:`plugins.updater.active = true`、`bundle.createUpdaterArtifacts = true`。
-3. 把**私鑰內容**與密碼設成 GitHub repo secrets:
-   - `TAURI_SIGNING_PRIVATE_KEY`(私鑰檔內容)
+1. Paste the **public key** into `plugins.updater.pubkey` in [src-tauri/tauri.conf.json](../../src-tauri/tauri.conf.json).
+2. **In the same file, turn the updater back on**: `plugins.updater.active = true`, `bundle.createUpdaterArtifacts = true`.
+3. Set the **private key content** and its password as GitHub repo secrets:
+   - `TAURI_SIGNING_PRIVATE_KEY` (the private key file's content)
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-4. **私鑰永不入庫**;遺失會導致已發佈的客戶端無法再收到更新,務必備份到密碼管理器。
+4. **The private key never goes into the repo.** Losing it means published clients can no longer receive updates, so back it up to a password manager.
 
-**驗收(D4.4 一半)**:CI release 後產物含 `latest.json` 且帶簽章欄位。端到端「舊版→更新」需先有兩個已簽章 release(見關卡 B 後再做)。
+**Acceptance (half of D4.4)**: after a CI release, the artifacts include `latest.json` with signature fields. The full "old version → update" round trip needs two already-signed releases (do that after Gate B).
 
 ---
 
-## 關卡 B — Apple Developer ID 簽章 + 公證(macOS 發佈)
+## Gate B — Apple Developer ID signing + notarization (macOS release)
 
-**擋住的項目**:D3.1 🧪、D3.2 🧪、D4.1、D4.4(mac 端到端)、D5 簽章/乾淨機。
+**Blocks**: D3.1 🧪, D3.2 🧪, D4.1, D4.4 (Mac end-to-end), D5 signing/clean machine.
 
-> **現況(2026-07 實測 Keychain)**:**簽章已解鎖** —— 本機有一張**有效**的
-> `Developer ID Application: Dudu Technology Ltd. (7469HYQ6HH)`(到 2031-03,私鑰在
-> Keychain,`codesign` 實測通過),且已寫進
-> [tauri.conf.json](../../src-tauri/tauri.conf.json) `bundle.macOS.signingIdentity`,
-> 所以 `cargo tauri build` 會自動簽章(免帶 env)。**剩下只差公證**:建立
-> app-specific password(B.1 第 4 步)並帶 `APPLE_ID` / `APPLE_PASSWORD` /
-> `APPLE_TEAM_ID=7469HYQ6HH` 即可,再到第二台乾淨機驗 D4.1 / D5。
+> **Current status (verified against Keychain, 2026-07)**: **signing is unblocked.** This machine has a valid
+> `Developer ID Application: Dudu Technology Ltd. (7469HYQ6HH)` certificate (expires 2031-03, private key in
+> Keychain, `codesign` verified working), and it's already set in
+> [tauri.conf.json](../../src-tauri/tauri.conf.json) under `bundle.macOS.signingIdentity`,
+> so `cargo tauri build` signs automatically (no env vars needed). **All that's left is notarization**: create
+> an app-specific password (B.1 step 4) and pass `APPLE_ID` / `APPLE_PASSWORD` /
+> `APPLE_TEAM_ID=7469HYQ6HH`, then verify D4.1 / D5 on a second, clean machine.
 
-### B.1 取得憑證與認證資訊
-1. ✅ 已有 Apple Developer Program 帳號 + Developer ID 憑證(Team ID `7469HYQ6HH`)。
-2. ✅ **Developer ID Application** 憑證已在 Keychain 且有效(見上「現況」)。
-3. (CI 用)匯出成 `.p12`(含私鑰),記下密碼。
-4. ⬜ 建立 **app-specific password**:appleid.apple.com → 登入與安全性 → App 專用密碼。（公證唯一還缺的一步）
-5. ✅ **Team ID** = `7469HYQ6HH`。
+### B.1 Get the certificate and authentication details
+1. ✅ Already have an Apple Developer Program account + Developer ID certificate (Team ID `7469HYQ6HH`).
+2. ✅ The **Developer ID Application** certificate is already in Keychain and valid (see "Current status" above).
+3. (For CI) Export it as a `.p12` (including the private key) and note the password.
+4. ⬜ Create an **app-specific password**: appleid.apple.com → Sign-In and Security → App-Specific Passwords. (The only remaining step for notarization.)
+5. ✅ **Team ID** = `7469HYQ6HH`.
 
-### B.2 本機簽章 + 公證(手動驗一次)
+### B.2 Sign and notarize locally (verify once by hand)
 ```bash
-# signingIdentity 已在 tauri.conf.json,build 會自動簽章。公證再帶下面三個 env:
+# signingIdentity is already set in tauri.conf.json, so the build signs automatically. Pass these three env vars for notarization:
 export APPLE_ID="you@example.com"
-export APPLE_PASSWORD="<app-specific-password>"   # B.1 第 4 步
+export APPLE_PASSWORD="<app-specific-password>"   # B.1 step 4
 export APPLE_TEAM_ID="7469HYQ6HH"
-cd src-tauri && cargo tauri build          # 簽章 + 公證 + staple(env 齊全時)
-# 或先 build 再用內附腳本單獨簽章 + 公證 + 釘選:
+cd src-tauri && cargo tauri build          # signs + notarizes + staples (when the env vars are set)
+# Or build first, then sign, notarize, and staple separately with the bundled script:
 ../scripts/desktop/sign-notarize-macos.sh "target/release/bundle/dmg/DuDuClaw_1.31.0_aarch64.dmg"
 ```
-> 腳本已用 [src-tauri/entitlements.plist](../../src-tauri/entitlements.plist) 的 hardened runtime entitlements。
+> The script uses the hardened runtime entitlements from [src-tauri/entitlements.plist](../../src-tauri/entitlements.plist).
 
-### B.3 設成 CI secrets(自動化發佈)
-在 GitHub repo → Settings → Secrets and variables → Actions 新增:
-| Secret | 值 |
+### B.3 Set as CI secrets (for automated releases)
+In the GitHub repo, go to Settings → Secrets and variables → Actions and add:
+| Secret | Value |
 | --- | --- |
-| `APPLE_CERTIFICATE` | `base64 -i DeveloperID.p12`(整段) |
-| `APPLE_CERTIFICATE_PASSWORD` | .p12 密碼 |
-| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: <名字> (<TEAMID>)` |
-| `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 同上 |
+| `APPLE_CERTIFICATE` | `base64 -i DeveloperID.p12` (the full output) |
+| `APPLE_CERTIFICATE_PASSWORD` | the .p12 password |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: <name> (<TEAMID>)` |
+| `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | same as above |
 
-### B.4 逐項驗收
-| TODO 項 | 怎麼驗 | 狀態 |
+### B.4 Item-by-item acceptance
+| TODO item | How to verify | Status |
 | --- | --- | --- |
-| **D4.1 🧪** | 把簽章+公證後的 `.dmg` 傳到**另一台從未裝過你憑證的 Mac**,雙擊 → **不**跳「來自未識別開發者」 | ✅ **已驗**(2026-07-01,`desktop-v1.31.0`):`stapler validate` = *worked*、`spctl -a` = accepted / Notarized Developer ID |
-| **D3.1 🧪** | 簽章+hardened 後開 App,sidecar 仍能 spawn CLI / 連網(在 chat 觸發需網路的動作) | ⬜ 待在簽章版 App 內實跑 |
-| **D3.2 🧪** | 首次用 Computer Use → 系統跳 Accessibility / Screen Recording 授權框,授權後截圖/模擬輸入可動 | ⬜ 待驗 |
-| **D5 簽章/乾淨機** | 同 D4.1,且 `spctl -a -vvv DuDuClaw.app` 回 `accepted` | ✅ **已驗**:`spctl -a -vvv` = `accepted, source=Notarized Developer ID` |
+| **D4.1 🧪** | Copy the signed and notarized `.dmg` to **another Mac that has never had your certificate installed**, then double-click it → it should **not** show "from an unidentified developer" (來自未識別開發者) | ✅ **Verified** (2026-07-01, `desktop-v1.31.0`): `stapler validate` = *worked*, `spctl -a` = accepted / Notarized Developer ID |
+| **D3.1 🧪** | After signing with the hardened runtime, open the app and confirm the sidecar can still spawn the CLI / reach the network (trigger a chat action that needs the network) | ⬜ Still needs a real run inside the signed app |
+| **D3.2 🧪** | The first time Computer Use runs, the system should show the Accessibility / Screen Recording permission prompt; after granting it, screenshots/simulated input should work | ⬜ Not yet verified |
+| **D5 signing/clean machine** | Same as D4.1, and `spctl -a -vvv DuDuClaw.app` should return `accepted` | ✅ **Verified**: `spctl -a -vvv` = `accepted, source=Notarized Developer ID` |
 
 ---
 
-## 關卡 C — Windows Authenticode 簽章
+## Gate C — Windows Authenticode signing
 
-**擋住的項目**:D4.2。
-**為什麼擋住**:需要 **Authenticode 程式碼簽章憑證**。
+**Blocks**: D4.2.
+**Why it's blocked**: it needs an **Authenticode code-signing certificate**.
 
-> ⚠️ **2023/6 起的重大變更**:CA/B Forum 規定**連 OV(標準)憑證也必須存放於 FIPS 硬體**
-> (USB token 或雲端 HSM),**不能再下載純 `.pfx` 丟進 CI**。因此自動化簽章要走**雲端簽章方案**;
-> 純 `.pfx` 路徑僅適用於舊庫存憑證或雲端 HSM 匯出的暫時憑證。
+> ⚠️ **Major change starting 2023/6**: the CA/B Forum now requires even OV (standard) certificates to be stored on FIPS-compliant hardware
+> (a USB token or a cloud HSM) — you can no longer download a plain `.pfx` and drop it into CI. Automated signing therefore needs a cloud signing service;
+> the plain-`.pfx` path only still works for old inventory certificates or temporary certificates exported from a cloud HSM.
 
-### 去哪裡買(由便宜到貴)
-| 方案 | 類型 | 價格(約) | CI 自動簽 | 適合 |
+### Where to buy one (cheapest to priciest)
+| Option | Type | Price (approx.) | CI auto-sign | Best for |
 | --- | --- | --- | --- | --- |
-| **Azure Trusted Signing** | OV(微軟自家) | **~US$9.99/月** | ✅ 原生 `signtool` dlib | **首選**:最便宜、SmartScreen 信譽最好;需通過身分驗證 |
-| **Certum 開源程式碼簽章** | OV(開源專用) | **~US$30–70/年** | ✅ SimplySign 雲端 | DuDuClaw 是 Apache-2.0 → **符合資格**,預算首選 |
-| **SSL.com eSigner** | OV / EV | OV ~US$249/年起 | ✅ eSigner 雲 API | 老牌、文件完整 |
-| **DigiCert KeyLocker** | OV / EV | 偏高 | ✅ KeyLocker | 企業級 |
-| **Sectigo/Comodo**(經銷商:The SSL Store、SignMyCode、Codegic) | OV / EV | OV ~US$200–400/年 | 視方案 | 經銷商常有折扣 |
+| **Azure Trusted Signing** | OV (Microsoft's own) | **~US$9.99/month** | ✅ native `signtool` dlib | **First choice**: cheapest, best SmartScreen reputation; requires identity verification |
+| **Certum open-source code signing** | OV (open-source only) | **~US$30–70/year** | ✅ SimplySign cloud | DuDuClaw is Apache-2.0 → **qualifies**, budget pick |
+| **SSL.com eSigner** | OV / EV | OV from ~US$249/year | ✅ eSigner cloud API | Established, well-documented |
+| **DigiCert KeyLocker** | OV / EV | On the higher end | ✅ KeyLocker | Enterprise-grade |
+| **Sectigo/Comodo** (resellers: The SSL Store, SignMyCode, Codegic) | OV / EV | OV ~US$200–400/year | Depends on the plan | Resellers often discount |
 
-**OV vs EV**:OV 便宜但 SmartScreen 信譽需**累積下載量**才漸無警告;EV 貴但**即時通過** SmartScreen。
-台灣可線上刷卡購買,過程會做身分 / 組織驗證。
+**OV vs. EV**: OV is cheaper, but its SmartScreen reputation needs **accumulated download volume** before warnings taper off; EV is pricier but clears SmartScreen right away.
+You can buy either online by card from Taiwan; the process includes identity/organization verification.
 
-### 路徑 1(推薦)— Azure Trusted Signing(雲端,~US$10/月)
-1. Azure 入口建立 **Trusted Signing account** + **Certificate Profile**,完成身分驗證。
-2. 建立 service principal,設 CI secrets:`AZURE_TENANT_ID`、`AZURE_CLIENT_ID`、`AZURE_CLIENT_SECRET`、
-   `AZURE_TS_ENDPOINT`、`AZURE_TS_ACCOUNT`、`AZURE_TS_PROFILE`。
-3. CI 用官方 action 簽章(取代純 `.pfx` 步驟):
+### Route 1 (recommended) — Azure Trusted Signing (cloud, ~US$10/month)
+1. In the Azure portal, create a **Trusted Signing account** + **Certificate Profile** and complete identity verification.
+2. Create a service principal and set these CI secrets: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
+   `AZURE_TS_ENDPOINT`, `AZURE_TS_ACCOUNT`, `AZURE_TS_PROFILE`.
+3. Sign in CI using the official action (replacing the plain-`.pfx` step):
    ```yaml
    - name: Azure Trusted Signing
      if: matrix.os == 'windows-latest'
@@ -189,86 +190,86 @@ cd src-tauri && cargo tauri build          # 簽章 + 公證 + staple(env 齊全
        timestamp-digest: SHA256
    ```
 
-> ⚠️ **地區限制**:Azure Trusted Signing 目前只開放給**美 / 加 / 歐盟 / 英國的組織**,以及
-> **美 / 加的個人開發者**。**台灣 / 澳門等地不符資格** —— 表單能填、資源能建,但 **Identity
-> Validation 會卡住**,等於白做。非上述地區請改走**路徑 2(Certum)**。
+> ⚠️ **Regional restriction**: Azure Trusted Signing is currently open only to organizations in the **US/Canada/EU/UK**, and to
+> **individual developers in the US/Canada**. **Taiwan/Macau and similar regions don't qualify**: you can fill out the form and create the resources, but
+> identity validation gets stuck, so it's wasted effort. If you're outside those regions, use **Route 2 (Certum)** instead.
 
-### 路徑 2 — Certum 開源憑證(雲端 SimplySign,**無地區限制,台/澳適用**)
-1. 到 [shop.certum.eu](https://shop.certum.eu/) 搜「Open Source Code Signing」,**買「Open Source Code
-   Signing in the Cloud」(雲端版,約 €49)** —— 三個版本差別:
-   - *code*(€25):只給憑證,**要自備** Certum 加密卡 + 讀卡機 → 不適合。
-   - *set*(€69):含實體卡 + 讀卡機 → 要國際寄送、CI 難自動化 → 不適合。
-   - **in the Cloud(€49):憑證放雲端,免硬體 → 選這個。**
-2. 完成個人身分驗證(接受國際申請,上傳證件),附 DuDuClaw GitHub 連結證明開源。
-3. 安裝 **SimplySign**(把雲端憑證映射成本機可用的簽章裝置),或用其 CLI。
-4. 簽章工具:
-   - Windows:`signtool` 接 SimplySign(PKCS#11 / CSP)。
-   - **Mac / Linux / CI**:用 **`osslsigncode`** 搭 SimplySign 雲端金鑰,**不必開 Windows** 也能簽 `.msi`。
+### Route 2 — Certum open-source certificate (cloud SimplySign, **no regional restriction, works for Taiwan/Macau**)
+1. Go to [shop.certum.eu](https://shop.certum.eu/) and search for "Open Source Code Signing," then buy **"Open Source Code
+   Signing in the Cloud"** (the cloud edition, about €49). The three editions differ like this:
+   - *code* (€25): certificate only; you **supply your own** Certum crypto card and reader, so it doesn't fit here.
+   - *set* (€69): includes a physical card and reader; needs international shipping and CI can't automate it, so it doesn't fit either.
+   - **in the Cloud (€49): the certificate lives in the cloud, no hardware needed — pick this one.**
+2. Complete individual identity verification (accepts international applicants, requires uploading ID), and attach the DuDuClaw GitHub link to prove it's open source.
+3. Install **SimplySign** (maps the cloud certificate to a locally usable signing device), or use its CLI.
+4. Signing tools:
+   - Windows: `signtool` connected to SimplySign (PKCS#11 / CSP).
+   - **Mac/Linux/CI**: use **`osslsigncode`** with the SimplySign cloud key — you can sign `.msi` files without ever opening Windows.
 
-> 💳 **付款注意(2026-06 實測)**:Certum 金流(Autopay,EU)**只收 Visa / Mastercard**,
-> **不收 JCB**;Apple Pay 跨境常出現「無法取得服務」。若手上只有 JCB:
-> ① 試 PayPal(JCB 多半可綁);② 辦一張 **Wise / Revolut 虛擬 Visa**(台/澳可申請,日後 Apple
-> Developer $99、各種 SaaS 都用得到,強烈建議);③ 請有 Visa/MC 的人代刷。
+> 💳 **Payment note (verified 2026-06)**: Certum's payment processor (Autopay, EU) **only accepts Visa/Mastercard**,
+> **not JCB**; cross-border Apple Pay often fails with "service unavailable" (無法取得服務). If you only have a JCB card:
+> ① try PayPal (it usually accepts JCB); ② get a **Wise/Revolut virtual Visa** (available in Taiwan/Macau, and useful later
+> for the Apple Developer $99 fee and various SaaS subscriptions — strongly recommended); ③ ask someone with a Visa/Mastercard to pay on your behalf.
 
-### 路徑 3(後備)— 純 .pfx(僅舊庫存 / HSM 匯出的暫時憑證)
-維持原腳本 [sign-windows.ps1](../../scripts/desktop/sign-windows.ps1):設 secrets
-`WINDOWS_CERT_PFX_BASE64`、`WINDOWS_CERT_PASSWORD`,本機可手動:
+### Route 3 (fallback) — plain .pfx (only for old inventory certificates / temporary certificates exported from an HSM)
+Use the existing [sign-windows.ps1](../../scripts/desktop/sign-windows.ps1) script: set the secrets
+`WINDOWS_CERT_PFX_BASE64` and `WINDOWS_CERT_PASSWORD`, then run it locally by hand:
 ```powershell
 pwsh scripts/desktop/sign-windows.ps1 -Artifact path\to\DuDuClaw_1.30.1_x64.msi
 ```
 
-> **建議**:**美/加/歐/英**走路徑 1(Azure,~$10/月、SmartScreen 最友善);
-> **台灣 / 澳門等其他地區**走**路徑 2(Certum Cloud €49)**——唯一不受地區限制又能接 CI 的選項。
+> **Recommendation**: in the **US/Canada/EU/UK**, use Route 1 (Azure, ~$10/month, friendliest to SmartScreen);
+> in **Taiwan/Macau and other regions**, use Route 2 (Certum Cloud, €49) — the only option with no regional restriction that still supports CI.
 
-### ⏭️ 這關可以延後(優先順序提醒)
-**Windows 簽章是整個 Phase D 裡最低優先、可延後的一項**,別讓它擋住專案:
-- 沒簽章的 Windows 安裝檔**仍可安裝**,只是 SmartScreen 會跳一次「未知發行者」,使用者按
-  「仍要執行」即可。
-- 開發者在 macOS、受眾偏 Mac / 台灣時,**先做關卡 A(本機跑起來)+ 關卡 B(macOS 簽章)**;
-  Windows 可**先出不簽章版**,等辦好 Wise/Revolut 卡或確有 Windows 使用者需求再補簽。
-- 對應 CI:repo 變數 `WINDOWS_SIGN_METHOD` 不設時,簽章步驟會**自動 skip**(見
-  [desktop-release.yml](../../.github/workflows/desktop-release.yml)),不影響其他平台發佈。
+### ⏭️ This gate can wait (priority note)
+**Windows signing is the lowest-priority, most deferrable item in all of Phase D.** Don't let it block the project:
+- An unsigned Windows installer **still installs fine** — SmartScreen just shows an "Unknown publisher" (未知發行者) warning once, and the user
+  clicks "Run anyway" (仍要執行) to proceed.
+- If you're developing on macOS and the audience skews Mac/Taiwan, **do Gate A (get it running locally) + Gate B (macOS signing) first**;
+  Windows can **ship unsigned initially**, and get signed later once you have a Wise/Revolut card or actual Windows users need it.
+- In CI: when the repo variable `WINDOWS_SIGN_METHOD` isn't set, the signing step **auto-skips** (see
+  [desktop-release.yml](../../.github/workflows/desktop-release.yml)), so it doesn't block releases on other platforms.
 
-**驗收(D4.2 🧪)**:在乾淨 Windows 下載已簽 `.msi`,SmartScreen **不**攔(OV 需累積信譽,EV/Azure 較快)。
+**Acceptance (D4.2 🧪)**: download the signed `.msi` on a clean Windows machine — SmartScreen should **not** block it (OV needs accumulated reputation; EV/Azure clears faster).
 
 ---
 
-## 關卡 D — Linux 打包驗證
+## Gate D — Linux packaging verification
 
-**擋住的項目**:D4.3 🧪。
-**為什麼擋住**:需要 Linux 環境 / VM 測試 `.AppImage` / `.deb`。免簽章。
+**Blocks**: D4.3 🧪.
+**Why it's blocked**: it needs a Linux environment/VM to test the `.AppImage`/`.deb`. No signing required.
 
-### 步驟
+### Steps
 ```bash
-# 在 Ubuntu 22.04(或 CI 已配好)
+# On Ubuntu 22.04 (or an already-configured CI runner)
 sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 cd src-tauri && cargo tauri build
-# 產物:target/release/bundle/{appimage,deb}/...
+# Output: target/release/bundle/{appimage,deb}/...
 ```
-**驗收**:在 Ubuntu / Fedora 各跑一次 `.AppImage`,App 起得來、能連 gateway。
+**Acceptance**: run the `.AppImage` once each on Ubuntu and Fedora — the app should launch and connect to the gateway.
 
 ---
 
-## 關卡 F — 端到端自動更新(需 B + E 完成)
+## Gate F — end-to-end auto-update (needs B + E done)
 
-**擋住的項目**:D4.4 🧪、D5 自動更新。
+**Blocks**: D4.4 🧪, D5 auto-update.
 
-### 步驟
-1. 確認關卡 E 的 pubkey 已填、私鑰在 secrets。
-2. 發第一個版本:`git tag desktop-v1.30.1 && git push origin desktop-v1.30.1`(CI 產 release + `latest.json`)。
-3. 安裝該版到測試機。
-4. bump `src-tauri/tauri.conf.json` version → `1.30.2`,發第二個 tag。
-5. 開舊版 App → 應偵測新版 → 驗章 → 下載 → 提示重啟 → 生效。
-6. **負向測試**:用錯誤金鑰簽一個假更新 → 客戶端應**拒絕安裝**(驗章失敗)。
+### Steps
+1. Confirm Gate E's pubkey is filled in and the private key is in the secrets.
+2. Publish the first version: `git tag desktop-v1.30.1 && git push origin desktop-v1.30.1` (CI produces the release + `latest.json`).
+3. Install that version on a test machine.
+4. Bump the version in `src-tauri/tauri.conf.json` to `1.30.2` and publish a second tag.
+5. Open the old app → it should detect the new version → verify the signature → download it → prompt for a restart → apply it.
+6. **Negative test**: sign a fake update with the wrong key → the client should **refuse to install it** (signature verification fails).
 
 ---
 
-## 一次性檢查清單(全部解除)
-- [ ] 關卡 A:`cargo tauri build` 本機出 App,生命週期 7 項驗收綠(D0/D1/D2.*/D5-1/P6.3)
-- [ ] 關卡 E:updater 金鑰生成、pubkey 填入、私鑰進 secrets(D4.4 一半)
-- [ ] 關卡 B:Apple 憑證 → 簽章+公證,乾淨 Mac 不被擋(D3.1/D3.2/D4.1/D5)
-- [ ] 關卡 C:Windows 憑證 → 簽章,SmartScreen 不擋(D4.2)
-- [ ] 關卡 D:Linux `.AppImage`/`.deb` 可跑(D4.3)
-- [ ] 關卡 F:兩版之間自動更新成功 + 驗章拒絕不符(D4.4/D5)
+## One-time checklist (clears everything)
+- [ ] Gate A: `cargo tauri build` produces the app locally, all 7 lifecycle checks pass (D0/D1/D2.*/D5-1/P6.3)
+- [ ] Gate E: updater key generated, pubkey filled in, private key in secrets (half of D4.4)
+- [ ] Gate B: Apple certificate → signed and notarized, unblocked on a clean Mac (D3.1/D3.2/D4.1/D5)
+- [ ] Gate C: Windows certificate → signed, SmartScreen doesn't block it (D4.2)
+- [ ] Gate D: Linux `.AppImage`/`.deb` runs (D4.3)
+- [ ] Gate F: auto-update between two versions succeeds, and signature verification rejects a mismatch (D4.4/D5)
 
-> 全部完成後,把 TODO 對應項從 `[ ]`/`[~]` 改成 `[x]`。
+> Once everything is done, flip the matching TODO items from `[ ]`/`[~]` to `[x]`.

@@ -1,6 +1,6 @@
 # TODO: RFC-26 Live Run Forking — Fine-grained Work Items
 
-> Companion to [RFC-26](./RFC-26-deep-agents-alignment.md). Each item is sized to be a
+> Companion to [RFC-26](../rfc/RFC-26-deep-agents-alignment.md). Each item is sized to be a
 > single focused commit. Checkboxes track progress. `[x]` = done, `[ ]` = pending.
 > Convention: default-off, fail-closed, no silent caps, `truncate_bytes` / `with_file_lock`
 > on all snippets & appends.

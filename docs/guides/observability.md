@@ -1,4 +1,4 @@
-# Observability — OpenTelemetry GenAI Tracing
+# Observability — OpenTelemetry GenAI tracing
 
 DuDuClaw emits [OpenTelemetry GenAI semantic-convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/) spans for every agent turn, model call, and MCP tool dispatch, and can export them over OTLP to any compatible backend (Grafana Tempo, Jaeger, Langfuse, Honeycomb, Datadog, ...).
 

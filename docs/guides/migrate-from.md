@@ -1,84 +1,94 @@
-# 從 OpenClaw / Hermes / paperclip 無痛轉移
+# Painless migration from OpenClaw / Hermes / paperclip
 
-`duduclaw migrate-from` 讓你用一行指令，把既有的 OpenClaw、Hermes 或 paperclip
-設定搬進 DuDuClaw。它預設是**預覽模式**：只印出「會匯入什麼、跳過什麼、為什麼」，
-確認無誤後再加 `--apply` 實際寫入。
+`duduclaw migrate-from` moves an existing OpenClaw, Hermes, or paperclip setup into
+DuDuClaw with one command. It defaults to **preview mode**: it only prints what would
+be imported, what would be skipped, and why. Once the plan looks right, add `--apply`
+to actually write anything.
 
 ```bash
-# 預覽（不寫任何檔案）
+# Preview (writes nothing)
 duduclaw migrate-from openclaw
 
-# 確認計畫後實際套用
+# Apply after reviewing the plan
 duduclaw migrate-from openclaw --apply
 ```
 
-## 指令
+## Command
 
 ```
 duduclaw migrate-from <openclaw|hermes|paperclip> [--source <path>] [--apply] [--rename]
 ```
 
-| 旗標 | 作用 |
+| Flag | Effect |
 |---|---|
-| （無） | 預覽轉移計畫，不寫入任何檔案。 |
-| `--source <path>` | 指定來源目錄。openclaw/hermes 有預設值；**paperclip 必填**。 |
-| `--apply` | 實際執行寫入。 |
-| `--rename` | 遇到同名 agent 時，以 `-imported` 後綴匯入，而不是跳過。 |
+| (none) | Preview the migration plan; writes nothing. |
+| `--source <path>` | Source directory. openclaw/hermes have defaults; **paperclip requires it**. |
+| `--apply` | Actually perform the write. |
+| `--rename` | On an agent-id collision, import under an `-imported` suffix instead of skipping. |
 
-每一項都會標示狀態：
+Every item is tagged with a status:
 
-- `IMPORTED` — 已（或將）匯入。
-- `PARTIAL` — 部分匯入或需人工確認（例如非 Claude 模型）。
-- `SKIPPED(原因)` — 因故跳過，附原因（來源缺檔、解析失敗、安全阻擋等）。
-- `CONFLICT(原因)` — 目標已有值，為保護既有設定而不覆蓋。
+- `IMPORTED` — imported (or will be).
+- `PARTIAL` — partially imported, or needs manual confirmation (e.g. a non-Claude model).
+- `SKIPPED(reason)` — skipped, with a reason (source file missing, parse failure, security block, etc.).
+- `CONFLICT(reason)` — the target already has a value; the existing setting is left untouched.
 
-整體結果彙整為 `COMPLETE` / `DEGRADED` / `PARTIAL`。套用後，完整報告會寫到
-`~/.duduclaw/imported/<platform>/migration-report.md`。所有 token 值一律以
-「前 4 後 4」遮罩顯示，不會明文出現在畫面或報告裡。
+The overall result rolls up to `COMPLETE` / `DEGRADED` / `PARTIAL`. After an apply run,
+a full report is written to `~/.duduclaw/imported/<platform>/migration-report.md`. Every
+token value is shown masked as "first 4, last 4" — never in plaintext on screen or in
+the report.
 
-## 各平台
+## Per platform
 
-### OpenClaw（`~/.openclaw`）
+### OpenClaw (`~/.openclaw`)
 
 ```bash
-duduclaw migrate-from openclaw            # 預設來源 ~/.openclaw
+duduclaw migrate-from openclaw            # defaults to ~/.openclaw
 duduclaw migrate-from openclaw --source /path/to/.openclaw --apply
 ```
 
-會讀取 `openclaw.json`（JSON5），並匯入：
+Reads `openclaw.json` (JSON5) and imports:
 
-- **Agents**：`agents.list[]`（或預設單一 `main`），連同各自的 workspace persona
-  （`SOUL.md`）與記憶（`MEMORY.md` / `USER.md` / `memory/*.md` 的條列）。
-- **通道 token**：`channels.telegram.botToken`、`channels.discord.token`、
-  `channels.slack.botToken` + `appToken`（加密寫入 config.toml）。WhatsApp 為
-  linked-device，技術上不可轉移 → `SKIPPED`。
-- **模型**：`agents.defaults.model.primary`（剝除 `anthropic/` 前綴）。
-- **Anthropic API key**：來自 `env` 段與 `~/.openclaw/.env`。其他供應商金鑰 → `SKIPPED`。
-- **Cron**：舊版 `cron/jobs.json`（防禦性解析）。新版 SQLite cron schema 未驗證 → `SKIPPED`。
-- **Skills**：依 OpenClaw 優先序尋找 `SKILL.md` 資料夾（先掃描再安裝）。
+- **Agents**: `agents.list[]` (or a single default `main`), each with its workspace
+  persona (`SOUL.md`) and memory (`MEMORY.md` / `USER.md` / bullet entries from
+  `memory/*.md`).
+- **Channel tokens**: `channels.telegram.botToken`, `channels.discord.token`,
+  `channels.slack.botToken` + `appToken` (written encrypted into config.toml). WhatsApp
+  is a linked device and technically cannot be transferred, so it is `SKIPPED`.
+- **Model**: `agents.defaults.model.primary` (with the `anthropic/` prefix stripped).
+- **Anthropic API key**: read from the `env` section and `~/.openclaw/.env`. Keys for
+  other providers are `SKIPPED`.
+- **Cron**: the legacy `cron/jobs.json` (parsed defensively). The newer SQLite cron
+  schema is unvalidated and `SKIPPED`.
+- **Skills**: `SKILL.md` folders located by OpenClaw's own precedence order (scanned
+  before install).
 
-也支援舊名目錄 `~/.moltbot`、`~/.clawdbot`。
+The legacy directory names `~/.moltbot` and `~/.clawdbot` are also supported.
 
-### Hermes（`~/.hermes`）
+### Hermes (`~/.hermes`)
 
 ```bash
 duduclaw migrate-from hermes --apply
-# 轉移非 active 的 profile：
+# migrate a non-active profile:
 duduclaw migrate-from hermes --source ~/.hermes/profiles/<name> --apply
 ```
 
-Hermes 是單一 agent 平台，會產生一個 DuDuClaw agent（id `hermes`）。匯入：
+Hermes is a single-agent platform, so this produces one DuDuClaw agent (id `hermes`).
+Imports:
 
-- **模型**：`config.yaml` 的 `model.default`。
-- **通道 token**（來自 `.env`）：`TELEGRAM_BOT_TOKEN`、`DISCORD_BOT_TOKEN`、
-  `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`。`EMAIL_*` 通道 v1 尚未支援 → `SKIPPED`。
-- **Persona / 記憶**：`SOUL.md`、`memories/MEMORY.md`、`memories/USER.md`。
-- **Cron**：`cron/jobs.json`（防禦性解析）。
-- 只轉移 **active profile**；其餘 profile 會列為 `SKIPPED`，並提示用 `--source` 逐一轉。
+- **Model**: `model.default` from `config.yaml`.
+- **Channel tokens** (from `.env`): `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`,
+  `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`. `EMAIL_*` channels are not yet supported in v1
+  and are `SKIPPED`.
+- **Persona / memory**: `SOUL.md`, `memories/MEMORY.md`, `memories/USER.md`.
+- **Cron**: `cron/jobs.json` (parsed defensively).
+- Only the **active profile** is migrated; other profiles are listed as `SKIPPED`, with
+  a prompt to migrate each one individually via `--source`.
 
-### paperclip — 走官方匯出
+### paperclip: via the official export
 
-paperclip 的資料在內嵌 PostgreSQL，DuDuClaw 不直連資料庫。請先在 paperclip 端匯出：
+paperclip's data lives in an embedded PostgreSQL instance, and DuDuClaw does not connect
+to that database directly. Export from the paperclip side first:
 
 ```bash
 paperclipai company export <company-id> --out ./export \
@@ -87,47 +97,53 @@ paperclipai company export <company-id> --out ./export \
 duduclaw migrate-from paperclip --source ./export --apply
 ```
 
-`--source` 為**必填**（未給時會印出上面的教學）。匯入：
+`--source` is **required** (omitting it prints the instructions above). Imports:
 
-- **Agents**：`agents/<slug>/AGENTS.md` 的 frontmatter（`name/title/reportsTo/skills`）
-  → DuDuClaw agent，body → `SOUL.md`。`reportsTo` 直接映射為 `reports_to`（建立時
-  依上下級拓撲排序；偵測到環則全部改為無上級並標 `PARTIAL`）。
-- **Tasks**：`tasks/<slug>/TASK.md` → Task Board；`recurring` → cron。
-- **Skills**：`skills/<slug>/SKILL.md` → agent SKILLS/（先掃描）。
-- **COMPANY.md** → 共享 wiki 頁 `shared/wiki/imported/paperclip-company.md`。
-- paperclip 官方匯出格式**不含機密**（channel token / API key / DB id），故通道與
-  金鑰一律 `SKIPPED`。
+- **Agents**: frontmatter (`name/title/reportsTo/skills`) from `agents/<slug>/AGENTS.md`
+  becomes a DuDuClaw agent, and the body becomes `SOUL.md`. `reportsTo` maps directly to
+  `reports_to` (agents are created in topological order by hierarchy; a detected cycle
+  falls back to no superior for every agent involved and is marked `PARTIAL`).
+- **Tasks**: `tasks/<slug>/TASK.md` becomes a Task Board entry; `recurring` becomes cron.
+- **Skills**: `skills/<slug>/SKILL.md` goes into the agent's SKILLS/ (scanned first).
+- **COMPANY.md** becomes a shared wiki page at `shared/wiki/imported/paperclip-company.md`.
+- The official paperclip export format **contains no secrets** (channel tokens, API
+  keys, DB ids), so channels and keys are always `SKIPPED`.
 
-## 安全與資料保全
+## Security and data preservation
 
-- **Skills 先掃再裝**：每個 `SKILL.md` 都會先通過 duduclaw-security 的 prompt-injection
-  掃描器（6 條規則）。命中即 fail-closed：不安裝、標 `SKIPPED(security)`。匯入的 skill
-  `skill_auto_activate` 維持 `false`（安全預設）。
-- **絕不覆蓋**：既有同名 agent → `SKIPPED`（或加 `--rename`）；config.toml 已有的
-  channel token / API key → `CONFLICT`，原值不動。
-- **token 加密落地**：channel token 與 API key 以 AES-256-GCM 加密後才寫入 config.toml，
-  不會明文入檔。
-- **資料不遺失**：v1 不把對話歷史解析進 `sessions.db`，但 `--apply` 會把原始 session /
-  對話檔原樣歸檔到 `~/.duduclaw/imported/<platform>/raw/` 供日後查閱。
+- **Skills are scanned before install**: every `SKILL.md` first passes through
+  duduclaw-security's prompt-injection scanner (6 rule categories). A hit fails closed:
+  nothing is installed, and it is marked `SKIPPED(security)`. Imported skills keep
+  `skill_auto_activate` at `false` (the safe default).
+- **Never overwritten**: an existing agent with the same id is `SKIPPED` (or use
+  `--rename`); a channel token / API key already present in config.toml is a
+  `CONFLICT`, and the original value is left untouched.
+- **Tokens land encrypted**: channel tokens and API keys are encrypted with AES-256-GCM
+  before being written into config.toml — never in plaintext.
+- **No data loss**: v1 does not parse conversation history into `sessions.db`, but
+  `--apply` archives the original session / conversation files verbatim to
+  `~/.duduclaw/imported/<platform>/raw/` for later reference.
 
-## v1 非目標（誠實邊界）
+## v1 non-goals (honest boundaries)
 
-1. 對話歷史入庫（僅原樣歸檔）。
-2. OpenClaw 新版 SQLite cron / auth-profiles（schema 未驗證）。
-3. WhatsApp linked-device 憑證（綁裝置，不可轉移）。
-4. Hermes 非 active profile（可用 `--source` 逐一轉）。
-5. paperclip 直讀 Postgres（走官方 export）。
-6. 外掛記憶後端（Honcho / Mem0 / QMD / LanceDB）。
+1. Ingesting conversation history into the database (verbatim archiving only).
+2. OpenClaw's newer SQLite cron / auth-profiles (schema unvalidated).
+3. WhatsApp linked-device credentials (bound to the device, cannot be transferred).
+4. Hermes profiles other than the active one (migrate each individually via `--source`).
+5. Reading paperclip's Postgres directly (use the official export instead).
+6. External memory backends (Honcho / Mem0 / QMD / LanceDB).
 
-## 常見問題
+## FAQ
 
-**Q：預覽會不會改到東西？**
-不會。沒有 `--apply` 時完全不寫入任何檔案，也不會啟動任何通道。
+**Q: Does preview mode change anything?**
+No. Without `--apply` nothing is written and no channel is started.
 
-**Q：跑到一半發現有 CONFLICT 怎麼辦？**
-CONFLICT 代表目標已有值、為保護你既有的設定而略過。要換成匯入的值，請先手動移除
-config.toml 裡的舊值再重跑，或改用 `--rename` 匯入成獨立 agent。
+**Q: I hit a CONFLICT partway through — what do I do?**
+CONFLICT means the target already has a value, and it was left alone to protect your
+existing configuration. To replace it with the imported value, manually remove the old
+value from config.toml first and rerun, or import as a separate agent with `--rename`.
 
-**Q：非 Claude 模型會怎樣？**
-會原樣保留成 `[model] preferred` 並標 `PARTIAL`，提示你人工確認要對映到哪個 runtime
-（codex / gemini / openai_compat）。DuDuClaw 不會替你猜。
+**Q: What happens with a non-Claude model?**
+It is kept as-is in `[model] preferred` and marked `PARTIAL`, prompting you to manually
+confirm which runtime it maps to (codex / gemini / openai_compat). DuDuClaw will not
+guess on your behalf.

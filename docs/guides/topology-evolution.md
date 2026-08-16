@@ -1,86 +1,112 @@
-# 半自動拓撲演化（D5，human-gated）
+# Semi-automatic topology evolution (D5, human-gated)
 
-DuDuClaw 的自主進化（GVU / AEE，v3 起預設走 AEE playbook 條目，不再整份改寫
-SOUL.md——見 `docs/architecture/evolution-engine.md` 第十二章）只優化「節點」——
-每個 agent 的 prompt/行為規則。多 agent 之間的「邊」，也就是 `reports_to` 階層把
-某類任務路由給誰，一直是寫死的。D5 讓這條邊變成可演化的對象，但每一次改動都必須
-經過人工核准，機器只負責提案與證據收集。
+DuDuClaw's autonomous evolution (GVU / AEE, defaulting from v3 onward to AEE playbook
+entries rather than rewriting the whole SOUL.md; see chapter 12 of
+`docs/architecture/evolution-engine.md`) only optimizes "nodes": each agent's prompt and
+behavior rules. The "edges" between agents, the `reports_to` hierarchy that decides who
+a given class of task routes to, have always been hardcoded. D5 turns that edge into
+something evolvable, but every change still has to pass human approval; the machine
+only handles proposing and gathering evidence.
 
-設計出處：GPTSwarm（arXiv:2402.16823，拓撲是可學習物件）、AFlow（2410.10762）、
-ADAS（2408.08435，全自動改寫控制流是 runaway 風險最高的能力，因此 D5 刻意不做全自動）。
+Design lineage: GPTSwarm (arXiv:2402.16823, topology as a learnable object), AFlow
+(2410.10762), and ADAS (2408.08435: fully automatic control-flow rewriting is the
+highest-runaway-risk capability, which is exactly why D5 deliberately stops short of
+full automation).
 
-> 預設關閉。整套機制只有在 `config.toml` 設定 `[topology_evolution] enabled = true`
-> 時才會啟動；關閉時派工路徑與純 `FixedHierarchy` byte-identical。
+> Off by default. The whole mechanism only activates when `config.toml` sets
+> `[topology_evolution] enabled = true`; with it off, the dispatch path is
+> byte-identical to plain `FixedHierarchy`.
 
-## 運作流程
+## How it works
 
-1. **證據分析**（純函式，可單測）
-   背景驅動器每 `tick_secs` 掃描 task store，聚合每個 `(agent, task_class)` 在近
-   `lookback_days` 天內的品質訊號：MAV/review 拒絕率、needs_human 升級率、goal-loop
-   無進展 oscillation 次數。`task_class` 取任務的第一個 tag（與 D4 RoundRobin 同口徑），
-   無 tag 時退回 priority。樣本基底是「已定案的 goal-mode 任務」（狀態 done / needs_human
-   / failed），其中 needs_human / failed 或 `retry_count > 0` 記為一次拒絕。
+1. **Evidence analysis** (a pure function, unit-testable)
+   A background driver scans the task store every `tick_secs`, aggregating quality
+   signals for each `(agent, task_class)` over the last `lookback_days` days: the
+   MAV/review rejection rate, the needs_human escalation rate, and the count of
+   goal-loop no-progress oscillations. `task_class` is taken from a task's first tag
+   (the same convention as D4's RoundRobin), falling back to priority when there is no
+   tag. The sample base is "settled goal-mode tasks" (status done / needs_human /
+   failed), where needs_human, failed, or `retry_count > 0` each count as one
+   rejection.
 
-2. **提案**（不是直接改動）
-   當某 agent 對某類任務的樣本數 ≥ `min_samples` 且拒絕率 ≥ `reject_rate_threshold`，
-   而同一 `reports_to` 父層的 sibling 中有人把同類任務做得更好（拒絕率更低、樣本也
-   足夠），驅動器產生一筆 `reroute` 提案，附上證據（樣本數、拒絕率、最多 10 筆 sample
-   task id）。沒有合格 sibling 就不提案——空結果優於假結果。每個 tick 最多提一筆。
+2. **Proposal** (not a direct change)
+   When an agent's sample count for a given task class is ≥ `min_samples` and its
+   rejection rate is ≥ `reject_rate_threshold`, and a sibling under the same
+   `reports_to` parent handles the same task class better (lower rejection rate, also
+   with enough samples), the driver produces one `reroute` proposal with evidence
+   attached (sample count, rejection rate, up to 10 sample task ids). With no qualifying
+   sibling, no proposal is made: an empty result beats a fabricated one. At most one
+   proposal per tick.
 
-3. **人工閘門（不可繞過）**
-   每筆提案都走 `ApprovalBroker`（`action_kind = "topology_reroute"`）。這是 ActionGuard
-   語意上的 **always-human**：不經 LLM judge、不受 `autonomy_level` 放寬，程式上只呼叫
-   `request` + `poll`，沒有任何自動核准路徑。TTL 過期 = 拒絕（broker fail-closed）。
-   人工可透過 dashboard 的 `approvals.decide` 或通道按鈕核准/退回。
+3. **The human gate (cannot be bypassed)**
+   Every proposal goes through `ApprovalBroker` (`action_kind = "topology_reroute"`).
+   In ActionGuard terms this is **always-human**: no LLM judge is involved, it is not
+   relaxed by `autonomy_level`, and the code only ever calls `request` + `poll`, with no
+   automatic approval path. TTL expiry means DENY (the broker fails closed). A
+   human approves or rejects it via the dashboard's `approvals.decide` or a channel
+   button.
 
-4. **生效與觀察期**
-   核准後寫入 `~/.duduclaw/routing_overrides.json`（advisory lock + 原子 temp/rename）。
-   `FixedHierarchy` 派工時先查 active override：命中 `(task_class, from_agent)` 就改派給
-   `to_agent`。override 檔缺失或損毀一律視為無 override，路由回到現狀（fail-safe）。
-   生效後進入 `observe_hours`（預設 24h）觀察期。
+4. **Taking effect and the observation window**
+   Once approved, it is written to `~/.duduclaw/routing_overrides.json` (advisory lock
+   + atomic temp-file rename). `FixedHierarchy` checks for an active override before
+   dispatching: a match on `(task_class, from_agent)` reroutes to `to_agent`. A missing
+   or corrupted override file is always treated as no override, and routing falls back
+   to the status quo (fail-safe). Once active, it enters an `observe_hours` (default
+   24h) observation window.
 
-5. **自動回滾**
-   觀察期內若 `to_agent` 對該類任務的拒絕率 ≥ `from_agent` 的歷史基準值，override 立即
-   `rolled_back`，路由自動還原。觀察期過且確實優於基準 → `confirmed`。樣本不足 → 延長
-   一次觀察期，再不足即 `rolled_back`（保守收斂）。
+5. **Automatic rollback**
+   If, during the observation window, `to_agent`'s rejection rate for that task class
+   reaches or exceeds `from_agent`'s historical baseline, the override is immediately
+   `rolled_back` and routing reverts automatically. If the window passes and the new
+   route genuinely beats the baseline, it becomes `confirmed`. Insufficient samples
+   extend the observation window once; still insufficient after that and it is
+   `rolled_back` (a conservative default).
 
-6. **防提案風暴**
-   同一 `(task_class, from_agent)` 在 `proposal_cooldown_days`（預設 7 天）內最多一筆提案
-   （含被拒者），記錄在 override 檔的 proposal log；已有 active override 或 pending 提案時
-   也不重複提。`dispatch_guard` 滑窗照常適用，不因 D5 繞過。
+6. **Guarding against a proposal storm**
+   The same `(task_class, from_agent)` pair gets at most one proposal within
+   `proposal_cooldown_days` (default 7 days, including rejected ones), recorded in the
+   override file's proposal log; an active override or a pending proposal also
+   suppresses a repeat. `dispatch_guard`'s sliding window still applies as usual; D5
+   does not bypass it.
 
-所有提案／核准／回滾／確認都寫入 `events.db` 事件與 dashboard Activity Feed
-（`topology.proposed` / `topology.approved` / `topology.rejected` / `topology.rolled_back`
-/ `topology.confirmed` / `topology.extended`）。
+Every proposal, approval, rollback, and confirmation is written to `events.db` and the
+dashboard Activity Feed (`topology.proposed` / `topology.approved` /
+`topology.rejected` / `topology.rolled_back` / `topology.confirmed` /
+`topology.extended`).
 
-## 設定
+## Configuration
 
 ```toml
 [topology_evolution]
-enabled = false            # 主開關，預設關閉
-lookback_days = 14         # 證據回看窗口（天）
-min_samples = 5            # 一個 (agent, task_class) 格子的最少已定案樣本數
-reject_rate_threshold = 0.6  # 觸發提案的拒絕率門檻
-observe_hours = 24         # 核准後的觀察期（小時）
-proposal_cooldown_days = 7 # 同一條邊的提案冷卻天數
-tick_secs = 3600           # 驅動器 tick 週期（秒）
-approval_ttl_secs = 86400  # reroute 核准的 TTL（秒），過期 = 拒絕
+enabled = false            # master switch, off by default
+lookback_days = 14         # evidence lookback window (days)
+min_samples = 5            # minimum settled sample count for an (agent, task_class) cell
+reject_rate_threshold = 0.6  # rejection-rate threshold that triggers a proposal
+observe_hours = 24         # observation window after approval (hours)
+proposal_cooldown_days = 7 # proposal cooldown for the same edge (days)
+tick_secs = 3600           # driver tick period (seconds)
+approval_ttl_secs = 86400  # TTL for a reroute approval (seconds); expiry = reject
 ```
 
 ## Dashboard RPC
 
-`topology.list`（require_manager）回傳目前的 routing overrides 與 pending reroute 提案，
-供 dashboard 呈現 D5 狀態。核准/退回沿用既有的 `approvals.list` / `approvals.decide`。
+`topology.list` (require_manager) returns the current routing overrides and pending
+reroute proposals for the dashboard to render D5 state. Approve/reject reuses the
+existing `approvals.list` / `approvals.decide`.
 
-## 風險與邊界
+## Risks and boundaries
 
-- **預設關閉**，且啟動需要 `ApprovalBroker` 可用，否則 D5 不啟動（提案沒有人工閘門就
-  不允許存在）。
-- 機器只做可逆的事（提案、觀察、回滾），不可逆的事（真正改路由）永遠留給人拍板。
-- D5 只在預設的 `FixedHierarchy` 階層路由上疊加。當操作者已明確選用 `RoundRobin` /
-  `LlmSelect`（`[dispatch] policy`），那是刻意的路由選擇，D5 override 只在其空 roster
-  fallback 到 hierarchy 時才生效。
-- override 是路由層的改動，不會回填已在執行中的任務；已改派的 in-flight 任務維持原樣，
-  未來派工才套用新路由或回滾。
+- **Off by default**, and it also needs `ApprovalBroker` to be available or D5 does not
+  start at all: a proposal mechanism without a human gate is not allowed to exist.
+- The machine only ever does reversible things (propose, observe, roll back); the
+  irreversible act (actually changing the route) is always left for a human to decide.
+- D5 only layers on top of the default `FixedHierarchy` hierarchical routing. When an
+  operator has explicitly chosen `RoundRobin` / `LlmSelect` (`[dispatch] policy`), that
+  is a deliberate routing choice, and a D5 override only takes effect when that policy's
+  empty roster falls back to the hierarchy.
+- An override is a routing-layer change; it does not retroactively touch tasks already
+  in flight. Already-dispatched in-flight tasks keep their original route; the new
+  route (or a rollback) only applies to future dispatches.
 
-依 opus-playbook 的觀察期紀律，D5 應在 D1–D4 穩定、eval 樣本量足夠後再啟用。
+Per the opus-playbook observation-window discipline, D5 should only be enabled once
+D1–D4 are stable and the eval sample size is sufficient.
