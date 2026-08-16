@@ -309,6 +309,40 @@ pub fn load(agent_dir: &Path) -> AgentTomlSections {
     }
 }
 
+/// Env kill-switch for the minimal-context spawn optimization (WP-7A). Set to
+/// `0`/`false`/`no`/`off` to disable globally, `1`/`true`/`yes`/`on` to
+/// force-enable; unset defers to per-agent `[runtime] minimal_context`, then the
+/// default (ON). An unrecognized value is ignored (falls through to the
+/// per-agent / default resolution).
+pub const ENV_MINIMAL_CONTEXT: &str = "DUDUCLAW_MINIMAL_CONTEXT";
+
+/// Resolve whether minimal-context spawn flags (`--setting-sources
+/// project,local` + a curated `--tools`) apply for the agent at `agent_dir`.
+///
+/// Precedence: env kill-switch ([`ENV_MINIMAL_CONTEXT`]) > `agent.toml
+/// [runtime] minimal_context` > default (`true`). A `None` `agent_dir`
+/// (agent-less system callers — GVU/utility, dashboard widgets) skips the
+/// per-agent read and uses the env/default only.
+///
+/// Reads `agent.toml` on every call by design (immediate hot-reload; matches
+/// [`load`]'s no-cache contract). The read is fail-safe: an absent/malformed
+/// file yields `None` for the field → the default (ON).
+pub fn resolve_minimal_context(agent_dir: Option<&Path>) -> bool {
+    if let Ok(v) = std::env::var(ENV_MINIMAL_CONTEXT) {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => return false,
+            "1" | "true" | "yes" | "on" => return true,
+            _ => {}
+        }
+    }
+    if let Some(dir) = agent_dir {
+        if let Some(v) = load(dir).runtime.minimal_context {
+            return v;
+        }
+    }
+    true
+}
+
 /// `<home>/agent_resolved/<agent_id>.toml` for the agent at `agent_dir`, or
 /// `None` when `agent_dir` is not the standard `<home>/agents/<id>` layout
 /// (ephemeral scaffolds, test fixtures) — see
@@ -520,6 +554,40 @@ decision_ttl_days = 3
         let s = load(&dir);
         assert_eq!(s.runtime, RuntimeSection::default());
         assert_eq!(s.guardrails, GuardrailsSection::default());
+    }
+
+    /// WP-7A: minimal-context resolution. Default ON; a per-agent explicit
+    /// `false` opts out; `None` agent_dir uses the default. The env kill-switch
+    /// is process-global, so this test only exercises the agent.toml/default
+    /// paths and skips them when the env var happens to be set in the runner.
+    #[test]
+    fn resolve_minimal_context_agent_toml_and_default() {
+        if std::env::var(ENV_MINIMAL_CONTEXT).is_ok() {
+            return; // env override is authoritative; skip the toml-path asserts
+        }
+        // No agent_dir → default ON.
+        assert!(resolve_minimal_context(None));
+
+        let dir = tempfile::tempdir().unwrap();
+        // Empty agent.toml → field absent → default ON.
+        std::fs::write(dir.path().join("agent.toml"), "[runtime]\nprovider = \"claude\"\n").unwrap();
+        assert!(resolve_minimal_context(Some(dir.path())));
+
+        // Explicit opt-out.
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[runtime]\nminimal_context = false\n",
+        )
+        .unwrap();
+        assert!(!resolve_minimal_context(Some(dir.path())));
+
+        // Explicit opt-in.
+        std::fs::write(
+            dir.path().join("agent.toml"),
+            "[runtime]\nminimal_context = true\n",
+        )
+        .unwrap();
+        assert!(resolve_minimal_context(Some(dir.path())));
     }
 
     /// WP-6F (agent presets P1): when `agent.resolved.toml` exists next to a

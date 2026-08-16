@@ -962,7 +962,95 @@ impl Default for PtcConfig {
     }
 }
 
+/// Built-in Claude Code tools DuDuClaw agents may use on a **skip-permissions**
+/// spawn path (channel reply / eval). This is the curated `--tools` set applied
+/// under minimal-context mode when the agent has no explicit `allowed_tools`
+/// allowlist: it drops the built-in tools DuDuClaw never uses in headless mode
+/// (`Task` — DuDuClaw delegates via the `spawn_agent` MCP tool, not Claude's
+/// native sub-agent tool; `ExitPlanMode` / `SlashCommand` — irrelevant under
+/// `-p`) while preserving every file / shell / web / todo / notebook tool.
+/// Sorted for deterministic CLI args.
+pub const CURATED_BUILTIN_TOOLS: [&str; 13] = [
+    "Bash",
+    "BashOutput",
+    "Edit",
+    "Glob",
+    "Grep",
+    "KillShell",
+    "MultiEdit",
+    "NotebookEdit",
+    "Read",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+];
+
+/// Built-in tool subset auto-approved on the dispatcher path
+/// (`claude_runner::prepare_claude_cmd`, `--permission-mode auto`). Mirrors the
+/// built-in half of that path's `DEFAULT_ALLOWED_TOOLS` allowlist so `--tools`
+/// never advertises a schema the allowlist would refuse to auto-approve (an
+/// unusable schema is pure token waste there). Sorted.
+pub const DISPATCH_DEFAULT_BUILTIN_TOOLS: [&str; 9] = [
+    "Bash",
+    "Edit",
+    "Glob",
+    "Grep",
+    "Read",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+];
+
 impl CapabilitiesConfig {
+    /// Curated `--tools` value for a minimal-context spawn.
+    ///
+    /// `--tools` controls which *built-in* Claude Code tool schemas are sent to
+    /// the model — distinct from `--allowedTools`, which controls permission.
+    /// Under minimal-context mode we send only the built-in tools the agent can
+    /// actually use, dropping the rest of the ~21k-token built-in schema.
+    ///
+    /// - `allowed_tools` empty → `default_builtins` (the caller path's curated
+    ///   set: [`CURATED_BUILTIN_TOOLS`] on skip-permissions paths,
+    ///   [`DISPATCH_DEFAULT_BUILTIN_TOOLS`] on the allowlisted dispatcher path).
+    /// - `allowed_tools` non-empty (allowlist mode) → the built-in entries of
+    ///   the allowlist (`mcp__…` MCP patterns and a bare `*` are not built-in
+    ///   tools), so `--tools` matches exactly what the allowlist permits.
+    /// - Either way, `denied_tools` base-name matches are removed.
+    ///
+    /// This can only ever *narrow* the built-in surface, never widen it — an
+    /// empty result means "no built-in tools" (`--tools ""`), correct for an
+    /// MCP-only agent. Never-widening is the fail-safe direction for a tool
+    /// gate: a misconfigured capability set drops tools, never grants extras.
+    /// Base-name matching only (never substring, per coding convention 2): the
+    /// part before an optional `(` qualifier, ASCII-case-insensitively.
+    pub fn minimal_builtin_tools(&self, default_builtins: &[&str]) -> Vec<String> {
+        fn base(entry: &str) -> &str {
+            entry.split('(').next().unwrap_or(entry).trim()
+        }
+        let allowed = self.allowed_tools();
+        let mut result: Vec<String> = if allowed.is_empty() {
+            default_builtins.iter().map(|s| (*s).to_string()).collect()
+        } else {
+            allowed
+                .iter()
+                .filter(|t| !t.starts_with("mcp__"))
+                .map(|t| base(t).to_string())
+                .filter(|t| !t.is_empty() && t.as_str() != "*")
+                .collect()
+        };
+        let denied: Vec<String> = self
+            .disallowed_tools()
+            .iter()
+            .map(|t| base(t).to_ascii_lowercase())
+            .collect();
+        result.retain(|t| !denied.contains(&t.to_ascii_lowercase()));
+        result.sort();
+        result.dedup();
+        result
+    }
+
     /// Compute the list of tools that should be disallowed for Claude CLI.
     ///
     /// Logic:
@@ -2154,6 +2242,19 @@ pub struct RuntimeSection {
     #[serde(deserialize_with = "crate::lenient::opt")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pty_idle_timeout_secs: Option<i64>,
+    /// Minimal-context spawn optimization (WP-7A). When applied, the spawned
+    /// official CLI drops the operator's *user*-global settings and memory
+    /// (`--setting-sources project,local` — keeps the agent's own
+    /// `.claude/settings.json`, so the agent-file-guard hook still loads) and
+    /// exposes only a curated built-in tool subset (`--tools`) instead of the
+    /// full ~21k-token built-in schema. Measured fixed-overhead reduction:
+    /// ~35.9k → ~11k tokens per spawn (local `claude -p` probe, 2026-08-16).
+    /// `None` ⇒ the runtime default (ON); an explicit `false` opts a single
+    /// agent out. Resolved via [`crate::agent_toml::resolve_minimal_context`],
+    /// which also honors the `DUDUCLAW_MINIMAL_CONTEXT` env kill-switch.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimal_context: Option<bool>,
 }
 
 impl RuntimeSection {
@@ -2966,6 +3067,70 @@ pub struct DoctorCheck {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    // ── WP-7A: minimal-context `--tools` curation ──────────────────────────
+
+    /// Empty `allowed_tools` → the caller path's curated default set, verbatim.
+    #[test]
+    fn minimal_builtin_tools_empty_allowlist_uses_default() {
+        let caps = CapabilitiesConfig::default();
+        let got = caps.minimal_builtin_tools(&CURATED_BUILTIN_TOOLS);
+        let mut want: Vec<String> = CURATED_BUILTIN_TOOLS.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(got, want);
+        // Never advertises Task / ExitPlanMode / SlashCommand.
+        assert!(!got.iter().any(|t| t == "Task"));
+    }
+
+    /// Non-empty `allowed_tools` → only its built-in entries; MCP `mcp__…`
+    /// patterns are dropped (they are not built-in tools), qualifiers stripped.
+    #[test]
+    fn minimal_builtin_tools_allowlist_keeps_only_builtins() {
+        let caps = CapabilitiesConfig {
+            allowed_tools: vec![
+                "Read".into(),
+                "Bash(git:*)".into(),
+                "mcp__duduclaw__memory_search".into(),
+                "*".into(),
+            ],
+            ..Default::default()
+        };
+        let got = caps.minimal_builtin_tools(&CURATED_BUILTIN_TOOLS);
+        assert_eq!(got, vec!["Bash".to_string(), "Read".to_string()]);
+    }
+
+    /// `denied_tools` base-name matches are removed even from the default set.
+    #[test]
+    fn minimal_builtin_tools_denied_removed() {
+        let caps = CapabilitiesConfig {
+            denied_tools: vec!["Bash".into()],
+            ..Default::default()
+        };
+        let got = caps.minimal_builtin_tools(&CURATED_BUILTIN_TOOLS);
+        assert!(!got.iter().any(|t| t == "Bash"));
+        assert!(got.iter().any(|t| t == "Read"));
+    }
+
+    /// An MCP-only allowlist yields an empty built-in set (`--tools ""`),
+    /// never a fallback to the full default — narrowing only, never widening.
+    #[test]
+    fn minimal_builtin_tools_mcp_only_allowlist_is_empty() {
+        let caps = CapabilitiesConfig {
+            allowed_tools: vec!["mcp__duduclaw__tasks_list".into()],
+            ..Default::default()
+        };
+        let got = caps.minimal_builtin_tools(&CURATED_BUILTIN_TOOLS);
+        assert!(got.is_empty(), "MCP-only allowlist → no built-in tools, got {got:?}");
+    }
+
+    /// `[runtime] minimal_context` round-trips through the typed section.
+    #[test]
+    fn runtime_section_minimal_context_roundtrips() {
+        let s: RuntimeSection = toml::from_str("minimal_context = false\n").unwrap();
+        assert_eq!(s.minimal_context, Some(false));
+        let absent: RuntimeSection = toml::from_str("provider = \"claude\"\n").unwrap();
+        assert_eq!(absent.minimal_context, None);
+    }
 
     /// `front_desk` (the expert-pack roster name) must load as TeamLeader —
     /// both via serde (existing agent.toml on disk) and FromStr (CLI/MCP

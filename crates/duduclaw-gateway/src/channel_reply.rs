@@ -7714,13 +7714,16 @@ async fn spawn_claude_cli_with_env(
         // regresses OAuth authentication when `--bare` is active — the flag
         // cuts the OS-keychain credential lookup alongside the optimizations,
         // causing every subprocess call to fail with "Not logged in".
-        // We still rely on --system-prompt-file + --exclude-dynamic-system-prompt-sections
-        // to keep the system prompt stable, which preserves most of the cache
-        // benefit that --bare was chasing.
-        // Move per-machine sections (cwd, env, git status) from system prompt to
-        // first user message. Keeps system prompt stable across turns → better
-        // prompt cache hit rate (~10-15% token reduction on turn 2+).
-        "--exclude-dynamic-system-prompt-sections",
+        // The system prompt goes via `--system-prompt-file` (below), which
+        // *replaces* the default system prompt and keeps it stable across turns
+        // for prompt-cache reuse.
+        //
+        // WP-7A (bug1): `--exclude-dynamic-system-prompt-sections` was here but
+        // is a documented no-op when combined with `--system-prompt[-file]`
+        // ("Only applies with the default system prompt (ignored with
+        // --system-prompt)" — CLI help). Local `claude -p` measurement
+        // confirmed byte-identical token counts with and without it while
+        // `--system-prompt-file` is set (2026-08-16). Removed.
         "-p",
         user_message,
         "--model",
@@ -7751,6 +7754,23 @@ async fn spawn_claude_cli_with_env(
         // Signal bash-gate.sh to allow browser automation commands
         if caps.browser_via_bash {
             cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");
+        }
+
+        // WP-7A minimal-context: drop the operator's *user*-global settings and
+        // memory (~14.8k tokens) and expose only a curated built-in tool subset
+        // (~10k tokens) instead of the full ~21k built-in schema. `project,local`
+        // is deliberate — dropping `user` alone removes the operator's personal
+        // ~/.claude/CLAUDE.md/rules while KEEPING the agent's own
+        // `.claude/settings.json` (the agent-file-guard PreToolUse hook still
+        // loads; `--setting-sources ""` would silently disable it — verified by
+        // a deny-hook probe, 2026-08-16). MCP tools are unaffected (they come
+        // from --mcp-config, orthogonal to setting sources). Default ON; env
+        // kill-switch DUDUCLAW_MINIMAL_CONTEXT / per-agent [runtime]
+        // minimal_context = false opts out.
+        if duduclaw_core::agent_toml::resolve_minimal_context(work_dir) {
+            cmd.args(["--setting-sources", "project,local"]);
+            let tools = caps.minimal_builtin_tools(&duduclaw_core::types::CURATED_BUILTIN_TOOLS);
+            cmd.args(["--tools", &tools.join(",")]);
         }
     }
     // Set working directory to agent dir so Claude can access agent config
@@ -8726,6 +8746,10 @@ fn build_claude_cli_args(
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     work_dir: Option<&Path>,
     system_prompt_file: Option<&Path>,
+    // WP-7A: apply minimal-context flags (`--setting-sources project,local` +
+    // curated `--tools`). Resolved by the caller from
+    // `agent_toml::resolve_minimal_context`.
+    minimal_context: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
@@ -8734,8 +8758,10 @@ fn build_claude_cli_args(
         args.push(sid.to_string());
     }
 
+    // WP-7A (bug1): `--exclude-dynamic-system-prompt-sections` removed — it is a
+    // documented no-op when combined with `--system-prompt-file` (see the
+    // streaming variant `spawn_claude_cli_with_env`).
     args.extend([
-        "--exclude-dynamic-system-prompt-sections".to_string(),
         "-p".to_string(),
         user_message.to_string(),
         "--model".to_string(),
@@ -8759,6 +8785,18 @@ fn build_claude_cli_args(
     if !denied.is_empty() {
         args.push("--disallowedTools".to_string());
         args.push(denied.join(","));
+    }
+
+    // WP-7A minimal-context (parity with `spawn_claude_cli_with_env`): keep
+    // `project,local` so the agent's own `.claude/settings.json` hook survives.
+    if minimal_context {
+        args.push("--setting-sources".to_string());
+        args.push("project,local".to_string());
+        args.push("--tools".to_string());
+        args.push(
+            caps.minimal_builtin_tools(&duduclaw_core::types::CURATED_BUILTIN_TOOLS)
+                .join(","),
+        );
     }
 
     if let Some(dir) = work_dir {
@@ -8844,6 +8882,7 @@ async fn spawn_claude_cli_pty_with_env(
         capabilities,
         work_dir,
         system_prompt_path,
+        duduclaw_core::agent_toml::resolve_minimal_context(work_dir),
     );
 
     // Assemble env: API key fallback → caps env vars → caller-provided
