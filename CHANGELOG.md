@@ -17,11 +17,15 @@
 - **`task_row_to_json` 輸出 `archived`/`pinned`**：`tasks.list`／`task.updated` 廣播現在帶這兩個狀態欄位。
 
 ### Security
+- **per-agent git 憑證授權（合規恢復 git push／簽章）**：第八波 env 擦洗刻意排除 `SSH_AUTH_SOCK`/`GNUPGHOME` 後，靠 SSH/GPG 從 spawn CLI 做 git push／commit 簽章的 agent 會失效。新增 `agent.toml [capabilities] git_credentials`（預設 `false`）——明確開啟才讓該 agent 的 spawn 子行程額外拿到 `SSH_AUTH_SOCK`/`SSH_AGENT_PID`/`GPG_TTY`/`GNUPGHOME`，git push over SSH 與 GPG 簽章即恢復；預設關的 agent 與第八波逐位相同（拿不到操作者 SSH/GPG 身分＝合規不變）。每次實際追加 git 憑證 env 時寫審計（`git_credentials_env_granted`，只記變數名不記值）。誠實揭露：開啟即把操作者完整 ssh-agent/gpg 身分交給該 agent（ssh-agent/gpg 協定無更細粒度的「只給 git 用」介面），故預設關、逐 agent 明確授權。
 - **credentials P2 零重啟輪換**：改過憑證不再需要重啟 gateway。帳號池（Claude/OAuth/API key）寫入（`accounts.add`/`update`/`update_budget`）觸發 rotator 快取失效，同進程即時生效（取代原本 5 分鐘 TTL；跨行程 CLI 直寫 `config.toml` 因打不到行程內失效仍留 30 分鐘 backstop）；Telegram 每輪 `getUpdates` 重解析 token（不再烤進 api_base）；Feishu／WhatsApp／WeCom／DingTalk／Google Chat／Teams 六個 webhook 通道 inbound 驗簽改 per-request resolve（比照 LINE），outbound 衍生 session token 保留有界 TTL；Odoo 全域／per-agent 憑證更新後下次呼叫即重連（`set_global` 改 `disconnect_all`，並修掉 profile 變更導致孤兒連線永不釋放的 bug）。仍需重啟：Discord／Slack（WebSocket 長駐連線持有 token）。
 - **credentials P3 env 擦洗**：spawn 官方 CLI 子行程改用白名單 env（`duduclaw-core/spawn_env.rs`）——只傳 PATH/HOME 等非敏感必需項，濾除所有 `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`；vendor 金鑰改由呼叫端顯式注入（rotator 解析的帳號 env），子行程不再繼承 gateway 的 `ANTHROPIC_API_KEY` 等。型別層測試焊死白名單不得含密鑰形狀名字。**行為變更**：白名單刻意排除 `SSH_AUTH_SOCK`/`GNUPGHOME`——靠 SSH/GPG 從 spawn 出的 CLI 做 git push／簽章的 agent 會受影響（範圍窄，屬應經 per-agent 明確授權而非全域白名單放行的能力）。
 - **secret:// resolver 收斂第二輪**：`account_rotator`（2 處）與 `duduclaw-cli/mcp.rs`（2 處）各自手刻的「`_enc` 解密→明文 fallback→`secret://` 參照」實作收斂到 `duduclaw-security::secret_ref` 單一 resolver；順帶修掉 Odoo 一處加密指標字面值外送洩漏（變嚴）。provider→env 名稱表三份收斂成一份權威（`duduclaw-core/provider_env.rs`）＋一致性測試，並修掉 `is_available` 誤報 TOGETHER/MISTRAL 可用的假陽性。
 
 ### Fixed
+- **歸檔任務仍可被派工引擎認領**：`claimable_tasks` 未排除 `archived`，歸檔中的 pending／未認領任務理論上仍可能被 dispatch engine 撈走；已加 `AND archived = 0`，與 `list_tasks_filtered` 慣例一致。
+- **needs_human 共用重試補備註欄（I-3c）**：`/goals` 卡片的重試早能帶備註，但收件匣／詳情頁共用的 `NeedsHumanActions` 三按鈕版本未暴露——現補上（重試改「展開備註→送出」兩段式，比照 /goals 卡片；後端本就支援 note，僅前端缺欄位）。
+- **LINE 進度事件過濾缺口**：LINE 的進度轉發先前未過濾 `Step`／`ModelInfo`（`to_display()` 為空）事件，可能對 LINE push API 送空訊息；現比照其他通道過濾（順帶記錄 Discord 同缺此過濾，列後續）。
 - **`estimate_tokens` CJK 校準**：從對所有字元一律 `chars/1.5` 改成依 codepoint 分類（CJK 1.306 tok/char、非 CJK 1/3.6，沿用 `duduclaw-llm` 既有 Unicode range），修正約 22% 低估——先前低估會讓 `[budget] max_input_tokens` 壓縮閘觸發過晚。
 - **`--exclude-dynamic-system-prompt-sections` 空操作移除**：該旗標與 `--system-prompt-file` 併用時被 CLI 忽略（活測 total_ctx 帶不帶逐位相同），三處無效使用移除、修正基於錯誤前提的註解。
 - **`handle_tools_list` 依 capability 過濾**：MCP `tools/list` 先前不論呼叫者 capability 一律送全部工具 schema；現在依呼叫者 `allowed_tools`/`denied_tools` 過濾（鏡像 dispatch gate，discoverable ⊆ callable），受限 agent 不再收到無法呼叫的工具宣告。（對 scaffold agent 的激進策展需 MCP 動態擴充/meta-invoke 新功能，DEFER 待拍板。）
