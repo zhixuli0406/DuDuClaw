@@ -126,7 +126,12 @@ describe('TaskDetailPage — 等你決定 (WP-A §2-6)', () => {
   it('routes 重試 through tasks.goal_decide — the same fail-closed path as the channel buttons', async () => {
     const user = userEvent.setup();
     renderAt('task-aaaa1111');
+    // WP-10B: 重試 now toggles an optional note field (mirrors the /goals
+    // card's InterventionButtons) instead of firing immediately — the first
+    // click must NOT call the RPC on its own.
     await user.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(mockWsClient.call.mock.calls.filter((c) => c[0] === 'tasks.goal_decide')).toHaveLength(0);
+    await user.click(screen.getByRole('button', { name: 'Retry now' }));
     await waitFor(() =>
       expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_decide', {
         task_id: 'task-aaaa1111',
@@ -193,7 +198,9 @@ describe('TaskDetailPage — 想一想 plan-first (I-1c)', () => {
   it('approving (重試) routes through the SAME tasks.goal_decide retry path', async () => {
     const user = userEvent.setup();
     renderAt('task-aaaa1111');
+    // WP-10B: 重試 opens the optional note field first; submit via "Retry now".
     await user.click(screen.getByRole('button', { name: 'Retry' }));
+    await user.click(screen.getByRole('button', { name: 'Retry now' }));
     await waitFor(() =>
       expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_decide', {
         task_id: 'task-aaaa1111',
