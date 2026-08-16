@@ -3227,6 +3227,20 @@ fn prepare_claude_cmd(
         cmd.args(["--disallowedTools", &denied_csv]);
     }
 
+    // WP-7A minimal-context: drop the operator's *user*-global settings/memory
+    // and expose only the built-in tools this allowlisted path can actually
+    // auto-approve. This path uses `--permission-mode auto` + an allowlist
+    // (DEFAULT_ALLOWED_TOOLS when unset), so `--tools` defaults to the built-in
+    // half of that allowlist (DISPATCH_DEFAULT_BUILTIN_TOOLS) — advertising a
+    // schema the allowlist would not auto-approve is pure token waste here.
+    // `project,local` keeps the agent's own `.claude/settings.json`. Default ON;
+    // env kill-switch / per-agent [runtime] minimal_context = false opts out.
+    if duduclaw_core::agent_toml::resolve_minimal_context(work_dir) {
+        cmd.args(["--setting-sources", "project,local"]);
+        let tools = caps.minimal_builtin_tools(&duduclaw_core::types::DISPATCH_DEFAULT_BUILTIN_TOOLS);
+        cmd.args(["--tools", &tools.join(",")]);
+    }
+
     // Signal bash-gate.sh to allow browser automation commands
     if caps.browser_via_bash {
         cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");

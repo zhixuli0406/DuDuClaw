@@ -9866,6 +9866,50 @@ pub(crate) fn handle_tools_list(
     home_dir: &Path,
 ) -> Value {
     let google_enabled = duduclaw_gateway::google_workspace::integration_enabled(home_dir);
+
+    // WP-7A bug2: for an INTERNAL agent caller, advertise only the tools it can
+    // actually call — mirror the dispatch gate's `denied_tools`/`allowed_tools`
+    // predicate (`McpDispatcher` §3.45) so "discoverable ⇔ callable". Before
+    // this, a capability-restricted agent still received all ~200 MCP tool
+    // schemas even though the gate would reject the calls. Keyed on
+    // `principal.client_id` — the SAME agent id the gate resolves — so the two
+    // stay in lock-step regardless of how client_id maps to an agent.
+    //
+    // Read once (not per tool). Uses the canonical preset-aware reader; a
+    // missing/malformed agent.toml yields empty lists, exactly like the gate's
+    // own fail-safe (`load_agent_gate_config`) — so this never advertises a
+    // tool the gate would then block (discoverable ⊆ callable holds). External
+    // clients are filtered separately by `external_tool_allowed` and carry no
+    // per-agent capability config.
+    let cap_gate: Option<(Vec<String>, Vec<String>)> =
+        if !principal.is_external && !principal.client_id.is_empty() {
+            let agent_dir = home_dir.join("agents").join(&principal.client_id);
+            let caps = duduclaw_core::agent_toml::load(&agent_dir).capabilities;
+            // Raw config fields (NOT the computed accessors) to match the gate.
+            Some((caps.denied_tools, caps.allowed_tools))
+        } else {
+            None
+        };
+    let tool_allowed_by_capability = |name: &str| -> bool {
+        let Some((denied, allowed)) = cap_gate.as_ref() else {
+            return true; // external / unresolved caller → not gated here
+        };
+        let base = duduclaw_core::tool_catalog::mcp_tool_base_name(name);
+        let is_denied = denied
+            .iter()
+            .any(|d| duduclaw_core::tool_catalog::mcp_tool_base_name(d) == base);
+        if is_denied {
+            return false;
+        }
+        let allowlist_active = !allowed.is_empty();
+        if allowlist_active {
+            return allowed
+                .iter()
+                .any(|a| duduclaw_core::tool_catalog::mcp_tool_base_name(a) == base);
+        }
+        true
+    };
+
     let tools: Vec<Value> = TOOLS
         .iter()
         .filter(|t| {
@@ -9874,6 +9918,8 @@ pub(crate) fn handle_tools_list(
             !principal.is_external || crate::mcp_auth::external_tool_allowed(t.name, principal)
         })
         .filter(|t| google_enabled || !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
+        // WP-7A bug2: internal per-agent capability filter (mirror of §3.45).
+        .filter(|t| tool_allowed_by_capability(t.name))
         .map(build_tool_schema)
         .collect();
     jsonrpc_response(id, serde_json::json!({ "tools": tools }))
@@ -22163,6 +22209,74 @@ mod wiki_namespace_tests {
             tools.len() > 7,
             "Internal principal must see more than 7 tools, got {}", tools.len()
         );
+    }
+
+    // ── WP-7A bug2: internal tools/list honors per-agent capability ──────────
+    fn internal_principal_named(client_id: &str) -> crate::mcp_auth::Principal {
+        crate::mcp_auth::Principal {
+            client_id: client_id.into(),
+            scopes: std::collections::HashSet::new(),
+            is_external: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn names_of(resp: &serde_json::Value) -> Vec<String> {
+        resp["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn internal_tools_list_hides_denied_tool() {
+        use serde_json::json;
+        let home = tmp_home_for_tools_list();
+        let agent_dir = home.path().join("agents").join("worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndenied_tools = [\"memory_store\"]\n",
+        )
+        .unwrap();
+
+        let resp = super::handle_tools_list(&json!(1), &internal_principal_named("worker"), home.path());
+        let names = names_of(&resp);
+        assert!(!names.contains(&"memory_store".to_string()), "denied tool must be hidden");
+        assert!(names.contains(&"memory_search".to_string()), "non-denied tools stay");
+    }
+
+    #[test]
+    fn internal_tools_list_allowlist_shows_only_allowed() {
+        use serde_json::json;
+        let home = tmp_home_for_tools_list();
+        let agent_dir = home.path().join("agents").join("readonly");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // Allowlist mode: only memory_search is callable → only it is advertised.
+        // A qualified `mcp__duduclaw__` entry must match its bare tool too.
+        std::fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\nallowed_tools = [\"memory_search\", \"mcp__duduclaw__wiki_read\"]\n",
+        )
+        .unwrap();
+
+        let resp = super::handle_tools_list(&json!(1), &internal_principal_named("readonly"), home.path());
+        let names = names_of(&resp);
+        assert!(names.contains(&"memory_search".to_string()));
+        assert!(names.contains(&"wiki_read".to_string()), "qualified allowlist entry matches bare tool");
+        assert!(!names.contains(&"memory_store".to_string()), "unlisted tool hidden in allowlist mode");
+        assert!(!names.contains(&"tasks_create".to_string()), "unlisted tool hidden in allowlist mode");
+    }
+
+    #[test]
+    fn internal_tools_list_no_agent_toml_is_unrestricted() {
+        use serde_json::json;
+        // No agent.toml for this caller → empty gate → full list (matches the
+        // dispatch gate's own fail-safe-to-empty posture).
+        let resp = super::handle_tools_list(&json!(1), &internal_principal_named("ghost"), tmp_home_for_tools_list().path());
+        assert!(names_of(&resp).len() > 7);
     }
 
     // ── Test 7: wiki_write succeeds for external client WITHOUT pre-created dir ──

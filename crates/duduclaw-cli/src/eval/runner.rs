@@ -226,6 +226,7 @@ async fn run_live(case: &EvalCaseFile, home: &Path) -> Result<String, String> {
         capabilities.as_ref(),
         mcp_path.as_deref(),
         sys_file.as_ref().map(|f| f.0.as_path()),
+        duduclaw_core::agent_toml::resolve_minimal_context(Some(&agent_dir)),
     );
     let _keep_alive = &mcp_temp;
 
@@ -273,9 +274,14 @@ fn build_eval_cli_args(
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     mcp_config: Option<&Path>,
     system_prompt_file: Option<&Path>,
+    // WP-7A: mirror the harness's minimal-context flags so eval stays
+    // representative of production spawns. Resolved from the eval agent dir.
+    minimal_context: bool,
 ) -> Vec<String> {
+    // WP-7A (bug1): `--exclude-dynamic-system-prompt-sections` removed — a
+    // documented no-op when combined with `--system-prompt-file` (which eval
+    // always sets for a case with a system prompt).
     let mut args: Vec<String> = vec![
-        "--exclude-dynamic-system-prompt-sections".into(),
         "-p".into(),
         case.case.prompt.clone(),
         "--model".into(),
@@ -298,6 +304,18 @@ fn build_eval_cli_args(
     if !denied.is_empty() {
         args.push("--disallowedTools".into());
         args.push(denied.join(","));
+    }
+
+    // WP-7A minimal-context (harness parity): keep `project,local` so the
+    // agent's own `.claude/settings.json` hook survives.
+    if minimal_context {
+        args.push("--setting-sources".into());
+        args.push("project,local".into());
+        args.push("--tools".into());
+        args.push(
+            caps.minimal_builtin_tools(&duduclaw_core::types::CURATED_BUILTIN_TOOLS)
+                .join(","),
+        );
     }
 
     if let Some(mcp_json) = mcp_config {
@@ -342,7 +360,8 @@ mod tests {
     #[test]
     fn cli_args_mirror_harness_invocation() {
         let c = case("model = \"claude-haiku-4-5\"\nmax_turns = 7\n");
-        let args = build_eval_cli_args(&c, None, None, None);
+        // minimal_context = false → no minimal flags, no dead exclude-dynamic.
+        let args = build_eval_cli_args(&c, None, None, None, false);
         let joined = args.join(" ");
         assert!(joined.contains("-p hi there"));
         assert!(joined.contains("--model claude-haiku-4-5"));
@@ -351,6 +370,22 @@ mod tests {
         assert!(joined.contains("--dangerously-skip-permissions"));
         assert!(!joined.contains("--mcp-config"));
         assert!(!joined.contains("--system-prompt-file"));
+        // WP-7A: the dead flag is gone; minimal flags only appear when enabled.
+        assert!(!joined.contains("--exclude-dynamic-system-prompt-sections"));
+        assert!(!joined.contains("--setting-sources"));
+        assert!(!joined.contains("--tools"));
+    }
+
+    #[test]
+    fn cli_args_minimal_context_adds_setting_sources_and_tools() {
+        let c = case("");
+        let args = build_eval_cli_args(&c, None, None, None, true);
+        let joined = args.join(" ");
+        assert!(joined.contains("--setting-sources project,local"));
+        // Curated built-in set, no operator globals dropped via "".
+        assert!(joined.contains("--tools "));
+        assert!(joined.contains("TodoWrite"));
+        assert!(!joined.contains("--exclude-dynamic-system-prompt-sections"));
     }
 
     #[test]
@@ -365,7 +400,7 @@ mod tests {
         };
         let sys = dir.path().join("sys.txt");
         let mcp = dir.path().join(".mcp.json");
-        let args = build_eval_cli_args(&c, Some(&caps), Some(&mcp), Some(&sys));
+        let args = build_eval_cli_args(&c, Some(&caps), Some(&mcp), Some(&sys), false);
         let joined = args.join(" ");
         assert!(joined.contains("--allowedTools"));
         assert!(joined.contains("--disallowedTools Bash"));
