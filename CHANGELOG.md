@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.61.1] - 2026-08-16 — 客戶端 WebSocket 協定修正
+
 ### Fixed
 - **三個客戶端的儀表板功能全掛（VS Code／Chrome／Stream Deck）**：它們的 RPC 都是照 JSON-RPC 2.0 寫的（`{"jsonrpc":"2.0",…}`），但 gateway 用的是自家的 `WsFrame` 協定（`{"type":"req",…}`，回覆是 `ok`＋`payload` 而非 `result`）。少了 `type` 標籤，gateway 的反序列化直接失敗、判定成握手失敗並關閉連線，客戶端則把它回報成 `connection closed` 之類的傳輸錯誤——訊息完全指不到真因。三個客戶端的收送兩端都已改正，並過濾掉沒有 `id` 的 `event` 推播（先前會被誤當成回應）。Stream Deck 連 committed 的建置產物 `bin/plugin.js` 一併重建（只改原始碼會讓出貨的檔案仍是壞的）。**聊天功能不受影響**：它走 `/ws/chat` 的另一套協定，本來就正確——這個分裂正是 bug 能出貨而沒被發現的原因（測試時對話會通，看起來像好的）。Obsidian 與 WordPress 只用聊天協定，無此問題。追蹤：[`docs/todo/TODO-client-ws-protocol-mismatch.md`](docs/todo/TODO-client-ws-protocol-mismatch.md)。
 - **WebSocket 握手把「格式錯誤」與「認證失敗」混為一談**：第一個 frame 若無法反序列化成 `WsFrame`，gateway 只記一句 `WebSocket auth failed`，於是上面那個純協定 bug 被一路當成憑證問題查。現在格式錯誤會另記一行明說是 client 協定錯誤而非憑證問題，並提示期待的 frame 形狀。純日誌變更，行為不變。
