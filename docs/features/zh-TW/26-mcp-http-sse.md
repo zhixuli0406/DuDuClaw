@@ -1,18 +1,18 @@
 # MCP HTTP/SSE Transport
 
-> 通往 MCP 工具箱的第二道大門——以 Bearer 認證的 REST 處理單次呼叫，以 Server-Sent Events 處理長連線串流，讓遠端用戶端能存取與 stdio transport 相同的工具。
+> 通往 MCP 工具箱的第二道大門：以 Bearer 認證的 REST 處理單次呼叫，以 Server-Sent Events 處理長連線串流，讓遠端用戶端能存取與 stdio transport 相同的工具。
 
 ---
 
 ## 比喻：私人專線 vs. 總機加廣播電台
 
-原本的 MCP transport 是 **stdio**——一條直接接在單一 Claude CLI 行程與 DuDuClaw MCP server 之間的私人電話專線。它快速而親密，但只有一位來電者。兩個行程共用 `stdin`/`stdout`；沒有別人能撥進來。
+原本的 MCP transport 是 **stdio**，一條直接接在單一 Claude CLI 行程與 DuDuClaw MCP server 之間的私人電話專線。它快速而親密，但只有一位來電者。兩個行程共用 `stdin`/`stdout`；沒有別人能撥進來。
 
 HTTP/SSE transport 則是**總機加廣播電台**：
 
-- 任何持有有效識別證（Bearer API key）的人都能*撥打總機*發出單次請求——`POST /mcp/v1/call`。一響、一答，掛斷。
-- 或者*收聽電台*——`GET /mcp/v1/stream`——聆聽事件發生時即時推送的長連線廣播。
-- 還能*撥打總機，請它把結果在電台上播報*——`POST /mcp/v1/stream/call`——現在發出請求，從已訂閱的串流上聽到回應傳回。
+- 任何持有有效識別證（Bearer API key）的人都能*撥打總機*發出單次請求（`POST /mcp/v1/call`）。一響、一答，掛斷。
+- 或者*收聽電台*：呼叫 `GET /mcp/v1/stream`，聆聽事件發生時即時推送的長連線廣播。
+- 還能*撥打總機，請它把結果在電台上播報*，也就是呼叫 `POST /mcp/v1/stream/call`：現在發出請求，從已訂閱的串流上聽到回應傳回。
 
 總機並不取代私人專線。stdio transport 仍服務本地 CLI。HTTP/SSE 只是把*同一個工具箱*開放給住在另一個行程、另一個容器，或另一台機器的外部用戶端。
 
@@ -62,7 +62,7 @@ duduclaw http-server --bind 127.0.0.1:8765
 | `/mcp/v1/call` | `POST` | 僅 Bearer | 單次同步的 JSON-RPC 2.0 `tools/call`，一次回應。 |
 | `/mcp/v1/stream` | `GET` | Bearer **或** `?api_key=` | 開啟長連線 SSE 事件串流；回傳一個 `conn_id`。 |
 | `/mcp/v1/stream/call` | `POST` | 僅 Bearer | 把工具呼叫注入指定串流；結果經 SSE 推送。 |
-| `/healthz` | `GET` | 無 | 存活探測——回傳 `200 OK`，無需認證。 |
+| `/healthz` | `GET` | 無 | 存活探測，回傳 `200 OK`，無需認證。 |
 
 `/healthz` 是唯一不需認證的路由。其餘一律 fail closed：缺漏或格式錯誤的 `Authorization` 標頭會在任何工具執行前被拒絕。
 
@@ -70,7 +70,7 @@ duduclaw http-server --bind 127.0.0.1:8765
 
 ## Request → Call（同步）
 
-最簡單的路徑是單次往返——撥號、發問、得到答案、掛斷：
+最簡單的路徑是單次往返，撥號、發問、得到答案、掛斷：
 
 ```
 client                         mcp_http_server                  dispatcher
@@ -90,7 +90,7 @@ client                         mcp_http_server                  dispatcher
   |       (連線關閉)                 |                              |
 ```
 
-若 `jsonrpc` 不是 `"2.0"`，server 回傳代碼 `-32600` 的 JSON-RPC 錯誤。若 `method` 不是 `tools/call`，回傳 `-32601`（"Method not found"）。契約刻意嚴格——驗證的是真正會執行的產物，而非僅僅請求外殼。
+若 `jsonrpc` 不是 `"2.0"`，server 回傳代碼 `-32600` 的 JSON-RPC 錯誤。若 `method` 不是 `tools/call`，回傳 `-32601`（"Method not found"）。契約刻意嚴格：驗證的是真正會執行的產物，而非僅僅請求外殼。
 
 ---
 
@@ -115,7 +115,7 @@ client                         mcp_http_server                  dispatcher
               (從步驟 1 的 SSE 連線傳達)
 ```
 
-`conn_id` 把兩個請求綁在一起。`mcp_sse_store.rs` 在訂閱時記錄**擁有的 principal**，使 `stream/call` 能驗證來電者確實擁有它要推送的串流——你無法把結果硬塞進別人的廣播。
+`conn_id` 把兩個請求綁在一起。`mcp_sse_store.rs` 在訂閱時記錄**擁有的 principal**，使 `stream/call` 能驗證來電者確實擁有它要推送的串流；你無法把結果硬塞進別人的廣播。
 
 ### mcp_sse_store.rs 內部
 
@@ -131,7 +131,7 @@ SseEventStore
 
 - `register_connection` / `remove_connection` 管理生命週期（用戶端斷線時移除，使發送端被丟棄）。
 - `push_event` 即時廣播；`record` 只附加到環形緩衝而不廣播。
-- `replay_after(conn_id, last_event_id)` 讓重連的用戶端恢復遺漏的事件——若落後超過 1024 事件視窗則回傳錯誤。
+- `replay_after(conn_id, last_event_id)` 讓重連的用戶端恢復遺漏的事件，若落後超過 1024 事件視窗則回傳錯誤。
 - 閒置連線在 10 分鐘 TTL 後被驅逐，使被遺棄的串流不會累積。
 
 ---
@@ -163,9 +163,9 @@ SseEventStore
    派送工具  → (下游仍套用 Read/Write scope 檢查)
 ```
 
-HTTP 閘門（`OpType::HttpRequest`）是與既有 `Read`（100/min）、`Write`（20/min）限制*分開*的 token bucket——它位於 transport 層，在 per-tool scope 檢查執行之前，依每把 API key 節流原始請求量。`GET /mcp/v1/stream` 可把 key 帶在 `?api_key=`（讓無法設定標頭的瀏覽器 `EventSource` 仍能認證）；`POST /mcp/v1/call` 與 `POST /mcp/v1/stream/call` 僅接受 Bearer 標頭。
+HTTP 閘門（`OpType::HttpRequest`）是與既有 `Read`（100/min）、`Write`（20/min）限制*分開*的 token bucket；它位於 transport 層，在 per-tool scope 檢查執行之前，依每把 API key 節流原始請求量。`GET /mcp/v1/stream` 可把 key 帶在 `?api_key=`（讓無法設定標頭的瀏覽器 `EventSource` 仍能認證）；`POST /mcp/v1/call` 與 `POST /mcp/v1/stream/call` 僅接受 Bearer 標頭。
 
-每個回應——連未認證的 `/healthz` 也是——都攜帶標準的 capability 標頭，使用戶端能在兩種 transport 間一致地協商功能。
+每個回應（連未認證的 `/healthz` 也是）都攜帶標準的 capability 標頭，使用戶端能在兩種 transport 間一致地協商功能。
 
 ---
 
@@ -208,11 +208,11 @@ es.onmessage = (e) => console.log("event:", e.data);
 
 ### 一個工具箱，兩道門
 
-相同的 MCP 工具——channel、memory、agent、skill、task、shared wiki、autopilot——既能由本地 CLI 透過 stdio 存取，*也*能由遠端 HTTP 用戶端透過網路存取。工具沒有第二套實作；HTTP 層是擺在同一個 dispatcher 前的 transport 轉接器。
+相同的 MCP 工具（channel、memory、agent、skill、task、shared wiki、autopilot）既能由本地 CLI 透過 stdio 存取，*也*能由遠端 HTTP 用戶端透過網路存取。工具沒有第二套實作；HTTP 層是擺在同一個 dispatcher 前的 transport 轉接器。
 
 ### 推送，而不只是輪詢
 
-SSE 讓用戶端*訂閱*結果，而非阻塞於同步呼叫或在迴圈裡輪詢。發出一個 `stream/call`，答案就從你已開啟的連線傳回——還有 1024 事件的重播緩衝，使短暫斷線不致遺失資料。
+SSE 讓用戶端*訂閱*結果，而非阻塞於同步呼叫或在迴圈裡輪詢。發出一個 `stream/call`，答案就從你已開啟的連線傳回。此外還有 1024 事件的重播緩衝，使短暫斷線不致遺失資料。
 
 ### 預設 fail closed、預設節流
 
@@ -220,10 +220,10 @@ SSE 讓用戶端*訂閱*結果，而非阻塞於同步呼叫或在迴圈裡輪�
 
 ### 對瀏覽器友善
 
-`/mcp/v1/stream` 上的 `?api_key=` 後備正是因為 `EventSource` 無法設定 `Authorization` 標頭而存在——讓儀表板無需 proxy 即可直接訂閱。
+`/mcp/v1/stream` 上的 `?api_key=` 後備正是因為 `EventSource` 無法設定 `Authorization` 標頭而存在，讓儀表板無需 proxy 即可直接訂閱。
 
 ---
 
 ## 總結
 
-stdio 是私人專線：一個行程、一位來電者、沒有網路。HTTP/SSE transport 是總機與廣播電台——`POST /mcp/v1/call` 處理單次撥號與回答，`GET /mcp/v1/stream` 讓你收聽，`POST /mcp/v1/stream/call` 讓你發出請求並從空中聽到結果傳回。同一個工具箱、以 Bearer 認證、以 60 req/min 節流、預設 fail-closed——如今任何外部 HTTP 用戶端皆可存取，不再只限本地 CLI。
+stdio 是私人專線：一個行程、一位來電者、沒有網路。HTTP/SSE transport 是總機與廣播電台：`POST /mcp/v1/call` 處理單次撥號與回答，`GET /mcp/v1/stream` 讓你收聽，`POST /mcp/v1/stream/call` 讓你發出請求並從空中聽到結果傳回。同一個工具箱、以 Bearer 認證、以 60 req/min 節流、預設 fail-closed，如今任何外部 HTTP 用戶端皆可存取，不再只限本地 CLI。

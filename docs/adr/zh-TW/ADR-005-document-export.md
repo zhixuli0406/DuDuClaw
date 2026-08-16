@@ -15,13 +15,13 @@ dashboard bundle(`PartnerPortalPage`)裡，是合作夥伴素材的下載連結�
 生成無關。ReportPage 的 export 是前端 JS 函數，不產出可寄送的檔案。
 
 agent 的輸出天生是 markdown。要把它變成客戶能收、能開、能改的
-Slide / Word / PPT / PDF，需要一條轉檔管線。這是一個選型 spike——先定方向，
+Slide / Word / PPT / PDF，需要一條轉檔管線。這是一個選型 spike，先定方向，
 再開實作(對映 WP11-T11.2 的 `document_export` MCP tool)。
 
 ## Options considered
 
 **(a) 純 Rust：`docx-rs` / `rust_xlsxwriter`**
-零外部依賴、單一 binary 打包乾淨、跨平台一致。缺點是 pptx 生態弱——Rust
+零外部依賴、單一 binary 打包乾淨、跨平台一致。缺點是 pptx 生態弱：Rust
 沒有成熟的 pptx 生成庫，自己拼 OOXML 成本高。docx 可行，pptx 是硬傷。
 
 **(b) Pandoc subprocess**
@@ -45,7 +45,7 @@ PDF 品質高、排版可控。**誠實的現況警告**：gateway 的 `browser_
 PDF 走既有瀏覽器層。純 Rust 路徑保留為後續選項。**
 
 理由：Pandoc 一次拿下 docx 與 pptx 兩種最常被要的格式，而 pptx 正是純 Rust
-的死穴。detect-then-enable 把「需要外部依賴」這個缺點降級成優雅退場——沒
+的死穴。detect-then-enable 把「需要外部依賴」這個缺點降級成優雅退場。沒
 Pandoc 就回 md 附件並附一句說明，不當掉、不假裝成功。PDF 借瀏覽器層是最短
 路徑，不引新依賴。Google Slides 原生涉及 OAuth 與雲端資料流，與地端優先的
 產品方向衝突，先不做。
@@ -64,7 +64,7 @@ Pandoc 的環境不會壞，只是拿到 md；不引入 OAuth 與雲端資料流
 
 **付出的：** Pandoc 是執行期外部依賴，部署文件要寫清楚怎麼裝、裝了才有
 Office 輸出。PDF 依賴的瀏覽器層目前是骨架，PDF 這條要等瀏覽器迴路串通才
-算數——這點不能對客戶含糊。
+算數(這點不能對客戶含糊)。
 
 **給客戶的誠實話術：** 「md → Office 已支援方向(docx / pptx)，Google Slides
 原生仍在評估中。」不承諾 Google Slides，不誇大 PDF 現況。

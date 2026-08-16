@@ -1,16 +1,16 @@
 # Multi-Runtime Agent 執行
 
-> 一個平台，四種 AI 後端——Claude、Codex、Gemini，以及任何 OpenAI 相容端點。
+> 一個平台，四種 AI 後端：Claude、Codex、Gemini，以及任何 OpenAI 相容端點。
 
 ---
 
 ## 比喻：多語辦公室
 
-想像一間需要翻譯人員的辦公室。與其聘請一位只會法語的翻譯，不如建立一個翻譯台——可以將工作分配給法語、德語、日語翻譯，或任何會說客戶語言的自由譯者。
+想像一間需要翻譯人員的辦公室。與其聘請一位只會法語的翻譯，不如建立一個翻譯台，可以將工作分配給法語、德語、日語翻譯，或任何會說客戶語言的自由譯者。
 
-翻譯台不在乎*哪位*翻譯處理工作——它在乎的是翻譯品質。如果法語翻譯正忙，就轉給下一位。
+翻譯台不在乎*哪位*翻譯處理工作。它在乎的是翻譯品質。如果法語翻譯正忙，就轉給下一位。
 
-DuDuClaw 的 Multi-Runtime 架構就是那個翻譯台——但對象是 AI 後端。
+DuDuClaw 的 Multi-Runtime 架構就是那個翻譯台，但對象是 AI 後端。
 
 ---
 
@@ -27,7 +27,7 @@ AgentRuntime trait:
   fn health_check() → Status
 ```
 
-每個後端——Claude、Codex、Gemini 或任何 OpenAI 相容端點——都實作相同的介面。系統的其餘部分不需要知道、也不在乎是哪個後端在處理特定請求。
+每個後端（Claude、Codex、Gemini 或任何 OpenAI 相容端點）都實作相同的介面。系統的其餘部分不需要知道、也不在乎是哪個後端在處理特定請求。
 
 ### 四種後端
 
@@ -152,7 +152,7 @@ FailoverManager 檢查 agent 設定：
 Claude 冷卻結束 → 恢復主要路由
 ```
 
-容錯對使用者透明——無論哪個後端處理，使用者都能看到回應。每個後端的健康狀態獨立追蹤：
+容錯對使用者透明；無論哪個後端處理，使用者都能看到回應。每個後端的健康狀態獨立追蹤：
 
 - **Healthy**：正常運作
 - **Rate-Limited**：短冷卻（2 分鐘）
@@ -184,7 +184,7 @@ DuDuClaw 不押注在單一 AI 供應商。如果 Claude 漲價，可以將 Agen
 ## 與其他系統的互動
 
 - **Account Rotator**：跨所有供應商管理認證，具備跨供應商容錯。
-- **Confidence Router**：位於 runtime 層之下——決定本地 vs. 雲端。Runtime 層決定*哪個*雲端。
+- **Confidence Router**：位於 runtime 層之下（決定本地 vs. 雲端）。Runtime 層決定*哪個*雲端。
 - **CostTelemetry**：追蹤每個供應商的成本，支援明智的路由決策。
 - **MCP Server**：工具暴露給所有支援的後端（Claude 透過原生 MCP，其他透過工具注入）。
 - **Agent Config**：每個 Agent 的 `agent.toml` 指定其 runtime 偏好和備案鏈。
@@ -193,4 +193,4 @@ DuDuClaw 不押注在單一 AI 供應商。如果 Claude 漲價，可以將 Agen
 
 ## 總結
 
-AI 領域是多供應商的。只基於單一 CLI 構建就像只為單一作業系統寫軟體——能用，直到不能用。`AgentRuntime` trait 抽象化了差異，讓 DuDuClaw 將 Claude、Codex、Gemini 和任何 OpenAI 相容端點視為可互換的後端。你的 Agent 每次都能取得最佳可用的大腦。
+AI 領域是多供應商的。只基於單一 CLI 構建就像只為單一作業系統寫軟體：能用，直到不能用。`AgentRuntime` trait 抽象化了差異，讓 DuDuClaw 將 Claude、Codex、Gemini 和任何 OpenAI 相容端點視為可互換的後端。你的 Agent 每次都能取得最佳可用的大腦。

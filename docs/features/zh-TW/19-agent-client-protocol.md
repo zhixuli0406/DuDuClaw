@@ -1,6 +1,6 @@
 # Agent Client Protocol (ACP/A2A)
 
-> 讓 IDE 與 Agent 對話的方式，就像 Agent 與其工具對話一樣——stdio JSON-RPC 2.0、可探索、與語言無關。
+> 讓 IDE 與 Agent 對話的方式，就像 Agent 與其工具對話一樣：stdio JSON-RPC 2.0、可探索、與語言無關。
 
 ---
 
@@ -8,20 +8,20 @@
 
 每家餐廳都有兩個入口：
 
-- **用餐區**——顧客走進來、瀏覽菜單、與服務生互動的地方。
-- **訂位專線**——一套電話協定。電話另一端的訂位系統不需要知道用餐區長什麼樣子；它只需要問「晚上 7 點有四人桌嗎？」並得到一個是／否。
+- **用餐區**：顧客走進來、瀏覽菜單、與服務生互動的地方。
+- **訂位專線**：一套電話協定。電話另一端的訂位系統不需要知道用餐區長什麼樣子；它只需要問「晚上 7 點有四人桌嗎？」並得到一個是／否。
 
-像 Zed、JetBrains、Neovim 這樣的 IDE 想問 Agent「你能接這個任務嗎？」，而不必理解 DuDuClaw 的整套頻道基礎設施。它們需要的是訂位專線——一個乾淨、穩定、協定驅動的介面。
+像 Zed、JetBrains、Neovim 這樣的 IDE 想問 Agent「你能接這個任務嗎？」，而不必理解 DuDuClaw 的整套頻道基礎設施。它們需要的是訂位專線，一個乾淨、穩定、協定驅動的介面。
 
-那正是這兩個協定 server 的角色。DuDuClaw 把它們**分成兩個指令**出貨：`duduclaw acp` 說 IDE agent panel 用的 Agent Client Protocol（Zed／JetBrains／nvim——設定方式見下方「協定範圍」），`duduclaw acp-server` 說 A2A 協定，服務 agent 對 agent 與腳本／CI 整合（即後續各節描述的內容）。
+那正是這兩個協定 server 的角色。DuDuClaw 把它們**分成兩個指令**出貨：`duduclaw acp` 說 IDE agent panel 用的 Agent Client Protocol（Zed／JetBrains／nvim，設定方式見下方「協定範圍」），`duduclaw acp-server` 說 A2A 協定，服務 agent 對 agent 與腳本／CI 整合（即後續各節描述的內容）。
 
 ---
 
 ## 什麼是 ACP/A2A？
 
-**ACP** 代表 Agent Client Protocol——一套用於 IDE ↔ Agent 通訊的 stdio JSON-RPC 2.0 行協定。**A2A** 是相關的「Agent to Agent」協定，用於 Agent 探索與任務交換。
+**ACP** 代表 Agent Client Protocol：一套用於 IDE ↔ Agent 通訊的 stdio JSON-RPC 2.0 行協定。**A2A** 是相關的「Agent to Agent」協定，用於 Agent 探索與任務交換。
 
-兩者合在一起，讓 IDE（或另一個 Agent、CI pipeline、shell 腳本）能把一個正在執行的 DuDuClaw Agent 當作一等公民服務來對待——可以探索它、發送任務、輪詢狀態、取消任務。
+兩者合在一起，讓 IDE（或另一個 Agent、CI pipeline、shell 腳本）能把一個正在執行的 DuDuClaw Agent 當作一等公民服務來對待，可以探索它、發送任務、輪詢狀態、取消任務。
 
 DuDuClaw 提供的是 server 端：
 
@@ -45,7 +45,7 @@ Responds to:
 
 ## Agent Card
 
-每個 ACP server 都能描述自己。當客戶端連線時，它可以發出 `agent/discover` 並收到一份 **Agent Card**——一份包含身分、能力與技能的 JSON 文件：
+每個 ACP server 都能描述自己。當客戶端連線時，它可以發出 `agent/discover` 並收到一份 **Agent Card**（一份包含身分、能力與技能的 JSON 文件）：
 
 ```json
 {
@@ -106,7 +106,7 @@ loop {
 }
 ```
 
-stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同——如果你已經建好了一個 MCP server，那你已經建好了一個 ACP server 的 95%。
+stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同。如果你已經建好了一個 MCP server，那你已經建好了一個 ACP server 的 95%。
 
 ### 範例工作階段
 
@@ -142,16 +142,16 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同——如果你已經�
 
 在 `tasks/send`、`tasks/get` 與 `tasks/cancel` 背後，是 `A2ATaskManager`。它的職責是：
 
-1. **排入佇列**——將傳入的任務排入 Agent 既有的任務系統（`TaskSpec`、`tasks/` 目錄）。
+1. **排入佇列**：將傳入的任務排入 Agent 既有的任務系統（`TaskSpec`、`tasks/` 目錄）。
 2. **追蹤**狀態轉換（queued → running → completed/failed/cancelled）。
 3. **路由**任務執行至 Agent 的正常 runtime（Claude / Codex / Gemini / OpenAI-compat）。
 4. **暴露**任務封套中的結果，讓客戶端能輪詢取得。
 
-這代表透過 ACP 提交的任務，會流經與透過頻道或 MCP 工具提交的任務**相同**的管線——單一事實來源，在 Logs/Activity dashboard 中統一可觀測。
+這代表透過 ACP 提交的任務，會流經與透過頻道或 MCP 工具提交的任務**相同**的管線，這是單一事實來源，在 Logs/Activity dashboard 中統一可觀測。
 
 ---
 
-## 協定範圍——請先讀這段
+## 協定範圍：請先讀這段
 
 > **狀態更正（2026-08-13）。**`duduclaw acp-server` 目前說的是 **A2A（Agent2Agent）協定**（stdio 上的 `agent/discover`、`message/send`、`tasks/send|get|cancel`＋`.well-known` agent card），**尚未**實作 IDE agent panel 使用的 *Agent Client Protocol*（`initialize`／`authenticate`／`session/new`／`session/prompt` 串流）。今天把 Zed、JetBrains 或 `nvim-acp` 指向它，會在 `initialize` 就收到 Method not found。兩個協定不巧共用「ACP」縮寫，本文早期版本把它們混為一談。
 >
@@ -163,7 +163,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同——如果你已經�
 > { "agent_servers": { "DuDuClaw": { "command": "duduclaw", "args": ["acp"] } } }
 > ```
 >
-> `duduclaw acp-server` 維持 A2A 用途——兩個協定刻意分開在不同指令上。
+> `duduclaw acp-server` 維持 A2A 用途：兩個協定刻意分開在不同指令上。
 
 ### CI/CD Pipeline
 
@@ -176,7 +176,7 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同——如果你已經�
       | duduclaw acp-server --agent duduclaw-pm
 ```
 
-不需要 HTTP server、不需要 auth token、不需要管理連接埠——只需容器內的 stdio。
+不需要 HTTP server、不需要 auth token、不需要管理連接埠；只需容器內的 stdio。
 
 ---
 
@@ -198,10 +198,10 @@ stdio 上的 JSON-RPC 與 MCP 使用的傳輸方式相同——如果你已經�
 
 對 IDE 整合而言，stdio 有幾個實務上的優勢：
 
-- **零設定**——不必挑連接埠、不必 TLS 憑證、不必防火牆規則。
-- **行程範圍**——ACP server 與 IDE 工作階段同生共死。不會有孤兒監聽器。
-- **OS 層級驗證**——如果你能衍生這個行程，你就已經擁有所需的權限。不需要 API key。
-- **與傳輸無關**——同一套行協定可以透過 SSH 隧道傳輸、在容器內、或跨 VS Code remote 工作階段。
+- **零設定**：不必挑連接埠、不必 TLS 憑證、不必防火牆規則。
+- **行程範圍**：ACP server 與 IDE 工作階段同生共死。不會有孤兒監聽器。
+- **OS 層級驗證**：如果你能衍生這個行程，你就已經擁有所需的權限。不需要 API key。
+- **與傳輸無關**：同一套行協定可以透過 SSH 隧道傳輸、在容器內、或跨 VS Code remote 工作階段。
 
 HTTP 對 Dashboard 與 Prometheus metrics 仍然可用，但對 IDE ↔ Agent 而言，stdio 更簡單也更安全。
 
@@ -211,10 +211,10 @@ HTTP 對 Dashboard 與 Prometheus metrics 仍然可用，但對 IDE ↔ Agent �
 
 Agent Card 宣告 `streaming: true` 與 `multi_turn: true`。這向客戶端傳達：
 
-- **串流**：長時間執行的任務可以在同一條 stdio 連線上發出進度事件，而不只是單一回應。
+- **串流**：長時間執行的任務可以在同一條 stdio 連線上發出進度事件，不只是單一回應。
 - **多輪**：一個任務情境可以橫跨多個請求／回應對（釐清、後續追問）而不喪失狀態。
 
-這些能力對映 Session Memory Stack——釘選指令、滾雪球式回顧與關鍵事實，都會橫跨多輪 ACP 對話延續，方式與頻道訊息中相同。
+這些能力對映 Session Memory Stack，釘選指令、滾雪球式回顧與關鍵事實，都會橫跨多輪 ACP 對話延續，方式與頻道訊息中相同。
 
 ---
 
@@ -222,19 +222,19 @@ Agent Card 宣告 `streaming: true` 與 `multi_turn: true`。這向客戶端傳�
 
 ACP 與 MCP 一樣，繼承 DuDuClaw 的安全邊界：
 
-- **CONTRACT.toml**——must_not/must_always 規則依然適用；經由 ACP 提交的任務無法違反它們。
-- **能力閘控**——`agent.toml [capabilities]` 的預設拒絕仍然閘控工具存取。
-- **稽核日誌**——經由 ACP 提交的任務會以 source=`acp` 出現在 `audit.unified_log` 中。
-- **沙箱化**——任務仍然會流經 worktree 層，並（可選地）流經容器沙箱。
+- **CONTRACT.toml**：must_not/must_always 規則依然適用；經由 ACP 提交的任務無法違反它們。
+- **能力閘控**：`agent.toml [capabilities]` 的預設拒絕仍然閘控工具存取。
+- **稽核日誌**：經由 ACP 提交的任務會以 source=`acp` 出現在 `audit.unified_log` 中。
+- **沙箱化**：任務仍然會流經 worktree 層，並（可選地）流經容器沙箱。
 
-客戶端是 IDE 並不會授予較高的信任——Agent 自身的策略才是最後一道防線。
+客戶端是 IDE 並不會授予較高的信任；Agent 自身的策略才是最後一道防線。
 
 ---
 
 ## 與其他系統的互動
 
 - **Task Board**：經由 ACP 提交的任務流經與經由頻道提交者相同的 `TaskStore`。兩者都會顯示在 Dashboard Activity Feed 中。
-- **Runtime 選擇**：Agent 的正常 runtime（Claude/Codex/Gemini/OpenAI）處理 ACP 任務——相同的工作階段記憶、相同的 prompt cache 策略、相同的帳號輪替。
+- **Runtime 選擇**：Agent 的正常 runtime（Claude/Codex/Gemini/OpenAI）處理 ACP 任務，相同的工作階段記憶、相同的 prompt cache 策略、相同的帳號輪替。
 - **演化**：ACP 任務在關鍵事實萃取與預測錯誤校準上，計為「實質性輪次」。
 - **稽核日誌**：所有 ACP 請求都以 source=`acp` 記錄，與其他四個稽核來源（security / tool_calls / channel_failures / feedback）並列。
 
@@ -256,10 +256,10 @@ ACP 是一個有真實客戶端（Zed、nvim-acp、實驗性 JetBrains 外掛）
 
 ### 可組合的編排
 
-一個 Agent 可以是另一個 Agent 的 A2A 客戶端。編排者風格的 Agent 可以透過 `agent/discover` 探索子 Agent、檢查它們的技能標籤，並透過 `tasks/send` 路由任務——對於跨行程情境，這是 DuDuClaw 內部以檔案為基礎的 IPC 的一個結構化、標準的替代方案。
+一個 Agent 可以是另一個 Agent 的 A2A 客戶端。編排者風格的 Agent 可以透過 `agent/discover` 探索子 Agent、檢查它們的技能標籤，並透過 `tasks/send` 路由任務。對於跨行程情境，這是 DuDuClaw 內部以檔案為基礎的 IPC 的一個結構化、標準的替代方案。
 
 ---
 
 ## 總結
 
-一個好的 Agent 應該能從工作發生的任何地方被觸及。用餐區（頻道）是給終端使用者的；訂位專線（ACP/A2A）是給那些需要以程式化方式與它協作的 IDE、pipeline 與對等 Agent 的。同一個 Agent、同一顆大腦、同一套契約——只是前門換上了一個更乾淨的協定。
+一個好的 Agent 應該能從工作發生的任何地方被觸及。用餐區（頻道）是給終端使用者的；訂位專線（ACP/A2A）是給那些需要以程式化方式與它協作的 IDE、pipeline 與對等 Agent 的。同一個 Agent、同一顆大腦、同一套契約，只是前門換上了一個更乾淨的協定。

@@ -89,7 +89,7 @@ memory/<major>,<other-cap-alpha>/<major>,...
 
 規則:
 1. 只有 `CAPABILITY_REGISTRY` 裡 `enabled: true` 的項目會出現。
-2. `memory` **永遠排第一個**——它是 DuDuClaw 核心的差異化能力。
+2. `memory` **永遠排第一個**:它是 DuDuClaw 核心的差異化能力。
 3. 其他所有已啟用的能力依**字典序(ASCII)**排列在後面。
 4. 每個項目是 `<name>/<major_version>`,不含空格。
 5. 項目之間以逗號分隔,不含空格。
@@ -102,13 +102,13 @@ capability registry 裡的 `major_version` **只在該能力發生破壞性協�
 `mcp/2.x` 行為維持穩定。
 
 #### §4.3 — x-duduclaw-version 語意
-這個版本追蹤的是 HTTP API 相容性——與 DuDuClaw 的 SemVer 發版(`v1.11.x` 等)脫鉤。
+這個版本追蹤的是 HTTP API 相容性,與 DuDuClaw 的 SemVer 發版(`v1.11.x` 等)脫鉤。
 只有在 HTTP API 本身發生相容性變更時(新增必要 header、status code 語意改變等)才會
 變動。
 
 目前值:`1.2`
 - `1`:HTTP API 穩定(過了 beta 期,W20 引入)
-- `2`:第二次向下相容的 HTTP 變更(W22——本 ADR,加入能力協商)
+- `2`:第二次向下相容的 HTTP 變更(W22,即本 ADR,加入能力協商)
 
 ### §5 — 能力登記表(Capability Registry)
 
@@ -138,7 +138,7 @@ router
 ```
 
 Axum 以反向註冊順序評估 layer(最後一個 `.layer()` 是最外層)。這個順序保證
-`inject_capability_headers` 會在**所有**回應上執行——包括內層 `negotiate_capabilities`
+`inject_capability_headers` 會在**所有**回應上執行,包括內層 `negotiate_capabilities`
 middleware 產生的 422。
 
 ### §7 — 停用能力的政策
@@ -154,7 +154,7 @@ middleware 產生的 422。
 當能力登記表發生變更(新增能力、啟用能力、或主版本躍升)時:
 
 1. 更新 `mcp_headers.rs` 裡的 `CAPABILITY_REGISTRY`
-2. 更新 snapshot test `header_snapshot_matches_expected`——這是能力變更在悄悄上線前的
+2. 更新 snapshot test `header_snapshot_matches_expected`。這是能力變更在悄悄上線前的
    強制暫停點
 3. 更新本 ADR 的 §5 表格
 4. 更新 CHANGELOG.md
@@ -166,8 +166,8 @@ middleware 產生的 422。
 
 ### Positive(正向)
 
-- **零成本發現**:每個回應本來就帶著能力 metadata——不需要額外的往返。
-- **明確契約**:宣告需求的 client 會得到 422 + 診斷資訊,而不是無聲的部分失敗。
+- **零成本發現**:每個回應本來就帶著能力 metadata,不需要額外的往返。
+- **明確契約**:宣告需求的 client 會得到 422 + 診斷資訊,不會是無聲的部分失敗。
 - **預設可加**:沒有送 request header 的 client 不會被新上線的能力破壞。
 - **測試鎖定的 registry**:snapshot test 防止 registry 的意外變更悄悄流進 production。
 
@@ -176,8 +176,8 @@ middleware 產生的 422。
 - **每請求的額外開銷**:`build_capabilities_header()` 在每個回應上都會遍歷
   `CAPABILITY_REGISTRY`(目前 9 個項目)。在現有規模下可接受;若 registry 成長超過
   100 個項目,可考慮預先計算成靜態的 `OnceLock<String>`。
-- **只協商主版本**:client 無法表達細粒度的 minor/patch 需求。這是刻意的設計——
-  minor/patch 變更依定義永遠向下相容。
+- **只協商主版本**:client 無法表達細粒度的 minor/patch 需求。這是刻意的設計
+  (minor/patch 變更依定義永遠向下相容)。
 
 ---
 
@@ -185,8 +185,8 @@ middleware 產生的 422。
 
 | File | Role |
 |------|------|
-| `crates/duduclaw-cli/src/mcp_headers.rs` | Registry、header builder、parser、協商邏輯——23 個 unit test |
-| `crates/duduclaw-cli/src/mcp_capability.rs` | Axum middleware(`inject_capability_headers`、`negotiate_capabilities`)——11 個整合測試 |
+| `crates/duduclaw-cli/src/mcp_headers.rs` | Registry、header builder、parser、協商邏輯(23 個 unit test) |
+| `crates/duduclaw-cli/src/mcp_capability.rs` | Axum middleware(`inject_capability_headers`、`negotiate_capabilities`),11 個整合測試 |
 | `crates/duduclaw-cli/src/mcp_http_server.rs` | 把兩個 middleware layer 接進 `build_router()` |
 | `crates/duduclaw-cli/src/lib.rs` | 匯出 `pub mod mcp_headers` + `pub mod mcp_capability` |
 

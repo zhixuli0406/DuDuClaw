@@ -1,6 +1,6 @@
 # Wiki Knowledge Layer
 
-> 四層知識，依信任度加權——身分與核心事實常駐，深層典藏則按需取用。
+> 四層知識，依信任度加權：身分與核心事實常駐，深層典藏則按需取用。
 
 ---
 
@@ -61,7 +61,7 @@ trust: 0.1   — Speculative, draft
 
 ## 自動注入流程
 
-注入發生在組裝 system prompt 時——分布在三個地方，因此四種 runtime（Claude／Codex／Gemini／OpenAI）都能得到相同的知識：
+注入發生在組裝 system prompt 時，分布在三個地方，因此四種 runtime（Claude／Codex／Gemini／OpenAI）都能得到相同的知識：
 
 ```
 User sends message
@@ -93,7 +93,7 @@ Three paths use the same module:
 
 ## FTS5 全文索引
 
-所有頁面（不論層級）都被索引在一個 SQLite FTS5 虛擬表中，使用 `unicode61` tokenizer——它能正確處理 CJK 字元：
+所有頁面（不論層級）都被索引在一個 SQLite FTS5 虛擬表中，使用 `unicode61` tokenizer。它能正確處理 CJK 字元：
 
 ```
 write_page("api-design.md") ──┐
@@ -185,7 +185,7 @@ Report candidate duplicates:
   ]
 ```
 
-這個工具不會自動合併——它只將候選浮現出來供人工審查。
+這個工具不會自動合併；它只將候選浮現出來供人工審查。
 
 ---
 
@@ -201,7 +201,7 @@ Report candidate duplicates:
 └── shared/wiki/            ← cross-agent SOPs, policies, product specs
 ```
 
-可見性透過每個頁面上的 `wiki_visible_to` capability 控制——預設為 agent 私有，但頁面可以提升為共享，或限制給某個團隊。MCP 工具：`shared_wiki_ls`、`shared_wiki_read`、`shared_wiki_write`、`shared_wiki_search`、`shared_wiki_delete`、`shared_wiki_stats`、`wiki_share`。
+可見性透過每個頁面上的 `wiki_visible_to` capability 控制：預設為 agent 私有，但頁面可以提升為共享，或限制給某個團隊。MCP 工具：`shared_wiki_ls`、`shared_wiki_read`、`shared_wiki_write`、`shared_wiki_search`、`shared_wiki_delete`、`shared_wiki_stats`、`wiki_share`。
 
 ### 命名空間 SoT 政策（`.scope.toml`）
 
@@ -235,7 +235,7 @@ mode         = "operator_only"
 | `read_only` | ❌ 拒絕 | ✅ 允許 | ✅ 允許 |
 | `operator_only` | ❌ 拒絕 | ❌ 拒絕 | ✅ 允許 |
 
-`shared_wiki_write` 與 `shared_wiki_delete` 都會遵守該政策。未列出的命名空間預設為 `agent_writable`——該政策*只會收緊*，絕不放寬。
+`shared_wiki_write` 與 `shared_wiki_delete` 都會遵守該政策。未列出的命名空間預設為 `agent_writable`；該政策*只會收緊*，絕不放寬。
 
 **Fail-safe（故障安全）：** 檔案不存在 ⇒ 無政策 ⇒ 維持既有行為。TOML 格式錯誤 ⇒ 記錄警告 + 視同無政策。gateway 絕不會被一個損壞的政策檔案卡住。
 
@@ -245,7 +245,7 @@ mode         = "operator_only"
 
 ### 部門級讀取可見範圍（`visible_to_departments`）
 
-上面的 `mode` 管的是「誰能寫入」一個命名空間。要管「誰能在**部門**層級讀取」，在同一個 `[namespaces."x"]` 表格底下加一個 `visible_to_departments` 陣列。只有 `[agent] department` 落在清單上的 Agent 才看得到那個命名空間——不論是**prompt 注入**（自動注入的 L0/L1 頁面），還是透過 **`shared_wiki_search` / `shared_wiki_read` / `shared_wiki_ls`**。
+上面的 `mode` 管的是「誰能寫入」一個命名空間。要管「誰能在**部門**層級讀取」，在同一個 `[namespaces."x"]` 表格底下加一個 `visible_to_departments` 陣列。只有 `[agent] department` 落在清單上的 Agent 才看得到那個命名空間，不論是**prompt 注入**（自動注入的 L0/L1 頁面），還是透過 **`shared_wiki_search` / `shared_wiki_read` / `shared_wiki_ls`**。
 
 ```toml
 # HR 頁面只有 hr 與 legal 部門能讀
@@ -254,9 +254,9 @@ mode                   = "operator_only"   # 寫入：僅限操作者
 visible_to_departments = ["hr", "legal"]   # 讀取：僅限 hr + legal 部門
 ```
 
-這與寫入用的 `mode` 是正交的——一個命名空間可以同時宣告兩者、只宣告其中一個，或都不宣告。Agent 的部門來自其 `agent.toml` 裡的 `[agent] department`（空值/未設定 = 沒有部門）。
+這與寫入用的 `mode` 是正交的：一個命名空間可以同時宣告兩者、只宣告其中一個，或都不宣告。Agent 的部門來自其 `agent.toml` 裡的 `[agent] department`（空值/未設定 = 沒有部門）。
 
-對任何有宣告的命名空間都是 **fail-closed**：部門不在清單上的 Agent——包括**沒有部門**的 Agent——一律拒絕。只做精確的部門比對（不做前綴/子字串比對）。清單為空則拒絕所有人。
+對任何有宣告的命名空間都是 **fail-closed**：部門不在清單上的 Agent（包括**沒有部門**的 Agent）一律拒絕。只做精確的部門比對（不做前綴/子字串比對）。清單為空則拒絕所有人。
 
 若未宣告則是 **fail-safe**：沒有 `visible_to_departments` 的命名空間維持對所有 Agent 可讀，行為與過去相同。`.scope.toml` 缺失或格式錯誤 ⇒ 不過濾。
 
@@ -286,7 +286,7 @@ Auto-ingested content defaults:
   └─ Entity pages:   layer: deep,    trust: 0.3
 ```
 
-預設為低信任度——Agent 可以在驗證後提升到更高層級。Cloud Ingest 的 prompt 明確指示 LLM 在萃取期間指派 `layer` 與 `trust`，因此原始輸入抵達時便已附帶合理的初步估計。
+預設為低信任度；Agent 可以在驗證後提升到更高層級。Cloud Ingest 的 prompt 明確指示 LLM 在萃取期間指派 `layer` 與 `trust`，因此原始輸入抵達時便已附帶合理的初步估計。
 
 ---
 
@@ -312,18 +312,18 @@ Auto-ingested content defaults:
 |---|---|---|
 | `author` | `auto-distill` | operator / agent id |
 | `tags` | 含 `auto-distilled` | — |
-| `layer` | `context`——**永不自動注入** | `identity` / `core` 會注入 |
+| `layer` | `context`：**永不自動注入** | `identity` / `core` 會注入 |
 | `trust` | `0.300`（`channel` 來源上限） | 最高 `1.0` |
 | `source_type` | `raw_dialogue`（排序係數 0.6） | `verified_fact`（1.2）等 |
 | 可搜尋 | 是（刻意不設 `do_not_inject`） | 是 |
 
-「不注入」是整份設計的風險支點：判別錯誤的代價是知識庫多一頁，而不是每一次回覆的系統提示被污染。
+「不注入」是整份設計的風險支點：判別錯誤的代價僅是知識庫多一頁，不至於讓每一次回覆的系統提示都被污染。
 
 **決定性**：頁面 key 為 `auto/<doc_type>/<slug>.md`，`slug` 取小模型提案並以 `^[a-z0-9][a-z0-9-]{0,63}$` 嚴格驗證，不合格則退回 `<doc_type>-<sha8(NFKC 正規化標題)>`。內容相同再貼一次不寫檔；內容不同則覆寫並在版本紀錄追加一行。
 
 **四道閘門，全部 fail-closed，全部退回記憶路徑**：
 
-1. `.scope.toml`——`[namespaces.auto]` 可設 `operator_only` 或指向其他 capability 的 `read_only` 來關閉自動建檔。與共享 wiki 的 fail-safe 不同，檔案存在但解析失敗會**停止**寫入。
+1. `.scope.toml`：`[namespaces.auto]` 可設 `operator_only` 或指向其他 capability 的 `read_only` 來關閉自動建檔。與共享 wiki 的 fail-safe 不同，檔案存在但解析失敗會**停止**寫入。
 2. 對整頁文字跑 `scan_input`，任一規則命中即丟棄。
 3. 同源爆量偵測（`knowledge_guard`）。
 4. 每日斷路器：每位 AI 員工每天 20 頁 + 20 次灰帶仲裁。
@@ -367,11 +367,11 @@ you need historical context or deep references.
 
 ### 信任度作為一等訊號
 
-`trust` 分數意味著 Agent 可以對自身知識的可靠性進行推理：「這個模式信任度 0.3，行動前我應該先驗證。」知識不是布林值（存在／不存在）——它是一種分布。
+`trust` 分數意味著 Agent 可以對自身知識的可靠性進行推理：「這個模式信任度 0.3，行動前我應該先驗證。」知識不是布林值（存在／不存在），它是一種分布。
 
 ### Runtime 無關
 
-Claude、Codex、Gemini 與 OpenAI 相容 runtime 都看到相同的 wiki——因為注入發生在 runtime 邊界*之前*，在 `build_system_prompt` 中。
+Claude、Codex、Gemini 與 OpenAI 相容 runtime 都看到相同的 wiki，因為注入發生在 runtime 邊界*之前*，在 `build_system_prompt` 中。
 
 ### 閉合累積迴圈
 
@@ -381,7 +381,7 @@ Claude、Codex、Gemini 與 OpenAI 相容 runtime 都看到相同的 wiki——�
 
 ## 與其他系統的互動
 
-- **GVU 迴圈**：SOUL.md 更新可由透過 wiki 搜尋偵測到的模式觸發——演化引擎知道 Agent 知道什麼。
+- **GVU 迴圈**：SOUL.md 更新可由透過 wiki 搜尋偵測到的模式觸發；演化引擎知道 Agent 知道什麼。
 - **Skill 生命週期**：技能萃取會諮詢 wiki 以取得脈絡。從記憶合成的技能可以引用支持它的 wiki 頁面。
 - **安全性**：包含機密的 wiki 頁面會被那個對其他可寫面執行的同一個掃描器標記。CONTRACT.toml 中的 `must_not` 規則可以限制 Agent 被允許寫入哪些層級。
 - **Dashboard**：Knowledge Hub 頁面以層級過濾器與圖譜視覺化呈現 wiki。
@@ -390,4 +390,4 @@ Claude、Codex、Gemini 與 OpenAI 相容 runtime 都看到相同的 wiki——�
 
 ## 總結
 
-知識不是一堆扁平的文件——它依你需要看到它的頻率分層。DuDuClaw 的 Wiki 將這種分層明確化、為每個頁面加上信任度權重，並將「必須永遠記住」那一層直接自動注入每一個 system prompt。深層典藏則保持安靜，直到被召喚。
+知識不是一堆扁平的文件，它依你需要看到它的頻率分層。DuDuClaw 的 Wiki 將這種分層明確化、為每個頁面加上信任度權重，並將「必須永遠記住」那一層直接自動注入每一個 system prompt。深層典藏則保持安靜，直到被召喚。
