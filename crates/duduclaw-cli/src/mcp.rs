@@ -8,6 +8,7 @@ use std::path::Path;
 use duduclaw_core::error::{DuDuClawError, Result};
 use duduclaw_core::truncate_bytes;
 use duduclaw_memory::SqliteMemoryEngine;
+use duduclaw_security::secret_ref::{Secret, SecretRef};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
@@ -2724,7 +2725,7 @@ async fn handle_send_media(
     let result = match channel {
         "telegram" => {
             let token = match config_ref {
-                Some(c) => decrypt_channel_token(c, "telegram_bot_token_enc", "telegram_bot_token", home_dir).await,
+                Some(c) => decrypt_channel_token(c, "telegram_bot_token", home_dir).await,
                 None => String::new(),
             };
             if token.is_empty() {
@@ -2746,7 +2747,7 @@ async fn handle_send_media(
         }
         "discord" => {
             let token = match config_ref {
-                Some(c) => decrypt_channel_token(c, "discord_bot_token_enc", "discord_bot_token", home_dir).await,
+                Some(c) => decrypt_channel_token(c, "discord_bot_token", home_dir).await,
                 None => String::new(),
             };
             if token.is_empty() {
@@ -7145,25 +7146,24 @@ async fn handle_odoo_connect(home_dir: &Path, odoo: &OdooState, caller_agent: &s
     let home_dir_owned = home_dir.to_path_buf();
     let connector = match odoo
         .get_or_connect(caller_agent, move |cred: String| {
-            // The credential source is normally AES ciphertext, but may be a
-            // `secret://<backend>/<name>` Vault reference — resolution differs
-            // and (for the reference case) is async, so this closure is async.
+            // WP-8C: previously a hand-rolled "starts_with secret:// ? resolve
+            // via secret_manager : decrypt as AES ciphertext" branch that
+            // duplicated `SecretRef`. `api_key_enc` / `password_enc` is a
+            // single field that may hold ciphertext, a raw `secret://…`
+            // reference, or (unresolvable ciphertext, not a reference)
+            // legacy plaintext — exactly the shape `SecretRef::from_single`
+            // classifies. Resolution (including the network-backend fetch)
+            // is async, so this closure stays async.
             let home = home_dir_owned.clone();
             async move {
-                if cred.starts_with("secret://") {
-                    // Load [secret_manager] from config.toml (fail-soft to default).
-                    let sm_cfg = match tokio::fs::read_to_string(home.join("config.toml")).await {
-                        Ok(s) => duduclaw_security::secret_manager::SecretManagerConfig::from_toml_str(&s)
-                            .unwrap_or_default(),
-                        Err(_) => Default::default(),
-                    };
-                    duduclaw_security::secret_manager::resolve_secret_reference(&cred, &sm_cfg, &home)
-                        .await
-                        .ok_or_else(|| "odoo secret:// reference resolution failed".to_string())
-                } else {
-                    decrypt_encrypted_value(&cred, &home)
-                        .ok_or_else(|| "Odoo credential not found or could not be decrypted".to_string())
-                }
+                let sm_cfg = duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(&home).await;
+                SecretRef::from_single(&cred)
+                    .resolve(&sm_cfg, &home)
+                    .await
+                    .map(Secret::expose_owned)
+                    .ok_or_else(|| {
+                        "Odoo credential not found, could not be decrypted, or its secret:// reference could not be resolved".to_string()
+                    })
             }
         })
         .await
@@ -9336,54 +9336,175 @@ async fn read_config(home_dir: &Path) -> Option<toml::Table> {
     content.parse().ok()
 }
 
-/// Decrypt an encrypted base64 value using the per-machine keyfile.
+/// Decrypt a channel token from `config.toml`'s `[channels]` table.
 ///
-/// Delegates to the canonical read-only primitive
-/// [`duduclaw_security::keyfile::decrypt_keyfile_value`] so the Odoo credential
-/// path (and channel-token reads) share one decrypt implementation with the
-/// gateway and account rotator.
+/// WP-8C: previously a hand-rolled "try `_enc`, else plaintext, else resolve
+/// `secret://…`" reader that duplicated (and had drifted from)
+/// [`duduclaw_security::secret_ref::SecretRef`] — the shared classifier the
+/// rest of the codebase (`duduclaw-gateway::config_crypto`, which reads this
+/// exact `[channels] telegram_bot_token(_enc)` / `discord_bot_token(_enc)`
+/// shape for the real channel bots) already resolves through. `field_base` is
+/// the plaintext key name (e.g. `"telegram_bot_token"`); the `_enc` twin is
+/// derived from it, matching the config-file convention `SecretRef::classify`
+/// itself documents.
 ///
-/// `secret://` resolution for Odoo `api_key` / `password` is wired at the
-/// `odoo_connect` → `OdooConnectorPool::get_or_connect` async call site: the
-/// resolver closure inspects the `*_enc` credential source, and when it begins
-/// with `secret://` it loads `[secret_manager]` from `config.toml` and calls
-/// `duduclaw_security::secret_manager::resolve_secret_reference` instead of this
-/// sync AES primitive. This function remains the path for ordinary ciphertext.
-fn decrypt_encrypted_value(encrypted: &str, home_dir: &Path) -> Option<String> {
-    duduclaw_security::keyfile::decrypt_keyfile_value(encrypted, home_dir)
+/// Behaviour is unchanged: `_enc` ciphertext wins, falls back to the
+/// plaintext field, and a `secret://<backend>/<name>` value in either field
+/// (including network-backed backends) resolves instead of being returned as
+/// a literal. Returns `""` when nothing is configured or resolvable —
+/// matches the pre-existing "empty means unset" contract callers already
+/// check for.
+async fn decrypt_channel_token(config: &toml::Table, field_base: &str, home_dir: &Path) -> String {
+    let channels = config.get("channels").and_then(|c| c.as_table());
+    let enc_field = format!("{field_base}_enc");
+    let secret_ref = SecretRef::classify(
+        channels.and_then(|c| c.get(&enc_field)).and_then(|v| v.as_str()),
+        channels.and_then(|c| c.get(field_base)).and_then(|v| v.as_str()),
+    );
+    let sm_cfg: duduclaw_security::secret_manager::SecretManagerConfig = config
+        .get("secret_manager")
+        .cloned()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_default();
+    secret_ref
+        .resolve(&sm_cfg, home_dir)
+        .await
+        .map(Secret::expose_owned)
+        .unwrap_or_default()
 }
 
-/// Decrypt a channel token from config.toml.
-///
-/// Tries the encrypted field (`_enc` suffix) first, then falls back to the
-/// plaintext field for backwards compatibility.
-async fn decrypt_channel_token(config: &toml::Table, enc_key: &str, plain_key: &str, home_dir: &Path) -> String {
-    let channels = config.get("channels").and_then(|c| c.as_table());
+#[cfg(test)]
+mod decrypt_channel_token_tests {
+    use super::*;
 
-    // 1. Encrypted (`_enc`) field — AES via the shared keyfile primitive.
-    if let Some(enc_val) = channels.and_then(|c| c.get(enc_key)).and_then(|v| v.as_str())
-        && let Some(decrypted) = decrypt_encrypted_value(enc_val, home_dir) {
-            return decrypted;
+    struct TempHome(std::path::PathBuf);
+    impl TempHome {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "duduclaw-mcp-decrypttest-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
         }
-
-    // 2. Plaintext field — may be a `secret://<backend>/<name>` reference,
-    //    resolved through the configured SecretManager (e.g. Vault). Non-
-    //    reference plaintext is returned as-is (backwards compat). Fail-soft.
-    let plain = channels
-        .and_then(|c| c.get(plain_key))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if plain.starts_with("secret://") {
-        let sm_cfg: duduclaw_security::secret_manager::SecretManagerConfig = config
-            .get("secret_manager")
-            .cloned()
-            .and_then(|v| v.try_into().ok())
-            .unwrap_or_default();
-        return duduclaw_security::secret_manager::resolve_secret_reference(plain, &sm_cfg, home_dir)
-            .await
-            .unwrap_or_default();
+        fn path(&self) -> &Path {
+            &self.0
+        }
+        /// Encrypt `plain` with a fresh (or existing) per-home keyfile, mirroring
+        /// how the gateway's real `_enc` write path produces ciphertext.
+        fn encrypt(&self, plain: &str) -> String {
+            let keyfile = self.0.join(".keyfile");
+            let key = if keyfile.exists() {
+                let bytes = std::fs::read(&keyfile).unwrap();
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&bytes);
+                k
+            } else {
+                let k = duduclaw_security::crypto::CryptoEngine::generate_key().unwrap();
+                std::fs::write(&keyfile, k).unwrap();
+                k
+            };
+            duduclaw_security::crypto::CryptoEngine::new(&key)
+                .unwrap()
+                .encrypt_string(plain)
+                .unwrap()
+        }
     }
-    plain.to_string()
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn channels_table(pairs: &[(&str, &str)]) -> toml::Table {
+        let mut channels = toml::Table::new();
+        for (k, v) in pairs {
+            channels.insert((*k).to_string(), toml::Value::String((*v).to_string()));
+        }
+        let mut root = toml::Table::new();
+        root.insert("channels".to_string(), toml::Value::Table(channels));
+        root
+    }
+
+    /// `_enc` round-trip: ciphertext decrypts to the original token.
+    #[tokio::test]
+    async fn enc_field_round_trips() {
+        let home = TempHome::new("enc-roundtrip");
+        let enc = home.encrypt("tg-secret-token");
+        let table = channels_table(&[("telegram_bot_token_enc", &enc)]);
+        let got = decrypt_channel_token(&table, "telegram_bot_token", home.path()).await;
+        assert_eq!(got, "tg-secret-token");
+    }
+
+    /// Plaintext fallback: no `_enc` field, plain field wins as-is.
+    #[tokio::test]
+    async fn plaintext_fallback_when_no_enc_field() {
+        let home = TempHome::new("plaintext-fallback");
+        let table = channels_table(&[("discord_bot_token", "plain-discord-token")]);
+        let got = decrypt_channel_token(&table, "discord_bot_token", home.path()).await;
+        assert_eq!(got, "plain-discord-token");
+    }
+
+    /// A `secret://` reference must never be handed back as the literal
+    /// string — a network-backed reference with no manager configured fails
+    /// closed to empty rather than leaking the URI as if it were the token.
+    #[tokio::test]
+    async fn secret_reference_never_returned_as_literal_token() {
+        let home = TempHome::new("secret-ref-not-literal");
+        let table = channels_table(&[("telegram_bot_token", "secret://vault/telegram_bot_token")]);
+        let got = decrypt_channel_token(&table, "telegram_bot_token", home.path()).await;
+        assert!(
+            got.is_empty(),
+            "expected fail-closed empty string, got literal: {got:?}"
+        );
+        assert_ne!(got, "secret://vault/telegram_bot_token");
+    }
+
+    /// A `secret://env/…` reference (local, no network) does resolve.
+    #[tokio::test]
+    async fn secret_env_reference_resolves() {
+        let home = TempHome::new("secret-env-resolves");
+        let var = format!(
+            "DUDUCLAW_MCP_DECRYPT_TEST_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // SAFETY: process-unique variable name, set and removed within this test.
+        unsafe { std::env::set_var(&var, "from-env-token") };
+        let table = channels_table(&[("telegram_bot_token", &format!("secret://env/{var}"))]);
+        let got = decrypt_channel_token(&table, "telegram_bot_token", home.path()).await;
+        unsafe { std::env::remove_var(&var) };
+        assert_eq!(got, "from-env-token");
+    }
+
+    /// Ciphertext wins over a plaintext twin sitting next to it.
+    #[tokio::test]
+    async fn enc_field_wins_over_plaintext_twin() {
+        let home = TempHome::new("enc-wins");
+        let enc = home.encrypt("encrypted-wins");
+        let table = channels_table(&[
+            ("telegram_bot_token_enc", &enc),
+            ("telegram_bot_token", "plaintext-loses"),
+        ]);
+        let got = decrypt_channel_token(&table, "telegram_bot_token", home.path()).await;
+        assert_eq!(got, "encrypted-wins");
+    }
+
+    /// Nothing configured at all → empty string, not a panic or an error.
+    #[tokio::test]
+    async fn nothing_configured_is_empty() {
+        let home = TempHome::new("nothing-configured");
+        let table = channels_table(&[]);
+        let got = decrypt_channel_token(&table, "telegram_bot_token", home.path()).await;
+        assert_eq!(got, "");
+    }
 }
 
 /// Resolve the caller-identity agent name for MCP authorization.
