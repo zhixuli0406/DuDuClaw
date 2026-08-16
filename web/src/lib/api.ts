@@ -744,6 +744,13 @@ export interface TaskInfo {
    *  `channel_link.rs`). Render the button ONLY when this is a non-empty
    *  string. */
   channel_link?: string | null;
+  // ── I-3b task list operations (2026-08-15) ────────────────
+  /** Recoverable off-board — hidden from every general listing
+   *  (`tasks.list` / `tasks.list_page` with `archived` unset or `false`) by
+   *  default. */
+  archived?: boolean;
+  /** Sorted first within `tasks.list_page` results (`ORDER BY pinned DESC`). */
+  pinned?: boolean;
 }
 
 /** One judge-review round of a goal-mode task (Iterative Kanban timeline). */
@@ -2338,6 +2345,46 @@ export interface MailStatus {
   sender_allowlist_count: number;
   recipient_allowlist_count: number;
   inbound_dir: string;
+}
+
+/** WP-7I — I-5 ⌘K content search. One cross-source hit from `search.query`.
+ *  `jump` is intentionally loosely typed — its shape depends on `source`
+ *  (matches the gateway's `search_index::SearchHit`, which documents each
+ *  source's jump-target fields). */
+export interface SearchHit {
+  source: 'conversation' | 'artifact' | 'memory' | 'wiki' | 'shared_wiki';
+  id: string;
+  title: string;
+  snippet: string;
+  agent_id?: string | null;
+  timestamp?: string | null;
+  jump: Record<string, unknown>;
+}
+
+/** WP-7I — one entry from `presets.list` (agent preset P1, read-only). A
+ *  preset that failed to parse still appears, carrying `error` instead of the
+ *  usual metadata — the CLI's `duduclaw preset list` never silently drops a
+ *  broken preset, and this mirrors that. */
+export interface PresetSummary {
+  id: string;
+  version?: string;
+  label?: string;
+  description?: string;
+  error?: string;
+}
+
+/** WP-7I — one agent's live preset binding + resolution outcome, as
+ *  `presets.status` returns it. `state: 'unbound'` carries no other field;
+ *  `'applied'` carries the resolved preset's identity plus which of the
+ *  agent's own fields override it; `'unresolved'` carries why resolution
+ *  failed (fail-closed — the agent still runs on its own `agent.toml`). */
+export interface PresetResolution {
+  state: 'unbound' | 'applied' | 'unresolved';
+  preset_id?: string;
+  version?: string;
+  label?: string;
+  changed_fields?: string[];
+  reason?: string;
 }
 
 export interface GalleryCard {
@@ -4181,9 +4228,17 @@ export const api = {
     archive: (mail_id: string) => client.call('mail.archive', { mail_id }) as Promise<{ ok: boolean }>,
     outbox: (params: { agent_id?: string; status?: MailDraft['status']; limit?: number } = {}) =>
       client.call('mail.outbox', params) as Promise<{ count: number; drafts: MailDraft[] }>,
-    /** Confirm (`approve: true`) or refuse an outgoing draft. */
-    decide: (mail_id: string, approve: boolean) =>
-      client.call('mail.decide', { mail_id, approve }) as Promise<{
+    /** Confirm (`approve: true`) or refuse an outgoing draft. `note` is an
+     *  optional human explanation — most useful on a refusal, so the AI
+     *  employee's next draft can address why. Sent whenever non-empty
+     *  regardless of the decision; the gateway is the authority on whether a
+     *  given decision path persists it. */
+    decide: (mail_id: string, approve: boolean, note?: string) =>
+      client.call('mail.decide', {
+        mail_id,
+        approve,
+        ...(note && note.trim() ? { note: note.trim() } : {}),
+      }) as Promise<{
         ok: boolean;
         mail_id: string;
         approved: boolean;
@@ -5308,6 +5363,41 @@ export const api = {
         message: string;
         task: TaskInfo | null;
       }>,
+    // ── I-3b: task list operations (search/pin/archive/rename, 2026-08-15) ──
+    // Thin wrappers over `tasks.archive`/`tasks.unarchive`/`tasks.pin`/
+    // `tasks.unpin`/`tasks.rename` — the gateway implements each as a
+    // convenience RPC delegating to `tasks.update` (same HS4 authorization,
+    // same `{ task: TaskInfo }` response shape).
+    archive: (taskId: string) =>
+      client.call('tasks.archive', { task_id: taskId }) as Promise<{ task: TaskInfo }>,
+    unarchive: (taskId: string) =>
+      client.call('tasks.unarchive', { task_id: taskId }) as Promise<{ task: TaskInfo }>,
+    pin: (taskId: string) =>
+      client.call('tasks.pin', { task_id: taskId }) as Promise<{ task: TaskInfo }>,
+    unpin: (taskId: string) =>
+      client.call('tasks.unpin', { task_id: taskId }) as Promise<{ task: TaskInfo }>,
+    rename: (taskId: string, title: string) =>
+      client.call('tasks.rename', { task_id: taskId, title }) as Promise<{ task: TaskInfo }>,
+    /** Paginated task listing with a total count — used by `/goals`'s 已結束／
+     *  已封存 section to replace the old client-side `.slice(0, 20)` hard cut
+     *  with real "load more" pagination. `archived` defaults to excluding
+     *  archived rows server-side (see `list_tasks_paginated`), matching
+     *  `tasks.list`'s existing default-hidden behaviour. */
+    listPage: (params: {
+      status?: TaskStatus;
+      agent_id?: string;
+      priority?: TaskPriority;
+      goal_mode?: boolean;
+      archived?: boolean;
+      limit?: number;
+      offset?: number;
+    }) =>
+      client.call('tasks.list_page', params) as Promise<{
+        tasks: TaskInfo[];
+        total: number;
+        limit: number;
+        offset: number;
+      }>,
   },
   // U4 co-edited plans — a shared, ordered step list per AI employee that both
   // the user (here) and the agent (plan_get / plan_update_step MCP) edit.
@@ -5710,5 +5800,32 @@ export const api = {
     /** On-demand OS-native environment probes — the only expensive OS RPC
      *  (live notification / frontmost / calendar / mdfind checks). */
     doctorRun: () => client.call('os.doctor.run') as Promise<OsDoctorRunResult>,
+  },
+  // ── I-5: ⌘K cross-source content search ─────────────────────────
+  search: {
+    /** One bounded query fanned out over conversations / artifacts / memory /
+     *  knowledge (agent + shared wiki). Non-admin callers must pass
+     *  `agent_id` (memory and agent-local wiki always require one — see the
+     *  gateway doc comment on `handle_search_query`). `sources` narrows which
+     *  surfaces are queried; omitted ⇒ every source. */
+    query: (params: { q: string; agent_id?: string; limit?: number; sources?: string[] }) =>
+      client.call('search.query', params) as Promise<{
+        query: string;
+        hits: SearchHit[];
+        truncated: boolean;
+      }>,
+  },
+  // ── Agent preset P1 (read-only dashboard card) ───────────────────
+  presets: {
+    /** Every preset under `~/.duduclaw/presets/`, read-only. A preset that
+     *  failed to parse still appears with `.error` set. */
+    list: () => client.call('presets.list') as Promise<{ presets: PresetSummary[] }>,
+    /** One agent's current preset binding + live resolution outcome +
+     *  which of its own `agent.toml` fields override the preset. */
+    status: (agentId: string) =>
+      client.call('presets.status', { agent_id: agentId }) as Promise<{
+        agent_id: string;
+        resolution: PresetResolution;
+      }>,
   },
 };
