@@ -21,7 +21,7 @@ const TASK_COLUMNS: &str = "id, title, description, status, priority, assigned_t
      goal_mode, acceptance_criteria, result_summary, judge_feedback, goal_id, lease_renewed_at, \
      source_channel, source_chat_id, revision_round, diminishing, agent_seconds, goal_state_json, \
      source_discord_guild_id, deadline_at, risk_boundary, acceptance_criteria_baseline, \
-     pause_reason, plan_pending";
+     pause_reason, plan_pending, archived, pinned";
 
 /// I-3a marker stamped onto `judge_feedback` by [`TaskStore::continue_from_terminal`]
 /// so [`crate::goal_loop::GoalLoopDriver::enqueue_work`] can tell a dashboard
@@ -230,6 +230,21 @@ pub struct TaskRow {
     /// all — the planner-failure fail-closed path never sets this).
     #[serde(default)]
     pub plan_pending: Option<String>,
+
+    // ── I-3b task list operations (dashboard-ux-workbuddy 2026-08) ─────
+    /// Archived tasks are deliberately taken out of active consideration:
+    /// hidden from the general board/list queries
+    /// ([`TaskStore::list_tasks_filtered`] / [`TaskStore::list_tasks`]) by
+    /// default, but still explicitly queryable via
+    /// [`TaskStore::list_tasks_paginated`]. `false` for every pre-existing
+    /// row (migration DEFAULT 0).
+    #[serde(default)]
+    pub archived: bool,
+    /// Pinned tasks sort first in list queries (`ORDER BY pinned DESC,
+    /// updated_at DESC`) — a lightweight "keep this at the top" flag, no
+    /// other query-shape effect. `false` for every pre-existing row.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 fn empty_deps() -> String {
@@ -289,6 +304,8 @@ impl TaskRow {
             acceptance_criteria_baseline: None,
             pause_reason: None,
             plan_pending: None,
+            archived: false,
+            pinned: false,
         }
     }
 }
@@ -807,6 +824,13 @@ impl TaskStore {
             // overwrites `judge_feedback`) so the approved plan reaches the
             // first execution round.
             ("plan_pending", "plan_pending TEXT"),
+            // I-3b task list operations (dashboard-ux-workbuddy 2026-08):
+            // archive/pin flags for the `/goals` board. `archived` is
+            // filtered out of the default list queries; `pinned` sorts
+            // first. Both idempotent ALTER TABLE ADD COLUMN, same pattern
+            // as every migration above.
+            ("archived", "archived INTEGER NOT NULL DEFAULT 0"),
+            ("pinned", "pinned INTEGER NOT NULL DEFAULT 0"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -820,6 +844,13 @@ impl TaskStore {
             [],
         )
         .map_err(|e| format!("create idx_tasks_lease: {e}"))?;
+        // I-3b: supports the default "hide archived" filter in
+        // list_tasks_filtered / list_tasks_paginated.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived)",
+            [],
+        )
+        .map_err(|e| format!("create idx_tasks_archived: {e}"))?;
         Ok(())
     }
 
@@ -862,7 +893,19 @@ impl TaskStore {
         if let Some(g) = goal_mode {
             sql.push_str(if g { " AND goal_mode = 1" } else { " AND goal_mode = 0" });
         }
-        sql.push_str(" ORDER BY updated_at DESC");
+        // I-3b: archived tasks are hidden from every general listing by
+        // default — the board, the heartbeat task-board pull, the goal-loop
+        // driver's enumeration, autopilot rule scans, and digests all go
+        // through this method (or `list_tasks`). Archiving is a deliberate
+        // "take this out of active consideration" action, so once archived
+        // a task should stop surfacing here the same way a `done` task
+        // isn't re-dispatched. Every pre-existing row defaults to
+        // archived=0 (migration DEFAULT), so this is behavior-neutral until
+        // a caller actually archives something. Callers that need to browse
+        // the archive explicitly use `list_tasks_paginated` instead.
+        sql.push_str(" AND archived = 0");
+        // Pinned tasks float to the top of every list (I-3b "置頂").
+        sql.push_str(" ORDER BY pinned DESC, updated_at DESC");
 
         let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare list: {e}"))?;
         let params_ref: Vec<&dyn rusqlite::types::ToSql> =
@@ -873,6 +916,87 @@ impl TaskStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect list: {e}"))?;
         Ok(rows)
+    }
+
+    /// I-3b: paginated task listing with a total count, for board views that
+    /// need to page through more rows than a client-side slice can safely
+    /// hold — the prior `/goals` UI hard-cut finished tasks at 20 with no
+    /// way to see the rest (`web/src/pages/GoalsPage.tsx` `.slice(0, 20)`).
+    /// Same filter set as [`Self::list_tasks_filtered`], plus an explicit
+    /// `archived` tri-state so a caller can deliberately browse the
+    /// archive instead of always excluding it: `None` or `Some(false)` ⇒
+    /// non-archived only (same default as `list_tasks_filtered`),
+    /// `Some(true)` ⇒ archived rows only. `limit` is clamped to `[1, 200]`
+    /// so a malformed page size can't force an unbounded scan; `offset` is
+    /// floored at 0. Ordering matches `list_tasks_filtered`: pinned rows
+    /// first, then most-recently-updated.
+    pub async fn list_tasks_paginated(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        priority: Option<&str>,
+        goal_mode: Option<bool>,
+        archived: Option<bool>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<TaskRow>, i64), String> {
+        let conn = self.conn.lock().await;
+        let mut count_sql = "SELECT COUNT(*) FROM tasks WHERE 1=1".to_string();
+        let mut query_sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE 1=1");
+        let mut binds: Vec<String> = Vec::new();
+        if let Some(s) = status {
+            binds.push(s.to_string());
+            let clause = format!(" AND status = ?{}", binds.len());
+            count_sql.push_str(&clause);
+            query_sql.push_str(&clause);
+        }
+        if let Some(a) = agent_id {
+            binds.push(a.to_string());
+            let clause = format!(" AND assigned_to = ?{}", binds.len());
+            count_sql.push_str(&clause);
+            query_sql.push_str(&clause);
+        }
+        if let Some(p) = priority {
+            binds.push(p.to_string());
+            let clause = format!(" AND priority = ?{}", binds.len());
+            count_sql.push_str(&clause);
+            query_sql.push_str(&clause);
+        }
+        if let Some(g) = goal_mode {
+            let clause = if g { " AND goal_mode = 1" } else { " AND goal_mode = 0" };
+            count_sql.push_str(clause);
+            query_sql.push_str(clause);
+        }
+        let archived_clause = if archived == Some(true) {
+            " AND archived = 1"
+        } else {
+            " AND archived = 0"
+        };
+        count_sql.push_str(archived_clause);
+        query_sql.push_str(archived_clause);
+
+        let bounded_limit = limit.clamp(1, 200);
+        let bounded_offset = offset.max(0);
+        query_sql.push_str(&format!(
+            " ORDER BY pinned DESC, updated_at DESC LIMIT {bounded_limit} OFFSET {bounded_offset}"
+        ));
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            binds.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+
+        let total: i64 = conn
+            .query_row(&count_sql, params_ref.as_slice(), |r| r.get(0))
+            .map_err(|e| format!("count tasks page: {e}"))?;
+
+        let mut stmt = conn
+            .prepare(&query_sql)
+            .map_err(|e| format!("prepare list page: {e}"))?;
+        let rows = stmt
+            .query_map(params_ref.as_slice(), row_to_task)
+            .map_err(|e| format!("query list page: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list page: {e}"))?;
+        Ok((rows, total))
     }
 
     pub async fn get_task(&self, id: &str) -> Result<Option<TaskRow>, String> {
@@ -898,10 +1022,10 @@ impl TaskStore {
                  goal_id, lease_renewed_at, source_channel, source_chat_id,
                  revision_round, diminishing, agent_seconds, source_discord_guild_id,
                  deadline_at, risk_boundary, acceptance_criteria_baseline, pause_reason,
-                 plan_pending)
+                 plan_pending, archived, pinned)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
+                     ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
             params![
                 row.id,
                 row.title,
@@ -940,6 +1064,8 @@ impl TaskStore {
                 row.acceptance_criteria_baseline,
                 row.pause_reason,
                 row.plan_pending,
+                row.archived as i64,
+                row.pinned as i64,
             ],
         )
         .map_err(|e| format!("insert task: {e}"))?;
@@ -1074,6 +1200,22 @@ impl TaskStore {
             if let Some(v) = fields.get("tags").and_then(|v| v.as_str()) {
                 binds.push(v.to_string());
                 sets.push(format!("tags = ?{}", binds.len()));
+            }
+            // I-3b task list operations: archived/pinned are booleans, not
+            // strings, so they bypass the `opt_field!` macro (which only
+            // reads `.as_str()`) — same shape as the `tags` special-case
+            // above. `handlers.rs::handle_tasks_archive/unarchive/pin/unpin`
+            // are thin wrappers that funnel through this generic update path
+            // (same pattern as the existing `tasks.assign` → `handle_tasks_update`
+            // delegation), so the HS4 agent-binding ACL check above already
+            // covers these writes — no separate authorization branch needed.
+            if let Some(v) = fields.get("archived").and_then(|v| v.as_bool()) {
+                binds.push((v as i64).to_string());
+                sets.push(format!("archived = ?{}", binds.len()));
+            }
+            if let Some(v) = fields.get("pinned").and_then(|v| v.as_bool()) {
+                binds.push((v as i64).to_string());
+                sets.push(format!("pinned = ?{}", binds.len()));
             }
 
             // Auto-set completed_at when status changes to done
@@ -2944,6 +3086,8 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         acceptance_criteria_baseline: row.get(35)?,
         pause_reason: row.get(36)?,
         plan_pending: row.get(37)?,
+        archived: row.get::<_, i64>(38)? != 0,
+        pinned: row.get::<_, i64>(39)? != 0,
     })
 }
 
@@ -3484,6 +3628,249 @@ mod tests {
         store.insert_task(&task).await.expect("insert task");
         let got = store.get_task("t-telegram").await.expect("get task").expect("row exists");
         assert_eq!(got.source_discord_guild_id, None);
+    }
+
+    // ── I-3b: archived/pinned task list operations ───────────
+
+    #[tokio::test]
+    async fn archived_and_pinned_default_to_false_on_insert() {
+        let (store, _dir) = temp_store();
+        let task = TaskRow::new(
+            "t-defaults".into(),
+            "Fresh task".into(),
+            String::new(),
+            "medium".into(),
+            "bot".into(),
+            "user-1".into(),
+        );
+        store.insert_task(&task).await.expect("insert task");
+        let got = store.get_task("t-defaults").await.expect("get task").expect("row exists");
+        assert!(!got.archived, "archived must default to false");
+        assert!(!got.pinned, "pinned must default to false");
+    }
+
+    /// Idempotent migration: opening the same on-disk `tasks.db` a second
+    /// time (simulating a gateway restart against a pre-existing store)
+    /// must not error and must leave a pre-existing row's archived/pinned
+    /// state untouched — same contract as every other `add_dispatch_columns`
+    /// migration.
+    #[tokio::test]
+    async fn archived_pinned_migration_is_idempotent_across_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let store = TaskStore::open(dir.path()).expect("open store");
+            let task = TaskRow::new(
+                "t-migrate".into(),
+                "Pre-migration task".into(),
+                String::new(),
+                "medium".into(),
+                "bot".into(),
+                "user-1".into(),
+            );
+            store.insert_task(&task).await.expect("insert task");
+        }
+        // Reopen — add_dispatch_columns runs again; ALTER TABLE ADD COLUMN
+        // must be a no-op the second time, not an error.
+        let store = TaskStore::open(dir.path()).expect("reopen store");
+        let got = store.get_task("t-migrate").await.expect("get task").expect("row exists");
+        assert!(!got.archived);
+        assert!(!got.pinned);
+    }
+
+    #[tokio::test]
+    async fn update_task_sets_archived_and_pinned_booleans() {
+        let (store, _dir) = temp_store();
+        let task = TaskRow::new(
+            "t-toggle".into(),
+            "Toggle me".into(),
+            String::new(),
+            "medium".into(),
+            "bot".into(),
+            "user-1".into(),
+        );
+        store.insert_task(&task).await.expect("insert task");
+
+        store
+            .update_task("t-toggle", &serde_json::json!({ "archived": true }))
+            .await
+            .expect("archive");
+        let got = store.get_task("t-toggle").await.unwrap().unwrap();
+        assert!(got.archived);
+        assert!(!got.pinned, "pinning must be untouched by an archive-only update");
+
+        store
+            .update_task("t-toggle", &serde_json::json!({ "pinned": true }))
+            .await
+            .expect("pin");
+        let got = store.get_task("t-toggle").await.unwrap().unwrap();
+        assert!(got.archived, "archiving must be untouched by a pin-only update");
+        assert!(got.pinned);
+
+        store
+            .update_task("t-toggle", &serde_json::json!({ "archived": false, "pinned": false }))
+            .await
+            .expect("unarchive+unpin");
+        let got = store.get_task("t-toggle").await.unwrap().unwrap();
+        assert!(!got.archived);
+        assert!(!got.pinned);
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filtered_excludes_archived_by_default() {
+        let (store, _dir) = temp_store();
+        for id in ["visible-1", "visible-2", "archived-1"] {
+            let task = TaskRow::new(
+                id.into(),
+                format!("Task {id}"),
+                String::new(),
+                "medium".into(),
+                "bot".into(),
+                "user-1".into(),
+            );
+            store.insert_task(&task).await.expect("insert");
+        }
+        store
+            .update_task("archived-1", &serde_json::json!({ "archived": true }))
+            .await
+            .expect("archive");
+
+        let listed = store.list_tasks(None, None, None).await.expect("list");
+        let ids: Vec<&str> = listed.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"visible-1"));
+        assert!(ids.contains(&"visible-2"));
+        assert!(
+            !ids.contains(&"archived-1"),
+            "archived task must be hidden from the default list: {ids:?}"
+        );
+
+        // list_tasks_filtered shares the same default.
+        let filtered = store
+            .list_tasks_filtered(None, None, None, None)
+            .await
+            .expect("list filtered");
+        assert!(!filtered.iter().any(|t| t.id == "archived-1"));
+    }
+
+    #[tokio::test]
+    async fn list_tasks_paginated_can_browse_the_archive_explicitly() {
+        let (store, _dir) = temp_store();
+        for id in ["p-1", "p-2"] {
+            let task = TaskRow::new(
+                id.into(),
+                format!("Task {id}"),
+                String::new(),
+                "medium".into(),
+                "bot".into(),
+                "user-1".into(),
+            );
+            store.insert_task(&task).await.expect("insert");
+        }
+        store
+            .update_task("p-2", &serde_json::json!({ "archived": true }))
+            .await
+            .expect("archive p-2");
+
+        // Default (archived=None) excludes the archived row.
+        let (rows, total) = store
+            .list_tasks_paginated(None, None, None, None, None, 50, 0)
+            .await
+            .expect("paginated default");
+        assert_eq!(total, 1, "only p-1 is non-archived");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "p-1");
+
+        // Explicit archived=true surfaces only the archived row.
+        let (rows, total) = store
+            .list_tasks_paginated(None, None, None, None, Some(true), 50, 0)
+            .await
+            .expect("paginated archived-only");
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].id, "p-2");
+    }
+
+    #[tokio::test]
+    async fn list_tasks_paginated_reports_total_across_pages() {
+        let (store, _dir) = temp_store();
+        for i in 0..5 {
+            let task = TaskRow::new(
+                format!("page-{i}"),
+                format!("Task {i}"),
+                String::new(),
+                "medium".into(),
+                "bot".into(),
+                "user-1".into(),
+            );
+            store.insert_task(&task).await.expect("insert");
+        }
+        let (first_page, total) = store
+            .list_tasks_paginated(None, None, None, None, None, 2, 0)
+            .await
+            .expect("page 1");
+        assert_eq!(total, 5, "total reflects the whole filtered set, not just this page");
+        assert_eq!(first_page.len(), 2);
+
+        let (second_page, total2) = store
+            .list_tasks_paginated(None, None, None, None, None, 2, 2)
+            .await
+            .expect("page 2");
+        assert_eq!(total2, 5);
+        assert_eq!(second_page.len(), 2);
+
+        // Pages don't overlap.
+        let first_ids: HashSet<&str> = first_page.iter().map(|t| t.id.as_str()).collect();
+        let second_ids: HashSet<&str> = second_page.iter().map(|t| t.id.as_str()).collect();
+        assert!(first_ids.is_disjoint(&second_ids));
+    }
+
+    #[tokio::test]
+    async fn pinned_tasks_sort_first() {
+        let (store, _dir) = temp_store();
+        for id in ["older", "newer"] {
+            let task = TaskRow::new(
+                id.into(),
+                format!("Task {id}"),
+                String::new(),
+                "medium".into(),
+                "bot".into(),
+                "user-1".into(),
+            );
+            store.insert_task(&task).await.expect("insert");
+        }
+        // "newer" would naturally sort first (updated_at DESC on insert
+        // order in a fresh store with monotonic timestamps isn't
+        // guaranteed within the same tick, so pin "older" explicitly to
+        // prove the ORDER BY clause, not insertion order, decides this).
+        store
+            .update_task("older", &serde_json::json!({ "pinned": true }))
+            .await
+            .expect("pin older");
+
+        let listed = store.list_tasks(None, None, None).await.expect("list");
+        assert_eq!(listed[0].id, "older", "pinned task must sort first regardless of recency");
+    }
+
+    #[tokio::test]
+    async fn rename_via_update_task_title_field() {
+        let (store, _dir) = temp_store();
+        let task = TaskRow::new(
+            "t-rename".into(),
+            "Original title".into(),
+            String::new(),
+            "medium".into(),
+            "bot".into(),
+            "user-1".into(),
+        );
+        store.insert_task(&task).await.expect("insert");
+
+        let updated = store
+            .update_task("t-rename", &serde_json::json!({ "title": "Renamed title" }))
+            .await
+            .expect("rename")
+            .expect("row exists");
+        assert_eq!(updated.title, "Renamed title");
+
+        let got = store.get_task("t-rename").await.unwrap().unwrap();
+        assert_eq!(got.title, "Renamed title");
     }
 
     #[tokio::test]
