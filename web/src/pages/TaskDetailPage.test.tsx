@@ -275,3 +275,141 @@ describe('TaskDetailPage — 接著做 (I-3a)', () => {
     );
   });
 });
+
+// ── I-2c: the `/goals?task=` dialog's content merged into this page ────────
+// (`GoalLoopPanel` — pause-reason chip, take-over action, contract cards,
+// pending kickoff approval, round timeline). Gated on `task.goal_mode` so a
+// plain `blocked` board task's decision flow is byte-identical to before.
+
+const NEEDS_HUMAN_GOAL: TaskInfo = {
+  ...TASK,
+  status: 'needs_human',
+  goal_mode: true,
+  judge_feedback: 'Could not confirm the refund amount',
+  pause_reason: 'no_progress',
+};
+
+describe('TaskDetailPage — I-2c goal-loop merge: needs_human take-over', () => {
+  it('adds the H11 pause-reason chip and a 4th 「交給我」take-over action for a goal-mode task', () => {
+    mockWsClient.call.mockResolvedValue({ tasks: [NEEDS_HUMAN_GOAL], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [NEEDS_HUMAN_GOAL], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    // The chip (H11 classification) — free of the 3 standard buttons still there.
+    expect(screen.getByText('Stuck, no progress')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Mark complete' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Give up' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: "I'll take over" })).toBeInTheDocument();
+  });
+
+  it('leaves the non-goal needs_human flow untouched — no chip, no 4th button', () => {
+    // NEEDS_HUMAN (module-level fixture above) has no `goal_mode` set.
+    mockWsClient.call.mockResolvedValue({ tasks: [NEEDS_HUMAN], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [NEEDS_HUMAN], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.queryByText('Stuck, no progress')).toBeNull();
+    expect(screen.queryByRole('button', { name: "I'll take over" })).toBeNull();
+  });
+
+  it('takeover routes through tasks.goal_decide with action: takeover', async () => {
+    const user = userEvent.setup();
+    mockWsClient.call.mockResolvedValue({ tasks: [NEEDS_HUMAN_GOAL], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [NEEDS_HUMAN_GOAL], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    mockWsClient.call.mockResolvedValueOnce({ ok: true, message: 'taken over', task: NEEDS_HUMAN_GOAL });
+    await user.click(screen.getByRole('button', { name: "I'll take over" }));
+    await waitFor(() =>
+      expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_decide', {
+        task_id: 'task-aaaa1111',
+        action: 'takeover',
+        note: '',
+      }),
+    );
+  });
+});
+
+describe('TaskDetailPage — I-2c goal-loop merge: contract cards + pending kickoff', () => {
+  it('renders the acceptance criteria and risk boundary cards for a goal task that carries them', () => {
+    const goalWithContract: TaskInfo = {
+      ...TASK,
+      goal_mode: true,
+      acceptance_criteria: 'Ship the Q3 report',
+      risk_boundary: 'Never touch production billing',
+    };
+    mockWsClient.call.mockResolvedValue({ tasks: [goalWithContract], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [goalWithContract], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.getByText('Acceptance criteria')).toBeInTheDocument();
+    expect(screen.getByText('Ship the Q3 report')).toBeInTheDocument();
+    expect(screen.getByText('Risk boundary for this goal')).toBeInTheDocument();
+    expect(screen.getByText('Never touch production billing')).toBeInTheDocument();
+  });
+
+  it('renders nothing extra for a goal task with no contract fields set', () => {
+    const bareGoal: TaskInfo = { ...TASK, goal_mode: true };
+    mockWsClient.call.mockResolvedValue({ tasks: [bareGoal], agents: AGENTS, events: [], comments: [] });
+    useTasksStore.setState({ tasks: [bareGoal], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+    expect(screen.queryByText('Acceptance criteria')).toBeNull();
+  });
+
+  it('shows the pending-kickoff approval card and decides via approvals.decide', async () => {
+    const user = userEvent.setup();
+    const kickoffGoal: TaskInfo = { ...TASK, goal_mode: true, status: 'pending' };
+    mockWsClient.call.mockImplementation((method: string) => {
+      switch (method) {
+        case 'tasks.list':
+          return Promise.resolve({ tasks: [kickoffGoal] });
+        case 'agents.list':
+          return Promise.resolve({ agents: AGENTS });
+        case 'tasks.timeline':
+          return Promise.resolve({
+            task: kickoffGoal,
+            iterations: [],
+            activity: [],
+            runs: [],
+            pending_kickoff: {
+              id: 'appr-1',
+              summary: 'Waiting for you to approve the first dispatch',
+              created_at: '2026-07-17T00:00:00Z',
+              ttl_seconds: 3600,
+            },
+          });
+        default:
+          return Promise.resolve({});
+      }
+    });
+    useTasksStore.setState({ tasks: [kickoffGoal], comments: {}, activities: [], loading: false });
+    renderAt('task-aaaa1111');
+
+    expect(await screen.findByText('Kickoff needs your approval')).toBeInTheDocument();
+    expect(screen.getByText('Waiting for you to approve the first dispatch')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Approve' }));
+    await waitFor(() => {
+      expect(mockWsClient.call).toHaveBeenCalledWith('approvals.decide', { id: 'appr-1', approve: true });
+    });
+  });
+});
+
+describe('TaskDetailPage — I-3b pin/archive from the detail kebab', () => {
+  it('pins the current task via the kebab, routing through tasks.pin', async () => {
+    const user = userEvent.setup();
+    renderAt('task-aaaa1111');
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
+    await user.click(await screen.findByRole('menuitem', { name: 'Pin' }));
+    await waitFor(() => {
+      expect(mockWsClient.call).toHaveBeenCalledWith('tasks.pin', { task_id: 'task-aaaa1111' });
+    });
+  });
+
+  it('archives the current task via the kebab, routing through tasks.archive', async () => {
+    const user = userEvent.setup();
+    renderAt('task-aaaa1111');
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
+    await user.click(await screen.findByRole('menuitem', { name: 'Archive' }));
+    await waitFor(() => {
+      expect(mockWsClient.call).toHaveBeenCalledWith('tasks.archive', { task_id: 'task-aaaa1111' });
+    });
+  });
+});

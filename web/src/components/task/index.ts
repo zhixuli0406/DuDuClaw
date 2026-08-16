@@ -18,3 +18,19 @@ export { TaskArtifactsList, TaskArtifactsPanel, artifactIcon } from './TaskArtif
 export { TaskFilesList, TaskFilesPanel, type TaskFileRow } from './TaskFilesPanel';
 export { TaskDoneBurst } from './TaskDoneBurst';
 export { TASK_DONE_XP, celebrateTaskDone } from './task-celebrate';
+// I-2c: goal-loop detail sections merged from the retired `/goals?task=`
+// dialog into `/tasks/:id` — contract cards, pending kickoff, round
+// timeline, pause-reason chip, and the goal-mode-only takeover action.
+export {
+  PauseReasonChip,
+  GoalTakeoverButton,
+  GoalContractCards,
+  GoalPendingKickoff,
+  GoalRoundTimeline,
+  GoalRoundBadge,
+  GoalDiminishingBadge,
+  GoalDeadlineBadge,
+} from './GoalLoopPanel';
+// I-3b: pin/rename/archive — not goal-specific, but currently only consumed
+// by `/goals`.
+export { TaskListActionsMenu, RenameTaskDialog } from './TaskListActionsMenu';

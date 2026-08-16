@@ -153,3 +153,24 @@ export function formatDurationSaved(minutes: number | null | undefined): string 
   const days = hours / 24;
   return Number.isInteger(days) ? `${days}d` : `${days.toFixed(1)}d`;
 }
+
+/** Compact H/M/S duration from whole seconds (e.g. 3725 → "1h 2m"). Used by
+ *  the task detail page's dual-clock + per-round timeline (I-2a/I-2c). */
+export function formatHms(totalSeconds: number): string {
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return '0s';
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = Math.floor(totalSeconds % 60);
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  return `${s}s`;
+}
+
+/** Seconds between two RFC3339 stamps (0 if unparseable / negative). */
+export function secondsBetween(from?: string | null, to?: string | null): number {
+  if (!from || !to) return 0;
+  const a = Date.parse(from);
+  const b = Date.parse(to);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  return Math.max(0, Math.round((b - a) / 1000));
+}
