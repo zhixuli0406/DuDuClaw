@@ -581,6 +581,13 @@ async fn line_webhook_handler(
                     .checked_sub(std::time::Duration::from_secs(120))
                     .unwrap_or_else(std::time::Instant::now)));
                 Some(Box::new(move |event: crate::channel_reply::ProgressEvent| {
+                    // Step / ModelInfo events are dashboard-only signals — never
+                    // rendered as channel text (would be an empty message).
+                    // Mirrors the telegram/slack progress callback filter
+                    // (WP-10C: LINE was the one channel missing this).
+                    if !should_forward_line_progress_event(&event) {
+                        return;
+                    }
                     let mut last = match last_progress.lock() {
                         Ok(g) => g,
                         Err(e) => e.into_inner(),
@@ -905,6 +912,27 @@ async fn push_message_rich(http: &reqwest::Client, token: &str, user_id: &str, m
     }
 }
 
+/// Whether a `ProgressEvent` should be pushed to a LINE user as a message.
+///
+/// WP-10C: LINE was the one channel (of the eleven) whose progress callback
+/// had no event-type filter — `Step` / `ModelInfo` are dashboard-only
+/// signals that render as an empty string via [`crate::channel_reply::ProgressEvent::to_display`],
+/// and pushing an empty `text` message would either be a wasted LINE Push
+/// API quota hit or an API rejection. Mirrors the explicit variant match
+/// already used by the telegram/slack progress callbacks, plus a
+/// defense-in-depth empty-string check so a future dashboard-only variant
+/// added without updating this match still can't reach the API.
+fn should_forward_line_progress_event(event: &crate::channel_reply::ProgressEvent) -> bool {
+    if matches!(
+        event,
+        crate::channel_reply::ProgressEvent::Step { .. }
+            | crate::channel_reply::ProgressEvent::ModelInfo { .. }
+    ) {
+        return false;
+    }
+    !event.to_display().is_empty()
+}
+
 /// Send a push message to a specific LINE user (for progress updates).
 ///
 /// Uses the LINE Push API which counts against the monthly message quota.
@@ -1007,5 +1035,59 @@ mod tests {
         }"#;
         let body: LineWebhookBody = serde_json::from_str(json).unwrap();
         assert!(body.events[0].postback.is_none());
+    }
+
+    // ── WP-10C: LINE progress-event filter ──────────────────────
+
+    use crate::channel_reply::{ProgressEvent, StepEvent, StepPhase, TodoItem};
+
+    #[test]
+    fn step_event_is_not_forwarded_to_line() {
+        let ev = ProgressEvent::Step(StepEvent {
+            phase: StepPhase::Start,
+            tool: "Read".into(),
+            summary: Some("x".into()),
+            depth: 0,
+            ts_ms: 1,
+        });
+        assert!(
+            ev.to_display().is_empty(),
+            "precondition: Step must render empty"
+        );
+        assert!(
+            !should_forward_line_progress_event(&ev),
+            "Step is dashboard-only and must never be pushed to LINE"
+        );
+    }
+
+    #[test]
+    fn model_info_event_is_not_forwarded_to_line() {
+        let ev = ProgressEvent::ModelInfo { model: "claude-x".into() };
+        assert!(
+            ev.to_display().is_empty(),
+            "precondition: ModelInfo must render empty"
+        );
+        assert!(
+            !should_forward_line_progress_event(&ev),
+            "ModelInfo is dashboard-only and must never be pushed to LINE"
+        );
+    }
+
+    #[test]
+    fn keepalive_and_tool_use_and_todo_update_are_forwarded_to_line() {
+        // These variants all render non-empty text and must keep reaching
+        // the LINE Push API (this fix must not over-filter).
+        assert!(should_forward_line_progress_event(&ProgressEvent::Keepalive));
+        assert!(should_forward_line_progress_event(&ProgressEvent::ToolUse {
+            tool: "Read".into(),
+            detail: Some("foo.rs".into()),
+        }));
+        assert!(should_forward_line_progress_event(&ProgressEvent::TodoUpdate {
+            todos: vec![TodoItem {
+                content: "do the thing".into(),
+                status: "pending".into(),
+                active_form: None,
+            }],
+        }));
     }
 }

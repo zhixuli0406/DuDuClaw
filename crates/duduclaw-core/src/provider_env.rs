@@ -6,12 +6,9 @@
 //! drift in shape (identical values, three independent definitions):
 //!
 //! 1. `duduclaw-agent::account_rotator::provider_env_key_names` (private fn) —
-//!    still a separate copy after this change; that file is owned by a
-//!    parallel work package this wave and was deliberately left untouched.
-//!    Every other crate in the workspace already depends on `duduclaw-core`
-//!    (see `Cargo.toml`), so once `duduclaw-agent` gains that same edge, its
-//!    copy should delegate here too — tracked as a follow-up, not silently
-//!    dropped.
+//!    collapsed onto this module in WP-10C (was left untouched by WP-8B
+//!    because it belonged to a parallel work package that wave); it is now a
+//!    thin delegate, verified byte-identical to this table before the switch.
 //! 2. `duduclaw-llm::provider::resolve_env_key` — now a thin wrapper over
 //!    this module.
 //! 3. `duduclaw-gateway::runtime::openai_compat` — `PROVIDERS`-derived
