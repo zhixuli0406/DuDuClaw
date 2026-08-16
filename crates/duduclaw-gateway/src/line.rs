@@ -585,7 +585,8 @@ async fn line_webhook_handler(
                         Ok(g) => g,
                         Err(e) => e.into_inner(),
                     };
-                    if last.elapsed().as_secs() < 60 {
+                    let throttle = crate::channel_capabilities::progress_throttle_secs("line").unwrap_or(60);
+                    if last.elapsed().as_secs() < throttle {
                         return;
                     }
                     *last = std::time::Instant::now();

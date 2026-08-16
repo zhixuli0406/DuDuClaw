@@ -743,7 +743,8 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         let is_todo = matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. });
         {
             let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
-            if !is_todo && last.elapsed().as_secs() < 30 {
+            let throttle = crate::channel_capabilities::progress_throttle_secs("teams").unwrap_or(30);
+            if !is_todo && last.elapsed().as_secs() < throttle {
                 return;
             }
             *last = std::time::Instant::now();

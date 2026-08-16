@@ -399,7 +399,8 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         let is_todo = matches!(event, crate::channel_reply::ProgressEvent::TodoUpdate { .. });
         {
             let mut last = last_progress.lock().unwrap_or_else(|e| e.into_inner());
-            if !is_todo && last.elapsed().as_secs() < 45 {
+            let throttle = crate::channel_capabilities::progress_throttle_secs("feishu").unwrap_or(45);
+            if !is_todo && last.elapsed().as_secs() < throttle {
                 return;
             }
             *last = std::time::Instant::now();

@@ -1557,7 +1557,8 @@ async fn handle_message_create(
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
-        if last.elapsed().as_secs() < 30 {
+        let throttle = crate::channel_capabilities::progress_throttle_secs("discord").unwrap_or(30);
+        if last.elapsed().as_secs() < throttle {
             return;
         }
         *last = std::time::Instant::now();
