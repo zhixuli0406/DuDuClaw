@@ -75,12 +75,22 @@ impl OdooConnectorPool {
     /// that hot-reload the global block typically want existing `agent.toml
     /// [odoo]` overrides to stay registered.
     ///
-    /// Cached connectors are *not* dropped here — they will continue to
-    /// serve requests against whatever they were authed for. Call
-    /// [`disconnect`] (or [`disconnect_all`]) explicitly if you want a
-    /// fresh handshake.
+    /// Credentials doctrine P2 (zero-restart rotation): every cached
+    /// connector is dropped here. A per-agent override only replaces the
+    /// fields it sets — `merge_credentials` falls back to the global
+    /// `api_key_enc` / `password_enc` for anything an override leaves unset —
+    /// so *any* pool slot may be resting on the credential that was just
+    /// replaced, not only the caller's own. Leaving other agents' connectors
+    /// cached would mean "rotate the Odoo password" silently keeps every
+    /// other agent authenticated on the old session until something else
+    /// disconnects them, which is exactly the "changed the credential, still
+    /// need a restart" gap this line exists to close. The next call per
+    /// agent re-authenticates and picks up whatever `resolve` now decrypts
+    /// to — no explicit [`disconnect`] / [`disconnect_all`] call required by
+    /// the caller.
     pub async fn set_global(&self, global: OdooConfig) {
         self.resolver.write().await.set_global(global);
+        self.disconnect_all().await;
     }
 
     /// Drop every cached connector. Useful after a global config edit when
@@ -90,6 +100,18 @@ impl OdooConnectorPool {
     }
 
     /// Register an `agent.toml [odoo]` override for `agent_id`.
+    ///
+    /// Credentials doctrine P2: an override may change this agent's own
+    /// credential fields, so its cached connector (if any) is dropped —
+    /// the next call re-authenticates against the config just registered
+    /// rather than continuing on a session opened under the old one. The
+    /// pool key is captured *before* the resolver is updated: `profile` is
+    /// itself part of the override and can change too, and if it does,
+    /// `pool_key_for` would resolve to a different key afterwards — dropping
+    /// post-update would silently orphan the connector under the old key
+    /// forever instead of freeing it. A no-op when nothing was connected yet
+    /// (the common case: registration usually runs at gateway startup before
+    /// the first `odoo_*` call).
     pub async fn register_agent(&self, agent_id: impl Into<String>, cfg: AgentOdooConfig) {
         let id = agent_id.into();
         info!(
@@ -97,7 +119,9 @@ impl OdooConnectorPool {
             profile = %cfg.profile_or_default(),
             "Odoo per-agent override registered"
         );
+        let old_key = self.pool_key(&id).await;
         self.resolver.write().await.upsert_agent(id, cfg);
+        self.drop_slot(&old_key).await;
     }
 
     /// Stable pool key for `agent_id`.
@@ -250,12 +274,19 @@ impl OdooConnectorPool {
     /// re-authenticate.
     pub async fn disconnect(&self, agent_id: &str) {
         let key = self.pool_key(agent_id).await;
-        if let Some(slot) = self.pool.write().await.remove(&key) {
+        self.drop_slot(&key).await;
+    }
+
+    /// Drop the cached connector at an already-resolved pool key. Shared by
+    /// [`disconnect`] (resolves the key itself) and [`register_agent`] (needs
+    /// the *pre-update* key — see its doc comment).
+    async fn drop_slot(&self, key: &(String, String)) {
+        if let Some(slot) = self.pool.write().await.remove(key) {
             // Hold the slot lock briefly so any in-flight call sees the
             // explicit disconnect rather than a stale Arc.
             let _g = slot.lock().await;
             warn!(
-                agent_id = %agent_id,
+                agent_id = %key.0,
                 profile = %key.1,
                 "Odoo connector disconnected"
             );
@@ -350,6 +381,96 @@ mod tests {
         assert_eq!(cfg.profile.as_deref(), Some("alpha"));
         assert_eq!(cfg.allowed_models, vec!["crm.lead".to_string()]);
         assert!(pool.agent_override("nope").await.is_none());
+    }
+
+    // ── WP-8A: credentials doctrine P2 — zero-restart rotation ───────────
+
+    /// `set_global` must drop EVERY cached slot, not just the caller's own —
+    /// a per-agent override only replaces the fields it sets, so any slot
+    /// may still be resting on the global credential that was just rotated
+    /// (`merge_credentials` falls back to it). A real connector needs live
+    /// network I/O to establish, so slots are seeded directly here — the
+    /// property under test is "does `set_global` clear the pool map", not
+    /// "can we actually connect".
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_global_drops_every_cached_slot_not_only_the_callers() {
+        let pool = OdooConnectorPool::default();
+        {
+            let mut inner = pool.pool.write().await;
+            inner.insert(
+                ("agent-a".into(), "default".into()),
+                Arc::new(Mutex::new(PoolSlot::default())),
+            );
+            inner.insert(
+                ("agent-b".into(), "default".into()),
+                Arc::new(Mutex::new(PoolSlot::default())),
+            );
+        }
+        assert_eq!(pool.slots().await.len(), 2, "precondition: two seeded slots");
+
+        pool.set_global(OdooConfig::default()).await;
+
+        assert!(
+            pool.slots().await.is_empty(),
+            "set_global must drop every cached slot so every agent re-authenticates \
+             with the new credential on its next call"
+        );
+    }
+
+    /// `register_agent` must drop the slot cached under the *pre-update* key.
+    /// The pool key is derived from the (possibly just-changed) `profile`, so
+    /// resolving the key AFTER applying the override would resolve to a
+    /// different key than the one actually cached and silently orphan the
+    /// old slot forever instead of freeing it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_agent_drops_the_pre_update_slot_even_when_profile_changes() {
+        let pool = OdooConnectorPool::default();
+        let old_key = pool.pool_key("alpha-pm").await;
+        assert_eq!(old_key, ("alpha-pm".to_string(), "default".to_string()));
+        {
+            let mut inner = pool.pool.write().await;
+            inner.insert(old_key.clone(), Arc::new(Mutex::new(PoolSlot::default())));
+        }
+        assert_eq!(pool.slots().await.len(), 1, "precondition: one seeded slot");
+
+        // The override changes `profile`, which changes the pool key.
+        pool.register_agent(
+            "alpha-pm",
+            AgentOdooConfig { profile: Some("alpha".into()), ..Default::default() },
+        )
+        .await;
+
+        assert_eq!(
+            pool.pool_key("alpha-pm").await,
+            ("alpha-pm".to_string(), "alpha".to_string()),
+            "sanity check: the key really did change"
+        );
+        assert!(
+            pool.slots().await.is_empty(),
+            "the slot cached under the pre-update key must be dropped, not orphaned"
+        );
+    }
+
+    /// Same-profile override: the key is unchanged, so this exercises the
+    /// ordinary (non-orphaning) path — the one slot under the one key is
+    /// still dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_agent_drops_its_slot_when_profile_is_unchanged() {
+        let pool = OdooConnectorPool::default();
+        let key = pool.pool_key("beta-pm").await;
+        {
+            let mut inner = pool.pool.write().await;
+            inner.insert(key.clone(), Arc::new(Mutex::new(PoolSlot::default())));
+        }
+
+        pool.register_agent(
+            "beta-pm",
+            AgentOdooConfig { allowed_models: vec!["res.partner".into()], ..Default::default() },
+        )
+        .await;
+
+        assert_eq!(pool.pool_key("beta-pm").await, key, "profile unchanged ⇒ same key");
+        assert!(pool.slots().await.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -270,14 +270,54 @@ pub(crate) fn xml_field(xml: &str, tag: &str) -> Option<String> {
 
 // ── Shared state ────────────────────────────────────────────────
 
-struct WeComState {
-    ctx: Arc<ReplyContext>,
+/// Live-resolved WeCom credentials — never held on [`WeComState`].
+///
+/// Credentials doctrine P2 (WP-8A): every handler / sender re-reads these
+/// fresh from config instead of trusting values captured at task-spawn time,
+/// mirroring `line.rs`'s per-request pattern — a dashboard credential edit
+/// (rotated `corp_secret`, rotated `callback_token`, ...) takes effect on the
+/// very next webhook call or token refresh instead of requiring this task or
+/// the gateway to restart. `aes_key` is re-derived from the current
+/// `wecom_encoding_aes_key` each time — cheap (one base64 decode), no
+/// meaningful cost.
+struct WeComCreds {
     corp_id: String,
     corp_secret: String,
-    agent_id: String,
     callback_token: String,
     aes_key: [u8; 32],
-    /// Cached access token (valid ~7200 s; refreshed 5 min early).
+}
+
+/// Resolve the full credential set fresh. `None` when anything required for
+/// authenticating/decrypting callbacks is missing or malformed — callers
+/// treat that as "not configured right now" and fail closed.
+///
+/// `agent_id` is deliberately not part of this set: it is outbound-only
+/// (used solely by [`send_wecom_msg`], which reads it fresh itself), and a
+/// missing value there just makes sending fail, same as at startup.
+async fn resolve_wecom_creds(home_dir: &Path) -> Option<WeComCreds> {
+    let corp_id = read_wecom_config(home_dir, "wecom_corp_id").await?;
+    let corp_secret = read_wecom_config(home_dir, "wecom_corp_secret").await?;
+    let callback_token = read_wecom_config(home_dir, "wecom_callback_token").await?;
+    let encoding_aes_key = read_wecom_config(home_dir, "wecom_encoding_aes_key").await?;
+    if corp_id.is_empty() || corp_secret.is_empty() || callback_token.is_empty() {
+        return None;
+    }
+    let aes_key = derive_aes_key(&encoding_aes_key)?;
+    Some(WeComCreds {
+        corp_id,
+        corp_secret,
+        callback_token,
+        aes_key,
+    })
+}
+
+struct WeComState {
+    ctx: Arc<ReplyContext>,
+    /// Cached access token (valid ~7200 s; refreshed 5 min early) — a
+    /// network-derived session token, which the credentials doctrine's
+    /// TTL-with-invalidation allowance (design §2.4) covers; the raw
+    /// `corp_id`/`corp_secret` used to obtain it are re-read fresh on every
+    /// refresh via [`resolve_wecom_creds`], never cached here.
     token: RwLock<(String, std::time::Instant)>,
     http: reqwest::Client,
 }
@@ -290,8 +330,11 @@ impl WeComState {
                 return Ok(cached.0.clone());
             }
         }
+        let creds = resolve_wecom_creds(&self.ctx.home_dir)
+            .await
+            .ok_or_else(|| "WeCom credentials not configured".to_string())?;
         let (token, _expires) =
-            fetch_access_token(&self.http, &self.corp_id, &self.corp_secret).await?;
+            fetch_access_token(&self.http, &creds.corp_id, &creds.corp_secret).await?;
         *self.token.write().await = (token.clone(), std::time::Instant::now());
         info!("WeCom access_token refreshed");
         Ok(token)
@@ -382,14 +425,14 @@ pub async fn start_wecom_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> Opt
     }
 
     info!("📮 WeCom webhook starting (corp: {corp_id})");
+    // corp_id / corp_secret / agent_id / callback_token / aes_key above are
+    // used only to decide whether to mount the router at all — they are
+    // intentionally not stored in `WeComState` (WP-8A: see `WeComCreds`'s doc
+    // comment). Every handler re-resolves them via `resolve_wecom_creds`.
+    let _ = (&corp_id, &corp_secret, &agent_id, &callback_token, &aes_key);
 
     let state = Arc::new(WeComState {
         ctx,
-        corp_id,
-        corp_secret,
-        agent_id,
-        callback_token,
-        aes_key,
         token: RwLock::new((String::new(), std::time::Instant::now())),
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -458,8 +501,17 @@ async fn handle_verify(
         warn!("WeCom URL verification timestamp stale/invalid — rejecting");
         return (StatusCode::UNAUTHORIZED, "stale timestamp".into());
     }
+    // WP-8A: re-resolve fresh for this request instead of trusting values
+    // captured at task-spawn time.
+    let creds = match resolve_wecom_creds(&state.ctx.home_dir).await {
+        Some(c) => c,
+        None => {
+            warn!("WeCom URL verification: credentials not configured — rejecting");
+            return (StatusCode::UNAUTHORIZED, "not configured".into());
+        }
+    };
     if !verify_wecom_signature(
-        &state.callback_token,
+        &creds.callback_token,
         &params.timestamp,
         &params.nonce,
         &params.echostr,
@@ -468,7 +520,7 @@ async fn handle_verify(
         warn!("WeCom URL verification signature mismatch — rejecting");
         return (StatusCode::UNAUTHORIZED, "invalid signature".into());
     }
-    match decrypt_wecom_message(&state.aes_key, &params.echostr, &state.corp_id) {
+    match decrypt_wecom_message(&creds.aes_key, &params.echostr, &creds.corp_id) {
         Ok(plain) => {
             info!("WeCom callback URL verified");
             (StatusCode::OK, plain)
@@ -507,6 +559,15 @@ async fn handle_webhook(
         warn!("WeCom webhook timestamp stale/invalid — rejecting request");
         return (StatusCode::UNAUTHORIZED, "stale timestamp".into());
     }
+    // WP-8A: re-resolve fresh for this request instead of trusting values
+    // captured at task-spawn time.
+    let creds = match resolve_wecom_creds(&state.ctx.home_dir).await {
+        Some(c) => c,
+        None => {
+            warn!("WeCom webhook: credentials not configured — rejecting request");
+            return (StatusCode::UNAUTHORIZED, "not configured".into());
+        }
+    };
     let body_str = match std::str::from_utf8(&body) {
         Ok(s) => s,
         Err(_) => return (StatusCode::BAD_REQUEST, "body not UTF-8".into()),
@@ -516,7 +577,7 @@ async fn handle_webhook(
         _ => return (StatusCode::BAD_REQUEST, "missing Encrypt".into()),
     };
     if !verify_wecom_signature(
-        &state.callback_token,
+        &creds.callback_token,
         &params.timestamp,
         &params.nonce,
         &encrypt,
@@ -525,7 +586,7 @@ async fn handle_webhook(
         warn!("WeCom webhook signature mismatch — rejecting request");
         return (StatusCode::UNAUTHORIZED, "invalid signature".into());
     }
-    let msg_xml = match decrypt_wecom_message(&state.aes_key, &encrypt, &state.corp_id) {
+    let msg_xml = match decrypt_wecom_message(&creds.aes_key, &encrypt, &creds.corp_id) {
         Ok(m) => m,
         Err(e) => {
             warn!("WeCom message decrypt failed: {e}");
@@ -659,6 +720,10 @@ async fn send_wecom_msg(
     msgtype: &str,
     content: &str,
 ) -> bool {
+    // WP-8A: re-read fresh rather than a value captured at task-spawn time.
+    let agent_id = read_wecom_config(&state.ctx.home_dir, "wecom_agent_id")
+        .await
+        .unwrap_or_default();
     for attempt in 0..2 {
         let token = match state.get_token(attempt > 0).await {
             Ok(t) => t,
@@ -670,7 +735,7 @@ async fn send_wecom_msg(
         let mut body = serde_json::json!({
             "touser": touser,
             "msgtype": msgtype,
-            "agentid": state.agent_id.parse::<i64>().unwrap_or(0),
+            "agentid": agent_id.parse::<i64>().unwrap_or(0),
         });
         body[msgtype] = serde_json::json!({ "content": content });
         let resp = state
@@ -1016,5 +1081,106 @@ mod tests {
         assert_eq!(xml_field(msg, "MsgType").as_deref(), Some("text"));
         assert_eq!(xml_field(msg, "FromUserName").as_deref(), Some("zhangsan"));
         assert_eq!(xml_field(msg, "Content").as_deref(), Some("午餐吃什麼？"));
+    }
+
+    // ── WP-8A / credentials doctrine P2: resolve_wecom_creds ────────────
+
+    async fn write_config(home: &Path, body: &str) {
+        tokio::fs::write(home.join("config.toml"), body).await.unwrap();
+    }
+
+    const FULL_CREDS_TOML: &str = concat!(
+        "[channels]\n",
+        "wecom_corp_id = \"wxCORP123\"\n",
+        "wecom_corp_secret = \"SECRETXYZ\"\n",
+        "wecom_callback_token = \"TOKEN123\"\n",
+        "wecom_encoding_aes_key = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0\"\n",
+        "wecom_agent_id = \"1000002\"\n",
+    );
+
+    #[tokio::test]
+    async fn resolve_wecom_creds_reads_every_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_config(home, FULL_CREDS_TOML).await;
+
+        let creds = resolve_wecom_creds(home).await.expect("fully configured");
+        assert_eq!(creds.corp_id, "wxCORP123");
+        assert_eq!(creds.corp_secret, "SECRETXYZ");
+        assert_eq!(creds.callback_token, "TOKEN123");
+        assert_eq!(creds.aes_key, derive_aes_key(TEST_AES_KEY).unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_wecom_creds_is_none_when_any_required_field_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        write_config(
+            home,
+            "[channels]\nwecom_corp_secret = \"S\"\nwecom_callback_token = \"T\"\nwecom_encoding_aes_key = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0\"\n",
+        )
+        .await;
+        assert!(resolve_wecom_creds(home).await.is_none(), "missing corp_id");
+
+        write_config(
+            home,
+            "[channels]\nwecom_corp_id = \"C\"\nwecom_callback_token = \"T\"\nwecom_encoding_aes_key = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0\"\n",
+        )
+        .await;
+        assert!(resolve_wecom_creds(home).await.is_none(), "missing corp_secret");
+
+        write_config(
+            home,
+            "[channels]\nwecom_corp_id = \"C\"\nwecom_corp_secret = \"S\"\nwecom_encoding_aes_key = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0\"\n",
+        )
+        .await;
+        assert!(resolve_wecom_creds(home).await.is_none(), "missing callback_token");
+
+        write_config(
+            home,
+            "[channels]\nwecom_corp_id = \"C\"\nwecom_corp_secret = \"S\"\nwecom_callback_token = \"T\"\nwecom_encoding_aes_key = \"too-short\"\n",
+        )
+        .await;
+        assert!(
+            resolve_wecom_creds(home).await.is_none(),
+            "malformed EncodingAESKey"
+        );
+    }
+
+    /// The WP-8A property under test: two resolves against a changed config
+    /// return different credentials — no process-lifetime caching.
+    #[tokio::test]
+    async fn resolve_wecom_creds_reflects_a_rotated_callback_token_without_any_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_config(home, FULL_CREDS_TOML).await;
+        let first = resolve_wecom_creds(home).await.unwrap();
+        assert_eq!(first.callback_token, "TOKEN123");
+
+        write_config(
+            home,
+            "[channels]\nwecom_corp_id = \"wxCORP123\"\nwecom_corp_secret = \"SECRETXYZ\"\nwecom_callback_token = \"ROTATED456\"\nwecom_encoding_aes_key = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP0\"\n",
+        )
+        .await;
+        let second = resolve_wecom_creds(home).await.unwrap();
+        assert_eq!(
+            second.callback_token, "ROTATED456",
+            "a second resolve must see the rotated token, not a cached first read"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_wecom_creds_reflects_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_config(home, FULL_CREDS_TOML).await;
+        assert!(resolve_wecom_creds(home).await.is_some());
+
+        write_config(home, "[channels]\n").await;
+        assert!(
+            resolve_wecom_creds(home).await.is_none(),
+            "a removed credential set must read as unconfigured on the very next call"
+        );
     }
 }

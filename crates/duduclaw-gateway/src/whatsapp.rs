@@ -131,12 +131,14 @@ struct VerifyQuery {
 
 // ── Shared state ────────────────────────────────────────────────
 
+/// Credentials doctrine P2 (WP-8A): none of `access_token` / `verify_token` /
+/// `app_secret` / `phone_number_id` are stored here — every handler re-reads
+/// them from config via `ctx.home_dir` (mirroring `line.rs`'s per-request
+/// pattern), so a dashboard credential edit (including rotating a leaked
+/// `app_secret`) takes effect on the very next webhook call instead of
+/// requiring this task or the gateway to restart.
 struct WhatsAppState {
     ctx: Arc<ReplyContext>,
-    access_token: String,
-    verify_token: String,
-    app_secret: String,
-    phone_number_id: String,
     http: reqwest::Client,
 }
 
@@ -177,13 +179,15 @@ pub async fn start_whatsapp_webhook(
 
     info!("📱 WhatsApp webhook starting (phone: {phone_number_id})");
     set_channel_connected(&ctx.channel_status, "whatsapp", true, None, Some(&ctx.event_tx)).await;
+    // access_token / verify_token / app_secret / phone_number_id above are
+    // used only to decide whether to mount the router at all — they are
+    // intentionally not stored in `WhatsAppState` (WP-8A: see its doc
+    // comment). `let _ =` keeps the emptiness/gating logic above intact
+    // without an unused-binding warning now that nothing captures them.
+    let _ = (access_token, verify_token, app_secret, phone_number_id);
 
     let state = Arc::new(WhatsAppState {
         ctx,
-        access_token,
-        verify_token,
-        app_secret,
-        phone_number_id,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -213,11 +217,17 @@ async fn verify_webhook(
         }
     }
 
+    // WP-8A: re-read fresh rather than trust a value captured at task-spawn
+    // time — a rotated verify_token is honoured on the very next handshake.
+    let verify_token = read_wa_config(&state.ctx.home_dir, "whatsapp_verify_token")
+        .await
+        .unwrap_or_default();
+
     if query.mode.as_deref() == Some("subscribe")
         && query
             .verify_token
             .as_deref()
-            .map(|t| constant_time_eq(t.as_bytes(), state.verify_token.as_bytes()))
+            .map(|t| constant_time_eq(t.as_bytes(), verify_token.as_bytes()))
             .unwrap_or(false)
     {
         if let Some(challenge) = query.challenge {
@@ -234,6 +244,21 @@ async fn receive_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
+    // WP-8A / credentials doctrine P2: re-read every credential fresh for
+    // this request instead of trusting values captured at task-spawn time.
+    // Shadows the rest of this function so every downstream use (signature
+    // verification, media download, outbound send) automatically picks up
+    // the current config — mirrors `line.rs`'s per-request pattern.
+    let access_token = read_wa_config(&state.ctx.home_dir, "whatsapp_access_token")
+        .await
+        .unwrap_or_default();
+    let phone_number_id = read_wa_config(&state.ctx.home_dir, "whatsapp_phone_number_id")
+        .await
+        .unwrap_or_default();
+    let app_secret = read_wa_config(&state.ctx.home_dir, "whatsapp_app_secret")
+        .await
+        .unwrap_or_default();
+
     // WP-H1: fail-closed. An empty app_secret means signature verification is
     // impossible — previously this silently skipped verification and accepted
     // every inbound request unauthenticated (webhook wide open to anyone who
@@ -243,8 +268,8 @@ async fn receive_webhook(
     // helper so it's covered by unit tests independent of axum state; the
     // branches below only decide which log message to emit.
     let sig_str = headers.get("x-hub-signature-256").and_then(|h| h.to_str().ok());
-    if !webhook_signature_ok(&state.app_secret, sig_str, &body) {
-        if state.app_secret.is_empty() {
+    if !webhook_signature_ok(&app_secret, sig_str, &body) {
+        if app_secret.is_empty() {
             // Warn once per process so a misconfigured deployment doesn't
             // spam logs on every dropped request.
             static MISSING_SECRET_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -277,7 +302,7 @@ async fn receive_webhook(
                 .metadata
                 .as_ref()
                 .map(|m| m.phone_number_id.clone())
-                .unwrap_or_else(|| state.phone_number_id.clone());
+                .unwrap_or_else(|| phone_number_id.clone());
 
             if let Some(messages) = &change.value.messages {
                 for msg in messages {
@@ -310,7 +335,7 @@ async fn receive_webhook(
 
                     if let Some((media_id, mime, type_label)) = media_info {
                         info!("📩 WhatsApp [{sender}]: {type_label} message");
-                        match download_media(&state.http, &state.access_token, media_id).await {
+                        match download_media(&state.http, &access_token, media_id).await {
                             Ok(data) => {
                                 let mt = crate::media::media_type_from_mime(mime);
                                 let ext = crate::media::extension_from_mime(mime);
@@ -331,7 +356,7 @@ async fn receive_webhook(
                         let mime = doc.mime_type.as_deref().unwrap_or("application/octet-stream");
                         let fname = doc.filename.as_deref().unwrap_or("document");
                         info!("📩 WhatsApp [{sender}]: document ({fname})");
-                        match download_media(&state.http, &state.access_token, &doc.id).await {
+                        match download_media(&state.http, &access_token, &doc.id).await {
                             Ok(data) => {
                                 let mt = crate::media::media_type_from_mime(mime);
                                 match crate::media::save_attachment_in_base(&attach_base, &data, fname).await {
@@ -397,7 +422,7 @@ async fn receive_webhook(
                             let reply = crate::chat_commands::handle_command(
                                 &cmd, &state.ctx, &session_id, &agent_id, true, sender,
                             ).await;
-                            send_text(&state.http, &state.access_token, &phone_id, sender, &reply).await;
+                            send_text(&state.http, &access_token, &phone_id, sender, &reply).await;
                             continue;
                         }
                     }
@@ -406,7 +431,7 @@ async fn receive_webhook(
                     // the reply arrives; one-shot — tied to the inbound wamid).
                     if !msg.id.is_empty() {
                         crate::channel_typing::whatsapp_typing_once(
-                            &state.http, &state.access_token, &phone_id, &msg.id,
+                            &state.http, &access_token, &phone_id, &msg.id,
                         )
                         .await;
                     }
@@ -415,7 +440,7 @@ async fn receive_webhook(
                     // progress texts consume conversation quota, so only the
                     // meaningful TodoUpdate board is forwarded (throttled 60s).
                     let progress_http = state.http.clone();
-                    let progress_token = state.access_token.clone();
+                    let progress_token = access_token.clone();
                     let progress_phone = phone_id.clone();
                     let progress_to = sender.clone();
                     let last_progress = Arc::new(std::sync::Mutex::new(
@@ -453,7 +478,7 @@ async fn receive_webhook(
                     // the WhatsApp media API, strip the marker.
                     let reply = {
                         let doc_sender = crate::channel_sender::WhatsAppSender {
-                            access_token: state.access_token.clone(),
+                            access_token: access_token.clone(),
                             phone_number_id: phone_id.clone(),
                             to: sender.clone(),
                             http: state.http.clone(),
@@ -473,7 +498,7 @@ async fn receive_webhook(
                     // tables → monospace blocks), chunked under the 4096 cap.
                     let formatted = crate::markdown_render::to_whatsapp_text(&reply);
                     for chunk in crate::channel_format::split_text(&formatted, 4000) {
-                        send_text(&state.http, &state.access_token, &phone_id, sender, &chunk).await;
+                        send_text(&state.http, &access_token, &phone_id, sender, &chunk).await;
                     }
                 }
             }

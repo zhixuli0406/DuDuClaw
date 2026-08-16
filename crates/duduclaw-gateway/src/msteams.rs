@@ -57,7 +57,19 @@ pub struct TeamsState {
 /// Outbound Connector credentials + token cache — separable from the
 /// webhook state so delegation forwarding / Computer Use can send without
 /// a `ReplyContext`.
+///
+/// Credentials doctrine P2 (WP-8A): `app_id` / `app_password` / `tenant_id`
+/// are the values this handle was constructed with. The values actually used
+/// to verify inbound JWTs and to obtain outbound tokens are re-read fresh
+/// from `home_dir` — every request for inbound verification (security gate,
+/// see `verify_inbound_jwt`), every refresh cycle for the outbound token
+/// (see `get_token`) — so a rotated App Secret (or App ID / tenant change)
+/// takes effect without restarting the gateway. The cached outbound `token`
+/// itself keeps its TTL — a genuinely network-derived, short-lived session
+/// credential, which the doctrine's TTL-with-invalidation allowance (design
+/// §2.4) covers.
 pub struct TeamsCreds {
+    home_dir: std::path::PathBuf,
     app_id: String,
     app_password: String,
     /// Entra tenant ID; empty for multi-tenant bots.
@@ -77,6 +89,7 @@ impl TeamsCreds {
         }
         let tenant_id = read_config(home_dir, "teams_tenant_id").await.unwrap_or_default();
         Some(TeamsCreds {
+            home_dir: home_dir.to_path_buf(),
             app_id,
             app_password,
             tenant_id,
@@ -93,6 +106,29 @@ impl TeamsCreds {
         })
     }
 
+    /// Re-read `app_id` / `app_password` / `tenant_id` fresh from config.
+    /// Falls back to the values this handle was constructed with when the
+    /// current config can't be read (transient I/O) — outbound credentials
+    /// fail open to "try with the last known secret" rather than break every
+    /// send; the inbound gate (`verify_inbound_jwt`) fails closed instead.
+    async fn resolve_fresh(&self) -> (String, String, String) {
+        let app_id = read_config(&self.home_dir, "teams_app_id").await;
+        let app_password = read_config(&self.home_dir, "teams_app_password").await;
+        match (app_id, app_password) {
+            (Some(id), Some(pw)) if !id.trim().is_empty() && !pw.trim().is_empty() => {
+                let tenant_id = read_config(&self.home_dir, "teams_tenant_id")
+                    .await
+                    .unwrap_or_default();
+                (id, pw, tenant_id)
+            }
+            _ => (
+                self.app_id.clone(),
+                self.app_password.clone(),
+                self.tenant_id.clone(),
+            ),
+        }
+    }
+
     /// Get (or refresh) the outbound Bot Connector token.
     async fn get_token(&self) -> Result<String, String> {
         {
@@ -101,10 +137,13 @@ impl TeamsCreds {
                 return Ok(cached.0.clone());
             }
         }
-        let tenant_segment = if self.tenant_id.trim().is_empty() {
+        // WP-8A: re-read fresh at refresh time rather than trust the values
+        // captured at construction.
+        let (app_id, app_password, tenant_id) = self.resolve_fresh().await;
+        let tenant_segment = if tenant_id.trim().is_empty() {
             "botframework.com"
         } else {
-            self.tenant_id.trim()
+            tenant_id.trim()
         };
         let url = format!("https://login.microsoftonline.com/{tenant_segment}/oauth2/v2.0/token");
         let resp = self
@@ -112,8 +151,8 @@ impl TeamsCreds {
             .post(&url)
             .form(&[
                 ("grant_type", "client_credentials"),
-                ("client_id", self.app_id.as_str()),
-                ("client_secret", self.app_password.as_str()),
+                ("client_id", app_id.as_str()),
+                ("client_secret", app_password.as_str()),
                 ("scope", "https://api.botframework.com/.default"),
             ])
             .send()
@@ -334,27 +373,34 @@ async fn read_config(home_dir: &Path, field: &str) -> Option<String> {
 /// Verify the inbound Connector JWT. Tries the Bot Framework issuer first;
 /// single-tenant bots may receive Entra-tenant tokens, so a tenant-scoped
 /// validation runs as fallback when configured. Fail-closed.
+///
+/// WP-8A: `app_id` / `tenant_id` are re-read fresh from config for every
+/// request rather than trusting `state.creds`'s construction-time values —
+/// this is the inbound security gate, so unlike the outbound token refresh
+/// it fails closed (rejects) if the current config can't be read, instead of
+/// silently falling back to a possibly-stale App ID.
 async fn verify_inbound_jwt(state: &TeamsState, token: &str) -> Result<serde_json::Value, String> {
     let creds = &state.creds;
-    let bf = crate::webhook_jwt::verify_rs256(
-        &creds.http,
-        token,
-        BF_JWKS_URL,
-        BF_ISSUER,
-        &creds.app_id,
-    )
-    .await;
+    let app_id = read_config(&state.ctx.home_dir, "teams_app_id")
+        .await
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "teams_app_id not configured".to_string())?;
+    let tenant_id = read_config(&state.ctx.home_dir, "teams_tenant_id")
+        .await
+        .unwrap_or_default();
+    let bf =
+        crate::webhook_jwt::verify_rs256(&creds.http, token, BF_JWKS_URL, BF_ISSUER, &app_id).await;
     match bf {
         Ok(claims) => Ok(claims),
         Err(bf_err) => {
-            let tid = creds.tenant_id.trim();
+            let tid = tenant_id.trim();
             if tid.is_empty() {
                 return Err(bf_err);
             }
             // Entra v2 tenant-scoped issuer fallback (single-tenant bots).
             let issuer = format!("https://login.microsoftonline.com/{tid}/v2.0");
             let jwks = format!("https://login.microsoftonline.com/{tid}/discovery/v2.0/keys");
-            crate::webhook_jwt::verify_rs256(&creds.http, token, &jwks, &issuer, &creds.app_id)
+            crate::webhook_jwt::verify_rs256(&creds.http, token, &jwks, &issuer, &app_id)
                 .await
                 .map_err(|e| format!("botframework: {bf_err}; entra: {e}"))
         }
@@ -1059,6 +1105,91 @@ mod tests {
         assert_eq!(m["textFormat"], "markdown");
         assert_eq!(m["replyToId"], "42");
         assert_eq!(m["conversation"]["id"], "a:1");
+    }
+
+    // ── WP-8A / credentials doctrine P2 ─────────────────────────────────
+
+    async fn write_config(home: &Path, body: &str) {
+        tokio::fs::write(home.join("config.toml"), body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn from_config_reads_app_id_password_and_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_config(
+            home,
+            "[channels]\nteams_app_id = \"app-1\"\nteams_app_password = \"secret-1\"\nteams_tenant_id = \"tenant-1\"\n",
+        )
+        .await;
+        let creds = TeamsCreds::from_config(home).await.expect("configured");
+        assert_eq!(creds.app_id, "app-1");
+        assert_eq!(creds.app_password, "secret-1");
+        assert_eq!(creds.tenant_id, "tenant-1");
+    }
+
+    #[tokio::test]
+    async fn from_config_is_none_without_app_id_or_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_config(home, "[channels]\nteams_app_id = \"app-1\"\n").await;
+        assert!(TeamsCreds::from_config(home).await.is_none(), "missing password");
+
+        write_config(home, "[channels]\nteams_app_password = \"secret-1\"\n").await;
+        assert!(TeamsCreds::from_config(home).await.is_none(), "missing app_id");
+    }
+
+    /// `resolve_fresh` is what `get_token`'s refresh path (WP-8A) calls
+    /// instead of trusting the fields captured at construction — this pins
+    /// down that a rotated App Secret is picked up without any caching, and
+    /// that it falls back to the construction-time values only when the
+    /// config can no longer be read at all (not merely when one of the two
+    /// required fields is blank — that still counts as "rotated to nothing
+    /// configured", which falls back exactly the same way, matching the
+    /// documented "fail open to last known secret" outbound posture).
+    #[tokio::test]
+    async fn resolve_fresh_reflects_a_rotated_app_password_without_any_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_config(
+            home,
+            "[channels]\nteams_app_id = \"app-1\"\nteams_app_password = \"original-secret\"\n",
+        )
+        .await;
+        let creds = TeamsCreds::from_config(home).await.expect("configured");
+        let (_, pw, _) = creds.resolve_fresh().await;
+        assert_eq!(pw, "original-secret");
+
+        write_config(
+            home,
+            "[channels]\nteams_app_id = \"app-1\"\nteams_app_password = \"rotated-secret\"\n",
+        )
+        .await;
+        let (_, pw2, _) = creds.resolve_fresh().await;
+        assert_eq!(
+            pw2, "rotated-secret",
+            "resolve_fresh must see the rotated secret, not the construction-time value"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_fresh_falls_back_to_construction_time_values_when_config_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_config(
+            home,
+            "[channels]\nteams_app_id = \"app-1\"\nteams_app_password = \"original-secret\"\n",
+        )
+        .await;
+        let creds = TeamsCreds::from_config(home).await.expect("configured");
+
+        // Simulate config.toml becoming unreadable (e.g. deleted mid-flight)
+        // — an outbound credential fails open to the last known secret
+        // rather than breaking every send.
+        tokio::fs::remove_file(home.join("config.toml")).await.unwrap();
+        let (id, pw, _) = creds.resolve_fresh().await;
+        assert_eq!(id, "app-1");
+        assert_eq!(pw, "original-secret");
     }
 }
 

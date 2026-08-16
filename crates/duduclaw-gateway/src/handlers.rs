@@ -12529,8 +12529,11 @@ impl MethodHandler {
     /// `CostTelemetry` (the persistent SQLite ledger).
     ///
     /// The `AccountRotator`'s `spent_this_month` counter is in-memory only: it
-    /// resets to 0 on every gateway restart and every 5-minute rotator rebuild,
-    /// and stays 0 for OAuth-subscription accounts (which have no per-call cost).
+    /// resets to 0 on every gateway restart and every rotator rebuild — which
+    /// now happens on the next call after any `[[accounts]]` write
+    /// (invalidate-on-write, WP-8A) or, for a write this process has no
+    /// invalidate hook for, after the 30-minute backstop TTL — and stays 0
+    /// for OAuth-subscription accounts (which have no per-call cost).
     /// CostTelemetry records every request's real token cost keyed by agent, so
     /// it is the correct source for "how much was actually used this month".
     async fn telemetry_spent_cents_total(&self) -> u64 {
@@ -22908,6 +22911,11 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
         }
 
+        // Credentials doctrine P2 (WP-8A): invalidate-on-write, not the old
+        // 5-minute rotator TTL — the new account is visible to the very next
+        // dispatch/channel-reply call instead of up to 5 minutes later.
+        crate::claude_runner::invalidate_rotator_cache().await;
+
         info!(id, auth_type, "accounts.add completed");
         WsFrame::ok_response(
             "",
@@ -22973,6 +22981,12 @@ impl MethodHandler {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
         }
+
+        // Credentials doctrine P2 (WP-8A): the cached rotator holds the whole
+        // parsed [[accounts]] row including budget — invalidate so budget
+        // enforcement sees the new ceiling on the next call, not up to 5
+        // minutes later.
+        crate::claude_runner::invalidate_rotator_cache().await;
 
         info!(account_id, budget_cents, "accounts.update_budget completed");
         WsFrame::ok_response(
@@ -23055,6 +23069,12 @@ impl MethodHandler {
         if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
             return WsFrame::error_response("", &e);
         }
+
+        // Credentials doctrine P2 (WP-8A): priority/tags/profile changes also
+        // land in the cached rotator's parsed account list — invalidate so
+        // rotation strategy reflects them on the next call.
+        crate::claude_runner::invalidate_rotator_cache().await;
+
         info!(account_id, ?changes, "accounts.update completed");
         WsFrame::ok_response(
             "",
