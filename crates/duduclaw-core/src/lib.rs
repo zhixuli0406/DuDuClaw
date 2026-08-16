@@ -99,7 +99,9 @@ pub use spawn_admission::{
     QueuedSpawn,
 };
 pub use spawn_env::{
-    agent_cli_spawn_env_pairs, apply_agent_cli_env_allowlist, AGENT_CLI_ENV_ALLOWLIST,
+    agent_cli_spawn_env_pairs, agent_cli_spawn_env_pairs_for, apply_agent_cli_env_allowlist,
+    apply_agent_cli_env_allowlist_for, git_credentials_env_pairs, git_credentials_granted_names,
+    AGENT_CLI_ENV_ALLOWLIST, GIT_CREDENTIALS_ENV_ALLOWLIST,
 };
 pub use takeover_state::{
     BeginOutcome as TakeoverBeginOutcome, BeginRequest as TakeoverBeginRequest, TakeoverConfig,

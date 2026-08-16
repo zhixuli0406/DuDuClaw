@@ -250,6 +250,29 @@ pub fn log_contract_violation(home_dir: &Path, agent_id: &str, violated_rules: &
     append_audit_event(home_dir, &event);
 }
 
+/// Log that a spawn granted an agent-CLI subprocess access to one or more of
+/// the operator's git/SSH/GPG identity env vars (WP-10A, 2026-08): per-agent
+/// `agent.toml [capabilities] git_credentials = true` opt-in, layered on top
+/// of the WP-8B env-scrub allowlist (`duduclaw_core::spawn_env`). Since this
+/// hands the agent the operator's own push/signing identity, every spawn
+/// that actually carries one of the four names
+/// (`SSH_AUTH_SOCK`/`SSH_AGENT_PID`/`GPG_TTY`/`GNUPGHOME`) must be traceable
+/// to which agent received it. `env_names` carries only the env var *names*
+/// that were added — never values, matching every other audit record in
+/// this module. Call sites are expected to skip this call entirely when
+/// `env_names` is empty (nothing was granted, nothing to log).
+pub fn log_git_credentials_granted(home_dir: &Path, agent_id: &str, env_names: &[&str]) {
+    let event = AuditEvent::new(
+        "git_credentials_env_granted",
+        agent_id,
+        Severity::Warning,
+        serde_json::json!({
+            "env_names": env_names,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
 /// Log a skill quarantine event.
 pub fn log_skill_quarantined(home_dir: &Path, agent_id: &str, skill_name: &str, reason: &str) {
     let event = AuditEvent::new(
@@ -1435,6 +1458,37 @@ mod tests {
             assert!(r.get("timestamp").is_some());
             assert!(r.get("params_summary").is_some());
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── WP-10A: git/SSH/GPG credential env grant audit ─────────────────
+
+    #[test]
+    fn git_credentials_granted_is_audited_with_names_only_never_values() {
+        let home = fresh_home();
+        log_git_credentials_granted(&home, "agnes", &["SSH_AUTH_SOCK", "GNUPGHOME"]);
+
+        let events = read_recent_events(&home, 10);
+        assert_eq!(events.len(), 1, "exactly one audit row for the grant");
+        let e = &events[0];
+        assert_eq!(e.event_type, "git_credentials_env_granted");
+        assert_eq!(e.agent_id, "agnes");
+        assert!(
+            matches!(e.severity, Severity::Warning),
+            "handing over the operator's push/sign identity must be at least Warning"
+        );
+        let names: Vec<&str> = e.details["env_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["SSH_AUTH_SOCK", "GNUPGHOME"]);
+
+        // Never a value anywhere in the record — only the two known names.
+        let raw = serde_json::to_string(e).unwrap();
+        assert!(!raw.contains("/tmp"), "no path/value should leak into the audit record");
+
         let _ = std::fs::remove_dir_all(&home);
     }
 }

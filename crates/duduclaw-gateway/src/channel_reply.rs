@@ -7708,7 +7708,22 @@ async fn spawn_claude_cli_with_env(
     // allowlisted base (see `duduclaw_core::spawn_env`); the `api_key` /
     // `env_vars` (rotator-resolved) applications further below run AFTER
     // this and always win.
-    duduclaw_core::apply_agent_cli_env_allowlist(&mut cmd);
+    //
+    // WP-10A (2026-08): `_for` additionally seeds
+    // `SSH_AUTH_SOCK`/`SSH_AGENT_PID`/`GPG_TTY`/`GNUPGHOME` when this
+    // agent's `agent.toml [capabilities] git_credentials = true` — default
+    // `false` ⇒ byte-identical to the call above. Every spawn that actually
+    // carries one of those names is audit-logged (names only, never
+    // values).
+    let git_env_granted =
+        duduclaw_core::apply_agent_cli_env_allowlist_for(&mut cmd, capabilities);
+    if !git_env_granted.is_empty() {
+        let agent_id = work_dir
+            .and_then(|d| d.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        duduclaw_security::audit::log_git_credentials_granted(home_dir, agent_id, &git_env_granted);
+    }
 
     // Resume an existing Claude CLI session for multi-turn continuity.
     // Placed before `-p` so the CLI establishes session context first.
@@ -8904,8 +8919,13 @@ async fn spawn_claude_cli_pty_with_env(
     // subprocess too. Seed the map from the same allowlist as the legacy
     // spawn path (`duduclaw_core::spawn_env`) and pass `clear_env: true`
     // below so nothing outside this map + the allowlist reaches the child.
+    // WP-10A (2026-08): `_for` additionally seeds the git/SSH/GPG
+    // credential set when this agent's `agent.toml [capabilities]
+    // git_credentials = true` — default `false` ⇒ byte-identical to the
+    // plain `agent_cli_spawn_env_pairs()` this replaced. See the
+    // `spawn_claude_cli_with_env` sibling above for the same pattern.
     let mut env: std::collections::HashMap<String, String> =
-        duduclaw_core::agent_cli_spawn_env_pairs()
+        duduclaw_core::agent_cli_spawn_env_pairs_for(capabilities)
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect();
@@ -8923,6 +8943,15 @@ async fn spawn_claude_cli_pty_with_env(
         if caps.browser_via_bash {
             env.insert("DUDUCLAW_BROWSER_VIA_BASH".to_string(), "1".to_string());
         }
+    }
+
+    let git_env_granted = duduclaw_core::git_credentials_granted_names(capabilities);
+    if !git_env_granted.is_empty() {
+        let agent_id = work_dir
+            .and_then(|d| d.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        duduclaw_security::audit::log_git_credentials_granted(home_dir, agent_id, &git_env_granted);
     }
 
     // Caller-provided env wins. Empty value means "force-remove" — for
