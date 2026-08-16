@@ -16,9 +16,10 @@
 //! - **Cost-pressure aware** — when an agent has a hot `cost_pressure`
 //!   flag (#6.3), early stages become more aggressive (e.g. TurnTrim
 //!   threshold drops from 800 → 200 chars).
-//! - **Token estimation** uses the 1.5 chars/token CJK-aware heuristic
-//!   already used by `prompt_audit`, sharing the helper to keep the
-//!   estimate consistent across observability and enforcement.
+//! - **Token estimation** uses a CJK-aware heuristic (1.306 tokens/char
+//!   for CJK text, 1 token per 3.6 chars otherwise — 2026-08 local-corpus
+//!   calibration; see `estimate_tokens` below for why the old uniform
+//!   1.5 chars/token guess underestimated usage by ~22%).
 //!
 //! ## Stages
 //!
@@ -170,12 +171,52 @@ pub fn should_skip_for_cache(
     cache_eff > min_eff && overshoot < max_overshoot
 }
 
-/// Estimate the number of tokens in a chunk of text using the same
-/// 1.5 chars/token heuristic the rest of the gateway uses. CJK-safe via
-/// `chars().count()`.
+/// CJK codepoint class — CJK Unified Ideographs + extension A,
+/// Hiragana/Katakana, Hangul, CJK compatibility ideographs, full-width
+/// forms. Same ranges as the other CJK-aware estimators in the workspace
+/// (`duduclaw-llm::types::estimate_tokens`, `duduclaw-llm::provenance`),
+/// kept as a local copy rather than a shared import to avoid a cross-crate
+/// dependency for one small range table.
+fn is_cjk_char(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
+        | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
+}
+
+/// Calibrated tokens-per-char for CJK text (2026-08 local-corpus
+/// calibration against real tokenizer output).
+const CJK_TOKENS_PER_CHAR: f64 = 1.306;
+
+/// Calibrated chars-per-token for non-CJK text (same calibration pass).
+const NON_CJK_CHARS_PER_TOKEN: f64 = 3.6;
+
+/// Estimate the number of tokens in a chunk of text, CJK-aware.
+///
+/// bug3 (2026-08): the prior heuristic was a uniform `chars / 1.5`
+/// regardless of script, which underestimated real usage by ~22% on this
+/// deployment's mixed zh-TW/en corpus — 1.5 chars/token (0.667 tok/char)
+/// sits well *below* the calibrated CJK rate (1.306 tok/char), so
+/// CJK-heavy prompts were undercounted and `[budget] max_input_tokens`
+/// enforcement (`enforce_budget`/`enforce_budget_traced` below) could fire
+/// the compression pipeline too late — by the time the estimate crossed
+/// the configured ceiling, the real request had already blown well past
+/// it. Splitting the estimate by codepoint class fixes both directions:
+/// CJK text now counts for *more* (1.306 tok/char) and plain ASCII/latin
+/// text counts for *less* (1 token per 3.6 chars, matching real tokenizer
+/// behavior far better than the old 1.5 chars/token guess for English).
 pub fn estimate_tokens(text: &str) -> u64 {
-    let chars = text.chars().count();
-    ((chars as f64) / 1.5).ceil() as u64
+    let mut cjk_chars: u64 = 0;
+    let mut other_chars: u64 = 0;
+    for ch in text.chars() {
+        if is_cjk_char(ch) {
+            cjk_chars += 1;
+        } else {
+            other_chars += 1;
+        }
+    }
+    let tokens =
+        (cjk_chars as f64) * CJK_TOKENS_PER_CHAR + (other_chars as f64) / NON_CJK_CHARS_PER_TOKEN;
+    tokens.ceil() as u64
 }
 
 /// Estimate total tokens across system prompt, conversation history, and
@@ -429,19 +470,51 @@ mod tests {
 
     #[test]
     fn estimate_tokens_ascii() {
-        // "hello" is 5 chars → ceil(5/1.5) = 4 tokens.
-        assert_eq!(estimate_tokens("hello"), 4);
+        // "hello" is 5 non-CJK chars → ceil(5/3.6) = 2 tokens (calibrated
+        // 3.6 chars/token for non-CJK text — corrects the old uniform
+        // chars/1.5 heuristic, which overestimated plain ASCII).
+        assert_eq!(estimate_tokens("hello"), 2);
     }
 
     #[test]
     fn estimate_tokens_cjk() {
-        // 4 CJK chars → ceil(4/1.5) = 3 tokens.
-        assert_eq!(estimate_tokens("你好世界"), 3);
+        // 4 CJK chars → ceil(4 * 1.306) = 6 tokens (calibrated 1.306
+        // tokens/char for CJK text — corrects the old uniform chars/1.5
+        // heuristic, which underestimated CJK-heavy prompts, the root
+        // cause of bug3's ~22% overall underestimate on mixed corpora).
+        assert_eq!(estimate_tokens("你好世界"), 6);
     }
 
     #[test]
     fn estimate_tokens_empty() {
         assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_pure_cjk_matches_calibration() {
+        // 1000 CJK chars at 1.306 tok/char should land at (near-)exactly
+        // 1306 tokens — the calibrated corpus value, not an approximation.
+        let text: String = "嘟".repeat(1000);
+        let tokens = estimate_tokens(&text);
+        assert!((tokens as i64 - 1306).abs() <= 2, "got {tokens}");
+    }
+
+    #[test]
+    fn estimate_tokens_pure_ascii_matches_calibration() {
+        // 3600 ASCII chars at 3.6 chars/token should land at (near-)exactly
+        // 1000 tokens.
+        let text = "a".repeat(3600);
+        let tokens = estimate_tokens(&text);
+        assert!((tokens as i64 - 1000).abs() <= 2, "got {tokens}");
+    }
+
+    #[test]
+    fn estimate_tokens_mixed_cjk_and_ascii_blends_rates() {
+        // 500 CJK chars (≈653 tok) + 1800 ASCII chars (≈500 tok) ≈ 1153 tok.
+        // Confirms the two rates are applied per-class, not averaged.
+        let text = format!("{}{}", "你".repeat(500), "a".repeat(1800));
+        let tokens = estimate_tokens(&text);
+        assert!((tokens as i64 - 1153).abs() <= 2, "got {tokens}");
     }
 
     #[test]
@@ -457,7 +530,8 @@ mod tests {
             },
         ];
         let total = estimate_request_tokens("system prompt", &history, "user msg");
-        // 8 + 2 + 4 + 4 + 4 + 6 = 28 (approx, dominated by char counts)
+        // All ASCII: "system prompt"(13→4) + "hi"(2→1)+4 + "hello"(5→2)+4
+        // + "user msg"(8→3) = 18 under the calibrated non-CJK rate.
         // Just assert > 0 and reasonable bound.
         assert!(total > 10 && total < 100, "got {total}");
     }
@@ -591,13 +665,19 @@ mod tests {
 
     #[test]
     fn pipeline_uses_cost_pressure_to_compress_harder() {
-        // Compose a history that's just at the budget edge under normal
-        // trim but fits under cost_pressure trim.
-        let mid = "x".repeat(1_500); // ~1000 tokens
+        // Compose a history that's over budget pre-compression (bug3
+        // calibration: non-CJK is 3.6 chars/token, so this needs ~3600
+        // ASCII chars to land at ~1000 tokens — 1500 chars, the pre-bug3
+        // fixture size, is only ~417 tokens and no longer crosses the 600
+        // budget at all under the corrected rate, which made this test
+        // fail closed on `enforce_budget`'s fast path instead of exercising
+        // TurnTrim).
+        let mid = "x".repeat(3_600); // ~1000 tokens
         let history = vec![msg("assistant", &mid)];
 
-        // Without cost pressure: turn_trim caps at 800 chars → ~533
-        // tokens. With pressure: 200 chars → ~133 tokens.
+        // Without cost pressure: turn_trim caps at 800 chars → ~229
+        // tokens. With pressure: 200 chars → ~62 tokens. Both fit under
+        // the 600 budget, so both succeed — but pressure trims harder.
         let normal = enforce_budget(
             "s",
             history.clone(),
