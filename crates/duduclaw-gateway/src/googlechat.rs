@@ -56,14 +56,24 @@ const GCHAT_TEXT_CHUNK: usize = 4000;
 
 pub struct GoogleChatState {
     pub(crate) ctx: Arc<ReplyContext>,
-    project_number: String,
     creds: GoogleChatCreds,
 }
 
 /// Service-account credentials + token cache — separable from the webhook
 /// state so delegation forwarding / Computer Use can send without a
 /// `ReplyContext`.
+///
+/// Credentials doctrine P2 (WP-8A): `client_email` / `private_key` /
+/// `token_uri` are the values this handle was constructed with — the values
+/// actually used to sign a JWT-bearer assertion are re-read fresh from
+/// `home_dir` on every token *refresh* (see `get_token`), so a rotated
+/// service-account key takes effect within one refresh cycle instead of
+/// requiring the gateway to restart. The cached OAuth `token` itself keeps
+/// its TTL — a genuinely network-derived, short-lived session credential,
+/// which the doctrine's TTL-with-invalidation allowance (design §2.4)
+/// covers.
 pub struct GoogleChatCreds {
+    home_dir: std::path::PathBuf,
     /// From the service-account JSON key.
     client_email: String,
     private_key: String,
@@ -74,17 +84,32 @@ pub struct GoogleChatCreds {
 }
 
 impl GoogleChatCreds {
-    /// Parse a service-account JSON key into a creds handle.
-    pub(crate) fn from_service_account_json(sa_json: &str) -> Option<GoogleChatCreds> {
+    /// Parse `{client_email, private_key, token_uri}` out of a service-account
+    /// JSON key. Shared by construction and by `get_token`'s refresh path so
+    /// there is exactly one parser.
+    fn parse_service_account_json(sa_json: &str) -> Option<(String, String, String)> {
         let sa: serde_json::Value = serde_json::from_str(sa_json).ok()?;
-        Some(GoogleChatCreds {
-            client_email: sa.get("client_email")?.as_str()?.to_string(),
-            private_key: sa.get("private_key")?.as_str()?.to_string(),
-            token_uri: sa
-                .get("token_uri")
+        Some((
+            sa.get("client_email")?.as_str()?.to_string(),
+            sa.get("private_key")?.as_str()?.to_string(),
+            sa.get("token_uri")
                 .and_then(|v| v.as_str())
                 .unwrap_or("https://oauth2.googleapis.com/token")
                 .to_string(),
+        ))
+    }
+
+    /// Parse a service-account JSON key into a creds handle.
+    pub(crate) fn from_service_account_json(
+        sa_json: &str,
+        home_dir: &Path,
+    ) -> Option<GoogleChatCreds> {
+        let (client_email, private_key, token_uri) = Self::parse_service_account_json(sa_json)?;
+        Some(GoogleChatCreds {
+            home_dir: home_dir.to_path_buf(),
+            client_email,
+            private_key,
+            token_uri,
             token: RwLock::new((String::new(), std::time::Instant::now())),
             // 30s request timeout like every other channel client. A bare
             // `Client::new()` has NO request timeout, and `get_token()` is
@@ -104,7 +129,7 @@ impl GoogleChatCreds {
         if sa_json.trim().is_empty() {
             return None;
         }
-        Self::from_service_account_json(&sa_json)
+        Self::from_service_account_json(&sa_json, home_dir)
     }
 
     /// Get (or refresh) the service-account access token (JWT-bearer grant).
@@ -117,18 +142,41 @@ impl GoogleChatCreds {
             }
         }
 
+        // WP-8A: re-read the service-account JSON fresh at refresh time
+        // instead of trusting the fields this handle was constructed with —
+        // a rotated key (e.g. after a leak) takes effect on the very next
+        // refresh. Falls back to the construction-time values only when the
+        // current config can't be read at all (transient I/O, or a
+        // `home_dir`-less handle from `from_service_account_json` used
+        // directly) — this is an outbound credential, not a security gate,
+        // so failing open to "try with the last known key" is preferable to
+        // breaking every send on a momentary read hiccup.
+        let (client_email, private_key, token_uri) =
+            match read_config(&self.home_dir, "googlechat_service_account_json").await {
+                Some(json) if !json.trim().is_empty() => Self::parse_service_account_json(&json)
+                    .ok_or_else(|| {
+                        "googlechat_service_account_json is not a valid service-account key"
+                            .to_string()
+                    })?,
+                _ => (
+                    self.client_email.clone(),
+                    self.private_key.clone(),
+                    self.token_uri.clone(),
+                ),
+            };
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_secs();
         let claims = serde_json::json!({
-            "iss": self.client_email,
+            "iss": client_email,
             "scope": CHAT_SCOPE,
-            "aud": self.token_uri,
+            "aud": token_uri,
             "iat": now,
             "exp": now + 3600,
         });
-        let key = jsonwebtoken::EncodingKey::from_rsa_pem(self.private_key.as_bytes())
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes())
             .map_err(|e| format!("service-account key: {e}"))?;
         let assertion = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
@@ -139,7 +187,7 @@ impl GoogleChatCreds {
 
         let resp = self
             .http
-            .post(&self.token_uri)
+            .post(&token_uri)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", assertion.as_str()),
@@ -177,10 +225,13 @@ pub async fn start_googlechat_webhook(
         error!("Google Chat: googlechat_service_account_json missing or not a valid service-account key");
         return None;
     };
+    // project_number above (checked non-empty) is used only to decide
+    // whether to mount the router at all — the webhook handler re-reads it
+    // fresh on every request instead of trusting this value for the task's
+    // entire lifetime (WP-8A: see its call site's comment).
 
     let state = Arc::new(GoogleChatState {
         ctx: ctx.clone(),
-        project_number,
         creds,
     });
 
@@ -221,12 +272,22 @@ async fn webhook_handler(
         warn!("Google Chat webhook: missing bearer token");
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     };
+    // WP-8A: re-read fresh for this request instead of trusting a value
+    // captured at task-spawn time. Fail-closed if it has since been unset.
+    let project_number = match read_config(&state.ctx.home_dir, "googlechat_project_number").await
+    {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => {
+            warn!("Google Chat webhook: project_number not configured — rejecting request");
+            return (StatusCode::UNAUTHORIZED, "not configured").into_response();
+        }
+    };
     if let Err(e) = crate::webhook_jwt::verify_rs256(
         &state.creds.http,
         token,
         CHAT_JWKS_URL,
         CHAT_ISSUER,
-        &state.project_number,
+        &project_number,
     )
     .await
     {
@@ -784,5 +845,81 @@ mod tests {
             reference: GchatAttachmentRef::Drive { file_id: "d".into() },
         };
         assert_eq!(unknown.effective_filename(), "file.bin");
+    }
+
+    // ── WP-8A / credentials doctrine P2 ─────────────────────────────────
+
+    const TEST_SA_JSON: &str = r#"{
+        "client_email": "bot@my-project.iam.gserviceaccount.com",
+        "private_key": "-----BEGIN PRIVATE KEY-----\nFAKE\n-----END PRIVATE KEY-----\n",
+        "token_uri": "https://oauth2.googleapis.com/token"
+    }"#;
+
+    #[test]
+    fn parse_service_account_json_extracts_the_three_fields() {
+        let (email, key, uri) =
+            GoogleChatCreds::parse_service_account_json(TEST_SA_JSON).expect("valid SA JSON");
+        assert_eq!(email, "bot@my-project.iam.gserviceaccount.com");
+        assert!(key.contains("FAKE"));
+        assert_eq!(uri, "https://oauth2.googleapis.com/token");
+    }
+
+    #[test]
+    fn parse_service_account_json_defaults_token_uri_when_absent() {
+        let json = r#"{"client_email":"e","private_key":"k"}"#;
+        let (_, _, uri) = GoogleChatCreds::parse_service_account_json(json).unwrap();
+        assert_eq!(uri, "https://oauth2.googleapis.com/token");
+    }
+
+    #[test]
+    fn parse_service_account_json_rejects_missing_fields_and_garbage() {
+        assert!(GoogleChatCreds::parse_service_account_json("{}").is_none());
+        assert!(
+            GoogleChatCreds::parse_service_account_json(r#"{"client_email":"e"}"#).is_none(),
+            "missing private_key"
+        );
+        assert!(GoogleChatCreds::parse_service_account_json("not json").is_none());
+    }
+
+    /// `get_token`'s refresh path re-reads the service-account JSON from
+    /// `home_dir` fresh (WP-8A) — this pins down the primitive it depends on:
+    /// two resolves against a changed config see different credentials, with
+    /// no process-lifetime caching of the key material itself (only the
+    /// derived OAuth token is cached, on its own TTL).
+    #[tokio::test]
+    async fn from_config_reflects_a_rotated_service_account_key_without_any_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // `encrypt_value` only cares about the plaintext bytes — the JSON's
+        // own internal newlines (both the pretty-printed structure and the
+        // PEM key's `\n` escapes) survive the round trip untouched; no
+        // TOML-unsafe characters ever land in config.toml because only the
+        // base64 ciphertext is written there.
+        let enc = crate::config_crypto::encrypt_value(TEST_SA_JSON, home).unwrap();
+        tokio::fs::write(
+            home.join("config.toml"),
+            format!("[channels]\ngooglechat_service_account_json_enc = \"{enc}\"\n"),
+        )
+        .await
+        .unwrap();
+
+        let creds1 = GoogleChatCreds::from_config(home).await.expect("configured");
+        assert_eq!(creds1.client_email, "bot@my-project.iam.gserviceaccount.com");
+
+        // Rotate to a different service account.
+        let rotated_json = TEST_SA_JSON.replace("bot@my-project", "rotated-bot@my-project");
+        let enc2 = crate::config_crypto::encrypt_value(&rotated_json, home).unwrap();
+        tokio::fs::write(
+            home.join("config.toml"),
+            format!("[channels]\ngooglechat_service_account_json_enc = \"{enc2}\"\n"),
+        )
+        .await
+        .unwrap();
+
+        let creds2 = GoogleChatCreds::from_config(home).await.expect("still configured");
+        assert_eq!(
+            creds2.client_email, "rotated-bot@my-project.iam.gserviceaccount.com",
+            "a fresh from_config must see the rotated key, not a cached first read"
+        );
     }
 }

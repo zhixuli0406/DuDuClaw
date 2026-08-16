@@ -180,9 +180,13 @@ pub fn lookup_session_ref(home_dir: &Path, conversation_id: &str) -> Option<Sess
 
 // ── Shared state ────────────────────────────────────────────────
 
+/// Credentials doctrine P2 (WP-8A): `app_secret` is NOT stored here — the
+/// webhook handler re-reads it from config fresh on every request (mirroring
+/// `line.rs`'s per-request pattern), so a rotated AppSecret is honoured on
+/// the very next callback instead of requiring this task or the gateway to
+/// restart.
 struct DingTalkState {
     ctx: Arc<ReplyContext>,
-    app_secret: String,
     http: reqwest::Client,
 }
 
@@ -196,10 +200,13 @@ pub async fn start_dingtalk_webhook(home_dir: &Path, ctx: Arc<ReplyContext>) -> 
     }
 
     info!("📌 DingTalk webhook starting");
+    // app_secret above is used only to decide whether to mount the router at
+    // all — intentionally not stored in `DingTalkState` (WP-8A: see its doc
+    // comment).
+    let _ = &app_secret;
 
     let state = Arc::new(DingTalkState {
         ctx: ctx.clone(),
-        app_secret,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -244,7 +251,16 @@ async fn handle_webhook(
         warn!("DingTalk webhook missing timestamp/sign headers — rejecting");
         return (StatusCode::UNAUTHORIZED, "missing signature".into());
     }
-    if !verify_dingtalk_callback(timestamp, sign, &state.app_secret, now_ms()) {
+    // WP-8A: re-read fresh for this request rather than trust a value
+    // captured at task-spawn time. Fail-closed if it has since been unset.
+    let app_secret = match read_dingtalk_config(&state.ctx.home_dir, "dingtalk_app_secret").await {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            warn!("DingTalk webhook: app_secret not configured — rejecting request");
+            return (StatusCode::UNAUTHORIZED, "not configured".into());
+        }
+    };
+    if !verify_dingtalk_callback(timestamp, sign, &app_secret, now_ms()) {
         warn!("DingTalk webhook signature mismatch or stale timestamp — rejecting");
         return (StatusCode::UNAUTHORIZED, "invalid signature".into());
     }

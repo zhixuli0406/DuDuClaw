@@ -60,10 +60,16 @@ struct SendMessageBody {
 
 struct FeishuState {
     ctx: Arc<ReplyContext>,
-    app_id: String,
-    app_secret: String,
-    verification_token: String,
-    /// Cached tenant access token (refreshed every 2 hours)
+    /// Cached tenant access token (refreshed every 2 hours) — a genuinely
+    /// network-derived, short-lived session token, which the credentials
+    /// doctrine's TTL-with-invalidation allowance (design §2.4) covers.
+    ///
+    /// Credentials doctrine P2 (WP-8A): `app_id` / `app_secret` /
+    /// `verification_token` themselves are deliberately NOT stored on this
+    /// struct — every use re-resolves them from config via `ctx.home_dir`
+    /// (mirroring `line.rs`'s per-request pattern), so a dashboard credential
+    /// edit takes effect on the very next inbound webhook or outbound token
+    /// refresh instead of requiring this task (or the gateway) to restart.
     token: RwLock<(String, std::time::Instant)>,
     http: reqwest::Client,
 }
@@ -78,13 +84,21 @@ impl FeishuState {
             }
         }
 
-        // Refresh token
+        // Refresh token — re-read app_id/app_secret fresh rather than trust a
+        // value captured at task-spawn time (WP-8A).
+        let app_id = read_feishu_config(&self.ctx.home_dir, "feishu_app_id")
+            .await
+            .ok_or_else(|| "Feishu app_id not configured".to_string())?;
+        let app_secret = read_feishu_config(&self.ctx.home_dir, "feishu_app_secret")
+            .await
+            .ok_or_else(|| "Feishu app_secret not configured".to_string())?;
+
         let resp: TokenResponse = self
             .http
             .post(format!("{FEISHU_API}/auth/v3/tenant_access_token/internal"))
             .json(&serde_json::json!({
-                "app_id": self.app_id,
-                "app_secret": self.app_secret,
+                "app_id": app_id,
+                "app_secret": app_secret,
             }))
             .send()
             .await
@@ -133,12 +147,12 @@ pub async fn start_feishu_webhook(
     }
 
     info!("📲 Feishu webhook starting (app: {app_id})");
+    // app_id / app_secret / verification_token above are used only to decide
+    // whether to mount the router at all — they are intentionally not stored
+    // in `FeishuState` (WP-8A: see its doc comment).
 
     let state = Arc::new(FeishuState {
         ctx,
-        app_id,
-        app_secret,
-        verification_token,
         token: RwLock::new((String::new(), std::time::Instant::now())),
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -173,6 +187,19 @@ async fn handle_webhook(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
+    // WP-8A / credentials doctrine P2: re-read the verification token fresh
+    // on every request instead of trusting a value captured at task-spawn
+    // time — mirrors `line.rs`'s per-request resolve. Fail-closed: if it has
+    // since been unset, reject rather than fall back to whatever was
+    // configured at startup.
+    let verification_token = match read_feishu_config(&state.ctx.home_dir, "feishu_verification_token").await {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            warn!("Feishu webhook: verification_token not configured — rejecting request");
+            return (StatusCode::UNAUTHORIZED, "not configured").into_response();
+        }
+    };
+
     // M3: when Feishu signs the request (X-Lark-Signature present), verify the
     // signature against the raw body BEFORE parsing. This authenticates the
     // request cryptographically rather than relying only on the in-body token.
@@ -185,7 +212,7 @@ async fn handle_webhook(
             .get("X-Lark-Request-Nonce")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !verify_feishu_signature(timestamp, nonce, &state.verification_token, &body, sig) {
+        if !verify_feishu_signature(timestamp, nonce, &verification_token, &body, sig) {
             warn!("Feishu webhook signature mismatch — rejecting request");
             return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
         }
@@ -199,10 +226,10 @@ async fn handle_webhook(
         }
     };
 
-    // Verify the in-body verification token (always configured — startup
-    // refuses to run without it). Constant-time compare to avoid timing leaks.
+    // Verify the in-body verification token. Constant-time compare to avoid
+    // timing leaks.
     if let Some(token) = event.token.as_deref() {
-        if !constant_time_eq(token.as_bytes(), state.verification_token.as_bytes()) {
+        if !constant_time_eq(token.as_bytes(), verification_token.as_bytes()) {
             warn!("Feishu webhook token mismatch — possible spoofed request");
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }

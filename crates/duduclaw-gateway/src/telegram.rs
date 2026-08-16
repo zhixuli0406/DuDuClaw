@@ -388,8 +388,13 @@ async fn spawn_telegram_bot(
         }
     }
 
+    // WP-8A / credentials doctrine P2: hand the *token* to `poll_loop`, not
+    // the pre-built `api_base` — the loop re-resolves it from the live config
+    // every polling cycle instead of holding it fixed for the task's entire
+    // lifetime, so a token change lands within one `getUpdates` cycle instead
+    // of requiring this task (or the gateway) to be restarted.
     let handle = tokio::spawn(async move {
-        poll_loop(client, api_base, ctx, label, agent_name).await;
+        poll_loop(client, token, ctx, label, agent_name).await;
     });
 
     Some(handle)
@@ -473,14 +478,52 @@ async fn read_telegram_token(home_dir: &Path) -> Option<String> {
         .map(|t| crate::config_crypto::repair_telegram_token(&t).into_owned())
 }
 
+/// Re-resolve this bot's token from the live config.
+///
+/// WP-8A / credentials doctrine P2: mirrors exactly how [`start_telegram_bots`]
+/// resolved it the first time — global via [`read_telegram_token`], per-agent
+/// via `resolve_agent_token` against the agent's *current* registry snapshot —
+/// so [`poll_loop`] can call this every polling cycle instead of the token
+/// being baked in once at task-spawn time for the task's entire lifetime.
+/// `None` means "not configured right now"; the caller decides how many
+/// consecutive misses justify treating that as authoritative (a registry read
+/// can transiently miss during a reload, so one miss must not kill the poller
+/// — see `MAX_MISSING_TOKEN` below).
+async fn resolve_current_token(ctx: &Arc<ReplyContext>, agent_name: Option<&str>) -> Option<String> {
+    match agent_name {
+        None => read_telegram_token(&ctx.home_dir).await,
+        Some(name) => {
+            let tg_cfg = {
+                let reg = ctx.registry.read().await;
+                reg.list()
+                    .into_iter()
+                    .find(|a| a.config.agent.name == name)
+                    .and_then(|a| a.config.channels.as_ref()?.telegram.clone())
+            }?;
+            let sm_cfg = duduclaw_security::secret_manager::SecretManagerConfig::load_from_home(
+                &ctx.home_dir,
+            )
+            .await;
+            let token = crate::config_crypto::resolve_agent_token(
+                &tg_cfg.bot_token_enc,
+                &tg_cfg.bot_token,
+                &ctx.home_dir,
+                &sm_cfg,
+            )
+            .await?;
+            Some(crate::config_crypto::repair_telegram_token(token.expose()).into_owned())
+        }
+    }
+}
 
 async fn poll_loop(
     client: reqwest::Client,
-    api_base: String,
+    mut token: String,
     ctx: Arc<ReplyContext>,
     label: String,
     agent_name: Option<String>,
 ) {
+    let mut api_base = format!("{TELEGRAM_API}/bot{token}");
     let mut offset: i64 = 0;
     let mut consecutive_errors: u32 = 0;
     /// Consecutive authoritative auth rejections (401/404) after which the
@@ -488,6 +531,11 @@ async fn poll_loop(
     /// loop: a genuinely bad token must not be polled forever.
     const MAX_AUTH_REJECTIONS: u32 = 3;
     let mut auth_rejections: u32 = 0;
+    /// Consecutive "not configured" answers from [`resolve_current_token`]
+    /// before the poller gives up — see that function's doc for why this
+    /// can't be 1.
+    const MAX_MISSING_TOKEN: u32 = 3;
+    let mut missing_token_count: u32 = 0;
     info!("Telegram polling started");
 
     // M4 note: `consecutive_errors` is intentionally NOT a give-up condition for
@@ -500,6 +548,37 @@ async fn poll_loop(
     let bot_username = get_bot_username(&client, &api_base).await.unwrap_or_default();
 
     loop {
+        // WP-8A / credentials doctrine P2: re-resolve the token from the live
+        // config every cycle instead of trusting the value this task was
+        // spawned with. `getUpdates` is exclusive per token but not tied to a
+        // persistent connection, so swapping mid-loop is safe — it is just a
+        // different URL on the next HTTP call, not a reconnect.
+        match resolve_current_token(&ctx, agent_name.as_deref()).await {
+            Some(fresh) => {
+                missing_token_count = 0;
+                if fresh != token {
+                    info!("Telegram [{label}] credential rotated — switching to the newly configured token, no restart needed");
+                    token = fresh;
+                    api_base = format!("{TELEGRAM_API}/bot{token}");
+                }
+            }
+            None => {
+                missing_token_count += 1;
+                if missing_token_count >= MAX_MISSING_TOKEN {
+                    warn!("Telegram [{label}] token no longer configured — stopping poller");
+                    set_channel_connected(
+                        &ctx.channel_status,
+                        &label,
+                        false,
+                        Some("Bot Token 已移除".to_string()),
+                        Some(&ctx.event_tx),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
         let url = format!("{api_base}/getUpdates?offset={offset}&timeout=25&allowed_updates=[\"message\",\"callback_query\"]");
 
         let resp = match client.get(&url).send().await {
@@ -915,9 +994,11 @@ async fn poll_loop(
                 // Telegram (sendDocument) and strip the marker from the text.
                 // Byte-identical no-op when the reply carries no marker.
                 let reply = {
-                    let token = api_base.rsplitn(2, "/bot").next().unwrap_or_default().to_string();
+                    // WP-8A: `token` is the loop's own first-class credential
+                    // state (see `resolve_current_token` above) — no more
+                    // reverse-parsing it back out of `api_base`.
                     let sender = crate::channel_sender::TelegramSender {
-                        bot_token: token,
+                        bot_token: token.clone(),
                         chat_id: chat_id.to_string(),
                         http: client.clone(),
                     };
@@ -2220,5 +2301,80 @@ mod wp12_resilience_tests {
         // A multi-day outage must not overflow the shift.
         assert_eq!(secs(1_000), 60);
         assert_eq!(secs(u32::MAX), 60);
+    }
+}
+
+/// WP-8A / credentials doctrine P2 (item #3): `poll_loop` re-resolves its
+/// token every polling cycle via `read_telegram_token` (global bot) instead
+/// of holding the value baked into `api_base` for the task's entire
+/// lifetime. This module pins down the primitive that makes that possible —
+/// `read_telegram_token` genuinely re-reads `config.toml` on every call, so a
+/// dashboard credential edit is visible on the very next poll iteration
+/// without restarting the bot task or the gateway. (`resolve_current_token`'s
+/// per-agent branch additionally needs a populated `AgentRegistry` inside a
+/// full `ReplyContext`, which none of this crate's channel test modules
+/// construct — that branch's registry lookup is exercised indirectly by the
+/// full gateway test suite instead.)
+#[cfg(test)]
+mod wp8a_live_token_reread_tests {
+    use super::*;
+
+    async fn write_config(home: &Path, body: &str) {
+        tokio::fs::write(home.join("config.toml"), body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_telegram_token_reflects_a_config_edit_without_any_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        write_config(home, "[channels]\ntelegram_bot_token = \"111:AAAoriginal\"\n").await;
+        assert_eq!(
+            read_telegram_token(home).await.as_deref(),
+            Some("111:AAAoriginal")
+        );
+
+        // Simulate a dashboard credential edit landing on disk between two
+        // poll iterations — no gateway restart, no bot-task restart.
+        write_config(home, "[channels]\ntelegram_bot_token = \"222:BBBrotated\"\n").await;
+        assert_eq!(
+            read_telegram_token(home).await.as_deref(),
+            Some("222:BBBrotated"),
+            "a second read must see the rotated token, not a cached first read"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_telegram_token_reflects_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_config(home, "[channels]\ntelegram_bot_token = \"111:AAAoriginal\"\n").await;
+        assert!(read_telegram_token(home).await.is_some());
+
+        // Explicit removal marker (blank key) — WP-H1 empty-is-unset.
+        write_config(home, "[channels]\ntelegram_bot_token = \"\"\n").await;
+        assert_eq!(
+            read_telegram_token(home).await,
+            None,
+            "a removed token must read as unset on the very next call"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_telegram_token_repairs_a_lost_colon_on_every_read() {
+        // WP12 repair (missing ':' separator) must survive the WP-8A
+        // refactor that moved token resolution off the single-read-at-spawn
+        // path onto a repeated per-cycle read.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write_config(
+            home,
+            "[channels]\ntelegram_bot_token = \"123456789-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
+        )
+        .await;
+        assert_eq!(
+            read_telegram_token(home).await.as_deref(),
+            Some("123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
     }
 }
