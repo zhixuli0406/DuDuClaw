@@ -1081,25 +1081,17 @@ async fn resolve_api_key(home_dir: &Path, table: &toml::Table) -> String {
 
 /// Standard environment-variable name(s) for a provider's API key.
 ///
-/// Mirrors `duduclaw_llm::resolve_env_key` (the agent crate must NOT depend on
-/// `duduclaw-llm`, so the map is inlined here). The FIRST name is the canonical
-/// one emitted onto a subprocess; the remaining names are accepted aliases when
-/// *reading* an env-var fallback value. Unknown providers → empty slice.
+/// Thin delegate to `duduclaw_core::provider_env::provider_env_key_names`, the
+/// single source of truth for this table (WP-8B, `commercial/docs/DESIGN-credentials-doctrine-2026-08.md`
+/// §3 P3). `duduclaw-agent` already depends on `duduclaw-core` (see
+/// `Cargo.toml`), so there is no new dependency edge — this used to be a third
+/// hand-copied table that had already drifted in comments from the canonical
+/// one; behavior (match arms) was verified byte-identical before collapsing.
+/// The FIRST name is the canonical one emitted onto a subprocess; the
+/// remaining names are accepted aliases when *reading* an env-var fallback
+/// value. Unknown providers → empty slice.
 fn provider_env_key_names(provider: &str) -> &'static [&'static str] {
-    match provider {
-        "anthropic" => &["ANTHROPIC_API_KEY"],
-        "openai" => &["OPENAI_API_KEY"],
-        "gemini" | "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "minimax" => &["MINIMAX_API_KEY"],
-        "groq" => &["GROQ_API_KEY"],
-        "together" => &["TOGETHER_API_KEY"],
-        "mistral" => &["MISTRAL_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
-        "xai" => &["XAI_API_KEY"],
-        "qwen" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
-        _ => &[],
-    }
+    duduclaw_core::provider_env::provider_env_key_names(provider)
 }
 
 /// Human-facing catalogue of consumer subscription sources the rotator can
@@ -2443,5 +2435,56 @@ mod wp8a_secret_ref_consolidation_tests {
         let home = TempHome::new();
         let table: toml::Table = "".parse().unwrap();
         assert_eq!(resolve_oauth_token(home.path(), &table).await, None);
+    }
+}
+
+/// WP-10C: `provider_env_key_names` here is now a thin delegate to
+/// `duduclaw_core::provider_env::provider_env_key_names` — the third
+/// hand-copied table collapsed onto the WP-8B single source of truth. These
+/// tests pin the delegation itself so a future edit to either side can't
+/// silently re-diverge without a red test.
+#[cfg(test)]
+mod wp10c_provider_env_delegation_tests {
+    use super::provider_env_key_names;
+
+    /// Every known provider must resolve to exactly the same name list as the
+    /// canonical `duduclaw-core` table — this is the whole point of the
+    /// delegation (not just "non-empty", but byte-identical).
+    #[test]
+    fn matches_core_table_for_every_known_provider() {
+        for provider in duduclaw_core::provider_env::KNOWN_PROVIDER_IDS {
+            assert_eq!(
+                provider_env_key_names(provider),
+                duduclaw_core::provider_env::provider_env_key_names(provider),
+                "agent-crate delegate diverged from duduclaw-core for provider `{provider}`"
+            );
+        }
+    }
+
+    /// Spot-check the two multi-name providers plus the alias pair, matching
+    /// the pre-consolidation table's asserted shape.
+    #[test]
+    fn known_provider_shapes_are_unchanged() {
+        assert_eq!(provider_env_key_names("anthropic"), &["ANTHROPIC_API_KEY"]);
+        assert_eq!(provider_env_key_names("openai"), &["OPENAI_API_KEY"]);
+        assert_eq!(
+            provider_env_key_names("gemini"),
+            &["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+        );
+        assert_eq!(
+            provider_env_key_names("gemini"),
+            provider_env_key_names("google"),
+            "gemini/google must remain aliases"
+        );
+        assert_eq!(
+            provider_env_key_names("qwen"),
+            &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]
+        );
+    }
+
+    /// Unknown provider ids must still return an empty slice, never a guess.
+    #[test]
+    fn unknown_provider_is_empty() {
+        assert!(provider_env_key_names("totally-unknown-vendor").is_empty());
     }
 }
