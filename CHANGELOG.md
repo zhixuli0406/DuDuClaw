@@ -14,6 +14,11 @@
 - **任務詳情頁統一（I-2c）**：`/goals` 點任務改導向 `/tasks/:id` 正式詳情頁，舊的 goal dialog 移除、內容併入四分頁詳情（驗收/風險/產出/kickoff/輪次＋活動時間軸＋MAV 徽章）；`/goals?task=` 保留為轉址相容層。needs_human 三按鈕審批動線不變，goal 任務旁補上先前 dashboard 漏掉的第 4 顆「交給我」按鈕（對齊通道卡片本有的四按鈕）。
 - **`task_row_to_json` 輸出 `archived`/`pinned`**：`tasks.list`／`task.updated` 廣播現在帶這兩個狀態欄位。
 
+### Security
+- **credentials P2 零重啟輪換**：改過憑證不再需要重啟 gateway。帳號池（Claude/OAuth/API key）寫入（`accounts.add`/`update`/`update_budget`）觸發 rotator 快取失效，同進程即時生效（取代原本 5 分鐘 TTL；跨行程 CLI 直寫 `config.toml` 因打不到行程內失效仍留 30 分鐘 backstop）；Telegram 每輪 `getUpdates` 重解析 token（不再烤進 api_base）；Feishu／WhatsApp／WeCom／DingTalk／Google Chat／Teams 六個 webhook 通道 inbound 驗簽改 per-request resolve（比照 LINE），outbound 衍生 session token 保留有界 TTL；Odoo 全域／per-agent 憑證更新後下次呼叫即重連（`set_global` 改 `disconnect_all`，並修掉 profile 變更導致孤兒連線永不釋放的 bug）。仍需重啟：Discord／Slack（WebSocket 長駐連線持有 token）。
+- **credentials P3 env 擦洗**：spawn 官方 CLI 子行程改用白名單 env（`duduclaw-core/spawn_env.rs`）——只傳 PATH/HOME 等非敏感必需項，濾除所有 `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`；vendor 金鑰改由呼叫端顯式注入（rotator 解析的帳號 env），子行程不再繼承 gateway 的 `ANTHROPIC_API_KEY` 等。型別層測試焊死白名單不得含密鑰形狀名字。**行為變更**：白名單刻意排除 `SSH_AUTH_SOCK`/`GNUPGHOME`——靠 SSH/GPG 從 spawn 出的 CLI 做 git push／簽章的 agent 會受影響（範圍窄，屬應經 per-agent 明確授權而非全域白名單放行的能力）。
+- **secret:// resolver 收斂第二輪**：`account_rotator`（2 處）與 `duduclaw-cli/mcp.rs`（2 處）各自手刻的「`_enc` 解密→明文 fallback→`secret://` 參照」實作收斂到 `duduclaw-security::secret_ref` 單一 resolver；順帶修掉 Odoo 一處加密指標字面值外送洩漏（變嚴）。provider→env 名稱表三份收斂成一份權威（`duduclaw-core/provider_env.rs`）＋一致性測試，並修掉 `is_available` 誤報 TOGETHER/MISTRAL 可用的假陽性。
+
 ### Fixed
 - **`estimate_tokens` CJK 校準**：從對所有字元一律 `chars/1.5` 改成依 codepoint 分類（CJK 1.306 tok/char、非 CJK 1/3.6，沿用 `duduclaw-llm` 既有 Unicode range），修正約 22% 低估——先前低估會讓 `[budget] max_input_tokens` 壓縮閘觸發過晚。
 - **`--exclude-dynamic-system-prompt-sections` 空操作移除**：該旗標與 `--system-prompt-file` 併用時被 CLI 忽略（活測 total_ctx 帶不帶逐位相同），三處無效使用移除、修正基於錯誤前提的註解。
