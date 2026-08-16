@@ -2211,7 +2211,30 @@ pub(crate) async fn get_inference_mode(home_dir: &Path) -> String {
     mode
 }
 
-/// Cached AccountRotator — avoids rebuilding on every call (BE-H4).
+/// Cached AccountRotator — avoids rebuilding (and re-running `claude auth
+/// status` for OAuth accounts) on every call (BE-H4).
+///
+/// Credentials doctrine P2 (WP-8A): invalidate-on-write is now the *primary*
+/// mechanism, not a timer. Every write path this process knows about
+/// (`accounts.add` / `accounts.update` / `accounts.update_budget`) calls
+/// [`invalidate_rotator_cache`] directly, so those edits are visible on the
+/// very next call instead of after up to five minutes — this is what the
+/// doctrine's §2.4 "callers must not cache a resolved value on their own
+/// schedule" is asking for, and what closes the design doc's §4.2 "rotator
+/// 5-minute TTL" incident class.
+///
+/// The `Instant` this cache still carries is deliberately **not** the same
+/// TTL that used to gate every read — it is a long backstop (see
+/// [`ROTATOR_CACHE_BACKSTOP_TTL`]) for the one write path invalidate-on-write
+/// structurally cannot reach: `duduclaw auth device` (and any other CLI
+/// subcommand that edits `config.toml [[accounts]]`) runs as its own
+/// process and has no way to call a `static` living in a *different*
+/// process's memory. Before this change, the flat 5-minute TTL was
+/// (accidentally) also this path's only safety net; a bare "cache forever
+/// until an in-process write invalidates it" would have silently regressed
+/// that case from "up to 5 minutes stale" to "stale until the gateway is
+/// restarted". The backstop keeps the eventual-consistency property for
+/// out-of-band writes while every write this process CAN see stays instant.
 static ROTATOR_CACHE: std::sync::OnceLock<
     tokio::sync::RwLock<
         Option<(
@@ -2220,6 +2243,14 @@ static ROTATOR_CACHE: std::sync::OnceLock<
         )>,
     >,
 > = std::sync::OnceLock::new();
+
+/// Backstop-only TTL for [`ROTATOR_CACHE`] — long enough that it is never the
+/// mechanism a same-process credential edit relies on (those go through
+/// [`invalidate_rotator_cache`] and take effect immediately), short enough
+/// that an out-of-band `config.toml` edit (a separate `duduclaw` CLI
+/// invocation, or a hand edit) is still picked up within a bounded window
+/// rather than requiring a gateway restart.
+const ROTATOR_CACHE_BACKSTOP_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// Mutex protecting rotator rebuild — prevents concurrent `claude auth status` subprocesses.
 static ROTATOR_INIT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -2432,7 +2463,9 @@ async fn call_local_inference(
     Ok(response.text)
 }
 
-/// Get or create a cached AccountRotator (refreshes every 5 minutes).
+/// Get or create a cached AccountRotator — valid until a credential write
+/// invalidates it (see [`invalidate_rotator_cache`]) or the long backstop TTL
+/// elapses, whichever comes first.
 /// Public accessor for the cached rotator — used by handlers.rs too.
 pub async fn get_rotator_cached(
     home_dir: &Path,
@@ -2441,9 +2474,12 @@ pub async fn get_rotator_cached(
 }
 
 /// Drop the cached `AccountRotator` so the next `get_rotator_cached` rebuilds
-/// from the current `config.toml`. Call after mutating accounts (e.g. a
-/// one-click login that just added an OAuth token) so the dashboard reflects it
-/// immediately instead of after the 5-minute TTL.
+/// from the current `config.toml`.
+///
+/// Credentials doctrine P2: this is the primary invalidation path — every
+/// write path *this process* can see (`accounts.add` / `accounts.update` /
+/// `accounts.update_budget`) MUST call this so the edit is visible on the
+/// very next call, not up to [`ROTATOR_CACHE_BACKSTOP_TTL`] later.
 pub async fn invalidate_rotator_cache() {
     if let Some(cache) = ROTATOR_CACHE.get() {
         *cache.write().await = None;
@@ -2454,29 +2490,32 @@ async fn get_rotator(
     home_dir: &Path,
 ) -> Result<std::sync::Arc<duduclaw_agent::account_rotator::AccountRotator>, String> {
     let cache = ROTATOR_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
-    let ttl = std::time::Duration::from_secs(300); // 5 min cache
 
-    // Check if cached version is still valid
+    // Fast path: valid until invalidated, or until the backstop TTL elapses
+    // (out-of-band `config.toml` edits this process has no invalidate hook
+    // for — see the static's doc comment).
     {
         let guard = cache.read().await;
-        if let Some((created, rotator)) = guard.as_ref() {
-            if created.elapsed() < ttl {
-                return Ok(rotator.clone());
-            }
+        if let Some((created, rotator)) = guard.as_ref()
+            && created.elapsed() < ROTATOR_CACHE_BACKSTOP_TTL
+        {
+            return Ok(rotator.clone());
         }
     }
 
     // Serialize rebuild to prevent concurrent `claude auth status` subprocesses
+    // (single-flight — the doctrine's mitigation for invalidate-triggered
+    // thundering herds, design §7 R3).
     let init_lock = ROTATOR_INIT_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
     let _init_guard = init_lock.lock().await;
 
     // Double-check after acquiring lock (another task may have rebuilt)
     {
         let guard = cache.read().await;
-        if let Some((created, rotator)) = guard.as_ref() {
-            if created.elapsed() < ttl {
-                return Ok(rotator.clone());
-            }
+        if let Some((created, rotator)) = guard.as_ref()
+            && created.elapsed() < ROTATOR_CACHE_BACKSTOP_TTL
+        {
+            return Ok(rotator.clone());
         }
     }
 
@@ -3145,6 +3184,20 @@ fn prepare_claude_cmd(
     work_dir: Option<&Path>,
 ) -> (tokio::process::Command, Option<tempfile::TempPath>) {
     let mut cmd = duduclaw_core::platform::async_command_for(claude_path);
+
+    // WP-8B (credentials doctrine P3, 2026-08): the child used to inherit the
+    // gateway's FULL environment (`tokio::process::Command` default), which
+    // meant every vendor `*_API_KEY` configured for ANY agent/provider on
+    // this gateway leaked into every `claude` CLI subprocess whether that
+    // agent used it or not. Clear the env and seed only the allowlisted
+    // base (PATH/HOME/locale/terminal/proxy — see
+    // `duduclaw_core::spawn_env` for the full list and rationale, mirrors
+    // the pattern already shipped in `worker_supervisor.rs`). The
+    // account-rotator-resolved credentials (`env_vars` in
+    // `call_claude_with_env`, applied further below) and every other
+    // explicit `cmd.env(...)` call in this function run AFTER this and
+    // always win.
+    duduclaw_core::apply_agent_cli_env_allowlist(&mut cmd);
 
     // Set working directory so Claude CLI auto-discovers the agent's
     // .mcp.json and .claude/settings.json from the project root.
