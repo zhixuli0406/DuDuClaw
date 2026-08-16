@@ -1,153 +1,169 @@
-# 校準式預測 + held-out 學習閘：讓 AI 員工的猜測有分數可打
+# Calibrated forward model and held-out learning gate
 
-DuDuClaw 1.54 起，任何一位 AI 員工都可以在動手之前，先對「這一步會不會
-成功」給出一個機率數字。事後系統會拿工具實際回傳的結果，用統計學上
-公認公平的方式幫這個數字打分。打分結果不只是給你看，也決定 AI 員工
-自己歸納出的教訓能不能被採用。沒有數字支持的教訓，只能待在旁邊觀察，
-不會被塞進之後的提示詞裡。
+> Every guess an AI teammate makes gets scored against reality — and self-derived lessons stay on the bench until the numbers back them.
 
-## 一句話說明
+---
 
-以前 AI 員工「學到教訓」靠的是自己反省、自己判斷有沒有道理；現在多了
-一道關卡：教訓要嘛有工具紀錄或稽核可查證，可以直接採用；要嘛先當候選，
-用之後真實發生的案例記命中率，命中率打贏基準才准轉正。v1.54 起這套能力
-預設開啟，每個 AI 員工開箱即用；不想要的人可以在設定裡整套或逐層關掉，
-關掉那一層的行為就跟沒有這個功能之前完全一樣。
+## What this is
 
-## 這解決三個問題
+Since DuDuClaw 1.54, any AI teammate can put a probability on "will this step succeed?" before acting. Afterwards, the system takes what the tools actually returned and grades that number with statistically fair scoring rules. The grade does more than feed a chart: it decides whether a lesson the agent derived on its own may enter future prompts. A lesson either comes with tool records or audit evidence and is adopted directly, or it starts as a candidate whose hit rate on later real cases must beat a baseline before promotion. The whole capability ships enabled by default since v1.54; each layer can be turned off in the settings, and a disabled layer behaves exactly as the system did before the feature existed.
 
-**第一，樣本太少會自圓其說。** AI 員工做了三十件事，回頭去找規律，
-很容易把雜訊當成模式，寫成一條規則，下次又照著這條規則做決定，而這條
-規則從沒被三十筆以外的資料檢驗過。這種閉環會愈滾愈自信，卻不會愈滾
-愈準。
+---
 
-**第二，外掛的「預測、行動、驗證」流程，驗證那一步經常只是自己讀自己
-寫的日誌。** 看起來有一套完整的迴圈，實際上「驗證」沒有接到任何外部
-事實，跟一次性問答的裸模型沒有本質差別。
+## Three problems this solves
 
-**第三，沒有人把「當初猜的」跟「後來發生的」對起來算分。** 沒有這個
-對照，模型不會因為猜錯而變準，只會因為講得順而顯得可信。
+**First, small samples invite self-confirmation.** An AI teammate handles thirty jobs, looks back for patterns, and easily mistakes noise for signal — writing it down as a rule, then making the next decision by that rule, which no data outside those thirty jobs has ever tested. The loop grows more confident with every turn, but no more accurate.
 
-## 運作原理
+**Second, bolt-on "predict, act, verify" loops usually verify against their own logs.** The loop looks complete on paper, but the "verify" step never touches an external fact, which makes it no different in substance from a bare model answering one-shot questions.
 
-三個階段，全部是純數學計算，不額外呼叫 LLM。
+**Third, nobody lines up the original guess with what actually happened and scores the gap.** Without that comparison, a model never becomes more accurate for having guessed wrong — it only sounds more convincing for speaking fluently.
 
-**先猜再做。** 行動前，任務層預測（`TaskPrediction.confidence`）記下
-一個機率：這一步會成功嗎、要花多久、失敗的話大概是哪一類失敗。這個
-數字在行動發生前就落檔，事後不能回頭改，符合先承諾、才可能被推翻的
-可證偽原則。
+---
 
-**事後用外部證據打分。** 任務結束後，系統用工具實際回傳的結果（不是
-AI 員工自己講的結果）當裁判，計算 Brier score（二元判斷）或 RPS
-（三分類排序判斷）。這兩種分數都有界，範圍固定在 0 到 1 之間；業界
-常用的 log score 因為單一次離譜的預測就能把總分拖到無限大，小樣本下
-不穩定，這裡刻意不用。
+## How it works
 
-**用 Murphy 分解檢查是不是真的學到東西。** Brier score 可以拆成三塊：
-可靠度（reliability）、鑑別力（resolution）、不確定性（uncertainty）。
-關鍵判斷在這一步，只有鑑別力隨時間上升，才算真的學到了預測模式；
-可靠度變好但鑑別力沒動，代表 AI 員工只是學會了保守報均值（永遠猜
-「五五波」最不容易被扣分，但這種猜法什麼都沒學到）。系統會分別追蹤
-這兩個數字，不會只看總分。
+Three stages, all pure arithmetic, no extra LLM calls:
 
-比較基準必須凍結，不能跟著資料一起漂移，否則連「贏基準」這件事本身
-都無法被檢驗。
-
-## 誠實標籤
-
-系統只允許三種結論：`SUPPORTED`（樣本外表現顯著優於基準）、
-`CANDIDATE`（樣本還不夠，暫時無法判斷）、
-`INDISTINGUISHABLE_FROM_LUCK`（信賴區間跨過五五波，或校準後的
-勝率信心不足，數學上分不出是技巧還是運氣）。「還不知道」是一個
-合法且常見的結論，系統不會為了顯得有用而硬給一個模糊的「初步有效」。
-
-## held-out 學習閘：反思產候選，數字決採納
-
-自我反省（reflexion）依然會產生候選教訓，但教訓要先過一道分類：
-
-- **有工具紀錄或稽核可查證的教訓**（例如某個工具參數格式錯誤會導致
-  失敗），照舊直接採用，判斷依據是確定的事實。
-- **沒有程式化證據、純粹靠歸納得出的教訓**（例如某種情境下成功率
-  比較低這類統計性直覺），先當 shadow 候選，不會出現在提示詞裡。
-  之後每發生一筆新案例，就記一次這個候選猜對還是猜錯，累積足夠樣本後，
-  用 Wilson 信賴區間下界（多個候選同時競爭時用 Bonferroni 校正收緊
-  門檻）跟基準比。贏基準才轉正、開始被注入。轉正後如果表現退步，
-  滾動視窗的信賴區間下界又跌破基準，立刻降級回候選，紀錄保留，不刪除。
-
-## 如何啟用
-
-三個開關都在 `[task_forward_model]` 底下，逐層打開：
-
-```toml
-# config.toml（全域）。也可在 dashboard →「進階設定 → 預測校準」直接切換。
-[task_forward_model]
-enabled = true                # 總開關：任務層預測本身，v1.54 預設 true
-calibration_enabled = true    # 打分：Brier/RPS + Murphy 分解，v1.54 預設 true
-held_out_gate_enabled = true  # 學習閘：反思候選要先過樣本外驗證，v1.54 預設 true
+```
+Before acting
+     |
+     v
++----------------------+
+|  Commit a guess      |  <-- TaskPrediction.confidence is recorded
++--------+-------------+      before the action; immutable afterwards
+         |
+         v
++----------------------+
+|  Score with external |  <-- actual tool results are the referee;
+|  evidence            |      Brier score or RPS
++--------+-------------+
+         |
+         v
++----------------------+
+|  Murphy              |  <-- only rising resolution counts
+|  decomposition       |      as real learning
++----------------------+
 ```
 
-三層獨立疊加。`enabled` 做預測記錄；`calibration_enabled` 開始打分、產生
-誠實標籤；`held_out_gate_enabled` 影響自我學習的教訓能不能被注入。三層
-v1.54 都預設開;把任何一層改成 `false`，那一層的行為就跟沒有這個功能之前
-完全一樣（byte-identical），方便逐層關掉。
+### Predict before acting
 
-## 舉個例子：不限於某一種 AI 員工
+Before the action, the task-level prediction (`TaskPrediction.confidence`) records a probability: will this step succeed, how long will it take, and if it fails, which failure class is most likely. The number is written down before the action happens and cannot be revised afterwards — commit first, so the claim can later be refuted.
 
-這套機制刻意設計成跟具體業務無關，引擎內部只認得
-`(信心值, 實際結果)` 這種抽象數對，不認識任何特定領域的字眼。舉例，
-一位會自己修改程式碼的 coding agent，在跑一次有風險的重構前先預測
-「這次改動測試會過」的機率，改完之後測試結果就是外部裁判。如果它
-歸納出「每次遇到某個特定錯誤代碼，先跑格式化工具再重試就會過」，
-這條有工具紀錄可查，直接採用。但如果它歸納出「禮拜五改的程式比較
-容易出包」這種沒有程式化證據的統計性直覺，就得先當候選、累積樣本，
-贏過基準才會真的被用上。同一套引擎，換成客服、操盤或其他任何場景的
-AI 員工，運作方式完全一樣。
+### Score with external evidence
 
-## 候選怎麼轉正：shadow-scoring
+When the task ends, the system uses what the tools actually returned (not what the AI teammate says happened) as the referee, computing a Brier score (binary judgments) or RPS (three-way ordered judgments). Both scores are bounded, fixed to the 0–1 range. The widely used log score is deliberately avoided here: one absurd prediction can drag the total to infinity, which makes it unstable on small samples.
 
-候選教訓的轉正閉環兩條路都已接上。自主任務迴圈那側，每一輪任務結算
-時，情境吻合的候選各記一筆命中或落空。一般對話那側，每次組提示詞時
-先把觸發訊號吻合本輪情境的候選登記起來（仍然不注入），等回覆的結果
-結算後再對每個登記過的候選記帳。
+### Check for real learning with the Murphy decomposition
 
-兩側用同一套判準。候選的隱含預測是「這種情境風險偏高」，實際出狀況
-算命中，虛驚算落空；樣本累積到門檻後，用 Wilson 信賴區間下界（多個
-候選同時競爭時經 Bonferroni 校正）跟該員工自己的歷史底率比，贏了才
-轉正、開始被注入，持續虛驚的候選退役。轉正後表現退步會被收回候選，
-履歷保留，訊號再吻合時可以重新累積樣本翻身。基準率各層各自計算：
-任務層看任務結算紀錄，對話層看對話誤差紀錄，歷史不足八筆時一律退回
-五五波，寧可保守。
+A Brier score splits into three parts: reliability, resolution, and uncertainty. The key judgment lives here: only resolution rising over time counts as having learned a predictive pattern. Reliability improving while resolution stays flat means the AI teammate has merely learned to report the average (always guessing "fifty-fifty" is the safest way to avoid penalty — and learns nothing). The system tracks the two numbers separately and never looks at the total alone.
 
-## 關鍵依據
+The baseline being competed against must be frozen. It cannot drift along with the data, or "beating the baseline" itself becomes untestable.
 
-- MuZero（arXiv:1911.08265）：世界模型不需要重建完整環境動態，只要能
-  預測會影響決策的量（成功與否、代價、失敗類別）就合格。
-- Gneiting & Raftery，*Strictly Proper Scoring Rules*（JASA 2007）：
-  proper scoring 的定義，以及為什麼有界分數在小樣本下比 log score 穩健。
-- Murphy（1973）／Siegert（*QJRMS* 2017）：Brier score 的三分解，
-  reliability − resolution + uncertainty，本篇校準判準的直接依據。
-- Richens et al.，ICML 2025（arXiv:2506.01622）：任何機制只要能真的
-  提升多步驟任務表現，數學上必然帶有可被抽取檢驗的世界模型內容。這是
-  本篇「不宣稱預訓練世界模型，但宣稱有校準閉環」立場的理論依據。
-- RSEA（arXiv:2606.28374）：沒有 held-out 閘的線上自我演化會崩潰，
-  論文中的 Dynamic Cheatsheet 換場景後準確率從 70.7% 掉到 0.14%，是
-  本篇 held-out 學習閘設計的直接動機。
-- 2310.01798：沒有外部訊號、純靠模型自評的自我修正，效果無效甚至更差，
-  是本篇堅持只用外部工具結果打分、不用 LLM 自評當採納依據的依據。
+---
 
-## 儀表板呈現（2026-08-13 新增）
+## Honest labels
 
-記憶頁新增「預測校準」分頁——本功能的第一個儀表板呈現面，對每個 AI 員工顯示：
-預測總數／已結算數／平均誤差分（Brier，低=準）、四級結果分布（如預期／小偏差／
-明顯偏差／嚴重偏差）、觀測保真度與預測來源分布，加「最近的預測與結果」對照列表。
-資料來源是 `prediction.db` 的 `task_prediction_log` 稽核軌跡（唯讀 RPC
-`forward.summary`／`forward.recent`）；統計視窗有界（最近 5000 筆）且在介面上
-誠實標示。這個呈現面是通用的——任何開啟任務預測的員工都會出現在這裡，
-不綁任何特定實驗或產業。
+The system permits only three conclusions:
 
-## 相關文件
+| Label | Meaning |
+|-------|---------|
+| `SUPPORTED` | Out-of-sample performance is statistically better than the baseline |
+| `CANDIDATE` | Not enough samples yet; no verdict for now |
+| `INDISTINGUISHABLE_FROM_LUCK` | The confidence interval straddles fifty-fifty, or the calibrated win-rate confidence falls short — mathematically, skill and luck cannot be told apart |
 
-- 自主進化 v3（playbook 學習容器）：
-  [`38-aee-playbook-evolution.md`](38-aee-playbook-evolution.md)
-- 進化開關總覽：
-  [`../guides/evolution-switches.md`](../guides/evolution-switches.md)
+"We don't know yet" is a legitimate and common conclusion. The system will not force a vague "preliminarily effective" just to look useful.
+
+---
+
+## The held-out learning gate: reflection proposes, numbers dispose
+
+Self-reflection (reflexion) still produces candidate lessons, but every lesson passes through a classification first:
+
+```
+Reflection produces a candidate lesson
+        |
+        v
+Backed by tool records or audit evidence?
+        |
+   +----+----+
+   |         |
+  yes        no
+   |         |
+   v         v
+Adopt      Shadow candidate (never injected)
+directly        |
+                v
+          Each new real case logs a hit or a miss
+                |
+                v
+          Wilson lower bound vs. the baseline
+          (Bonferroni-corrected when several
+           candidates compete at once)
+                |
+           +----+----+
+           |         |
+          wins     doesn't
+           |         |
+           v         v
+        Promoted,  Keeps observing;
+        starts     repeated misses
+        injecting  retire it
+```
+
+- **Lessons verifiable from tool records or the audit log** (for example, a particular tool-parameter format error causing failures) are adopted directly, as before — the basis is settled fact.
+- **Lessons with no programmatic evidence, derived purely by induction** (for example, a statistical hunch that success rates run lower in some situation) start as shadow candidates and never appear in prompts. Each new case afterwards logs whether the candidate guessed right or wrong. Once enough samples accumulate, the Wilson confidence-interval lower bound (tightened by Bonferroni correction when several candidates compete at once) is compared against the baseline. Only beating the baseline earns promotion and injection. If a promoted lesson later regresses and its rolling-window lower bound falls back below the baseline, it is demoted to candidate immediately — the record is kept, never deleted.
+
+---
+
+## How candidates graduate: shadow scoring
+
+Both promotion paths for candidate lessons are wired up. On the autonomous task-loop side, every task settlement logs a hit or a miss for each candidate whose context matches. On the ordinary conversation side, prompt assembly first registers the candidates whose trigger signals match the turn's context (still without injecting them), then settles the books for every registered candidate once the reply's outcome lands.
+
+Both sides use the same yardstick. A candidate's implicit prediction is "risk runs high in this situation": a real incident counts as a hit, a false alarm as a miss. Once samples reach the threshold, the Wilson lower bound (Bonferroni-corrected when several candidates compete) is compared against the teammate's own historical base rate — winning earns promotion and injection, while candidates that keep producing false alarms retire. A promoted lesson that regresses is pulled back to candidate, its record kept, free to accumulate fresh samples and climb back the next time its signals match. Base rates are computed per layer: the task layer reads task-settlement records, the conversation layer reads conversation-error records, and with fewer than eight samples of history both fall back to fifty-fifty — conservative on purpose.
+
+---
+
+## How to enable
+
+All three switches live under `[task_forward_model]` and stack layer by layer:
+
+```toml
+# config.toml (global). Also switchable in the dashboard under
+# Advanced settings → Prediction calibration.
+[task_forward_model]
+enabled = true                # master switch: task-level prediction itself, default true since v1.54
+calibration_enabled = true    # scoring: Brier/RPS + Murphy decomposition, default true since v1.54
+held_out_gate_enabled = true  # learning gate: reflexion candidates need out-of-sample validation, default true since v1.54
+```
+
+The three layers stack independently. `enabled` records predictions; `calibration_enabled` starts scoring and produces honest labels; `held_out_gate_enabled` decides whether self-learned lessons may be injected. All three default to on since v1.54. Setting any layer to `false` makes that layer behave byte-identically to the system before this feature existed, so the layers can be switched off one at a time.
+
+---
+
+## Not tied to any one kind of agent
+
+The mechanism is deliberately business-agnostic: internally the engine only understands abstract `(confidence, realized outcome)` pairs and knows no domain vocabulary. As an example, a coding agent that edits its own code predicts the probability that "the tests will pass after this change" before a risky refactor; the test result afterwards is the external referee. If it induces "whenever this particular error code appears, running the formatter first makes the retry pass," that lesson is verifiable from tool records and adopted directly. But if it induces "code changed on Fridays breaks more often" — a statistical hunch with no programmatic evidence — it must start as a candidate, accumulate samples, and beat the baseline before it is ever used. The same engine works identically for customer-support, trading, or any other kind of AI teammate.
+
+---
+
+## Dashboard view (added 2026-08-13)
+
+The memory page gains a "prediction calibration" tab — the feature's first dashboard surface. Per AI teammate it shows: total predictions / settled count / mean error score (Brier, lower = more accurate), the four-level outcome distribution (as expected / small deviation / clear deviation / severe deviation), observation-fidelity and prediction-source distributions, plus a "recent predictions vs. outcomes" comparison list. The data source is the `task_prediction_log` audit trail in `prediction.db` (read-only RPCs `forward.summary` / `forward.recent`); the statistics window is bounded (most recent 5,000 entries) and honestly labeled in the UI. The surface is generic: any teammate with task prediction enabled appears here, with no tie to any particular experiment or industry.
+
+---
+
+## Research grounding
+
+- MuZero (arXiv:1911.08265): a world model need not reconstruct full environment dynamics; predicting the quantities that affect decisions (success, cost, failure class) is enough.
+- Gneiting & Raftery, *Strictly Proper Scoring Rules* (JASA 2007): the definition of proper scoring, and why bounded scores are steadier than the log score on small samples.
+- Murphy (1973) / Siegert (*QJRMS* 2017): the three-way Brier decomposition, reliability − resolution + uncertainty — the direct basis for this feature's calibration criterion.
+- Richens et al., ICML 2025 (arXiv:2506.01622): any mechanism that genuinely improves multi-step task performance must, mathematically, carry extractable and testable world-model content. This is the theoretical basis for claiming a calibration loop here without claiming a pretrained world model.
+- RSEA (arXiv:2606.28374): online self-evolution without a held-out gate collapses — the paper's Dynamic Cheatsheet dropped from 70.7% to 0.14% accuracy after a scenario change. The direct motivation for the held-out learning gate.
+- 2310.01798: self-correction with no external signal, relying purely on the model grading itself, is ineffective or worse — the basis for scoring only with external tool results and never using LLM self-assessment as grounds for adoption.
+
+---
+
+## Related documents
+
+- Evolution v3 (the playbook learning container): [`38-aee-playbook-evolution.md`](38-aee-playbook-evolution.md)
+- Evolution switches overview: [`../guides/evolution-switches.md`](../guides/evolution-switches.md)

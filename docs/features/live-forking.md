@@ -1,92 +1,104 @@
-# Live Forking:同一個任務,並行跑幾條路,擇優收斂
+# Live forking: when to use it
 
-> 本文講**使用情境**(什麼時候該用、什麼時候別用),面向對內/對外溝通。想看機制原理與比喻,讀技術特寫 [28-live-forking.md](./28-live-forking.md);完整設計見 [RFC-26](../rfc/RFC-26-deep-agents-alignment.md)。
+> Usage scenarios for live forking: when to fork, when not to, and how it differs from `duduclaw eval`. For the mechanism and the maze metaphor, read the technical deep-dive [28-live-forking.md](./28-live-forking.md); the full design is in [RFC-26](../rfc/RFC-26-deep-agents-alignment.md).
 
-Live Forking 讓一個正在執行的任務當場分裂成 N 條競爭分支,每條用不同的帳號、獨立的工作區副本、各自的預算跑,跑完由一位 AI judge(或你自己)挑出最好的一條合併回來。它預設關閉,per-agent 用 `agent.toml [fork] enabled = true` 開啟。
+Live forking lets a running task split on the spot into N competing branches. Each branch runs with a different account, an isolated workspace copy, and its own budget; when they finish, an AI judge (or you) picks the best one and merges it back. It is off by default; enable it per agent with `agent.toml [fork] enabled = true`.
 
-一句話講差異:平常一個任務走一條路,錯了重來;開了 fork,一個任務同時走幾條路,直接比出哪條好。
+The one-line difference: normally a task walks one path and starts over when it goes wrong; with fork on, one task walks several paths at once and the results compete directly.
 
-## 一條分支到底是什麼
+---
 
-DuDuClaw 的 agent 是以 `claude` CLI 子行程跑的,所以一條「分支」就是一次隔離的子行程執行,帶著:
+## What a branch actually is
 
-- 自己的**工作區疊層**(copy-on-write:讀得到父工作區,寫只寫進自己的副本,互不污染)
-- 自己的**帳號**(由 AccountRotator 分派不同帳號,分支之間不會撞到同一個 rate limit)
-- 自己的**預算上限**與可選的**引導語**(steering:告訴這條分支往哪個方向試)
-- 對父工作區的**唯讀共享視圖**
+A DuDuClaw agent runs as a `claude` CLI subprocess, so a "branch" is one isolated subprocess execution carrying:
 
-跑完每條分支可選跑一個 `test_command`(例如 `pytest -q`),用 exit code 餵給 judge 評分。
+- its own **workspace overlay** (copy-on-write: it reads the parent workspace, but writes land only in its own copy, so branches never contaminate each other)
+- its own **account** (the AccountRotator assigns distinct accounts, so branches never collide on the same rate limit)
+- its own **budget cap** and an optional **steering message** (telling the branch which direction to try)
+- a **read-only shared view** of the parent workspace
 
-## 三種該用的情境
+After finishing, each branch can optionally run a `test_command` (for example `pytest -q`), and its exit code feeds the judge's scoring.
 
-### 情境一:多方案並行,擇優
+---
 
-一個問題有好幾種合理解法,你不確定哪種好。與其一種一種試、試錯了再退回來,不如一次開三條分支各走一種策略,跑完比結果。
+## Three scenarios where forking pays off
 
-典型:「這段慢查詢,一條分支試加索引、一條試改寫 JOIN、一條試加快取,哪個實測最快用哪個。」每條分支拿到不同的 steering,judge 依測試通過率與品質評分,`merge_mode = "auto_with_fallback"` 會自動挑贏家但保留一個確認關卡。
+### Scenario 1: several candidate approaches, pick the winner
 
-### 情境二:高風險變更,先在分支裡試
+A problem has several reasonable solutions and you are not sure which is best. Instead of trying them one at a time and backtracking on failure, open three branches at once, give each a different strategy, and compare the results.
 
-要動的東西一旦錯了很麻煩(大規模重構、改動核心設定、跑破壞性遷移),你想先看它到底會改成什麼樣,再決定要不要落地。
+Typical case: "this slow query — one branch tries adding an index, one rewrites the JOIN, one adds a cache; whichever measures fastest wins." Each branch gets a different steering message, the judge scores by test pass rate and quality, and `merge_mode = "auto_with_fallback"` auto-picks the winner while keeping a confirmation gate.
 
-分支的 copy-on-write 疊層天生適合這件事:分支的所有寫入落在自己的副本,父工作區在合併前一個字都不動。試爆了就丟掉那條疊層,父工作區完好如初;試對了才把贏家的寫入合併回來。這比「先 commit 再 revert」乾淨,因為失敗的那條根本沒碰到主線。
+### Scenario 2: high-risk change, rehearse it in a branch first
 
-### 情境三:AI judge 評審
+The thing you want to touch would be painful to get wrong (a large refactor, core config changes, a destructive migration), and you want to see exactly what it would become before deciding whether to land it.
 
-你要的是「幾個結果裡挑一個最好的,並且說得出為什麼挑它」,光「跑出結果」還不夠。
+The branch's copy-on-write overlay is a natural fit: every write a branch makes lands in its own copy, and the parent workspace does not change by a single character before merge. If the attempt blows up, discard that overlay and the parent stays intact; only when it works do the winner's writes get merged back. This is cleaner than "commit first, revert later", because the failed attempt never touched the mainline.
 
-judge 產出一個 `JudgeVerdict`,信心分數按 RFC-26 的公式算:`quality_spread·0.4 + test_pass_ratio·0.4 + internal_consistency·0.2`。這正是會議 §15 問的那個情境:一個 agent 產出多個結果後,派另一個 agent 當評審。fail-closed 是刻意的:judge 不存在、判決 parse 不出來、sandbox 起不來,一律退回 `manual`(把所有分支攤給你看),絕不靜默亂挑一個。
+### Scenario 3: AI-judged review
 
-## 何時不該用
+You want "pick the best of several results, and be able to say why", where "producing a result" alone is not enough.
 
-Fork 不是預設就該開的東西,以下情況別用:
+The judge emits a `JudgeVerdict`, with confidence computed by the RFC-26 formula: `quality_spread·0.4 + test_pass_ratio·0.4 + internal_consistency·0.2`. This is exactly the scenario meeting §15 asked about: one agent produces several results, then another agent is dispatched as the reviewer. Fail-closed is deliberate: if the judge is missing, the verdict cannot be parsed, or the sandbox fails to start, everything falls back to `manual` (all branches are laid out for you to see); it never silently picks one at random.
 
-- **確定性的單一任務**:答案只有一個、沒有取捨空間(格式轉換、單純查詢),開分支只是白燒 N 倍成本。
-- **成本敏感**:N 條分支 = N 個帳號、N 份預算。訂閱額度或 API 費用吃緊時,fork 會放大消耗。`[fork] max_branches` 與 `aggregate_budget_usd` 是硬上限,但根本問題是這個任務值不值得並行。
-- **沒有可評分的依據**:`test_command` 為空時,judge 公式裡的 `test_pass_ratio` 會被中性化,評分只剩品質與一致性,擇優的客觀性打折。沒有測試能跑的任務,fork 的價值主要在情境二(隔離試錯),不在情境一(客觀擇優)。
-- **需要跨行程強制中止某條分支**:`terminate_branch` 只能中止與它同一個行程的子行程。跨不同行程殺分支子行程是 RFC-26 明列的 by-design 排除項。
+---
 
-## 跟 `duduclaw eval` 的關係
+## When not to use it
 
-兩者都會用到「AI judge」,但用途相反,別混淆:
+Fork is not something to leave on by default. Skip it when:
 
-| | Live Forking | `duduclaw eval` |
+- **The task is deterministic**: there is only one answer and no trade-off space (format conversion, a plain lookup). Opening branches just burns N times the cost for nothing.
+- **Cost is tight**: N branches = N accounts, N budgets. When subscription quota or API spend is under pressure, fork amplifies consumption. `[fork] max_branches` and `aggregate_budget_usd` are hard caps, but the underlying question is whether this task deserves parallelism at all.
+- **There is nothing to score against**: with an empty `test_command`, the `test_pass_ratio` in the judge formula is neutralized, scoring falls back to quality and consistency alone, and objective selection loses ground. For tasks with no runnable tests, fork's value is mostly scenario 2 (isolated trial and error), not scenario 1 (objective selection).
+- **You need to force-kill a branch across processes**: `terminate_branch` can only stop subprocesses in its own process. Killing a branch subprocess across a different process is a by-design exclusion listed in RFC-26.
+
+---
+
+## How it relates to `duduclaw eval`
+
+Both use an "AI judge", but for opposite purposes; do not confuse them:
+
+| | Live forking | `duduclaw eval` |
 |---|---|---|
-| 時機 | 執行期,任務正在跑 | 事後 / CI,離線回歸 |
-| 目的 | 在幾條路裡當場挑一條最好的往下走 | 用固定的黃金任務驗 agent 有沒有退步 |
-| 輸入 | 一個活的任務 + N 種策略 | `evals/<suite>/<case>.toml` 預錄案例 |
-| 產出 | 合併贏家分支到工作區 | JSON 報告 + 非零 exit 擋 PR |
+| When | At run time, while the task is in flight | After the fact / CI, offline regression |
+| Goal | Pick the best of several paths on the spot and continue with it | Verify against fixed golden tasks that the agent has not regressed |
+| Input | One live task + N strategies | Pre-recorded cases in `evals/<suite>/<case>.toml` |
+| Output | Winner branch merged into the workspace | JSON report + non-zero exit to block a PR |
 
-實作上 `duduclaw eval` 的 LLM judge 復用了 `duduclaw-fork` 的 judge 原語,所以評審邏輯是同一套。可以這樣記:**fork 是往前探路,eval 是回頭驗收**。eval 的用法見 [evals 指南](../guides/evals.md)。
+In implementation, `duduclaw eval`'s LLM judge reuses the `duduclaw-fork` judge primitives, so the review logic is the same set. One way to remember it: **fork scouts ahead, eval checks the work afterwards**. For eval usage, see the [evals guide](../guides/evals.md).
 
-## 設定與工具
+---
+
+## Configuration and tools
 
 `agent.toml`:
 
 ```toml
 [fork]
-enabled = false              # 預設關,per-agent 開啟
-max_branches = 4             # 分支數硬上限(避免帳號/額度爆掉)
-default_budget_usd = 0.50    # 每條分支上限
-aggregate_budget_usd = 1.50  # 所有分支合計上限
+enabled = false              # off by default; enable per agent
+max_branches = 4             # hard cap on branch count (avoid account/quota blowout)
+default_budget_usd = 0.50    # per-branch cap
+aggregate_budget_usd = 1.50  # cap across all branches
 merge_mode = "auto_with_fallback"
-test_command = ""            # 可選;空 ⇒ judge 的 test_pass_ratio 中性化
+test_command = ""            # optional; empty ⇒ judge's test_pass_ratio neutralized
 test_timeout_s = 120
 ```
 
-MCP 工具(agent 開了 `[fork] enabled = true` 才註冊,統一 gated 在 `Scope::ForkExecute`,fail-closed):
+MCP tools (registered only when the agent sets `[fork] enabled = true`, uniformly gated behind `Scope::ForkExecute`, fail-closed):
 
-| 工具 | 做什麼 |
+| Tool | What it does |
 |---|---|
-| `fork_run` | 把當前任務分成 N 條分支 |
-| `inspect_branches` | 列出活著的分支 + 狀態 + 花費 |
-| `diff_branches` | 兩條分支的檔案/輸出差異 |
-| `merge_or_select` | 收斂一個 fork(judge 判或你指定) |
-| `terminate_branch` | 殺掉一條失控的分支 |
-| `fork_cost` | 合計與各分支花費 |
+| `fork_run` | Split the current task into N branches |
+| `inspect_branches` | List live branches + state + spend |
+| `diff_branches` | File/output diff between two branches |
+| `merge_or_select` | Resolve a fork (judge verdict or your pick) |
+| `terminate_branch` | Kill a runaway branch |
+| `fork_cost` | Aggregate and per-branch spend |
 
-每次 fork 收斂都寫進 `~/.duduclaw/fork_history.jsonl` 與 Activity Feed,dashboard 有 ForkPage 可視化。
+Every fork resolution is written to `~/.duduclaw/fork_history.jsonl` and the Activity Feed, and the dashboard has a ForkPage for visualization.
 
-## 一句總結
+---
 
-Live Forking 適合有取捨、有風險、需要比較的任務,不適合確定性的、成本敏感的、無從評分的任務。開之前先問一句:這個任務,並行幾條路換來的品質,值不值那幾倍的花費。
+## One-line summary
+
+Live forking suits tasks with trade-offs, risk, and something to compare. It does not suit tasks that are deterministic, cost-sensitive, or unscoreable. Before turning it on, ask one question: for this task, is the quality gained from walking several paths worth several times the spend.

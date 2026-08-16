@@ -280,3 +280,5 @@ A missing judge, an unparseable verdict, a sandbox spawn failure, or zero judgea
 ## The Takeaway
 
 When you're lost in a maze and can afford to clone yourself, you don't pick one tunnel and pray — you send a copy down each, and let a judge at the entrance keep only the clone that found the exit. Live Run Forking gives DuDuClaw agents that ability: parallel competing branches, isolated workspaces, distinct accounts, bounded budgets, an AI judge, and a cross-process `ForkStore` so the gateway and dashboard can watch it happen. Default off, fail-closed, no silent caps — explore in breadth, merge only the winner.
+
+See also: [Live forking: when to use it](./live-forking.md) — usage scenarios (when to fork, when not to, and how it differs from `duduclaw eval`).

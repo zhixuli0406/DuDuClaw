@@ -1,20 +1,63 @@
-# Telegram 內的審批詳情卡（Mini App）
+# Telegram Mini App approval card
 
-高風險動作要人同意時，DuDuClaw 會把一張卡片推到 Telegram，上面兩顆按鈕：同意、拒絕。按鈕夠用，但卡片裝不下判斷需要的東西——完整的動作說明、模擬出來的後果、還剩多久會自動拒絕。以前這些只能到儀表板看，於是「在手機上決定」變成「先切到瀏覽器、先登入、再找到那一筆」。
-
-這一頁講的功能把那三樣東西搬進 Telegram 裡：卡片多一顆「🔎 查看詳情」，按下去在對話上方展開一個小畫面，看完直接按同意或拒絕，整段過程沒有離開 Telegram。
-
-> **這是試作（spike）功能，預設關閉。** 範圍只有審批詳情這一張卡：目標是先驗證「把介面塞進通道」這條路可不可行，再決定要不要推廣到任務、花費、狀態等其他畫面。
+> Read the full approval — action description, simulated consequences, countdown — and decide inside Telegram, without switching to the dashboard.
 
 ---
 
-## 開啟條件（三個都要滿足）
+## The problem it solves
 
-| 條件 | 怎麼設定 | 不滿足會怎樣 |
+When a high-risk action needs a human's consent, DuDuClaw pushes a card to Telegram with two buttons: approve and deny. The buttons are enough, but the card cannot carry what the judgment actually needs — the complete action description, the simulated consequences, and how long remains before the request auto-denies. Those details used to live only in the dashboard, so "decide on the phone" turned into "switch to a browser, log in, then find the right entry".
+
+This feature moves those three things into Telegram. The card gains a third button, 「🔎 查看詳情」 (view details). Tapping it expands a small screen above the conversation; you read the full picture, then approve or deny on the spot. The whole exchange never leaves Telegram.
+
+> **This is a spike, off by default.** Its scope is this single approval-detail card: the goal is to first prove that "putting an interface inside the channel" is a workable path, then decide whether to extend it to task, spending, and status screens.
+
+---
+
+## How it works
+
+```
+High-risk action needs consent
+        |
+        v
+Card pushed to your 1:1 chat with the bot
+   [approve]  [deny]  [🔎 view details]
+        |  tap the third button
+        v
+Mini App opens above the conversation
+        |  Telegram attaches signed initData
+        v
+Gateway recomputes the HMAC and verifies it
+        |  match --> details arrive via POST
+        v
+Full description + simulated consequences
+           + live countdown
+        |  approve / deny
+        v
+Screen closes; the card in the chat
+collapses in place to a one-line result
+```
+
+### What the screen shows
+
+- **What kind of decision this is**: a label inline with the card content (「⚠️ 高風險動作需要你同意」 — a high-risk action needs your approval).
+- **Who wants to do what**: the AI teammate's name plus a plain-language description of the action ("run a high-risk tool", "install a new skill/tool", ...).
+- **The content**: the complete description, not truncated the way a chat bubble is.
+- **What happens next if you approve**: one to three consequence steps the system simulated beforehand. An approval without a simulation simply omits this section — nothing is made up.
+- **Time remaining**: a countdown updated every second, turning red when less than a third is left. No answer before the deadline means an automatic deny.
+- **Two large buttons**: approve this action / deny this action. On success the screen closes by itself and you are back in the conversation.
+
+The screen's colors follow Telegram's theme (dark mode, light mode, and custom themes all apply), so it never punches a white rectangle into a dark chat.
+
+---
+
+## Enabling it (all three conditions required)
+
+| Condition | How to set it | When it is not met |
 |---|---|---|
-| 功能開關 | `config.toml` 加上 `[miniapp]` `enabled = true` | 端點回 404，卡片維持原本兩顆按鈕 |
-| 對外網址是 **https** | `config.toml` `[dashboard] public_url = "https://你的網域"` | 不附詳情按鈕（Telegram 硬性規定 Mini App 只吃 https） |
-| 卡片送到**一對一私訊** | 由推播目的地決定 | 不附詳情按鈕（Telegram 規定 `web_app` 按鈕只能在私訊出現） |
+| Feature switch | `config.toml`: `[miniapp]` `enabled = true` | Endpoint returns 404; the card keeps its original two buttons |
+| Public URL is **https** | `config.toml`: `[dashboard] public_url = "https://your.domain"` | No details button (Telegram hard-requires https for Mini Apps) |
+| Card delivered to a **1:1 private chat** | Decided by the push destination | No details button (Telegram permits `web_app` buttons in private chats only) |
 
 ```toml
 # ~/.duduclaw/config.toml
@@ -25,88 +68,75 @@ enabled = true
 public_url = "https://ai.example.com"
 ```
 
-改完重開 gateway。三個條件任何一個沒過，卡片就跟開啟這個功能之前**一模一樣**——不會少一顆按鈕，也不會送不出去。
+Restart the gateway after the change. If any of the three conditions fails, the card is **exactly** what it was before this feature existed — no missing button, no undelivered message.
 
-`http://localhost:18789` 這種本機網址是有效的儀表板位置，但不是有效的 Mini App 位置。沒有對外 https 網域的部署（大多數本機安裝屬於這類）不需要做任何事，這個功能對它們是靜默的。
-
----
-
-## 打開之後看到什麼
-
-- **這是哪一類決定**：與卡片同一行的標籤（「⚠️ 高風險動作需要你同意」）。
-- **誰要做什麼**：AI 員工名稱、動作的白話說明（「執行高風險工具」「安裝新技能／工具」…）。
-- **內容**：完整說明，不像聊天氣泡那樣被截斷。
-- **如果同意，接下來會發生什麼**：系統事先模擬出來的一到三步後果。沒有模擬結果的審批就不顯示這一段，不會硬編。
-- **剩餘時間**：每秒更新的倒數，剩不到三分之一時轉紅。逾時未回覆一律自動拒絕。
-- **兩顆大按鈕**：同意這個動作／拒絕這個動作。按下去送出，成功後畫面自動關閉，回到對話。
-
-畫面配色跟著 Telegram 的佈景走（深色模式、淺色模式、自訂主題都會套用），不會在深色聊天室裡刺出一片白。
+An address like `http://localhost:18789` is a valid dashboard location but not a valid Mini App location. Deployments without a public https domain (most local installs) need to do nothing; the feature stays silent for them.
 
 ---
 
-## 安全模型
+## Security model
 
-### 身分怎麼證明
+### Proving identity
 
-Telegram 開啟 Mini App 時會附一段簽好章的 `initData`，內容包含使用者 id 與開啟時間，簽章的金鑰是**你自己的 bot token**。DuDuClaw 收到後照官方文件重算一次：
+When Telegram opens a Mini App it attaches a signed `initData` string containing the user id and the open time; the signing key derives from **your own bot token**. DuDuClaw recomputes it exactly as the official documentation specifies:
 
 ```text
-data_check_string = 除了 hash 以外的所有欄位，依字母排序，用 \n 串起來
+data_check_string = every field except hash, sorted alphabetically, joined with \n
 secret_key        = HMAC_SHA256(<bot_token>, "WebAppData")
 hash              = hex(HMAC_SHA256(data_check_string, secret_key))
 ```
 
-算出來的值與 Telegram 附的 `hash` 用定值時間比對。**對不上就什麼都不回**——不是回一份精簡版，是連這筆審批存不存在都不透露。
+The result is compared with Telegram's `hash` in constant time. **On mismatch, nothing comes back** — not even confirmation that the approval exists, let alone a trimmed-down view.
 
-除了簽章，還有三道：
+Three more gates sit behind the signature:
 
-1. `auth_date` 超過 1 小時視為過期（畫面開太久要回對話重開）；時間戳離譜地指向未來也一樣擋掉。
-2. `user` 欄位必須含數字 id，否則拒絕。
-3. 端點有每 IP 每分鐘的請求上限。
+1. `auth_date` older than 1 hour counts as expired (a screen left open too long must be reopened from the conversation); a timestamp absurdly far in the future is rejected the same way.
+2. The `user` field must contain a numeric id, or the request is refused.
+3. The endpoint enforces a per-IP, per-minute request cap.
 
-網址上的 `?id=<編號>` **不是憑證**。知道編號不會讓任何人看到內容——頁面本身不帶資料，資料一律走驗簽後的 POST 才拿得到。
+The `?id=<number>` in the URL **is not a credential.** Knowing the id shows nobody anything — the page itself carries no data; data is only obtainable through the signature-verified POST.
 
-### 誰可以決定
+### Who can decide
 
-**沒有第二套權限。** Mini App 認出來的 Telegram 使用者 id，跟按下卡片按鈕時回報的是同一個 id，所以決定送出後走的是與按鈕完全相同的那一條路：
+**There is no second permission system.** The Telegram user id the Mini App identifies is the same id reported when a card button is pressed, so a submitted decision travels the exact same path as the buttons:
 
-- 儀表板裡有已驗證綁定且身分是管理員／主管的人，可以決定；
-- 一般員工帳號不行（就算他是收件人也不行——這是職責分離）；
-- 完全還沒有人綁定通道帳號的部署，只有「卡片送達的那個帳號本人」可以決定。
+- Someone with a verified binding in the dashboard whose role is admin or supervisor can decide;
+- A regular staff account cannot — even when that person is the recipient (separation of duties);
+- On a deployment where nobody has bound a channel account yet, only the account the card was delivered to can decide.
 
-看詳情套用的是同一組判斷，不是比較寬鬆的讀取規則：不能決定的人也看不到內容。
+Viewing details applies the same rule, not a looser read-only one: whoever cannot decide cannot see the content either.
 
-### 秘密不外流
+### Secrets stay put
 
-bot token 只當作 HMAC 的金鑰材料用，不寫日誌、不回應、不進到頁面裡。頁面本身沒有任何後端細節——錯誤訊息一律是「請回到對話重新開啟」這種給人看的話。
-
----
-
-## 已知限制
-
-- **群組收不到這顆按鈕。** Telegram 規定 `web_app` 按鈕只在使用者與 bot 的私訊出現。卡片推到群組時只會有原本的同意／拒絕兩顆——這是刻意的：硬塞會讓整則訊息送不出去。
-- **一定要 https。** 這是 Telegram 的規定，不是本專案的選擇。
-- **只有審批這一張卡。** 任務、花費、狀態卡都還是走既有的按鈕與儀表板深連結。
-- **只有 Telegram。** LINE LIFF、Teams Dialog、飛書 Web App 都具備對等能力，但這次沒做；Slack、WhatsApp、Google Chat、Discord 沒有對等機制，未來也只會走「卡片按鈕＋原生表單」那一軌。
-- **頁面會向 telegram.org 取得平台 SDK。** 這是取得 `Telegram.WebApp`（`initData`、佈景參數、關閉視窗）的唯一受支援方式。SDK 取不到時頁面不會壞——會改從網址片段（`tgWebAppData`）讀同一份資料，只是少了自動關閉視窗。除此之外頁面沒有任何外部資源：CSS、JS 全部內嵌，沒有 CDN、沒有字型、沒有圖片。
+The bot token serves only as HMAC key material — never logged, never echoed in responses, never embedded in the page. The page itself exposes no backend details; every error message is written for humans ("please reopen this from the conversation").
 
 ---
 
-## 真機驗收怎麼做
+## Known limitations
 
-本機沒有對外 https，webview 開不起來，所以下面這段要在有公網部署的環境上跑：
-
-1. 設好 `[miniapp] enabled = true` 與 https 的 `[dashboard] public_url`，重開 gateway。
-2. 用瀏覽器打開 `https://你的網域/miniapp/approval?id=test` — 應該看到「請從對話中開啟」，這代表頁面活著而且沒有身分就不給資料。
-3. 觸發一筆需要人核可的動作，讓卡片推到你與 bot 的**私訊**。
-4. 卡片上應該出現第三顆按鈕「🔎 查看詳情」，點開後看到完整內容與倒數。
-5. 在畫面裡按同意或拒絕 → 對話裡原本那張卡片會就地收斂成一行結果（與按按鈕的行為一致）。
-6. 反面測試：把同一個網址傳給一個沒有決定權限的人，他打開應該只看到「您沒有查看這筆決定的權限」。
+- **Groups never get the button.** Telegram shows `web_app` buttons only in a user's private chat with the bot. A card pushed to a group keeps the original approve/deny pair — deliberately: forcing the button in would make the whole message undeliverable.
+- **https is mandatory.** Telegram's rule, not this project's choice.
+- **Only this one approval card.** Task, spending, and status cards still use their existing buttons and dashboard deep links.
+- **Only Telegram.** LINE LIFF, Teams Dialog, and Feishu Web App offer equivalent capability but were not built this round; Slack, WhatsApp, Google Chat, and Discord have no equivalent mechanism and will stay on the "card buttons + native forms" track.
+- **The page fetches the platform SDK from telegram.org.** That is the only supported way to obtain `Telegram.WebApp` (`initData`, theme parameters, window close). If the SDK cannot load, the page does not break — it reads the same data from the URL fragment (`tgWebAppData`) and only loses auto-close. Beyond that the page has zero external resources: all CSS and JS are inlined; no CDN, no fonts, no images.
 
 ---
 
-## 相關文件
+## Verifying on a real deployment
 
-- [高風險動作核可與模擬](34-goal-loop.md)
-- [通知治理與勿擾時段](40-notification-governance.md)
-- [真人接手對話](42-human-takeover.md)
+A local machine has no public https, so the webview will not open; run these steps on a deployment with a public address:
+
+1. Set `[miniapp] enabled = true` and an https `[dashboard] public_url`, then restart the gateway.
+2. Open `https://your.domain/miniapp/approval?id=test` in a browser — you should see 「請從對話中開啟」 (please open this from the conversation), which proves the page is alive and hands out no data without an identity.
+3. Trigger an action that needs human approval so a card lands in your **private chat** with the bot.
+4. The card should show a third button, 「🔎 查看詳情」; tapping it opens the full content and the countdown.
+5. Approve or deny inside the screen → the original card in the chat collapses in place to a one-line result (the same behavior as pressing the buttons).
+6. Negative test: hand the same URL to someone without decision permission; opening it should show only 「您沒有查看這筆決定的權限」 (you do not have permission to view this decision).
+
+---
+
+## Related features
+
+- [High-risk action approval and simulation](34-goal-loop.md)
+- [Notification governance and quiet hours](40-notification-governance.md)
+- [Human takeover](42-human-takeover.md)

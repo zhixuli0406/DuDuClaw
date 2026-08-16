@@ -279,9 +279,9 @@ The write-side burst detector is on by default and tunable in `config.toml`. Abs
 
 ```toml
 [knowledge_guard]
-enabled = true          # master switch for the same-origin burst detector. 預設 true
-window_secs = 3600      # 滑動窗長度（秒）。預設 3600（1 小時）
-max_per_subject = 5     # 一個來源在窗內對同一 subject 可寫入的事實上限，超過即隔離。預設 5
+enabled = true          # master switch for the same-origin burst detector (default true)
+window_secs = 3600      # sliding window length in seconds (default 3600 = 1 hour)
+max_per_subject = 5     # facts one origin may write per subject inside the window; beyond this, quarantine (default 5)
 ```
 
 The injection scan on the write path is unconditional (no config). Ranking trust weight `w_trust` (default 0.10) lives in `RetrievalWeights` (per-engine, not a config key); at `w_trust = 0.0` ranking is byte-identical to the pre-D2 path.

@@ -1,6 +1,6 @@
 # DuDuClaw Feature Highlights
 
-> DuDuClaw v1.46.0 | Last updated: 2026-07-29
+> DuDuClaw v1.61.0 | Last updated: 2026-08-16
 
 This directory contains detailed introductions to DuDuClaw's standout features. Each article explains the design rationale, system behavior, and operational flow — aimed at developers who want to understand *how things work* without diving into source code.
 
@@ -28,7 +28,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 16 | [Session Memory Stack](16-session-memory-stack.md) | Pinned instructions + snowball recap + key-fact accumulator |
 | 17 | [Wiki Knowledge Layer](17-wiki-knowledge-layer.md) | L0-L3 trust-weighted knowledge with auto-injection |
 | 18 | [Git Worktree L0 Isolation](18-worktree-isolation.md) | Lightweight per-task sandbox with atomic merge |
-| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp`＝IDE 用 Agent Client Protocol v1（Zed／JetBrains／nvim）；`duduclaw acp-server`＝A2A v1.0 stdio JSON-RPC（agent card／message/send／tasks） |
+| 19 | [Agent Client Protocol (ACP/A2A)](19-agent-client-protocol.md) | `duduclaw acp` speaks Agent Client Protocol v1 for IDE panels (Zed / JetBrains / nvim); `duduclaw acp-server` is the A2A stdio surface |
 | 20 | [Memory Intelligence](20-memory-intelligence.md) | Temporal facts + reflexion loop + batch fetch |
 | 21 | [Governance Layer](21-governance-layer.md) | Policy registry + per-agent quotas (duduclaw-governance) |
 | 22 | [Durability Framework](22-durability-framework.md) | Idempotency / retry / circuit breaker / checkpoint / DLQ |
@@ -46,17 +46,26 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 34 | [Autonomous Goal Loop](34-goal-loop.md) | /goal → loop to completion with an MAV acceptance judge; stuck escalates to a human |
 | 35 | [Photo → Desktop Pet](35-photo-desktop-pet.md) | Local photo-to-pixel-pet pipeline with a Codex-Pets spritesheet and wander engine |
 | 36 | [Recording → Skill](36-recording-to-skill.md) | Browser/desktop recordings distilled into approval-gated SKILL.md drafts |
-| 37 | [部門與階級隔離](37-delegation-isolation.md) | Org-boundary delegation policy: hierarchy / department / white-list enforcement |
-| 38 | [自主進化 v3：AEE + Playbook](38-aee-playbook-evolution.md) | Agentic Evolution Engine — playbook entries with Gate/Measure split |
-| 39 | [校準式預測 + held-out 學習閘](39-calibrated-forward-model.md) | Proper-scoring calibration + out-of-sample rule promotion |
-| 40 | [通知治理](40-notification-governance.md) | Notification governance across channels |
-| 41 | [常駐感知＋訊號喚醒](41-resident-sensing.md) | External data streams wake agents only on rule hits |
-| 42 | [真人接手對話](42-human-takeover.md) | Human takeover with `/takeover` lifecycle (opt-in) |
-| 43 | [Telegram Mini App 審批卡](43-telegram-miniapp.md) | Approval detail card inside Telegram (preview, default off) |
-| 44 | [工作狀態（Working State）](44-working-state.md) | Per-agent authoritative cross-wake state — the ghost-memory fix |
-| 45 | [本地模型市集](45-local-model-marketplace.md) | Intent + hardware-fit HF picker with one-click install and MoE dual-track |
-| 46 | [Belief Loop](46-belief-loop.md) | Structured predictions about the external world, scored against reality |
-| 47 | [Agent Mail](47-agent-mail.md) | Per-agent inbox for incoming mail, outbox for draft replies pending human confirmation |
+| 37 | [Delegation Isolation](37-delegation-isolation.md) | Org-boundary delegation policy: hierarchy / department / white-list enforcement |
+| 38 | [Agentic Evolution Engine & Playbook](38-aee-playbook-evolution.md) | SOUL.md becomes a read-only persona layer; the playbook is what learns and can be retired rule by rule |
+| 39 | [Calibrated Forward Model & Held-Out Learning Gate](39-calibrated-forward-model.md) | Every guess gets scored against reality; self-derived lessons stay on the bench until the numbers back them |
+| 40 | [Notification Governance](40-notification-governance.md) | Severity levels, quiet-hour deferral, one digest a day, and action-rate metrics for every push |
+| 41 | [Resident Sensing & Signal Wake-Up](41-resident-sensing.md) | External data streams wake the AI employee only when a rule actually fires |
+| 42 | [Human Takeover](42-human-takeover.md) | An admin typing directly in a channel silences the AI for that one conversation until they hand it back |
+| 43 | [Telegram Mini App Approval Card](43-telegram-miniapp.md) | Read the full approval and decide inside Telegram, no dashboard switch (spike, off by default) |
+| 44 | [Working State](44-working-state.md) | One authoritative cross-wake record of each AI employee's current rules, changed only through audited tool calls |
+| 45 | [Local Model Marketplace](45-local-model-marketplace.md) | Pick a model by purpose, see whether it fits this machine, install in one click |
+| 46 | [Belief Loop](46-belief-loop.md) | State a prediction about the outside world, get scored against reality, see your own calibration next time |
+| 47 | [Agent Mail](47-agent-mail.md) | Per-agent inbox for incoming mail; nothing goes out until a person confirms it |
+
+---
+
+## Companion Articles
+
+| Article | One-liner |
+|---------|-----------|
+| [Live Forking: When to Use It](live-forking.md) | Usage-scenario companion to #28 — when to fork, when not to, and how it differs from `duduclaw eval` |
+| [ERP / CRM Support Matrix](erp-support-matrix.md) | One-page coverage table for sales and customer conversations |
 
 ---
 

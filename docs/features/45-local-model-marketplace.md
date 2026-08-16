@@ -1,61 +1,96 @@
-# 本地模型市集：依用途挑選、看得懂跑不跑得動、一鍵安裝
+# Local model marketplace
 
-跑本地模型的門檻從來不是硬體，是**術語**。GGUF、Q4_K_M、imatrix、context window、
-MoE——這些字擋在「我想要一個離線能用的 AI」和「真的裝起來」之間。
-本地模型市集把這條路收斂成三個看得懂的步驟。
+> Pick a model by purpose, see at a glance whether it fits this machine, and install it in one click.
 
-## 一句話說明
+---
 
-在「管理 → 本地模型」選一個用途，系統掃 Hugging Face 上五家品質驗證過的
-發布者，每個推薦附一顆依**你這台機器**算出來的適配燈（綠／黃／紅），
-按下安裝就自動挑量化版本、續傳下載、裝完即用。
+## The barrier is terminology, not hardware
 
-## 三個步驟
+The hard part of running a local model was never the hardware. It's the vocabulary: GGUF, Q4_K_M, imatrix, context window, MoE. These words stand between "I want an AI that works offline" and actually getting one installed. The local model marketplace collapses that path into three steps anyone can read.
 
-1. **選用途**：聊天助理／寫程式／長文件／中文優先。不用知道模型名。
-2. **看適配燈**：
-   - 🟢 可舒適執行——記憶體佔用低於六成，日常使用不影響其他工作
-   - 🟡 勉強可跑——裝得下但吃緊，建議關閉其他大型程式
-   - 🔴 裝不下——這個版本超過這台機器的能力
-   判定式用的是實際檔案大小＋推理時的快取預留＋執行環境開銷，
-   對照目前可用記憶體的九成——不是理論值，是這台機器現在的狀況。
-3. **一鍵安裝**：自動挑「裝得下的最高品質」量化版本（優先 imatrix 校準版），
-   斷線續傳，裝完自動出現在已安裝清單。
+---
 
-## MoE 模型的雙軌判定（讓 16GB 機器跑 30B）
+## How it works
 
-MoE（Mixture-of-Experts）模型像 30B-A3B：總參數 30B，但每個字實際只動用 3B。
-這類模型的 expert 權重**不需要**全部塞進快速記憶體——turbo-fieldfare 專案
-實證了 26B 模型常駐 2GB 也能跑。市集對 MoE 模型因此顯示兩顆燈：
+Open **Manage → Local models** and choose what you want the model for. The marketplace scans Hugging Face across five quality-vetted publishers, and every recommendation carries a fit light (green / yellow / red) computed for **this machine**. Press install and the system picks the quantization for you, resumes interrupted downloads, and has the model ready to use the moment it lands.
 
-- **全載入**：整包塞進記憶體的傳統判定
-- **省顯存模式**：只有共享層進 GPU、expert 留在系統記憶體的判定
+```
+Pick a purpose
+      |
+      v
++----------------------+
+| Scan Hugging Face    |  <-- five vetted publishers,
+|                      |      results cached 24h
++----------+-----------+
+           |
+           v
++----------------------+
+| Compute the fit      |  <-- against this machine's
+| light (🟢/🟡/🔴)      |      memory, right now
++----------+-----------+
+           |
+           v
++----------------------+
+| One-click install    |  <-- best quant that fits,
+|                      |      resumable download
++----------------------+
+```
 
-全載入紅燈但省顯存綠燈的模型會標「省顯存模式可用」。執行層今天就能啟用：
-`inference.toml` 的 `[llamafile] extra_args = ["--cpu-moe"]`（llamafile 底層
-就是 llama.cpp）。llama.cpp 原生的 expert SSD streaming（上游 PR #25294）
-合併後會再跟進成一格開關。
+### Step 1: pick a purpose
 
-## 進階使用者
+Chat assistant, coding, long documents, or Chinese-first. No model names required.
 
-- **進階抽屜**：每個模型的全部量化版本手選，含 imatrix 標示、
-  每檔各自的適配燈與省顯存判定。
-- **手動安裝**：直接輸入任何 Hugging Face repo（`org/Model-GGUF`），
-  一樣枚舉 quant＋算適配——這是舊「清單機制」的替代逃生口。
-- **LoRA 與其他調整**：經 `inference.toml` 的 `[llamafile] extra_args`
-  傳遞（如 `["--lora", "/path/adapter.gguf"]`），推理設定頁可編輯。
-- **HF token**：環境變數 `HF_TOKEN`——限額翻倍＋可存取需授權（gated）模型。
+### Step 2: read the fit light
 
-## 資料來源與品質
+| Light | What it means |
+|-------|---------------|
+| 🟢 Runs comfortably | Memory footprint stays under 60%; everyday use won't disturb other work |
+| 🟡 Barely fits | It loads, but it's tight — close other large applications first |
+| 🔴 Won't fit | This variant exceeds what this machine can handle |
 
-五家發布者白名單：unsloth（MoE 強項）、bartowski、mradermacher、
-lmstudio-community、ggml-org——依社群量化品質基準（KL divergence 對照
-原始權重）挑選；同一模型多家發布時自動去重取最優。搜尋結果快取 24 小時；
-Hugging Face 不可達時退回快取，絕不擋頁面。
+The verdict comes from the actual file size, plus the cache reservation needed at inference time, plus runtime overhead, compared against 90% of the memory available right now. Not a theoretical figure — the state of this machine, today.
 
-## 界線
+### Step 3: install with one click
 
-- 模型檔就是註冊表：安裝＝檔案落到 `~/.duduclaw/models/`，刪除＝刪檔。
-  AI 員工面的 `model_list`／`model_load` MCP 工具讀同一個目錄，行為不變。
-- 推理設定頁（後端選擇、路由、llamafile 參數）維持原樣——搬走的只有
-  「找模型、裝模型」這段。
+The system picks the highest-quality quantization that fits (imatrix-calibrated builds preferred), resumes the download if the connection drops, and the model appears in the installed list when done.
+
+---
+
+## Dual-track fit for MoE models: running 30B on a 16GB machine
+
+MoE (Mixture-of-Experts) models like 30B-A3B carry 30B total parameters but activate only 3B per token. Their expert weights do **not** need to sit in fast memory all at once — the turbo-fieldfare project demonstrated a 26B model running with just 2GB resident. The marketplace therefore shows two lights for MoE models:
+
+| Track | What it judges |
+|-------|----------------|
+| **Full load** | The traditional verdict: the whole package loaded into memory |
+| **VRAM-saving mode** | Only shared layers go to the GPU; experts stay in system memory |
+
+A model that is red on full load but green in VRAM-saving mode gets a "VRAM-saving mode available" label. The execution layer can enable it today: `[llamafile] extra_args = ["--cpu-moe"]` in `inference.toml` (llamafile is llama.cpp underneath). Once llama.cpp's native expert SSD streaming (upstream PR #25294) merges, it will follow as a single toggle.
+
+---
+
+## For power users
+
+- **Advanced drawer**: hand-pick from every quantization variant of a model, with imatrix labels and a per-file fit light plus VRAM-saving verdict.
+- **Manual install**: type any Hugging Face repo (`org/Model-GGUF`) and get the same quant enumeration and fit computation — the escape hatch that replaces the old list mechanism.
+- **LoRA and other tweaks**: passed through `[llamafile] extra_args` in `inference.toml` (e.g. `["--lora", "/path/adapter.gguf"]`), editable on the inference settings page.
+- **HF token**: set the `HF_TOKEN` environment variable to double the rate limit and reach gated models.
+
+---
+
+## Data sources and quality
+
+Five publishers make the whitelist: unsloth (strong on MoE), bartowski, mradermacher, lmstudio-community, and ggml-org — selected on community quantization-quality benchmarks (KL divergence against the original weights). When several publishers ship the same model, duplicates collapse to the best one. Search results are cached for 24 hours; if Hugging Face is unreachable, the marketplace falls back to the cache and never blocks the page.
+
+---
+
+## Boundaries
+
+- **The model files are the registry.** Install means a file lands in `~/.duduclaw/models/`; delete means the file is removed. The agent-facing `model_list` / `model_load` MCP tools read the same directory — their behavior is unchanged.
+- **The inference settings page stays put.** Backend selection, routing, and llamafile arguments remain where they were. Only the "find a model, install a model" part moved here.
+
+---
+
+## The takeaway
+
+The marketplace answers three questions in plain words: what is this model for, will it run on this machine, and how do I get it — a purpose picker, a fit light computed from real memory numbers, and a one-click resumable install.

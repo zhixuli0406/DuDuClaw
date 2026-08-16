@@ -1,152 +1,150 @@
-# 真人接手對話（Human takeover）
+# Human takeover
 
-管理者在通道裡**直接發言**，AI 就會停止回覆那一個對話，直到管理者交還為止。沒有按鈕要按，沒有模式要切，也不會動到任何全域設定。
-
-這一頁說明它怎麼觸發、期間發生什麼事、以及怎麼收回。
+> An admin who types directly in a channel silences the AI for that one conversation until they hand it back — no button to press, no mode to switch, no global settings touched.
 
 ---
 
-## 為什麼是「發言」而不是按鈕
+## Why speaking, not a button
 
-客服工具做人機交接有三種模型：Intercom 把 AI 當成一個可被取代的指派對象（真人送出一則訊息＝控制權轉移）；ManyChat 把自動化當成一條可靜音的音軌（真人開始打字就自動暫停 30 分鐘）；LINE 官方帳號則在對話層開一個「暫時手動聊天」逃生口（預設 1 小時、可延長、可提前結束、明講不影響全域設定）。
+Support tools model human handoff in three ways. Intercom treats the AI as a replaceable assignee: a human sending one message transfers control. ManyChat treats automation as a track you can mute: a human starting to type pauses it for 30 minutes. LINE Official Account opens a per-conversation "temporary manual chat" escape hatch — one hour by default, extendable, endable early, and explicitly guaranteed not to touch global settings.
 
-三家的共同結論是：**專員不該為了接手而先去按一顆按鈕**。人衝進對話裡通常是因為出事了，這時候多一步操作就是多一次忘記。DuDuClaw 取的是同一條路——管理者一發言，接手就成立。
-
----
-
-## 觸發條件（很嚴格，故意的）
-
-只有**同時**滿足這兩件事的人發言才會觸發接手：
-
-1. 這個通道帳號已經在儀表板完成**身分綁定**，而且該綁定是**已驗證**的；
-2. 綁定到的儀表板帳號是**啟用中的管理員或主管**。
-
-其他任何人發言都不會觸發，包括：一般員工帳號、只填了通道帳號但沒完成驗證的綁定、完全沒綁定的陌生帳號、同一個 id 但在別的通訊軟體上。
-
-還沒有任何人在儀表板綁定通道帳號的部署（例如一人公司剛裝好），**不會有自動接手**。這是刻意的：那種情況下唯一能拿來當身分證明的只有「訊息從設定的目的地送來」，而在通道裡那等於「你自己」——套用的結果會是老闆傳第一句話 AI 就永遠閉嘴。這類部署想暫停 AI，請用 `!STOP` 安全詞，或先到儀表板完成一次通道綁定。
-
-在通道輸入 `/takeover` 會直接告訴你目前屬於哪一種狀況。
+All three reach the same conclusion: **a support agent should not have to press a button before taking over.** A person jumps into a conversation because something went wrong, and at that moment one extra step is one extra thing to forget. DuDuClaw takes the same path — the moment an admin speaks, the takeover holds.
 
 ---
 
-## 接手期間發生什麼
+## How it works
 
-**AI 對這個對話完全靜默。** 不會回答，也不會發「我被暫停了」之類的說明——真人正在處理，機器人跳出來報告自己的狀態就是干擾。
+### Trigger conditions (strict on purpose)
 
-**訊息還是有被記下來。** 接手期間的每一則發言（管理者的、客戶的）都會寫進對話紀錄，所以 AI 恢復之後看得到中間發生了什麼，不會接在一個斷掉的脈絡上。
+Only a message from someone meeting **both** of these conditions triggers a takeover:
 
-**排程中的動作一併停住。** 這是最容易做漏的一環：只擋住「新的回覆」是不夠的，已經在跑的工作結束後仍然會把結果推進來——真人處理完了，機器人的舊訊息才慢慢冒出來（ManyChat 使用者實際踩過的坑）。DuDuClaw 對這個對話的每一條派發路徑都加了檢查：
+1. The channel account has completed **identity binding** in the dashboard, and the binding is **verified**;
+2. The bound dashboard account is an **active admin or supervisor**.
 
-| 路徑 | 接手期間的行為 |
+Nobody else triggers it: regular employee accounts, bindings whose channel account was filled in but never verified, unbound stranger accounts, or the same id on a different messenger.
+
+Deployments where nobody has bound a channel account yet (say, a one-person company right after install) get **no automatic takeover**. That is deliberate: in that situation the only available identity proof is "the message came from the configured destination", which inside a channel means "you" — applying it would mean the owner's first message silences the AI forever. To pause the AI in such a deployment, use the `!STOP` safe word, or complete one channel binding in the dashboard first.
+
+Typing `/takeover` in the channel tells you which of these situations you are in.
+
+### What happens during a takeover
+
+**The AI goes fully silent for this conversation.** It does not answer, and it does not post "I am paused" notices — a human is handling things, and a bot popping up to report its own status is interference.
+
+**Messages are still recorded.** Every message during the takeover (the admin's, the customer's) is written to the conversation log, so when the AI resumes it sees what happened in between and does not continue on a broken thread of context.
+
+**Scheduled actions are held too.** This is the easiest part to get wrong: blocking only *new replies* is not enough, because work already in flight finishes later and pushes its result in — the human wraps up, then the bot's stale messages trickle out (a trap ManyChat users have actually hit). DuDuClaw checks every dispatch path aimed at this conversation:
+
+| Path | Behavior during takeover |
 |---|---|
-| 通道進來的訊息 | 不回覆（訊息仍記入對話紀錄） |
-| 自主任務派工 | 凍結，不派工也不轉人工（要找的人正在現場） |
-| 自主任務進度推播 | 延後，交還後合併投遞 |
-| 自主任務「等你決定」卡片 | 延後，交還後投遞（按鈕完整保留） |
-| 自主任務結束通知（全自動模式） | 延後，交還後合併投遞 |
-| 一般主動推播（週知／待確認級） | 延後，交還後合併投遞 |
-| 自動規則跳閘通知 | 延後，交還後投遞（按鈕完整保留） |
-| 任務看板叫醒 | 略過，交還後照常叫醒 |
-| 主動關懷訊息 | 丟棄（遲到一小時的「你已經連續工作兩小時了」是錯的訊息，不是晚到的訊息） |
-| 例行工作（排程）結果 | 丟棄（下一次執行會取代它；執行紀錄仍然留著） |
-| 交辦回報（子員工做完回報） | 丟棄（結果仍在佇列，可從儀表板查看） |
+| Inbound channel messages | No reply (the message is still written to the conversation log) |
+| Autonomous task dispatch | Frozen — no dispatch, no escalation to a human (the person to find is already on scene) |
+| Autonomous task progress pushes | Held, merged and delivered after handback |
+| Autonomous task "your decision needed" cards | Held, delivered after handback (buttons fully preserved) |
+| Autonomous task completion notices (fully automatic mode) | Held, merged and delivered after handback |
+| Regular proactive pushes (FYI / needs-confirmation tiers) | Held, merged and delivered after handback |
+| Autopilot rule circuit-breaker notices | Held, delivered after handback (buttons fully preserved) |
+| Task-board wake-ups | Skipped; wake-ups resume normally after handback |
+| Proactive care messages | Dropped (an hour-late "you have been working for two hours straight" is a wrong message, not a late one) |
+| Scheduled (cron) job results | Dropped (the next run replaces it; the run log is kept) |
+| Delegation reports (a sub-employee finishing and reporting back) | Dropped (the result stays in the queue, readable from the dashboard) |
 
-每一次略過都會寫進 gateway 日誌，所以「AI 為什麼沒講話」永遠查得到，不會是無聲的黑洞。
+Every skip is written to the gateway log, so "why didn't the AI say anything" always has an answer — never a silent black hole.
 
-**三種通知不擋，這是刻意的**：高風險動作核可、安裝申請簽核、通道故障告警。這三種都是「須處理」級（緊急、重要、且真的要你動手），而且跟你正在處理的這個對話無關。通知治理本來就把這一級排除在勿擾時段之外，理由相同：為了少一次打擾而壓住「這個動作可能不可逆，要同意嗎？」，換來的是真實風險。
+**Three notification types pass through, deliberately**: high-risk action approvals, install-request sign-offs, and channel failure alerts. All three are action-required tier (urgent, important, and genuinely needing your hands), and none of them concern the conversation you are handling. Notification governance already exempts this tier from quiet hours, for the same reason: suppressing "this action may be irreversible — approve?" to save one interruption buys real risk.
 
-**接手是對話層的，不是帳號層的。** 同一個 AI 員工在別的群組、別的私訊照常回覆；同一個群組裡的討論串各自獨立。唯一刻意放寬的地方：接手某個討論串時，發往母頻道的推播也會一起被擋住——寧可多安靜一則，也不要在真人講話時插嘴。
+**A takeover is conversation-level, not account-level.** The same AI employee keeps replying in other groups and other DMs; threads within the same group are independent of each other. One deliberate widening: taking over a thread also blocks pushes to its parent channel — one extra quiet message beats interrupting while the human is talking.
 
----
+### Lifecycle
 
-## 生命週期
-
-| 動作 | 怎麼做 |
+| Action | How |
 |---|---|
-| 開始 | 管理者在對話裡發言（預設 60 分鐘） |
-| 延長 | `/takeover +30m`（也接受 `+30`、`30m`、`45min`） |
-| 查詢 | `/takeover` — 現在是誰在接手、還剩幾分鐘 |
-| 提前交還 | `/takeover end`（也接受 `結束`） |
-| 自動交還 | 時間到，AI 自動恢復 |
+| Start | An admin speaks in the conversation (default 60 minutes) |
+| Extend | `/takeover +30m` (also accepts `+30`, `30m`, `45min`) |
+| Status | `/takeover` — who holds the takeover, minutes remaining |
+| End early | `/takeover end` (also accepts `結束`) |
+| Auto handback | Timer expires; the AI resumes on its own |
 
-管理者每發一句話，計時就從那一刻重新起算 60 分鐘——處理中的對話不會講到一半突然被 AI 接走。反過來說，離開對話 60 分鐘後就自動交還，不會有人忘記把 AI 打開。
+Every message the admin sends restarts the 60-minute clock from that moment — a conversation being handled is never snatched back mid-sentence. Conversely, 60 minutes after the admin leaves the conversation, handback is automatic, so nobody has to remember to switch the AI back on.
 
-**Slack 例外**：Slack 會在用戶端攔掉沒註冊過的斜線指令，`/takeover` 根本送不到我們這裡。Slack 上請用 `/duduclaw takeover`、`/duduclaw takeover +30m`、`/duduclaw takeover end`。其他通道兩種寫法都可以。
+**Slack exception**: Slack intercepts unregistered slash commands client-side, so `/takeover` never reaches us at all. On Slack use `/duduclaw takeover`, `/duduclaw takeover +30m`, `/duduclaw takeover end`. Every other channel accepts both spellings.
 
-延長有上限：`max_duration_minutes`（預設 12 小時，硬上限也是 12 小時）。「永久暫停」不是這個功能該做的事——那是停用 AI 員工。
+Extensions have a ceiling: `max_duration_minutes` (default 12 hours, hard cap also 12 hours). "Pause forever" is not this feature's job — that is disabling the AI employee.
 
----
+### Three things happen at once
 
-## 接手時同時發生的三件事
+The moment a takeover holds is one action, not three:
 
-接手成立的那一刻是一個動作，不是三個：
+1. **Pause** AI replies for this conversation;
+2. **Claim the work**: unfinished autonomous tasks that came from this conversation are marked as handled by you (the board stops showing them as "AI working on it");
+3. **Log to the activity feed**: who took over which conversation, and how many pieces of work came along.
 
-1. **暫停**這個對話的 AI 回覆；
-2. **接手工作**：這個對話產生的、還沒結束的自主任務標記為由你處理（看板上不再顯示成「AI 在做」）；
-3. **記一筆活動流**：誰接手了哪個對話、順便接手幾件工作。
+Drop any one of the three and a black hole remains — most commonly pausing without marking, so the board still shows the AI running the task and the next person has no idea someone is already on it.
 
-三者少任何一個都會留下黑洞——最常見的是只暫停不標記，於是看板上那件事看起來還是 AI 在跑，下一個人接手時完全不知道已經有人在處理了。
-
-順序是刻意的：先暫停（唯一牽涉安全的一步，失敗就整件事不成立、也不會對外宣告），再標記工作，最後記活動流。後兩者失敗只寫警告，不會把已經生效的暫停撤掉。
+The order is deliberate: pause first (the only safety-relevant step — if it fails, the whole takeover fails and nothing is announced), then mark the work, last log the activity. Failures in the latter two only write warnings and never undo a pause already in effect.
 
 ---
 
-## 對話裡看得到什麼
+## What the conversation shows
 
-接手時，對話裡會出現一則：
+When a takeover starts, one message appears in the conversation:
 
 ```
 👤 王小明 已接手對話，接下來由真人回覆（約 60 分鐘）。
 ```
 
-交還時：
+("王小明 has taken over this conversation; a human will reply from here — about 60 minutes.")
+
+On handback:
 
 ```
 🤖 AI 已恢復回應。
 ```
 
-**這一層必須自己做。** Intercom 是唯一內建完整身分揭露的平台（法遵驅動）；ManyChat 官方 FAQ 明講「不會自動通知聯絡人自動化被暫停」；LINE 的架構上根本沒有這層。所以 DuDuClaw 自己發這兩則訊息。
+("The AI has resumed responding.")
 
-顯示的名字取自儀表板的顯示名稱。沒有設顯示名稱時顯示「管理員」——**永遠不會**把通道帳號 id 露出來。
+**This layer has to be built in-house.** Intercom is the only platform with complete built-in identity disclosure (compliance-driven); ManyChat's own FAQ states it does not notify contacts that automation is paused; LINE's architecture has no such layer at all. So DuDuClaw sends these two messages itself.
+
+The displayed name comes from the dashboard display name. When none is set, it shows 「管理員」 ("administrator") — the channel account id is **never** exposed.
 
 ---
 
-## 設定
+## Configuration
 
-`~/.duduclaw/config.toml`：
+`~/.duduclaw/config.toml`:
 
 ```toml
 [takeover]
-enabled = true            # 預設開啟；設 false 完全關閉這個功能
-duration_minutes = 60     # 一次接手的長度
-max_duration_minutes = 720  # 延長的上限（硬上限 12 小時）
+enabled = true            # on by default; set false to turn the feature off entirely
+duration_minutes = 60     # length of one takeover
+max_duration_minutes = 720  # extension ceiling (hard cap 12 hours)
 ```
 
-數值寫錯（0、負數、天文數字）會被夾到合理範圍，而不是讓功能失效——設定檔打錯字的代價不該是「AI 從此不回話」或「暫停一秒就結束」。
+Bad values (0, negative, astronomical) are clamped into a sane range rather than breaking the feature — a typo in a config file should not cost you "the AI never speaks again" or "the pause ends after one second".
 
-狀態存在 `~/.duduclaw/takeover_state.json`，只有這一個檔案會被寫到。沒有人接手的時候這個檔案是空的（或不存在）。**任何全域設定、`agent.toml`、通道設定都不會被動到**——這是 LINE 四件套裡最關鍵的那一條，也是專員敢用這個功能的原因。
-
----
-
-## 儀表板
-
-`takeover.list` RPC（主管以上）回傳目前被接手的對話清單：誰在接手、哪個通道、還剩幾分鐘、順便接手了哪幾件工作。
-
-**只有讀，沒有寫。** 接手是「人在那個對話裡」這件事本身，把它做成儀表板上的一顆按鈕會產生第二套授權模型，並讓人「接手」一個自己根本不在場的對話。要接手就去那個對話裡講話。
+State lives in `~/.duduclaw/takeover_state.json`, the only file ever written. When nobody is taking over, the file is empty (or absent). **No global settings, no `agent.toml`, no channel configuration are touched** — the most important line in LINE's four-part design, and the reason support agents dare to use this feature at all.
 
 ---
 
-## 已知邊界
+## Dashboard
 
-- **斜線指令不算發言。** 管理者打 `/status` 不會觸發接手——指令是操作，不是對話。
-- **一次只有一位持有者。** 第二位管理者在同一個對話發言會把接手轉移給他（最後講話的人才是客戶正在對話的對象）。
-- **交還通知需要 bot token。** 找不到 token 的通道收不到「AI 已恢復回應」那一則；活動流照樣有紀錄。
-- **暫停到期不依賴背景排程。** 每個檢查點都是比對當下時間，所以就算掃描任務沒跑，時間一到 AI 就恢復回答；背景掃描只負責發那則交還通知。
+The `takeover.list` RPC (supervisor and above) returns the conversations currently taken over: who holds each one, on which channel, minutes remaining, and which pieces of work were claimed along the way.
+
+**Read-only, no writes.** A takeover *is* the fact of a person being in that conversation; turning it into a dashboard button would create a second authorization model and let someone "take over" a conversation they are not even present in. To take over, go speak in the conversation.
 
 ---
 
-## 相關文件
+## Known boundaries
 
-- [34-goal-loop.md](34-goal-loop.md) — 自主任務迴圈（接手會凍結它）
-- [40-notification-governance.md](40-notification-governance.md) — 通知分級與延後佇列（接手沿用同一條佇列）
-- [37-delegation-isolation.md](37-delegation-isolation.md) — 誰能對誰下指令
+- **Slash commands do not count as speaking.** An admin typing `/status` does not trigger a takeover — a command is an operation, not conversation.
+- **One holder at a time.** A second admin speaking in the same conversation transfers the takeover to them (whoever spoke last is the person the customer is actually talking to).
+- **The handback notice needs a bot token.** A channel with no resolvable token does not receive the "AI has resumed responding" message; the activity feed records the handback regardless.
+- **Expiry does not depend on a background job.** Every checkpoint compares against the current time, so the AI resumes on schedule even if the sweep task never runs; the background sweep only sends the handback notice.
+
+---
+
+## Related documents
+
+- [34-goal-loop.md](34-goal-loop.md) — the autonomous task loop (a takeover freezes it)
+- [40-notification-governance.md](40-notification-governance.md) — notification tiers and the deferred-delivery queue (takeover reuses the same queue)
+- [37-delegation-isolation.md](37-delegation-isolation.md) — who may command whom

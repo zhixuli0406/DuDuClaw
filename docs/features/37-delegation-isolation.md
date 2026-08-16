@@ -1,65 +1,80 @@
-# 部門與階級隔離
+# Delegation Isolation
 
-DuDuClaw 1.52 引入一套針對多人團隊的委派管制。你的 AI 員工現在需要遵循組織結構，不是對任何人都言聽計從。
+> Delegation control for AI employees: who can hand work to whom is decided by the `reports_to` tree, departments, and a white-list.
 
-## 問題狀況
+DuDuClaw 1.52 introduces delegation controls for multi-person teams. Your AI employees now follow the organizational structure instead of taking orders from just anyone.
 
-早期版本只有單層父子檢查——祖父無法直接指派工作給孫層員工（越級被拒），同部門同事互派也被擋。後端路徑（任務隊列、自動化規則、外部 A2A 呼叫）根本沒檢查，任何人都可以偽造委派指令。
+---
 
-## 三層政策，自主選擇
+## The problem
 
-在 `config.toml` 或儀表板「進階設定」裡配置 `[delegation] policy`：
+Earlier versions had only a single-level parent-child check — a grandparent could not assign work directly to a grandchild-level employee (skip-level requests were rejected), and same-department colleagues could not delegate to each other either. Backend paths (task queue, automation rules, external A2A calls) had no check at all: anyone could forge a delegation instruction.
 
-| 政策 | 行為 | 用途 |
-|------|------|------|
-| `department`（預設） | 上下級可派工、同部門橫向協作、白名單配對都允許 | 大多數團隊 |
-| `hierarchy` | 只允許上下級與白名單配對，沒有同部門橫向 | 嚴格的指揮鏈 |
-| `open` | 舊版本行為，除了「不能派給自己」之外不做檢查 | 緊急回退用 |
+---
 
-白名單配對在 `department` 與 `hierarchy` 兩種政策下都有效；只有 `open` 用不到它（本來就全開）。
+## Three policies, your choice
 
-預設值 `department` 適合一般協作——既已修正越級指派漏洞，同時保留同事互相支援的彈性。
+Configure `[delegation] policy` in `config.toml` or under "Advanced settings" in the dashboard:
 
-## 工作流程受影響的地方
+| Policy | Behavior | Use case |
+|--------|----------|----------|
+| `department` (default) | Up/down the hierarchy, same-department horizontal collaboration, and white-listed pairs are all allowed | Most teams |
+| `hierarchy` | Only hierarchy and white-listed pairs; no same-department horizontal | Strict chain of command |
+| `open` | Legacy behavior — no checks except "cannot delegate to yourself" | Emergency fallback |
 
-派工的三種方式都受管制：
+White-list pairs work under both `department` and `hierarchy`; only `open` has no use for them (everything is already allowed).
 
-1. **直接指派** — 從儀表板、Telegram 或 API 呼叫 `send_to_agent` / `spawn_agent`
-   - 頭目能指派給直屬下級，也能指派給孫層（祖父→孫現已允許）
-   - 同部門員工之間可互相指派
-   - 其他情況被拒，收到明確錯誤訊息說明是誰對誰、缺什麼關係
+The default `department` suits everyday collaboration — it fixes the skip-level assignment gap while keeping the flexibility for colleagues to back each other up.
 
-2. **任務派遣** — 在任務板建立任務（`tasks_create`）或改派（`tasks_update` 的
-   `assigned_to`）時指派給某人
-   - 檢查同1，拒絕時任務創建/改派失敗
-   - 接手自己的任務（`tasks_claim`）不受限
-   - Dashboard 的指派操作不受限（都是人類操作）
+---
 
-2b. **多步驟計畫與例行工作** — `create_task` 的每個步驟可以指定執行者、
-   `schedule_task` 可以幫別人排定期工作
-   - 兩者都是委派，建立當下就檢查；`create_task` 的步驟另外在真正派工前再檢查一次
-   - 幫自己排程、指定自己執行不受限
+## Where workflows are affected
 
-3. **自動化規則** — autopilot 規則裡的 delegate 動作
-   - 用 `autopilot` 系統身分檢查，自動放行
-   - 規則本身由儀表板守門，需要管理員設定
+Every delegation route is governed:
 
-4. **外部 A2A 呼叫** — 其他系統透過 ACP 協議呼叫 `message/send` 委派任務
-   - 預設被拒（fail-closed）
-   - 如果信任的外部夥伴需要，設定 `[acp] trusted = true` 才開通
-   - 一旦開通，外部呼叫用 `a2a-client` 身分，同樣受委派政策管制
+**1. Direct assignment** — calling `send_to_agent` / `spawn_agent` from the dashboard, Telegram, or the API
 
-## 同部門是什麼
+- A lead can assign to direct reports and also to grandchildren (grandparent→grandchild is now allowed)
+- Same-department employees can assign to each other
+- Everything else is rejected with a clear error naming who tried to assign to whom and which relationship is missing
 
-每個 AI 員工的 `agent.toml [agent] department` 欄位定義所屬部門。
+**2. Task dispatch** — assigning someone while creating a task on the task board (`tasks_create`) or reassigning (`assigned_to` in `tasks_update`)
 
-- 同 department 值的員工被視為「同部門」，在 `department` 政策下可互相指派
-- 欄位留空或不設 = 無部門，不會與任何人算同部門
-- 部門值是純文字對比，例如 `sales` 與 `Sales` 視為不同部門
+- Same checks as 1; on rejection the task creation/reassignment fails
+- Claiming your own task (`tasks_claim`) is unrestricted
+- Dashboard assignment operations are unrestricted (they are human operations)
 
-## 跨部門合作：白名單配對
+**2b. Multi-step plans and routines** — every step of `create_task` can name an executor, and `schedule_task` can set up recurring work for someone else
 
-銷售部主管和倉庫主管不同部門，但要彼此派工？使用白名單：
+- Both count as delegation and are checked at creation time; `create_task` steps are checked once more right before actual dispatch
+- Scheduling for yourself or naming yourself as executor is unrestricted
+
+**3. Automation rules** — the delegate action inside autopilot rules
+
+- Checked under the `autopilot` system identity, automatically allowed
+- The rules themselves are gated by the dashboard and require admin setup
+
+**4. External A2A calls** — other systems delegating tasks via the ACP protocol's `message/send`
+
+- Rejected by default (fail-closed)
+- If a trusted external partner needs it, set `[acp] trusted = true` to open it up
+- Once enabled, external calls use the `a2a-client` identity and are subject to the same delegation policy
+
+---
+
+## What counts as the same department
+
+Each AI employee's `agent.toml [agent] department` field defines its department.
+
+- Employees with the same department value are "same department" and may assign to each other under the `department` policy
+- Empty or unset = no department; such an employee never counts as same-department with anyone
+- Department values are compared as plain text, e.g. `sales` and `Sales` are different departments
+
+---
+
+## Cross-department collaboration: white-list pairs
+
+The sales lead and the warehouse lead are in different departments but need to delegate to each other? Use the white-list:
 
 ```toml
 [delegation]
@@ -70,46 +85,45 @@ allow = [
 ]
 ```
 
-- 每筆是一對兩個員工 ID，無序（`["A", "B"]` 等於 `["B", "A"]`）
-- 配對後兩人可互相指派，不需上下級關係
-- 自我配對（`["x", "x"]`）會被忽略
-- 手動編輯設定檔時，格式壞掉的項目（不是恰好兩個字串、有空字串）會被忽略並警告，
-  不影響其他配對；ID 拼錯不會被偵測，只是那組配對不會生效
-- 從儀表板存檔時規則更嚴：任何一個 ID 找不到對應的 AI 員工就整筆拒絕儲存並指出是哪一個，
-  而且一次最多 200 組配對
+- Each entry is a pair of two employee IDs, unordered (`["A", "B"]` equals `["B", "A"]`)
+- Once paired, the two can assign to each other with no hierarchy relationship required
+- Self-pairs (`["x", "x"]`) are ignored
+- When editing the config file by hand, malformed entries (not exactly two strings, or containing an empty string) are ignored with a warning and do not affect other pairs; a mistyped ID is not detected — that pair simply never takes effect
+- Saving from the dashboard is stricter: if any ID has no matching AI employee the whole save is rejected with the offending ID named, and at most 200 pairs may be saved at once
 
-儀表板「進階設定 → 委派權限」卡提供編輯界面，每個配對同時顯示兩方部門徽章，一眼看出協作意圖。
+The dashboard card "Advanced settings → Delegation permissions" provides the editor; each pair shows both sides' department badges so the collaboration intent is visible at a glance.
 
-## 儀表板設定（僅管理員）
+---
 
-**進階設定 → 委派權限**
+## Dashboard settings (admin only)
 
-三個控制項：
+**Advanced settings → Delegation permissions**
 
-1. **政策選擇**（單選）：department / hierarchy / open
-   - 每項附一句說明
-   - `open` 附紅色風險警語："放棄所有檢查，回到舊版本行為"
+Three controls:
 
-2. **跨部門協作**（配對列表）
-   - 每列顯示兩個 AI 員工名稱 + 部門徽章
-   - 點「+」新增配對（agent picker 下拉）、點「✕」刪除
-   - 變更立即生效，無需重啟
+1. **Policy selection** (radio): department / hierarchy / open
+   - Each option carries a one-line explanation
+   - `open` carries a red risk warning: "abandons all checks, back to legacy behavior"
 
-3. **狀態指示**
-   - 當前政策、配對數量
-   - 若有設定警告（例如無效 ID）會顯示
+2. **Cross-department collaboration** (pair list)
+   - Each row shows two AI employee names + department badges
+   - Click "+" to add a pair (agent picker dropdown), "✕" to delete
+   - Changes take effect immediately, no restart needed
 
-## 審計與除錯
+3. **Status indicators**
+   - Current policy, pair count
+   - Configuration warnings (e.g. invalid IDs) are shown if present
 
-拒絕的委派嘗試都會留痕，依攔截點分成兩個檔案：
+---
 
-- 派工真正要開始執行時被擋（bus 隊列、多步驟計畫）→ `~/.duduclaw/security_audit.jsonl`，
-  事件型別 `delegation_denied`
-- MCP 工具當下被擋（`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` /
-  `create_task` / `schedule_task`）→ `~/.duduclaw/tool_calls.jsonl`，同樣是
-  `delegation_denied`；`create_agent` / `agent_update` 的組織調整被擋則是 `org_placement_denied`
+## Audit and debugging
 
-`security_audit.jsonl` 的一筆長這樣：
+Rejected delegation attempts always leave a trail, split into two files by interception point:
+
+- Blocked when dispatch is actually about to execute (bus queue, multi-step plans) → `~/.duduclaw/security_audit.jsonl`, event type `delegation_denied`
+- Blocked at the MCP tool itself (`send_to_agent` / `spawn_agent` / `tasks_create` / `tasks_update` / `create_task` / `schedule_task`) → `~/.duduclaw/tool_calls.jsonl`, also `delegation_denied`; blocked org adjustments via `create_agent` / `agent_update` are recorded as `org_placement_denied`
+
+A `security_audit.jsonl` record looks like this:
 
 ```json
 {
@@ -129,186 +143,184 @@ allow = [
 }
 ```
 
-協助排查：
-- 檢查 agent 的 `department` 欄位有沒有拼對
-- 核對白名單配對是否正確（大小寫敏感）
-- 若整個團隊交不通工作，改成 `hierarchy` 或 `open` 確認是部門隔離問題
+Troubleshooting checklist:
 
-## 升級須知
+- Check whether the agent's `department` field is spelled correctly
+- Verify the white-list pairs (case-sensitive)
+- If the whole team cannot hand work around, switch to `hierarchy` or `open` to confirm department isolation is the cause
 
-從早期版本升級到 1.52 時：
+---
 
-- **前門路徑零回歸**：父子派工全部仍然通過（新政策更寬鬆）
-- **後門路徑變嚴**：直接 append bus_queue.jsonl（有帶發送者欄位時）、任務板指派、
-  多步驟計畫、例行工作、外部 A2A 呼叫這些之前無檢查的路徑現在都會執行隔離
-  - 若有自動化腳本依賴舊的「任意人派任意人」行為，會看到拒絕錯誤
-  - 解法：設定 `policy = "open"` 暫時回退，或補齊組織結構（加 department、補白名單）
-  
-- **`[acp] trusted` 預設 false**：外部 A2A 呼叫現在被拒，需明確開通
+## Upgrade notes
 
-建議保持預設 `department` 政策。即使舊版本沒有任何檢查，新政策對現有合法指派零影響，只在不合理的穿插嘗試時發出警告。
+When upgrading from earlier versions to 1.52:
 
-## 技術細節
+- **Zero regression on front-door paths**: all parent-child delegation still passes (the new policy is more permissive)
+- **Back-door paths tighten**: paths that previously had no checks — direct appends to bus_queue.jsonl (when a sender field is present), task-board assignment, multi-step plans, routines, external A2A calls — now enforce isolation
+  - Automation scripts relying on the old "anyone can assign to anyone" behavior will see rejection errors
+  - Fix: set `policy = "open"` as a temporary rollback, or fill in the org structure (add departments, add white-list pairs)
+- **`[acp] trusted` defaults to false**: external A2A calls are now rejected until explicitly enabled
 
-### 誰視為「系統」（不受隔離管制）
+Keep the default `department` policy. Even though earlier versions had no checks at all, the new policy has zero impact on existing legitimate assignments and only raises warnings on unreasonable cross-cutting attempts.
 
-以下身分的指派自動放行：
+---
 
-- `dashboard`（儀表板操作，人類身分）
-- `webhook`（來自 webhook 的排程任務）
-- `goal-loop-driver`（自主目標迴圈）
-- `cron`（排定任務）
-- `heartbeat`（心跳回應）
-- `autopilot`（自動化規則，前提是規則本身經驗證）
+## Technical details
 
-外部 A2A 呼叫預設用 `a2a-client` 身分，**不在清單內**。僅當 `[acp] trusted = true` 時才納入。
+### Who counts as "system" (exempt from isolation)
 
-上述名稱（加上 `a2a-client`、`default`、以及任何 `__` 開頭的名稱）是**保留字**，
-不能拿來建立 AI 員工——否則等於幫自己發一張通行證。
+Assignments from these identities pass automatically:
 
-### 這道防線管得到什麼、管不到什麼
+- `dashboard` (dashboard operations, a human identity)
+- `webhook` (scheduled tasks arriving via webhook)
+- `goal-loop-driver` (autonomous goal loop)
+- `cron` (scheduled tasks)
+- `heartbeat` (heartbeat responses)
+- `autopilot` (automation rules, provided the rule itself has been validated)
 
-管得到：AI 員工之間透過平台功能互相派工的每一條路徑（MCP 工具、任務板、多步驟計畫、
-例行工作、任務隊列、外部 A2A）。這是**組織權限邊界**，讓「誰能叫誰做事」跟著組織圖走。
+External A2A calls default to the `a2a-client` identity, which is **not** on the list. It is included only when `[acp] trusted = true`.
 
-管不到（設計上的已知邊界，不是 bug）：
+The names above (plus `a2a-client`, `default`, and any name starting with `__`) are **reserved words** and cannot be used to create AI employees — doing so would amount to issuing yourself a free pass.
 
-- **舊格式任務**：1.52 版對完全沒有發送者欄位的隊列任務仍然放行，只記一筆 warning
-  （避免升級時把還在排隊的工作全部打掉）。下一版改為拒絕。
-- **設定檔層級的改動**：從 v1.52 起，PreToolUse hook 凍結了敏感的組織資料欄位——agent 無法透過 Write/Edit/Bash 工具改寫
-  `agent.toml` 的 `name` / `reports_to` / `department`、`config.toml` 的 `[delegation]` / `[acp]` 段、`.mcp.json` 身分區塊、
-  `.claude/settings.json` 或 `identity.key`。更改這些設定必須走儀表板或 `agent_update` MCP 工具，由經過審驗的正式管道進行。
-  跨員工檔案修改（例如改別人的 SOUL.md）亦被拒絕。非 Claude runtime（codex/gemini 等）在 workspace-write 沙箱下無法寫入 `~/.duduclaw/` 
-  目錄，提供沙箱層防線。只有 FullAccess 沙箱例外，屬操作者顯式選擇的極端權限。
-- **系統與人類發起的操作**：儀表板、webhook、排程、自動化規則本來就是操作者的意志，
-  一律放行。
+### What this line of defense covers, and what it does not
 
-### 可見範圍過濾
+Covered: every route by which AI employees delegate to each other through platform features (MCP tools, task board, multi-step plans, routines, task queue, external A2A). This is an **organizational permission boundary**: "who can tell whom what to do" follows the org chart.
 
-`list_agents` 和 `agent_status` 指令只回傳 caller 有權看見的員工清單。
+Not covered (known boundaries by design, not bugs):
 
-根據政策，可見範圍包括：
+- **Legacy-format tasks**: 1.52 still lets queued tasks with no sender field at all pass, logging only a warning (to avoid wiping out work still queued during an upgrade). The next version switches to rejection.
+- **Config-file-level changes**: since v1.52 a PreToolUse hook freezes the sensitive org data fields — an agent cannot rewrite `agent.toml`'s `name` / `reports_to` / `department`, the `[delegation]` / `[acp]` sections of `config.toml`, the `.mcp.json` identity block, `.claude/settings.json`, or `identity.key` through the Write/Edit/Bash tools. Changing these settings must go through the dashboard or the `agent_update` MCP tool — the vetted official channels. Cross-employee file edits (e.g. modifying someone else's SOUL.md) are also rejected. Non-Claude runtimes (codex/gemini etc.) cannot write to the `~/.duduclaw/` directory under the workspace-write sandbox, adding a sandbox-level line of defense. Only the FullAccess sandbox is exempt — an extreme permission the operator chooses explicitly.
+- **System- and human-initiated operations**: dashboard, webhooks, schedules, and automation rules are the operator's will to begin with, and always pass.
 
-- 自己
-- 自己的整個子樹
-- 自己的所有祖先
-- （`department` 政策）同部門的所有員工
-- （所有政策）白名單配對夥伴
+### Visibility filtering
 
-試圖探測不可見員工（例如 `agent_status bob` 但 alice 無權看 bob）會回「not found or not visible」，不區分兩者。
+The `list_agents` and `agent_status` commands return only the employees the caller is allowed to see.
 
-### 禁止自助提權
+Depending on the policy, the visible scope includes:
 
-`create_agent` 建立新員工時，caller 只能把新員工掛在自己或自己子樹內的節點。
+- Yourself
+- Your entire subtree
+- All of your ancestors
+- (`department` policy) every employee in the same department
+- (all policies) white-list partners
 
-- 頭目只能建立自己的直屬下級，或接在下級底下
-- 不能建立員工掛到主管底下（除非操作者就是那個主管或更上層）
-- Dashboard 建立員工不受限（人類操作）
+Probing an invisible employee (e.g. `agent_status bob` when alice has no right to see bob) returns "not found or not visible", without distinguishing the two cases.
 
-## 身分驗證（進階）
+### No self-service privilege escalation
 
-### MCP 身分 Token 機制
+When `create_agent` creates a new employee, the caller can only attach it to itself or to a node inside its own subtree.
 
-從 v1.52 起，每個 agent 的 MCP 呼叫都帶上一組簽名身分 token，防止冒充。
+- A lead can only create direct reports, or attach new employees under an existing report
+- You cannot create an employee attached under your own manager (unless the operator is that manager or someone above)
+- Creating employees from the dashboard is unrestricted (a human operation)
 
-**工作原理**：
+---
 
-1. Gateway 啟動時在 `~/.duduclaw/identity.key` 生成 256-bit 隨機密鑰（檔案權限 0600）
-2. Spawn 子 agent 時，gateway 產生簽名 token（HMAC-SHA256，綁定 agent ID）
-3. Token 注入環境變數 `DUDUCLAW_AGENT_TOKEN`，子 agent 啟動時帶著它
-4. MCP server 端驗證 token 有效性與授權者身分
+## Identity verification (advanced)
 
-**軟硬模式**：
+### The MCP identity token mechanism
 
-- **軟模式**（預設）：`config.toml [delegation] require_identity_token = false`
-  - 缺失或無效 token 只發警告，不拒絕 MCP 啟動
-  - 用來容錯：升級中或 token 一時未同步的過渡階段
+Since v1.52, every agent's MCP calls carry a signed identity token to prevent impersonation.
 
-- **嚴格模式**：`config.toml [delegation] require_identity_token = true`
-  - 無效身分直接拒絕 MPC 啟動，失敗訊息寫入日誌
-  - 適合安全要求高的環境
+**How it works**:
 
-**升級順序很重要**：先重啟 gateway（讓 agent 的 MCP 設定重新簽署），再改成嚴格模式。
-順序反了 agent 會以無效 token 啟動，進嚴格模式後立即被拒。
+1. On startup, the gateway generates a 256-bit random key at `~/.duduclaw/identity.key` (file permission 0600)
+2. When spawning a sub-agent, the gateway produces a signed token (HMAC-SHA256, bound to the agent ID)
+3. The token is injected as the environment variable `DUDUCLAW_AGENT_TOKEN`, and the sub-agent starts up carrying it
+4. The MCP server verifies the token's validity and the grantor's identity
 
-### 組織資料保護
+**Soft and strict modes**:
 
-#### 凍結目標
+- **Soft mode** (default): `config.toml [delegation] require_identity_token = false`
+  - A missing or invalid token only produces a warning; MCP startup is not rejected
+  - Meant for tolerance: mid-upgrade transitions or moments when a token is briefly out of sync
 
-Agent 經檔案工具（Write/Edit/Bash）的變更會被 PreToolUse hook 攔截：
+- **Strict mode**: `config.toml [delegation] require_identity_token = true`
+  - An invalid identity rejects MCP startup outright, with the failure written to the log
+  - Suited to environments with high security requirements
 
-| 檔案 | 欄位 / 區塊 | 原因 |
-|------|-----------|------|
-| `agent.toml` | `[agent]` 的 `name`, `reports_to`, `department` | 改這些等於改組織圖，自助提權漏洞 |
-| `config.toml` | `[delegation]`, `[acp]` 全段 | 政策設定涉及全團隊安全，不能隨意改 |
-| `.mcp.json` | `DUDUCLAW_AGENT_ID`, `DUDUCLAW_AGENT_TOKEN` | 身分令牌，改掉等於冒充別人 |
-| `.claude/settings.json` | 整個檔案 | 權限清單等敏感設定統一由儀表板管理 |
-| `identity.key` | （整個檔案） | 簽章密鑰，任何更動都破壞身分驗證 |
+**Upgrade order matters**: restart the gateway first (so agents' MCP configs get re-signed), then switch to strict mode. In the reverse order, agents start up with invalid tokens and are rejected the moment strict mode takes effect.
 
-#### 正確的變更管道
+### Org data protection
 
-需要改這些設定時：
+#### Freeze targets
 
-- **修改 `name`、`reports_to`、`department`** → 儀表板「AI 員工 → 詳情 → 編輯」，或用 MCP `agent_update` 工具
-- **調整权限或新增工具** → 儀表板「AI 員工 → 進階設定」，或編輯 `agent.toml [capabilities]` 再手動指定（不走檔案工具）
-- **改委派政策或白名單** → 儀表板「進階設定 → 委派權限」，或直接編輯 `config.toml [delegation]` 再重啟 gateway
-- **新增 MCP server** → 編輯 `.mcp.json` 的 `tools` 陣列（不要改身分區塊），儀表板「進階設定 → MCP 伺服器」手動新增
+Agent changes made through file tools (Write/Edit/Bash) are intercepted by the PreToolUse hook:
 
-攔截會記在 `~/.duduclaw/tool_calls.jsonl` 帶 `org_placement_denied` 標記，便於除錯。
+| File | Fields / sections | Reason |
+|------|-------------------|--------|
+| `agent.toml` | `name`, `reports_to`, `department` in `[agent]` | Changing these rewrites the org chart — a self-service escalation hole |
+| `config.toml` | Entire `[delegation]`, `[acp]` sections | Policy settings affect the whole team's safety and cannot be changed casually |
+| `.mcp.json` | `DUDUCLAW_AGENT_ID`, `DUDUCLAW_AGENT_TOKEN` | Identity tokens; changing them means impersonating someone else |
+| `.claude/settings.json` | Whole file | Permission lists and other sensitive settings are managed centrally by the dashboard |
+| `identity.key` | (whole file) | Signing key; any change breaks identity verification |
 
-#### 系統身分無限制
+#### The right channels for changes
 
-系統發送者（dashboard、webhook、cron、autopilot）操作不受限，可改任何設定。這是由設計保證的：這些來源都是操作者的意志體現。
+When these settings need to change:
 
-### 白名單輸入的彈性
+- **`name`, `reports_to`, `department`** → dashboard "AI employees → details → edit", or the MCP `agent_update` tool
+- **Adjusting permissions or adding tools** → dashboard "AI employees → advanced settings", or edit `agent.toml [capabilities]` and specify by hand (not through file tools)
+- **Delegation policy or white-list** → dashboard "Advanced settings → Delegation permissions", or edit `config.toml [delegation]` directly and restart the gateway
+- **Adding an MCP server** → edit the `tools` array in `.mcp.json` (leave the identity block alone), or add manually via dashboard "Advanced settings → MCP servers"
 
-Dashboard 委派權限卡編輯配對時，兩個欄位都接受：
+Interceptions are recorded in `~/.duduclaw/tool_calls.jsonl` with the `org_placement_denied` marker for easier debugging.
 
-- **AI 員工顯示名**（`agent.toml [agent] display_name`）：例如「Alice」
-- **目錄名**（`agent.toml [agent] id`）：例如「alice-engineer」
+#### System identities are unrestricted
 
-輸入時檢索會同時掃描兩個欄位，但儲存一律正規化為目錄名，保證配對穩定不會因為顯示名改動而失效。
+System senders (dashboard, webhook, cron, autopilot) operate without restriction and may change any setting. This is guaranteed by design: those sources embody the operator's will.
 
-### 團隊佈署時的自動部門
+### White-list input flexibility
 
-使用儀表板的「部署新團隊」功能時，不需要逐一編輯成員的 department 欄位：
+When editing pairs on the dashboard delegation-permissions card, both fields accept:
 
-1. 上傳或選擇産業範本（`team.toml` 會定義 `[team] industry`，例如 `retail`, `healthcare`）
-2. 佈署時所有前台 agent（客服、銷售等）+ 背景 worker（資料整理、報表等）
-3. 的 `department` 自動設為該產業代碼
-4. 產業包單獨安裝時也帶上 department，新員工加進去時手動指定同部門或用儀表板一次改多個
+- **AI employee display name** (`agent.toml [agent] display_name`): e.g. "Alice"
+- **Directory name** (`agent.toml [agent] id`): e.g. "alice-engineer"
 
-這樣全隊自動同部門，符合大多數產業團隊的組織結構。需要跨部門協作再補白名單配對。
+The input search scans both fields, but storage always normalizes to the directory name, so pairs stay stable even when display names change.
 
-## 常見 Q&A
+### Automatic departments on team deployment
 
-**Q：升級後員工派不動工作了**
+With the dashboard's "Deploy new team" feature, there is no need to edit each member's department field one by one:
 
-A：檢查錯誤訊息。若是「不同部門」，補齊 `department` 欄位或加白名單配對。若訊息寫「層級不足」，檢查 `reports_to` 樹結構。
+1. Upload or pick an industry template (`team.toml` defines `[team] industry`, e.g. `retail`, `healthcare`)
+2. On deployment, every front-office agent (support, sales, ...) and background worker (data prep, reports, ...) gets its `department` set to that industry code automatically
+3. Industry packs installed standalone carry the department too; when new employees join, set the same department by hand or change several at once from the dashboard
 
-**Q：要不要開啟 `policy = "open"`**
+The whole team ends up in the same department automatically, matching how most industry teams are organized. Add white-list pairs when cross-department collaboration is needed.
 
-A：不建議。預設 `department` 等同「人人有權派下屬，同事可幫忙」——這是常見協作模式。回到 `open` 只應該是臨時除錯用。
+---
 
-**Q：白名單配對有數量上限嗎**
+## Common Q&A
 
-A：從儀表板存檔時一次最多 200 組。需要更多通常代表該調整組織結構或部門劃分，而不是繼續加例外。
+**Q: After the upgrade, my employees can't hand out work anymore**
 
-**Q：新員工 `department` 欄位要填什麼**
+A: Read the error message. If it says "different department", fill in the `department` fields or add a white-list pair. If the message says the hierarchy level is insufficient, check the `reports_to` tree structure.
 
-A：填部門代碼就行（例如 `sales`、`engineering`、`hr`）。字面對比，大小寫敏感。空值或不設 = 無部門，不與任何人算同部門，只能透過上下級或白名單協作。
+**Q: Should I turn on `policy = "open"`?**
 
-## 組織資料的權威來源
+A: Not recommended. The default `department` amounts to "everyone may assign to their reports, colleagues may help out" — the common collaboration pattern. Falling back to `open` should only ever be temporary debugging.
 
-從 v1.52 起，組織結構有一個中央權威儲存，防止多人編輯導致不一致。
+**Q: Is there a limit on white-list pairs?**
 
-### `org.toml` — 組織圖的單一事實來源
+A: Saving from the dashboard caps at 200 pairs at a time. Needing more usually means the org structure or department split should be adjusted, not that exceptions should keep piling up.
 
-Gateway 首次啟動時，自動掃描所有 agent 目錄下的 `agent.toml`，把組織資料（`reports_to`、`department`）匯入到 `~/.duduclaw/org.toml` 中央檔案。
-之後所有對組織結構的變更都透過這個檔案進行：
+**Q: What goes into a new employee's `department` field?**
+
+A: A department code is enough (e.g. `sales`, `engineering`, `hr`). Literal comparison, case-sensitive. Empty or unset = no department; such an employee never counts as same-department with anyone and can only collaborate through the hierarchy or the white-list.
+
+---
+
+## The authoritative source of org data
+
+Since v1.52, the organizational structure has one central authoritative store, preventing inconsistencies caused by concurrent edits.
+
+### `org.toml` — the single source of truth for the org chart
+
+On first startup, the gateway automatically scans the `agent.toml` under every agent directory and imports the org data (`reports_to`, `department`) into the central file `~/.duduclaw/org.toml`. From then on, all changes to the org structure go through this file:
 
 ```toml
-# ~/.duduclaw/org.toml — v1.52+ 新增
+# ~/.duduclaw/org.toml — new in v1.52+
 [agents."alice-engineer"]
 display_name = "Alice"
 reports_to = "sales-lead"
@@ -320,84 +332,86 @@ reports_to = "alice-engineer"
 department = "sales"
 ```
 
-這個檔案由 gateway 管理，直接編輯時格式壞掉可能導致啟動失敗，建議改用指令。
+This file is managed by the gateway; a broken format from hand editing can fail startup, so prefer the commands.
 
-### 三個指令管理組織結構
+### Three commands to manage the org structure
 
-#### 1. `duduclaw org sync` — 同步本機 agent.toml 到權威檔
+#### 1. `duduclaw org sync` — sync local agent.toml into the authoritative file
 
-操作者在終端執行（**不是 AI 員工工作階段裡執行**）：
+Run by the operator in a terminal (**not inside an AI employee session**):
 
 ```bash
 duduclaw org sync
 ```
 
-掃描所有 agent 目錄下 `agent.toml [agent]` 的 `reports_to` / `department` 欄位，更新到 `~/.duduclaw/org.toml`。
-如有衝突（例如 alice-engineer 在權威檔裡是 sales，但本機 `agent.toml` 寫的是 engineering），指令會列出每一筆差異並提示確認。
+Scans the `reports_to` / `department` fields of `agent.toml [agent]` under every agent directory and updates `~/.duduclaw/org.toml`. On conflict (e.g. alice-engineer is sales in the authoritative file but the local `agent.toml` says engineering), the command lists every difference and asks for confirmation.
 
-**什麼時候用**：
-- 手動編輯了某個 agent.toml 的組織欄位，想把改動同步到權威檔
-- 從舊版本升級來，agent.toml 還有組織資料但權威檔空空的
+**When to use**:
 
-#### 2. `duduclaw org show` — 檢視目前的組織結構
+- You hand-edited an agent.toml's org fields and want the change synced into the authoritative file
+- You upgraded from an older version: agent.toml still holds org data but the authoritative file is empty
+
+#### 2. `duduclaw org show` — inspect the current org structure
 
 ```bash
 duduclaw org show
 ```
 
-以樹狀或表格顯示所有員工、誰匯報給誰、各員工的部門。便於確認組織圖是否符合預期。
+Shows every employee, who reports to whom, and each employee's department as a tree or table. Handy for confirming the org chart matches expectations.
 
-#### 3. `duduclaw doctor` — 診斷組織資料不一致
+#### 3. `duduclaw doctor` — diagnose org data inconsistencies
 
 ```bash
 duduclaw doctor
 ```
 
-掃描並回報以下問題：
-- 權威檔遺失或格式錯誤
-- agent.toml 中的 `reports_to` 或 `department` 與權威檔不一致（稱為「漂移」）
-- 懸空的 reports_to（指向不存在的員工）
-- 循環依賴（A→B→C→A）
+Scans for and reports the following problems:
 
-輸出格式清楚列舉每個問題與建議修復步驟。
+- Missing or malformed authoritative file
+- `reports_to` or `department` in an agent.toml disagreeing with the authoritative file (called "drift")
+- Dangling reports_to (pointing at a nonexistent employee)
+- Circular dependencies (A→B→C→A)
 
-### 為什麼要搬——組織結構是決策，不是數據
+The output lists each problem clearly with suggested repair steps.
 
-舊版本允許 agent 手改自己目錄下的 `agent.toml [agent]` 欄位，直接影響委派判定（例如改 `reports_to` 就改了上司）。
-這創造了一個漏洞：一個員工可以自助改組織圖，達成提權目的。
+### Why the move — org structure is a decision, not data
 
-新版本把組織資料改成**中央權威**，代表：
-- **誰決定誰匯報給誰**：是操作者（人類），不是 AI 員工
-- **手改不生效**：編輯 agent.toml 的組織欄位只會被 doctor 檢舉漂移，不會自動改變委派行為
-- **改組織要走流程**：儀表板或 `duduclaw org sync` 指令，確保每一次變更都有人類的簽核意圖
+Older versions let an agent hand-edit the `agent.toml [agent]` fields in its own directory, directly affecting delegation decisions (changing `reports_to` changed your boss). That opened a hole: an employee could rewrite the org chart on its own and escalate its own authority.
 
-## 跨員工檔案隔離
+The new version makes org data a **central authority**, which means:
 
-AI 員工之間應該涇渭分明，一個員工不應能改動另一個員工的檔案。
+- **Who decides who reports to whom**: the operator (a human), not the AI employee
+- **Hand edits don't take effect**: editing the org fields of an agent.toml only gets flagged as drift by doctor; delegation behavior never changes automatically
+- **Org changes follow a process**: the dashboard or the `duduclaw org sync` command, so every change carries a human's sign-off intent
 
-### 檔案工具禁止跨境
+---
 
-v1.52 之後，Write / Edit / Bash 工具對檔案路徑有邊界檢查：
+## Cross-employee file isolation
 
-- **同員工目錄內 ✅**：alice-engineer 能讀寫 `~/.duduclaw/agents/alice-engineer/` 下的所有檔案
-- **其他員工目錄內 ❌**：alice-engineer 試圖修改 bob-qa 的 SOUL.md 或記憶檔 → **工具執行被拒**，寫入 `tool_calls.jsonl` 帶 `access_denied` 標記
-- **全局敏感檔 ❌**：alice-engineer 無法改 `~/.duduclaw/config.toml`、`org.toml`、`identity.key` 等全局檔案
+AI employees should stay cleanly separated: one employee must not be able to modify another employee's files.
 
-### PreToolUse hook 攔截層
+### File tools stop at the border
 
-任何檔案 Write / Edit / Bash 操作都經 hook 檢查，拒絕後立即返回錯誤。無需等到檔案 I/O，防止競態與日誌洩漏。
+Since v1.52, the Write / Edit / Bash tools enforce boundary checks on file paths:
 
-### 沙箱層防線 — 非 Claude runtime
+- **Inside your own employee directory ✅**: alice-engineer can read and write everything under `~/.duduclaw/agents/alice-engineer/`
+- **Inside another employee's directory ❌**: alice-engineer trying to modify bob-qa's SOUL.md or memory files → **tool execution rejected**, written to `tool_calls.jsonl` with the `access_denied` marker
+- **Global sensitive files ❌**: alice-engineer cannot change `~/.duduclaw/config.toml`, `org.toml`, `identity.key`, or other global files
 
-Codex、Gemini、Antigravity 等非 Claude runtime，在 `workspace-write` 沙箱下無法寫入 `~/.duduclaw/` 目錄。
-即使 PreToolUse 有漏洞，沙箱會在系統層阻止。只有 FullAccess 沙箱（操作者顯式選擇的極端權限）會開放，此時應視為授予該員工臨時全域存取。
+### The PreToolUse hook interception layer
 
-### 合法跨員工變更的管道
+Every file Write / Edit / Bash operation goes through the hook check, and a rejected call returns an error immediately — no waiting for file I/O, which prevents races and log leakage.
 
-若需改動另一個員工的設定（例如主管調整下屬的 department）：
+### The sandbox layer — non-Claude runtimes
 
-1. **員工基本資料** — 儀表板「AI 員工 → 詳情 → 編輯」（由人類/系統操作者進行）
-2. **組織結構** — `duduclaw org sync` 或儀表板「進階設定 → 組織結構」
-3. **能力權限** — 儀表板「AI 員工 → 進階設定」或用 MCP `agent_update` 工具（需管理員驗證）
+Non-Claude runtimes such as Codex, Gemini, and Antigravity cannot write to the `~/.duduclaw/` directory under the `workspace-write` sandbox. Even if the PreToolUse hook had a hole, the sandbox blocks at the system level. Only the FullAccess sandbox (an extreme permission the operator chooses explicitly) opens it up — at that point, treat it as granting the employee temporary global access.
 
-這些管道都是人類決策的體現，不會被員工自助繞過。
+### Legitimate channels for cross-employee changes
+
+If another employee's settings must change (e.g. a lead adjusting a report's department):
+
+1. **Employee basics** — dashboard "AI employees → details → edit" (performed by a human/system operator)
+2. **Org structure** — `duduclaw org sync` or dashboard "Advanced settings → org structure"
+3. **Capabilities and permissions** — dashboard "AI employees → advanced settings" or the MCP `agent_update` tool (admin verification required)
+
+These channels all embody human decisions and cannot be bypassed by employee self-service.
