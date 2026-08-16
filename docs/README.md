@@ -29,7 +29,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/16-session-memory-stack.md](features/16-session-memory-stack.md) | Session memory stack — pinned instructions + snowball recap + key facts |
 | [features/17-wiki-knowledge-layer.md](features/17-wiki-knowledge-layer.md) | Wiki knowledge layer — L0-L3 trust-weighted auto-injection |
 | [features/18-worktree-isolation.md](features/18-worktree-isolation.md) | Git worktree L0 isolation — lightweight per-task sandbox |
-| [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | ACP/A2A protocol server — A2A v1.0 over stdio（真正的 IDE Agent Client Protocol 支援規劃中） |
+| [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | Agent Client Protocol — `duduclaw acp` (ACP v1 for IDE panels: Zed / JetBrains / nvim) + `duduclaw acp-server` (A2A over stdio) |
 | [features/20-memory-intelligence.md](features/20-memory-intelligence.md) | Memory intelligence — temporal facts + reflexion loop + batch fetch |
 | [features/21-governance-layer.md](features/21-governance-layer.md) | Governance layer — policy registry + per-agent quotas |
 | [features/22-durability-framework.md](features/22-durability-framework.md) | Durability — idempotency / retry / circuit breaker / checkpoint / DLQ |
@@ -47,19 +47,19 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/34-goal-loop.md](features/34-goal-loop.md) | Autonomous goal loop — /goal to completion with an MAV acceptance judge |
 | [features/35-photo-desktop-pet.md](features/35-photo-desktop-pet.md) | Photo → desktop pet — local pixel-art pipeline + wander engine |
 | [features/36-recording-to-skill.md](features/36-recording-to-skill.md) | Recording → skill — approval-gated skill drafts from browser/desktop recordings |
-| [features/37-delegation-isolation.md](features/37-delegation-isolation.md) | 部門與階級隔離（A2A 委派政策） — 三層政策 + 白名單配對 + 可見範圍過濾 |
-| [features/38-aee-playbook-evolution.md](features/38-aee-playbook-evolution.md) | 自主進化 v3：Agentic Evolution Engine + Playbook — SOUL.md 唯讀化、gene 形行為規則、條目級觀察窗 |
-| [features/39-calibrated-forward-model.md](features/39-calibrated-forward-model.md) | 校準式預測 + held-out 學習閘 — 任意 AI 員工的 predict-score-gate 迴圈，Brier/RPS 校準 + Murphy 分解 + honest-luck 標籤 |
-| [features/40-notification-governance.md](features/40-notification-governance.md) | 通知治理 — 四級 escalation ladder、勿擾時段延後佇列、每日摘要、行動率量測（SRE 50% 判準） |
-| [features/41-resident-sensing.md](features/41-resident-sensing.md) | 常駐感知＋訊號喚醒（Resident Sensing）— 外部資料流（http_poll/command/file_tail/websocket）進 autopilot 匯流排、deterministic delta 衍生欄位、本地模型初篩、ticks.sources/ticks.recent 觀測 RPC |
-| [features/42-human-takeover.md](features/42-human-takeover.md) | 真人接手對話 — 管理者發言即接手、暫停+接手工作+活動流三合一、每條派發路徑逐一擋住、`/takeover` 生命週期 |
-| [features/43-telegram-miniapp.md](features/43-telegram-miniapp.md) | Telegram 內的審批詳情卡（Mini App，試作／預設關閉）— `initData` HMAC-SHA-256 驗簽、與按鈕共用同一套授權、https + 私訊才附「查看詳情」按鈕 |
-| [features/44-working-state.md](features/44-working-state.md) | 工作狀態（Working State）— AI 員工跨喚醒的唯一權威狀態：鍵值化現行規則＋交接註記每次喚醒自動注入、變更必經工具＋理由＋取代鏈、CAS 並發保護、TTL 當日規則 |
-| [features/45-local-model-marketplace.md](features/45-local-model-marketplace.md) | 本地模型市集 — 依用途挑選＋硬體適配三態燈＋一鍵安裝；MoE 省顯存雙軌判定（turbo-fieldfare 路線）；五發布者白名單＋手動 repo 逃生口 |
-| [features/46-belief-loop.md](features/46-belief-loop.md) | 信念迴圈（Belief Loop）— agent 對外部世界的結構化信念記帳：belief_submit/settle/stats、確定性三向 Brier＋觀測交叉核對、校準統計與 tick 信念對照程式化注入、/foresight 信念與驗證分頁 |
-| [features/47-agent-mail.md](features/47-agent-mail.md) | 信箱（Agent Mail）— 逐 agent 非即時信箱：Gmail／drop folder 兩種入站傳輸、到達即觸發（預設關）、外發一律經 ApprovalBroker 人工確認絕不自動寄出、可疑信顯示但不觸發、mail_list/mail_read/mail_send 三個 MCP 工具 |
-| [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios (zh-TW) — when to use, when not to, vs `duduclaw eval` |
-| [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix (zh-TW) — sales-facing coverage table |
+| [features/37-delegation-isolation.md](features/37-delegation-isolation.md) | Delegation isolation — who can hand work to whom, decided by the reports_to tree, departments, and a white-list |
+| [features/38-aee-playbook-evolution.md](features/38-aee-playbook-evolution.md) | Agentic Evolution Engine + playbook — SOUL.md becomes read-only; the playbook learns and retires rule by rule |
+| [features/39-calibrated-forward-model.md](features/39-calibrated-forward-model.md) | Calibrated forward model + held-out learning gate — Brier/RPS scoring, Murphy decomposition, luck-vs-skill labels |
+| [features/40-notification-governance.md](features/40-notification-governance.md) | Notification governance — four-level escalation ladder, quiet-hour deferral, daily digest, action-rate metrics |
+| [features/41-resident-sensing.md](features/41-resident-sensing.md) | Resident sensing — external data streams (http_poll / command / file_tail / websocket) wake agents only on rule hits |
+| [features/42-human-takeover.md](features/42-human-takeover.md) | Human takeover — an admin speaking in a channel silences the AI for that conversation until hand-back (`/takeover` lifecycle) |
+| [features/43-telegram-miniapp.md](features/43-telegram-miniapp.md) | Telegram Mini App approval card — full approval details + decision inside Telegram, HMAC-verified `initData` (spike, off by default) |
+| [features/44-working-state.md](features/44-working-state.md) | Working state — authoritative cross-wake state per agent; tool-only writes with reasons, CAS protection, TTL rules |
+| [features/45-local-model-marketplace.md](features/45-local-model-marketplace.md) | Local model marketplace — purpose-based picker, hardware-fit lights, one-click install |
+| [features/46-belief-loop.md](features/46-belief-loop.md) | Belief loop — structured predictions about the outside world, deterministically scored against reality |
+| [features/47-agent-mail.md](features/47-agent-mail.md) | Agent Mail — per-agent inbox (Gmail / drop folder); outbound mail always requires human confirmation |
+| [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
+| [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---
 
@@ -181,7 +181,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 ├── features/                          # Feature highlight articles (+ ja-JP, zh-TW)
 │   ├── README.md
 │   ├── feature-inventory.md
-│   └── 01-…-19-…                      #   19 feature deep-dives
+│   └── 01-…-47-…                      #   47 feature deep-dives
 ├── spec/                              # Open format specifications
 │   ├── soul-md-spec.md                #   SOUL.md format v1.0
 │   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0

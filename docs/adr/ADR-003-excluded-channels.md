@@ -7,7 +7,8 @@
 ## Context
 
 DuDuClaw ships nine channels (Telegram, LINE, Discord, Slack, WhatsApp, Feishu,
-Google Chat, Microsoft Teams, WebChat). During the 2026-07 channel-gap review
+Google Chat, Microsoft Teams, WebChat — count as of this ADR; WeCom and DingTalk
+were added later, bringing the total to eleven). During the 2026-07 channel-gap review
 three further platforms were evaluated and **deliberately excluded**. Recording
 that decision here prevents the same options being re-investigated every quarter,
 and — more importantly — stops someone shipping a risky unofficial dependency

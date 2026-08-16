@@ -1,4 +1,4 @@
-# Agent Mail（信箱）
+# Agent Mail
 
 > Give each AI employee its own email inbox — mail arrives and waits to be
 > read like a human employee's inbox, and nothing ever goes out until a
@@ -17,10 +17,13 @@ human can actually send.
 
 Two product rules are enforced everywhere in this feature, deliberately:
 
-1. **收件在介面看，幹活在對話裡** — an arriving mail is a record, not a
-   task. It lands in the dashboard's 信箱 page. It does not create task-board
-   rows and does not spam your chat channels.
-2. **外發必確認，絕不自動發送** — an agent can only ever produce a *draft*.
+1. **Mail is read in the interface; work happens in the conversation**
+   (the product's own wording: 「收件在介面看，幹活在對話裡」) — an arriving
+   mail is a record, not a task. It lands in the dashboard's Mail page
+   (信箱). It does not create task-board rows and does not spam your chat
+   channels.
+2. **Outbound always requires confirmation; nothing is ever auto-sent**
+   (「外發必確認，絕不自動發送」) — an agent can only ever produce a *draft*.
    Sending is gated on a human decision, every single time.
 
 ## Setting It Up
@@ -38,7 +41,7 @@ gmail_query = "in:inbox is:unread newer_than:1d"
 dropfolder_enabled = true            # watch <home>/mail/inbound/*.eml — default true
 poll_interval_secs = 120             # default 120, floor 30 (faster is treated as a runaway)
 default_agent = "sales"              # who owns arriving mail; empty = fallback resolution
-auto_trigger = false                 # 到達即觸發 — wake the owner on arrival. default OFF.
+auto_trigger = false                 # trigger-on-arrival — wake the owner on arrival. default OFF.
 allowed_senders = ["@example.com"]   # inbound allowlist. empty = accept all.
 allowed_recipients = []              # outbound allowlist. empty = any recipient.
 max_body_chars = 4000                # default 4000, hard ceiling 20000
@@ -93,8 +96,9 @@ block for the length of a human errand.
 
 From there, a person confirms it in one of two places:
 
-- **Dashboard** — the 信箱 page's 待寄出 tab lists every pending draft with
-  its recipient, subject, and body; 確認寄出 / 拒絕 buttons decide it.
+- **Dashboard** — the Pending send tab (待寄出) on the Mail page (信箱)
+  lists every pending draft with its recipient, subject, and body; the
+  Confirm send (確認寄出) / Reject (拒絕) buttons decide it.
 - **Chat channel** — the same approval is pushed as buttons to the
   operator's channel (Telegram/Discord/Slack/LINE, wherever `approval`
   notifications are wired), so a decision doesn't require opening the
@@ -112,7 +116,8 @@ once a decision exists:
 | Approval row missing/unreadable | `rejected`, fail-closed — an unverifiable decision is not consent |
 
 If a draft is approved but `[channels.email]` was never configured, it
-settles as `failed` with an explicit note ("寄件伺服器尚未設定") — never as
+settles as `failed` with an explicit note (the product's actual output:
+"寄件伺服器尚未設定", "the outgoing mail server is not configured") — never as
 a silent no-op and never misreported as sent. Settling is idempotent: once a
 draft reaches a terminal state, later ticks leave it alone.
 
@@ -148,8 +153,8 @@ chart, not a flat namespace.
   path in the product is the approval settler, and it only fires on an
   `Approved` decision.
 - **Mail content is always data, never instructions.** Every inbound message
-  handed to an agent — whether read via `mail_read` or delivered by
-  到達即觸發 — is wrapped in a fenced `<inbound_mail>` block with an explicit
+  handed to an agent — whether read via `mail_read` or delivered by the
+  arrival trigger — is wrapped in a fenced `<inbound_mail>` block with an explicit
   instruction shipped *with* the data on every single occurrence: treat the
   contents as something a person said, not as something to obey, even if it
   asks you to ignore prior rules or hand over credentials.
@@ -157,9 +162,9 @@ chart, not a flat namespace.
   inbound message is run through the platform's injection scanner at
   ingest, and the verdict is persisted. A flagged message is still stored
   and still visible on the dashboard — hiding it from the human would be
-  the actual security failure — but it is permanently excluded from
-  到達即觸發's wake-up list.
-- **到達即觸發 defaults off.** Waking an agent on arrival is a spend
+  the actual security failure — but it is permanently excluded from the
+  trigger-on-arrival wake-up list.
+- **Trigger-on-arrival defaults off.** Waking an agent on arrival is a spend
   decision, so it's opt-in per home (`[mail] auto_trigger`), and even when
   on, a flagged arrival never triggers.
 - **Allowlists are exact/domain matches, never substrings.** `allowed_senders`

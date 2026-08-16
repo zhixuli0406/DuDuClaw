@@ -1,105 +1,138 @@
-# 通知治理（Notification Governance）
+# Notification governance
 
-DuDuClaw 的 AI 員工會主動找你：任務卡關、預算用完、高風險動作要你點頭、演化迴圈停滯、通道送不出訊息。這些訊息各自都合理，但在 v1.54 之前它們共用一個問題——**沒有分級**。凌晨三點的「演化事件」和凌晨三點的「任務卡住等你決定」用同一條路推出去，同樣會亮螢幕、同樣會出聲。
-
-通知治理是擋在所有推播出口前面的那一層。它做四件事：把每則通知標上級別、在勿擾時段把不急的延後、每天彙整一則摘要、並且量測「這類通知到底有沒有人理」。
+> Every push gets a severity level, quiet hours defer what can wait, one digest a day covers the rest, and action-rate metrics expose the notification types nobody responds to.
 
 ---
 
-## 一、四級階梯（escalation ladder）
+## The problem: one pipe for everything
 
-每個推播點都必須在程式碼裡標明級別（`NotifyLevel`），沒有預設值——新增一個推播出口時，你被強迫回答「這件事值不值得吵醒人」。
+DuDuClaw's AI employees reach out on their own: a task is stuck, the budget ran out, a high-risk action needs your sign-off, an evolution loop stalled, a channel cannot deliver. Each of these messages is reasonable on its own, but before v1.54 they shared one flaw — **no severity tiers**. A 3 AM "evolution event" and a 3 AM "task stuck, waiting on your decision" went out the same pipe, lit up the same screen, made the same sound.
 
-| 級別 | 判準 | 勿擾時段行為 | DuDuClaw 實例 |
+Notification governance is the layer standing in front of every push outlet. It does four things: labels each notification with a level, defers the non-urgent ones during quiet hours, rolls up one digest per day, and measures whether anyone actually acts on each notification type.
+
+---
+
+## How it works
+
+Every notification travels this path from creation to delivery (or deferral):
+
+```
+Notification created (NotifyLevel required, no default)
+        |
+        v
+   Is it L3? --yes--> deliver immediately (quiet hours never block L3)
+        |
+        no
+        |
+        v
+  Quiet hours active? --no--> deliver now
+        |
+       yes
+        |
+        v
+  Append to ~/.duduclaw/notify_queue.jsonl (file-locked)
+        |
+        v
+  When the window ends, a background scheduler delivers:
+    - L1 items for the same destination merged into one message
+    - L2 decision cards delivered individually
+    - caps: 500 entries max, older than 36 hours dropped (warn log)
+```
+
+### The four-level escalation ladder
+
+Every push point must declare its level (`NotifyLevel`) in code, and there is no default — adding a new push outlet forces you to answer "is this worth waking someone up for?"
+
+| Level | Criterion | During quiet hours | DuDuClaw examples |
 |---|---|---|---|
-| **L0** | 沒有狀態變化 | 根本不進這一層 | 心跳、巡邏無事 |
-| **L1 週知** | 發生了，但不需要人 | 延後，醒來後合併 | 演化事件、SOUL 整併、技能缺口摘要、每日摘要、預算恢復 |
-| **L2 待確認** | 需要人知道並按一下 | 延後，醒來後單獨投遞 | 派工核准（任務還沒開始）、自動規則跳閘暫停 |
-| **L3 須處理** | 又急、又重要、又可行動、又是真的 | **照發，不擋** | 自主任務等你決定、高風險審批、安裝簽核、預算停工、通道故障 |
+| **L0** | No state change | Never enters this layer | Heartbeats, uneventful patrols |
+| **L1 FYI** | It happened, no human needed | Deferred, merged after the window ends | Evolution events, SOUL consolidation, skill-gap summaries, daily digest, budget recovery |
+| **L2 Needs confirmation** | A human should know and click once | Deferred, delivered individually after the window ends | Dispatch approval (task not yet started), autopilot rule circuit-breaker pause |
+| **L3 Act now** | Urgent, important, actionable, and real | **Delivered regardless** | Autonomous task waiting on your decision, high-risk approvals, install sign-off, budget stop, channel failure |
 
-判準借自 Google SRE 的告警三分法（Page / Ticket / Report）。實務上的分界線是「等到早上有沒有代價」：派工核准等到早上只是晚八小時開工；任務卡在半路等你決定，是整條自主迴圈停擺。
+The criteria borrow Google SRE's three-way alert split (Page / Ticket / Report). The practical dividing line is what waiting until morning costs: a dispatch approval that waits until morning starts eight hours late; a task stuck mid-run waiting on your decision means the whole autonomous loop is stalled.
 
-L3 永遠不受勿擾時段影響，這是刻意的——一個可以被設定關掉的緊急通知不叫緊急通知。
+L3 is never affected by quiet hours, and that is deliberate — an urgent notification that a setting can switch off is not an urgent notification.
 
 ---
 
-## 二、勿擾時段（quiet hours）
+## Quiet hours
 
-### 設定
+### Configuration
 
 ```toml
 # ~/.duduclaw/agents/<agent>/agent.toml
 [proactive]
-quiet_hours = "22:00-08:00"   # 可選；未設定 = 不啟用
-timezone    = "Asia/Taipei"   # 可選；無法解析時用主機系統時區
+quiet_hours = "22:00-08:00"   # optional; unset = disabled
+timezone    = "Asia/Taipei"   # optional; host system timezone when unparseable
 ```
 
 ```toml
-# ~/.duduclaw/config.toml — 全域退路
+# ~/.duduclaw/config.toml — global fallback
 [notify]
 quiet_hours = "22:00-08:00"
 ```
 
-員工自己的設定優先，沒有才吃全域值。跨午夜的區間（`22:00-08:00`）正常運作；區間是左閉右開，所以設 `08:00` 結束代表 08:00 整就會投遞。
+The employee's own setting wins; the global value applies only when it is absent. Ranges that cross midnight (`22:00-08:00`) work as expected. The range is half-open on the right, so an end of `08:00` means delivery resumes at exactly 08:00.
 
-### 解析失敗一律「不啟用」
+### Parse failure always means "disabled"
 
-格式錯誤、空字串、`start == end`（例如 `00:00-00:00`）全部視為沒有勿擾時段，並在日誌留下 `warn` 記錄告訴你哪個值被忽略了。理由很直接：解析器的 bug 不該讓一個部署整晚收不到通知。設定寫錯的代價是「照常收到通知」，不是「靜悄悄什麼都收不到」。
+A malformed value, an empty string, and `start == end` (for example `00:00-00:00`) are all treated as "no quiet hours", and a `warn` log records which value was ignored. The reasoning is plain: a parser bug must never leave a deployment unable to receive notifications all night. The cost of a misconfigured value is that notifications arrive as usual — never that everything goes silent without a trace.
 
-### 舊欄位不會自動接管
+### Legacy fields never take over
 
-`[proactive]` 底下還有一組舊的 `quiet_hours_start` / `quiet_hours_end`（數字小時），它的預設值是 23–8，而且**每個員工都有**。治理層刻意不讀它——否則每個既有安裝都會在沒人要求的情況下，突然被靜音一整晚。那組欄位維持原本較窄的職責：排程 `[proactive]` 主動檢查的時間。
+Under `[proactive]` there is an older pair, `quiet_hours_start` / `quiet_hours_end` (numeric hours), whose default is 23–8 — and **every employee has it**. The governance layer deliberately does not read it; otherwise every existing installation would suddenly be muted all night without anyone asking for it. That pair keeps its original, narrower job: scheduling when `[proactive]` proactive checks run.
 
-### 延後不是丟掉
+### Deferred, never dropped silently
 
-被擋下的通知寫進 `~/.duduclaw/notify_queue.jsonl`（附檔案鎖），時段結束後由背景排程器投遞：
+Blocked notifications are written to `~/.duduclaw/notify_queue.jsonl` (under a file lock) and delivered by a background scheduler once the window ends:
 
-- **同一個收件目的地的 L1 通知合併成一則**（`🌙 勿擾時段收到 3 則通知：` + 編號清單），不是三則分開的訊息。
-- **決定卡單獨投遞**，因為每張卡有自己的按鈕。
-- 佇列有雙重上限：最多 500 則、超過 36 小時的直接丟棄（一天半前的「任務完成了」不是新聞）。**丟棄一定會寫 `warn` 日誌**，不會無聲消失。
+- **L1 notifications for the same destination merge into one message** (`🌙 勿擾時段收到 3 則通知：` followed by a numbered list) rather than three separate messages.
+- **Decision cards are delivered individually**, because each card carries its own buttons.
+- The queue has two hard caps: 500 entries at most, and anything older than 36 hours is dropped ("the task finished" from a day and a half ago is no longer news). **Every drop writes a `warn` log** — nothing disappears silently.
 
-已知限制：在勿擾時段內被人從儀表板處理掉的決定，早上仍會投遞一張過期的卡片。按下去會被該決定的儲存層以「此決定已處理」擋掉（fail-closed），所以代價是一張多餘的卡片，不會重複執行。
+Known limitation: a decision resolved from the dashboard during quiet hours still delivers a stale card in the morning. Pressing it is rejected by that decision's storage layer as "already handled" (fail-closed), so the cost is one redundant card, never a duplicate execution.
 
-### 儀表板要說出來
+### The dashboard must say so
 
-`agent.get` RPC 的 `proactive` 區塊多回傳兩個欄位：
+The `proactive` block of the `agent.get` RPC returns two extra fields:
 
-- `quiet_hours` — 生效中的區間字串（`"22:00-08:00"`），沒有勿擾時段時為 `null`
-- `quiet_hours_note` — 一句可直接渲染的繁中說明，明確寫出「哪些會延後、哪些照常送達」
+- `quiet_hours` — the active range string (`"22:00-08:00"`), `null` when no quiet hours apply
+- `quiet_hours_note` — a ready-to-render zh-TW sentence spelling out what gets deferred and what still comes through
 
-會被靜默的條件必須攤在使用者看得到的地方，這是硬要求，不是加分項。
+Whatever will be silenced must be laid out where the user can see it. That is a hard requirement, not a bonus.
 
 ---
 
-## 三、每日摘要
+## Daily digest
 
 ```toml
 # ~/.duduclaw/config.toml
 [notify]
-daily_digest    = false     # 預設關閉，需明確開啟
-daily_digest_at = "09:00"   # 本地時間
+daily_digest    = false     # off by default, must be enabled explicitly
+daily_digest_at = "09:00"   # local time
 ```
 
-每天一則，推到 `[general] default_agent` 的 `[proactive]` 目的地，內容彙整過去 24 小時：
+One message per day, pushed to the `[proactive]` destination of `[general] default_agent`, summarizing the past 24 hours:
 
-- 完成任務數
-- 待你決定的件數（審批 + 安裝申請 + 卡在 `needs_human` 的任務）
-- 學習事件數（`gvu_*` / `playbook_*` / `soul_*` / `evolution_*` 活動流事件）
-- 花費
-- 通道異常告警次數
-- 行動率過低的通知類別（見下節）
+- tasks completed
+- items waiting on you (approvals + install requests + tasks stuck in `needs_human`)
+- learning events (`gvu_*` / `playbook_*` / `soul_*` / `evolution_*` activity-feed events)
+- spend
+- channel failure alert count
+- notification types with a low action rate (see the next section)
 
-### 無事不寄
+### No news, no message
 
-全部歸零的一天，**不發訊息**——不是發一則「今日無事」。一個你每天都可以不看的摘要，會訓練你連該看的那天也不看。
+On a day where every number is zero, **nothing is sent** — there is no "nothing happened today" note. A digest you can skip every day trains you to skip it on the one day you shouldn't.
 
-上限硬性一則：狀態檔記錄「最後送出的本地日期」，重啟不會補送第二則；但 09:00 時 gateway 沒開機、11:00 才起來的話，當天的摘要仍會送出一次。
+The one-per-day cap is hard: a state file records the last local date a digest went out, so a restart never sends a second one. But if the gateway is down at 09:00 and comes back at 11:00, that day's digest still goes out once.
 
 ---
 
-## 四、行動率量測
+## Action-rate measurement
 
-每則通知送出時記一筆，每次有人真的把決定按掉時記一筆，存在 `~/.duduclaw/notify_events.jsonl`。
+One record is written every time a notification goes out, and another every time someone actually resolves a decision. Both land in `~/.duduclaw/notify_events.jsonl`.
 
 ```
 duduclaw dashboard → notify.stats RPC
@@ -114,52 +147,52 @@ duduclaw dashboard → notify.stats RPC
 }
 ```
 
-`broken` 直接搬 Google SRE 的判準：**準確率低於 50% 的告警就是壞掉的告警**。條件是至少 10 筆「可按的」推播，且行動率低於 50%。
+`broken` applies Google SRE's rule directly: **an alert with accuracy below 50% is a broken alert**. The conditions: at least 10 actionable pushes, and an action rate below 50%.
 
-兩個刻意的設計：
+Some deliberate choices:
 
-- **同一張卡按兩次只算一次行動**（用決定 id 比對，不是計數），所以行動率不會超過 100%。
-- **被拒絕的按壓不算行動**——按了但被權限或狀態擋掉，是失敗的互動，不是「這則通知有用」的證據。
-- 純週知類（沒有按鈕可按）會回報 `actionable: 0` 且**永遠不會被標記 broken**。說「FYI 的行動率是 0%」是同義反覆，不是發現。
+- **Pressing the same card twice counts as one action** (matched by decision id rather than counted), so the action rate can never exceed 100%.
+- **A rejected press is not an action** — pressed but blocked by permissions or state is a failed interaction, and no evidence that the notification was useful.
+- Pure FYI types (nothing to press) report `actionable: 0` and are **never marked broken**. "The action rate of an FYI is 0%" is a tautology, not a finding.
 
-儀表板圖表已實作，位置見下一節。
+The dashboard chart is implemented; its location is listed in the dashboard section below.
 
 ---
 
-## 五、通道故障記錄的 schema
+## Channel failure record schema
 
-`channel_failures.jsonl` 有兩項調整：
+`channel_failures.jsonl` received two adjustments:
 
-1. **`channel` 欄位普及**：所有能從 session id 推出平台的寫入點（`channel_reply_silent` / `channel_reply_fallback` / `runtime_fallback_substitution` / `trajectory_anomaly` / `foresight_alarm`）都補上 `channel`，讓儀表板統一日誌能回答「這次失敗發生在哪個平台」。推不出平台的（cron / bus / heartbeat 這類內部 session，以及只拿得到工作目錄的 PTY fallback）寫 `null` 或省略——不假造歸屬。
+1. **The `channel` field is now widespread**: every write point that can derive the platform from the session id (`channel_reply_silent` / `channel_reply_fallback` / `runtime_fallback_substitution` / `trajectory_anomaly` / `foresight_alarm`) fills in `channel`, so the unified dashboard log can answer "which platform did this failure happen on". Writers that cannot derive a platform (internal sessions such as cron / bus / heartbeat, and the PTY fallback that only knows a working directory) write `null` or omit the field — attribution is never fabricated.
 
-2. **恢復事件**：通道從告警狀態回到正常時，寫一筆
+2. **Recovery events**: when a channel returns from an alerting state to normal, one record is written:
    ```json
    {"event":"channel_recovered","channel":"telegram","reason":"recovered","resolved":true,"resolves":"telegram_send_failed","timestamp":"…"}
    ```
-   舊的失敗行**不會被改寫**（append-only 稽核檔），消費端靠「同一 channel 有沒有更晚的 `channel_recovered`」判斷這次故障是否仍然相關。
+   Old failure lines are **never rewritten** (append-only audit file); consumers decide whether a failure is still relevant by checking for a later `channel_recovered` on the same channel.
 
-⚠️ 連帶的行為修正：通道故障告警的判定條件從「有 `channel` 欄位」改成「`event` 在送出失敗白名單內 **且** 有 `channel` 欄位」。少了這一步，第 1 點會讓每次 LLM 逾時、每次軌跡異常都被當成通道斷線來告警。白名單目前只有 `telegram_send_failed`；要加入新項目，該事件必須真的代表「這個通道送不出訊息」。
+⚠️ A behavioral fix rides along: the channel-failure alert condition changed from "has a `channel` field" to "`event` is in the send-failure allowlist **and** has a `channel` field". Without that step, point 1 would turn every LLM timeout and every trajectory anomaly into a channel-outage alert. The allowlist currently holds only `telegram_send_failed`; to add an entry, the event must genuinely mean "this channel cannot deliver messages".
 
 ---
 
-## 六、儀表板介面位置
+## Dashboard entry points
 
-這幾項設定／資訊都有 RPC，但入口分散在不同頁面，直接列出：
+All of these settings and readouts have RPCs, but the entry points are spread across pages:
 
-| 設定／資訊 | 位置 | 說明 |
+| Setting / readout | Location | Notes |
 |---|---|---|
-| 勿擾時段（員工自己的 `quiet_hours`，完整脈絡） | AI 員工列表 → 選一位員工 → 編輯（`/agents/:id/edit`）→「自動化」分頁 | 進階區塊有一個 `HH:MM-HH:MM` 輸入框，格式錯誤會就地標紅；下方即時顯示這位員工目前生效中的說明句（`quiet_hours_note`）。 |
-| 勿擾時段（跨員工快速切換） | 系統設定 →「主動行為」分頁 | 同一顆 `[proactive] quiet_hours`，頁面頂端有員工下拉選單可切換。若這位員工的新格式欄位是空的、但偵測到舊版數字式 `quiet_hours_start`/`quiet_hours_end` 曾被改成非預設值（代表操作者早年透過這個頁面設定過勿擾時段），會顯示轉換提示並自動代填成新格式，儲存後才正式生效——避免「以為改了勿擾時段，其實治理層完全看不到」這種靜默陷阱（W2-9）。 |
-| 每日摘要開關（`[notify] daily_digest` / `daily_digest_at`） | 系統設定 →「系統」分頁 | 開關 + 時間欄位；全域一則，非逐員工設定。 |
-| 通知成效（`notify.stats` 行動率） | 分析報表頁 →「通知成效」卡 | 依第四節的 SRE 50% 判準列出各通知類型的推播數／行動率，行動率過低的類別長條標紅並附一句提示文字（不只靠顏色，避免色弱或黑白列印看不出來）；純週知類（沒有按鈕可按）永遠不會被標記壞掉。 |
+| Quiet hours (the employee's own `quiet_hours`, full context) | AI employees list → pick an employee → edit (`/agents/:id/edit`) → the「自動化」(automation) tab | The advanced block has an `HH:MM-HH:MM` input that flags format errors inline; below it, the sentence currently in effect for this employee (`quiet_hours_note`) renders live. |
+| Quiet hours (quick switching across employees) | Settings → the「主動行為」(proactive behavior) tab | The same `[proactive] quiet_hours`, with an employee dropdown at the top of the page. If the new-format field is empty but the legacy numeric `quiet_hours_start`/`quiet_hours_end` were changed away from their defaults (meaning the operator set quiet hours through this page in the past), a conversion prompt appears and pre-fills the new format; it only takes effect after saving — avoiding the silent trap of "I thought I changed quiet hours, but the governance layer never saw it" (W2-9). |
+| Daily digest switch (`[notify] daily_digest` / `daily_digest_at`) | Settings → the「系統」(system) tab | Switch + time field; one global digest, never per employee. |
+| Notification effectiveness (`notify.stats` action rates) | Reports page → the「通知成效」(notification effectiveness) card | Lists pushes / action rate per notification type against the SRE 50% rule from the action-rate section; low-action-rate types get a red bar plus a text hint (never color alone, for color-blind readers and black-and-white printing); pure FYI types (nothing to press) are never marked broken. |
 
-同一顆 `[proactive] quiet_hours` 有兩個編輯入口：員工編輯表單的「自動化」分頁是完整脈絡（跟通知目的地、check-in 排程放在一起）；系統設定的「主動行為」分頁是給操作者不進員工詳情就能快速切換、查看多位員工勿擾時段的捷徑。兩邊寫的是同一個 `agent.toml` 欄位，存檔後立即互相反映，不會各自為政。
+The same `[proactive] quiet_hours` has two editing entry points: the「自動化」tab of the employee edit form is the full context (next to notification destinations and check-in scheduling); the「主動行為」tab in Settings is the shortcut for operators who want to view or switch several employees' quiet hours without opening each employee's details. Both write the same `agent.toml` field; a save in one place shows up in the other immediately.
 
 ---
 
-## 相關
+## Related
 
-- 設計依據：`commercial/docs/ux-redesign-2026-08/02-ux-methodology.md` 主題 4（P4-1、P4-4、P4-5、P4-6）與 `03-analogous-products.md` C1／C7／C8／C12
-- 程式碼：`crates/duduclaw-gateway/src/notify_governance.rs`、`notify_stats.rs`、`notify_digest.rs`
-- 前端：`web/src/pages/agent-form/EditAgentPage.tsx`（自動化分頁）、`web/src/components/settings/sections/ProactiveTab.tsx`、`SystemTab.tsx`、`web/src/pages/ReportPage.tsx`
-- 相關功能：[34-goal-loop.md](34-goal-loop.md)（needs_human 決定卡）、[23-autopilot-engine.md](23-autopilot-engine.md)（規則跳閘通知）
+- Design basis: `commercial/docs/ux-redesign-2026-08/02-ux-methodology.md` theme 4 (P4-1, P4-4, P4-5, P4-6) and `03-analogous-products.md` C1 / C7 / C8 / C12
+- Code: `crates/duduclaw-gateway/src/notify_governance.rs`, `notify_stats.rs`, `notify_digest.rs`
+- Frontend: `web/src/pages/agent-form/EditAgentPage.tsx` (automation tab), `web/src/components/settings/sections/ProactiveTab.tsx`, `SystemTab.tsx`, `web/src/pages/ReportPage.tsx`
+- Related features: [34-goal-loop.md](34-goal-loop.md) (needs_human decision cards), [23-autopilot-engine.md](23-autopilot-engine.md) (rule circuit-breaker notifications)

@@ -1,10 +1,56 @@
 # DuDuClaw 全機能一覧
 
-> v1.24.0 コア + 2026-07/08 追加 | 最終更新：2026-08-08 (v1.53.0)
+> v1.24.0 コア + 2026-07/08 追加 | 最終更新：2026-08-16 (v1.61.0)
 >
 > 注記:以下の各セクションは v1.24.0 のベースラインです。直後の**「追加」**ブロックが、それ以降に実装された機能をまとめています(正式な一覧は `CHANGELOG.md` を参照)。本ファイルは英語版と同期済みです。
 
 ---
+
+## 2026-08 追加(v1.54 – v1.61)
+
+| 機能 | 説明 |
+|------|------|
+| 校正付きフォワードモデル + held-out 学習ゲート(v1.54) | 行動前の確信度予測を proper score(Brier/RPS、log score は不採用)で採点し Murphy 分解——証拠は外部ツール結果であり自己申告ではない;プログラム的証拠のない帰納型教訓は shadow 候補として開始し、サンプル外の Wilson 下界(複数候補は Bonferroni 補正)が凍結ベースラインを上回って初めて昇格;結論は 3 種の誠実ラベルのみ(SUPPORTED / CANDIDATE / INDISTINGUISHABLE_FROM_LUCK)。デフォルト有効、ダッシュボードで層別に無効化可([39-calibrated-forward-model.md](../39-calibrated-forward-model.md)) |
+| 通知ガバナンス(v1.55) | すべてのプロアクティブ通知に L1/L2/L3 レベル必須;サイレント時間帯は L1/L2 を延期・統合配信(L3 は常に配信);オプトインの日次ダイジェスト(何もない日は送らない);通知カテゴリ別のアクション率計測(`notify.stats`、精度 <50% は broken 判定);決定カードは決定後その場で畳まれる;チャネル通知にダッシュボード深リンク([40-notification-governance.md](../40-notification-governance.md)) |
+| 保留決定パイプラインの統一(v1.55) | 5 種の決定ソース(goal needs_human / 起動承認 / 一般承認 / インストール承認 / 自動ルール停止)を単一の action-id エンコード・単一の認可モデル(従来未認証だった goal ボタンの穴を閉鎖)・統一受信箱に収斂;4 つ目の「引き継ぐ」アクション追加;1 人の決定で全受信者のカードが同期して畳まれる |
+| 人間による引き継ぎ(v1.55) | 検証済み管理者がチャネル会話で発言するだけで AI がその会話への返信を停止(デフォルト 60 分、`/takeover` で照会/延長/終了);引き継ぎ中は AI メッセージをその会話へ送るすべての経路を凍結・延期・破棄(L3 承認は配信継続)。個人版の自分との会話が沈黙する問題のため v1.56 でオプトイン化(デフォルト off)([42-human-takeover.md](../42-human-takeover.md)) |
+| 常駐センシング(v1.55) | 外部データストリーム(`http_poll` / `command` / `file_tail` / `websocket`、デフォルト off)を `tick` イベントとして autopilot バスへ接続;数値フィールドは `prev_`/`delta_`/`pct_` を自動導出;エージェント起床前の任意のローカルモデルスクリーニング;TickHub インメモリリングバッファ;SSRF/DNS リバインディング防御;実相場フィードでの実地検証により強化([41-resident-sensing.md](../41-resident-sensing.md)) |
+| 呼び出し横断の「最近の自身の行動」注入(v1.55) | 各起床の冒頭に、そのエージェント自身の直近 24 時間のツール呼び出し監査ダイジェスト(失敗・ブロックされた呼び出しを含む)を注入——「あれをやった?」への回答は耐久記録が基準になり、ライブツール状態だけに頼らない |
+| 5 チャネルの引用返信コンテキスト(v1.55) | Telegram / Discord / Slack / Teams / WhatsApp でメッセージへの返信(引用)時、引用内容がエージェント入力に含まれる;mention-only グループで bot への返信はメンション扱い;Telegram 転送は転送元をラベル付け |
+| 学習ルールの平易化(v1.55) | playbook ルールを平易な文として表示(LLM ゼロのテンプレート変換)+「なぜこのルールがあるか」の証拠文;チャネルコマンド `/rules`;注入ルールに番号付与——AI は回答の根拠ルールを引用できる |
+| Telegram Mini App 承認カード(v1.55) | 高リスク承認カードにオプトインの「詳細を見る」web-app ボタン——完全な説明、事前シミュレーションの結果、期限カウントダウン、承認/拒否;署名付き `initData` 検証、ボタン押下と同一の認可([43-telegram-miniapp.md](../43-telegram-miniapp.md)) |
+| 学習パイプラインの可観測性(v1.56) | `source_facts` を記録したルールはソース事実が置換されると `source-stale` フラグ(注入時に降格 + ラベル);閾値到達後にゲートで阻止された統合失敗を理由付きで記録(`consolidation_failures.jsonl`);会話パスのルール決算も held-out ゲート経由に;帰納型 shadow 候補が会話側でもサンプル外実績を蓄積し、実際に昇格可能に |
+| エディションと設定の強化(v1.56) | 個人版の同時実行上限は「同時実行中のゴールタスク数」(デフォルト 2、拒否せずキュー、fail-open;RFC-27)——エージェント数の上限は永遠に設けない;チーム版専用画面はゲートウェイのディスパッチ入口でサーバー側ブロック;`agent.toml [model] account_pool` が実際にローテーション候補を絞る;ダッシュボードのエージェント作成はモデルの明示選択必須 |
+| 真の ACP サーバー(v1.57) | `duduclaw acp` が Agent Client Protocol v1(stdio JSON-RPC)を実装——Zed / JetBrains / nvim の agent panel が通信チャネルと同一のゲートウェイ返信パイプラインでエージェントと対話、`tool_call` / `plan` / メッセージチャンクをストリーミング;A2A の `acp-server` コマンドは無変更 |
+| Remote MCP + OAuth 2.1(v1.57) | 仕様ネイティブの `POST /mcp` エンドポイント(バージョンネゴシエーション、ステートレスモード、Origin アンカーの許可リスト)+ 最小かつ完全な OAuth 2.1(RFC 9728/8414/7591、PKCE S256、オペレーター同意、refresh ローテーション)——claude.ai カスタムコネクタ / Claude モバイル / MCP Inspector がセルフホストの DuDuClaw に直接接続可能 |
+| 5 チャネルのテキスト裁決(v1.57) | 決定カードへの返信でメッセージ全体が裁決語(承認/拒否/再試行/完了/中止/一時停止、中英対応)ならボタン押下と同等——Telegram / Discord / Slack / LINE / Teams、同一の認可・重複押下保護・アクション率計測;スマートウォッチのワンタップ決定の欠落を補完 |
+| ローカルモデルマーケットプレイス(v1.57) | 用途を選ぶ → 実機メモリから算出したハードウェア適合ランプ → ワンクリックインストール(検証済み 5 発行者の HF ソースから量子化を自動選択);MoE 二重判定により 16GB マシンでも 30B-A3B 級モデルを合理的に推奨([45-local-model-marketplace.md](../45-local-model-marketplace.md)) |
+| ワーキングステート——起床横断の権威状態(v1.57) | エージェントごとのキーバリュー状態 + 引き継ぎノートを全起床(cron / heartbeat / goal loop / チャネル)に唯一の権威として自動注入;更新は明示ツール呼び出しのみ(`reason` 必須 + 置換履歴、`expected_value` CAS、`ttl_hours` による当日ルール失効、32 キー上限);`[memory] working_state_enabled`、デフォルト on([44-working-state.md](../44-working-state.md)) |
+| スケジュール実行が記憶と可視性を獲得(v1.57) | 成功した cron/ディスパッチ実行が同じ蒸留/知識パイプラインへ(エージェントごと毎時スロットル)、実行履歴ページにも記録——従来、スケジュール駆動のみのエージェントは何も蓄積せず実行記録もゼロだった |
+| エコシステムと配布面(v1.57) | 無料産業スターターパック 6 種(安全境界は無削減)、pack registry のインストール/公開(クライアント側 sha256 + minisign 検証)、CONTRIBUTING.md + パック自作チュートリアル、公開サイトチャットウィジェット(ゲストモード、デフォルト off)+ WordPress プラグイン、Chrome / VS Code 拡張、ウェアラブル書き起こし取り込み(`POST /ingest/transcript`)、`duduclaw tunnel`、LINE 友だち QR/NFC;外部 MCP ツール面は scope 駆動に;Homebrew チャネル廃止 |
+| ゴールタスクコンソール /goals(v1.58) | ダッシュボードから直接エージェントへゴールを割り当て(`/goal` と同一セマンティクス)、ラウンドごとの完全な実行タイムライン(`tasks.timeline`)、その場での人間介入——ダッシュボードの全 needs_human 裁決がチャネルボタンと同じ fail-closed な `tasks.goal_decide` パスに統一 |
+| 予測と検証ページ(v1.58) | LLM→LWM ループの可視化:予測 → 実行 → 観測 → 対照;ラウンドごとの予測 vs 実際(`forward.chain`);エージェントごとの予測能力判定カード(Brier + Murphy 分解、3 態の誠実ラベル);世界モデル状態バケットが初めて閲覧可能に;MAV 観点別裁決、実行記録リンク、再派遣/進捗なしシグナル、予測サブ誤差もラウンド単位で永続化 |
+| チャネル OTP 候補チェーン + 設定統合(v1.58) | ログイン OTP 送信は「グローバル token 優先、次に各エージェント専用 bot token を順に試行」(重複排除・順序付き)——bot を単一エージェントへ移した後の静かな失敗を修正;エージェントのチャネル設定とチャネル管理が同一の編集ダイアログを共有;サイドバー「新機能」(`newIn`)バッジ規約導入 |
+| 信念ループ(v1.59) | 外部世界に対する構造化信念の記帳(`belief_submit` / `belief_settle` / `belief_stats` MCP ツール);提出時ベースラインに対する決定論的三方向 Brier 決算、TickHub 交差検証(エージェントは現実を自己申告できない);校正統計と信念-実値対照の 2 つのプログラム的注入フック;/foresight の信念と検証タブ([46-belief-loop.md](../46-belief-loop.md)) |
+| ゴール単位の契約フィールド + 自主研究(v1.59) | ゴール作成時に `duration_hours`(期限超過 → needs_human)と `risk_boundary`(空なら 5 行のベースライン)を設定可能、毎ラウンド注入され MAV の safety 観点の基準に;`/goal` は `時限:`/`邊界:` セグメント対応;構造化予測の要求チェックボックス;当日の信念を外したエージェントには夜間の自主研究ゴールを自動割り当て |
+| ディスパッチエンジンのデフォルト有効化 + スケジューラ生存性(v1.59) | `[dispatch] enabled` デフォルトを true に(割り当てたゴールが箱出しで実行される)、ダッシュボードでホット切替;cron/heartbeat ループが 5 分以上停止すると `/healthz` が 503——スケジューラ全滅中もコンテナが healthy 表示だった事故を封じる |
+| 二段階裁決 + 判定の強化(v1.60) | MAV 判定団の前に安価な第一段階評価器(`continue`/`candidate_complete`/`blocked`、デフォルト on;いかなる障害も完全 MAV へ降格、自動合格は絶対にしない);判定規律 4 条(反ラチェット、監査のみで証拠を自作しない、契約外拡張禁止、自己申告の完了は証拠でない);切り詰められたパネル JSON と先頭トークン `PASS` の 2 つの誤検出穴を封鎖;gap 指紋による停滞検出;早期切り上げ検出;`resume_on_restart` デフォルト `pause` |
+| 差し替え可能な判定 seam(v1.60) | `[dispatch] judge = mav / evaluator_only / external / human_only`——外部判定の障害は常に MAV へ降格(より厳格、監査記録付き)、その feedback は未信頼 DATA として処理;未知の値は `mav` にフォールバック;設定→自動化にセレクタ |
+| ゴール契約の凍結(v1.60) | 作成時に受け入れ基準を不変の `acceptance_criteria_baseline` として凍結、判定と評価器はこのベースラインのみを読む;エージェント身分による goal タスク受け入れ基準の変更は拒否 + 監査記録;基準なしの `/goal` には 4 要素ガイダンスと outcome 式基準の提案を付与 |
+| ゴールループの人間シグナル + アドミッションキュー(v1.60) | needs_human に閉じた 6 分類の `pause_reason`(トリガー現場で静的スタンプ、LLM の記述から逆解析しない);超過進捗レポート(`progress_report_minutes`);LLM ゼロのツール連打アドバイザリ(3/5/8 段階);ephemeral spawn の上限超過は有界 FIFO キューに(デフォルト `queue`);予算枯渇時は「ベストラウンド成果物」を引き渡し(決定論的選択 + ギャップ一覧、手ぶらエスカレーションの廃止) |
+| Agent Mail(v1.60) | エージェントごとのメールボックス(`/mail` ページ):Gmail API / drop folder 受信、送信は常にドラフト作成 → ApprovalBroker 確認待ち(実送信はバックグラウンドワーカーのみ)、メール内容は DATA フェンス、外部付与不可の専用 scope、エージェント横断の閲覧は組織権限判定を通過([47-agent-mail.md](../47-agent-mail.md)) |
+| エージェント設定プリセット P1(v1.60) | `duduclaw preset` コマンド群 + `agent create --preset`——名前付きで再利用可能な設定バンドル;バインディング権威は `preset_bindings.toml`、解決結果はエージェントディレクトリ外へ実体化(自己改変による回避を防止)、org フィールドは値があれば全体拒否、機微セクションは静かに剥離;組み込み部門プリセット 9 種 |
+| 統一アサインパネル + 計画モード + ギャラリー(v1.60) | すべての入口が同一のアサインパネルを共有(個人版にようやく主要アクション)、質問 / 委任 / 「考えてみて」の 3 モード——計画モードは 3-8 ステップの計画を生成して needs_human で承認待ち、承認後 `<execution_plan>` として 1 回だけ注入;終了したゴールへの「続きをやって」対応;インスピレーションギャラリー `/gallery` が 22 業種チームの実例をワンクリック複製カードに展開;タスク詳細は 4 タブ化(成果物/ファイル/変更/経過) |
+| 成果物 provenance + 納品安全(v1.60) | `artifacts.jsonl` 5 種 origin の provenance 台帳(declared/swept/uploaded/produced/unknown;exact/inferred の帰属表示、時間窓による推測は絶対にしない);goal 受け入れ時に成果物コピーを `attachments/` へアーカイブ(canonicalize 封じ込め、20MB/100MB 上限);📎DELIVER 前の LLM ゼロ納品ゲート(ゼロバイト/magic 不一致/zip 破損はハード失敗);`[limits]` DocumentLimits が下流 3 パーサーを防御;エキスパートパック解凍の「ヘッダ虚偽申告」バイパスを修正 |
+| 認証情報 P1 + secret 参照の収斂(v1.60) | `secret://keychain` と `secret://file` のローカル backend、tick ソース headers の `secret://` 対応、認証情報インベントリカード + `doctor --fix-residue`;`SecretRef`/`Secret` 型が手作り復号 7 方言を収斂——`secret://` 参照リテラルが本物の認証情報として vendor API へ送られる漏洩を修正;WhatsApp webhook 署名検証を fail-closed 化;ActionGuard 判定は 21 トークンの閉じた列挙 findings のみを受領(攻撃者制御テキストは構造的に判定プロンプトへ到達不能);MCP キーのローテーション即時反映、`denied_tools`/`allowed_tools` を MCP ディスパッチゲートでも強制 |
+| 10 チャネル通知統一(v1.60) | autopilot `notify`、MCP `send_message`、リマインダーがすべて共有 `create_sender` ファクトリ経由の 10 チャネル対応に(WebChat は誠実に拒否)——一度も配信されたことのなかった autopilot Slack 通知の生きた bug と Google Chat / Teams の静かなスキップ欠陥を修正 |
+| 進化計測の強化(v1.60) | AEE コミットゲートを visible / held-out の 2 次元に分離(fence-only:拒否のみ可能で昇格には使えない);チャンピオン bootstrap を同形計測に;`duduclaw evolution clear-holdout-rotation` オペレーター出口;ラウンドごとに 14 ノブのスナップショットを `aee_round` イベントへ;Code Mode Phase 0 計測ゲート(`duduclaw cost tool-loop`、4 基準の PROCEED/REJECT/INSUFFICIENT_DATA) |
+| cron 曜日規約の修正(v1.61、**BREAKING**) | 数値曜日フィールドをパース時に Unix crontab 規約(0/7=日曜、1-5=月〜金)から `cron` crate の Quartz 序数へ変換、スケジューラ/heartbeat/MCP 検証/ダッシュボードが同一 normaliser を共有——従来 `* * 1-5` は日曜〜木曜に発火していた(日曜のゴースト発火 + 金曜の静かなスキップ);意図的に Quartz 規約で書かれたスケジュールはアップグレード後 1 日ずれる |
+| `duduclaw migrate-from claude-code`(v1.61) | Claude Code の memory shard(→ semantic + SPO 時間記憶)、CLAUDE.md(→ エージェント wiki の context 層、注入予算を消費しない)、セッション書き起こし(ノイズ除去で人間 prompt + assistant 最終返信のみ——実測で有効シグナルは約 1.5%)の一方向インポート;すべて `origin=import`(trust ≤ 0.7)、DATA 扱い、redaction デフォルト on、インジェクションスキャン通過、skill は fail-closed のセキュリティスキャン;`--apply` なしでは何も書き込まない |
+| チャネル能力テーブル(v1.61) | `channel_capabilities.rs` が 11 チャネル × 7 能力(ファイル/写真アップロード、対話ボタン、その場編集、typing、ネイティブ markdown、引用返信)+ 進捗スロットル秒数の単一権威;未対応の能力は静かな no-op から構造化ログへ |
+| minimal_context コンテキスト削減(v1.61) | 公式 CLI の全 spawn にキュレーション済み `--tools` リスト + `--setting-sources project,local`(agent-file-guard hook は維持):実測で固定オーバーヘッド 35,892 → 10,974 tokens/spawn(約 69% 削減);`estimate_tokens` の CJK 再校正(約 22% の過小評価を修正);MCP `tools/list` を呼び出し元 capability でフィルタ(discoverable ⊆ callable) |
+| 認証情報 P2/P3(v1.61) | 再起動不要のローテーション——アカウントプール書き込みで rotator キャッシュ無効化、Telegram は毎ポーリングで token 再解決、6 つの webhook チャネルは受信署名を per-request 検証、Odoo は次回呼び出しで再接続(Discord/Slack の常駐 WS は要再起動);spawn env を許可リストで洗浄(すべての `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` を除去、vendor キーは呼び出し元が明示注入);エージェント単位のオプトイン `[capabilities] git_credentials`(デフォルト off)で git push 用 SSH/GPG を復元(監査付き);secret:// 収斂第 2 ラウンド(account_rotator + mcp.rs) |
+| コンソールとタスクの磨き込み(v1.61) | ⌘K のソース横断コンテンツ検索(会話/成果物/記憶/wiki)、`/files` の検索 + タスクフィルタ + 期間指定、`/goals` タスクのピン留め/アーカイブ/リネーム + ページネーション(20 件ハードカット解除)、読み取り専用 `/presets` ページ、メール拒否メモ、`/goals` 詳細を 4 タブの `/tasks/:id` 正式ページへ統合 |
 
 ## 2026-08 追加(v1.53)
 

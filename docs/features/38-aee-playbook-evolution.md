@@ -1,176 +1,181 @@
-# 自主進化 v3：Agentic Evolution Engine + Playbook
+# Agentic Evolution Engine and playbook evolution
 
-DuDuClaw 1.53 起，AI 員工「自我改善」的方式換了一套機制。這篇文件說明改了什麼、
-對你有什麼影響，以及怎麼設定與觀察。
+> SOUL.md becomes a read-only persona layer; what actually learns, accumulates, and can be retired rule by rule is the playbook.
 
-## 一句話說明
+---
 
-以前，AI 員工學到教訓時會請 LLM 整份改寫自己的人格檔 `SOUL.md`。現在，
-`SOUL.md` 對 AI 員工是**唯讀**的（只有你，透過儀表板或操作者終端才能改），
-真正在學習、累積、可以個別淘汰的是一份新的**行為規則清單（playbook）**。
+## The one-sentence version
 
-## 為什麼要換
+Previously, when an agent learned a lesson it would ask an LLM to rewrite its entire persona file `SOUL.md`. Starting with DuDuClaw 1.53, `SOUL.md` is **read-only** for agents (only you can change it, through the dashboard or the operator terminal). What actually learns, accumulates, and can be retired entry by entry is a new **behavioral rule list — the playbook**. This document explains what changed, how it affects you, and how to configure and observe it.
 
-三個月的實際運作數據顯示，舊機制常常「壞掉但沒人發現」：
+---
 
-- 人格檔一旦長超過安全上限，後續所有學習提案都會被同一道關卡擋下，
-  而系統只把「需要人工複查」寫進一行沒人看的 log——AI 員工就此卡住，
-  再也學不到新東西，直到有人偶然發現。
-- 觀察期規則原本是「對話數不夠就等」，但等待邏輯有漏洞，最後變成
-  「反正等夠久就當作驗證通過」，實際上完全沒有真正的證據支持。
-- 業界也在往這個方向走：Anthropic 官方記憶 API 建議用「很多個小而專注的
-  檔案」取代「少數幾個大檔案」；Letta（MemGPT 的後繼者）乾脆不讓主 AI
-  自己編輯核心記憶。人格檔本身沒有被淘汰的跡象，被淘汰的是「讓 LLM
-  自己整份改寫它」這件事——這也剛好是最容易被提示注入攻擊利用的一塊。
+## Why the old mechanism was replaced
 
-## 改了什麼（給你的實際影響）
+Three months of production data showed the old mechanism often "broke without anyone noticing":
 
-1. **SOUL.md 你來改，AI 員工不能自己改。** 想調整某位 AI 員工的個性、
-   語氣、職責邊界，一樣是在儀表板「AI 員工 → 詳情 → 編輯」或直接編輯檔案，
-   跟以前一樣。差別是 AI 員工自己不會再半夜偷偷改自己的人格檔。
-2. **新的學習容器是 Playbook（行為規則），不是整份人格檔。** 每條規則很小、
-   有自己的分類（修正錯誤 / 優化既有做法 / 探索新做法）、記錄什麼情境該
-   觸發它、連結至少一個驗證用的測試案例，累積 helpful/harmful 成效分數，
-   表現不好會自動退休——不會無限累積成一份誰都不敢動的巨型文件。
-3. **驗證變細顆粒。** 以前是「整份人格檔改完，觀察 24 小時，整份 confirm
-   或整份 rollback」。現在每條規則各自驗證、各自決定去留——一條規則
-   表現不好，只回滾那一條，不會牽連其他學到的好東西。
-4. **舊機制沒有被刪除，是預設關閉的逃生門。** 若你有特殊理由需要維持舊的
-   「整份改寫 SOUL.md」行為，可在該 AI 員工的 `agent.toml` 設定
-   `[evolution] legacy_soul_evolution = true`。但走這條路的 AI 員工
-   享受不到新機制的保護（分層驗證、更細的回滾、停滯告警）。
+- Once the persona file grew past its safety cap, every subsequent learning proposal was blocked by the same gate, and the system's only response was to write "needs manual review" into a log line nobody read — the agent was stuck, unable to learn anything new, until someone happened to notice.
+- The observation-window rule was "wait until there are enough conversations", but the waiting logic had a hole: in the end it behaved as "if we waited long enough, count it as verified", with no real evidence behind it.
+- The industry is heading the same way: Anthropic's official memory API recommends many small, focused files over a few large ones; Letta (the successor to MemGPT) goes further and never lets the main AI edit its own core memory. The persona file itself shows no sign of dying out — what is being retired is letting an LLM rewrite the whole thing, which also happens to be the part most exposed to prompt-injection attacks.
 
-## 怎麼開啟
+---
 
-進化學習本來就是選擇性功能，兩層開關都要打開：
+## What changed for you
+
+1. **You edit SOUL.md; agents cannot edit their own.** To adjust an agent's personality, tone, or responsibility boundaries, use the dashboard ("agents → details → edit") or edit the file directly, same as before. The difference is that an agent will no longer quietly rewrite its own persona file in the middle of the night.
+2. **The playbook (behavioral rules) is the new learning container, replacing whole-persona rewrites.** Each rule is small, has its own category (fix a mistake / refine an existing approach / explore a new one), records which situations should trigger it, links at least one verification test case, and accumulates helpful/harmful scores. Rules that perform poorly retire automatically — they never pile up into a giant document nobody dares to touch.
+3. **Verification became fine-grained.** The old flow was: rewrite the whole persona file, observe for 24 hours, confirm or roll back the whole thing. Now each rule is verified on its own and kept or dropped on its own — when one rule performs poorly, only that rule is rolled back, without dragging down the other good lessons.
+4. **The old mechanism was kept as an escape hatch, off by default.** If you have a specific reason to keep the old whole-file SOUL.md rewrite behavior, set `[evolution] legacy_soul_evolution = true` in that agent's `agent.toml`. Agents on that path give up the new mechanism's protections (layered verification, finer rollback, stagnation alerts).
+
+---
+
+## How it works
+
+Every newly learned rule walks the same lifecycle; verification and keep-or-drop decisions happen per rule:
+
+```
+Learning proposal (one rule)
+       |
+       v
++---------------------------+
+| Zero-LLM cheat screening  |  <-- copied eval-case text / always-true filler /
++-------------+-------------+      teaching failure-hiding -> blocked, reason logged
+              |
+              v
++---------------------------+
+| Link an eval case         |  <-- every rule links at least one case,
++-------------+-------------+      with machine-checkable assertions
+              |
+              v
++---------------------------+
+| Observation window        |  <-- aee_settle_hours (default 24 hours)
++-------------+-------------+
+              |
+              v
++---------------------------+
+| Per-rule keep-or-drop     |  <-- helpful/harmful scores accumulate;
+|                           |      a poor performer rolls back alone
+|                           |      and retires automatically
++---------------------------+
+```
+
+---
+
+## How to enable it
+
+Evolution learning has always been opt-in; both switches must be on:
 
 ```toml
 # agent.toml
 [evolution]
-enabled = true        # 總開關（master switch）
-gvu_enabled = true     # 學習迴圈本身（預設 false，需要你明確打開）
+enabled = true        # master switch
+gvu_enabled = true    # the learning loop itself (default false; you must turn it on explicitly)
 ```
 
-`gvu_enabled` 的預設值已改為 `false`（本次修正了一個長期存在的設定矛盾——
-過去範本產生的設定檔即使寫 `= true`，實際執行時卻常被系統當成
-`false` 處理，兩邊不一致）。若你之前依賴「沒寫這個 key 就會自動啟用」的
-舊行為，升級後請明確把它打開。
+The default for `gvu_enabled` is now `false` (this release fixed a long-standing configuration contradiction — config files produced by the templates could say `= true` while the runtime often treated the value as `false`, and the two sides disagreed). If you relied on the old behavior where omitting the key auto-enabled the loop, turn it on explicitly after upgrading.
 
-其他常用設定：
+Other common settings:
 
 ```toml
 [evolution]
-gvu_cooldown_minutes = 60     # 每位 AI 員工的學習冷卻時間（分鐘），
-                                # 防止短時間內連續觸發多次學習耗費過多資源
-aee_settle_hours = 24         # 新學到的規則要觀察多久才決定去留
-strategy = "balanced"         # 每輪學習比較偏向修錯 / 優化 / 探索新做法
+gvu_cooldown_minutes = 60     # per-agent learning cooldown (minutes);
+                              # prevents repeated learning bursts from burning resources
+aee_settle_hours = 24         # how long a newly learned rule is observed before keep-or-drop
+strategy = "balanced"         # whether each learning round leans toward fixing / refining / exploring
 ```
 
-`strategy` 有四種選擇：
+`strategy` takes four values:
 
-| 值 | 適合情境 |
-|----|---------|
-| `balanced`（預設） | 修錯、優化、探索三者平衡 |
-| `innovate` | 偏重探索新做法，適合還在摸索定位的新 AI 員工 |
-| `harden` | 偏重優化既有規則，適合已經穩定運作、想精修的 AI 員工 |
-| `repair_only` | 只修錯，不主動探索新規則，最保守 |
+| Value | When to use it |
+|-------|----------------|
+| `balanced` (default) | An even mix of fixing mistakes, refining, and exploring |
+| `innovate` | Leans toward exploring new approaches; suits new agents still finding their footing |
+| `harden` | Leans toward refining existing rules; suits agents already running stably that need polish |
+| `repair_only` | Only fixes mistakes, never explores new rules; the most conservative |
 
-## 怎麼觀察
+---
 
-儀表板「記憶」頁新增「自主學習」分頁，可以看到：
+## How to observe it
 
-- **進化模式總覽**：目前有多少 AI 員工啟用了學習、走的是新機制還是舊逃生門
-- **版本歷史**：每次學習事件的時間軸
-- **停滯偵測**：某位 AI 員工連續好幾輪學習都被拒絕、或很久沒有成功學到
-  新東西時，這裡會出現警示（過去這種情況完全沒人看得到）
-- **拒絕統計圖**：學習提案在哪一關被擋下最多，方便判斷是規則太嚴還是
-  AI 員工提案品質不好
-- **經驗法則清單**：目前每位 AI 員工學到的規則。每張卡片以**白話**呈現
-  （「當任務出現〈做不到、能力不足〉時，我會〈先確認手上有哪些工具〉」），
-  底下一行「為什麼有這條」說明來源與證據（歸納自幾次失敗、有幾個驗收案例
-  把關、實際用過幾次、其中幾次有幫助）；給模型看的原始條文收在「看原始規則
-  內容」裡，需要時才展開。狀態用一致的白話標籤：**觀察中（尚未生效）／
-  試用中／生效中／很久沒用到，已收起來／已淘汰**。可一鍵匯出成 JSON，
-  或停用某一條你不認同的規則。
+The dashboard's Memory page gained a "self-directed learning" (自主學習) tab, showing:
 
-  白話改寫是**純樣板組裝，不呼叫任何模型**，所以列表頁重整不會產生費用或
-  延遲。組不出通順句子時不會硬編——卡片改為顯示原始條文並明確標示
-  「這條還無法自動改寫成白話」。
+- **Evolution mode overview**: how many agents have learning enabled, and whether each runs the new mechanism or the legacy escape hatch
+- **Version history**: a timeline of every learning event
+- **Stagnation detection**: when an agent's learning gets rejected round after round, or it has gone a long time without learning anything new, a warning appears here (previously this situation was completely invisible)
+- **Rejection statistics chart**: which gate blocks the most proposals, so you can tell whether the rules are too strict or the agent's proposal quality is poor
+- **Learned-rule list**: the rules each agent currently holds. Each card renders in **plain language** ("when a task hits 'can't do this, capability missing', I will 'first check which tools I have'"), with a one-line "why this rule exists" underneath describing source and evidence (distilled from how many failures, guarded by how many eval cases, actually used how many times, and helpful in how many of those); the raw rule text shown to the model folds under "view raw rule content" and expands on demand. Status uses consistent plain-language labels: **under observation (not yet active) / on trial / active / unused for a long time, shelved / retired**. One click exports everything as JSON, or disables a rule you disagree with.
 
-## 在通訊軟體裡看規則
+  The plain-language rendering is **pure template assembly with no model calls**, so reloading the list page costs nothing and adds no latency. When a fluent sentence cannot be assembled it never forces one — the card falls back to the raw text and is clearly marked "this rule cannot be auto-rendered in plain language yet".
 
-不必開儀表板也能問：
+---
+
+## Checking rules from your chat app
+
+You can ask without opening the dashboard:
 
 ```
-/rules       # 目前生效中的前 3 條（白話）
-/rules all   # 全部（含觀察中、已收起來的；已淘汰的留在儀表板）
+/rules       # top 3 currently active rules (plain language)
+/rules all   # everything (including under-observation and shelved; retired rules stay on the dashboard)
 ```
 
-同樣零模型成本：指令在進入 AI 之前就被攔截處理。
+Also zero model cost: the command is intercepted and handled before it reaches the AI.
 
-回答裡也能問「你為什麼這樣做？」：注入給 AI 的規則現在帶編號與一行說明，
-AI 可以直接指出它依據的是哪一條（「因為我學過：…」），而不是事後編一個
-聽起來合理的理由。
+You can also ask "why did you do it that way?" in a reply: rules injected into the AI now carry a number and a one-line description, so the AI can point at the exact rule it followed ("because I learned: ...") instead of inventing a plausible-sounding reason after the fact.
 
-規則的試行結果（採用／回退／證據不足）會計入**每日摘要**的學習事件節，
-不會單獨推播打擾你。
+Trial results for rules (adopted / rolled back / insufficient evidence) roll up into the learning-events section of the **daily digest**; they never push separate notifications at you.
 
-## 進階：匯出規則、跑驗證題庫
+---
 
-想把某位 AI 員工目前學到的規則整批匯出（例如做人工審查、或未來想跨員工
-複製一份經驗），可以用：
+## Advanced: exporting rules and running eval suites
+
+To export an agent's current rules in one batch (for manual review, or to later copy experience across agents):
 
 ```bash
-duduclaw playbook export --agent <員工 id> --out rules.json
+duduclaw playbook export --agent <agent id> --out rules.json
 ```
 
-每條規則的去留由連結的「驗證題庫」（eval case）決定。若你想自己手動跑一次
-驗證，或建立/擴充題庫：
+Each rule's fate is decided by its linked eval cases. To run a verification pass yourself, or to build and grow a suite:
 
 ```bash
-duduclaw eval evals/<員工 id>                       # 跑一次完整題庫
-duduclaw eval evals/<員工 id> --case foo,bar         # 只跑指定幾題
-duduclaw eval evals/<員工 id> --exclude-dir held-out # 排除保留題（防止 AI 員工看過答案）
+duduclaw eval evals/<agent id>                        # run the full suite once
+duduclaw eval evals/<agent id> --case foo,bar         # run only the named cases
+duduclaw eval evals/<agent id> --exclude-dir held-out # skip held-out cases (so agents never see the answers)
 ```
 
-自 1.53 起，每條新學到的規則都必須連結至少一題驗證題，並附上幾條可機器
-檢查的斷言（必須用哪些工具、輸出必須或不得包含哪些字樣）。還沒有題庫的話，
-可以先用草稿指令從 SOUL.md 的行為規則產生題目草稿：
+Since 1.53, every newly learned rule must link at least one eval case and carry a few machine-checkable assertions (which tools must be used, which strings the output must or must not contain). If you have no suite yet, draft cases from the behavioral rules in SOUL.md:
 
 ```bash
-duduclaw eval-scaffold --agent <員工 id>    # 產生題目草稿到 evals-drafts/
+duduclaw eval-scaffold --agent <agent id>    # draft cases into evals-drafts/
 ```
 
-草稿會放在 `evals-drafts/`，經你人工審核、搬進 `evals/` 之後才會被學習
-機制採用，未審核的草稿不會混進正式題庫。若某條規則的斷言沒有對應的錄製
-紀錄可以重放，系統會誠實標記「未驗證」並降為僅供參考，不會假裝測過。
+Drafts land in `evals-drafts/`; only after you review them and move them into `evals/` does the learning mechanism use them — unreviewed drafts never mix into the official suite. If a rule's assertions have no recorded transcript to replay against, the system honestly marks them "unverified" and downgrades them to advisory; it never pretends they were tested.
 
-若某位 AI 員工過去在舊機制下已經把不少行為規則寫進了 SOUL.md，可以把
-它們搬進新的 playbook（先產生草稿、你審核過再套用）：
+If an agent already wrote many behavioral rules into SOUL.md under the old mechanism, you can migrate them into the playbook (draft first, apply after your review):
 
 ```bash
-duduclaw playbook migrate-soul --agent <員工 id>          # 步驟 1：產生遷移草稿
-duduclaw playbook migrate-soul --agent <員工 id> --apply  # 步驟 2：審核後套用
+duduclaw playbook migrate-soul --agent <agent id>          # step 1: generate a migration draft
+duduclaw playbook migrate-soul --agent <agent id> --apply  # step 2: apply after review
 ```
 
-## 防作弊稽核（1.53 起內建）
+---
 
-學習提案在進入驗證前，會先經過一道零 LLM 的作弊偵測：規則內容若大量
-抄襲驗證題的題面（等於背答案）、寫成永遠成立的空話、或教 AI 員工隱瞞
-失敗不回報，提案會直接被擋下並記錄原因。至於「討好評審的措辭」這類較
-模糊的訊號，只會記進統計供你觀察，不直接否決，避免誤殺正常規則。
+## Anti-cheat screening (built in since 1.53)
 
-## 還沒做的部分
+Before a learning proposal enters verification, it passes a zero-LLM cheat check: a rule that copies large chunks of eval-case text (memorizing the answers), reads as an always-true platitude, or teaches the agent to hide failures without reporting them is blocked outright, with the reason recorded. Softer signals such as judge-pleasing phrasing only feed statistics for you to watch; they never veto on their own, to avoid killing legitimate rules.
 
-這是一份分階段落地的改造。以下項目在規劃中，尚未隨本版出貨，之後會另行公告：
+---
 
-- 把每次學習「立成一個可證偽的假設」，讓觀察期真正在等一個具體答案，
-  而不是模糊地看統計數字
-- 定期把累積的規則做語意層面的去重整理（目前已有的去重只擋幾乎一字不差的
-  重複，還不會發現「五條規則其實在講同一件事」這種需要理解才看得出的重疊）
+## What is not done yet
 
-## 相關文件
+This is a staged rebuild. The items below are planned and did not ship in this release; they will be announced separately:
 
-- 開關細節：[`docs/guides/evolution-switches.md`](../guides/evolution-switches.md)
-- 驗證題庫（eval）完整指南：[`docs/guides/evals.md`](../guides/evals.md)
-- 技術架構：[`docs/architecture/evolution-engine.md`](../architecture/evolution-engine.md) 第十二章
+- Turning each learning event into a falsifiable hypothesis, so the observation window waits for a concrete answer instead of vaguely watching statistics
+- Periodic semantic deduplication of accumulated rules (today's dedup only catches near-verbatim repeats; it cannot yet see that five rules are really saying the same thing — an overlap that takes understanding to spot)
+
+---
+
+## Related documents
+
+- Switch details: [`docs/guides/evolution-switches.md`](../guides/evolution-switches.md)
+- Full eval guide: [`docs/guides/evals.md`](../guides/evals.md)
+- Technical architecture: [`docs/architecture/evolution-engine.md`](../architecture/evolution-engine.md), chapter 12

@@ -1,4 +1,4 @@
-# Belief Loop（信念迴圈）
+# Belief loop
 
 > Give an agent a human-like belief cycle about the outside world: state a
 > prediction, get scored against reality, see your own calibration next time.
@@ -33,7 +33,7 @@ Agents get three MCP tools:
 
 - `belief_submit` — subject (any external thing to forecast, e.g. a ticker
   `2317` or a KPI like `trial_conversion_rate`), horizon (a free-form label
-  for when it settles, e.g. `今日收盤` or `本週五`, ≤40 chars), direction
+  for when it settles, e.g. `today's close` or `this Friday`, ≤40 chars), direction
   (`up`/`down`/`flat`), probability 0–1, a short rationale, and the reference
   value the direction is measured against.
 - `belief_settle` — belief id + realized value. Settlement is deterministic:
@@ -47,7 +47,7 @@ Agents get three MCP tools:
   value = subject) when a source doesn't follow that convention.
 - `belief_stats` — the agent's own calibration record.
 
-Dashboard: the Foresight page gains a **信念與驗證** tab — prediction list
+Dashboard: the Foresight page gains a **Beliefs & Verification** tab — prediction list
 (direction + confidence vs realized, hit/miss), Wilson-lower-bound hit rate,
 mean Brier, overconfidence. Under 30 settled beliefs it shows counts only and
 says so — never "seems to work".
@@ -55,11 +55,11 @@ says so — never "seems to work".
 ## Two Examples
 
 - **Investment** (the first validated use case): subject = a ticker, horizon
-  = `今日收盤` (today's close), reference value = the price at submission,
+  = `today's close`, reference value = the price at submission,
   realized value = the closing price. Settlement cross-checks against a live
   tick feed when one is configured.
-- **Business KPI**: subject = `trial_conversion_rate`, horizon = `本週五`
-  (this Friday), reference value = this week's starting conversion rate, an
+- **Business KPI**: subject = `trial_conversion_rate`, horizon = `this Friday`,
+  reference value = this week's starting conversion rate, an
   agent submits a belief each Monday about which direction it will move and
   settles it against the actual CRM number at week's end. No tick feed
   required — settlement can be driven by a scheduled goal task instead.

@@ -1,10 +1,56 @@
 # DuDuClaw 完整功能清單
 
-> v1.24.0 核心 + 2026-07/08 新增 | 最後更新：2026-08-08（v1.53.0）
+> v1.24.0 核心 + 2026-07/08 新增 | 最後更新：2026-08-16（v1.61.0）
 >
 > 說明:以下各章為 v1.24.0 基準。緊接其後的**「新增」**區塊涵蓋此後落地的功能(權威清單見 `CHANGELOG.md`)。本檔已與英文版同步。
 
 ---
+
+## 2026-08 新增(v1.54 – v1.61)
+
+| 功能 | 說明 |
+|------|------|
+| 校準式 forward model + held-out 學習閘(v1.54) | 行動前的信心預測以 proper score(Brier/RPS,拒用 log score)計分並做 Murphy 分解,證據來自外部工具結果而非自我陳述;無程式化證據的歸納型教訓先進 shadow,樣本外以 Wilson 信賴下界(多候選 Bonferroni 校正)贏過凍結基準才轉正;只給三種誠實結論(SUPPORTED / CANDIDATE / INDISTINGUISHABLE_FROM_LUCK)。預設開啟,可在儀表板逐層關閉([39-calibrated-forward-model.md](../39-calibrated-forward-model.md)) |
+| 通知治理(v1.55) | 所有主動推播必附 L1/L2/L3 級別;勿擾時段延後並合併投遞 L1/L2(L3 照發);每日摘要預設關、無事不寄;每類通知的行動率量測(`notify.stats`,精確率 <50% 標記 broken);決定卡按下後就地收斂;通道推播附儀表板深連結([40-notification-governance.md](../40-notification-governance.md)) |
+| 統一待辦決定管線(v1.55) | 五種決定來源(goal needs_human / 啟動核准 / 通用審批 / 安裝簽核 / 自動規則跳閘)收斂為單一 action-id 編碼、單一授權模型(關閉 goal 按鈕先前不驗身分的缺口)與統一收件匣;新增第四顆「交給我」接手動作;一人決定後所有收件者的卡片同步收斂 |
+| 真人接手(v1.55) | 已驗證的管理者在通道對話中直接發言即接手——AI 對該對話暫停回覆(預設 60 分鐘,`/takeover` 查詢/延長/提前結束);接手期間所有把 AI 訊息送進該對話的路徑一律凍結、延後或丟棄,L3 級審批照發。v1.56 起改為 opt-in(預設關)——原預設開會讓個人版跟自己的 AI 對話被噤聲([42-human-takeover.md](../42-human-takeover.md)) |
+| 常駐感知(v1.55) | 外部資料流(`http_poll` / `command` / `file_tail` / `websocket`,預設關)以 `tick` 事件接進 autopilot 匯流排,數值欄位自動衍生 `prev_`/`delta_`/`pct_` 比對欄位;喚醒 agent 前可選本地模型初篩;TickHub 記憶體環形緩衝;SSRF/DNS rebinding 防護;經真實行情流多輪活測強化([41-resident-sensing.md](../41-resident-sensing.md)) |
+| 跨喚醒「近期自身行動」注入(v1.55) | 每次喚醒開場注入該 agent 近 24 小時實際工具呼叫的稽核摘要(含失敗與被攔截的行動),讓「你是否做過某事」以耐久紀錄為準,不再只信即時工具狀態 |
+| 五通道引用回覆上下文(v1.55) | 在 Telegram / Discord / Slack / Teams / WhatsApp 回覆(引用)訊息時,被引用內容帶進 agent 輸入;mention-only 群組中回覆 bot 的訊息視同提及;Telegram 轉發訊息標注原始來源 |
+| 白話化經驗法則(v1.55) | Playbook 規則以白話句呈現(零 LLM 模板改寫)並附「為什麼有這條」證據;通道指令 `/rules`;注入規則帶編號,AI 能指出回答依據的是哪一條 |
+| Telegram Mini App 審批卡(v1.55) | 高風險審批卡可選掛「查看詳情」web-app 按鈕——完整說明、事前模擬後果、到期倒數、同意/拒絕;`initData` 簽章驗證,授權與按鈕同一套([43-telegram-miniapp.md](../43-telegram-miniapp.md)) |
+| 學習管線可觀測性(v1.56) | 記錄了 `source_facts` 的規則在來源事實被取代時標記 `source-stale`(注入時降權並標示);達標後才被關卡擋下的整合失敗記錄原因(`consolidation_failures.jsonl`);對話路徑的規則結算接上 held-out 閘;歸納型 shadow 候選在對話側也能累積樣本外紀錄、真的轉得了正 |
+| 分版與設定硬化(v1.56) | 個人版併發上限限「同時執行的目標任務數」(預設 2,排隊不拒絕、fail-open;RFC-27)——永不設 AI 員工數量上限;多人團隊版專屬畫面改由 gateway 分派入口伺服器端把關;`agent.toml [model] account_pool` 真的會篩選帳號輪替候選;儀表板建立員工必須明確選模型 |
+| 真 ACP server(v1.57) | `duduclaw acp` 實作 Agent Client Protocol v1(stdio JSON-RPC),Zed / JetBrains / nvim 的 agent panel 直連 AI 員工,走與通訊頻道同一條 gateway 回覆管線,即時串流 `tool_call` / `plan` / 訊息分塊;A2A 的 `acp-server` 指令行為不變 |
+| Remote MCP + OAuth 2.1(v1.57) | 規範原生 `POST /mcp` 端點(版本協商、無狀態模式、Origin 錨定白名單)+ 最小而完整的 OAuth 2.1 授權面(RFC 9728/8414/7591、PKCE S256、操作者同意、refresh 輪替),claude.ai 自訂連接器 / Claude 行動版 / MCP Inspector 可直連自架 DuDuClaw |
+| 五通道文字裁決(v1.57) | 回覆決定卡並送出整句裁決詞(同意/拒絕/重試/完成/中止/暫停,中英皆可)就等於按下按鈕——Telegram / Discord / Slack / LINE / Teams,同一套授權、重複按壓保護與行動率記帳;補上智慧手錶一鍵決定的缺口 |
+| 本地模型市集(v1.57) | 選用途 → 依本機記憶體算出的硬體適配燈 → 一鍵安裝(自動挑量化版本,來源為五家品質驗證過的 HF 發布者);MoE 雙軌判定讓 16GB 機器也能被合理推薦 30B-A3B 級模型([45-local-model-marketplace.md](../45-local-model-marketplace.md)) |
+| 工作狀態——跨喚醒權威狀態(v1.57) | 每 agent 鍵值化工作狀態 + 交接註記,自動注入每一次喚醒(排程/心跳/目標迴圈/通道)作為唯一權威;只收顯式工具更新且 `reason` 必填 + 取代鏈歷史、`expected_value` CAS、`ttl_hours` 當日規則到期、32-key 上限;`[memory] working_state_enabled`,預設開([44-working-state.md](../44-working-state.md)) |
+| 排程執行有記憶、看得到(v1.57) | 成功的排程/派工執行現在也餵進同一條蒸餾/知識管線(每 agent 每小時節流)並落執行紀錄頁——先前純排程驅動的 agent 跑再久也零記憶、零紀錄 |
+| 生態系與散發面(v1.57) | 六個免費產業入門包(安全邊界一字不減)、pack registry 安裝/發佈(客戶端 sha256 + minisign 驗證)、CONTRIBUTING.md + pack 自製教學、公開網站聊天 widget(訪客模式,預設關)+ WordPress 外掛、Chrome / VS Code 擴充、穿戴裝置逐字稿直灌(`POST /ingest/transcript`)、`duduclaw tunnel`、LINE 加好友 QR/NFC;外部 MCP 工具面改 scope 驅動;Homebrew 通路廢棄 |
+| 目標任務管理台 /goals(v1.58) | 儀表板直接指派目標給 AI 員工(與 `/goal` 同一套語義)、每目標完整逐輪執行時間軸(`tasks.timeline`)、人工介入就地操作——儀表板所有 needs_human 裁決統一走與通道按鈕相同的 fail-closed `tasks.goal_decide` 路徑 |
+| 預測與驗證頁(v1.58) | LLM→LWM 迴圈可視化:預測 → 執行 → 觀測 → 對照;逐輪預測 vs 實際(`forward.chain`);每 agent 預測能力判定卡(Brier + Murphy 分解,三態誠實標籤);世界模型狀態桶首次可讀;MAV 逐面向裁決、執行紀錄連結、重派/無進展訊號與預測子誤差逐輪落庫 |
+| 通道 OTP 候選鏈 + 設定整合(v1.58) | 登入驗證碼送信改為「全域 token 優先,再逐一嘗試各 agent 專屬 bot token」(去重、排序)——修復 bot 綁到單一員工後 OTP 靜默失敗;agent 通道設定與通道管理共用同一個編輯對話框;側邊欄「新功能」(`newIn`)標籤機制上線 |
+| 信念迴圈(v1.59) | 對外部世界的結構化信念記帳(`belief_submit` / `belief_settle` / `belief_stats` MCP 工具);確定性三向 Brier 結算,對照提交時基準值並與 TickHub 交叉核對(agent 不能自報現實);校準統計與信念對照兩個程式化注入鉤點;/foresight 信念與驗證分頁([46-belief-loop.md](../46-belief-loop.md)) |
+| 每目標契約欄位 + 自主研究(v1.59) | 建目標時可設 `duration_hours`(到期未過驗收 → needs_human)與 `risk_boundary`(留空套五行基本款),逐輪注入並成為 MAV safety 面向檢核基準;`/goal` 支援 `時限:`/`邊界:` 段;可勾選要求結構化預測;當日信念失準的員工自動獲派晚間研究目標 |
+| 派工引擎預設開 + 排程器活性(v1.59) | `[dispatch] enabled` 預設改 true(指派目標開箱即跑),儀表板熱切換;`/healthz` 在 cron/heartbeat 迴圈停擺逾 5 分鐘時回 503——修復排程層全滅、容器卻連日顯示 healthy 的事故 |
+| 兩段式裁決 + 判官硬化(v1.60) | MAV 判官團之前先跑便宜的第一階段評估器(`continue`/`candidate_complete`/`blocked`,預設開;任何故障降級直跑 MAV,絕不自動通過);四條判官紀律(反棘輪、只稽核不自建證據、反契約外擴張、自稱完成不是證據);修掉截斷面板與 `PASS` 誤判兩個 fail-open 洞;gap 指紋停滯偵測;提前收工偵測;`resume_on_restart` 預設 `pause` |
+| 可換判官 seam(v1.60) | `[dispatch] judge = mav / evaluator_only / external / human_only`——外部判官任何故障一律降級回 MAV(變嚴、留稽核),其 feedback 視為未受信 DATA;未知值回退 `mav`;設定→自動化有下拉選擇器 |
+| 目標契約凍結(v1.60) | 建立時把驗收標準凍結成不可變 `acceptance_criteria_baseline`,判官與評估器一律讀這份基準;agent 身分改 goal 任務驗收標準一律拒絕並留稽核;`/goal` 未帶標準時附四要素引導與 outcome 式標準建議 |
+| 目標迴圈人為信號 + 准入排隊(v1.60) | needs_human 帶封閉六類 `pause_reason`(觸發現場靜態標記,絕不從 LLM 敘述反解);逾時進度通報(`progress_report_minutes`);零 LLM 工具連擊 advisory(3/5/8 逐級);ephemeral spawn 超限改有界 FIFO 排隊(預設 `queue`);預算耗盡改交「最佳輪成品」(確定性挑選 + 差距清單,不再空手升級) |
+| Agent Mail(v1.60) | 每 agent 信箱(`/mail` 頁):Gmail API / drop folder 入站,外發一律先建草稿過 ApprovalBroker 確認(背景 worker 是唯一寄信者),信件內容 DATA 圍欄,獨立不可外部授予的 scope,跨 agent 讀信過組織權限判定([47-agent-mail.md](../47-agent-mail.md)) |
+| Agent 組態 preset P1(v1.60) | `duduclaw preset` 指令族 + `agent create --preset`——可具名複用的組態組合;綁定權威存 `preset_bindings.toml`,解析結果物化到 agent 目錄之外(防自改繞過),org 欄位帶值整包拒絕、敏感段靜默剝除;內建 9 個部門職務 preset |
+| 統一交辦面板 + 計畫模式 + 靈感畫廊(v1.60) | 所有入口共用同一個交辦面板(個人版終於有主要動作按鈕),問一問 / 交辦 / 「想一想」三模式——計畫模式先產 3-8 條計畫停在 needs_human 等核准,核准後以 `<execution_plan>` 一次性注入;已結束的目標可「接著做」;靈感畫廊 `/gallery` 把 22 組產業團隊範例扇出成一鍵做同款卡片;任務詳情改四分頁(產物/檔案/變更/過程) |
+| 產物 provenance + 交付安全(v1.60) | `artifacts.jsonl` 五種 origin 的 provenance ledger(declared/swept/uploaded/produced/unknown,exact/inferred 歸屬標示,絕不用時間窗猜方向);goal 驗收通過時封存產物副本進 `attachments/`(canonicalize 圈定、20MB/100MB 上限);📎DELIVER 前的零 LLM 交付閘(零位元組/magic 不符/zip 損壞硬失敗);`[limits]` DocumentLimits 守三個下游 office/zip 解析器;修補專家包解壓 header 謊報繞過 |
+| 憑證 P1 + secret 參照收斂(v1.60) | `secret://keychain` 與 `secret://file` 本機 backend、tick 來源 headers 支援 `secret://`、憑證來源總表卡 + `doctor --fix-residue`;`SecretRef`/`Secret` 型別收斂七套手刻解密方言——修掉 `secret://` 參照字面值被當真憑證送給 vendor API 的洩漏;WhatsApp webhook 驗簽改 fail-closed;ActionGuard 判官改吃 21 項封閉列舉 findings(攻擊者可控文字結構上進不了判官 prompt);MCP key 輪替即時生效、`denied_tools`/`allowed_tools` 補上 MCP 分派總門強制 |
+| 十通道通知統一(v1.60) | autopilot `notify`、MCP `send_message`、提醒全部改走共用 `create_sender` 工廠,十通道全通(WebChat 誠實拒絕)——修復 autopilot slack 通知從未送出過的活 bug 與 Google Chat / Teams 靜默跳過缺陷 |
+| 進化量測硬化(v1.60) | AEE 提交閘拆 visible / held-out 兩維(fence-only:只否決不晉升);冠軍 bootstrap 改同形量測;`duduclaw evolution clear-holdout-rotation` 操作者出口;每輪 14 個旋鈕快照進 `aee_round` 事件;Code Mode Phase 0 量測閘(`duduclaw cost tool-loop`,四判準 PROCEED/REJECT/INSUFFICIENT_DATA) |
+| cron 星期慣例修正(v1.61,**BREAKING**) | 數字星期欄在解析時從 Unix crontab 慣例(0/7=週日、1-5=週一到五)轉譯成 `cron` crate 的 Quartz 序數,排程器/heartbeat/MCP 驗證/儀表板共用同一份 normaliser——先前 `* * 1-5` 實際排的是週日到週四(週日幽靈觸發 + 週五整天靜默跳過);刻意照 Quartz 寫的排程升級後會位移一天 |
+| `duduclaw migrate-from claude-code`(v1.61) | 單向匯入 Claude Code 的 memory shard(→ semantic + SPO 時間記憶)、CLAUDE.md(→ agent wiki context 層,不佔注入預算)與對話逐字稿(噪音濾除只留人類 prompt + assistant 最終回覆——實測有效訊號僅約 1.5%);一律 `origin=import`(trust ≤ 0.7)、當 DATA、redaction 預設開、過注入掃描、skill 過安全掃描 fail-closed;需人工 `--apply` 才真正寫入 |
+| 通道能力表(v1.61) | `channel_capabilities.rs` 單一權威表——11 通道 × 7 能力(檔案/照片上傳、互動按鈕、edit-in-place、typing、原生 markdown、引用回覆)+ 進度節流秒數;不支援的能力從靜默 no-op 改為留下結構化 log |
+| minimal_context 上下文瘦身(v1.61) | 每次 spawn 官方 CLI 帶策展 `--tools` 清單 + `--setting-sources project,local`(保留 agent-file-guard hook):實測固定開銷 35,892 → 10,974 tokens/次(省 ~69%);`estimate_tokens` CJK 校準(修 ~22% 低估);MCP `tools/list` 依呼叫者 capability 過濾(discoverable ⊆ callable) |
+| 憑證 P2/P3(v1.61) | 零重啟輪換——帳號池寫入即失效 rotator 快取、Telegram 每輪重解析 token、六個 webhook 通道 inbound 驗簽 per-request、Odoo 下次呼叫即重連(Discord/Slack 長駐 WS 仍需重啟);spawn env 改白名單擦洗(濾除所有 `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`,vendor 金鑰改呼叫端顯式注入);per-agent `[capabilities] git_credentials`(預設關)明確授權才恢復 SSH/GPG git push,留稽核;secret:// 收斂第二輪(account_rotator + mcp.rs) |
+| 管理台與任務打磨(v1.61) | ⌘K 跨來源內容搜尋(對話/產物/記憶/wiki)、`/files` 搜尋 + 任務篩選 + 日期範圍、`/goals` 任務置頂/歸檔/重新命名 + 分頁(解除 20 筆硬截)、唯讀 `/presets` 頁、mail 拒絕備註、`/goals` 詳情併入四分頁 `/tasks/:id` 正式頁 |
 
 ## 2026-08 新增(v1.53)
 
