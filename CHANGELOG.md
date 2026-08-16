@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.61.0] - 2026-08-16 — cron 星期慣例修正×Claude Code 匯入×通道能力表×上下文瘦身
+
 ### Added
 - **上下文膨脹正解（`[runtime] minimal_context`，預設開）**：每次 spawn 官方 CLI 現在帶 `--tools <策展清單>`（只送該 agent 實際會用的內建工具 schema，其餘走 MCP）＋`--setting-sources project,local`（不再把操作者個人全域 `~/.claude/CLAUDE.md`／rules 塞進對客 agent）。本機實測固定開銷 35,892 → 10,974 tokens/次（省 ~69%）。安全：**不用** `--setting-sources ""`（那會停用 cwd `.claude/settings.json` 的 agent-file-guard 安全 hook）；`project,local` 省一樣多 token 但保留 hook。可用 env `DUDUCLAW_MINIMAL_CONTEXT=0`（全域）或 `agent.toml [runtime] minimal_context = false`（每-agent）關閉。行為變更：曾靠操作者全域 CLAUDE.md 塑形對客 agent 的部署升級後會有變（反模式，off-switch 已備）。
 - **⌘K 內容搜尋（`search.query`）**：命令面板新增跨來源內容搜尋——對話、產物、記憶、wiki 聚合查詢，結果依來源分組、點擊跳轉；各來源有結果上限、CJK-safe 截斷。個人版恢復先前缺失的搜尋觸發器。
