@@ -6486,12 +6486,16 @@ var Gateway = class {
         } catch {
           return;
         }
-        if (f.id == null) return;
+        if (f.type !== "res" || f.id == null) return;
         const p = this.pending.get(String(f.id));
         if (!p) return;
         this.pending.delete(String(f.id));
-        if (f.error) p.reject(new Error(f.error.message ?? "rpc error"));
-        else p.resolve(f.result);
+        if (f.ok === false) {
+          const msg = typeof f.error === "string" ? f.error : JSON.stringify(f.error);
+          p.reject(new Error(msg || "rpc error"));
+        } else {
+          p.resolve(f.payload);
+        }
       });
       sock.on("close", () => {
         if (this.ws === sock) {
@@ -6522,7 +6526,7 @@ var Gateway = class {
     return new Promise((resolve, reject) => {
       const id = String(++this.seq);
       this.pending.set(id, { resolve, reject });
-      this.ws?.send(JSON.stringify({ jsonrpc: "2.0", method, params, id }));
+      this.ws?.send(JSON.stringify({ type: "req", id, method, params }));
       setTimeout(() => {
         if (this.pending.delete(id)) reject(new Error(`${method} timeout`));
       }, 15e3);

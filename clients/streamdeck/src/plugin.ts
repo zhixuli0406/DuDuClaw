@@ -84,19 +84,32 @@ class Gateway {
       if (!this.accessToken) await this.login();
       const sock = new WebSocket(this.base().replace(/^http/, 'ws') + '/ws');
       this.ws = sock;
+      // Replies are `{type:"res", id, ok, payload, error}` (see
+      // `crates/duduclaw-gateway/src/protocol.rs`); `error` is a bare JSON
+      // value, and server-pushed `event` frames carry no `id`.
       sock.on('message', (raw: Buffer) => {
-        let f: { id?: unknown; result?: unknown; error?: { message?: string } };
+        let f: {
+          type?: string;
+          id?: unknown;
+          ok?: boolean;
+          payload?: unknown;
+          error?: unknown;
+        };
         try {
           f = JSON.parse(raw.toString('utf8'));
         } catch {
           return;
         }
-        if (f.id == null) return;
+        if (f.type !== 'res' || f.id == null) return;
         const p = this.pending.get(String(f.id));
         if (!p) return;
         this.pending.delete(String(f.id));
-        if (f.error) p.reject(new Error(f.error.message ?? 'rpc error'));
-        else p.resolve(f.result);
+        if (f.ok === false) {
+          const msg = typeof f.error === 'string' ? f.error : JSON.stringify(f.error);
+          p.reject(new Error(msg || 'rpc error'));
+        } else {
+          p.resolve(f.payload);
+        }
       });
       sock.on('close', () => {
         if (this.ws === sock) {
@@ -128,7 +141,9 @@ class Gateway {
     return new Promise((resolve, reject) => {
       const id = String(++this.seq);
       this.pending.set(id, { resolve, reject });
-      this.ws?.send(JSON.stringify({ jsonrpc: '2.0', method, params, id }));
+      // `type: 'req'` is mandatory — an untagged frame fails the gateway's
+      // `WsFrame` deserialization and gets the socket closed as an auth failure.
+      this.ws?.send(JSON.stringify({ type: 'req', id, method, params }));
       setTimeout(() => {
         if (this.pending.delete(id)) reject(new Error(`${method} timeout`));
       }, 15000);

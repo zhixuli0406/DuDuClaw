@@ -101,7 +101,11 @@ function rpc(method, params) {
   return new Promise((resolve, reject) => {
     const id = String(++rpcId);
     rpcPending.set(id, { resolve, reject });
-    rpcWs.send(JSON.stringify({ jsonrpc: '2.0', method, params, id }));
+    // The gateway speaks its own `WsFrame` protocol (crates/duduclaw-gateway/
+    // src/protocol.rs), NOT JSON-RPC 2.0. An untagged frame fails its
+    // deserialization, which it reports as a failed handshake and closes the
+    // socket — surfacing here as a misleading transport error.
+    rpcWs.send(JSON.stringify({ type: 'req', id, method, params }));
     setTimeout(() => { if (rpcPending.delete(id)) reject(new Error(method + ' timeout')); }, 15000);
   });
 }
@@ -112,10 +116,19 @@ function connectRpc() {
     rpcWs = new WebSocket(wsBase() + '/ws');
     rpcWs.onmessage = (ev) => {
       let f; try { f = JSON.parse(ev.data); } catch { return; }
-      const p = f.id != null && rpcPending.get(String(f.id));
+      // Replies are `{type:"res", id, ok, payload, error}`; `error` is a bare
+      // JSON value (usually a string). Server-pushed `event` frames carry no
+      // `id` and must not be mistaken for responses.
+      if (f.type !== 'res' || f.id == null) return;
+      const p = rpcPending.get(String(f.id));
       if (p) {
         rpcPending.delete(String(f.id));
-        f.error ? p.reject(new Error(f.error.message || JSON.stringify(f.error))) : p.resolve(f.result);
+        if (f.ok === false) {
+          const msg = typeof f.error === 'string' ? f.error : JSON.stringify(f.error);
+          p.reject(new Error(msg || 'request failed'));
+        } else {
+          p.resolve(f.payload);
+        }
       }
     };
     rpcWs.onopen = async () => {
