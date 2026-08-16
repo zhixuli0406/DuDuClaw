@@ -1475,9 +1475,13 @@ impl TaskStore {
         Ok(rows)
     }
 
-    /// Pending tasks that are claimable *right now*: unclaimed and with every
-    /// `depends_on` id already `done`. Dependency filtering is done in Rust
-    /// (parsing the JSON array) against the current `done` set.
+    /// Pending tasks that are claimable *right now*: unclaimed, not
+    /// archived, and with every `depends_on` id already `done`. Dependency
+    /// filtering is done in Rust (parsing the JSON array) against the
+    /// current `done` set. Archiving a still-pending/unclaimed task (the
+    /// `/goals` board "take out of active consideration" action) must
+    /// remove it from the dispatch engine's pickup queue, same as it's
+    /// already hidden from `list_tasks_filtered`'s default view.
     pub async fn claimable_tasks(&self) -> Result<Vec<TaskRow>, String> {
         let done = self.done_task_ids().await?;
         let pending = {
@@ -1485,7 +1489,7 @@ impl TaskStore {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {TASK_COLUMNS} FROM tasks
-                      WHERE status = 'pending' AND claimed_by IS NULL
+                      WHERE status = 'pending' AND claimed_by IS NULL AND archived = 0
                       ORDER BY created_at ASC"
                 ))
                 .map_err(|e| format!("prepare claimable: {e}"))?;
@@ -4241,6 +4245,31 @@ mod tests {
         let claimable2 = store.claimable_tasks().await.unwrap();
         let ids2: HashSet<_> = claimable2.iter().map(|t| t.id.clone()).collect();
         assert!(ids2.contains("child"), "child claimable once dep done");
+    }
+
+    /// WP-10B: archiving a pending/unclaimed task (the `/goals` board
+    /// "take out of active consideration" action) must remove it from the
+    /// dispatch engine's pickup queue — mirrors the existing
+    /// `list_tasks_filtered_excludes_archived_by_default` guarantee.
+    #[tokio::test]
+    async fn claimable_tasks_excludes_archived() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TaskStore::open(dir.path()).expect("open");
+
+        store.insert_task(&pending_task("visible")).await.unwrap();
+        store.insert_task(&pending_task("archived")).await.unwrap();
+        store
+            .update_task("archived", &serde_json::json!({ "archived": true }))
+            .await
+            .unwrap();
+
+        let claimable = store.claimable_tasks().await.unwrap();
+        let ids: HashSet<_> = claimable.iter().map(|t| t.id.clone()).collect();
+        assert!(ids.contains("visible"), "non-archived task stays claimable");
+        assert!(
+            !ids.contains("archived"),
+            "archived task must not be claimable by the dispatch engine: {ids:?}"
+        );
     }
 
     #[tokio::test]

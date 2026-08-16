@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 import { api, type TaskInfo } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
-import { Button, Tabs, TabsList, TabsTab, TabsPanel } from '@/components/mds';
+import { Button, Input, Tabs, TabsList, TabsTab, TabsPanel } from '@/components/mds';
 import { TaskChangesPanel } from '@/components/task';
 import { DetailShell } from './DetailShell';
 import { TYPE_META } from './meta';
@@ -32,6 +32,17 @@ type ResolveAction = 'retry' | 'done' | 'abort';
  * "retry" was unreachable outside the Inbox and a drag could silently move the
  * card past the decision entirely. The mapping above stays the single source of
  * truth — callers never write a `needs_human` task's status themselves.
+ *
+ * WP-10B (2026-08-16): 重試 can carry an optional note for the next round —
+ * `tasks.goal_decide` has accepted `note` since I-3c shipped it for the
+ * `/goals` board's `InterventionButtons` (`GoalsPage.tsx`), but this shared
+ * component — the one every OTHER needs_human surface (Inbox detail pane,
+ * `/tasks/:id`, the task board card) renders through — never exposed it,
+ * so "leave a note for the retry" only worked from `/goals`. 重試 now toggles
+ * the same optional note field before submitting (mirrors
+ * `InterventionButtons`'s toggle-then-submit affordance exactly, reusing its
+ * `goals.decide.notePlaceholder` / `goals.decide.retryGo` copy); 標記完成 /
+ * 放棄 are unchanged — immediate, no note.
  */
 export function NeedsHumanActions({
   taskId,
@@ -47,9 +58,11 @@ export function NeedsHumanActions({
 }) {
   const intl = useIntl();
   const [busy, setBusy] = useState<ResolveAction | null>(null);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [note, setNote] = useState('');
 
   const resolve = useCallback(
-    async (action: ResolveAction) => {
+    async (action: ResolveAction, withNote?: string) => {
       if (busy) return;
       setBusy(action);
       try {
@@ -58,8 +71,10 @@ export function NeedsHumanActions({
         // bare status write — the old `tasks.update` route left the stale
         // claim/lease/result behind on retry and let the previous round's
         // judge feedback leak into the next dispatch.
-        await api.tasks.goalDecide(taskId, action);
+        await api.tasks.goalDecide(taskId, action, withNote);
         toast.success(intl.formatMessage({ id: `inbox.needsHuman.${action}Toast` }));
+        setNoteOpen(false);
+        setNote('');
         onResolved();
       } catch (e) {
         toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
@@ -71,19 +86,39 @@ export function NeedsHumanActions({
   );
 
   return (
-    <div className={className ?? 'flex flex-wrap items-center gap-2'}>
-      <Button variant="brand" size={size} disabled={!!busy} onClick={() => resolve('retry')}>
-        {busy === 'retry' ? <Loader2 className="animate-spin" /> : <RotateCcw />}
-        {intl.formatMessage({ id: 'inbox.needsHuman.retry' })}
-      </Button>
-      <Button variant="outline" size={size} disabled={!!busy} onClick={() => resolve('done')}>
-        {busy === 'done' ? <Loader2 className="animate-spin" /> : <CheckCircle2 />}
-        {intl.formatMessage({ id: 'inbox.needsHuman.done' })}
-      </Button>
-      <Button variant="destructive" size={size} disabled={!!busy} onClick={() => resolve('abort')}>
-        {busy === 'abort' ? <Loader2 className="animate-spin" /> : <XCircle />}
-        {intl.formatMessage({ id: 'inbox.needsHuman.abort' })}
-      </Button>
+    <div className="space-y-2">
+      <div className={className ?? 'flex flex-wrap items-center gap-2'}>
+        <Button
+          variant="brand"
+          size={size}
+          disabled={!!busy}
+          onClick={() => setNoteOpen((v) => !v)}
+        >
+          {busy === 'retry' ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+          {intl.formatMessage({ id: 'inbox.needsHuman.retry' })}
+        </Button>
+        <Button variant="outline" size={size} disabled={!!busy} onClick={() => resolve('done')}>
+          {busy === 'done' ? <Loader2 className="animate-spin" /> : <CheckCircle2 />}
+          {intl.formatMessage({ id: 'inbox.needsHuman.done' })}
+        </Button>
+        <Button variant="destructive" size={size} disabled={!!busy} onClick={() => resolve('abort')}>
+          {busy === 'abort' ? <Loader2 className="animate-spin" /> : <XCircle />}
+          {intl.formatMessage({ id: 'inbox.needsHuman.abort' })}
+        </Button>
+      </div>
+      {noteOpen && (
+        <div className="flex gap-1.5">
+          <Input
+            value={note}
+            placeholder={intl.formatMessage({ id: 'goals.decide.notePlaceholder' })}
+            onChange={(e) => setNote(e.target.value)}
+            className={size === 'sm' ? 'h-8 text-xs' : ''}
+          />
+          <Button variant="brand" size={size} disabled={!!busy} onClick={() => resolve('retry', note)}>
+            {intl.formatMessage({ id: 'goals.decide.retryGo' })}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
