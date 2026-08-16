@@ -46,6 +46,17 @@
 | 34 | [自主目標迴圈](34-goal-loop.md) | /goal → 迴圈到完成，MAV 驗收判官；卡住升級真人 |
 | 35 | [照片 → 桌寵](35-photo-desktop-pet.md) | 本地照片轉像素桌寵：Codex Pets 動作表＋漫遊引擎 |
 | 36 | [錄製 → 技能](36-recording-to-skill.md) | 瀏覽器/桌面錄製蒸餾成審批制 SKILL.md 草稿 |
+| 37 | [部門與階級隔離](37-delegation-isolation.md) | 組織邊界委派政策：階級 / 部門 / 白名單強制 |
+| 38 | [自主進化 v3：AEE + Playbook](38-aee-playbook-evolution.md) | 自主進化引擎——以閘道/評估二分法組織的行為規則 |
+| 39 | [校準式預測 + held-out 學習閘](39-calibrated-forward-model.md) | 合理計分校準＋樣本外規則晉升 |
+| 40 | [通知治理](40-notification-governance.md) | 跨通道的通知治理 |
+| 41 | [常駐感知＋訊號喚醒](41-resident-sensing.md) | 外部資料流只在規則命中時才喚醒 AI 員工 |
+| 42 | [真人接手對話](42-human-takeover.md) | 人工接手（支援 `/takeover` 生命週期，選用） |
+| 43 | [Telegram 審批詳情卡](43-telegram-miniapp.md) | 在 Telegram 內展開審批詳情卡（預覽版，預設關閉） |
+| 44 | [工作狀態（Working State）](44-working-state.md) | 每個 AI 員工跨喚醒的唯一權威狀態——解決幽靈記憶問題 |
+| 45 | [本地模型市集](45-local-model-marketplace.md) | 依用途選擇、硬體適配綠黃紅燈、一鍵安裝與 MoE 雙軌 |
+| 46 | [信念迴圈](46-belief-loop.md) | 對外部世界的結構化預測，與實際對比計分 |
+| 47 | [信箱](47-agent-mail.md) | 每個 AI 員工獨立的郵件收件夾，待寄件夾中的回覆需人工確認才送出 |
 
 ---
 

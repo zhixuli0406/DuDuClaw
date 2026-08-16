@@ -46,6 +46,17 @@
 | 34 | [自律ゴールループ](34-goal-loop.md) | /goal → 完了までループ、MAV 受入ジャッジ；行き詰まりは人間へ |
 | 35 | [写真 → デスクトップペット](35-photo-desktop-pet.md) | ローカル写真→ピクセルペット：Codex Pets スプライトシート＋徘徊エンジン |
 | 36 | [録画 → スキル](36-recording-to-skill.md) | ブラウザ/デスクトップ録画を承認制 SKILL.md 草稿へ蒸留 |
+| 37 | [部門と職級の分離](37-delegation-isolation.md) | 組織境界委譲ポリシー：階級 / 部門 / ホワイトリスト強制 |
+| 38 | [自主進化 v3：AEE + Playbook](38-aee-playbook-evolution.md) | Agentic Evolution Engine — ゲート/測定分割のプレイブックルール |
+| 39 | [キャリブレーション予測 + held-out 学習ゲート](39-calibrated-forward-model.md) | 正当なスコアリング校準＋サンプル外ルール昇格 |
+| 40 | [通知ガバナンス](40-notification-governance.md) | チャネル横断の通知ガバナンス |
+| 41 | [常駐センシング＋シグナル起動](41-resident-sensing.md) | 外部データストリーム：ルール命中時のみエージェント起動 |
+| 42 | [人間による引き継ぎ](42-human-takeover.md) | `/takeover` ライフサイクルによる人間の引き継ぎ（オプト イン） |
+| 43 | [Telegram ミニアプリ 承認詳細カード](43-telegram-miniapp.md) | Telegram 内の承認詳細カード（プレビュー、デフォルト オフ） |
+| 44 | [ワークステート（Working State）](44-working-state.md) | エージェント別の唯一の権威ある横断起動状態 — ゴーストメモリ修正 |
+| 45 | [ローカルモデルマーケットプレイス](45-local-model-marketplace.md) | 用途別セレクター + ハードウェア適合 HF ピッカー + ワンクリックインストール |
+| 46 | [信念ループ（Belief Loop）](46-belief-loop.md) | 外部世界についての構造化予測、実現対実測でスコア化 |
+| 47 | [Agent Mail（メール箱）](47-agent-mail.md) | エージェント別メール受信トレイ、送信下書きは人間承認で送出 |
 
 ---
 

@@ -55,6 +55,8 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 43 | [Telegram Mini App 審批卡](43-telegram-miniapp.md) | Approval detail card inside Telegram (preview, default off) |
 | 44 | [工作狀態（Working State）](44-working-state.md) | Per-agent authoritative cross-wake state — the ghost-memory fix |
 | 45 | [本地模型市集](45-local-model-marketplace.md) | Intent + hardware-fit HF picker with one-click install and MoE dual-track |
+| 46 | [Belief Loop](46-belief-loop.md) | Structured predictions about the external world, scored against reality |
+| 47 | [Agent Mail](47-agent-mail.md) | Per-agent inbox for incoming mail, outbox for draft replies pending human confirmation |
 
 ---
 
