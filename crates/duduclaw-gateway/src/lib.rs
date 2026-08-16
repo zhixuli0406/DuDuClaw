@@ -188,6 +188,7 @@ pub mod builtin_skills_seed_migration;
 pub mod pty_default_migration;
 pub mod pty_runtime;
 pub mod files_api;
+pub mod search_index;
 pub mod runtime_install;
 pub mod runtime_models;
 pub mod runtime_status;
