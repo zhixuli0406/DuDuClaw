@@ -103,6 +103,11 @@ pub const AGENT_CLI_ENV_ALLOWLIST: &[&str] = &[
     "http_proxy",
     "https_proxy",
     "no_proxy",
+    // Feature flag (not a credential): semantic-vector memory re-ranking,
+    // read by the spawned `duduclaw mcp-server` (`mcp.rs`). The v1.61.0
+    // scrub silently kept this off even when the operator set `=1` — the
+    // TODO-spawn-env-allowlist-fallout sweep's one silent in-child casualty.
+    "DUDUCLAW_SEMANTIC_VECTORS",
 ];
 
 /// macOS only: Cocoa `NSString`/Keychain Services initialization reads this
@@ -121,12 +126,57 @@ pub const AGENT_CLI_ENV_ALLOWLIST_MACOS: &[&str] = &["__CF_USER_TEXT_ENCODING"];
 pub const AGENT_CLI_ENV_ALLOWLIST_WINDOWS: &[&str] =
     &["USERPROFILE", "APPDATA", "LOCALAPPDATA", "COMPUTERNAME"];
 
+/// The `DUDUCLAW_*` names set in THIS process's environment that the
+/// allowlist will drop from every spawn. Pure helper for
+/// [`warn_scrubbed_duduclaw_vars_once`] and its test.
+///
+/// Scoped to our own namespace on purpose: a `DUDUCLAW_*` var on the gateway
+/// process is almost certainly operator intent aimed at DuDuClaw components,
+/// so silently dropping it is exactly the failure mode of the v1.61.0
+/// incident (TODO-spawn-env-allowlist-fallout: a real-money agent fell back
+/// to a mock broker because its env never arrived). Foreign names (`ML_*`,
+/// vendor keys) stay unlisted — dropping those is the scrub working as
+/// designed.
+fn scrubbed_duduclaw_var_names() -> Vec<String> {
+    std::env::vars()
+        .filter(|(k, v)| {
+            k.starts_with("DUDUCLAW_")
+                && !v.is_empty()
+                && !AGENT_CLI_ENV_ALLOWLIST.contains(&k.as_str())
+        })
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Warn ONCE per process (names only, never values) about `DUDUCLAW_*` env
+/// vars the allowlist drops from spawned children. The v1.61.0 scrub's two
+/// production failures each took hours to diagnose precisely because the
+/// drop was perfectly silent — this converts the next one into a boot-time
+/// signal. Delivery paths that survive the scrub (`.mcp.json` `env` blocks,
+/// explicit caller injection) are unaffected; the warning documents them.
+fn warn_scrubbed_duduclaw_vars_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let dropped = scrubbed_duduclaw_var_names();
+        if !dropped.is_empty() {
+            tracing::warn!(
+                dropped = %dropped.join(", "),
+                "spawn-env allowlist will NOT pass these DUDUCLAW_* vars to spawned \
+                 agent CLIs / MCP servers — if a child needs one, declare it in the \
+                 server's .mcp.json `env` block or add it to the allowlist \
+                 (never for credentials)"
+            );
+        }
+    });
+}
+
 /// Snapshot the current process's allowlisted env vars as `(name, value)`
 /// pairs — present + non-empty only. Pure data; callers decide HOW to apply
 /// it: `tokio::process::Command::env_clear()` + a loop (see
 /// [`apply_agent_cli_env_allowlist`]), or seeding a `HashMap` for the
 /// portable-pty path (`duduclaw-cli-runtime`'s `PtyCommand::clear_env`).
 pub fn agent_cli_spawn_env_pairs() -> Vec<(&'static str, String)> {
+    warn_scrubbed_duduclaw_vars_once();
     let mut out = Vec::new();
     for name in AGENT_CLI_ENV_ALLOWLIST {
         if let Ok(v) = std::env::var(name) {
@@ -346,6 +396,57 @@ mod tests {
                 Some(v) => std::env::set_var("TZ", v),
                 None => std::env::remove_var("TZ"),
             }
+        }
+    }
+
+    #[test]
+    fn semantic_vectors_flag_is_carried_through() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("DUDUCLAW_SEMANTIC_VECTORS").ok();
+        unsafe { std::env::set_var("DUDUCLAW_SEMANTIC_VECTORS", "1") };
+
+        let pairs = agent_cli_spawn_env_pairs();
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == "DUDUCLAW_SEMANTIC_VECTORS" && v == "1"),
+            "the semantic-vectors feature flag must reach spawned children \
+             (TODO-spawn-env-allowlist-fallout item 4)"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DUDUCLAW_SEMANTIC_VECTORS", v),
+                None => std::env::remove_var("DUDUCLAW_SEMANTIC_VECTORS"),
+            }
+        }
+    }
+
+    #[test]
+    fn scrub_detector_lists_dropped_duduclaw_vars_only() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("DUDUCLAW_SCRUB_TEST_PROBE", "x");
+            std::env::set_var("ML_SCRUB_TEST_FOREIGN", "y");
+        }
+
+        let dropped = scrubbed_duduclaw_var_names();
+        assert!(
+            dropped.iter().any(|n| n == "DUDUCLAW_SCRUB_TEST_PROBE"),
+            "a DUDUCLAW_* var off the allowlist must be reported as dropped"
+        );
+        assert!(
+            !dropped.iter().any(|n| n == "ML_SCRUB_TEST_FOREIGN"),
+            "foreign-namespace vars are dropped by design, not reported"
+        );
+        assert!(
+            !dropped.iter().any(|n| n == "DUDUCLAW_SEMANTIC_VECTORS"),
+            "an allowlisted DUDUCLAW_* var must not be reported as dropped"
+        );
+
+        unsafe {
+            std::env::remove_var("DUDUCLAW_SCRUB_TEST_PROBE");
+            std::env::remove_var("ML_SCRUB_TEST_FOREIGN");
         }
     }
 
