@@ -599,6 +599,9 @@ fi
 # step is skipped — it never fails the release. Opt out: DUDUCLAW_SKIP_PRO_BIN=1.
 PRO_BIN_KEY="$HOME/.minisign/duduclaw-pro-release.key"
 PRO_BIN_BUCKET="${DUDUCLAW_IMAGE_TAR_BUCKET:-duduclaw-oem-images}"
+# Tracked so the control-plane allowlist sync below only fires when this
+# release actually shipped at least one pro asset.
+PRO_BIN_UPLOADED=0
 
 # Package <staged_dir>/<plat>/duduclaw-pro into a signed, checksummed tar.gz
 # and upload the three-piece set (tar.gz + .sha256 + .minisig) to GCS.
@@ -671,7 +674,9 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
             if ( cd commercial/duduclaw-pro-gateway && cargo build --release --bin duduclaw-pro ); then
                 mkdir -p "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL"
                 if cp target/release/duduclaw-pro "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL/duduclaw-pro"; then
-                    package_and_upload_pro_bin "$DARWIN_PLATFORM_LABEL" "$PRO_BIN_TMP" "$NEW_VERSION" || true
+                    if package_and_upload_pro_bin "$DARWIN_PLATFORM_LABEL" "$PRO_BIN_TMP" "$NEW_VERSION"; then
+                        PRO_BIN_UPLOADED=1
+                    fi
                 else
                     echo "  WARNING: built binary missing at target/release/duduclaw-pro — skipping $DARWIN_PLATFORM_LABEL."
                 fi
@@ -693,7 +698,9 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
                 if [[ -n "$PRO_BIN_CID" ]]; then
                     mkdir -p "$PRO_BIN_TMP/linux-x64"
                     if docker cp "$PRO_BIN_CID:/usr/local/bin/duduclaw-pro" "$PRO_BIN_TMP/linux-x64/duduclaw-pro" 2>/dev/null; then
-                        package_and_upload_pro_bin linux-x64 "$PRO_BIN_TMP" "$NEW_VERSION" || true
+                        if package_and_upload_pro_bin linux-x64 "$PRO_BIN_TMP" "$NEW_VERSION"; then
+                            PRO_BIN_UPLOADED=1
+                        fi
                     else
                         echo "  WARNING: docker cp from duduclaw-pro image failed — skipping linux-x64."
                     fi
@@ -710,6 +717,54 @@ if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
         fi
 
         rm -rf "$PRO_BIN_TMP"
+    fi
+
+    # --- Control-plane offered-version allowlist (DUDUCLAW_PRO_VERSIONS) ---
+    # Auto-discovery (GitHub releases × AR manifest probe) proved unreliable
+    # in production (2026-08-17: silently all-false manifest probes degraded
+    # the offered list to ["latest"], blanking the Pro update channel and the
+    # console version dropdown). The operator allowlist — path ① in
+    # pro_versions::resolve, highest precedence — is therefore maintained
+    # per-release HERE as the authoritative source; discovery + the registry
+    # fallback stay behind it as the safety net. Newest-first, top 3 release
+    # tags from git (desktop-v* excluded); first entry doubles as the console
+    # packaging default pin. Best-effort like every step above — a failure
+    # WARNs with the manual command, never fails the release.
+    # Opt out: DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1.
+    if [[ "${DUDUCLAW_SKIP_PRO_VERSIONS_ENV:-0}" == "1" ]]; then
+        echo ""
+        echo "Skipping control-plane DUDUCLAW_PRO_VERSIONS sync (DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1)."
+    elif [[ "$PRO_IMAGE_PUSHED" == "1" || "$PRO_BIN_UPLOADED" == "1" ]]; then
+        CP_SERVICE="${DUDUCLAW_CP_SERVICE:-duduclaw-control-plane}"
+        CP_REGION="${DUDUCLAW_GCP_REGION:-asia-east1}"
+        CP_PROJECT="${DUDUCLAW_GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
+        # Newest three vX.Y.Z tags — the tag for THIS release already exists
+        # at this point in the flow, so it is the natural first entry.
+        CP_VERSIONS="$(git tag --list 'v*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -3 | paste -sd, -)"
+        if ! command -v gcloud >/dev/null 2>&1 || [[ -z "$CP_PROJECT" || "$CP_PROJECT" == "(unset)" ]]; then
+            echo ""
+            echo "  WARNING: gcloud/project unavailable — control-plane version allowlist NOT synced."
+            echo "           Run manually:  gcloud run services update $CP_SERVICE --region $CP_REGION \\"
+            echo "                            --update-env-vars '^:^DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS:-v$NEW_VERSION}'"
+        elif [[ -z "$CP_VERSIONS" ]]; then
+            echo ""
+            echo "  WARNING: could not derive a version list from git tags — allowlist NOT synced."
+        else
+            echo ""
+            echo "Syncing control-plane version allowlist: DUDUCLAW_PRO_VERSIONS=$CP_VERSIONS"
+            # ^:^ switches the pair delimiter to ':' so the comma-separated
+            # version list survives as ONE value (a bare comma would split it
+            # into bogus KEY=VALUE pairs and fail the update).
+            if gcloud run services update "$CP_SERVICE" --project "$CP_PROJECT" --region "$CP_REGION" \
+                --update-env-vars "^:^DUDUCLAW_PRO_VERSIONS=${CP_VERSIONS}" >/dev/null 2>&1; then
+                echo "  Control-plane allowlist updated (new revision rolled out)."
+            else
+                echo "  WARNING: control-plane env update FAILED. Run manually:"
+                echo "    gcloud run services update $CP_SERVICE --region $CP_REGION \\"
+                echo "      --update-env-vars '^:^DUDUCLAW_PRO_VERSIONS=$CP_VERSIONS'"
+            fi
+        fi
     fi
 fi
 
