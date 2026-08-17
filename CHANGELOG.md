@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+- **Pro 自動升級通道（開源側 seam）**：`GatewayExtension` 新增 `update_provider()` hook（預設 `None`，CE 行為逐位不變）；updater 開出可重用的下載重試／參數化驗簽（`verify_archive_with_pubkey`）／換裝（`install_verified_binary`，內含容器閘——容器內一律拒絕行程內換 binary，image 部署走 image 更新）公開面。6h 更新迴圈與 `system.check_update`／`apply_update` 在 provider 存在時改走 provider；回應與廣播新增 `update_channel`（`control_plane`／`github`／`none`）與 `containerized` 欄位，更新頁據此顯示正確動線（Pro 無通道→說明卡、容器→主機端 update.sh 指引、CE 照舊）。`InstallMethod` 新增 `pro`。企業側的 `ControlPlaneUpdateProvider`（license-proof 認證、獨立 pro 簽章 key）與 control plane 端點在 commercial 樹（設計：`DESIGN-pro-auto-update-2026-08.md`）。同步收掉一個噪音洞：Pro 部署開 `auto_update` 先前每 6h 撞拒絕防呆留一筆 `auto_update_failed` 審計，現在每個新版本只記一行 info。release.sh 新增 pro binary 資產步驟（依 build host triple 自動標平台、pro key 簽章、GCS 上傳、verify 檢查）。
+
+### Fixed
+- **儀表板系統更新在標準 macOS 佈局上必失敗**：updater 的目錄權限閘用 `mode & 0o022` 一刀切，把 group-writable 一律當不安全——但 macOS 的 `/usr/local/bin` 出廠就是 `drwxrwxr-x …:admin`（admin 群組成員本來就是管理員），於是每一台標準安裝的 Mac 按「安裝更新」都得到「更新失敗」（audit log：`Binary directory is world/group writable`）。新的 `is_unsafe_update_dir` 維持 world-writable 一律拒絕，group-writable 只放行 admin-class 群組（root/wheel gid 0 全平台、macOS `admin` gid 80）；macOS `staff`（gid 20，所有本機使用者都在）之類仍拒絕。錯誤訊息現在帶目錄路徑與修復指令。
+- **企業版 wrapper（`duduclaw-pro`）自我更新會把部署換成 CE binary**：公開 release 資產是開源 `duduclaw`，蓋掉 wrapper 會同時失去 Enterprise extension，且 wrapper 忽略 argv 而 CE binary 要求 subcommand——無參數的 launchd/systemd 服務單元重啟後直接 clap 錯誤 crash-loop。現在 `apply_update` 偵測到 `duduclaw-pro` 即拒絕並說明正確升級路徑（企業散發包／重建流程），比照桌面版 sidecar 的既有防呆。
+- **配額預警 frame 被當成 rate-limit 失敗**（[TODO](docs/todo/TODO-rate-limit-warning-misread-as-failure.md)）：`claude` CLI 的 `rate_limit_event`（`allowed_warning`，run 照常完成）先前被兩個 stream parser 丟棄，但 frame 原文可經診斷字串（`last_line`）進入錯誤訊息，`rateLimitType` 小寫後含 `ratelimit` 子字串→健康帳號被誤判 rate-limited 進冷卻、已成功的呼叫被換帳號重打——恰好發生在配額最緊的時候（2026-08-17 實錘：七日窗 92% 時派工被回報成 rate-limit 失敗）。現在 frame 解析為 telemetry（新 `rate_limit_watch` 模組：節流 warn 日誌＋`system.status` 回傳 `quota_warning`），診斷字串不再夾帶 frame，`is_rate_limit_error` 額外中和 advisory token（真拒絕的分類逐位不變，含回歸測試）。
+- **spawn-env 白名單事故收尾**（[TODO](docs/todo/TODO-spawn-env-allowlist-fallout.md)，v1.61.0 CRITICAL）：① `setup-token` 容器部署的 OAuth session 現在把 token 記在帳號上顯式注入（先前 P3 擦洗後子行程拿不到任何憑證，派工全滅 `authentication_failed`，而手動 `claude -p` 因繼承 shell env 反而正常——矛盾正是難查的原因）；② 白名單丟棄 gateway 環境中存在的 `DUDUCLAW_*` 變數時，開機警告一次（只記名不記值，附 `.mcp.json` env block 修法）——兩起 production 事故各花數小時，正因丟棄完全無聲；③ `DUDUCLAW_SEMANTIC_VECTORS`（功能旗標，非憑證）加入白名單，操作者設 `=1` 重新在 spawn 出的 MCP server 生效；④ 白名單不含密鑰形狀名字的型別層保證不變。
+
 ## [1.61.1] - 2026-08-16 — 客戶端 WebSocket 協定修正
 
 ### Fixed

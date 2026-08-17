@@ -101,6 +101,8 @@ Open standards that define the DuDuClaw agent ecosystem.
 | Document | Description |
 |----------|-------------|
 | [todo/TODO-bootstrap-admin-ws-deadlock.md](todo/TODO-bootstrap-admin-ws-deadlock.md) | 🟠 Bootstrap admin deadlock — a fresh containerised install logs in fine yet spins forever, because `must_change_password` blocks the WS handshake and the passwordless escape needs Personal + loopback |
+| [todo/TODO-spawn-env-allowlist-fallout.md](todo/TODO-spawn-env-allowlist-fallout.md) | 🔴 The v1.61.0 spawn-env allowlist silently broke every consumer that relied on inheritance — one instance put a real-money agent on a mock broker, another killed all gateway dispatch |
+| [todo/TODO-rate-limit-warning-misread-as-failure.md](todo/TODO-rate-limit-warning-misread-as-failure.md) | 🟡 The CLI's `allowed_warning` quota notice is dropped by the stream parser and reported as a failed call, so successful runs get retried near the ceiling |
 | [todo/TODO-client-ws-protocol-mismatch.md](todo/TODO-client-ws-protocol-mismatch.md) | 🟠 VS Code / Chrome / Stream Deck send JSON-RPC 2.0 frames the gateway's `WsFrame` protocol rejects — every dashboard RPC dies as a misleading "connection closed" |
 | [todo/TODO-agent-toml-silent-skip.md](todo/TODO-agent-toml-silent-skip.md) | 🟠 One missing `agent.toml` field drops the whole agent with a single WARN — `agents.list` goes empty and `FirstRunGate` shows a working install as brand-new |
 | [todo/TODO-agent-honesty.md](todo/TODO-agent-honesty.md) | Agent honesty / anti-hallucination tasks |
