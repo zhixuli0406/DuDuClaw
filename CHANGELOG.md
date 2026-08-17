@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- **release.sh 每版自動同步 control plane 版本 allowlist**：pro image／pro binary 資產上傳成功後，`DUDUCLAW_PRO_VERSIONS`（Cloud Run env，`pro_versions::resolve` 的 ① 號最高優先來源）自動更新為 git 最新三個 `vX.Y.Z` tag——2026-08-17 生產事故實錘 auto-discovery（GitHub releases × AR manifest 探測）會靜默降級成 `["latest"]`，把 Pro 更新通道與 console 版本下拉一起清空；allowlist 從此由 release 流程維護為權威源，discovery＋registry fallback 退居安全網（control plane 端的探測留痕與 fallback 修正在 commercial 樹）。best-effort：失敗只 WARN 附手動指令，不炸 release；`DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1` 可跳過。
+
 ## [1.61.2] - 2026-08-17 — 更新通道修復與 Pro 自動升級
 
 ### Added
