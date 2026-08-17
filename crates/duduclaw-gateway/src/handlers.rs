@@ -17933,6 +17933,11 @@ impl MethodHandler {
             // license `edition` string returned by system.version. The
             // dashboard reads this to hide/show enterprise management surfaces.
             "edition_profile": edition_profile.as_str(),
+            // Latest CLI quota advisory (`rate_limit_event` frame), if any —
+            // e.g. "seven_day window at 92%, resets at <ts>". `null` until a
+            // frame has been observed since boot. Telemetry only; never
+            // implies a failure (see `rate_limit_watch`).
+            "quota_warning": crate::rate_limit_watch::latest(),
         })
     }
 

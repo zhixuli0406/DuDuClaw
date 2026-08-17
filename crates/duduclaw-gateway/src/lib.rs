@@ -38,6 +38,7 @@ pub mod channel_alerts;
 pub mod channel_capabilities;
 pub mod channel_format;
 pub mod channel_reply;
+pub mod rate_limit_watch;
 pub mod markdown_render;
 pub mod channel_typing;
 pub mod webhook_jwt;
