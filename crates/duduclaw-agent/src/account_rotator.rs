@@ -886,9 +886,32 @@ fn should_autodetect_anthropic_oauth(loaded: &[Account]) -> bool {
 /// Works with all Claude Code versions — does not depend on `.credentials.json`
 /// which no longer exists in recent versions. The `claude` CLI manages its own
 /// auth state (OS keychain / internal storage).
+///
+/// ## Two different sessions look identical to `claude auth status`
+///
+/// `loggedIn: true` is reported both when the CLI found a keychain session
+/// **and** when it merely read `CLAUDE_CODE_OAUTH_TOKEN` out of the ambient
+/// environment (the `setup-token` flow every container deployment uses).
+///
+/// Before the P3 env scrub those two were interchangeable here, because a
+/// spawned child inherited the gateway's environment and found the token by
+/// itself. Since v1.61.0 the spawn environment is an allowlist that
+/// deliberately drops `*_TOKEN`, so an account carrying neither `oauth_token`
+/// nor a usable keychain leaves the child with no credential at all —
+/// every dispatch dies as `authentication_failed`, while a manual
+/// `claude -p` in the same container still works (it *does* inherit the env).
+///
+/// So: when the session came from the env var, capture that token on the
+/// account. `build_env_for` then injects it explicitly, which is exactly what
+/// the scrub intends — credentials travel as data, not as ambient state.
 fn detect_default_oauth_session() -> Option<Account> {
     let claude = duduclaw_core::which_claude()?;
     let claude_dir = dirs::home_dir()?.join(".claude");
+    // Captured before the probe so a token-derived session is never mistaken
+    // for a keychain one.
+    let env_token = std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
 
     let output = duduclaw_core::platform::command_for(&claude)
         .args(["auth", "status"])
@@ -930,10 +953,16 @@ fn detect_default_oauth_session() -> Option<Account> {
         profile: "default".to_string(),
         email: email.to_string(),
         subscription: subscription.to_string(),
-        label: "本機登入".to_string(),
+        label: if env_token.is_some() {
+            "setup-token".to_string()
+        } else {
+            "本機登入".to_string()
+        },
         expires_at: None, // OS keychain manages token lifecycle
         api_key: String::new(),
-        oauth_token: None, // Uses OS keychain, not explicit token
+        // `Some` ⇒ inject explicitly (setup-token deployments); `None` ⇒ let the
+        // CLI read its own keychain via `credentials_dir`.
+        oauth_token: env_token,
         credentials_dir: Some(claude_dir),
         is_healthy: true,
         consecutive_errors: 0,
@@ -1396,6 +1425,31 @@ mod select_env_tests {
         assert_eq!(
             env.env_vars.get("CLAUDE_CONFIG_DIR").map(String::as_str),
             Some(profile_dir.to_string_lossy().as_ref())
+        );
+    }
+
+    /// v1.61.0 regression guard: a `setup-token` session must put the token ON
+    /// the account, not rely on the child inheriting it.
+    ///
+    /// The P3 env scrub drops `*_TOKEN` from the spawn environment, so an
+    /// account with `oauth_token: None` and no real keychain hands the spawned
+    /// CLI nothing — every dispatch failed `authentication_failed` while a
+    /// manual `claude -p` in the same container still worked. Asserting on the
+    /// built env (not on the detection function, which shells out to `claude`)
+    /// keeps this hermetic.
+    #[test]
+    fn setup_token_account_injects_the_token_into_spawn_env() {
+        let mut acct = oauth_account("oauth-default");
+        acct.oauth_token = Some("sk-ant-oat01-test".to_string());
+        acct.credentials_dir = Some(std::path::PathBuf::from("/home/x/.claude"));
+
+        let env = build_account_env(&acct);
+
+        assert_eq!(
+            env.env_vars.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("sk-ant-oat01-test"),
+            "a setup-token account must inject its token explicitly — the spawn \
+             env allowlist will not carry it ambiently"
         );
     }
 
