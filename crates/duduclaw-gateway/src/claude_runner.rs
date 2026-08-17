@@ -1256,8 +1256,28 @@ pub(crate) fn is_billing_error(error: &str) -> bool {
 }
 
 /// Check whether an error indicates rate limiting (usage limit exhausted).
+///
+/// Defence in depth against the `rate_limit_event` ADVISORY frame (an
+/// early-warning the CLI emits while the run continues normally): its field
+/// names lowercase into matching substrings (`rateLimitType` →
+/// "ratelimittype" ⊃ "ratelimit"), so an error string that merely embeds a
+/// frame would classify a healthy account as rate-limited and cool it down.
+/// The stream parsers no longer embed those frames (see
+/// `rate_limit_watch`); here the frame's own tokens are additionally
+/// neutralized before matching, so a genuine refusal must match on its own
+/// words.
 pub(crate) fn is_rate_limit_error(error: &str) -> bool {
-    let lower = error.to_lowercase();
+    let mut lower = error.to_lowercase();
+    if lower.contains("rate_limit_event") || lower.contains("allowed_warning") {
+        for advisory_token in [
+            "rate_limit_event",
+            "rate_limit_info",
+            "ratelimittype",
+            "allowed_warning",
+        ] {
+            lower = lower.replace(advisory_token, "");
+        }
+    }
     lower.contains("rate limit")
         || lower.contains("rate-limit")
         || lower.contains("ratelimit")
@@ -3055,6 +3075,12 @@ async fn call_claude_streaming(
                                         &event, &mut native_events, &mut open_native_calls,
                                     );
                                 }
+                                Some("rate_limit_event") => {
+                                    // Quota advisory (`allowed_warning`) — telemetry,
+                                    // never a failure. Record and continue; the run's
+                                    // own `result` decides success.
+                                    crate::rate_limit_watch::record_frame(&event);
+                                }
                                 _ => {}
                             }
                         }
@@ -3669,6 +3695,38 @@ mod native_tool_collector_tests {
 // ---------------------------------------------------------------------------
 // Tests — Direct-API multi-provider routing (W2)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod rate_limit_classifier_tests {
+    use super::is_rate_limit_error;
+
+    /// The exact advisory frame from the 2026-08-17 field report: the run it
+    /// belonged to finished normally (`is_error: false`, result "PONG").
+    const ADVISORY_FRAME: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.92,"resetsAt":1787083200,"isUsingOverage":false,"surpassedThreshold":0.75}}"#;
+
+    #[test]
+    fn advisory_frame_is_not_a_rate_limit_error() {
+        assert!(
+            !is_rate_limit_error(ADVISORY_FRAME),
+            "an allowed_warning advisory must never classify as a refusal"
+        );
+        // …including when it is embedded inside a larger diagnostic string.
+        let embedded = format!("claude CLI hard timeout — last_line={ADVISORY_FRAME:?}");
+        assert!(!is_rate_limit_error(&embedded));
+    }
+
+    #[test]
+    fn genuine_refusals_still_classify() {
+        assert!(is_rate_limit_error("HTTP 429 Too Many Requests"));
+        assert!(is_rate_limit_error("Rate limit exceeded, retry later"));
+        assert!(is_rate_limit_error("Claude AI usage limit reached"));
+        assert!(is_rate_limit_error("server overloaded"));
+        // A refusal that coexists with an embedded advisory must still match
+        // on its own words after the advisory tokens are neutralized.
+        let mixed = format!("usage limit reached; last frame: {ADVISORY_FRAME}");
+        assert!(is_rate_limit_error(&mixed));
+    }
+}
 
 #[cfg(test)]
 mod direct_api_routing_tests {

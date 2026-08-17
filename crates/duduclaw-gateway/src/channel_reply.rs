@@ -8048,7 +8048,13 @@ async fn spawn_claude_cli_with_env(
                         lines_seen += 1;
                         // Keep only a truncated tail for diagnostics (full line
                         // can contain the user's prompt — we don't want it on disk).
-                        last_raw_line = line.chars().take(400).collect();
+                        // `rate_limit_event` frames are excluded: embedding one in a
+                        // failure diagnostic made `is_rate_limit_error` classify a
+                        // healthy account as rate-limited ("rateLimitType" ⊃
+                        // "ratelimit" — TODO-rate-limit-warning-misread-as-failure).
+                        if !crate::rate_limit_watch::line_is_rate_limit_frame(&line) {
+                            last_raw_line = line.chars().take(400).collect();
+                        }
 
                         // Optional raw-stream debug log.
                         if let Some(ref p) = stream_debug_path {
@@ -8406,7 +8412,12 @@ async fn spawn_claude_cli_with_env(
                                         }
                                     }
                                 }
-                                _ => {} // system, rate_limit_event, etc.
+                                Some("rate_limit_event") => {
+                                    // Quota advisory — telemetry, never a failure.
+                                    // The run continues; only record and move on.
+                                    crate::rate_limit_watch::record_frame(&event);
+                                }
+                                _ => {} // system, etc.
                             }
                         }
                     }
@@ -8672,12 +8683,21 @@ pub(crate) fn parse_claude_stream_json_complete(stdout: &str) -> Result<StreamPa
             continue;
         }
         diag.lines_seen += 1;
-        diag.last_raw_line = line.chars().take(400).collect();
+        // Never let a `rate_limit_event` advisory become the diagnostic tail —
+        // an embedded frame tripped `is_rate_limit_error`'s substring match
+        // and rotated away from a healthy account (2026-08-17 field report).
+        if !crate::rate_limit_watch::line_is_rate_limit_frame(line) {
+            diag.last_raw_line = line.chars().take(400).collect();
+        }
 
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         diag.events_parsed += 1;
+
+        if crate::rate_limit_watch::record_frame(&event) {
+            continue; // quota advisory — telemetry only, not part of the reply
+        }
 
         match event.get("type").and_then(|t| t.as_str()) {
             Some("result") => {
