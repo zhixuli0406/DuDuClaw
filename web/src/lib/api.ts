@@ -4816,6 +4816,23 @@ export const api = {
         auto_update: boolean;
         /** Non-null when a newer binary is already on disk — restart to apply. */
         restart_pending_version?: string | null;
+        /**
+         * Which channel can actually install this update:
+         * - `control_plane` — an enterprise update provider is configured.
+         * - `github` — the public release channel (CE).
+         * - `none` — enterprise binary with no update channel wired up: the new
+         *   version is real, but nothing here can install it, so the install
+         *   button must not be offered.
+         */
+        update_channel?: 'control_plane' | 'github' | 'none';
+        /**
+         * True when this gateway is running inside a container (`/.dockerenv`
+         * or `DUDUCLAW_IN_CONTAINER`). The image is immutable — an in-process
+         * binary swap never sticks — so the dashboard shows an `update.sh` /
+         * image-rebuild guidance card instead of an install button. Absent on
+         * older gateways ⇒ treated as `false`.
+         */
+        containerized?: boolean;
       }>,
     /**
      * Installing an update = download + checksum + signature + extract + swap,

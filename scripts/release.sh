@@ -162,6 +162,28 @@ run_audit() {
     return $drift
 }
 
+# --- Darwin platform label, derived from the ACTUAL build host triple
+# (`rustc -vV`), never assumed as darwin-arm64. A native `cargo build`
+# produces a binary matching whatever toolchain is active — an x86_64 Rosetta
+# toolchain running on Apple Silicon hardware still builds an x86_64 binary —
+# so labeling the pro-bin asset by hardware alone would silently mislabel an
+# x86_64 binary as darwin-arm64 (2026-08-17 live-verification finding: this
+# dev machine's own `rustc -vV` host is x86_64-apple-darwin, and its deployed
+# `/usr/local/bin/duduclaw-pro` is an x86_64 Mach-O binary). Shared by the
+# pro-bin build/package step and `run_verify`'s pro-bin-mac check so both
+# agree on which platform object they mean. Echoes "" (never guesses) on any
+# host triple that is not a recognized darwin target — fail-closed: callers
+# must skip the darwin asset rather than risk a wrong label.
+darwin_platform_label() {
+    local host
+    host="$(rustc -vV 2>/dev/null | grep '^host:' | awk '{print $2}')"
+    case "$host" in
+        aarch64-apple-darwin) echo "darwin-arm64" ;;
+        x86_64-apple-darwin) echo "darwin-x64" ;;
+        *) echo "" ;;
+    esac
+}
+
 # --- Verify: query the public registries for an actually-published version. ---
 run_verify() {
     local want="$1" rc=0
@@ -214,6 +236,35 @@ run_verify() {
             else
                 printf "  %-10s %-10s MISSING (%s) — issued packs fall back to manual docker save\n" \
                     "oem-tar" "v$want" "$tar"
+                rc=1
+            fi
+
+            # Bare-metal Pro binary assets (P0 control-plane auto-update channel).
+            # darwin: which platform object to check for is decided by the
+            # SAME host-triple detection the build/package step uses (see
+            # darwin_platform_label above) — a verify run on a non-darwin host
+            # (e.g. Linux CI) or an unrecognized triple can't know which
+            # object to expect, so it skips this row rather than guessing.
+            local darwin_label
+            darwin_label="$(darwin_platform_label)"
+            if [[ -n "$darwin_label" ]]; then
+                tar="gs://${bucket}/duduclaw-pro-bin/v${want}/duduclaw-pro-${darwin_label}.tar.gz"
+                if gcloud storage objects describe "$tar" >/dev/null 2>&1; then
+                    printf "  %-10s %-10s OK\n" "pro-bin-mac" "v$want"
+                else
+                    printf "  %-10s %-10s MISSING (%s) — Pro auto-update has no %s asset\n" \
+                        "pro-bin-mac" "v$want" "$tar" "$darwin_label"
+                    rc=1
+                fi
+            else
+                echo "  pro-bin-mac: skipped (could not determine a darwin host triple via rustc -vV)"
+            fi
+            tar="gs://${bucket}/duduclaw-pro-bin/v${want}/duduclaw-pro-linux-x64.tar.gz"
+            if gcloud storage objects describe "$tar" >/dev/null 2>&1; then
+                printf "  %-10s %-10s OK\n" "pro-bin-linux" "v$want"
+            else
+                printf "  %-10s %-10s MISSING (%s) — Pro auto-update has no linux-x64 asset\n" \
+                    "pro-bin-linux" "v$want" "$tar"
                 rc=1
             fi
         else
@@ -513,16 +564,152 @@ fi
 # skipping this step means the new version never appears in the dropdown.
 # No-op on public checkouts (script absent). Opt out: DUDUCLAW_SKIP_PRO_IMAGE=1.
 PRO_IMAGE_SCRIPT="commercial/duduclaw-pro-gateway/build-image.sh"
+# Tracked so the pro-binary-assets step below knows whether it can extract
+# linux-x64 from a freshly-built local image tag (docker build always tags
+# locally even if the AR push itself fails, but a skipped/failed build leaves
+# no local image to extract from).
+PRO_IMAGE_PUSHED=0
 if [[ -x "$PRO_IMAGE_SCRIPT" && "${DUDUCLAW_SKIP_PRO_IMAGE:-0}" != "1" ]]; then
     echo ""
     echo "Building + pushing enterprise duduclaw-pro:v$NEW_VERSION image..."
     if "$PRO_IMAGE_SCRIPT" "v$NEW_VERSION"; then
         echo "  Enterprise image v$NEW_VERSION pushed."
+        PRO_IMAGE_PUSHED=1
     else
         echo ""
         echo "  WARNING: duduclaw-pro image build/push FAILED. The release commit +"
         echo "  tag stand, but the cloud console will not offer v$NEW_VERSION until"
         echo "  you re-run:  $PRO_IMAGE_SCRIPT v$NEW_VERSION"
+    fi
+fi
+
+# --- Enterprise pro binary assets (darwin + linux-x64, commercial checkout only) ---
+# Bare-metal duduclaw-pro binaries for the P0 control-plane auto-update
+# channel (commercial/docs/DESIGN-pro-auto-update-2026-08.md §3 P0, §4 item
+# 3). Signed with an INDEPENDENT minisign keypair
+# (~/.minisign/duduclaw-pro-release.key) so a control-plane compromise can
+# never poison CE users via the CE update channel, or vice versa (design
+# principle 2 — key isolation from UPDATE_PUBKEY / duduclaw-release.key). The
+# darwin binary builds natively on this machine, LABELED BY ITS ACTUAL BUILD
+# HOST TRIPLE (darwin_platform_label — darwin-arm64 or darwin-x64, never
+# assumed; see that function's doc comment for the 2026-08-17 mislabel
+# finding); linux-x64 is extracted from the duduclaw-pro image built above (no
+# cross-compile toolchain needed). Best-effort, same discipline as the
+# pro-image step above: any missing prerequisite or failure WARNs and this
+# step is skipped — it never fails the release. Opt out: DUDUCLAW_SKIP_PRO_BIN=1.
+PRO_BIN_KEY="$HOME/.minisign/duduclaw-pro-release.key"
+PRO_BIN_BUCKET="${DUDUCLAW_IMAGE_TAR_BUCKET:-duduclaw-oem-images}"
+
+# Package <staged_dir>/<plat>/duduclaw-pro into a signed, checksummed tar.gz
+# and upload the three-piece set (tar.gz + .sha256 + .minisig) to GCS.
+# Isolated into a function so the tar-naming / GCS-path formula is
+# independently callable (source this script and invoke directly to check
+# the naming/path logic without building or uploading anything real).
+package_and_upload_pro_bin() {
+    local plat="$1" staged_dir="$2" version="$3"
+    local tar_name="duduclaw-pro-${plat}.tar.gz"
+    local tar_path="${staged_dir}/${tar_name}"
+    local dest="gs://${PRO_BIN_BUCKET}/duduclaw-pro-bin/v${version}/"
+
+    if ! ( cd "$staged_dir/$plat" && tar czf "$tar_path" duduclaw-pro ); then
+        echo "  WARNING: failed to package $tar_name — skipping."
+        return 1
+    fi
+    if ! shasum -a 256 "$tar_path" > "${tar_path}.sha256"; then
+        echo "  WARNING: sha256 failed for $tar_name — skipping."
+        return 1
+    fi
+    if ! minisign -S -s "$PRO_BIN_KEY" -m "$tar_path" -t "duduclaw-pro v$version $tar_name"; then
+        echo "  WARNING: minisign failed for $tar_name — skipping upload."
+        return 1
+    fi
+    if ! command -v gcloud >/dev/null 2>&1; then
+        echo "  WARNING: gcloud not found — $tar_name built + signed locally, not uploaded."
+        return 1
+    fi
+    if gcloud storage cp "$tar_path" "${tar_path}.sha256" "${tar_path}.minisig" "$dest"; then
+        echo "  Uploaded: ${dest}${tar_name} (+ .sha256 + .minisig)"
+        return 0
+    fi
+    echo "  WARNING: GCS upload failed for $tar_name."
+    return 1
+}
+
+if [[ -d "commercial/duduclaw-pro-gateway" ]]; then
+    if [[ "${DUDUCLAW_SKIP_PRO_BIN:-0}" == "1" ]]; then
+        echo ""
+        echo "Skipping duduclaw-pro binary assets (DUDUCLAW_SKIP_PRO_BIN=1)."
+    elif ! command -v minisign >/dev/null 2>&1; then
+        echo ""
+        echo "  WARNING: minisign not found in PATH — skipping duduclaw-pro binary assets."
+    elif [[ ! -f "$PRO_BIN_KEY" ]]; then
+        echo ""
+        echo "  WARNING: $PRO_BIN_KEY not found — skipping duduclaw-pro binary assets."
+    else
+        echo ""
+        echo "Building duduclaw-pro bare-metal binary assets (v$NEW_VERSION)..."
+        PRO_BIN_TMP="$(mktemp -d)"
+
+        # darwin: native build on this machine, LABELED BY THE ACTUAL BUILD
+        # HOST TRIPLE (never assumed as darwin-arm64 — see darwin_platform_label
+        # above). An unrecognized host triple skips the darwin asset entirely
+        # rather than uploading it under a guessed label (fail-closed:
+        # mislabeling a binary is worse than not shipping one this round).
+        # Built with CWD inside the crate dir (not --manifest-path from repo
+        # root) so cargo's config discovery actually walks through
+        # commercial/duduclaw-pro-gateway/.cargo/config.toml and honors its
+        # target-dir="../../target" redirect — verified via `cargo metadata`:
+        # --manifest-path from the repo root resolves target_directory to
+        # commercial/duduclaw-pro-gateway/target instead (config discovery
+        # follows CWD, not the manifest path).
+        DARWIN_PLATFORM_LABEL="$(darwin_platform_label)"
+        if [[ -z "$DARWIN_PLATFORM_LABEL" ]]; then
+            echo "  WARNING: could not determine a darwin-arm64/darwin-x64 host triple via"
+            echo "           'rustc -vV' — skipping darwin binary asset (fail-closed)."
+        else
+            echo "  [$DARWIN_PLATFORM_LABEL] cargo build --release --bin duduclaw-pro..."
+            if ( cd commercial/duduclaw-pro-gateway && cargo build --release --bin duduclaw-pro ); then
+                mkdir -p "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL"
+                if cp target/release/duduclaw-pro "$PRO_BIN_TMP/$DARWIN_PLATFORM_LABEL/duduclaw-pro"; then
+                    package_and_upload_pro_bin "$DARWIN_PLATFORM_LABEL" "$PRO_BIN_TMP" "$NEW_VERSION" || true
+                else
+                    echo "  WARNING: built binary missing at target/release/duduclaw-pro — skipping $DARWIN_PLATFORM_LABEL."
+                fi
+            else
+                echo "  WARNING: $DARWIN_PLATFORM_LABEL duduclaw-pro build failed — skipping this platform."
+            fi
+        fi
+
+        # linux-x64: extract from the duduclaw-pro image built above (docker
+        # build always tags the image locally even if the AR push failed, but
+        # we only attempt this when the step above actually reported success).
+        if [[ "$PRO_IMAGE_PUSHED" == "1" ]] && command -v docker >/dev/null 2>&1; then
+            echo "  [linux-x64] extracting binary from duduclaw-pro:v$NEW_VERSION image..."
+            PRO_BIN_REGION="${DUDUCLAW_GCP_REGION:-asia-east1}"
+            PRO_BIN_PROJECT="${DUDUCLAW_GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
+            if [[ -n "$PRO_BIN_PROJECT" && "$PRO_BIN_PROJECT" != "(unset)" ]]; then
+                PRO_BIN_IMAGE="${PRO_BIN_REGION}-docker.pkg.dev/${PRO_BIN_PROJECT}/duduclaw/duduclaw-pro:v${NEW_VERSION}"
+                PRO_BIN_CID="$(docker create "$PRO_BIN_IMAGE" 2>/dev/null || true)"
+                if [[ -n "$PRO_BIN_CID" ]]; then
+                    mkdir -p "$PRO_BIN_TMP/linux-x64"
+                    if docker cp "$PRO_BIN_CID:/usr/local/bin/duduclaw-pro" "$PRO_BIN_TMP/linux-x64/duduclaw-pro" 2>/dev/null; then
+                        package_and_upload_pro_bin linux-x64 "$PRO_BIN_TMP" "$NEW_VERSION" || true
+                    else
+                        echo "  WARNING: docker cp from duduclaw-pro image failed — skipping linux-x64."
+                    fi
+                    docker rm "$PRO_BIN_CID" >/dev/null 2>&1 || true
+                else
+                    echo "  WARNING: docker create duduclaw-pro:v$NEW_VERSION failed — skipping linux-x64."
+                fi
+            else
+                echo "  WARNING: no GCP project configured — skipping linux-x64 (need image ref)."
+            fi
+        else
+            echo "  NOTE: pro image was not built/pushed above (skipped or failed), or docker"
+            echo "        is unavailable — linux-x64 binary asset skipped."
+        fi
+
+        rm -rf "$PRO_BIN_TMP"
     fi
 fi
 

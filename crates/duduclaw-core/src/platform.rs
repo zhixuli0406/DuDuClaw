@@ -563,6 +563,22 @@ pub fn is_world_writable(path: &Path) -> bool {
     sys::is_world_writable(path)
 }
 
+/// Whether a binary-install directory is unsafe to self-update into.
+///
+/// World-writable is always unsafe. Group-writable is unsafe **unless** the
+/// owning group is an admin-class group — root/wheel (gid 0) anywhere, plus
+/// `admin` (gid 80) on macOS, where `/usr/local/bin` ships `drwxrwxr-x
+/// root:admin` (or user:admin) by default and every group member is an
+/// administrator anyway. The blanket `is_world_writable` gate (2026-08-17
+/// field report) refused updates on that stock layout, making self-update
+/// unusable on most standalone macOS installs while blocking no one who
+/// couldn't already escalate.
+///
+/// On Windows, always returns `false` (POSIX mode bits not applicable).
+pub fn is_unsafe_update_dir(path: &Path) -> bool {
+    sys::is_unsafe_update_dir(path)
+}
+
 /// Check if a file has group/other permission bits set.
 ///
 /// On Windows, always returns `false` (not applicable).
@@ -688,6 +704,28 @@ mod sys {
             .unwrap_or(false)
     }
 
+    pub fn is_unsafe_update_dir(path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .map(|m| unsafe_update_dir_mode(m.mode(), m.gid()))
+            .unwrap_or(false)
+    }
+
+    /// Pure decision for [`is_unsafe_update_dir`], split out for tests (a
+    /// test process cannot chown a real directory to gid 0/80).
+    pub(crate) fn unsafe_update_dir_mode(mode: u32, gid: u32) -> bool {
+        if mode & 0o002 != 0 {
+            return true; // world-writable: always unsafe
+        }
+        if mode & 0o020 != 0 {
+            // Group-writable: tolerate only admin-class groups — root/wheel
+            // (gid 0) everywhere, `admin` (gid 80) on macOS.
+            let privileged = gid == 0 || (cfg!(target_os = "macos") && gid == 80);
+            return !privileged;
+        }
+        false
+    }
+
     pub fn has_loose_permissions(path: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(path)
@@ -797,6 +835,10 @@ mod sys {
     }
 
     pub fn is_world_writable(_path: &Path) -> bool {
+        false
+    }
+
+    pub fn is_unsafe_update_dir(_path: &Path) -> bool {
         false
     }
 
@@ -932,6 +974,55 @@ mod home_tests {
                 None => std::env::remove_var("DUDUCLAW_INSTANCE"),
             }
         }
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod update_dir_tests {
+    use super::sys::unsafe_update_dir_mode;
+
+    #[test]
+    fn world_writable_is_always_unsafe() {
+        assert!(unsafe_update_dir_mode(0o777, 0));
+        assert!(unsafe_update_dir_mode(0o757, 80));
+        assert!(unsafe_update_dir_mode(0o40777, 501));
+    }
+
+    #[test]
+    fn owner_only_writable_is_safe() {
+        assert!(!unsafe_update_dir_mode(0o755, 501));
+        assert!(!unsafe_update_dir_mode(0o40755, 20));
+        assert!(!unsafe_update_dir_mode(0o700, 501));
+    }
+
+    #[test]
+    fn group_writable_by_non_admin_group_is_unsafe() {
+        // gid 20 = `staff` on macOS — every local user is a member, so a
+        // staff-writable binary dir hands any user a binary-swap primitive.
+        assert!(unsafe_update_dir_mode(0o775, 20));
+        assert!(unsafe_update_dir_mode(0o40775, 1000));
+    }
+
+    #[test]
+    fn group_writable_by_root_group_is_safe() {
+        assert!(!unsafe_update_dir_mode(0o775, 0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_writable_by_macos_admin_is_safe() {
+        // The stock `/usr/local/bin` layout (drwxrwxr-x …:admin) that the
+        // blanket group-writable gate wrongly refused (2026-08-17 field
+        // report — dashboard 更新失敗 on every standalone macOS install).
+        assert!(!unsafe_update_dir_mode(0o40775, 80));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn group_writable_by_gid_80_is_unsafe_off_macos() {
+        // gid 80 has no special meaning outside macOS.
+        assert!(unsafe_update_dir_mode(0o775, 80));
     }
 }
 

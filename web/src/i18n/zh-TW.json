@@ -694,6 +694,8 @@
   "settings.update.installed": "更新完成！正在重新啟動...",
   "settings.update.brewHint": "偵測到 Homebrew 安裝方式。Homebrew 通路已停止維護，無法再透過 brew upgrade 取得新版本，請改用 npm（npm install -g duduclaw）或下載桌面版重新安裝。",
   "settings.update.desktopManaged": "你使用的是桌面版：新版本由 DuDuClaw App 自動下載，下載完成後這裡會出現「重啟並更新」按鈕，也可等下次重啟 App 時自動套用。",
+  "settings.update.proNoChannel": "企業版更新通道未設定：新版本確實存在，但這台主機無法自行安裝。請以企業散發包或重建流程更新 binary。",
+  "settings.update.containerHint": "容器部署偵測到新版本：請在主機上執行企業散發包內的 update.sh 更新 image（互動確認），或加上 --auto 供排程無人值守更新；也可離線 docker save/load 手動更新。詳見 INSTALL.md「更新」章節。",
   "settings.update.desktopStaged": "新版本 v{version} 已在背景下載完成，點「重啟並更新」立即套用。",
   "settings.update.restartAndUpdate": "重啟並更新",
   "settings.update.restarting": "重啟中...",

@@ -695,6 +695,8 @@
   "settings.update.installed": "Update installed! Restarting...",
   "settings.update.brewHint": "Homebrew installation detected. The Homebrew tap is no longer maintained, so `brew upgrade` won't get you new versions anymore — please reinstall via npm (npm install -g duduclaw) or the desktop app instead.",
   "settings.update.desktopManaged": "You are on the desktop app: updates download automatically — once ready, a \"Restart & Update\" button appears here, or the update applies on the next app restart.",
+  "settings.update.proNoChannel": "No enterprise update channel is configured. The new version is real, but this host cannot install it itself — update the binary through your enterprise distribution package or rebuild process.",
+  "settings.update.containerHint": "A new version is available for this containerized deployment. Run update.sh from your enterprise distribution package on the host to update the image (interactive confirmation), or pass --auto for unattended/scheduled updates. Offline docker save/load also still works. See the \"Update\" section in INSTALL.md.",
   "settings.update.desktopStaged": "Version v{version} has been downloaded in the background — click \"Restart & Update\" to apply it now.",
   "settings.update.restartAndUpdate": "Restart & Update",
   "settings.update.restarting": "Restarting...",

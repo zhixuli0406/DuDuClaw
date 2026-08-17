@@ -19,6 +19,7 @@
 //! - [R2:NM2] Redirect policy with URL re-validation
 //! - [R2:NL1] Binary verification timeout (10s)
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -124,13 +125,16 @@ pub async fn on_disk_version() -> Option<String> {
 }
 
 /// Maximum download + decompressed binary size: 200 MB. [H5][R2:NC2]
-const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+pub const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 /// Back-off between download retries, in seconds. Length + 1 = max attempts
 /// (2026-08-04 field report: a v1.50.0 → v1.51.0 install failed with a red
 /// error seconds after the release was published, and the very next manual
 /// click succeeded — GitHub asset propagation lag / a dropped connection).
 /// Applies ONLY to download-class failures; integrity failures never retry.
-const DOWNLOAD_RETRY_DELAYS_SECS: [u64; 2] = [5, 15];
+///
+/// Public so an [`UpdateProvider`] outside this crate feeds the SAME policy to
+/// [`with_retries`] instead of inventing a second retry doctrine.
+pub const DOWNLOAD_RETRY_DELAYS_SECS: [u64; 2] = [5, 15];
 /// Maximum release notes length: 8 KB. [M1]
 const MAX_RELEASE_NOTES_CHARS: usize = 8192;
 /// Binary verification timeout. [R2:NL1]
@@ -173,9 +177,50 @@ pub enum InstallMethod {
     /// the Tauri updater instead, so `apply_update` refuses (2026-07-29
     /// field report: the generic path failed opaquely here).
     Desktop,
+    /// Running as the closed Enterprise wrapper binary (`duduclaw-pro`).
+    /// The public release asset is the open CE binary, so this install can
+    /// never be updated from the GitHub channel (see the refusal in
+    /// [`apply_update_with_progress`]); its updates arrive through an
+    /// extension-supplied [`UpdateProvider`], and until one is wired up the
+    /// deployment honestly reports "no update channel" rather than offering an
+    /// install button that is guaranteed to be refused.
+    Pro,
     Standalone,
     Source,
     Unknown,
+}
+
+/// Which channel this deployment receives binary updates through — reported to
+/// the dashboard so the update page can stop offering an install it cannot do.
+///
+/// - `"control_plane"` — an extension supplied an [`UpdateProvider`].
+/// - `"none"` — Pro wrapper with no provider. New versions are still *visible*
+///   (the Pro build follows the OSS release train, so "a newer version exists"
+///   is true information), but nothing in this process can install one.
+/// - `"github"` — the public CE release channel.
+pub fn update_channel_label(provider_present: bool) -> &'static str {
+    if provider_present {
+        return "control_plane";
+    }
+    if detect_install_method() == InstallMethod::Pro {
+        return "none";
+    }
+    "github"
+}
+
+/// Whether this process runs inside a container image.
+///
+/// Design hard constraint: an image is immutable, so swapping the binary
+/// in-process is undone the moment the container is recreated — version drift
+/// that is worse than not updating at all. Container deployments update by
+/// pulling a new image, so [`install_verified_binary`] refuses here.
+pub fn is_containerized() -> bool {
+    if let Ok(val) = std::env::var("DUDUCLAW_IN_CONTAINER") {
+        if matches!(val.as_str(), "1" | "true" | "yes") {
+            return true;
+        }
+    }
+    std::path::Path::new("/.dockerenv").exists()
 }
 
 /// Result of applying an update.
@@ -202,6 +247,45 @@ pub struct UpdateProgress {
 /// Callback type for [`apply_update_with_progress`].
 pub type ProgressSink<'a> = &'a (dyn Fn(UpdateProgress) + Send + Sync);
 
+/// A pluggable source of binary updates.
+///
+/// The open-source gateway ships exactly one path: the public GitHub release
+/// channel, wired directly into [`check_update`] /
+/// [`apply_update_with_progress`]. A closed-source wrapper injects its own
+/// provider through `GatewayExtension::update_provider`, swapping BOTH the
+/// update source and the signature-verification key without touching — or
+/// weakening — the CE path. No provider ⇒ every code path below behaves
+/// exactly as it did before this seam existed.
+///
+/// Implementors are expected to reuse the machinery this module already
+/// exposes rather than re-implement it: [`with_retries`] +
+/// [`fetch_asset_bytes`] for downloads, [`verify_archive_with_pubkey`] for
+/// integrity (with their OWN pinned public key — never the CE
+/// `UPDATE_PUBKEY`), and [`install_verified_binary`] for the
+/// extract → verify-run → swap → cleanup sequence.
+#[async_trait]
+pub trait UpdateProvider: Send + Sync {
+    /// Whether a newer version is available, and what it is.
+    ///
+    /// `UpdateInfo::download_url` / `checksum_url` are OPAQUE to the gateway on
+    /// this path — a provider that resolves its asset at apply time (signed,
+    /// short-TTL URLs) may leave them empty, and the gateway never validates
+    /// them against the GitHub allowlist. Only `available` / `latest_version` /
+    /// `release_notes` / `published_at` / `install_method` are consumed.
+    async fn check(&self) -> Result<UpdateInfo, String>;
+
+    /// Download, verify, and install the update described by `info`.
+    ///
+    /// `on_progress` is the same sink the dashboard renders as
+    /// 「下載中（重試 N/M）」. Integrity verification is the implementor's
+    /// responsibility and MUST fail closed.
+    async fn apply(
+        &self,
+        info: &UpdateInfo,
+        on_progress: ProgressSink<'_>,
+    ) -> Result<ApplyResult, String>;
+}
+
 /// Whether a failed update stage may be retried.
 ///
 /// The split is the whole point of the retry feature: a flaky download is worth
@@ -209,7 +293,7 @@ pub type ProgressSink<'a> = &'a (dyn Fn(UpdateProgress) + Send + Sync);
 /// checksum or a bad Ed25519 signature would turn a fail-closed security gate
 /// into "try until it slips through". [S1][C1]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailureClass {
+pub enum FailureClass {
     /// Network / HTTP / release-propagation failure — safe to retry.
     Transient,
     /// Integrity or permanent failure — must surface immediately.
@@ -218,16 +302,16 @@ enum FailureClass {
 
 /// A stage failure carrying its retry classification.
 #[derive(Debug, Clone)]
-struct StageError {
-    class: FailureClass,
-    message: String,
+pub struct StageError {
+    pub class: FailureClass,
+    pub message: String,
 }
 
 impl StageError {
-    fn transient(message: impl Into<String>) -> Self {
+    pub fn transient(message: impl Into<String>) -> Self {
         Self { class: FailureClass::Transient, message: message.into() }
     }
-    fn fatal(message: impl Into<String>) -> Self {
+    pub fn fatal(message: impl Into<String>) -> Self {
         Self { class: FailureClass::Fatal, message: message.into() }
     }
 }
@@ -252,7 +336,7 @@ fn classify_http_status(status: reqwest::StatusCode) -> FailureClass {
 /// attempts run out. `delays` holds the back-off before each RETRY, so
 /// `max_attempts = delays.len() + 1`. `on_attempt(attempt, max_attempts)` fires
 /// before every attempt (including the first) for UI progress.
-async fn with_retries<T, F, Fut>(
+pub async fn with_retries<T, F, Fut>(
     delays: &[u64],
     on_attempt: &(dyn Fn(u32, u32) + Send + Sync),
     mut op: F,
@@ -298,11 +382,29 @@ pub fn brew_formula_name() -> &'static str {
     "duduclaw"
 }
 
+/// Whether `exe` is the closed Enterprise wrapper binary (`duduclaw-pro`),
+/// which must never be overwritten by the public CE release asset — see the
+/// refusal in [`apply_update_with_progress`]. Matches the bare stem so
+/// `duduclaw-pro.exe` (Windows) is covered too.
+fn is_pro_wrapper_exe(exe: &std::path::Path) -> bool {
+    exe.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s == "duduclaw-pro")
+}
+
 pub fn detect_install_method() -> InstallMethod {
     let exe = duduclaw_core::platform::executable_path();
     if exe.as_os_str().is_empty() {
         return InstallMethod::Unknown;
     }
+
+    // Enterprise wrapper: checked BEFORE Desktop, because a `duduclaw-pro`
+    // deployed next to a desktop bundle is still a Pro install — the update
+    // channel follows the BINARY, not the directory it happens to sit in.
+    if is_pro_wrapper_exe(&exe) {
+        return InstallMethod::Pro;
+    }
+
     let exe_str = exe.to_string_lossy();
 
     // Desktop-app sidecar: macOS bundle path, or (Windows/Linux) the Tauri
@@ -447,17 +549,28 @@ pub fn is_valid_download_url(url: &str) -> bool {
 // Ed25519 signature verification [S1] — minisign format, pinned public key
 // ---------------------------------------------------------------------------
 
-/// Verify a minisign signature (`.minisig` file content) over `data`
-/// against the pinned [`UPDATE_PUBKEY`]. Fails closed: any parse or
-/// verification error rejects the update. Legacy (non-prehashed)
-/// signatures are rejected — CI signs with modern minisign (`ED` alg).
-fn verify_minisign_signature(data: &[u8], sig_text: &str) -> Result<(), String> {
-    let pk = minisign_verify::PublicKey::from_base64(UPDATE_PUBKEY)
+/// Verify a minisign signature (`.minisig` file content) over `data` against
+/// `pubkey_b64`. Fails closed: any parse or verification error rejects the
+/// update. Legacy (non-prehashed) signatures are rejected — CI signs with
+/// modern minisign (`ED` alg).
+fn verify_minisign_signature_with_pubkey(
+    data: &[u8],
+    sig_text: &str,
+    pubkey_b64: &str,
+) -> Result<(), String> {
+    let pk = minisign_verify::PublicKey::from_base64(pubkey_b64)
         .map_err(|e| format!("Embedded update public key is invalid: {e}"))?;
     let sig = minisign_verify::Signature::decode(sig_text)
         .map_err(|e| format!("Signature file has invalid format: {e}"))?;
     pk.verify(data, &sig, false)
         .map_err(|e| format!("Ed25519 signature verification FAILED — refusing update: {e}"))
+}
+
+/// CE-channel signature verification: [`verify_minisign_signature_with_pubkey`]
+/// against the pinned [`UPDATE_PUBKEY`].
+#[cfg(test)]
+fn verify_minisign_signature(data: &[u8], sig_text: &str) -> Result<(), String> {
+    verify_minisign_signature_with_pubkey(data, sig_text, UPDATE_PUBKEY)
 }
 
 /// Extract the first 64-char hex token from a checksum sidecar file.
@@ -604,6 +717,19 @@ pub async fn apply_update_with_progress(
         );
     }
 
+    // Enterprise wrapper (`duduclaw-pro`): the public release asset is the
+    // open CE binary. Installing it over the wrapper would silently drop the
+    // Enterprise extension AND — because the wrapper ignores argv while the
+    // CE binary requires a subcommand — crash-loop any service unit that
+    // launches the binary with no arguments (the wrapper's documented usage).
+    // Refuse with the real upgrade path instead of bricking the deployment.
+    if is_pro_wrapper_exe(&duduclaw_core::platform::executable_path()) {
+        return Err(
+            "企業版 (duduclaw-pro) 不透過公開發行通道自我更新——請以企業散發包或重建流程更新 binary"
+                .into(),
+        );
+    }
+
     // Homebrew check
     if detect_install_method() == InstallMethod::Homebrew {
         return Ok(ApplyResult {
@@ -642,9 +768,17 @@ pub async fn apply_update_with_progress(
         .parent()
         .ok_or("Cannot determine binary directory")?;
 
-    // [H3] Verify directory permissions
-    if duduclaw_core::platform::is_world_writable(exe_dir) {
-        return Err("Binary directory is world/group writable — refusing update for safety".into());
+    // [H3] Verify directory permissions. Group-writable by an admin-class
+    // group (macOS `/usr/local/bin` ships `drwxrwxr-x …:admin`) is tolerated —
+    // the blanket group-writable refusal made self-update fail on every stock
+    // standalone macOS install (2026-08-17 field report: dashboard 更新失敗,
+    // audit log "Binary directory is world/group writable").
+    if duduclaw_core::platform::is_unsafe_update_dir(exe_dir) {
+        return Err(format!(
+            "Binary directory {} is writable by non-admin users — refusing update for safety \
+             (fix: chmod o-w,g-w on that directory, or reinstall to a user-owned path)",
+            exe_dir.display()
+        ));
     }
 
     info!(url = download_url, "Downloading update...");
@@ -694,9 +828,24 @@ pub async fn apply_update_with_progress(
     .await
     .map_err(|e| e.message)?;
 
+    install_archive_bytes(&bytes, &current_exe, exe_dir).await
+}
+
+/// Install an already-verified archive over the running binary: extract →
+/// size-check → temp file → verify-run → atomic swap → cleanup.
+///
+/// Callers own integrity verification and the environment gates (container,
+/// directory permissions); this is only the swap machine. Shared by the CE
+/// GitHub path and by [`install_verified_binary`] so a provider cannot end up
+/// with a subtly different install sequence.
+async fn install_archive_bytes(
+    archive_bytes: &[u8],
+    current_exe: &std::path::Path,
+    exe_dir: &std::path::Path,
+) -> Result<ApplyResult, String> {
     // Extract binary
     info!("Extracting binary...");
-    let new_binary_bytes = extract_binary_from_archive(&bytes)?;
+    let new_binary_bytes = extract_binary_from_archive(archive_bytes)?;
 
     // [R2:NC2] Verify decompressed size
     if new_binary_bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
@@ -716,17 +865,62 @@ pub async fn apply_update_with_progress(
         .map_err(|e| format!("Failed to write temp binary: {e}"))?;
 
     // [R2:NH4] From here on, any error must clean up tmp_path
-    let result = apply_update_inner(&tmp_path, &current_exe, exe_dir).await;
+    let result = apply_update_inner(&tmp_path, current_exe, exe_dir).await;
     if result.is_err() {
         let _ = tokio::fs::remove_file(&tmp_path).await;
     }
     result
 }
 
+/// Install a verified update archive over the running binary — the install half
+/// of an [`UpdateProvider`], shared with the CE path so both go through exactly
+/// one swap implementation.
+///
+/// `archive_bytes` MUST already have passed integrity verification (see
+/// [`verify_archive_with_pubkey`]); this function does not and cannot know which
+/// key the caller's channel is pinned to.
+///
+/// Two environment gates fire first, both fail-closed:
+/// 1. **Container** — an image is immutable, so an in-process swap is silently
+///    reverted the next time the container is recreated. Refused outright; those
+///    deployments update by pulling a new image.
+/// 2. **Directory permissions** — the same [`duduclaw_core::platform::is_unsafe_update_dir`]
+///    gate the CE path applies, so a world-writable install directory cannot be
+///    used to land a binary.
+pub async fn install_verified_binary(archive_bytes: &[u8]) -> Result<ApplyResult, String> {
+    if is_containerized() {
+        return Err(
+            "容器內不執行 binary 換裝（image 不可變，換裝會在重建容器時還原）——請改用 image 更新流程"
+                .into(),
+        );
+    }
+
+    let current_exe = duduclaw_core::platform::executable_path();
+    if current_exe.as_os_str().is_empty() {
+        return Err("Cannot determine current binary path".into());
+    }
+    let exe_dir = current_exe
+        .parent()
+        .ok_or("Cannot determine binary directory")?;
+
+    if duduclaw_core::platform::is_unsafe_update_dir(exe_dir) {
+        return Err(format!(
+            "Binary directory {} is writable by non-admin users — refusing update for safety \
+             (fix: chmod o-w,g-w on that directory, or reinstall to a user-owned path)",
+            exe_dir.display()
+        ));
+    }
+
+    install_archive_bytes(archive_bytes, &current_exe, exe_dir).await
+}
+
 /// Fetch a release asset body once, classifying every failure. Network errors
 /// and retryable HTTP statuses come back [`FailureClass::Transient`]; anything
-/// else is fatal.
-async fn fetch_asset_bytes(
+/// else is fatal. `what` names the asset in error messages ("Update archive").
+///
+/// Public so an out-of-crate [`UpdateProvider`] inherits the same size limit
+/// ([`MAX_DOWNLOAD_BYTES`]) and retry classification as the CE path.
+pub async fn fetch_asset_bytes(
     client: &reqwest::Client,
     url: &str,
     what: &str,
@@ -770,32 +964,52 @@ async fn fetch_asset_bytes(
 }
 
 /// Verify a downloaded archive against its checksum sidecar and its minisign
-/// signature. Every failure here is [`FailureClass::Fatal`] — an integrity gate
-/// that a retry loop could wear down would not be a gate. [S1][C1][R2:NH2]
+/// signature, using a caller-supplied public key.
+///
+/// The key is a PARAMETER precisely so the Pro update channel can pin its own
+/// keypair: a compromise of one signing key must not become the ability to
+/// install over the other channel's users. Callers pass a key that is pinned in
+/// their own binary — never one read from the network.
+///
+/// Fails closed on every branch (unparseable sidecar, digest mismatch, bad or
+/// absent signature). Never retry a failure from here: an integrity gate a
+/// retry loop can wear down is not a gate. [S1][C1][R2:NH2]
+pub fn verify_archive_with_pubkey(
+    bytes: &[u8],
+    checksum_text: &str,
+    sig_text: &str,
+    pubkey_b64: &str,
+) -> Result<(), String> {
+    // Scan tokens for the first 64-char hex digest so both `shasum`
+    // ("<hash>  <file>") and PowerShell `Format-List` ("Hash : <HASH>")
+    // sidecar formats parse.
+    let expected = extract_sha256_token(checksum_text)
+        .ok_or("Checksum file has invalid format (no SHA-256 digest found)")?;
+    let computed = format!("{:x}", Sha256::digest(bytes));
+    if computed != expected {
+        return Err(format!(
+            "SHA-256 checksum mismatch!\n  Expected: {expected}\n  Computed: {computed}"
+        ));
+    }
+    info!("SHA-256 checksum verified");
+
+    // The public key is pinned in the binary, so this holds even if the
+    // release (and its .sha256 sidecar) is attacker-controlled.
+    verify_minisign_signature_with_pubkey(bytes, sig_text, pubkey_b64)?;
+    info!("Ed25519 signature verified");
+    Ok(())
+}
+
+/// CE-channel integrity check: [`verify_archive_with_pubkey`] against the
+/// pinned [`UPDATE_PUBKEY`], with every failure classified
+/// [`FailureClass::Fatal`] for the retry loop.
 fn verify_archive_integrity(
     bytes: &[u8],
     checksum_text: &str,
     sig_text: &str,
 ) -> Result<(), StageError> {
-    // Scan tokens for the first 64-char hex digest so both `shasum`
-    // ("<hash>  <file>") and PowerShell `Format-List` ("Hash : <HASH>")
-    // sidecar formats parse.
-    let expected = extract_sha256_token(checksum_text).ok_or_else(|| {
-        StageError::fatal("Checksum file has invalid format (no SHA-256 digest found)")
-    })?;
-    let computed = format!("{:x}", Sha256::digest(bytes));
-    if computed != expected {
-        return Err(StageError::fatal(format!(
-            "SHA-256 checksum mismatch!\n  Expected: {expected}\n  Computed: {computed}"
-        )));
-    }
-    info!("SHA-256 checksum verified");
-
-    // The public key is pinned in the binary, so this holds even if the
-    // GitHub release (and its .sha256 sidecar) is attacker-controlled.
-    verify_minisign_signature(bytes, sig_text).map_err(StageError::fatal)?;
-    info!("Ed25519 signature verified");
-    Ok(())
+    verify_archive_with_pubkey(bytes, checksum_text, sig_text, UPDATE_PUBKEY)
+        .map_err(StageError::fatal)
 }
 
 /// One download + verify attempt: archive, checksum sidecar, signature sidecar,
@@ -1230,6 +1444,20 @@ mod tests {
         let _serialized = serde_json::to_string(&method).unwrap();
     }
 
+    #[test]
+    fn test_pro_wrapper_exe_detection() {
+        use std::path::Path;
+        assert!(is_pro_wrapper_exe(Path::new("/usr/local/bin/duduclaw-pro")));
+        // Windows form (`.exe` stripped by file_stem); backslash separators
+        // only parse as separators on Windows, so keep this relative.
+        assert!(is_pro_wrapper_exe(Path::new("duduclaw-pro.exe")));
+        assert!(!is_pro_wrapper_exe(Path::new("/usr/local/bin/duduclaw")));
+        assert!(!is_pro_wrapper_exe(Path::new(
+            "/home/x/.duduclaw/bin/duduclaw-pro-gateway"
+        )));
+        assert!(!is_pro_wrapper_exe(Path::new("")));
+    }
+
     // Real minisign signature over the exact bytes b"FAKE_BINARY", signed
     // with the DuDuClaw release key that matches UPDATE_PUBKEY.
     const TEST_SIG: &str = "untrusted comment: signature from minisign secret key\n\
@@ -1570,6 +1798,115 @@ mRGk2RUiXNVr9zzLXu6BI9+0URr0xlBwS3rMMXD3smkK7rcMrajd/tMz7jhWxQkiPzmWe4pdxFiIG1Vx
     fn retry_delays_match_the_documented_policy() {
         // 2 retries at 5s / 15s — the UI's "重試 N/3" copy is derived from this.
         assert_eq!(DOWNLOAD_RETRY_DELAYS_SECS, [5, 15]);
+    }
+
+    // ── Pro update channel seam (P0a/P1a) ──
+
+    #[test]
+    fn install_method_pro_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&InstallMethod::Pro).unwrap(),
+            "\"pro\"",
+            "the dashboard branches on this exact literal"
+        );
+        // Round-trips, so a persisted value stays readable.
+        assert_eq!(
+            serde_json::from_str::<InstallMethod>("\"pro\"").unwrap(),
+            InstallMethod::Pro
+        );
+        // Pre-existing variants are untouched.
+        assert_eq!(serde_json::to_string(&InstallMethod::Desktop).unwrap(), "\"desktop\"");
+        assert_eq!(serde_json::to_string(&InstallMethod::Homebrew).unwrap(), "\"homebrew\"");
+    }
+
+    #[test]
+    fn update_channel_label_rules() {
+        // A provider wins regardless of how the binary was installed.
+        assert_eq!(update_channel_label(true), "control_plane");
+        // Without a provider the label follows the install method. This test
+        // process is not `duduclaw-pro`, so it must read "github" — the CE
+        // answer, which is what byte-identical CE behavior depends on.
+        assert_ne!(detect_install_method(), InstallMethod::Pro);
+        assert_eq!(update_channel_label(false), "github");
+    }
+
+    #[test]
+    fn containerized_detection_honors_env_override() {
+        // Serialized against the other env-mutating tests in this module by
+        // being the only one touching DUDUCLAW_IN_CONTAINER.
+        let prev = std::env::var("DUDUCLAW_IN_CONTAINER").ok();
+        for truthy in ["1", "true", "yes"] {
+            unsafe { std::env::set_var("DUDUCLAW_IN_CONTAINER", truthy) };
+            assert!(is_containerized(), "{truthy} must read as containerized");
+        }
+        // A non-truthy value falls through to the /.dockerenv probe rather than
+        // asserting "not a container" — on a real container host the file is
+        // the authority, so only assert the negative when it is absent.
+        unsafe { std::env::set_var("DUDUCLAW_IN_CONTAINER", "0") };
+        if !std::path::Path::new("/.dockerenv").exists() {
+            assert!(!is_containerized());
+        }
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DUDUCLAW_IN_CONTAINER", v) },
+            None => unsafe { std::env::remove_var("DUDUCLAW_IN_CONTAINER") },
+        }
+    }
+
+    #[tokio::test]
+    async fn install_verified_binary_refuses_inside_container() {
+        let prev = std::env::var("DUDUCLAW_IN_CONTAINER").ok();
+        unsafe { std::env::set_var("DUDUCLAW_IN_CONTAINER", "1") };
+        // Garbage bytes: the container gate must fire BEFORE any extraction, so
+        // the error is the container refusal, never "binary not found in archive".
+        let err = install_verified_binary(b"not an archive").await.unwrap_err();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DUDUCLAW_IN_CONTAINER", v) },
+            None => unsafe { std::env::remove_var("DUDUCLAW_IN_CONTAINER") },
+        }
+        assert!(err.contains("容器"), "unexpected error: {err}");
+        assert!(err.contains("image"), "should point at the image update path: {err}");
+    }
+
+    #[test]
+    fn verify_archive_with_pubkey_is_unchanged_for_the_ce_key() {
+        // Signature is valid for exactly b"FAKE_BINARY" under UPDATE_PUBKEY.
+        let good = b"FAKE_BINARY";
+        let good_sum = format!("{:x}", Sha256::digest(good));
+        let sidecar = format!("{good_sum}  duduclaw.tar.gz\n");
+        assert!(verify_archive_with_pubkey(good, &sidecar, TEST_SIG, UPDATE_PUBKEY).is_ok());
+
+        // Same three failure shapes as the classified CE wrapper, fail-closed.
+        assert!(
+            verify_archive_with_pubkey(good, &"a".repeat(64), TEST_SIG, UPDATE_PUBKEY)
+                .unwrap_err()
+                .contains("checksum mismatch")
+        );
+        assert!(
+            verify_archive_with_pubkey(good, "no digest here", TEST_SIG, UPDATE_PUBKEY).is_err()
+        );
+        let tampered = b"FAKE_BINARY_TAMPERED";
+        let tampered_sum = format!("{:x}", Sha256::digest(tampered));
+        assert!(
+            verify_archive_with_pubkey(tampered, &tampered_sum, TEST_SIG, UPDATE_PUBKEY)
+                .unwrap_err()
+                .contains("FAILED")
+        );
+    }
+
+    #[test]
+    fn verify_archive_with_pubkey_rejects_a_foreign_key() {
+        // A signature that verifies under the CE key must NOT verify under a
+        // different (well-formed) key — the whole point of parameterizing it is
+        // that the two channels' trust roots stay separate.
+        let good = b"FAKE_BINARY";
+        let good_sum = format!("{:x}", Sha256::digest(good));
+        let sidecar = format!("{good_sum}  duduclaw.tar.gz\n");
+        // Same key material with one flipped base64 char → valid shape, wrong key.
+        let mut other = UPDATE_PUBKEY.to_string();
+        other.replace_range(10..11, if &UPDATE_PUBKEY[10..11] == "A" { "B" } else { "A" });
+        assert!(verify_archive_with_pubkey(good, &sidecar, TEST_SIG, &other).is_err());
+        // A malformed key is an error, never a pass.
+        assert!(verify_archive_with_pubkey(good, &sidecar, TEST_SIG, "not-a-key").is_err());
     }
 
     #[test]
