@@ -67,6 +67,8 @@ export function UpdateTab() {
     brew_formula?: string;
     auto_update?: boolean;
     restart_pending_version?: string | null;
+    update_channel?: 'control_plane' | 'github' | 'none';
+    containerized?: boolean;
   } | null>(null);
 
   // Load edition + auto_update state on mount
@@ -153,7 +155,12 @@ export function UpdateTab() {
 
   // [M2] applyUpdate no longer sends URL — server uses cached URL from check_update
   const handleInstall = async () => {
-    if (installingRef.current || !updateInfo?.download_url) return;
+    // A control-plane provider resolves its asset server-side at install time,
+    // so it legitimately reports no download_url — the gateway holds the cached
+    // descriptor either way (`system.apply_update` never takes a URL from us).
+    const installable =
+      !!updateInfo?.download_url || updateInfo?.update_channel === 'control_plane';
+    if (installingRef.current || !installable) return;
     installingRef.current = true;
     setInstalling(true);
     setError('');
@@ -177,7 +184,30 @@ export function UpdateTab() {
 
   const isHomebrew = updateInfo?.install_method === 'homebrew';
   const isDesktop = updateInfo?.install_method === 'desktop';
-  const noBinary = updateInfo?.available && !updateInfo.download_url;
+  // Containerized deployment: the image is immutable, so an in-process
+  // binary swap never sticks regardless of `update_channel` — this check
+  // takes priority over `isProNoChannel` below (a containerized host may
+  // legitimately report update_channel "none", but the guidance is
+  // different: run update.sh / rebuild the image, not "wait for a channel").
+  const isContainerized = updateInfo?.containerized === true;
+  // Enterprise binary with no update channel configured: the new version is
+  // real (the enterprise build follows the same release train), but this
+  // process cannot install it — the binary arrives through the enterprise
+  // distribution package or a rebuild. Offering an install button here would
+  // only produce a guaranteed refusal.
+  const isProNoChannel =
+    updateInfo?.install_method === 'pro' && updateInfo?.update_channel === 'none' && !isContainerized;
+  // A control-plane provider resolves its own asset at install time, so an
+  // empty download_url there says nothing about availability. `noBinary` stays
+  // a statement about the public release channel only (undefined channel = an
+  // older gateway = the public channel).
+  const usesProvider = updateInfo?.update_channel === 'control_plane';
+  const noBinary =
+    updateInfo?.available &&
+    !updateInfo.download_url &&
+    !isProNoChannel &&
+    !usesProvider &&
+    !isContainerized;
   const isPro = edition !== 'community';
 
   const handleAutoUpdateToggle = useCallback(async (enabled: boolean) => {
@@ -361,8 +391,28 @@ export function UpdateTab() {
                 </div>
               )}
 
+              {/* Containerized deployment — image is immutable, no in-process
+                  install is possible regardless of update_channel. Takes
+                  priority over every other guidance card below. */}
+              {isContainerized && (
+                <div className="rounded-lg bg-muted/60 p-4 ring-1 ring-inset ring-surface-border">
+                  <p className="text-sm text-muted-foreground">
+                    {intl.formatMessage({ id: 'settings.update.containerHint' })}
+                  </p>
+                </div>
+              )}
+
+              {/* Enterprise binary, no update channel configured */}
+              {isProNoChannel && !isContainerized && (
+                <div className="rounded-lg bg-muted/60 p-4 ring-1 ring-inset ring-surface-border">
+                  <p className="text-sm text-muted-foreground">
+                    {intl.formatMessage({ id: 'settings.update.proNoChannel' })}
+                  </p>
+                </div>
+              )}
+
               {/* No binary hint */}
-              {noBinary && !isHomebrew && !isDesktop && (
+              {noBinary && !isHomebrew && !isDesktop && !isContainerized && (
                 <div className="rounded-lg bg-warning/10 p-4 ring-1 ring-inset ring-warning/20">
                   <p className="text-sm text-warning">
                     {intl.formatMessage({ id: 'settings.update.noBinary' })}
@@ -371,7 +421,7 @@ export function UpdateTab() {
               )}
 
               {/* Install button */}
-              {!isHomebrew && !isDesktop && !noBinary && (
+              {!isHomebrew && !isDesktop && !noBinary && !isProNoChannel && !isContainerized && (
                 <Button
                   variant="brand"
                   onClick={handleInstall}

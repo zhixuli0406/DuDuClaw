@@ -4071,6 +4071,12 @@ struct PendingUpdate {
     download_url: String,
     checksum_url: String,
     version: String,
+    /// The full check result, kept ONLY when an extension-supplied
+    /// [`crate::updater::UpdateProvider`] produced it: that path resolves its
+    /// asset at apply time (short-TTL signed URLs), so there is no URL pair to
+    /// cache and `apply` needs the whole descriptor back. `None` on the CE
+    /// GitHub path, which stays exactly as it was.
+    info: Option<crate::updater::UpdateInfo>,
     /// [R2:NM1] TTL — expires after 5 minutes to prevent stale URL replay
     cached_at: Instant,
 }
@@ -18731,7 +18737,15 @@ impl MethodHandler {
         let on_disk = crate::updater::on_disk_version().await;
         let restart_pending_version =
             on_disk.filter(|v| v != crate::updater::current_version());
-        match crate::updater::check_update().await {
+        // An extension-supplied provider owns both halves of the update flow.
+        // Without one this is byte-for-byte the previous behavior.
+        let provider = self.extension.update_provider();
+        let update_channel = crate::updater::update_channel_label(provider.is_some());
+        let check_result = match &provider {
+            Some(p) => p.check().await,
+            None => crate::updater::check_update().await,
+        };
+        match check_result {
             Ok(info) => {
                 // [M2] Cache the download/checksum URLs server-side
                 // so apply_update does not accept URLs from the client.
@@ -18740,6 +18754,7 @@ impl MethodHandler {
                         download_url: info.download_url.clone(),
                         checksum_url: info.checksum_url.clone(),
                         version: info.latest_version.clone(),
+                        info: provider.as_ref().map(|_| info.clone()),
                         cached_at: Instant::now(),
                     })
                 } else {
@@ -18762,6 +18777,17 @@ impl MethodHandler {
                         // different version than this running process —
                         // "installed, restart to apply".
                         "restart_pending_version": restart_pending_version,
+                        // Which channel can actually install this update:
+                        // "control_plane" | "github" | "none". The update page
+                        // hides its install button on "none" instead of offering
+                        // a click that is guaranteed to be refused.
+                        "update_channel": update_channel,
+                        // Containerized deployments never swap the running
+                        // binary in-process (image is immutable — see
+                        // `install_verified_binary`'s refusal); the dashboard
+                        // uses this to show an `update.sh`/image-rebuild
+                        // guidance card instead of an install button.
+                        "containerized": crate::updater::is_containerized(),
                     }),
                 )
             }
@@ -18770,10 +18796,19 @@ impl MethodHandler {
     }
 
     async fn handle_system_apply_update(&self, _params: Value) -> WsFrame {
-        // [M2] Use server-side cached URL — never accept URL from client
+        // An extension-supplied provider installs through its own channel and
+        // its own pinned key. Without one this is byte-for-byte the previous
+        // behavior — including the `duduclaw-pro` refusal inside
+        // `apply_update_with_progress`, which stays as the last line of defence.
+        let provider = self.extension.update_provider();
+
+        // [M2] Use server-side cached URL — never accept URL from client.
+        // On the provider path the cached descriptor stands in for the URL pair
+        // (the provider resolves its asset at apply time).
         let pending = self.pending_update.read().await.clone();
         let pending = match pending {
-            Some(p) if !p.download_url.is_empty() => p,
+            Some(p) if provider.is_some() && p.info.is_some() => p,
+            Some(p) if provider.is_none() && !p.download_url.is_empty() => p,
             _ => {
                 return WsFrame::error_response(
                     "",
@@ -18824,13 +18859,18 @@ impl MethodHandler {
             let _ = tx.send(serde_json::to_string(&frame).unwrap_or_default());
         };
 
-        match crate::updater::apply_update_with_progress(
-            &pending.download_url,
-            &pending.checksum_url,
-            &on_progress,
-        )
-        .await
-        {
+        let apply_result = match (&provider, pending.info.as_ref()) {
+            (Some(p), Some(info)) => p.apply(info, &on_progress).await,
+            _ => {
+                crate::updater::apply_update_with_progress(
+                    &pending.download_url,
+                    &pending.checksum_url,
+                    &on_progress,
+                )
+                .await
+            }
+        };
+        match apply_result {
             Ok(result) => {
                 *self.pending_update.write().await = None;
 

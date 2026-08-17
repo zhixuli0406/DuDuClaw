@@ -1458,11 +1458,27 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     {
         let etx = event_tx.clone();
         let home_for_update = home_dir.clone();
+        // Update channel for this deployment. An extension-supplied provider
+        // takes over both the check and the install; without one, a
+        // `duduclaw-pro` wrapper can still SEE new versions (the Pro build
+        // follows the OSS release train) but has nothing that can install them,
+        // and CE stays on the public GitHub channel exactly as before.
+        let update_provider = extension.update_provider();
+        let update_channel = crate::updater::update_channel_label(update_provider.is_some());
+        let notify_only_channel = update_channel == "none";
         tokio::spawn(async move {
             // First check after 30 seconds (let gateway finish startup)
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            // Last version we already logged an "unconfigured channel" skip for,
+            // so an unattended Pro deployment logs once per release instead of
+            // every 6h forever.
+            let mut skip_logged_for: Option<String> = None;
             loop {
-                match crate::updater::check_update().await {
+                let check_result = match &update_provider {
+                    Some(provider) => provider.check().await,
+                    None => crate::updater::check_update().await,
+                };
+                match check_result {
                     Ok(info) if info.available => {
                         let event = WsFrame::Event {
                             event: "system.update_available".to_string(),
@@ -1474,6 +1490,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                 "published_at": info.published_at,
                                 "install_method": info.install_method,
                                 "auto_update": auto_update,
+                                "update_channel": update_channel,
                             }),
                             seq: None,
                             state_version: None,
@@ -1482,7 +1499,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                             let _ = etx.send(json);
                         }
 
-                        if auto_update {
+                        if auto_update && notify_only_channel {
+                            // Pro wrapper with no update provider: installing the
+                            // public asset is refused by design (it would replace
+                            // the wrapper with the CE binary). Say so once per
+                            // version — writing an `auto_update_failed` audit
+                            // record every 6h against an intentional refusal is
+                            // noise that buries real failures.
+                            if skip_logged_for.as_deref()
+                                != Some(info.latest_version.as_str())
+                            {
+                                info!(
+                                    latest = %info.latest_version,
+                                    "Pro update channel not configured — skipping auto-install"
+                                );
+                                skip_logged_for = Some(info.latest_version.clone());
+                            }
+                        } else if auto_update {
                             // Pro auto-update: download, verify, install, restart
                             info!(
                                 latest = %info.latest_version,
@@ -1504,12 +1537,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                 ),
                             );
 
-                            match crate::updater::apply_update(
-                                &info.download_url,
-                                &info.checksum_url,
-                            )
-                            .await
-                            {
+                            let apply_result = match &update_provider {
+                                Some(provider) => {
+                                    provider.apply(&info, &|_| {}).await
+                                }
+                                None => crate::updater::apply_update(
+                                    &info.download_url,
+                                    &info.checksum_url,
+                                )
+                                .await,
+                            };
+                            match apply_result {
                                 Ok(result) if result.success => {
                                     info!("Auto-update installed v{}", info.latest_version);
 
@@ -1598,7 +1636,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         });
         info!(
             auto_update,
-            "Periodic update checker started (every 6h, auto_update={})", auto_update,
+            update_channel,
+            "Periodic update checker started (every 6h, auto_update={auto_update}, channel={update_channel})",
         );
     }
 

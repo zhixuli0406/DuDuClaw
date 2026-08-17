@@ -694,6 +694,8 @@
   "settings.update.installed": "アップデートをインストールしました！再起動中...",
   "settings.update.brewHint": "Homebrew インストールを検出しました。Homebrew tap は保守を終了したため、brew upgrade では新しいバージョンを取得できません。npm（npm install -g duduclaw）またはデスクトップ版で再インストールしてください。",
   "settings.update.desktopManaged": "デスクトップ版をご利用中です。新バージョンは App が自動でダウンロードし、準備が整うとここに「再起動して更新」ボタンが表示されます。次回の再起動時に自動適用もされます。",
+  "settings.update.proNoChannel": "エンタープライズ版の更新チャネルが未設定です。新バージョンは実在しますが、このホストでは自動インストールできません。エンタープライズ配布パッケージまたは再ビルド手順でバイナリを更新してください。",
+  "settings.update.containerHint": "コンテナ版で新しいバージョンを検出しました。ホスト上でエンタープライズ配布パッケージ内の update.sh を実行して image を更新してください（対話確認あり）。無人運転で更新する場合は --auto を付けてスケジュール実行できます。オフラインの docker save/load による手動更新も引き続き利用できます。詳細は INSTALL.md の「更新」セクションを参照してください。",
   "settings.update.desktopStaged": "新バージョン v{version} はバックグラウンドでダウンロード済みです。「再起動して更新」で今すぐ適用できます。",
   "settings.update.restartAndUpdate": "再起動して更新",
   "settings.update.restarting": "再起動中...",

@@ -39,6 +39,19 @@ pub trait GatewayExtension: Send + Sync + 'static {
     fn extra_routes(&self) -> Option<axum::Router> {
         None
     }
+
+    /// Binary update channel for this deployment.
+    ///
+    /// `None` (the default) leaves the gateway on its built-in path: the public
+    /// GitHub release channel for CE, and — for the closed `duduclaw-pro`
+    /// wrapper, which the public asset would overwrite with the open binary —
+    /// check-and-notify with no install offered.
+    ///
+    /// A plugin returns `Some(..)` to supply both the update source and its own
+    /// pinned signature key; see [`crate::updater::UpdateProvider`].
+    fn update_provider(&self) -> Option<std::sync::Arc<dyn crate::updater::UpdateProvider>> {
+        None
+    }
 }
 
 /// No-op extension (default).
@@ -56,5 +69,7 @@ mod tests {
         let ext = NullExtension;
         assert_eq!(ext.name(), "DuDuClaw");
         assert!(ext.extra_routes().is_none());
+        // No provider ⇒ the gateway keeps its built-in update behavior.
+        assert!(ext.update_provider().is_none());
     }
 }
