@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.61.2] - 2026-08-17 — 更新通道修復與 Pro 自動升級
+
 ### Added
 - **Pro 自動升級通道（開源側 seam）**：`GatewayExtension` 新增 `update_provider()` hook（預設 `None`，CE 行為逐位不變）；updater 開出可重用的下載重試／參數化驗簽（`verify_archive_with_pubkey`）／換裝（`install_verified_binary`，內含容器閘——容器內一律拒絕行程內換 binary，image 部署走 image 更新）公開面。6h 更新迴圈與 `system.check_update`／`apply_update` 在 provider 存在時改走 provider；回應與廣播新增 `update_channel`（`control_plane`／`github`／`none`）與 `containerized` 欄位，更新頁據此顯示正確動線（Pro 無通道→說明卡、容器→主機端 update.sh 指引、CE 照舊）。`InstallMethod` 新增 `pro`。企業側的 `ControlPlaneUpdateProvider`（license-proof 認證、獨立 pro 簽章 key）與 control plane 端點在 commercial 樹（設計：`DESIGN-pro-auto-update-2026-08.md`）。同步收掉一個噪音洞：Pro 部署開 `auto_update` 先前每 6h 撞拒絕防呆留一筆 `auto_update_failed` 審計，現在每個新版本只記一行 info。release.sh 新增 pro binary 資產步驟（依 build host triple 自動標平台、pro key 簽章、GCS 上傳、verify 檢查）。
 
