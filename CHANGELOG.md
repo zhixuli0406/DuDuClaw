@@ -2,8 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+- **通道 goal 意圖路由（`[goal_intent]`，預設開）**：通道自然語言現在會被判斷是否為交辦——三層分類（L0 零成本硬排除 → L1 訊號分數表零 LLM → L2 灰帶問小模型），命中即回覆確認選單（TG/Discord/Slack/LINE 三按鈕「建立目標／想一想／只是聊聊」，其餘七通道文字 1/2/3），**絕不自動建立**。確認後走與 `/goal` 完全相同的建立路徑（存取閘、autonomy 開工審批照舊），誤判成本壓到一則可忽略的訊息，因此敢預設開。L2 引擎 `mode`：`auto`（有本地推論引擎則走本地 YES/NO screening，否則摺進本來就要發生的主回覆、零額外呼叫）／`local`／`reply_tag`／`off`；任何模型不可用一律 fail-open 回聊天。`/goal ... || 想一想` 讓通道也能要求先出計畫再執行（原本只有 dashboard 有）。設計：`commercial/docs/DESIGN-goal-intent-router-2026-08.md`；使用者說明：`docs/features/48-goal-intent-router.md`。
+- **代碼安全審計 `duduclaw secaudit`（對標 CodeBuddy Security）**：靜態掃描器編排（gitleaks/semgrep/cargo-audit/osv-scanner，缺工具誠實列 `engines_missing` 不靜默跳過）＋威脅建模式 intake（git 安全熱點）＋AI 深度審計（`--profile deep`，per-module 讀碼找靜態掃描追不到的路徑漏洞，`--max-modules` 防燒錢）＋**零共享上下文對抗式覆核**（新 agent 從乾淨重讀證偽候選，可疑留待人審、絕不自動 confirm）＋PoC 沙箱（`--poc`＋High 以上，container 內無網路執行，無沙箱一律不在宿主機裸跑）。`--save` 落報告到 `<home>/secaudit/reports/`；dashboard「安全審計」頁（manager 限定）看 findings 證據鏈＋人審三鍵。CI：exit 0/1/2，缺所有掃描器仍 exit 0；已證偽/已壓制不計入嚴重度統計與 `--fail-on`。設計：`commercial/docs/DESIGN-code-security-audit-2026-08.md`；使用者說明：`docs/features/49-code-security-audit.md`。
+- **VS Code 插件 v2（0.3.0）**：AI 員工選擇器（吃伺服器端已按綁定過濾的 `agents.list`）、角色感知 UI（employee 不再撞審批權限牆）、選取內容問 AI 員工（DATA 圍欄）、交辦／想一想模式（`tasks.goal_create`）、任務 tab（含 needs_human 核准/重試/中止）、跨重啟對話 resume。上架材料備妥（尚未 publish）。設計：`commercial/docs/DESIGN-vscode-client-v2-2026-08.md`。
+- **WebChat 顯式 agent 存取控制**：`user_message` 指定 `agent` 時現在強制檢查該使用者的 agent 綁定（非 admin 需綁定、fail-closed、60s 快取），resume 既有 session 沿用非預設 agent 時同樣重查——先前任何登入者可指定任意 agent 對話，且解綁後仍可靠舊 session 續聊。default agent 路徑逐位不變。
+- **MCP scope 清單單一權威**：22 個 scope 字串收斂到 `duduclaw-core::mcp_scopes`，cli enum 與 gateway 複本改引用同一份＋雙向鎖同步測試；前端補齊先前缺的 12 個 scope（三語系描述），修掉它們在 dashboard 發不出 key（"Unknown scope"）的漂移。
+
 ### Changed
 - **release.sh 每版自動同步 control plane 版本 allowlist**：pro image／pro binary 資產上傳成功後，`DUDUCLAW_PRO_VERSIONS`（Cloud Run env，`pro_versions::resolve` 的 ① 號最高優先來源）自動更新為 git 最新三個 `vX.Y.Z` tag——2026-08-17 生產事故實錘 auto-discovery（GitHub releases × AR manifest 探測）會靜默降級成 `["latest"]`，把 Pro 更新通道與 console 版本下拉一起清空；allowlist 從此由 release 流程維護為權威源，discovery＋registry fallback 退居安全網（control plane 端的探測留痕與 fallback 修正在 commercial 樹）。best-effort：失敗只 WARN 附手動指令，不炸 release；`DUDUCLAW_SKIP_PRO_VERSIONS_ENV=1` 可跳過。
+
+### Fixed
+- **os_watch 觸發的 goal 未凍結 `acceptance_criteria_baseline`**：三條 goal 建立路徑（dashboard／`/goal`／os_watch）中，os_watch 是唯一漏寫驗收基準的一條，判官因此讀到 NULL 基準。現已對齊另兩條的凍結契約（goal 意圖路由 2026-08-17 稽核順帶抓出）。
+- **Discord 元件互動閘吞掉 goal 意圖確認按鈕**：`handle_component_interaction` 開頭的 `if ns != "duduclaw"` 早退會靜默丟棄所有 `gintent:` 按鈕；已把意圖分支上移至該閘之前，並補 deferred-response（想一想會呼叫 LLM，可能超過 Discord 3 秒 ack 窗）。
+- **secaudit：cargo-audit 真實輸出的 `"url": null` 使整份報告解析失敗**（活體 dogfood 2026-08-18 抓到，本 repo 4 個真實 rustls-webpki findings 被靜默歸零）——欄位改 `Option`；且已證偽／已壓制的 findings 先前仍計入嚴重度統計與 `--fail-on`，讓對抗覆核對 CI gate 失效，已改為只計可行動 findings。
+
+### Security
+- **升級 rustls-webpki 0.103.12 → 0.103.14 修補 RUSTSEC-2026-0104**（憑證撤銷列表解析可達 panic）：secaudit 首次 dogfood 就掃出本 repo 實際依賴圖的 rustls-webpki 中此洞——連帶 `aws-lc-rs` 1.16.3→1.18.0、`aws-lc-sys` 0.40→0.44，已完整重驗（全 workspace build＋7575 測試＋真 TLS 呼叫確認握手正常）。Cargo.lock 另有 `rustls-webpki` 0.102.8（經 `rustls` 0.22.4）殘留孤兒，不在實際依賴圖、不編進 binary（cargo-audit 掃 lock 全表才報的 3 個 finding），為避免跨 target/feature 破壞未強行移除，待確認無任何 target 使用後再清。
 
 ## [1.61.2] - 2026-08-17 — 更新通道修復與 Pro 自動升級
 
