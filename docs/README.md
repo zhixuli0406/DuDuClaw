@@ -58,6 +58,8 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/45-local-model-marketplace.md](features/45-local-model-marketplace.md) | Local model marketplace — purpose-based picker, hardware-fit lights, one-click install |
 | [features/46-belief-loop.md](features/46-belief-loop.md) | Belief loop — structured predictions about the outside world, deterministically scored against reality |
 | [features/47-agent-mail.md](features/47-agent-mail.md) | Agent Mail — per-agent inbox (Gmail / drop folder); outbound mail always requires human confirmation |
+| [features/48-goal-intent-router.md](features/48-goal-intent-router.md) | Goal intent router — chat channels notice task delegation and offer to create a goal; never auto-created |
+| [features/49-code-security-audit.md](features/49-code-security-audit.md) | Code security audit — `duduclaw secaudit`: static scanners + AI deep audit + adversarial review + sandboxed PoC |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
