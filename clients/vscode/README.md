@@ -1,22 +1,43 @@
 # DuDuClaw for VS Code
 
-Chat with your self-hosted [DuDuClaw](https://github.com/zhixuli0406/DuDuClaw) AI employees and approve their pending actions (HITL) without leaving the editor.
+跟你自架的 [DuDuClaw](https://github.com/zhixuli0406/DuDuClaw) AI 員工聊天、交辦目標、審批他們待處理的動作（HITL），不用離開編輯器——把 IDE 變成第 12 個對話通道。
 
-## Features
+## 功能
 
-- 💬 **對話** — talk to your AI employees over the gateway's WebChat channel
-- ✅ **審批** — see pending approval requests and approve/deny from the sidebar
+- 💬 **對話** — 透過 gateway 的 WebChat 通道跟 AI 員工聊天；重新連線（例如 VS Code 重啟）後會嘗試接續上次的對話，而不是每次都從空白開始
+- 🧑‍💼 **多 AI 員工切換** — 面板頂部下拉選單或 `DuDuClaw: 切換 AI 員工` 指令，切換你要對話的 AI 員工；每位員工的對話紀錄各自獨立，不會互相混入
+- 🔖 **權限徽章** — 下拉選單旁顯示你對該 AI 員工的權限等級（完整權限／可操作／僅檢視）
+- 📎 **編輯器上下文** — 選取程式碼後，右鍵選單或指令面板執行「DuDuClaw: 把選取內容問 AI 員工」，選取的內容（含檔名與行號）會附進對話，聊天紀錄中以可摺疊區塊顯示
+- 🧭 **問一問／交辦／想一想** — 輸入框上方的模式切換：問一問是一般對話；交辦讓 AI 員工自主執行到完成或卡住為止；想一想會先請 AI 員工擬一份計畫，等你在「任務」分頁核准才開始做（需要你對該 AI 員工有「可操作」以上的權限）
+- 📋 **任務** — 第三個分頁列出目前選中 AI 員工的任務，「等你決定」的任務可直接重試（可附指示）／標記完成／放棄
+- ✅ **審批** — 在側邊欄檢視、同意或拒絕待審批項目（僅限有管理權限的帳號看得到這個分頁）
+- 🩺 **狀態列** — VS Code 下方狀態列顯示目前的 AI 員工與你的帳號角色，點一下可直接切換
 
-## Setup
+## 角色行為
 
-1. Run a DuDuClaw gateway (`duduclaw gateway`), local or remote.
-2. Set `duduclaw.gatewayUrl` in VS Code settings (default `http://127.0.0.1:18789`).
-3. Open the DuDuClaw sidebar (paw icon) and click **登入** — sign in with your dashboard email/password.
+登入後擴充功能會呼叫 gateway 的 `GET /api/me` 取得你的帳號角色：
 
-## Network & privacy disclosure
+| 角色 | 可見範圍 |
+|------|---------|
+| 管理者 (admin) | 看得到所有 AI 員工，審批分頁可見 |
+| 經理 (manager) | 看得到自己綁定的 AI 員工，審批分頁可見 |
+| 員工 (employee) | 只看得到自己綁定的 AI 員工，審批分頁**自動隱藏**（而不是讓你點了才顯示「權限不足」） |
 
-This extension communicates **only** with the DuDuClaw gateway URL you configure — typically a server on your own machine (`127.0.0.1`) or your own infrastructure. It makes no requests to any other host, collects **no telemetry**, and contains no analytics. Credentials are exchanged for a JWT via your gateway's `/api/login` and stored in VS Code Secret Storage; nothing is written to disk in plain text.
+AI 員工清單一律由 gateway 依帳號綁定過濾（`agents.list` RPC），擴充功能本身不做任何額外的存取判斷,只負責顯示。
+
+「任務」分頁所有角色都看得到，但**交辦／想一想**與任務的重試／標記完成／放棄，都需要你對該 AI 員工至少有「可操作」（Operator）等級的權限——伺服器端強制檢查，權限不足時會顯示「此功能需要管理者權限。」而不是原始錯誤訊息。
+
+## 安裝與設定
+
+1. 執行一個 DuDuClaw gateway（`duduclaw gateway`），本機或遠端皆可。
+2. 在 VS Code 設定裡調整 `duduclaw.gatewayUrl`（預設 `http://127.0.0.1:18789`）。
+3. 打開 DuDuClaw 側邊欄（爪印圖示），點擊**登入**，用你的 dashboard email/密碼登入。
+4. 面板頂部的下拉選單會列出你能對話的 AI 員工；選一位開始聊天，或用指令面板執行 `DuDuClaw: 切換 AI 員工`。
+
+## 網路與隱私聲明
+
+這個擴充功能**只**會連線到你設定的 DuDuClaw gateway 位址——通常是你自己的機器（`127.0.0.1`）或你自己的基礎設施。它不會對任何其他主機發出請求，**沒有任何遙測**，也不含分析工具。帳密會透過你 gateway 的 `/api/login` 換成 JWT，存放在 VS Code Secret Storage 裡；JWT 永遠不會進入 webview（所有連線都在擴充功能的 extension host 端，webview 只是純 UI），也不會有任何明文寫入磁碟。
 
 ## License
 
-Apache-2.0 (same as DuDuClaw).
+Apache-2.0（與 DuDuClaw 主專案相同）。

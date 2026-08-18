@@ -1,8 +1,8 @@
 {
   "name": "duduclaw",
   "displayName": "DuDuClaw — AI 員工",
-  "description": "Chat with and approve actions from your self-hosted DuDuClaw AI employees, right inside VS Code. Connects only to the gateway URL you configure — no telemetry, no third-party servers.",
-  "version": "0.1.0",
+  "description": "Chat with, delegate to, and approve actions from your self-hosted DuDuClaw AI employees, right inside VS Code — including editor-selection context and goal-loop task tracking. Connects only to the gateway URL you configure — no telemetry, no third-party servers.",
+  "version": "0.3.0",
   "publisher": "dudustudio",
   "license": "Apache-2.0",
   "repository": {
@@ -22,7 +22,10 @@
     "duduclaw",
     "line",
     "assistant",
-    "self-hosted"
+    "self-hosted",
+    "delegate",
+    "goal loop",
+    "task"
   ],
   "icon": "media/icon.png",
   "main": "./out/extension.js",
@@ -54,8 +57,25 @@
       {
         "command": "duduclaw.logout",
         "title": "DuDuClaw: 登出"
+      },
+      {
+        "command": "duduclaw.switchAgent",
+        "title": "DuDuClaw: 切換 AI 員工"
+      },
+      {
+        "command": "duduclaw.askAboutSelection",
+        "title": "DuDuClaw: 把選取內容問 AI 員工"
       }
     ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "duduclaw.askAboutSelection",
+          "when": "editorHasSelection",
+          "group": "9_duduclaw"
+        }
+      ]
+    },
     "configuration": {
       "title": "DuDuClaw",
       "properties": {
