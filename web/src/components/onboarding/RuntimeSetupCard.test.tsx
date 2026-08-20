@@ -269,21 +269,41 @@ describe('RuntimeSetupCard — login + re-detect', () => {
     expect(screen.queryByRole('button', { name: /install it for me/i })).not.toBeInTheDocument();
   });
 
-  it('opens the PTY login modal from the sign-in button', async () => {
+  it('opens the PTY login modal from the sign-in button for a non-Claude provider', async () => {
     const user = userEvent.setup();
     vi.spyOn(api.auth, 'cliLoginStart').mockResolvedValue({
       session_id: 'login-1',
-      runtime: 'claude',
-      program: '/usr/local/bin/claude',
-      remote_safe: true,
-      hint: 'paste the code below',
+      runtime: 'codex',
+      program: '/usr/local/bin/codex',
+      remote_safe: false,
+      hint: 'complete sign-in in your browser',
       status: 'running',
+    });
+    renderWithProviders(
+      <RuntimeSetupCard provider="codex" installed loggedIn={false} onDetect={vi.fn()} />,
+    );
+    await user.click(screen.getByRole('button', { name: /sign in now/i }));
+    await waitFor(() => expect(api.auth.cliLoginStart).toHaveBeenCalledWith('codex'));
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+  });
+
+  // WP-D: headless boxes can't complete `claude login`'s localhost-callback
+  // OAuth, so the Claude case swaps in the guided "訂閱帳號" setup wizard
+  // (QR code + validated paste-back code) instead of the generic streamed
+  // PTY terminal the other CLIs still use above.
+  it('opens the subscription setup wizard from the sign-in button for Claude', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api.accounts, 'setupTokenStart').mockResolvedValue({
+      session_id: 'setup-1',
+      auth_url: 'https://claude.com/cai/oauth/authorize?code=true',
+      expires_in_seconds: 300,
+      program: '/usr/local/bin/claude',
     });
     renderWithProviders(
       <RuntimeSetupCard provider="claude" installed loggedIn={false} onDetect={vi.fn()} />,
     );
     await user.click(screen.getByRole('button', { name: /sign in now/i }));
-    await waitFor(() => expect(api.auth.cliLoginStart).toHaveBeenCalledWith('claude'));
+    await waitFor(() => expect(api.accounts.setupTokenStart).toHaveBeenCalled());
     expect(await screen.findByRole('dialog')).toBeInTheDocument();
   });
 

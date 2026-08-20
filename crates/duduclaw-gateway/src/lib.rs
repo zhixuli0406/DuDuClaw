@@ -162,6 +162,7 @@ pub mod ephemeral;
 pub mod message_queue;
 pub mod external_factors;
 pub mod cli_auth;
+pub mod setup_token_wizard;
 pub mod cli_noise;
 pub mod handlers;
 pub mod knowledge_guard;

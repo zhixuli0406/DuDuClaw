@@ -28,6 +28,7 @@ import {
   DialogClose,
 } from '@/components/mds';
 import { CliLoginModal, type LoginRuntime } from '@/components/CliLoginModal';
+import { SubscriptionSetupWizard } from '@/components/SubscriptionSetupWizard';
 import {
   Wallet,
   Plus,
@@ -38,6 +39,7 @@ import {
   Key,
   KeyRound,
   Pencil,
+  QrCode as QrCodeIcon,
   Settings2,
   TrendingUp,
   PiggyBank,
@@ -125,6 +127,7 @@ export function AccountsPage() {
   const [loading, setLoading] = useState(false);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [subscriptionWizardOpen, setSubscriptionWizardOpen] = useState(false);
   const [loginRuntime, setLoginRuntime] = useState<LoginRuntime | null>(null);
   const [cliCreds, setCliCreds] = useState<CliCredentialInfo[]>([]);
   // WP-C (§2-2) — the reverse of `[model] account_pool`: which staff members
@@ -222,24 +225,43 @@ export function AccountsPage() {
         new user must do, dressed as the least important control on the page and
         buried in a spend readout. It now opens the page as a full-width card
         with room for what it actually does.
+
+        WP-D (2026-08-18) split this into two entry points: a guided,
+        QR-code + validated wizard for the common case (connecting a Claude
+        subscription — the only flow headless boxes can actually complete,
+        since `claude login`'s browser callback targets the CLI's own
+        machine), and the original CLI picker for the other four runtimes /
+        power users who want the raw streamed terminal.
       */}
       <div className="flex flex-wrap items-center gap-4 rounded-xl border border-brand/30 bg-brand/8 p-4">
         <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-brand/15 text-brand">
-          <LogIn className="size-5" />
+          <QrCodeIcon className="size-5" />
         </span>
         <div className="min-w-56 flex-1">
           <p className="text-sm font-medium text-foreground">
-            {intl.formatMessage({ id: 'accounts.cliLogin.heroTitle' })}
+            {intl.formatMessage({ id: 'accounts.subscriptionSetup.heroTitle' })}
           </p>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            {intl.formatMessage({ id: 'accounts.cliLogin.pickHint' })}
+            {intl.formatMessage({ id: 'accounts.subscriptionSetup.heroDesc' })}
           </p>
         </div>
-        <Button variant="brand" onClick={() => setPickerOpen(true)}>
-          <LogIn />
-          {intl.formatMessage({ id: 'accounts.cliLogin' })}
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="brand" onClick={() => setSubscriptionWizardOpen(true)}>
+            <QrCodeIcon />
+            {intl.formatMessage({ id: 'accounts.subscriptionSetup' })}
+          </Button>
+          <Button variant="outline" onClick={() => setPickerOpen(true)}>
+            <LogIn />
+            {intl.formatMessage({ id: 'accounts.cliLogin' })}
+          </Button>
+        </div>
       </div>
+
+      <SubscriptionSetupWizard
+        open={subscriptionWizardOpen}
+        onClose={() => setSubscriptionWizardOpen(false)}
+        onSuccess={fetchBudget}
+      />
 
       {/* CLI picker for one-click login */}
       <Dialog open={pickerOpen} onOpenChange={(o) => !o && setPickerOpen(false)}>

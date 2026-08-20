@@ -27,10 +27,11 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use regex::Regex;
 use tokio::sync::broadcast;
 
 use duduclaw_core::types::RuntimeType;
@@ -138,6 +139,102 @@ pub fn extract_oauth_token(raw: &str) -> Option<String> {
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
     (tok.len() >= 24).then_some(tok)
+}
+
+fn url_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"https?://[^\s"'<>)\]]+"#).expect("static regex"))
+}
+
+fn oauth_param_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)[?&](client_id|response_type|redirect_uri|code_challenge|user_code|device_code|scope|state)=")
+            .expect("static regex")
+    })
+}
+
+fn not_a_destination_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(oauth-?callback|auth-?success|/(docs?|terms|privacy|support|changelog|help)(?:[^\w-]|$))")
+            .expect("static regex")
+    })
+}
+
+fn looks_like_auth_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)oauth|authorize|auth\.|/cai/").expect("static regex"))
+}
+
+fn tidy_url(url: &str) -> String {
+    url.trim_end_matches(|c: char| ".,;:)]}>'\"|".contains(c)).to_string()
+}
+
+/// Extract the sign-in URL a CLI login command printed, or `None` when the
+/// transcript has none yet. Operates on RAW output (strips ANSI internally,
+/// like [`extract_oauth_token`]) so callers can feed it the same rolling tail.
+///
+/// Faithful Rust port of `web/src/lib/cli-auth-url.ts`'s `extractAuthUrl` —
+/// see that file for the full rationale (a transcript usually contains
+/// several URLs — callback echoes, docs links — and only one is the page the
+/// user must open; ranking by OAuth query params disambiguates them). Kept in
+/// sync deliberately: both sides solve the exact same problem from the exact
+/// same class of transcript, just so the gateway can also return `auth_url`
+/// synchronously from an RPC instead of requiring the caller to parse the
+/// streamed byte events itself.
+///
+/// Verified against a REAL `claude setup-token` capture (claude 2.1.220,
+/// 2026-08-18, 600-col PTY — the width `AuthSession::spawn` actually uses):
+/// the CLI prints the URL as an OSC-8 hyperlink,
+/// `\x1b]8;id=…;<URL>\x07<URL>\x1b]8;;\x07` — `strip_ansi_keep_case` consumes
+/// the OSC-wrapped URI parameter (the `\x1b]8;id=…;<URL>` prefix, terminated
+/// by BEL) as part of stripping the escape sequence, leaving exactly one
+/// plain-text copy of the complete URL behind (the "display text" half of the
+/// hyperlink) — see `extract_auth_url_from_real_setup_token_osc8_capture`.
+pub fn extract_auth_url(raw: &str) -> Option<String> {
+    let clean = strip_ansi_keep_case(raw);
+    let urls: Vec<String> = url_regex()
+        .find_iter(&clean)
+        .map(|m| tidy_url(m.as_str()))
+        .filter(|u| !u.is_empty())
+        .collect();
+    if urls.is_empty() {
+        return None;
+    }
+
+    // Drop known non-destinations up front (callback echoes / docs links) so
+    // no later rule can promote one. Fall back to the full set rather than
+    // returning None if that empties the pool.
+    let plausible: Vec<String> = urls
+        .iter()
+        .filter(|u| !not_a_destination_regex().is_match(u))
+        .cloned()
+        .collect();
+    let pool: Vec<String> = if plausible.is_empty() { urls } else { plausible };
+
+    let with_query: Vec<String> = pool.iter().filter(|u| u.contains('?')).cloned().collect();
+
+    // 1. A URL carrying OAuth parameters. Take the LAST one: a TUI redraws
+    //    its screen, and after a retry the newest URL is the live one.
+    let oauth_params: Vec<String> = with_query
+        .iter()
+        .filter(|u| oauth_param_regex().is_match(u))
+        .cloned()
+        .collect();
+    if let Some(u) = oauth_params.last() {
+        return Some(u.clone());
+    }
+    // 2. Any other parameterised URL.
+    if let Some(u) = with_query.last() {
+        return Some(u.clone());
+    }
+    // 3. No query strings at all — fall back to shape matching.
+    if let Some(u) = pool.iter().find(|u| looks_like_auth_regex().is_match(u)) {
+        return Some(u.clone());
+    }
+    // 4. Last resort: the longest remaining URL.
+    pool.into_iter().max_by_key(|u| u.len())
 }
 
 /// Redact token-like runs (e.g. `sk-ant-oat01-…`) from normalized PTY text
@@ -422,6 +519,11 @@ pub struct AuthSession {
     // Long-lived OAuth token scraped from the output (`claude setup-token` prints
     // it once and never persists it). Used to register an account on success.
     token: Arc<Mutex<Option<String>>>,
+    // Sign-in URL scraped from the output (see `extract_auth_url`). Lets a
+    // caller (e.g. the "訂閱帳號" setup wizard, `setup_token_wizard.rs`) return
+    // it synchronously from a status RPC instead of parsing the streamed byte
+    // events itself.
+    url: Arc<Mutex<Option<String>>>,
 }
 
 impl AuthSession {
@@ -473,6 +575,7 @@ impl AuthSession {
         let (output_tx, _rx) = broadcast::channel::<Vec<u8>>(1024);
         let status = Arc::new(AtomicU8::new(ST_RUNNING));
         let token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         // Success-file watcher: the most reliable signal that login succeeded is
         // the CLI writing its credentials file — independent of the TUI's success
@@ -508,6 +611,7 @@ impl AuthSession {
             let spec = spec.clone();
             let log_id = id.clone();
             let token_store = token.clone();
+            let url_store = url.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 let mut tail = String::new();
@@ -527,6 +631,10 @@ impl AuthSession {
                             // arrives split across reads converges to the full value.
                             if let Some(t) = extract_oauth_token(&tail) {
                                 *token_store.lock().unwrap() = Some(t);
+                            }
+                            // Sign-in URL: same rolling-tail scan, see extract_auth_url.
+                            if let Some(u) = extract_auth_url(&tail) {
+                                *url_store.lock().unwrap() = Some(u);
                             }
                             // Diagnostic: log a redacted, normalized snapshot of the
                             // tail end so the live transcript is inspectable from the
@@ -568,12 +676,19 @@ impl AuthSession {
             child: Mutex::new(child),
             _master: Mutex::new(pair.master),
             token,
+            url,
         }))
     }
 
     /// The long-lived OAuth token scraped from the login output, if any.
     pub fn captured_token(&self) -> Option<String> {
         self.token.lock().unwrap().clone()
+    }
+
+    /// The sign-in URL scraped from the login output, if any. See
+    /// [`extract_auth_url`].
+    pub fn captured_auth_url(&self) -> Option<String> {
+        self.url.lock().unwrap().clone()
     }
 
     /// Subscribe to the raw output byte stream.
@@ -691,6 +806,54 @@ mod tests {
             extract_oauth_token(out2).as_deref(),
             Some("sk-ant-oat01-ZZZZZZZZZZZZZZZZZZZZZZ")
         );
+    }
+
+    /// Byte-faithful (structure-wise) reconstruction of a REAL `claude
+    /// setup-token` capture — claude 2.1.220, 2026-08-18, at the 600-col PTY
+    /// width `AuthSession::spawn` actually uses (see the `live_*` test below
+    /// for how this was captured). The OSC-8 hyperlink `id=` and the PKCE
+    /// `code_challenge`/`state` values are replaced with obviously-fake
+    /// placeholders (they were already dead — the real session was killed
+    /// before ever completing) but every escape sequence, byte order, and the
+    /// "URL appears twice — once as the OSC-8 URI param, once as its display
+    /// text" shape is verbatim.
+    const REAL_SETUP_TOKEN_OSC8_CAPTURE: &str = "\r\u{1b}[1C\u{1b}[1ABrowser didn't open?\u{1b}[23GUse the url\u{1b}[35Gbelow\u{1b}[41Gto\u{1b}[44Gsign\u{1b}[49Gin\u{1b}[52G(c\u{1b}[55Gto\u{1b}[58Gcopy)\r\r\n\r\r\n\u{1b}]8;id=fakeid01;https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=FAKECHALLENGEFAKECHALLENGEFAKECHALLENGE&code_challenge_method=S256&state=FAKESTATEFAKESTATEFAKESTATEFAKESTATE\u{7}https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=FAKECHALLENGEFAKECHALLENGEFAKECHALLENGE&code_challenge_method=S256&state=FAKESTATEFAKESTATEFAKESTATEFAKESTATE\u{1b}]8;;\u{7}\r\r\n\r\r\n\r\r\n\u{1b}[2GPaste\u{1b}[8Gcode\u{1b}[13Ghere\u{1b}[18Gif\u{1b}[21Gprompted\u{1b}[30G>\r\r\n";
+
+    #[test]
+    fn extract_auth_url_from_real_setup_token_osc8_capture() {
+        let url = extract_auth_url(REAL_SETUP_TOKEN_OSC8_CAPTURE);
+        assert_eq!(
+            url.as_deref(),
+            Some(
+                "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=FAKECHALLENGEFAKECHALLENGEFAKECHALLENGE&code_challenge_method=S256&state=FAKESTATEFAKESTATEFAKESTATEFAKESTATE"
+            ),
+            "OSC-8's URI-param copy must be stripped as part of the escape sequence, \
+             leaving exactly the display-text copy as the extracted URL"
+        );
+    }
+
+    #[test]
+    fn extract_auth_url_ignores_prompt_before_the_link_appears() {
+        assert_eq!(extract_auth_url("Opening browser to sign in…"), None);
+        assert_eq!(extract_auth_url("Paste code here if prompted >"), None);
+    }
+
+    #[test]
+    fn extract_auth_url_prefers_oauth_param_url_over_plain_ones() {
+        // A docs link and a callback echo sit alongside the real consent URL —
+        // ranking (not document order) must pick the one with OAuth params.
+        let tail = "See https://claude.com/docs/setup for help. \
+                     Callback landed on https://claude.com/oauth-callback?ok=1 \
+                     Sign in: https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz";
+        assert_eq!(
+            extract_auth_url(tail).as_deref(),
+            Some("https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz")
+        );
+    }
+
+    #[test]
+    fn extract_auth_url_none_when_no_url_present() {
+        assert_eq!(extract_auth_url("no links here at all"), None);
     }
 
     #[test]

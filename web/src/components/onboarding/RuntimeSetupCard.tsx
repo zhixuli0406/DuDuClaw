@@ -10,6 +10,7 @@ import {
 import { client } from '@/lib/ws-client';
 import { Button, Card } from '@/components/mds';
 import { CliLoginModal } from '@/components/CliLoginModal';
+import { SubscriptionSetupWizard } from '@/components/SubscriptionSetupWizard';
 
 /**
  * WP2 / D16 — the onboarding wizard's "get this CLI working" card.
@@ -347,7 +348,20 @@ export function RuntimeSetupCard({ provider, installed, loggedIn, onDetect, dete
         </div>
       )}
 
-      {loginOpen && (
+      {/* WP-D: headless boxes can't complete `claude login`'s localhost-
+          callback OAuth (the redirect targets the CLI's own machine, not
+          the operator's browser) — `claude setup-token`'s paste-back flow
+          is the only one that works there. The guided QR-code + validated
+          wizard replaces the generic streamed-terminal modal for Claude
+          specifically; the other CLIs keep the original picker. */}
+      {loginOpen && provider === 'claude' && (
+        <SubscriptionSetupWizard
+          open={loginOpen}
+          onClose={() => setLoginOpen(false)}
+          onSuccess={onDetect}
+        />
+      )}
+      {loginOpen && provider !== 'claude' && (
         <CliLoginModal
           open={loginOpen}
           runtime={provider}
