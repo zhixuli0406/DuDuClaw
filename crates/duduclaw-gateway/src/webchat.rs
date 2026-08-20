@@ -143,7 +143,16 @@ pub enum ChatMessage {
     },
     /// Server → Client: error occurred.
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        message: String,
+        /// C-ACL (P0-S1): machine-readable error class for clients that need
+        /// to branch without parsing zh-TW prose (e.g. an agent picker
+        /// greying out an agent whose binding was just revoked). Absent on
+        /// every error frame that predates this field — byte-compatible with
+        /// clients that only ever read `message`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+    },
     /// Server → Client: session info (sent on connect).
     #[serde(rename = "session_info")]
     SessionInfo {
@@ -165,6 +174,22 @@ pub enum ChatMessage {
     },
 }
 
+impl ChatMessage {
+    /// Build a plain-text error frame (`code: None`) — the wire shape every
+    /// error predating C-ACL used, so existing string-matching clients (e.g.
+    /// the dashboard's `isResumeNotFound`) keep working unchanged.
+    fn error(message: impl Into<String>) -> Self {
+        ChatMessage::Error { message: message.into(), code: None }
+    }
+
+    /// Build an error frame carrying a machine-readable `code` (ASCII
+    /// snake_case) so a client can branch on error class without parsing
+    /// zh-TW prose.
+    fn error_coded(message: impl Into<String>, code: &'static str) -> Self {
+        ChatMessage::Error { message: message.into(), code: Some(code.to_string()) }
+    }
+}
+
 /// A file attachment uploaded through the WebChat socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatAttachment {
@@ -177,6 +202,83 @@ pub struct ChatAttachment {
     pub data_base64: String,
 }
 
+/// C-ACL (P0-S1, 2026-08 audit): TTL for the per-user ACL snapshot cache
+/// (`WebChatState::acl_cache`) that gates explicit `agent` selection in a
+/// `user_message`. Short enough that revoking a user's binding
+/// (`users.unbind_agent`) takes effect for WebChat within this window instead
+/// of riding out a JWT's full lifetime (JWT `access_levels` are baked in at
+/// issue time and never re-checked) — a bounded staleness window instead of
+/// an active-connection disconnect mechanism.
+const ACL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Snapshot of a user's role + full agent-binding set — the data
+/// `WebChatState::agent_access_allowed` needs to gate explicit `agent`
+/// selection in a WebChat `user_message`. Pure data, no DB handle, so the
+/// decision logic below (`acl_allows_agent` / `resolve_agent_acl`) is
+/// unit-testable without a live `UserDb`.
+#[derive(Debug, Clone)]
+struct AclSnapshot {
+    role: duduclaw_auth::UserRole,
+    bound_agents: std::collections::HashSet<String>,
+}
+
+/// C-ACL (P0-S1): may `snapshot`'s user address `agent_name` by name in a
+/// `user_message`? Admins pass unconditionally; everyone else needs a
+/// binding to the named agent at ANY access level — Viewer is enough to
+/// converse (this gates *which agent* the turn addresses, not what the user
+/// may do to it once selected; that finer-grained check is
+/// `duduclaw_auth::acl::require_agent_access` on the dashboard RPC path).
+fn acl_allows_agent(snapshot: &AclSnapshot, agent_name: &str) -> bool {
+    snapshot.role == duduclaw_auth::UserRole::Admin || snapshot.bound_agents.contains(agent_name)
+}
+
+/// Compose a (possibly failed) ACL lookup into a final allow/deny decision.
+/// Fails CLOSED: any lookup error (DB unavailable, corrupt row, the user
+/// record vanished mid-session) denies rather than falling through to
+/// "allow".
+fn resolve_agent_acl(snapshot: &Result<AclSnapshot, String>, agent_name: &str) -> bool {
+    match snapshot {
+        Ok(s) => acl_allows_agent(s, agent_name),
+        Err(_) => false,
+    }
+}
+
+/// C-ACL resume gap (P0-S2, 2026-08 audit follow-up): wave one (`acl_allows_agent`
+/// above) only gated an EXPLICIT `agent` field on a `user_message`. Resuming a
+/// stored session — a `session_id` naming a past session, with no `agent`
+/// field (or one that already matches, per the identity guard) on that turn —
+/// adopted the session's stored agent straight from `SessionManager` with no
+/// re-check at all: a user unbound from a non-default agent could keep
+/// talking to it forever through an old session id, because the 60s
+/// `ACL_CACHE_TTL` staleness bound wave one relies on was never consulted on
+/// this path.
+///
+/// This predicate answers "does resuming into `stored_agent` need the same
+/// `agent_access_allowed` check wave one already applies to explicit
+/// selection?" Session storage has no "the user explicitly chose this agent"
+/// flag, so the criterion is the best available proxy: `stored_agent !=
+/// default_agent`. The main/default-agent resume path (`stored_agent ==
+/// default_agent`) is wave one's byte-compatible scope and MUST stay
+/// ungated here — widening the check to the default agent is explicitly out
+/// of scope for this fix.
+fn resume_needs_acl_check(stored_agent: &str, default_agent: &str) -> bool {
+    stored_agent != default_agent
+}
+
+/// Load `user_id`'s role + full agent-binding set from the auth DB — the one
+/// DB round-trip `WebChatState::agent_access_allowed` performs on a cache
+/// miss.
+fn load_acl_snapshot(user_db: &UserDb, user_id: &str) -> Result<AclSnapshot, String> {
+    let user = user_db
+        .get_user(user_id)?
+        .ok_or_else(|| "user not found".to_string())?;
+    let bindings = user_db.get_user_agents(user_id)?;
+    Ok(AclSnapshot {
+        role: user.role,
+        bound_agents: bindings.into_iter().map(|b| b.agent_name).collect(),
+    })
+}
+
 /// Shared state for WebChat connections.
 pub struct WebChatState {
     pub ctx: Arc<ReplyContext>,
@@ -186,6 +288,10 @@ pub struct WebChatState {
     user_db: Arc<UserDb>,
     /// Track active connections per user_id.
     connections: tokio::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// C-ACL (P0-S1): per-user role+bindings snapshot cache, keyed by
+    /// authenticated user id. Populated lazily on the first explicit-agent
+    /// selection and refreshed after `ACL_CACHE_TTL`.
+    acl_cache: tokio::sync::Mutex<std::collections::HashMap<String, (AclSnapshot, std::time::Instant)>>,
 }
 
 impl WebChatState {
@@ -195,18 +301,57 @@ impl WebChatState {
             jwt_config,
             user_db,
             connections: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            acl_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     /// Verify a JWT and confirm the user is active. Returns the user id.
-    fn authenticate(&self, token: &str) -> Result<String, String> {
+    /// Returns `(auth_user, must_change_password)`. The bool rides along
+    /// exactly like `UserContext::must_change_password` on the dashboard WS
+    /// path (`server.rs::jwt_account_gate`) — the handshake succeeds for
+    /// any Active account, flagged or not; the caller (the socket loop)
+    /// restricts a flagged connection to a guidance-only reply instead of
+    /// refusing to connect at all. A widget-mode visitor never carries this
+    /// flag (there is no account to force a password change on).
+    fn authenticate(&self, token: &str) -> Result<(String, bool), String> {
         // WP1.3/1.8 (ecosystem): public-widget visitor mode — site-embedded
         // chat for anonymous visitors (WordPress widget, website demo).
         // Default OFF; every failure path denies. JWT path is untouched.
         if let Some(presented) = token.strip_prefix("widget:") {
-            return widget_authenticate(&self.ctx.home_dir, presented);
+            return widget_authenticate(&self.ctx.home_dir, presented).map(|id| (id, false));
         }
         authenticate_with(&self.jwt_config, &self.user_db, token)
+    }
+
+    /// C-ACL (P0-S1): may `user_id` address `agent_name` by name in a
+    /// `user_message`? Reads the short-TTL `acl_cache` first so a chatty
+    /// conversation doesn't hit sqlite on every turn; a miss (or expiry)
+    /// re-queries `UserDb` directly and refreshes the cache entry on success.
+    /// A failed lookup is logged and denies (fail-closed) without touching
+    /// the cache — a transient DB hiccup should not poison a good decision
+    /// for `ACL_CACHE_TTL`, and should not cache a bad one either.
+    async fn agent_access_allowed(&self, user_id: &str, agent_name: &str) -> bool {
+        let now = std::time::Instant::now();
+        {
+            let cache = self.acl_cache.lock().await;
+            if let Some((snapshot, at)) = cache.get(user_id) {
+                if now.duration_since(*at) < ACL_CACHE_TTL {
+                    return acl_allows_agent(snapshot, agent_name);
+                }
+            }
+        }
+        let lookup = load_acl_snapshot(&self.user_db, user_id);
+        let allowed = resolve_agent_acl(&lookup, agent_name);
+        match lookup {
+            Ok(snapshot) => {
+                let mut cache = self.acl_cache.lock().await;
+                cache.insert(user_id.to_string(), (snapshot, now));
+            }
+            Err(e) => {
+                warn!(user_id, agent = %agent_name, "WebChat ACL lookup failed — denying agent selection: {e}");
+            }
+        }
+        allowed
     }
 
     async fn acquire_connection(&self, user_id: &str) -> bool {
@@ -397,7 +542,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
             Ok(u) => u,
             Err(e) => {
                 warn!("WebChat auth failed from {peer_ip}: {e}");
-                let err = ChatMessage::Error { message: format!("authentication failed: {e}") };
+                let err = ChatMessage::error(format!("authentication failed: {e}"));
                 if let Ok(json) = serde_json::to_string(&err) {
                     let _ = sink.send(Message::Text(json.into())).await;
                 }
@@ -498,9 +643,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                         let chat_msg: ChatMessage = match serde_json::from_str(&text) {
                             Ok(m) => m,
                             Err(e) => {
-                                let err = ChatMessage::Error {
-                                    message: format!("Invalid message format: {e}"),
-                                };
+                                let err = ChatMessage::error(format!("Invalid message format: {e}"));
                                 if let Ok(json) = serde_json::to_string(&err) {
                                     let _ = sink.send(Message::Text(json.into())).await;
                                 }
@@ -531,17 +674,43 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             let reg = state.ctx.registry.read().await;
                                             reg.get(name).is_some()
                                         };
-                                        if exists {
-                                            Some(name.to_string())
-                                        } else {
-                                            let err = ChatMessage::Error {
-                                                message: format!("unknown agent: {name}"),
-                                            };
+                                        if !exists {
+                                            let err = ChatMessage::error(format!("unknown agent: {name}"));
                                             if let Ok(json) = serde_json::to_string(&err) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
                                             }
                                             continue;
                                         }
+                                        // ── C-ACL (P0-S1, 2026-08 audit): explicit
+                                        // agent selection was previously gated on
+                                        // NOTHING beyond "does this agent exist" —
+                                        // any logged-in user (employee, manager)
+                                        // could address any agent by name. Admins
+                                        // pass unconditionally; everyone else must
+                                        // hold a binding (any access level — see
+                                        // `acl_allows_agent`). Checked per-message
+                                        // (every `user_message` frame re-resolves
+                                        // it), which is also what bounds the
+                                        // "unbind but JWT keeps stale
+                                        // access_levels" staleness window to
+                                        // `ACL_CACHE_TTL` instead of the JWT's full
+                                        // lifetime. The default (no `agent` field)
+                                        // path below is untouched — out of scope.
+                                        if !state.agent_access_allowed(&auth_user, name).await {
+                                            warn!(
+                                                user = %auth_user, agent = %name,
+                                                "WebChat agent selection denied: not admin and not bound"
+                                            );
+                                            let err = ChatMessage::error_coded(
+                                                "你沒有與此 AI 員工對話的權限，請聯絡管理員",
+                                                "agent_forbidden",
+                                            );
+                                            if let Ok(json) = serde_json::to_string(&err) {
+                                                let _ = sink.send(Message::Text(json.into())).await;
+                                            }
+                                            continue;
+                                        }
+                                        Some(name.to_string())
                                     }
                                     None => None,
                                 };
@@ -608,9 +777,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         warn!(
                                             "WebChat resume denied: session {want} not owned by this user"
                                         );
-                                        let err = ChatMessage::Error {
-                                            message: "conversation not found".to_string(),
-                                        };
+                                        let err = ChatMessage::error("conversation not found");
                                         if let Ok(json) = serde_json::to_string(&err) {
                                             let _ = sink.send(Message::Text(json.into())).await;
                                         }
@@ -623,9 +790,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             // the resumed session.
                                             if let Some(a) = &requested_agent {
                                                 if a != &stored_agent {
-                                                    let err = ChatMessage::Error {
-                                                        message: "this conversation belongs to a different AI staff member".to_string(),
-                                                    };
+                                                    let err = ChatMessage::error(
+                                                        "this conversation belongs to a different AI staff member",
+                                                    );
                                                     if let Ok(json) = serde_json::to_string(&err) {
                                                         let _ = sink.send(Message::Text(json.into())).await;
                                                     }
@@ -644,9 +811,41 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                                     reg.get(&stored_agent).is_some()
                                                 };
                                                 if !loaded {
-                                                    let err = ChatMessage::Error {
-                                                        message: "the AI staff member for this conversation is no longer available".to_string(),
-                                                    };
+                                                    let err = ChatMessage::error(
+                                                        "the AI staff member for this conversation is no longer available",
+                                                    );
+                                                    if let Ok(json) = serde_json::to_string(&err) {
+                                                        let _ = sink.send(Message::Text(json.into())).await;
+                                                    }
+                                                    continue;
+                                                }
+                                                // ── C-ACL resume gap (P0-S2, 2026-08
+                                                // audit follow-up): wave one only
+                                                // gated an EXPLICIT `agent` field —
+                                                // adopting a stored session's
+                                                // non-default agent on resume never
+                                                // ran `agent_access_allowed` at all,
+                                                // so a since-unbound user could keep
+                                                // talking to it forever through an
+                                                // old session id. Re-run the same
+                                                // fail-closed, 60s-cached check here
+                                                // (`resume_needs_acl_check` scopes it
+                                                // to non-default agents only — the
+                                                // default/main agent branch above is
+                                                // untouched, matching wave one).
+                                                if resume_needs_acl_check(&stored_agent, &agent_id)
+                                                    && !state
+                                                        .agent_access_allowed(&auth_user, &stored_agent)
+                                                        .await
+                                                {
+                                                    warn!(
+                                                        user = %auth_user, agent = %stored_agent,
+                                                        "WebChat resume denied: agent binding revoked since session was stored"
+                                                    );
+                                                    let err = ChatMessage::error_coded(
+                                                        "你沒有與此 AI 員工對話的權限，請聯絡管理員",
+                                                        "agent_forbidden",
+                                                    );
                                                     if let Ok(json) = serde_json::to_string(&err) {
                                                         let _ = sink.send(Message::Text(json.into())).await;
                                                     }
@@ -673,9 +872,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             announced_agent = effective_agent.clone();
                                         }
                                         Ok(None) => {
-                                            let err = ChatMessage::Error {
-                                                message: "conversation not found".to_string(),
-                                            };
+                                            let err = ChatMessage::error("conversation not found");
                                             if let Ok(json) = serde_json::to_string(&err) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
                                             }
@@ -683,9 +880,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         }
                                         Err(e) => {
                                             warn!("WebChat resume lookup failed: {e}");
-                                            let err = ChatMessage::Error {
-                                                message: "failed to load conversation".to_string(),
-                                            };
+                                            let err = ChatMessage::error("failed to load conversation");
                                             if let Ok(json) = serde_json::to_string(&err) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
                                             }
@@ -928,9 +1123,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                             }
                             _ => {
                                 // Client sent an unexpected message type
-                                let err = ChatMessage::Error {
-                                    message: "Only user_message is accepted from client".to_string(),
-                                };
+                                let err = ChatMessage::error("Only user_message is accepted from client");
                                 if let Ok(json) = serde_json::to_string(&err) {
                                     let _ = sink.send(Message::Text(json.into())).await;
                                 }
@@ -1490,5 +1683,196 @@ mod tests {
 
         let result = authenticate_with(&jwt, &db, &token);
         assert!(result.is_err(), "suspended user must be rejected");
+    }
+
+    // ── C-ACL (P0-S1, 2026-08 audit): explicit-agent selection ACL ─────────
+    //
+    // These target the pure decision layer (`acl_allows_agent` /
+    // `resolve_agent_acl` / `load_acl_snapshot`) rather than the socket loop
+    // itself, per the same rationale as `authenticate_with` above: no live
+    // WebSocket needed to exercise the actual security decision.
+
+    fn snapshot(role: UserRole, bound: &[&str]) -> AclSnapshot {
+        AclSnapshot {
+            role,
+            bound_agents: bound.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn acl_denies_non_admin_without_a_binding() {
+        let snap = snapshot(UserRole::Employee, &["sales-bot"]);
+        assert!(!acl_allows_agent(&snap, "other-agent"));
+    }
+
+    #[test]
+    fn acl_allows_non_admin_with_a_binding() {
+        let snap = snapshot(UserRole::Employee, &["sales-bot"]);
+        assert!(acl_allows_agent(&snap, "sales-bot"));
+    }
+
+    #[test]
+    fn acl_allows_admin_regardless_of_bindings() {
+        let snap = snapshot(UserRole::Admin, &[]);
+        assert!(acl_allows_agent(&snap, "any-agent"));
+    }
+
+    #[test]
+    fn acl_manager_is_not_admin_and_still_needs_a_binding() {
+        // Manager sits below Admin in `UserRole::level()` — same rule as
+        // Employee applies; only Admin is unconditional.
+        let snap = snapshot(UserRole::Manager, &["ops-bot"]);
+        assert!(acl_allows_agent(&snap, "ops-bot"));
+        assert!(!acl_allows_agent(&snap, "finance-bot"));
+    }
+
+    // ── C-ACL resume gap (P0-S2, 2026-08 audit follow-up) ──────────────────
+    //
+    // Wave one (`acl_allows_agent`) only gated an EXPLICIT `agent` field on a
+    // `user_message`; resuming a stored session adopted its stored agent
+    // straight from `SessionManager` with no re-check. These tests target
+    // the extracted pure criterion (`resume_needs_acl_check`) and compose it
+    // with the already-covered `acl_allows_agent` predicate to document the
+    // exact resume-turn decision the socket loop now makes — the socket loop
+    // itself is not exercised (same rationale as the P0-S1 section above).
+
+    #[test]
+    fn resume_needs_check_denies_when_binding_was_revoked() {
+        // Session was stored while the user was bound to "sales-bot"; the
+        // binding has since been removed (`bound` no longer contains it).
+        let snap = snapshot(UserRole::Employee, &["other-bot"]);
+        let default_agent = "main-agent";
+        let stored_agent = "sales-bot";
+
+        assert!(resume_needs_acl_check(stored_agent, default_agent));
+        assert!(
+            !acl_allows_agent(&snap, stored_agent),
+            "resume must deny once the binding is gone"
+        );
+    }
+
+    #[test]
+    fn resume_needs_check_allows_when_still_bound() {
+        let snap = snapshot(UserRole::Employee, &["sales-bot"]);
+        let default_agent = "main-agent";
+        let stored_agent = "sales-bot";
+
+        assert!(resume_needs_acl_check(stored_agent, default_agent));
+        assert!(
+            acl_allows_agent(&snap, stored_agent),
+            "resume must pass while the binding still holds"
+        );
+    }
+
+    #[test]
+    fn resume_needs_check_allows_admin_regardless_of_bindings() {
+        let snap = snapshot(UserRole::Admin, &[]);
+        let default_agent = "main-agent";
+        let stored_agent = "sales-bot";
+
+        assert!(resume_needs_acl_check(stored_agent, default_agent));
+        assert!(
+            acl_allows_agent(&snap, stored_agent),
+            "admin must resume into any stored agent unconditionally"
+        );
+    }
+
+    #[test]
+    fn resume_needs_check_is_false_for_the_default_agent_session() {
+        // The main/default-agent resume path is wave one's byte-compatible
+        // scope and must never be gated here, even for a user with zero
+        // bindings — this is the "default agent path unaffected" guarantee.
+        let default_agent = "main-agent";
+        assert!(!resume_needs_acl_check(default_agent, default_agent));
+
+        // Sanity: a snapshot that would deny every non-default agent must
+        // still be irrelevant to the default-agent branch, since the gate
+        // short-circuits on `resume_needs_acl_check` before ever consulting
+        // the ACL snapshot (mirrors the `if resume_needs_acl_check(..) &&
+        // !agent_access_allowed(..)` short-circuit at the real call site).
+        let snap = snapshot(UserRole::Employee, &[]);
+        assert!(
+            !resume_needs_acl_check(default_agent, default_agent) || acl_allows_agent(&snap, default_agent),
+            "default agent session must resume regardless of ACL state"
+        );
+    }
+
+    #[test]
+    fn resume_needs_check_is_symmetric_on_agent_identity_not_string_shape() {
+        // Different agent ids, even ones that share a default-agent-like
+        // name pattern, must still be recognised as non-default (exact
+        // string equality — no prefix/substring shortcut).
+        assert!(resume_needs_acl_check("main-agent-2", "main-agent"));
+        assert!(!resume_needs_acl_check("main-agent", "main-agent"));
+    }
+
+    #[test]
+    fn resolve_agent_acl_denies_on_lookup_failure() {
+        // Fail-closed: a DB error / unreachable auth service must deny, never
+        // fall through to "allow".
+        let lookup: Result<AclSnapshot, String> = Err("auth service unavailable".to_string());
+        assert!(!resolve_agent_acl(&lookup, "any-agent"));
+    }
+
+    #[test]
+    fn resolve_agent_acl_matches_acl_allows_agent_on_success() {
+        let lookup: Result<AclSnapshot, String> = Ok(snapshot(UserRole::Employee, &["sales-bot"]));
+        assert!(resolve_agent_acl(&lookup, "sales-bot"));
+        assert!(!resolve_agent_acl(&lookup, "other-agent"));
+    }
+
+    #[test]
+    fn load_acl_snapshot_fails_closed_for_unknown_user() {
+        let (_jwt, db, _dir) = fixtures();
+        // Mirrors a widget-visitor id or a user deleted mid-session — neither
+        // is a row `get_user` can find, and that must deny rather than
+        // silently defaulting to some permissive shape.
+        let result = load_acl_snapshot(&db, "no-such-user-id");
+        assert!(result.is_err(), "an unknown user id must fail closed");
+    }
+
+    #[test]
+    fn load_acl_snapshot_reflects_role_and_bindings() {
+        let (_jwt, db, _dir) = fixtures();
+        let user = db
+            .create_user("carol@example.com", "Carol", "pw-strong-123", UserRole::Employee)
+            .expect("create user");
+        db.bind_agent(&user.id, "sales-bot", AccessLevel::Viewer)
+            .expect("bind agent");
+
+        let snap = load_acl_snapshot(&db, &user.id).expect("lookup should succeed");
+        assert_eq!(snap.role, UserRole::Employee);
+        assert!(snap.bound_agents.contains("sales-bot"));
+        assert!(!snap.bound_agents.contains("other-bot"));
+    }
+
+    #[test]
+    fn load_acl_snapshot_admin_role_is_carried_through() {
+        let (_jwt, db, _dir) = fixtures();
+        let admin = db
+            .create_user("dana@example.com", "Dana", "pw-strong-123", UserRole::Admin)
+            .expect("create user");
+
+        let snap = load_acl_snapshot(&db, &admin.id).expect("lookup should succeed");
+        assert_eq!(snap.role, UserRole::Admin);
+        // Admin needs no bindings — `acl_allows_agent` short-circuits on role.
+        assert!(acl_allows_agent(&snap, "literally-any-agent"));
+    }
+
+    // ── ChatMessage::Error `code` field (P0-S1 wire-format addition) ───────
+
+    #[test]
+    fn error_helper_omits_code_on_the_wire() {
+        let msg = ChatMessage::error("plain error");
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains(r#""message":"plain error""#));
+        assert!(!json.contains("\"code\""), "absent code must not serialize: {json}");
+    }
+
+    #[test]
+    fn error_coded_helper_carries_code_on_the_wire() {
+        let msg = ChatMessage::error_coded("你沒有與此 AI 員工對話的權限，請聯絡管理員", "agent_forbidden");
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains(r#""code":"agent_forbidden""#), "{json}");
     }
 }
