@@ -97,7 +97,7 @@ function UpdateBanner() {
         {intl.formatMessage({ id: 'update.notification' }, { version: notification.latest_version })}
       </span>
       <button
-        onClick={() => navigate('/manage/updates')}
+        onClick={() => navigate('/app/system/updates')}
         className="ml-auto whitespace-nowrap rounded-md bg-warning px-2 py-0.5 text-xs font-medium text-white transition-colors hover:bg-warning/90"
       >
         {intl.formatMessage({ id: 'update.viewDetails' })}

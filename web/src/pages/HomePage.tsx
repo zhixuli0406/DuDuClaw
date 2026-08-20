@@ -34,6 +34,7 @@ import {
   LayoutGrid,
   ArrowUp,
   ArrowDown,
+  ArrowRight,
   EyeOff as EyeOffIcon,
   GripVertical,
   MoreVertical,
@@ -42,6 +43,7 @@ import {
   Check,
   X,
   Eye,
+  Bot,
 } from 'lucide-react';
 import { hasMinRole } from '@/lib/roles';
 
@@ -406,6 +408,31 @@ export function HomePage() {
           {intl.formatDate(new Date(), { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
         </p>
       </div>
+
+      {/* O-2 (`DESIGN-agent-os-native-apps-2026-08.md` §6.3): remote/desktop
+          installs keep this dashboard as the default landing page (only the
+          appliance image redirects straight to `/console`, see `App.tsx`'s
+          `HomeLanding`) — but every install still gets a one-click door into
+          the conversational console, per §6.2 "遠端管理維持既有首頁，但也提供
+          進主控台的入口". Hidden in view-as mode, same rule as the two blocks
+          below: this reads as the VIEWER's own action, not the impersonated
+          user's. */}
+      {!viewing && (
+        <button
+          type="button"
+          onClick={() => navigate('/console')}
+          className="flex w-full items-center justify-between gap-3 rounded-xl border border-brand/30 bg-brand/5 px-4 py-3 text-left transition-colors hover:bg-brand/10"
+        >
+          <span className="flex min-w-0 items-center gap-2 text-sm text-foreground">
+            <Bot className="size-4 shrink-0 text-brand" aria-hidden="true" />
+            <span className="truncate">{intl.formatMessage({ id: 'home.console.cta' })}</span>
+          </span>
+          <span className="flex shrink-0 items-center gap-1 text-xs font-medium text-brand">
+            {intl.formatMessage({ id: 'home.console.ctaHint' })}
+            <ArrowRight className="size-3.5" aria-hidden="true" />
+          </span>
+        </button>
+      )}
 
       {/* Overview-first fixed section (W2-1, 憲章 8) — hidden in view-as
           mode: both read the current VIEWER's own pending items / activity,

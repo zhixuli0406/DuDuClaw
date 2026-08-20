@@ -41,6 +41,8 @@ members = [
     "crates/duduclaw-os",
     "crates/duduclaw-pets",
     "crates/duduclaw-docuseal-mcp",
+    "crates/duduclaw-relay",
+    "crates/duduclaw-sysd",
 ]
 
 [workspace.package]
@@ -136,3 +138,8 @@ duduclaw-llm = { path = "crates/duduclaw-llm" }
 duduclaw-sandbox = { path = "crates/duduclaw-sandbox" }
 duduclaw-os = { path = "crates/duduclaw-os" }
 duduclaw-pets = { path = "crates/duduclaw-pets", default-features = false }
+# WP-E2: gateway-side relay client integration tests spin up the real relay
+# router (crates/duduclaw-relay) on an ephemeral port rather than
+# re-implementing a mock — see duduclaw-gateway's [dev-dependencies].
+duduclaw-relay = { path = "crates/duduclaw-relay" }
+duduclaw-sysd = { path = "crates/duduclaw-sysd" }

@@ -140,6 +140,17 @@ pub enum ChatMessage {
         /// the backend didn't report one (chat commands, local inference).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// O-4→O-3: a structured chat-artifact (see
+        /// `web/src/components/console/artifact-types.ts`'s `ChatArtifact`)
+        /// derived from an O-4 `<system_operator_pending>` marker on this
+        /// reply — e.g. a `confirm_action` card for a pending restart/
+        /// shutdown/factory-reset. `None` for the overwhelming majority of
+        /// replies (anything that never went through O-4's pending-op path).
+        /// The raw marker tag is ALWAYS stripped from `content` before this
+        /// frame is built, regardless of whether this field is populated —
+        /// see `channel_reply::build_reply_with_session_with_artifact`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<serde_json::Value>,
     },
     /// Server → Client: error occurred.
     #[serde(rename = "error")]
@@ -940,6 +951,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                             tokens_used: 0,
                                             conv: conv_nonce.clone(),
                                             model: None,
+                                            // Chat commands (`/xxx`) never go through
+                                            // `build_reply_*` / O-4 at all — no marker
+                                            // can exist on this path.
+                                            artifact: None,
                                         };
                                         if let Ok(json) = serde_json::to_string(&done) {
                                             let _ = sink.send(Message::Text(json.into())).await;
@@ -965,16 +980,22 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 // resolved, else the default-agent path. Both
                                 // branches consume `on_progress`; they are
                                 // mutually exclusive so the single move is valid.
+                                // O-4→O-3: the `_with_artifact` siblings return the
+                                // same stripped text as `build_reply_for_agent` /
+                                // `build_reply_with_session`, plus any O-4 pending-op
+                                // marker mapped to an O-3 chat-artifact. WebChat is
+                                // the only caller that reads the second half — see
+                                // `channel_reply::build_reply_with_session_with_artifact`.
                                 let work = async {
                                     match &effective_agent {
                                         Some(a) => {
-                                            crate::channel_reply::build_reply_for_agent(
+                                            crate::channel_reply::build_reply_for_agent_with_artifact(
                                                 &full_content, &state.ctx, a, sid, &user_id, Some(on_progress),
                                             )
                                             .await
                                         }
                                         None => {
-                                            crate::channel_reply::build_reply_with_session(
+                                            crate::channel_reply::build_reply_with_session_with_artifact(
                                                 &full_content, &state.ctx, sid, &user_id, Some(on_progress),
                                             )
                                             .await
@@ -1025,6 +1046,11 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         }
                                     }
                                 };
+                                // O-4→O-3: split off the artifact half early — every
+                                // transformation below (📎DELIVER parsing, cli-noise,
+                                // branding, etc.) only ever operates on the text; the
+                                // artifact rides along untouched to the final frame.
+                                let (reply, operator_artifact) = reply;
 
                                 // WP1.3 + live-verification fix (2026-08-15):
                                 // 📎DELIVER: handling. WebChat has no in-band
@@ -1114,6 +1140,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     tokens_used: tokens,
                                     conv: conv_nonce.clone(),
                                     model: actual_model,
+                                    artifact: operator_artifact,
                                 };
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     if sink.send(Message::Text(json.into())).await.is_err() {
@@ -1559,6 +1586,7 @@ mod tests {
             tokens_used: 3,
             conv: Some("c-42".into()),
             model: Some("claude-sonnet-4-6".into()),
+            artifact: None,
         };
         let json = serde_json::to_string(&with).expect("serialize");
         assert!(json.contains(r#""conv":"c-42""#), "conv must be on the wire: {json}");
@@ -1573,10 +1601,41 @@ mod tests {
             tokens_used: 3,
             conv: None,
             model: None,
+            artifact: None,
         };
         let json = serde_json::to_string(&without).expect("serialize");
         assert!(!json.contains("conv"), "absent conv must not serialize: {json}");
         assert!(!json.contains("model"), "absent model must not serialize: {json}");
+        assert!(!json.contains("artifact"), "absent artifact must not serialize: {json}");
+    }
+
+    #[test]
+    fn assistant_done_carries_artifact_when_o4_marker_maps_to_one() {
+        // O-4→O-3: when `channel_reply::build_reply_*_with_artifact` maps a
+        // pending-op marker to an O-3 chat-artifact, it rides the wire as a
+        // plain JSON value on this frame — no new envelope, no separate frame.
+        let artifact = serde_json::json!({
+            "type": "confirm_action",
+            "payload": { "action": "restart" },
+        });
+        let done = ChatMessage::AssistantDone {
+            content: "「電源操作（重開機／關機）」會變更這台機器的狀態，請先確認：要執行嗎？".into(),
+            tokens_used: 12,
+            conv: None,
+            model: None,
+            artifact: Some(artifact.clone()),
+        };
+        let json = serde_json::to_string(&done).expect("serialize");
+        assert!(
+            json.contains(r#""artifact":{"payload":{"action":"restart"},"type":"confirm_action"}"#)
+                || json.contains(r#""artifact":{"type":"confirm_action","payload":{"action":"restart"}}"#),
+            "artifact must serialize as a plain JSON value on the wire: {json}"
+        );
+        // The tag itself must never appear on the wire — only WebChat's own
+        // `strip_operator_pending_marker` call guarantees that in production,
+        // but this test locks the frame's own contract: `content` here is
+        // already-stripped human text, exactly what production sends.
+        assert!(!json.contains("system_operator_pending"));
     }
 
     #[test]

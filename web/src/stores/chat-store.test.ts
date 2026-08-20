@@ -4,6 +4,7 @@ import {
   frameBelongsToConversation,
   historyToMessages,
   isResumeNotFound,
+  parseChatArtifact,
   sessionIdAfterHello,
   useChatStore,
 } from './chat-store';
@@ -104,6 +105,60 @@ describe('historyToMessages (WP3 resume)', () => {
     expect(m.role).toBe('user');
     expect(m.timestamp).toBeGreaterThanOrEqual(before);
   });
+
+  // Task B: the gateway's `chat_history_row_content_and_artifact` (handlers.rs)
+  // replays the same O-4 marker strip+map on resume that the live socket path
+  // applies, so a resumed conversation reconstructs its confirmation card
+  // instead of losing it. These cases mirror that backend contract on the
+  // wire-decoding side.
+  it('reconstructs a ChatMessage.artifact from a valid history artifact field', () => {
+    const [m] = historyToMessages([
+      {
+        role: 'assistant',
+        content: '「重新開機」會變更這台機器的狀態，請先確認：要執行嗎？',
+        timestamp: '2026-08-18T00:00:00Z',
+        artifact: { type: 'confirm_action', payload: { action: 'restart' } },
+      },
+    ]);
+    expect(m.artifact).toEqual({ type: 'confirm_action', payload: { action: 'restart' } });
+  });
+
+  it('omits artifact when the history row carries none', () => {
+    const [m] = historyToMessages([
+      { role: 'assistant', content: '訂單已出貨', timestamp: '2026-08-18T00:00:00Z' },
+    ]);
+    expect('artifact' in m).toBe(false);
+  });
+
+  it('drops a malformed/unknown artifact via parseChatArtifact instead of rendering garbage', () => {
+    const [unknownType, missingPayload, notAnObject] = historyToMessages([
+      {
+        role: 'assistant',
+        content: 'a',
+        timestamp: '2026-08-18T00:00:00Z',
+        artifact: { type: 'something_new', payload: {} },
+      },
+      { role: 'assistant', content: 'b', timestamp: '2026-08-18T00:00:00Z', artifact: { type: 'confirm_action' } },
+      { role: 'assistant', content: 'c', timestamp: '2026-08-18T00:00:00Z', artifact: 'confirm_action' },
+    ]);
+    expect('artifact' in unknownType).toBe(false);
+    expect('artifact' in missingPayload).toBe(false);
+    expect('artifact' in notAnObject).toBe(false);
+  });
+
+  it('never attaches an artifact to a non-assistant row, even if the wire carries one', () => {
+    // Defence in depth: the backend only ever emits `artifact` on assistant
+    // rows, but the frontend guard must not trust that blindly.
+    const [m] = historyToMessages([
+      {
+        role: 'user',
+        content: '使用者訊息',
+        timestamp: '2026-08-18T00:00:00Z',
+        artifact: { type: 'confirm_action', payload: { action: 'restart' } },
+      },
+    ]);
+    expect('artifact' in m).toBe(false);
+  });
 });
 
 describe('isResumeNotFound (WP3 resume miss)', () => {
@@ -137,6 +192,48 @@ describe('frameBelongsToConversation (misrouted-reply attribution guard)', () =>
     expect(frameBelongsToConversation(null, 'c-2')).toBe(true);
     expect(frameBelongsToConversation('', 'c-2')).toBe(true);
     expect(frameBelongsToConversation(123, 'c-2')).toBe(true);
+  });
+});
+
+describe('parseChatArtifact (O-4→O-3 wire validation)', () => {
+  it('accepts a well-formed confirm_action payload (the real O-4 producer today)', () => {
+    const artifact = parseChatArtifact({ type: 'confirm_action', payload: { action: 'restart' } });
+    expect(artifact).toEqual({ type: 'confirm_action', payload: { action: 'restart' } });
+  });
+
+  it('accepts every other known artifact type with a minimal object payload', () => {
+    for (const type of [
+      'device_status',
+      'update_status',
+      'backup_result',
+      'network_info',
+      'update_confirm',
+      'approval_request',
+    ]) {
+      expect(parseChatArtifact({ type, payload: {} })).toEqual({ type, payload: {} });
+    }
+  });
+
+  it('rejects an unknown type without throwing', () => {
+    expect(parseChatArtifact({ type: 'something_new', payload: { action: 'restart' } })).toBeUndefined();
+  });
+
+  it('rejects a missing/null/non-object payload without throwing', () => {
+    expect(parseChatArtifact({ type: 'confirm_action' })).toBeUndefined();
+    expect(parseChatArtifact({ type: 'confirm_action', payload: null })).toBeUndefined();
+    expect(parseChatArtifact({ type: 'confirm_action', payload: 'restart' })).toBeUndefined();
+  });
+
+  it('rejects non-object / primitive / null input without throwing', () => {
+    expect(parseChatArtifact(undefined)).toBeUndefined();
+    expect(parseChatArtifact(null)).toBeUndefined();
+    expect(parseChatArtifact('confirm_action')).toBeUndefined();
+    expect(parseChatArtifact(42)).toBeUndefined();
+    expect(parseChatArtifact([])).toBeUndefined();
+  });
+
+  it('rejects a payload with a non-string type field', () => {
+    expect(parseChatArtifact({ type: 123, payload: {} })).toBeUndefined();
   });
 });
 

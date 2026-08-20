@@ -938,7 +938,7 @@ export function WelcomePage() {
                     )}
                   </p>
                   <div>
-                    <Button variant="outline" onClick={() => navigate('/license')}>
+                    <Button variant="outline" onClick={() => navigate('/app/system/license')}>
                       {intl.formatMessage({ id: 'welcome.industry.lockedCta' })}
                     </Button>
                   </div>

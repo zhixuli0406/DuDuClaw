@@ -45,6 +45,18 @@ describe('nav-visibility (dashboard-redesign WP11-T11.1)', () => {
     expect(isVisible(org, 'admin', true, { agentCount: 1 })).toBe(false);
   });
 
+  // WP-C (2026-08) — `/device`'s progressive-disclosure gate: hidden unless a
+  // `device.status` probe confirms the running gateway IS the appliance image.
+  it('requiresData "appliance" fails closed without a confirmed probe, on every edition', () => {
+    const device: Gated = { requiresData: 'appliance' };
+    expect(isVisible(device, 'admin', false)).toBe(false); // no ctx at all
+    expect(isVisible(device, 'admin', false, { isAppliance: false })).toBe(false);
+    expect(isVisible(device, 'admin', false, { isAppliance: true })).toBe(true);
+    // Personal is gated by the same probe, not by edition.
+    expect(isVisible(device, 'admin', true, { isAppliance: true })).toBe(true);
+    expect(isVisible(device, 'admin', true, { isAppliance: false })).toBe(false);
+  });
+
   it('filterVisible applies every gate together', () => {
     const items: Gated[] = [
       { minRole: 'admin' },

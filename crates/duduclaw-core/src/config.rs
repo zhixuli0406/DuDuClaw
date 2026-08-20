@@ -152,12 +152,20 @@ pub fn read_gateway_raw_settings(home: &Path) -> (Option<String>, Option<i64>) {
 
 /// Convenience wrapper: resolve the effective gateway bind address for
 /// `home`, reading `DUDUCLAW_BIND` and `<home>/config.toml [gateway] bind`.
-/// Default is `127.0.0.1`, matching [`write_minimal_config`]'s advertised
-/// loopback-first posture.
+/// Default is `127.0.0.1` (loopback-first posture) UNLESS this process is
+/// running in appliance mode (`DUDUCLAW_APPLIANCE=1` — see
+/// `crate::appliance`), in which case the default is `0.0.0.0`. This only
+/// changes what "nothing set" resolves to — an explicit `DUDUCLAW_BIND` env
+/// var or `config.toml [gateway] bind` always wins regardless of appliance
+/// mode, per `resolve_gateway_bind`'s priority order.
 pub fn gateway_bind_for_home(home: &Path) -> (String, GatewaySettingSource) {
     let (config_bind, _) = read_gateway_raw_settings(home);
     let env_bind = std::env::var("DUDUCLAW_BIND").ok();
-    resolve_gateway_bind(env_bind.as_deref(), config_bind.as_deref(), "127.0.0.1")
+    resolve_gateway_bind(
+        env_bind.as_deref(),
+        config_bind.as_deref(),
+        crate::appliance::appliance_default_bind(),
+    )
 }
 
 /// Convenience wrapper: resolve the effective gateway port for `home`,

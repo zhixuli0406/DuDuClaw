@@ -293,10 +293,11 @@ export function DistributorsPage() {
         <div className="space-y-4">
           {/* Scope disclaimer (UX audit §2-10) — this tab issues real, verifiable
               licenses; it is not the sales/commission tracker (that's the
-              Partner tab, /manage/license?tab=partner). Shown regardless of
-              issuer/loading state so the distinction is clear up front.
-              X03 (§3.3): the cross-reference used to be plain, unclickable
-              text — now a real CrossLink over to the Partner tab. */}
+              Partner tab, /app/system/license?tab=partner — relocated by N-3,
+              2026-08). Shown regardless of issuer/loading state so the
+              distinction is clear up front. X03 (§3.3): the cross-reference
+              used to be plain, unclickable text — now a real CrossLink over
+              to the Partner tab. */}
           <div className="flex flex-wrap items-start justify-between gap-2 rounded-lg border border-info/30 bg-info/10 px-3 py-2 text-xs text-foreground">
             <div className="flex items-start gap-2">
               <Info className="mt-0.5 h-4 w-4 shrink-0 text-info" />
@@ -304,7 +305,7 @@ export function DistributorsPage() {
             </div>
             <CrossLink
               label={intl.formatMessage({ id: 'crosslink.distributor.toPartner' })}
-              onClick={() => navigate('/manage/license?tab=partner')}
+              onClick={() => navigate('/app/system/license?tab=partner')}
             />
           </div>
 

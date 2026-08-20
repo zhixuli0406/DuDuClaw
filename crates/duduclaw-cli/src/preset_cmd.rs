@@ -234,59 +234,64 @@ pub fn cmd_preset_status(agent: &str) -> Result<()> {
     Ok(())
 }
 
-/// `duduclaw preset install-builtin [--force]` — copy the built-in
-/// department-kit presets (converted from `_departments/<kit>/agent.toml`,
-/// design §4.2 Step A) from the premium templates tree into
-/// `~/.duduclaw/presets/`. Gated by the same `premium_templates` license
-/// feature the source kits already require — no new gate is introduced.
+/// `duduclaw preset install-builtin [--force]` — install every built-in
+/// preset this build knows about into `~/.duduclaw/presets/`:
+///
+/// 1. The one **free** preset (`system-operator`, P2) — compiled into the
+///    binary from the public `templates/presets/system-operator/` tree, no
+///    license check, no `commercial/` checkout required. Always attempted.
+/// 2. The **premium** department-kit presets (converted from
+///    `_departments/<kit>/agent.toml`, design §4.2 Step A) copied from the
+///    premium templates tree. Gated by the same `premium_templates` license
+///    feature the source kits already require — unchanged from before this
+///    change; a license-less caller now still gets item 1 instead of a hard
+///    error.
 pub fn cmd_preset_install_builtin(force: bool) -> Result<()> {
-    if !crate::premium_templates::premium_unlocked() {
-        return Err(DuDuClawError::Agent(
-            "目前的授權方案未開放內建產業/部門職務組合。這是既有的 premium_templates 授權旗標，\
-             不是本功能新增的限制——可自行在 `~/.duduclaw/presets/` 下新增職務組合，機制本身完全免費。"
-                .to_string(),
-        ));
-    }
-    let Some(premium_dir) = crate::premium_templates::find_premium_templates_dir() else {
-        return Err(DuDuClawError::Agent(
-            "找不到 commercial/templates-premium/ 目錄，無法安裝內建職務組合。".to_string(),
-        ));
-    };
-    let source_root = premium_dir.join("presets");
-    let Ok(entries) = std::fs::read_dir(&source_root) else {
-        println!("{} 尚未找到內建職務組合來源（{}）。", style("提示").yellow(), source_root.display());
-        return Ok(());
-    };
-
     let home = crate::duduclaw_home();
     let mut installed = Vec::new();
     let mut skipped = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.path().is_dir() {
-            continue;
+
+    match preset::install_system_operator_preset(&home, force) {
+        Ok(true) => installed.push(preset::SYSTEM_OPERATOR_PRESET_ID.to_string()),
+        Ok(false) => skipped.push(preset::SYSTEM_OPERATOR_PRESET_ID.to_string()),
+        Err(e) => {
+            return Err(DuDuClawError::Agent(format!(
+                "安裝免費內建職務組合「{}」失敗：{e}",
+                preset::SYSTEM_OPERATOR_PRESET_ID
+            )));
         }
-        let Some(id) = entry.file_name().to_str().map(str::to_string) else { continue };
-        let src_file = entry.path().join(preset::PRESET_FILE);
-        if !src_file.is_file() {
-            continue;
-        }
-        let dest_dir = preset::preset_dir(&home, &id);
-        let dest_file = dest_dir.join(preset::PRESET_FILE);
-        if dest_file.is_file() && !force {
-            skipped.push(id);
-            continue;
-        }
-        std::fs::create_dir_all(&dest_dir)
-            .map_err(|e| DuDuClawError::Agent(format!("建立 {} 失敗：{e}", dest_dir.display())))?;
-        std::fs::copy(&src_file, &dest_file)
-            .map_err(|e| DuDuClawError::Agent(format!("複製 {id} 失敗：{e}")))?;
-        installed.push(id);
     }
 
-    if installed.is_empty() && skipped.is_empty() {
-        println!("沒有找到任何內建職務組合可以安裝。");
-        return Ok(());
+    let premium_available = crate::premium_templates::premium_unlocked();
+    if premium_available {
+        if let Some(premium_dir) = crate::premium_templates::find_premium_templates_dir() {
+            let source_root = premium_dir.join("presets");
+            if let Ok(entries) = std::fs::read_dir(&source_root) {
+                for entry in entries.flatten() {
+                    if !entry.path().is_dir() {
+                        continue;
+                    }
+                    let Some(id) = entry.file_name().to_str().map(str::to_string) else { continue };
+                    let src_file = entry.path().join(preset::PRESET_FILE);
+                    if !src_file.is_file() {
+                        continue;
+                    }
+                    let dest_dir = preset::preset_dir(&home, &id);
+                    let dest_file = dest_dir.join(preset::PRESET_FILE);
+                    if dest_file.is_file() && !force {
+                        skipped.push(id);
+                        continue;
+                    }
+                    std::fs::create_dir_all(&dest_dir)
+                        .map_err(|e| DuDuClawError::Agent(format!("建立 {} 失敗：{e}", dest_dir.display())))?;
+                    std::fs::copy(&src_file, &dest_file)
+                        .map_err(|e| DuDuClawError::Agent(format!("複製 {id} 失敗：{e}")))?;
+                    installed.push(id);
+                }
+            }
+        }
     }
+
     if !installed.is_empty() {
         println!("{} 已安裝 {} 個內建職務組合：{}", style("✓").green().bold(), installed.len(), installed.join(", "));
     }
@@ -296,6 +301,15 @@ pub fn cmd_preset_install_builtin(force: bool) -> Result<()> {
             style("略過").dim(),
             skipped.len(),
             skipped.join(", ")
+        );
+    }
+    if !premium_available {
+        println!(
+            "{} 目前的授權方案未開放內建產業/部門職務組合（premium_templates），\
+             只安裝了免費的「{}」。可自行在 `~/.duduclaw/presets/` 下新增其他職務組合，\
+             機制本身完全免費。",
+            style("提示").dim(),
+            preset::SYSTEM_OPERATOR_PRESET_ID
         );
     }
     Ok(())

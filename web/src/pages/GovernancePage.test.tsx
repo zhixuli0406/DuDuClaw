@@ -63,7 +63,8 @@ describe('GovernancePage', () => {
 
   // X03 (UX audit §3.3) — SecurityPage's RBAC card already links to
   // `/manage/governance?tab=governance`; this is the missing reverse
-  // direction, surfaced while looking at permission-type policies.
+  // direction, surfaced while looking at permission-type policies. N-3
+  // (2026-08): the target relocated to `/app/system/security`.
   it('opens the Security page RBAC matrix from the permission filter', async () => {
     const user = userEvent.setup();
     mockWsClient.call.mockResolvedValue({ policies: [] });
@@ -73,7 +74,7 @@ describe('GovernancePage', () => {
         <MemoryRouter initialEntries={['/manage/governance']}>
           <Routes>
             <Route path="/manage/governance" element={<GovernancePage />} />
-            <Route path="/manage/security" element={<div>security-probe</div>} />
+            <Route path="/app/system/security" element={<div>security-probe</div>} />
           </Routes>
         </MemoryRouter>
       </IntlProvider>,

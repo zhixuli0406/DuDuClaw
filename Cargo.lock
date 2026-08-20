@@ -2162,6 +2162,7 @@ name = "duduclaw-core"
 version = "1.61.2"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "cron",
@@ -2262,8 +2263,10 @@ dependencies = [
  "duduclaw-odoo",
  "duduclaw-os",
  "duduclaw-redaction",
+ "duduclaw-relay",
  "duduclaw-sandbox",
  "duduclaw-security",
+ "duduclaw-sysd",
  "ed25519-dalek",
  "enigo",
  "flate2",
@@ -2495,6 +2498,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "duduclaw-relay"
+version = "1.61.2"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "duduclaw-core",
+ "futures-util",
+ "reqwest 0.12.28",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid 1.23.1",
+]
+
+[[package]]
 name = "duduclaw-sandbox"
 version = "1.61.2"
 dependencies = [
@@ -2526,6 +2552,23 @@ dependencies = [
  "unicode-script",
  "unicode-segmentation",
  "zeroize",
+]
+
+[[package]]
+name = "duduclaw-sysd"
+version = "1.61.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid 1.23.1",
 ]
 
 [[package]]

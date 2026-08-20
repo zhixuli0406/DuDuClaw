@@ -2770,7 +2770,7 @@ struct ClaudeResponse {
 /// (match by block `id` when present, else fall back to the most recently
 /// opened call) — kept local rather than importing that CLI-crate module
 /// (this gateway crate does not depend on duduclaw-cli).
-fn ingest_stream_json_event_for_native_tools(
+pub(crate) fn ingest_stream_json_event_for_native_tools(
     event: &serde_json::Value,
     native_events: &mut Vec<crate::runtime::NativeToolEvent>,
     open_native_calls: &mut Vec<(String, usize)>,

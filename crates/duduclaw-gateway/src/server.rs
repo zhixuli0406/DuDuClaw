@@ -153,6 +153,41 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     );
 
     let home_dir = config.home_dir.clone();
+
+    // ── WP-G1: apply a pending device-migration restore, if any ──────────
+    // Must run before anything else in this function touches `home_dir`'s
+    // files (config.toml, identity.key, org.toml, MCP key, …) — those are
+    // exactly the files a restore replaces, so doing this first means this
+    // boot's own bootstrap steps below always see the POST-restore state,
+    // never a stale mix. Cheap no-op (`Ok(None)`) on every boot with no
+    // pending marker — the overwhelming majority — so this costs nothing on
+    // a non-appliance install or an appliance box that never ran
+    // `device.backup_restore`. See `backup_restore.rs`'s module doc for the
+    // full ordering guarantee (old data is always preserved, never deleted).
+    match crate::backup_restore::perform_pending_restore_swap(
+        &home_dir,
+        &chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string(),
+    ) {
+        Ok(Some(report)) => {
+            crate::metrics::global_metrics().backup_restore_swap_ok();
+            info!(
+                preserved = %report.preserved_dir.display(),
+                entries = report.entries_swapped,
+                "device migration restore applied at boot — previous data preserved"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            crate::metrics::global_metrics().backup_restore_swap_fail();
+            tracing::error!(
+                error = ?e,
+                "device migration restore failed at boot — gateway continues with whatever \
+                 state is on disk; if old data was already preserved it is under a \
+                 restore-backup-<timestamp> directory in the home dir"
+            );
+        }
+    }
+
     // ── Memory-db split self-heal (2026-08-20 關鍵洞察 incident) ─────────
     // Merge any per-agent `agents/<id>/[state/]memory.db` back into the
     // shared `<home>/memory.db` and archive the source file, restoring the
@@ -790,6 +825,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         info!("Self-study scheduler scheduled — 5 min interval (off unless an agent sets [research] self_study = true)");
     }
 
+    // WP-G1: scheduled device backups. Self-gating: the scheduler reads
+    // `config.toml [backup] schedule_enabled` on every tick and returns
+    // immediately when it is off (the default) — a deployment that never
+    // opts in pays one file read per tick and creates nothing. Not a cron
+    // reimplementation — `interval_hours` is a single fixed cadence, so a
+    // short `tokio::time::interval` tick that re-checks "is it due yet"
+    // (same idiom as `notify_digest::DailyDigestScheduler`) is the whole
+    // mechanism this needs.
+    {
+        let backup_sched = Arc::new(crate::backup_schedule::BackupScheduler::new(home_dir.clone()));
+        tokio::spawn(backup_sched.run(std::time::Duration::from_secs(300)));
+        info!("Backup scheduler scheduled — 5 min tick (off unless [backup] schedule_enabled = true)");
+    }
+
     // Event broadcast channel for pushing real-time updates (e.g. channel status) to dashboard
     let (event_tx, _) = broadcast::channel::<String>(64);
     handler.set_event_tx(event_tx.clone()).await;
@@ -877,6 +926,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // DingTalk) — global only for now. Per-agent webhook routing requires
     // multi-path routers (TODO-per-agent-channels.md)
     let line_router = crate::line::start_line_bot(&home_dir, reply_ctx.clone()).await;
+    // WP-E2: box-side relay client — no-ops unless `[relay] enabled` resolves
+    // true (default off; default on under DUDUCLAW_APPLIANCE=1). When active,
+    // it feeds LINE webhooks received via `duduclaw-relay` into the exact
+    // same verify+dispatch path `line_router` above mounts for direct HTTP.
+    crate::relay_client::spawn_relay_client(&home_dir, reply_ctx.clone());
     let whatsapp_router =
         crate::whatsapp::start_whatsapp_webhook(&home_dir, reply_ctx.clone()).await;
     let feishu_router = crate::feishu::start_feishu_webhook(&home_dir, reply_ctx.clone()).await;
@@ -1939,6 +1993,19 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 crate::expert_admin::MAX_EXPERT_UPLOAD_BYTES + 512 * 1024,
             )),
         )
+        // WP-G1: device-migration ("汰機搬家") restore upload + the
+        // dedicated scheduled-backup download route. Admin + appliance JWT
+        // gated (`authorize_device_admin`, mirrors `authorize_file_access`
+        // but additionally requires appliance mode — the whole `device.*`
+        // surface is appliance-only). Backups never share the attachments
+        // download route — see `backup_schedule.rs`'s module doc.
+        .route(
+            "/api/device/backup-upload",
+            post(handle_device_backup_upload).layer(DefaultBodyLimit::max(
+                crate::backup_restore::MAX_BACKUP_UPLOAD_BYTES + 4 * 1024 * 1024,
+            )),
+        )
+        .route("/api/device/backups/download", get(handle_device_backup_download))
         .route("/api/tts", post(handle_tts))
         .route(
             "/api/voice/config",
@@ -2047,6 +2114,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .await
         .map_err(|e| duduclaw_core::error::DuDuClawError::Gateway(e.to_string()))?;
 
+    // WP-B: systemd sd_notify — tell systemd startup is complete, and start
+    // watchdog pings if this unit is `Type=notify` with `WatchdogSec=` set.
+    // Both are safe unconditional no-ops off-systemd (gated internally on
+    // `$NOTIFY_SOCKET`/`$WATCHDOG_USEC`, not on `is_appliance()` — see
+    // `watchdog.rs`'s module doc for why).
+    if let Err(e) = crate::watchdog::notify_ready() {
+        warn!("sd_notify READY=1 failed (non-fatal): {e}");
+    }
+    let _watchdog_pings = crate::watchdog::spawn_watchdog_pings();
+
     // LAN discovery: advertise this gateway over mDNS so desktop apps on the
     // same network can find it (WP-GW). Strictly best-effort — a failure only
     // warns and never blocks serving. Held for the lifetime of the process and
@@ -2128,6 +2205,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     .with_graceful_shutdown(async move {
         let _ = tokio::signal::ctrl_c().await;
         info!("Shutdown signal received, flushing state...");
+        // sd_notify STOPPING=1 — best-effort, no-op off-systemd.
+        let _ = crate::watchdog::notify_stopping();
         // Withdraw the LAN advertisement first so peers stop offering a
         // gateway that is going away (sends the mDNS goodbye packet).
         if let Some(adv) = mdns_advertiser {
@@ -3305,6 +3384,49 @@ fn authorize_file_access(
     Ok(())
 }
 
+/// Authenticate + authorize a `/api/device/*` REST caller: valid JWT
+/// (header or `token` query — browser download links can't set a header),
+/// password already changed, admin role, AND appliance mode. Mirrors
+/// `authorize_file_access` but additionally enforces the appliance gate —
+/// every `device.*` surface (RPC and REST alike) is appliance-only, per
+/// `handlers.rs`'s `require_appliance!()` doc comment.
+fn authorize_device_admin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    token_query: Option<&str>,
+) -> Result<(), axum::response::Response> {
+    let unauthorized = || {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid or expired token" })),
+        )
+            .into_response()
+    };
+    let token = extract_bearer_token(headers)
+        .or(token_query)
+        .ok_or_else(unauthorized)?;
+    let ctx = authenticate_jwt(state, token).map_err(|_| unauthorized())?;
+    require_password_changed(&ctx)?;
+    if !ctx.is_admin() {
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "access denied" })),
+        )
+            .into_response());
+    }
+    if !duduclaw_core::is_appliance() {
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "此功能僅限 DuDuClaw 裝置版（appliance image）使用。",
+                "code": crate::handlers::DEVICE_NOT_APPLIANCE_ERROR_CODE,
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
 #[derive(serde::Deserialize)]
 struct FilesListQuery {
     agent: Option<String>,
@@ -3816,6 +3938,198 @@ async fn handle_expert_upload(
     }
 
     Json(serde_json::json!({ "path": dest.to_string_lossy() })).into_response()
+}
+
+/// POST /api/device/backup-upload — stage an uploaded `.tar.gz` device
+/// backup for `device.backup_restore` (WP-G1 device migration / "汰機搬家").
+///
+/// Multipart body with a `file` part, ≤`MAX_BACKUP_UPLOAD_BYTES`. Admin +
+/// appliance gated. The upload is staged under
+/// `crate::backup_restore::upload_dir` (client filename contributes only a
+/// sanitized basename — no traversal) and the resulting server-local path is
+/// returned for the follow-up `device.backup_restore` RPC, which runs the
+/// real safety gate (magic check, per-entry/cumulative size caps, path
+/// traversal / symlink rejection — `crate::backup_restore`) on it. This
+/// endpoint itself only does a cheap magic-byte sanity check, same division
+/// of labor as `handle_expert_upload` / `experts.install`.
+async fn handle_device_backup_upload(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    mut multipart: Multipart,
+) -> axum::response::Response {
+    if let Err(resp) = authorize_device_admin(&state, &headers, None) {
+        return resp;
+    }
+
+    let mut data: Option<Vec<u8>> = None;
+    let mut client_name = "backup.tar.gz".to_string();
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("malformed multipart: {e}") })),
+                )
+                    .into_response();
+            }
+        };
+        if field.name().unwrap_or("") == "file" {
+            if let Some(fname) = field.file_name()
+                && !fname.is_empty()
+            {
+                client_name = fname.to_string();
+            }
+            match field.bytes().await {
+                Ok(bytes) => {
+                    if bytes.len() > crate::backup_restore::MAX_BACKUP_UPLOAD_BYTES {
+                        return (
+                            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                            Json(serde_json::json!({ "error": "備份檔超過上傳上限" })),
+                        )
+                            .into_response();
+                    }
+                    data = Some(bytes.to_vec());
+                }
+                Err(e) => {
+                    return (
+                        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                        Json(serde_json::json!({
+                            "error": format!("讀取上傳內容失敗（檔案過大或連線中斷）: {e}")
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    let Some(data) = data else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing 'file' field" })),
+        )
+            .into_response();
+    };
+    // Light sanity: a gzip stream starts with the 1f 8b magic. The real
+    // fence (tar-entry traversal / symlink / size caps) runs inside
+    // `device.backup_restore`.
+    if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不是有效的 .tar.gz 備份檔" })),
+        )
+            .into_response();
+    }
+
+    let dest = crate::backup_restore::staged_upload_path(&state.home_dir, &client_name);
+    let dir = crate::backup_restore::upload_dir(&state.home_dir);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("建立暫存目錄失敗: {e}") })),
+        )
+            .into_response();
+    }
+    // Opportunistic cleanup: drop staged uploads older than 24 h (mirrors
+    // `handle_expert_upload`).
+    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if let Ok(meta) = entry.metadata().await
+                && let Ok(modified) = meta.modified()
+                && modified.elapsed().map(|d| d.as_secs() > 86_400).unwrap_or(false)
+            {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+    if let Err(e) = tokio::fs::write(&dest, &data).await {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("寫入上傳檔失敗: {e}") })),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({ "path": dest.to_string_lossy() })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct DeviceBackupDownloadQuery {
+    name: String,
+    /// Optional JWT for browser download links that cannot set an
+    /// `Authorization` header.
+    token: Option<String>,
+}
+
+/// GET /api/device/backups/download — stream one scheduled backup file from
+/// `crate::backup_schedule::backups_dir` (never `attachments/` — see that
+/// module's doc comment for why the two stay separate). Admin + appliance
+/// gated, same path-safety discipline as `handle_files_download`.
+async fn handle_device_backup_download(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<DeviceBackupDownloadQuery>,
+) -> axum::response::Response {
+    if let Err(resp) = authorize_device_admin(&state, &headers, q.token.as_deref()) {
+        return resp;
+    }
+
+    let dir = crate::backup_schedule::backups_dir(&state.home_dir);
+    let path = match crate::files_api::resolve_download(&dir, &q.name) {
+        Ok(p) => p,
+        Err(crate::files_api::ResolveError::BadRequest) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid file name" })),
+            )
+                .into_response();
+        }
+        Err(crate::files_api::ResolveError::Denied) => {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "access denied" })),
+            )
+                .into_response();
+        }
+        Err(crate::files_api::ResolveError::NotFound) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "file not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "file not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+    let mut resp = axum::response::Response::new(body);
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/gzip"),
+    );
+    let cd = format!(
+        "attachment; filename*=UTF-8''{}",
+        crate::files_api::encode_filename_star(&q.name)
+    );
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_str(&cd)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
+    );
+    resp
 }
 
 /// POST /api/stt — transcribe an uploaded audio clip to text.

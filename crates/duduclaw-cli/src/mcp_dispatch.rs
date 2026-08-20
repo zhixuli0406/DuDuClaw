@@ -65,6 +65,31 @@ const RECORDING_TOOLS: &[&str] = &[
     "skill_from_recording",
 ];
 
+/// The system-operator MCP tool face gated by the `[capabilities]
+/// system_operator` master switch (O-4, closing O-0's residual risk 4).
+/// Every tool here is already `Scope::Admin`-scoped (`mcp_auth.rs`), but
+/// scope alone was an opt-out posture — any internal agent that somehow
+/// held Admin could invoke these physical-machine operations. This gate
+/// makes the posture opt-in per agent, mirroring [`OS_NATIVE_TOOLS`] /
+/// [`RECORDING_TOOLS`]'s deny-by-default shape exactly. Kept as its own
+/// list (not merged into `OS_NATIVE_TOOLS`) because the two capabilities
+/// are semantically distinct — `os_native` is host automation for an
+/// agent's own machine footprint, `system_operator` is "this agent may
+/// operate the box on a human's behalf" — an agent can hold either, both,
+/// or neither.
+const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
+    "os_device_status",
+    "os_system_status",
+    "os_check_update",
+    "os_backup_list",
+    "os_network_info",
+    "os_apply_update",
+    "os_backup_create",
+    "os_power",
+    "os_factory_reset",
+    "os_doctor_repair",
+];
+
 /// Neutralize `os_notify` `title`/`body` in place for the user's visual surface
 /// (P2-5). Each value is replaced by its perception-sanitized form (control
 /// chars stripped, angle brackets defanged, CJK-safe truncation) and any
@@ -118,6 +143,7 @@ struct AgentGateConfig {
     policy: Vec<ToolPolicy>,
     os_native: bool,
     recording: bool,
+    system_operator: bool,
     denied_tools: Vec<String>,
     allowed_tools: Vec<String>,
 }
@@ -143,6 +169,7 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
             policy: cfg.capabilities.policy,
             os_native: cfg.capabilities.os_native,
             recording: cfg.capabilities.recording,
+            system_operator: cfg.capabilities.system_operator,
             denied_tools: cfg.capabilities.denied_tools,
             allowed_tools: cfg.capabilities.allowed_tools,
         },
@@ -151,7 +178,7 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
                 agent = %agent_id,
                 error = %e,
                 "malformed agent.toml [capabilities] — PolicyKernel abstains (empty policy) \
-                 and os_native / recording default to false (fail-closed)"
+                 and os_native / recording / system_operator default to false (fail-closed)"
             );
             AgentGateConfig::default()
         }
@@ -716,6 +743,30 @@ impl McpDispatcher {
                 &format!(
                     "工具「{tool_name}」需要錄製能力，但此代理未啟用。請在 agent.toml 設定 \
                      [capabilities] recording = true 後再使用。"
+                ),
+            );
+        }
+
+        // ── 3.626 System-operator capability gate (O-4, deny-by-default, I5) ─
+        // Closes O-0's residual risk: the `os_*` system-operation tools are
+        // `Scope::Admin`-scoped, but scope alone was an opt-out posture — any
+        // internal agent holding Admin could invoke them. This makes the
+        // posture opt-in: an agent must carry the agent's OWN explicit
+        // `[capabilities] system_operator = true` before any of these tools
+        // are reachable, regardless of scope. Same fail-closed shape as the
+        // OS-native/recording gates above: missing/malformed config resolves
+        // to `system_operator = false` in `load_agent_gate_config`. External
+        // clients are never granted `Scope::Admin` (not externally
+        // grantable), so they are already excluded upstream; this check still
+        // runs for them (empty default gate) as defence-in-depth.
+        if SYSTEM_OPERATOR_TOOLS.contains(&tool_name) && !agent_gate.system_operator {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            return jsonrpc_error(
+                id,
+                -32003,
+                &format!(
+                    "工具「{tool_name}」需要系統操作員能力，但此代理未啟用。請在 agent.toml 設定 \
+                     [capabilities] system_operator = true 後再使用。"
                 ),
             );
         }
@@ -1427,6 +1478,138 @@ effect = "forbid"
         assert!(
             result.get("error").is_none(),
             "browser_record_stop with recording=true must pass the gate, got: {result}"
+        );
+    }
+
+    // ── O-4: system-operator capability gate ────────────────────────────────
+    //
+    // Mirrors the OS-native / recording gate tests above exactly: absent,
+    // explicit-false, and true, each exercised across all ten `os_*` system-
+    // operation tools listed in `SYSTEM_OPERATOR_TOOLS`.
+
+    /// All ten `os_*` tools with the capability absent (no agent.toml) are
+    /// denied fail-closed, even though `Scope::Admin` clears the scope check.
+    #[tokio::test]
+    async fn system_operator_tools_denied_when_capability_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+
+        // Admin bypasses the scope check so the call reaches the
+        // system_operator gate — proving scope alone is not enough.
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        for tool in super::SYSTEM_OPERATOR_TOOLS {
+            let params = make_params(tool, serde_json::json!({ "confirm": true, "action": "restart", "target": "system" }));
+            let id = serde_json::json!(60);
+            let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+            assert_eq!(
+                result["error"]["code"], -32003,
+                "{tool} without system_operator must be denied, got: {result}"
+            );
+            let msg = result["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                msg.contains("system_operator"),
+                "{tool}: denial must mention system_operator, got: {msg}"
+            );
+        }
+    }
+
+    /// `system_operator = false` explicitly is also denied (never fall-open
+    /// on an explicit false, same as the OS-native/recording gates).
+    #[tokio::test]
+    async fn system_operator_tool_denied_when_capability_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nsystem_operator = false\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("os_device_status", serde_json::json!({}));
+        let id = serde_json::json!(61);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "os_device_status with system_operator=false must be denied, got: {result}"
+        );
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("system_operator"), "got: {msg}");
+    }
+
+    /// A malformed `[capabilities]` table (wrong type) also fails closed —
+    /// `load_agent_gate_config`'s parse error path defaults `system_operator`
+    /// to `false`, same as `os_native`/`recording`.
+    #[tokio::test]
+    async fn system_operator_tool_denied_when_config_malformed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nsystem_operator = \"yes-please\"\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("os_device_status", serde_json::json!({}));
+        let id = serde_json::json!(62);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "malformed system_operator config must fail closed, got: {result}"
+        );
+    }
+
+    /// `system_operator = true` lets `os_device_status` pass the capability
+    /// gate — it may still fail downstream (never an appliance in CI), but
+    /// NOT with the system_operator capability message.
+    #[tokio::test]
+    async fn system_operator_tool_passes_gate_when_capability_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nsystem_operator = true\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("os_device_status", serde_json::json!({}));
+        let id = serde_json::json!(63);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        // Reaches the handler at the JSON-RPC level (no -32003 capability
+        // denial) — the tool itself still refuses fail-closed off-appliance,
+        // but that is a DIFFERENT, already-covered gate (`mcp_os_ops.rs`'s
+        // own `is_appliance()` check), not this one.
+        assert!(
+            result.get("error").is_none(),
+            "os_device_status with system_operator=true must pass the capability gate, got: {result}"
+        );
+    }
+
+    /// Without `Scope::Admin` at all, the scope check itself still denies
+    /// first (before ever reaching the system_operator gate) — proves the
+    /// new capability gate is additive, not a replacement for the existing
+    /// scope check.
+    #[tokio::test]
+    async fn system_operator_tool_still_requires_admin_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nsystem_operator = true\n");
+
+        let principal = make_principal(vec![], false);
+        let ns_ctx = make_ns_ctx(false);
+        let params = make_params("os_device_status", serde_json::json!({}));
+        let id = serde_json::json!(64);
+
+        let result = dispatcher.dispatch_tool_call(&principal, &ns_ctx, &params, &id).await;
+
+        assert_eq!(
+            result["error"]["code"], -32003,
+            "os_device_status without Admin scope must be denied even with system_operator=true, got: {result}"
+        );
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("system_operator"),
+            "denial must come from the scope check, not the system_operator gate, got: {msg}"
         );
     }
 

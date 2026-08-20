@@ -33,14 +33,21 @@ export function FirstRunGate() {
     );
   }
 
-  // `/license` is reachable during first-run: the welcome wizard's industry
-  // step shows an unlock CTA that sends the operator here to install a Pro
-  // license BEFORE any agent exists. Bouncing it back to /welcome made that
-  // CTA a dead loop.
+  // `/app/system/license` is reachable during first-run: the welcome
+  // wizard's industry step shows an unlock CTA that sends the operator here
+  // to install a Pro license BEFORE any agent exists. Bouncing it back to
+  // /welcome made that CTA a dead loop. N-3 (2026-08,
+  // `DESIGN-agent-os-native-apps-2026-08.md` §5 WP N-3) relocated the license
+  // page from `/license` to `/app/system/license`; the old path is now a
+  // redirect (`App.tsx`) that lands here a render later, so it MUST stay
+  // exempted too — otherwise this gate fires on that intermediate render
+  // (pathname briefly `/license`, not yet `/app/system/license`) and the CTA
+  // becomes a dead loop again.
   if (
     agents.length === 0 &&
     location.pathname !== '/welcome' &&
-    location.pathname !== '/license'
+    location.pathname !== '/license' &&
+    location.pathname !== '/app/system/license'
   ) {
     return <Navigate to="/welcome" replace />;
   }

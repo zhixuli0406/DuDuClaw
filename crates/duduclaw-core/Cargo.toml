@@ -16,6 +16,10 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 fs2 = "0.4"
+# relay_protocol.rs (WP-E2): base64-encodes/decodes HookFrame.body_b64 — the
+# wire type shared verbatim with duduclaw-relay, which already depends on
+# this exact version.
+base64 = { workspace = true }
 
 # WP21 debt ⑧ — MCP caller-identity token (src/identity_token.rs).
 # Pure-Rust RustCrypto stack: no build script, no C toolchain, and `Mac::verify_slice`

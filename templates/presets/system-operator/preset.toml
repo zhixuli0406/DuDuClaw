@@ -1,0 +1,90 @@
+# DuDuClaw 職務組合（preset）——系統操作員（system-operator）
+#
+# 這是免費內建職務組合，隨開源版本身附帶（見
+# `crates/duduclaw-core/src/preset.rs` 的 `install_system_operator_preset`），
+# 不需要 commercial/ 這棵（gitignored、私有）樹，也不受任何授權旗標限制——
+# 跟 `duduclaw preset install-builtin` 另外複製進來的 9 個產業/部門職務組合
+# （那些才需要 premium_templates 授權）是兩回事。
+#
+# 套用後，這個 AI 員工可以用自然語言操作這台機器本身（查裝置狀態／檢查
+# 更新／列出備份／查網路資訊／電源／更新／出廠重置），但這個 preset 只是
+# 把 `[capabilities] system_operator = true` 等設定物化到 agent.toml——
+# 每個 os_* 系統操作工具自己既有的 Admin scope／`is_appliance()`／
+# `confirm:true`／`ApprovalBroker` 這些閘完全不受影響，破壞性操作仍然一律
+# 先確認或送審，不會因為套用了這個職務組合就被繞過。
+#
+# 使用方式：
+#   duduclaw preset install-builtin              # 把這個 preset 複製到 ~/.duduclaw/presets/
+#   duduclaw agent create <name> --preset system-operator
+# 或替既有 AI 員工套用：
+#   duduclaw preset bind --agent <name> --preset system-operator
+
+[preset]
+version = "1.0.0"
+label = "系統操作員"
+description = "適合值班機／appliance 的系統操作員：可查詢裝置狀態、檢查更新、列出備份、查網路資訊；電源、更新、出廠重置等破壞性操作一律先確認或送審，絕不自動執行。"
+
+[capabilities]
+system_operator = true
+# "operator" 是既有 goal-loop autonomy 五級（operator/collaborator/
+# consultant/approver/observer）之一：可信任其主動行動，但仍要通過
+# os_* 系統操作工具自己的 Admin scope／appliance／confirm／
+# ApprovalBroker 等既有閘（見 `duduclaw-gateway::os_operator` 模組文件建議的
+# 設定）。
+autonomy_level = "operator"
+allowed_tools = []
+denied_tools = []
+browser_via_bash = false
+computer_use = false
+os_native = false
+recording = false
+native_sandbox = false
+
+[budget]
+hard_stop = false
+monthly_limit_cents = 1000
+warn_threshold_percent = 80
+
+[container]
+max_concurrent = 1
+network_access = false
+readonly_project = true
+sandbox_enabled = false
+timeout_ms = 60000
+
+[evolution]
+gvu_enabled = false
+max_active_skills = 2
+max_gvu_generations = 0
+max_silence_hours = 168.0
+observation_period_hours = 24.0
+skill_auto_activate = false
+skill_security_scan = true
+skill_token_budget = 500
+
+[heartbeat]
+cron = ""
+cron_timezone = ""
+enabled = false
+interval_seconds = 300
+max_concurrent_runs = 1
+
+[model]
+api_mode = "cli"
+fallback = "claude-haiku-4-5"
+preferred = "claude-sonnet-4-6"
+
+[model.local]
+backend = "llama_cpp"
+context_length = 8192
+gpu_layers = -1
+model = ""
+prefer_local = false
+use_router = true
+
+[permissions]
+allowed_channels = []
+can_create_agents = false
+can_modify_own_skills = false
+can_schedule_tasks = false
+can_send_cross_agent = false
