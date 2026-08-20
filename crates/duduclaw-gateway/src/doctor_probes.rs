@@ -51,6 +51,50 @@ pub struct McpColdStartReport {
     pub outcome: McpColdStartOutcome,
 }
 
+/// Render one [`McpColdStartOutcome`] into a `(status, message)` pair —
+/// `status` is one of `"pass"`/`"fail"`/`"warn"`, matching the doctor check
+/// card vocabulary. `provision_error` is [`McpColdStartReport::provision_error`],
+/// only consulted on `AuthFailed`. Single source of truth for BOTH
+/// `run_doctor_checks` (`duduclaw-gateway::handlers`, the dashboard
+/// `system.doctor`/`system.doctor_repair` RPCs) and the O-0 `os_doctor_repair`
+/// MCP tool (`duduclaw-cli::mcp`) so their zh-TW copy can never drift apart.
+pub fn mcp_cold_start_status_and_message(
+    outcome: &McpColdStartOutcome,
+    provision_error: Option<&str>,
+) -> (&'static str, String) {
+    match outcome {
+        McpColdStartOutcome::Pass => {
+            ("pass", "MCP server 啟動並回應 initialize，工具面可用。".to_string())
+        }
+        McpColdStartOutcome::AuthFailed => (
+            "fail",
+            format!(
+                "MCP server 因認證被拒而終止 — agent 會完全叫不到 duduclaw 工具。{}重啟 gateway 讓它自動配發 internal key，或設定 env DUDUCLAW_MCP_API_KEY。",
+                provision_error
+                    .map(|e| format!("（internal key 配發失敗：{e}）"))
+                    .unwrap_or_default()
+            ),
+        ),
+        McpColdStartOutcome::BinaryUnresolved => (
+            "fail",
+            "duduclaw binary 無法解析為絕對路徑 — CLI runtime 無法註冊 MCP server。".to_string(),
+        ),
+        McpColdStartOutcome::SpawnFailed(e) => ("fail", format!("mcp-server 無法啟動：{e}")),
+        McpColdStartOutcome::Timeout => (
+            "warn",
+            "mcp-server 10 秒內未結束（stdin 已關閉），無法確認 initialize 是否成功。".to_string(),
+        ),
+        McpColdStartOutcome::Abnormal { exit, stderr_tail } => (
+            "fail",
+            format!(
+                "mcp-server 異常結束（exit={}，無 initialize 回應）。stderr：{}",
+                exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                if stderr_tail.is_empty() { "(空)" } else { stderr_tail }
+            ),
+        ),
+    }
+}
+
 /// Run the same internal-key provisioning the gateway does at startup, then
 /// spawn one `mcp-server` child and classify its cold-start behavior.
 /// Idempotent and side-effect-light: provisioning reuses the existing

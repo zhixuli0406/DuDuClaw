@@ -12,6 +12,8 @@ import { LoginPage } from './pages/LoginPage';
 import { useConnectionStore } from './stores/connection-store';
 import { useAuthStore } from './stores/auth-store';
 import { ApprovalModal } from './components/ApprovalModal';
+import { AppRouteRedirect, LegacyRouteRedirect } from './apps/AppRouteRedirect';
+import { useIsAppliance } from './hooks/useIsAppliance';
 
 // Code-splitting: every authenticated page is lazy-loaded so heavy, page-only
 // dependencies (d3 for WikiGraph/OrgChart, large forms) land in their own route
@@ -39,6 +41,10 @@ const BillingShell = lazyPage(() => import('./pages/BillingShell'), 'BillingShel
 const GovernanceShell = lazyPage(() => import('./pages/GovernanceShell'), 'GovernanceShell');
 const LicenseShell = lazyPage(() => import('./pages/LicenseShell'), 'LicenseShell');
 const WebChatPage = lazyPage(() => import('./pages/WebChatPage'), 'WebChatPage');
+// O-2 (`DESIGN-agent-os-native-apps-2026-08.md` §6.3) — the conversational
+// "operate the whole machine" scaffold; see `HomeLanding` below for how the
+// appliance image lands here by default.
+const OperatorConsolePage = lazyPage(() => import('./pages/OperatorConsolePage'), 'OperatorConsolePage');
 const AgentsPage = lazyPage(() => import('./pages/AgentsPage'), 'AgentsPage');
 const CreateAgentPage = lazyPage(() => import('./pages/agent-form/CreateAgentPage'), 'CreateAgentPage');
 const EditAgentPage = lazyPage(() => import('./pages/agent-form/EditAgentPage'), 'EditAgentPage');
@@ -72,6 +78,11 @@ const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
 const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage');
+// N-1 (`DESIGN-agent-os-native-apps-2026-08.md` §5 WP N-1) — the app-registry
+// grid; the web-first half of the launcher the on-box shell (N-2) will reuse.
+const LauncherPage = lazyPage(() => import('./pages/LauncherPage'), 'LauncherPage');
+// N-3 (§5 WP N-3) — the 系統設定 app's own `/app/system` settings-hub home.
+const SystemHomePage = lazyPage(() => import('./pages/SystemHomePage'), 'SystemHomePage');
 // v2 redesign lazy placeholder pages (T1.5) — replaced in place by later waves.
 const TaskDetailPage = lazyPage(() => import('./pages/TaskDetailPage'), 'TaskDetailPage');
 const SkillNewPage = lazyPage(() => import('./pages/SkillNewPage'), 'SkillNewPage');
@@ -84,6 +95,7 @@ const AboutPage = lazyPage(() => import('./pages/AboutPage'), 'AboutPage');
 const DistributorsPage = lazyPage(() => import('./pages/DistributorsPage'), 'DistributorsPage');
 const OSPage = lazyPage(() => import('./pages/OSPage'), 'OSPage');
 const PresetsPage = lazyPage(() => import('./pages/PresetsPage'), 'PresetsPage');
+const DevicePage = lazyPage(() => import('./pages/DevicePage'), 'DevicePage');
 // WP9 (2026-08-04 IA rework): full conversation history + the two management
 // surfaces lifted out of billing / settings + the 進階設定 index.
 const ConversationsPage = lazyPage(() => import('./pages/ConversationsPage'), 'ConversationsPage');
@@ -97,6 +109,38 @@ function PageFallback() {
       <span className="h-6 w-6 animate-spin rounded-full border-2 border-brand/30 border-t-brand" />
     </div>
   );
+}
+
+/**
+ * O-2 landing gate (`DESIGN-agent-os-native-apps-2026-08.md` §6.2 "對話先行":
+ * appliance 的預設畫面是全螢幕對話式主控台，不是 app 網格). The bare `/` index
+ * route renders the conversational console instead of the dashboard grid once
+ * `system.status`'s `is_appliance` field confirms this gateway IS the
+ * DuDuClaw appliance image; every other install (the overwhelming majority)
+ * is unaffected and keeps `HomePage` exactly as before. `/workspace` —
+ * HomePage's other alias — is left pointing straight at `HomePage` so "go to
+ * the dashboard" always has a literal, ungated destination even on an
+ * appliance (§6 O-5: nothing native is removed, only the default first door
+ * changes).
+ *
+ * R2 (2026-08): every authenticated role gets this redirect, not just admin.
+ * The original gate reused `useIsAppliance(hasMinRole(role, 'admin'))` — the
+ * same pattern `AppSidebar`/`CommandPalette` use for their `/device` nav
+ * probe — because that hook used to read the admin-only `device.status` RPC
+ * (`require_admin!()` in `handlers.rs`), so a manager/employee viewer could
+ * never learn whether the box was an appliance and silently stayed on
+ * `HomePage`. `useIsAppliance` now reads the non-admin `is_appliance` field
+ * on `system.status` instead, so this route no longer needs a role gate at
+ * all — `HomeLanding` only renders once `AuthGuard` has already confirmed
+ * the caller is signed in, and `/console` itself is open to every role
+ * (see its route below). `AppSidebar`/`CommandPalette` keep their own
+ * `hasMinRole(role, 'admin')` argument unchanged — that gate is about
+ * showing the admin-only `/device` page, a separate concern from this one.
+ */
+function HomeLanding() {
+  const isAppliance = useIsAppliance(true);
+  if (isAppliance) return <Navigate to="/console" replace />;
+  return <HomePage />;
 }
 
 export function App() {
@@ -165,6 +209,16 @@ export function App() {
                   zero-agent redirect target itself is never gated (no loop). */}
               <Route path="welcome" element={<WelcomePage />} />
 
+              {/* N-1 deep-link seam (§2 L2 + §5 WP N-1/N-3): /app/<id>/<rest>
+                  redirects to the existing canonical route at /<rest> (or the
+                  app's default path with no rest). Mounted outside
+                  FirstRunGate, like `welcome` above — the redirect TARGET is
+                  what carries FirstRunGate (most of them do), so gating
+                  cascades naturally on the next render instead of being
+                  duplicated here. No pages have moved; see
+                  `apps/AppRouteRedirect.tsx` for the full rationale. */}
+              <Route path="app/:appId/*" element={<AppRouteRedirect />} />
+
               {/* Everything else requires at least one agent to exist. */}
               <Route element={<FirstRunGate />}>
               {/* ── Zone A 每日 — open to all authenticated users ──
@@ -174,12 +228,18 @@ export function App() {
                   global and mounted in `MainLayout` (UX plan I-1a); this
                   comment used to claim a "launcher hero" that no version of
                   HomePage ever rendered. */}
-              <Route index element={<HomePage />} />
+              {/* O-2: appliance lands on the conversational console; every
+                  other install still lands on HomePage (see `HomeLanding`). */}
+              <Route index element={<HomeLanding />} />
               <Route path="workspace" element={<HomePage />} />
               <Route path="inbox" element={<InboxPage />} />
               {/* v2 (T1.5): /webchat renamed to /chat; old path redirects. */}
               <Route path="chat" element={<WebChatPage />} />
               <Route path="webchat" element={<Navigate to="/chat" replace />} />
+              {/* O-2 (§6.3) — the operator console scaffold. Open to every
+                  authenticated role, like `/chat`: the capability gating that
+                  matters lives at the tool layer (O-0), not the nav entry. */}
+              <Route path="console" element={<OperatorConsolePage />} />
               {/* Full conversation history (2026-08-04, D17) — the sidebar zone
                   lists the newest five and links here for the rest. */}
               <Route path="conversations" element={<ConversationsPage />} />
@@ -233,6 +293,38 @@ export function App() {
               <Route path="knowledge" element={<Navigate to="/memory?tab=wiki" replace />} />
               {/* 關於 — open to every authenticated user (all instances). */}
               <Route path="about" element={<AboutPage />} />
+              {/* N-1 launcher (§2 L3 + §5 WP N-1) — app grid, open to every
+                  authenticated role (each card's own visibility still gates
+                  per-app via isAppVisible). Not a nav item by design — see
+                  `LauncherPage.tsx`'s doc comment. */}
+              <Route path="launcher" element={<LauncherPage />} />
+
+              {/* N-3 (§5 WP N-3): 系統設定 app canonical routes. These six
+                  pages physically left `/manage/*` (and, for `device`, the
+                  bare top-level `/device`) — this IS their home now, not a
+                  redirect stand-in. Role gates are copied byte-for-byte from
+                  where each page used to sit: `license` was the one
+                  manager-level surface among them (`manageAdvancedNav`'s
+                  `personalHidden` license row), the other five were
+                  admin-level (the P4-3 `/device` block below used to gate
+                  `device`; the former `/manage` admin block gated the rest).
+                  The bare index is admin-gated too — it matches the app's own
+                  `minRole: 'admin'` in `apps/registry.ts`, and a manager who
+                  still needs `license` reaches it by its own direct route,
+                  not through this grid. */}
+              <Route path="app/system">
+                <Route element={<RoleGuard minRole="admin" />}>
+                  <Route index element={<SystemHomePage />} />
+                  <Route path="device" element={<DevicePage />} />
+                  <Route path="updates" element={<SystemUpdatePage />} />
+                  <Route path="accounts" element={<AccountsPage />} />
+                  <Route path="security" element={<SecurityPage />} />
+                  <Route path="settings" element={<SettingsPage />} />
+                </Route>
+                <Route element={<RoleGuard minRole="manager" />}>
+                  <Route path="license" element={<LicenseShell />} />
+                </Route>
+              </Route>
 
               {/* manager+ routes (Zone B/C) */}
               <Route element={<RoleGuard minRole="manager" />}>
@@ -254,6 +346,10 @@ export function App() {
                     presets.list itself, but preset content is capability/
                     security-relevant, matching its `/os` neighbour's gate). */}
                 <Route path="presets" element={<PresetsPage />} />
+                {/* 裝置（WP-C）relocated to `/app/system/device` (N-3). Old
+                    bookmarks/links redirect there — same admin gate, query
+                    string preserved. */}
+                <Route path="device" element={<LegacyRouteRedirect to="/app/system/device" />} />
                 {/* 專家包 — expert-pack management; experts.* RPCs are
                     require_admin!-gated server-side, this mirrors that. */}
                 <Route path="experts" element={<ExpertsPage />} />
@@ -268,23 +364,32 @@ export function App() {
               <Route path="manage" element={<ManageShell />}>
                 <Route element={<RoleGuard minRole="manager" />}>
                   <Route path="billing" element={<BillingShell />} />
-                  <Route path="license" element={<LicenseShell />} />
+                  {/* 授權 relocated to `/app/system/license` (N-3). */}
+                  <Route path="license" element={<LegacyRouteRedirect to="/app/system/license" />} />
                   <Route path="migrate" element={<MigratePage />} />
                   <Route path="logs" element={<LogsPage />} />
+                  {/* 安全審計（secaudit dashboard）— manager+, not admin-only:
+                      reviewing a finding is closer to analytics.* than the
+                      admin-gated credential-rotation surfaces below. */}
+                  <Route path="secaudit" element={<SecauditPage />} />
                   {/* 進階設定 index — the surfaces folded a level down (D18). */}
                   <Route path="advanced" element={<ManageAdvancedPage />} />
                 </Route>
                 <Route element={<RoleGuard minRole="admin" />}>
                   <Route path="channels" element={<ChannelsPage />} />
-                  {/* 帳戶與登入 / 系統更新 — promoted out of billing / settings. */}
-                  <Route path="accounts" element={<AccountsPage />} />
-                  <Route path="updates" element={<SystemUpdatePage />} />
+                  {/* 帳戶與登入 / 系統更新 relocated to `/app/system/*` (N-3) —
+                      see the `system` app route block above `manage` used to
+                      be promoted out of billing / settings into here (D18);
+                      N-3 promotes them one level further, out of 管理 entirely. */}
+                  <Route path="accounts" element={<LegacyRouteRedirect to="/app/system/accounts" />} />
+                  <Route path="updates" element={<LegacyRouteRedirect to="/app/system/updates" />} />
                   <Route path="integrations" element={<IntegrationsPage />} />
                   <Route path="inference" element={<InferencePage />} />
                   <Route path="local-models" element={<LocalModelsPage />} />
                   <Route path="reliability" element={<ReliabilityPage />} />
-                  <Route path="security" element={<SecurityPage />} />
-                  <Route path="system" element={<SettingsPage />} />
+                  {/* 安全 / 設定 relocated to `/app/system/*` (N-3). */}
+                  <Route path="security" element={<LegacyRouteRedirect to="/app/system/security" />} />
+                  <Route path="system" element={<LegacyRouteRedirect to="/app/system/settings" />} />
                   {/* Enterprise-only surfaces (D8/D10-B). The rail already hides
                       these on a Personal instance; `EditionGuard` closes the URL
                       too, so a bookmark or a typed path can't reach a console
@@ -326,19 +431,27 @@ export function App() {
                   pointing at it. Their content lives inside a `/manage/*` shell
                   now, so the old path redirects there instead of rendering a
                   second, unreachable-except-by-URL copy. */}
-              <Route path="partner" element={<Navigate to="/manage/license" replace />} />
+              {/* N-3: both hops now land straight on the current canonical
+                  `/app/system/license` instead of bouncing through the
+                  now-also-redirecting `/manage/license`. */}
+              <Route path="partner" element={<Navigate to="/app/system/license" replace />} />
               <Route path="wiki-trust" element={<Navigate to="/manage/governance?tab=wikiTrust" replace />} />
               <Route element={<RoleGuard minRole="manager" />}>
                 <Route path="billing" element={<BillingPage />} />
-                <Route path="license" element={<LicensePage />} />
+                {/* 授權 relocated to `/app/system/license` (N-3) — this legacy
+                    alias used to render the bare `LicensePage` (pre-dating the
+                    license+partner tab merge); it now lands on the same
+                    canonical `LicenseShell` every other license route does. */}
+                <Route path="license" element={<LegacyRouteRedirect to="/app/system/license" />} />
                 <Route path="logs" element={<LogsPage />} />
               </Route>
               <Route element={<RoleGuard minRole="admin" />}>
                 <Route path="channels" element={<Navigate to="/manage/channels" replace />} />
-                <Route path="accounts" element={<AccountsPage />} />
-                <Route path="security" element={<SecurityPage />} />
+                {/* 帳戶與登入 / 安全 / 設定 relocated to `/app/system/*` (N-3). */}
+                <Route path="accounts" element={<LegacyRouteRedirect to="/app/system/accounts" />} />
+                <Route path="security" element={<LegacyRouteRedirect to="/app/system/security" />} />
                 <Route path="reliability" element={<ReliabilityPage />} />
-                <Route path="settings" element={<SettingsPage />} />
+                <Route path="settings" element={<LegacyRouteRedirect to="/app/system/settings" />} />
                 <Route path="inference" element={<InferencePage />} />
                 <Route path="local-models" element={<LocalModelsPage />} />
                 {/* D10-B: the aliases were the hole — every Enterprise-only page

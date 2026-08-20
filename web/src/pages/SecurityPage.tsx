@@ -132,7 +132,7 @@ export function SecurityPage() {
           authoritative _enc twin in [[accounts]]) is exactly as relevant to a
           single-owner Personal install as to an Enterprise one, so unlike the
           cards below it does not fold behind the Personal AdvancedSection. */}
-      <CredentialHygienePanel onGoToAccounts={() => navigate('/manage/accounts')} />
+      <CredentialHygienePanel onGoToAccounts={() => navigate('/app/system/accounts')} />
 
       {/* Credential inventory (WP-H1 P1) — sits directly under hygiene because
           the two answer adjacent questions: hygiene says what is wrong, the

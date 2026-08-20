@@ -39,6 +39,7 @@ pub mod mcp_namespace;
 pub mod mcp_rate_limit;
 pub mod mcp_recording;         // WP3.3 R1/R3: browser + desktop recording capture
 pub(crate) mod mcp_recording_distill; // WP3.3 R2: HAR redaction/parsing + skill_from_recording
+pub(crate) mod mcp_os_ops;     // O-0: device.*/system.* → agent-facing os_* MCP tool bridge
 pub mod mcp_redact;
 pub mod mcp_redaction;         // RFC-23 redaction pipeline integration
 pub mod redaction_verify;      // WP2: `duduclaw redaction verify` evidence report
@@ -1110,10 +1111,11 @@ enum PresetCommands {
         agent: String,
     },
 
-    /// Copy the built-in department-kit presets (converted from
-    /// `commercial/templates-premium/teams/_departments/`) into
-    /// `~/.duduclaw/presets/`. Gated by the existing `premium_templates`
-    /// license feature — no new gate.
+    /// Install every built-in preset this build knows about into
+    /// `~/.duduclaw/presets/`: the free `system-operator` preset (no
+    /// license required) plus, if your plan includes it, the premium
+    /// department-kit presets. Existing local files are left alone unless
+    /// `--force` is given.
     #[command(name = "install-builtin")]
     InstallBuiltin {
         /// Overwrite presets already present locally
@@ -5786,6 +5788,14 @@ async fn cmd_agent_create(
         return Ok(());
     }
 
+    // P2: a free built-in preset (currently only `system-operator`) may
+    // carry a suggested SOUL.md persona — presets are agent.toml-shaped
+    // config only (`duduclaw_core::preset` module docs), so the persona text
+    // is looked up separately and threaded into the scaffold here. `None`
+    // for any other/unknown `--preset` value, same as before this change
+    // (the caller's own default persona template applies).
+    let soul_body = preset_opt.as_deref().and_then(duduclaw_core::preset::builtin_soul_template);
+
     scaffold_agent_dir(
         &home,
         &AgentScaffold {
@@ -5797,7 +5807,7 @@ async fn cmd_agent_create(
             trigger,
             provider,
             model_preferred: None,
-            soul_body: None,
+            soul_body: soul_body.map(str::to_string),
         },
     )
     .await?;

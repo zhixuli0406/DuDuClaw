@@ -244,6 +244,16 @@ export interface SystemStatus {
    * enterprise (show everything) for backward compatibility.
    */
   edition_profile?: EditionProfile;
+  /**
+   * R2 (2026-08): whether this gateway is the DuDuClaw appliance image — a
+   * direct forward of `duduclaw_core::is_appliance()`, the same authority
+   * `device.status` gates on. Unlike `device.status` (admin + appliance
+   * only), `system.status` carries no admin gate, so this is the one
+   * appliance signal every authenticated role can read; `useIsAppliance`
+   * reads this field. Absent on older gateways → treat as `false` (fail
+   * closed, matches the hook's own fail-closed default).
+   */
+  is_appliance?: boolean;
 }
 
 /** Response of `system.autostart.status` / `system.autostart.set` — the
@@ -2486,6 +2496,92 @@ export interface PresetResolution {
   reason?: string;
 }
 
+// ── WP-C: appliance device management ("裝置" page) ─────────────────────
+
+/** Machine-readable code the gateway returns for every `device.*` RPC
+ *  reached on a non-appliance install (`handlers.rs::DEVICE_NOT_APPLIANCE_ERROR_CODE`). */
+export const DEVICE_NOT_APPLIANCE_ERROR_CODE = 'not_appliance';
+/** Returned when a destructive `device.*` RPC is called without `confirm: true`. */
+export const DEVICE_CONFIRM_REQUIRED_ERROR_CODE = 'confirm_required';
+
+export interface DeviceLoadAverage {
+  load1: number;
+  load5: number;
+  load15: number;
+}
+
+export interface DeviceMemInfo {
+  total_mb: number;
+  available_mb: number;
+  used_mb: number;
+}
+
+export interface DeviceDiskUsage {
+  total_mb: number;
+  used_mb: number;
+  available_mb: number;
+}
+
+export interface DeviceNetworkInterface {
+  name: string;
+  is_up: boolean;
+  addresses: string[];
+}
+
+/** `device.status` payload. Every field but `cpu_cores`/`network_interfaces`
+ *  is `null` when the underlying sensor can't be read (off-appliance-Linux
+ *  dev host, or hardware with no exposed sensor) — `null` is a normal, honest
+ *  reading, not an error; the UI omits that row rather than showing 0/blank. */
+export interface DeviceStatus {
+  cpu_cores: number;
+  load_average: DeviceLoadAverage | null;
+  ram: DeviceMemInfo | null;
+  disk: DeviceDiskUsage | null;
+  temperature_c: number | null;
+  uptime_secs: number | null;
+  network_interfaces: DeviceNetworkInterface[];
+}
+
+/** Shape shared by every shell-out-backed `device.*` RPC
+ *  (`update_status`/`update_apply`/`factory_reset`/`power`) — a normal `Ok`
+ *  can still carry `success: false` (the command ran but exited non-zero). */
+export interface DeviceOpResult {
+  success: boolean;
+  stdout: string;
+  stderr: string;
+}
+
+export interface DeviceBackupResult {
+  /** Pass straight to `GET /api/files/download?name=<filename>` to fetch it. */
+  filename: string;
+  stdout: string;
+  stderr: string;
+}
+
+// ── WP-G1: scheduled backups + device-migration restore ────────────────
+
+/** `device.backup_schedule_get` / `device.backup_schedule_set` payload. */
+export interface DeviceBackupScheduleConfig {
+  schedule_enabled: boolean;
+  interval_hours: number;
+  retention_count: number;
+}
+
+/** One row from `device.backup_list` — a file under the gateway's dedicated
+ *  `<home>/backups/` directory (never the task/channel attachments dir). */
+export interface DeviceBackupFileEntry {
+  name: string;
+  size: number;
+  /** Unix epoch milliseconds. */
+  mtime: number;
+}
+
+export interface DeviceBackupRestoreResult {
+  staged: true;
+  files_written: number;
+  restart_required: true;
+}
+
 export interface GalleryCard {
   /** Deterministic (`<team-slug>-<example-index>`) — stable React key. */
   id: string;
@@ -2810,6 +2906,14 @@ export interface AgentCapabilities {
    *  commit-signing credentials) to this agent's spawned CLI subprocess.
    *  Danger-zone capability: default false. */
   git_credentials?: boolean;
+  /** O-4 — opt-in system-operator designation: master switch for the `os_*`
+   *  system-operation tool face (device/system status, backup, power,
+   *  update, factory reset, doctor). A materially higher trust tier than
+   *  `os_native` (own-machine automation only) — this marks the agent as
+   *  allowed to operate the whole host on the operator's behalf. Danger-zone
+   *  capability: default false, denied at the dispatch gate even for an
+   *  Admin-scoped agent until explicitly enabled here. */
+  system_operator?: boolean;
   /** How much the autonomous goal loop may drive this agent on its own. */
   autonomy_level?: AutonomyLevel;
 }
@@ -5994,5 +6098,50 @@ export const api = {
         agent_id: string;
         resolution: PresetResolution;
       }>,
+  },
+  // ── WP-C: appliance device management ("裝置" page) ────────────────
+  // Every RPC is admin + appliance-only server-side (`require_admin!()` +
+  // `require_appliance!()`); a non-appliance install rejects all of these
+  // with the structured `not_appliance` error. `useIsAppliance` (R2,
+  // 2026-08) no longer probes this admin-gated surface — it reads the
+  // non-admin `is_appliance` field on `system.status` instead, so a
+  // manager/employee viewer can also learn whether the box is an appliance.
+  device: {
+    status: () => client.call('device.status') as Promise<DeviceStatus>,
+    /** Read-only interface list. Setting a static IP is not implemented yet
+     *  (the gateway refuses any network-write-shaped param with
+     *  `not_implemented` — this client never sends one). */
+    network: () =>
+      client.call('device.network') as Promise<{ interfaces: DeviceNetworkInterface[] }>,
+    /** `systemd-sysupdate list --json=short`, forwarded verbatim in `.stdout`. */
+    updateStatus: () => client.call('device.update_status') as Promise<DeviceOpResult>,
+    /** Installs the newest available update. */
+    updateApply: () => client.call('device.update_apply') as Promise<DeviceOpResult>,
+    /** Always rejects `unsupported` this round (no verified appliance A/B
+     *  rollback mechanism yet — see the gateway doc comment) — kept for the
+     *  seam, never called from the UI, which shows the button disabled. */
+    updateRollback: () => client.call('device.update_rollback', { confirm: true }) as Promise<DeviceOpResult>,
+    /** Archives the device's writable data partition. Feed `.filename` to
+     *  `GET /api/files/download?name=<filename>` to fetch it. */
+    backupCreate: () => client.call('device.backup_create') as Promise<DeviceBackupResult>,
+    /** Wipes device state and re-provisions on next boot. Irreversible. */
+    factoryReset: () =>
+      client.call('device.factory_reset', { confirm: true }) as Promise<DeviceOpResult>,
+    power: (action: 'restart' | 'shutdown') =>
+      client.call('device.power', { action, confirm: true }) as Promise<DeviceOpResult>,
+    // ── WP-G1: scheduled backups + device-migration restore ──────────
+    backupScheduleGet: () =>
+      client.call('device.backup_schedule_get') as Promise<DeviceBackupScheduleConfig>,
+    backupScheduleSet: (patch: Partial<DeviceBackupScheduleConfig>) =>
+      client.call('device.backup_schedule_set', patch) as Promise<DeviceBackupScheduleConfig>,
+    /** Lists files under the dedicated `<home>/backups/` directory. */
+    backupList: () => client.call('device.backup_list') as Promise<{ files: DeviceBackupFileEntry[] }>,
+    backupDelete: (name: string) =>
+      client.call('device.backup_delete', { name }) as Promise<{ deleted: true }>,
+    /** Stage an already-uploaded (`POST /api/device/backup-upload`) archive
+     *  for restore on next boot. Nothing destructive happens until the
+     *  gateway actually restarts. */
+    backupRestore: (path: string) =>
+      client.call('device.backup_restore', { path, confirm: true }) as Promise<DeviceBackupRestoreResult>,
   },
 };

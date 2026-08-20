@@ -342,4 +342,74 @@ describe('EditAgentPage', () => {
       expect(screen.queryByText('Confirm high-risk setting')).not.toBeInTheDocument();
     });
   });
+
+  // O-4 follow-up — `[capabilities] system_operator` marks this agent as the
+  // machine's designated operator persona (the `os_*` system-operation tool
+  // face). Same danger-confirm gate and default-off contract as
+  // git_credentials above, plus a persistent high-risk banner once enabled.
+  describe('system_operator danger-zone switch', () => {
+    it('renders unchecked by default and only writes true after danger confirmation', async () => {
+      const user = userEvent.setup();
+      const updateAgent = vi.fn().mockResolvedValue(undefined);
+      useAgentsStore.setState({ updateAgent } as never);
+
+      renderAt('/agents/my-bot/edit?tab=tools');
+
+      await waitFor(() => {
+        expect(screen.getByRole('heading', { name: 'Tools & permissions', level: 2 })).toBeInTheDocument();
+      });
+
+      const opSwitch = screen.getByRole('switch', { name: 'Allow operating this computer' });
+      expect(opSwitch).not.toBeChecked();
+      // No standing high-risk banner while the capability is off.
+      expect(screen.queryByText(/Highest permission tier/)).not.toBeInTheDocument();
+
+      // Clicking ON must not apply immediately — it opens the shared
+      // danger-confirm dialog instead of flipping the switch right away.
+      await user.click(opSwitch);
+      expect(opSwitch).not.toBeChecked();
+      expect(updateAgent).not.toHaveBeenCalled();
+
+      await waitFor(() => {
+        expect(screen.getByText('Confirm high-risk setting')).toBeInTheDocument();
+      });
+      // The specific risk copy (not just the generic "high risk" boilerplate)
+      // must be visible before the operator can confirm.
+      expect(
+        screen.getByText(/the same as handing over control of the machine itself/),
+      ).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Confirm' }));
+
+      await waitFor(() => {
+        expect(opSwitch).toBeChecked();
+      });
+      // The persistent high-risk banner appears once the switch is on.
+      expect(screen.getByText(/Highest permission tier/)).toBeInTheDocument();
+      await waitFor(
+        () => {
+          expect(updateAgent).toHaveBeenCalledWith(
+            'my-bot',
+            expect.objectContaining({
+              capabilities: expect.objectContaining({ system_operator: true }),
+            }),
+          );
+        },
+        { timeout: 3000 },
+      );
+    });
+
+    it('prefills a checked state from agents.inspect without re-triggering the confirm dialog', async () => {
+      mockWsClient.call.mockResolvedValue({ ...DETAIL, capabilities: { system_operator: true } });
+      renderAt('/agents/my-bot/edit?tab=tools');
+
+      const opSwitch = await screen.findByRole('switch', { name: 'Allow operating this computer' });
+      await waitFor(() => {
+        expect(opSwitch).toBeChecked();
+      });
+      // A value merged in from the server must never pop the confirm dialog —
+      // that gate is only for operator-initiated ON clicks.
+      expect(screen.queryByText('Confirm high-risk setting')).not.toBeInTheDocument();
+    });
+  });
 });

@@ -10,7 +10,17 @@ import { ManageShell } from './ManageShell';
 import { manageAdvancedNav, allManageNav } from './nav-model';
 
 /** Render ManageShell with a real nested-route tree (NavLink + Outlet need it —
- *  Zone D is real routing, not `?tab=`, per WP4.1). */
+ *  Zone D is real routing, not `?tab=`, per WP4.1).
+ *
+ * N-3 (2026-08, `DESIGN-agent-os-native-apps-2026-08.md` §5 WP N-3) relocated
+ * five `allManageNav` entries (帳戶與登入 / 系統更新 / 安全 / 授權 / 設定) out
+ * of `/manage/*` entirely, into the 系統設定 app — their `to` no longer
+ * starts with `/manage/`. ManageShell itself still renders them as rail rows
+ * (that part of this fixture, and every test asserting on rail LABELS/order,
+ * is unaffected — see the tests below); what changes is that clicking one now
+ * navigates the viewer OUT of this shell, so there is no `/manage/*` child
+ * page left to mock a route for. Only items still living under `/manage/*`
+ * get a stub `<Route>` here. */
 function renderManage(initialPath: string) {
   return render(
     <IntlProvider messages={en} locale="en" defaultLocale="en">
@@ -18,13 +28,15 @@ function renderManage(initialPath: string) {
         <Routes>
           <Route path="/" element={<div>Home page</div>} />
           <Route path="manage" element={<ManageShell />}>
-            {allManageNav.map((item) => (
-              <Route
-                key={item.to}
-                path={item.to.replace('/manage/', '')}
-                element={<div>{item.to} page</div>}
-              />
-            ))}
+            {allManageNav
+              .filter((item) => item.to.startsWith('/manage/'))
+              .map((item) => (
+                <Route
+                  key={item.to}
+                  path={item.to.replace('/manage/', '')}
+                  element={<div>{item.to} page</div>}
+                />
+              ))}
           </Route>
         </Routes>
       </MemoryRouter>
@@ -90,8 +102,11 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
   });
 
   it('renders the routed child page inside the content pane', () => {
-    renderManage('/manage/accounts');
-    expect(screen.getByText('/manage/accounts page')).toBeInTheDocument();
+    // N-3: `/manage/accounts` relocated to `/app/system/accounts` (outside
+    // this shell); `/manage/logs` is still a genuine `/manage/*` child, so it
+    // exercises the exact same Outlet-rendering behaviour this test targets.
+    renderManage('/manage/logs');
+    expect(screen.getByText('/manage/logs page')).toBeInTheDocument();
   });
 
   it('hides admin-gated items for a manager-only viewer', () => {

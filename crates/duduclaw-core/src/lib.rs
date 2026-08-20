@@ -1,6 +1,7 @@
 pub mod agent_guard;
 pub mod agent_rename;
 pub mod agent_toml;
+pub mod appliance;
 pub mod autostart;
 pub mod concurrency_gate;
 pub mod config;
@@ -22,6 +23,7 @@ pub mod org_store;
 pub mod platform;
 pub mod preset;
 pub mod provider_env;
+pub mod relay_protocol;
 pub mod sensitivity;
 pub mod spawn_admission;
 pub mod spawn_env;
@@ -35,6 +37,7 @@ pub mod zh_variant;
 
 pub use agent_guard::{check_agent_file_write, check_bash_command, GuardDecision, AGENT_STRUCTURE_FILES};
 pub use agent_rename::{rename_in_markdown, synced_trigger};
+pub use appliance::{appliance_default_bind, appliance_flag, is_appliance, pick_default_bind, APPLIANCE_ENV};
 pub use concurrency_gate::{
     active_count as concurrency_active_count, effective_limit as concurrency_effective_limit,
     release as concurrency_release, renew as concurrency_renew, try_acquire as concurrency_try_acquire,

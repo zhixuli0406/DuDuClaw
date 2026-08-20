@@ -10,6 +10,21 @@ RUN npm run build
 
 # Stage 2: Rust compilation
 FROM rust:slim AS rust-builder
+# CARGO_JOBS caps cargo's build parallelism (maps to the CARGO_BUILD_JOBS
+# env var cargo already reads — https://doc.rust-lang.org/cargo/reference/config.html#env).
+# Empty default (unset by any caller that doesn't pass --build-arg) means
+# the RUN below never exports CARGO_BUILD_JOBS at all, so the default
+# path is byte-for-byte identical to before this arg existed — this
+# Dockerfile is shared by scripts/release.sh and appliance/build.sh, and
+# scripts/release.sh's build hosts are not memory-constrained the way
+# appliance/build.sh's Docker Desktop VM can be, so the cap must stay opt-in.
+ARG CARGO_JOBS=""
+# EXTRA_PACKAGES appends additional `-p <crate>` selections to the cargo
+# build below (e.g. "-p duduclaw-sysd" for the appliance image, which ships
+# the privileged helper binary alongside the gateway). Empty default keeps
+# every existing caller byte-for-byte identical, same contract as
+# CARGO_JOBS above.
+ARG EXTRA_PACKAGES=""
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev && \
@@ -26,10 +41,11 @@ COPY --from=frontend-builder /build/crates/duduclaw-dashboard/dist/ crates/duduc
 # Build release binary with dashboard only (desktop feature excluded —
 # Computer Use / screen capture lives in the dedicated Dockerfile.computer-use
 # image; pulling xcap/enigo here would drag in wayland/pipewire/gbm on Linux).
-RUN cargo build --release \
+RUN if [ -n "$CARGO_JOBS" ]; then export CARGO_BUILD_JOBS="$CARGO_JOBS"; fi && \
+    cargo build --release \
     --no-default-features \
     --features duduclaw-gateway/dashboard \
-    -p duduclaw-cli -p duduclaw-gateway
+    -p duduclaw-cli -p duduclaw-gateway $EXTRA_PACKAGES
 
 # Stage 3: Production image
 FROM python:3.12-slim

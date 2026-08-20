@@ -29,7 +29,8 @@ describe('DistributorsPage', () => {
   });
 
   // X03 (UX audit §3.3): the Partner cross-reference used to be plain,
-  // unclickable text on the 經銷商簽發 tab.
+  // unclickable text on the 經銷商簽發 tab. N-3 (2026-08): the target
+  // relocated from `/manage/license` to `/app/system/license`.
   it('opens the Partner tab from the distributors-tab scope note', async () => {
     const user = userEvent.setup();
 
@@ -43,7 +44,7 @@ describe('DistributorsPage', () => {
         <MemoryRouter initialEntries={['/manage/distributors?tab=distributors']}>
           <Routes>
             <Route path="/manage/distributors" element={<DistributorsPage />} />
-            <Route path="/manage/license" element={<PartnerProbe />} />
+            <Route path="/app/system/license" element={<PartnerProbe />} />
           </Routes>
         </MemoryRouter>
       </IntlProvider>,

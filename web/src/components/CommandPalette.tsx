@@ -42,6 +42,7 @@ import { hasMinRole } from '@/lib/roles';
 import { isVisible } from '@/lib/nav-visibility';
 import { isTauri } from '@/lib/gateway-picker';
 import { useForksExist } from '@/hooks/useForksExist';
+import { useIsAppliance } from '@/hooks/useIsAppliance';
 import { CharacterAvatar } from '@/components/character';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useSystemStore } from '@/stores/system-store';
@@ -239,6 +240,8 @@ export function CommandPalette() {
   );
   // Progressive disclosure for /forks — same signal the Sidebar uses.
   const forksExist = useForksExist(hasMinRole(user?.role, 'manager'));
+  // Progressive disclosure for /device (WP-C) — same signal the Sidebar uses.
+  const isAppliance = useIsAppliance(hasMinRole(user?.role, 'admin'));
   const setTheme = useThemeStore((s) => s.setTheme);
   const setLocale = useLocaleStore((s) => s.setLocale);
 
@@ -340,7 +343,13 @@ export function CommandPalette() {
     // D6: mirrors AppSidebar's ctx — `agents` here already feeds the
     // agent-jump commands below, so the org chart's progressive-disclosure
     // gate is a free read, not a second fetch.
-    const visibilityCtx = { hasOperatorAccess, forksExist, isDesktop: isTauri(), agentCount: agents.length };
+    const visibilityCtx = {
+      hasOperatorAccess,
+      forksExist,
+      isDesktop: isTauri(),
+      agentCount: agents.length,
+      isAppliance,
+    };
     const navCommands: Command[] = navSources
       .filter(({ item }) => isVisible(item, user?.role, isPersonal, visibilityCtx))
       .map(({ item, groupLabel }) => ({
@@ -441,7 +450,7 @@ export function CommandPalette() {
         }];
 
     return [...navCommands, ...manageCommands, ...agentCommands, ...taskCommands, ...themeActions, ...localeActions, ...logoutAction];
-  }, [t, user?.role, hasOperatorAccess, forksExist, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout]);
+  }, [t, user?.role, hasOperatorAccess, forksExist, isAppliance, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout]);
 
   // Empty query → recent routes first, then all commands in natural order.
   const results = useMemo<ScoredCommand[]>(() => {

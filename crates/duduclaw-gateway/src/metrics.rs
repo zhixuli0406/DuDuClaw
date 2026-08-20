@@ -133,6 +133,30 @@ pub struct MetricsRegistry {
     /// `verdict` ∈ {`suggested`, `chat`}).
     pub goal_intent_l2: RwLock<std::collections::HashMap<(String, String), u64>>,
 
+    // ── Relay client (WP-E2: box-side webhook relay ingestion) ────────
+    /// Gauge: 1 while the box holds an authenticated `duduclaw-relay`
+    /// WebSocket session, 0 otherwise (including `[relay] enabled = false`,
+    /// which never sets it).
+    pub relay_connected: AtomicU64,
+    /// Hook frames received from the relay, by `(channel, outcome)`.
+    /// `outcome` ∈ {`ok`, `bad_signature`, `unsupported`} — see
+    /// `relay_client::inject_line_hook` / `handle_hook_text`.
+    pub relay_frames: RwLock<std::collections::HashMap<(String, String), u64>>,
+    /// Relay WebSocket (re)connect attempts, including the first connect
+    /// after gateway boot. A steady trickle is expected (Cloud Run forces a
+    /// disconnect every ~3600s per `crates/duduclaw-relay/README.md`) —
+    /// this counter is for rate-of-change dashboards, not an alarm by
+    /// itself.
+    pub relay_reconnects_total: AtomicU64,
+
+    // ── WP-G1: scheduled backups + device-migration restore ──────────
+    /// Scheduled backup runs, by outcome. Fail-open per the WP-G1 spec — a
+    /// failure is counted and logged, never fatal to the gateway.
+    pub backup_schedule_ok_total: AtomicU64,
+    pub backup_schedule_fail_total: AtomicU64,
+    /// Restore swap outcomes applied at boot (`perform_pending_restore_swap`).
+    pub backup_restore_swap_ok_total: AtomicU64,
+    pub backup_restore_swap_fail_total: AtomicU64,
 }
 
 const DURATION_BOUNDS_MS: [u64; 7] = [100, 250, 500, 1000, 2500, 5000, 10000];
@@ -215,7 +239,30 @@ impl MetricsRegistry {
             goal_intent: RwLock::new(std::collections::HashMap::new()),
             goal_intent_l2: RwLock::new(std::collections::HashMap::new()),
 
+            relay_connected: AtomicU64::new(0),
+            relay_frames: RwLock::new(std::collections::HashMap::new()),
+            relay_reconnects_total: AtomicU64::new(0),
+
+            backup_schedule_ok_total: AtomicU64::new(0),
+            backup_schedule_fail_total: AtomicU64::new(0),
+            backup_restore_swap_ok_total: AtomicU64::new(0),
+            backup_restore_swap_fail_total: AtomicU64::new(0),
         }
+    }
+
+    // ── WP-G1: scheduled backups + device-migration restore ──────────
+
+    pub fn backup_schedule_ok(&self) {
+        self.backup_schedule_ok_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn backup_schedule_fail(&self) {
+        self.backup_schedule_fail_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn backup_restore_swap_ok(&self) {
+        self.backup_restore_swap_ok_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn backup_restore_swap_fail(&self) {
+        self.backup_restore_swap_fail_total.fetch_add(1, Ordering::Relaxed);
     }
 
     // ── Decision Continuity helpers (RFC-24) ─────────────────────────
@@ -311,6 +358,29 @@ impl MetricsRegistry {
     pub async fn goal_intent_l2_event(&self, engine: &str, verdict: &str) {
         let mut map = self.goal_intent_l2.write().await;
         *map.entry((engine.to_string(), verdict.to_string())).or_insert(0) += 1;
+    }
+
+    // ── Relay client (WP-E2) ────────────────────────────────────────────
+
+    /// Set the relay-connected gauge. `connected = true` while the box
+    /// holds an authenticated relay WebSocket session.
+    pub fn set_relay_connected(&self, connected: bool) {
+        self.relay_connected
+            .store(if connected { 1 } else { 0 }, Ordering::Relaxed);
+    }
+
+    /// Record one relayed hook frame outcome. `outcome` should be `"ok"` /
+    /// `"bad_signature"` / `"unsupported"`, but any value is accepted
+    /// verbatim (a closed, code-defined set at every call site — see
+    /// `relay_client.rs` — so no further validation happens here).
+    pub async fn relay_frame(&self, channel: &str, outcome: &str) {
+        let mut map = self.relay_frames.write().await;
+        *map.entry((channel.to_string(), outcome.to_string())).or_insert(0) += 1;
+    }
+
+    /// Record one relay WebSocket (re)connect attempt.
+    pub fn relay_reconnect(&self) {
+        self.relay_reconnects_total.fetch_add(1, Ordering::Relaxed);
     }
 
     // ── PTY pool helpers (Phase 8 production-rollout observability) ───
@@ -792,6 +862,55 @@ impl MetricsRegistry {
             ));
         }
 
+        // ── Relay client (WP-E2: box-side webhook relay ingestion) ──
+        out.push_str(
+            "# HELP relay_connected Whether the box holds an authenticated duduclaw-relay WebSocket session (1) or not (0).\n",
+        );
+        out.push_str("# TYPE relay_connected gauge\n");
+        out.push_str(&format!(
+            "relay_connected {}\n",
+            self.relay_connected.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP relay_frames_total Hook frames received from the relay, by channel and outcome.\n",
+        );
+        out.push_str("# TYPE relay_frames_total counter\n");
+        for ((channel, outcome), count) in self.relay_frames.read().await.iter() {
+            out.push_str(&format!(
+                "relay_frames_total{{channel=\"{channel}\",outcome=\"{outcome}\"}} {count}\n"
+            ));
+        }
+        out.push_str("# HELP relay_reconnects_total Relay WebSocket (re)connect attempts.\n");
+        out.push_str("# TYPE relay_reconnects_total counter\n");
+        out.push_str(&format!(
+            "relay_reconnects_total {}\n",
+            self.relay_reconnects_total.load(Ordering::Relaxed)
+        ));
+
+        // ── WP-G1: scheduled backups + device-migration restore ──────
+        out.push_str("# HELP duduclaw_backup_schedule_total Scheduled backup runs, by outcome.\n");
+        out.push_str("# TYPE duduclaw_backup_schedule_total counter\n");
+        out.push_str(&format!(
+            "duduclaw_backup_schedule_total{{outcome=\"ok\"}} {}\n",
+            self.backup_schedule_ok_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "duduclaw_backup_schedule_total{{outcome=\"fail\"}} {}\n",
+            self.backup_schedule_fail_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP duduclaw_backup_restore_swap_total Pending-restore swaps applied at boot, by outcome.\n",
+        );
+        out.push_str("# TYPE duduclaw_backup_restore_swap_total counter\n");
+        out.push_str(&format!(
+            "duduclaw_backup_restore_swap_total{{outcome=\"ok\"}} {}\n",
+            self.backup_restore_swap_ok_total.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "duduclaw_backup_restore_swap_total{{outcome=\"fail\"}} {}\n",
+            self.backup_restore_swap_fail_total.load(Ordering::Relaxed)
+        ));
+
         out
     }
 }
@@ -1232,4 +1351,50 @@ mod tests {
         assert!(output.contains("goal_intent_l2_total{engine=\"reply_tag\",verdict=\"suggested\"} 1"));
     }
 
+    // ── Relay client (WP-E2) ─────────────────────────────────────────────
+
+    #[test]
+    fn relay_connected_gauge_toggles() {
+        let r = MetricsRegistry::new();
+        assert_eq!(r.relay_connected.load(Ordering::Relaxed), 0, "off by default");
+        r.set_relay_connected(true);
+        assert_eq!(r.relay_connected.load(Ordering::Relaxed), 1);
+        r.set_relay_connected(false);
+        assert_eq!(r.relay_connected.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn relay_frame_counts_by_channel_and_outcome() {
+        let r = MetricsRegistry::new();
+        r.relay_frame("line", "ok").await;
+        r.relay_frame("line", "ok").await;
+        r.relay_frame("line", "bad_signature").await;
+        r.relay_frame("whatsapp", "unsupported").await;
+        let map = r.relay_frames.read().await;
+        assert_eq!(map.get(&("line".to_string(), "ok".to_string())), Some(&2));
+        assert_eq!(map.get(&("line".to_string(), "bad_signature".to_string())), Some(&1));
+        assert_eq!(map.get(&("whatsapp".to_string(), "unsupported".to_string())), Some(&1));
+    }
+
+    #[test]
+    fn relay_reconnects_total_increments() {
+        let r = MetricsRegistry::new();
+        r.relay_reconnect();
+        r.relay_reconnect();
+        assert_eq!(r.relay_reconnects_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn render_emits_relay_client_metric_labels() {
+        let r = MetricsRegistry::new();
+        r.set_relay_connected(true);
+        r.relay_frame("line", "ok").await;
+        r.relay_frame("line", "bad_signature").await;
+        r.relay_reconnect();
+        let output = r.render().await;
+        assert!(output.contains("relay_connected 1"));
+        assert!(output.contains("relay_frames_total{channel=\"line\",outcome=\"ok\"} 1"));
+        assert!(output.contains("relay_frames_total{channel=\"line\",outcome=\"bad_signature\"} 1"));
+        assert!(output.contains("relay_reconnects_total 1"));
+    }
 }

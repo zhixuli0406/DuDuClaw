@@ -50,12 +50,17 @@ export interface Gated {
    * at least one RFC-26 fork record exists (see `useForksExist`). `'org'` =
    * the AI-staff headcount has reached `ORG_CHART_MIN_AGENTS` (D6,
    * 09-edition-split-features.md §4) — a 1-2-agent org chart is an empty
-   * diagram, so the entry waits for a roster worth drawing. Applies on every
-   * edition (same as `'forks'`), not just Personal: an under-staffed
-   * Enterprise instance gets the same dead-page relief. The route itself
-   * stays reachable by URL — this is presentation, not access control.
+   * diagram, so the entry waits for a roster worth drawing. `'appliance'`
+   * (WP-C, 2026-08) = the running gateway IS the DuDuClaw appliance image
+   * — the overwhelming majority of installs are a plain desktop/server
+   * gateway, so the 「裝置」 hardware-management page (`/device`) only earns a
+   * nav slot once a `device.status` probe confirms the RPC surface is
+   * actually reachable (see `useIsAppliance`). Applies on every edition
+   * (same as `'forks'`/`'org'`), not just Personal. The route itself stays
+   * reachable by URL — this is presentation, not access control (the real
+   * gate is the gateway's own `require_appliance!()`, fail-closed).
    */
-  readonly requiresData?: 'forks' | 'org';
+  readonly requiresData?: 'forks' | 'org' | 'appliance';
 }
 
 /** Minimum AI-employee headcount before the org chart earns a nav slot (D6). */
@@ -74,6 +79,10 @@ export interface VisibilityContext {
   readonly agentCount?: number;
   /** True when running inside the desktop app (Tauri). */
   readonly isDesktop?: boolean;
+  /** True once a `device.status` probe confirms this gateway is the
+   *  appliance image (fail-closed: undefined/unresolved counts as false,
+   *  same default-hidden posture as `forksExist`/`agentCount`). */
+  readonly isAppliance?: boolean;
 }
 
 export function isVisible(
@@ -92,6 +101,7 @@ export function isVisible(
   // Progressive disclosure: hidden until the backing data exists.
   if (item.requiresData === 'forks' && !ctx?.forksExist) return false;
   if (item.requiresData === 'org' && (ctx?.agentCount ?? 0) < ORG_CHART_MIN_AGENTS) return false;
+  if (item.requiresData === 'appliance' && !ctx?.isAppliance) return false;
   return true;
 }
 

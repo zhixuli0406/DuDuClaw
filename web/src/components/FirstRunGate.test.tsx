@@ -54,3 +54,46 @@ describe('FirstRunGate', () => {
     expect(screen.queryByText('WELCOME')).not.toBeInTheDocument();
   });
 });
+
+/**
+ * N-3 (2026-08, `DESIGN-agent-os-native-apps-2026-08.md` §5 WP N-3): the
+ * license page relocated from `/license` to `/app/system/license` — the
+ * welcome wizard's zero-agent "unlock a Pro license" CTA must reach it
+ * without bouncing back to `/welcome` (a dead loop this gate exists to
+ * avoid), for BOTH the new canonical path and the still-working legacy
+ * redirect alias.
+ */
+function renderGateAt(initialPath: string) {
+  return render(
+    <IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={[initialPath]}>
+        <Routes>
+          <Route element={<FirstRunGate />}>
+            <Route index element={<div>DASHBOARD</div>} />
+            <Route path="/license" element={<div>LICENSE (legacy)</div>} />
+            <Route path="/app/system/license" element={<div>LICENSE (canonical)</div>} />
+          </Route>
+          <Route path="/welcome" element={<div>WELCOME</div>} />
+        </Routes>
+      </MemoryRouter>
+    </IntlProvider>,
+  );
+}
+
+describe('FirstRunGate — license exemption (N-3)', () => {
+  beforeEach(() => {
+    useAgentsStore.setState({ loaded: true, loading: false, agents: [] });
+  });
+
+  it('does not bounce the new canonical /app/system/license to /welcome', () => {
+    renderGateAt('/app/system/license');
+    expect(screen.getByText('LICENSE (canonical)')).toBeInTheDocument();
+    expect(screen.queryByText('WELCOME')).not.toBeInTheDocument();
+  });
+
+  it('does not bounce the legacy /license alias to /welcome either', () => {
+    renderGateAt('/license');
+    expect(screen.getByText('LICENSE (legacy)')).toBeInTheDocument();
+    expect(screen.queryByText('WELCOME')).not.toBeInTheDocument();
+  });
+});

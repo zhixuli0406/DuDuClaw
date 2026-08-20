@@ -976,6 +976,22 @@ pub async fn build_reply_with_progress(
     build_reply_with_session(text, ctx, "default", "anonymous", on_progress).await
 }
 
+/// O-4→O-3 wiring: strip an O-4 `<system_operator_pending>` marker (if
+/// present) out of `raw` and map it to an O-3 chat-artifact
+/// (`os_operator::marker_to_artifact`). Called from BOTH funnel points below
+/// (`build_reply_for_agent_with_artifact` / `build_reply_with_session_with_artifact`)
+/// — the only two places `build_reply_with_session_inner`'s raw text is ever
+/// consumed — so the tag is stripped before ANY channel sees the reply text,
+/// regardless of whether that channel's caller asks for the artifact half.
+/// `os_operator::strip_system_operator_pending_tag` is fail-open (returns the
+/// input unchanged when no tag is present), so this is a no-op on the
+/// overwhelming majority of replies that never went through O-4 at all.
+fn strip_operator_pending_marker(raw: &str) -> (String, Option<serde_json::Value>) {
+    let (stripped, marker) = crate::os_operator::strip_system_operator_pending_tag(raw);
+    let artifact = marker.as_ref().and_then(crate::os_operator::marker_to_artifact);
+    (stripped, artifact)
+}
+
 /// Build a reply for a specific named agent (used by per-agent Discord bots).
 ///
 /// Instead of reading `default_agent` from config.toml, this directly resolves
@@ -988,7 +1004,73 @@ pub async fn build_reply_for_agent(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> String {
-    let raw = build_reply_with_session_inner(
+    build_reply_for_agent_with_artifact(text, ctx, agent_name, session_id, user_id, on_progress)
+        .await
+        .0
+}
+
+/// Task C (O-4 Guide-path result cards): run [`build_reply_with_session_inner`]
+/// inside a fresh [`crate::runtime::NATIVE_TOOL_COLLECTOR`] scope and pair its
+/// raw text with any read-only `os_*` result artifact captured during the
+/// turn (`os_operator::extract_readonly_result_artifact`). Unconditional and
+/// cheap for every caller: a non-`system_operator` agent's turn never
+/// populates the collector at all (the capture hook inside
+/// `spawn_claude_cli_with_env` is itself capability-gated), so this costs one
+/// empty `Vec` allocation and is otherwise behavior-neutral — the returned
+/// artifact is `None` exactly as often as before this existed.
+async fn build_reply_with_session_inner_capturing_operator_result(
+    text: &str,
+    ctx: &ReplyContext,
+    agent_override: Option<&str>,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> (String, Option<serde_json::Value>) {
+    let collector: std::sync::Arc<std::sync::Mutex<Vec<crate::runtime::NativeToolEvent>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let raw = crate::runtime::NATIVE_TOOL_COLLECTOR
+        .scope(
+            collector.clone(),
+            build_reply_with_session_inner(
+                text,
+                ctx,
+                agent_override,
+                session_id,
+                user_id,
+                on_progress,
+            ),
+        )
+        .await;
+    let operator_result_artifact = collector
+        .lock()
+        .ok()
+        .and_then(|events| crate::os_operator::extract_readonly_result_artifact(&events));
+    (raw, operator_result_artifact)
+}
+
+/// Identical to [`build_reply_for_agent`] but also returns any O-4 pending-op
+/// marker mapped to an O-3 chat-artifact — the second half of the O-4→O-3
+/// wire. Only WebChat (`webchat.rs`) calls this today; every other channel
+/// keeps calling [`build_reply_for_agent`], which discards the artifact half
+/// and is otherwise byte-identical (both funnel through the same strip call
+/// below, so the raw tag never reaches either caller).
+///
+/// Task C: the returned artifact prefers a `<system_operator_pending>` marker
+/// (a destructive-op confirmation card) over a Guide-path result card when —
+/// structurally impossible today, but not asserted as such — both would
+/// somehow be present: `os_operator::decide`'s `ShortCircuit` branch (the
+/// only source of a pending marker) returns before the LLM/CLI ever runs, so
+/// the same turn can never also carry Guide-path tool-call evidence. The
+/// `.or()` below is the documented tie-break rule regardless.
+pub async fn build_reply_for_agent_with_artifact(
+    text: &str,
+    ctx: &ReplyContext,
+    agent_name: &str,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> (String, Option<serde_json::Value>) {
+    let (raw, operator_result_artifact) = build_reply_with_session_inner_capturing_operator_result(
         text,
         ctx,
         Some(agent_name),
@@ -997,10 +1079,13 @@ pub async fn build_reply_for_agent(
         on_progress,
     )
     .await;
+    let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
+    let artifact = pending_artifact.or(operator_result_artifact);
     let raw = crate::cli_noise::strip_cli_noise(&raw).text;
     let restored = restore_for_channel(raw, ctx, agent_name, session_id).await;
     let enforced = enforce_contract(restored, &ctx.home_dir, agent_name).await;
-    append_pending_agent_notice(enforced, &ctx.home_dir, agent_name)
+    let final_text = append_pending_agent_notice(enforced, &ctx.home_dir, agent_name);
+    (final_text, artifact)
 }
 
 /// Build a reply with session tracking and optional progress streaming.
@@ -1015,8 +1100,35 @@ pub async fn build_reply_with_session(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> String {
-    let raw =
-        build_reply_with_session_inner(text, ctx, None, session_id, user_id, on_progress).await;
+    build_reply_with_session_with_artifact(text, ctx, session_id, user_id, on_progress)
+        .await
+        .0
+}
+
+/// Identical to [`build_reply_with_session`] but also returns any O-4
+/// pending-op marker mapped to an O-3 chat-artifact — see
+/// [`build_reply_for_agent_with_artifact`]'s doc comment for the shared
+/// rationale (both are thin siblings of the same two-function split),
+/// including the Task C tie-break rule (pending marker `.or()` Guide-path
+/// result — structurally mutually exclusive in practice).
+pub async fn build_reply_with_session_with_artifact(
+    text: &str,
+    ctx: &ReplyContext,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> (String, Option<serde_json::Value>) {
+    let (raw, operator_result_artifact) = build_reply_with_session_inner_capturing_operator_result(
+        text,
+        ctx,
+        None,
+        session_id,
+        user_id,
+        on_progress,
+    )
+    .await;
+    let (raw, pending_artifact) = strip_operator_pending_marker(&raw);
+    let artifact = pending_artifact.or(operator_result_artifact);
     // WP11-A: last-line-of-defence filter for AI-runtime internal messages
     // (CLI TUI chrome, `CLAUDE_CODE_*` operator hints, paste/mode markers).
     // Placed here so every channel that funnels through `build_reply_*` is
@@ -1026,7 +1138,8 @@ pub async fn build_reply_with_session(
     let restored = restore_for_channel(raw, ctx, &agent_id, session_id).await;
     let enforced = enforce_contract(restored, &ctx.home_dir, &agent_id).await;
     let with_notice = append_pending_agent_notice(enforced, &ctx.home_dir, &agent_id);
-    append_branding_footer(with_notice, &ctx.home_dir, session_id).await
+    let final_text = append_branding_footer(with_notice, &ctx.home_dir, session_id).await;
+    (final_text, artifact)
 }
 
 /// WP1.4 (ecosystem, 2026-08-13 拍板): free-tier branding footer on
@@ -1529,6 +1642,50 @@ async fn build_reply_with_session_inner(
     }
     let agent_dir = agent.map(|a| a.dir.clone());
     let capabilities = agent.map(|a| a.config.capabilities.clone());
+
+    // ── O-4: system-operator routing ────────────────────────────────────
+    // ONLY for an agent explicitly opted in via `[capabilities]
+    // system_operator = true` (the same capability O-0's MCP dispatch gate
+    // requires) — every other agent skips this block entirely, so its reply
+    // path stays byte-identical to before this existed (fail-open by
+    // construction, not by exception handling). Placed after `agent_dir`/
+    // `capabilities` resolve and after the goal-intent precheck above (never
+    // races or overrides it — `os_operator::decide` returns `Continue` for
+    // anything the goal-intent path should keep owning).
+    //
+    // `ShortCircuit` returns immediately: clarify/pending/rejected replies
+    // are produced WITHOUT ever reaching the LLM, so a destructive intent
+    // structurally cannot be auto-executed by this turn. `Guide` instead
+    // carries a hint into the system prompt built further below (search
+    // `operator_guide_hint`) — the model still has to make the actual tool
+    // call, which still passes through every existing MCP gate unchanged.
+    let mut operator_guide_hint: Option<String> = None;
+    if capabilities.as_ref().map(|c| c.system_operator).unwrap_or(false) {
+        let os_intent_result =
+            crate::os_intent::route_os_intent(&ctx.home_dir, agent_dir.as_deref(), text).await;
+        match crate::os_operator::decide(&os_intent_result) {
+            crate::os_operator::OperatorAction::ShortCircuit(reply) => {
+                crate::os_operator::audit_operator_decision(
+                    &ctx.home_dir,
+                    &agent_id,
+                    text,
+                    &os_intent_result,
+                );
+                return reply;
+            }
+            crate::os_operator::OperatorAction::Guide { hint, .. } => {
+                crate::os_operator::audit_operator_decision(
+                    &ctx.home_dir,
+                    &agent_id,
+                    text,
+                    &os_intent_result,
+                );
+                operator_guide_hint = Some(hint);
+            }
+            crate::os_operator::OperatorAction::Continue => {}
+        }
+    }
+
     // G1: the agent's `[model] account_pool` narrows the rotator candidate set
     // (fail-open — see `AccountRotator::select_for_provider_with_pool`). Empty
     // when unset or when no agent resolved ⇒ rotation is unchanged.
@@ -2972,38 +3129,67 @@ async fn build_reply_with_session_inner(
         // this request's API path; don't re-send the ensemble id upstream.
         None if fallback_api_key.is_some() && !duduclaw_llm::is_moa_model_id(&model) => {
             let key = fallback_api_key.as_deref().unwrap_or_default();
-            match crate::direct_api::call_direct_api(
-                key,
-                &model,
-                &full_system_prompt,
-                &sanitized_text,
-                &[],
-            )
-            .await
-            {
-                Ok(resp) => {
-                    info!("Claude replied via Direct API ({} chars)", resp.text.len());
-                    Some(resp.text)
-                }
-                Err(e) => {
-                    let log_line = format!("[{}] direct API error: {e}\n", chrono::Utc::now());
-                    let _ = tokio::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(ctx.home_dir.join("debug.log"))
-                        .await
-                        .map(|mut f| {
-                            use tokio::io::AsyncWriteExt;
-                            tokio::spawn(async move {
-                                let _ = f.write_all(log_line.as_bytes()).await;
-                            });
-                        });
-                    warn!("Direct API unavailable: {e}");
-                    // Only overwrite if we don't already have a more specific CLI error.
-                    if last_cli_error.is_none() {
-                        last_cli_error = Some(e);
+            // P34 #4: a `system_operator`-capable agent gets one attempt at
+            // the real MCP tool loop before falling through to the plain
+            // tools-less call below. `is_operator` false (every other agent)
+            // ⇒ `operator_tool_reply` is `None` at zero extra cost, so this
+            // whole branch stays byte-identical to before for non-operator
+            // agents. See `try_operator_direct_api_tool_loop`'s doc comment
+            // for the full rationale and fail-safe contract.
+            let is_operator = capabilities
+                .as_ref()
+                .map(|c| c.system_operator)
+                .unwrap_or(false);
+            let operator_tool_reply = if is_operator {
+                try_operator_direct_api_tool_loop(
+                    &agent_id,
+                    key,
+                    &model,
+                    &full_system_prompt,
+                    &sanitized_text,
+                    capabilities.as_ref(),
+                )
+                .await
+            } else {
+                None
+            };
+            if let Some(text) = operator_tool_reply {
+                Some(text)
+            } else {
+                match crate::direct_api::call_direct_api(
+                    key,
+                    &model,
+                    &full_system_prompt,
+                    &sanitized_text,
+                    &[],
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        info!("Claude replied via Direct API ({} chars)", resp.text.len());
+                        Some(resp.text)
                     }
-                    None
+                    Err(e) => {
+                        let log_line =
+                            format!("[{}] direct API error: {e}\n", chrono::Utc::now());
+                        let _ = tokio::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(ctx.home_dir.join("debug.log"))
+                            .await
+                            .map(|mut f| {
+                                use tokio::io::AsyncWriteExt;
+                                tokio::spawn(async move {
+                                    let _ = f.write_all(log_line.as_bytes()).await;
+                                });
+                            });
+                        warn!("Direct API unavailable: {e}");
+                        // Only overwrite if we don't already have a more specific CLI error.
+                        if last_cli_error.is_none() {
+                            last_cli_error = Some(e);
+                        }
+                        None
+                    }
                 }
             }
         }
@@ -8042,6 +8228,21 @@ async fn spawn_claude_cli_with_env(
     // alongside the existing ToolUse/TodoUpdate progress emission below.
     let mut step_tracker = StepTracker::new();
 
+    // Task C (O-4 Guide-path result cards): only a `system_operator`-capable
+    // agent's turn pays for this — everyone else's stream loop takes the
+    // exact same branches it always did (byte-identical output). Reuses the
+    // WP-A4 pairing logic (`claude_runner::ingest_stream_json_event_for_native_tools`)
+    // instead of duplicating tool_use/tool_result matching a second time in
+    // this file; the resulting events are flushed into whatever
+    // `NATIVE_TOOL_COLLECTOR` scope the caller entered (see
+    // `build_reply_for_agent_with_artifact`/`build_reply_with_session_with_artifact`),
+    // same best-effort, scope-optional contract every other producer of that
+    // collector already relies on.
+    let operator_result_capture =
+        capabilities.map(|c| c.system_operator).unwrap_or(false);
+    let mut operator_native_events: Vec<crate::runtime::NativeToolEvent> = Vec::new();
+    let mut operator_open_calls: Vec<(String, usize)> = Vec::new();
+
     // R1: deterministic, zero-LLM-cost trajectory anomaly detector. Fed the
     // same start/end step stream as the dashboard tree. Default: report-only
     // (append high-severity signals to channel_failures.jsonl); it NEVER kills
@@ -8148,6 +8349,18 @@ async fn spawn_claude_cli_with_env(
                             if let Some(alarm) = foresight.check() {
                                 crate::foresight::emit_alarm(
                                     home_dir, &traj_agent, &traj_session, &alarm,
+                                );
+                            }
+
+                            // Task C: accumulate this event's tool_use/tool_result
+                            // into the operator-result collector — gated on
+                            // `operator_result_capture` so a non-operator agent's
+                            // loop never allocates or masks anything extra here.
+                            if operator_result_capture {
+                                crate::claude_runner::ingest_stream_json_event_for_native_tools(
+                                    &event,
+                                    &mut operator_native_events,
+                                    &mut operator_open_calls,
                                 );
                             }
 
@@ -8635,6 +8848,15 @@ async fn spawn_claude_cli_with_env(
         }
     }
 
+    // Task C: best-effort flush into whatever `NATIVE_TOOL_COLLECTOR` scope
+    // the caller entered (silent no-op with no scope, or for a non-operator
+    // agent whose loop above never populated this vec — see
+    // `extend_native_tool_events`'s own doc comment). Never affects the
+    // primary CLI response either way.
+    if operator_result_capture {
+        crate::runtime::extend_native_tool_events(operator_native_events);
+    }
+
     Ok(result_text)
 }
 
@@ -8850,6 +9072,44 @@ pub(crate) fn parse_claude_stream_json_complete(stdout: &str) -> Result<StreamPa
     })
 }
 
+/// R1 (2026-08): the PTY-pool (one-shot) sibling of the `tool_use`/
+/// `tool_result` pairing the fresh-spawn `spawn_claude_cli_with_env` stream
+/// loop does incrementally, line-by-line, as events arrive. Here the whole
+/// stream-json log is already buffered in `stdout` (same
+/// `--output-format stream-json --verbose` shape — see
+/// `parse_claude_stream_json_complete` just above, which walks the exact
+/// same lines), so this walks it once up front instead. Reuses
+/// `claude_runner::ingest_stream_json_event_for_native_tools` for the
+/// pairing itself rather than re-implementing it — the parsing loop here is
+/// the only new code, and it is a direct copy of
+/// `parse_claude_stream_json_complete`'s own line-splitting/JSON-parsing
+/// preamble (same tolerant "skip on parse failure" rule).
+///
+/// Pure and side-effect free (no `NATIVE_TOOL_COLLECTOR` interaction) so
+/// it's independently testable; the caller (`spawn_claude_cli_pty_with_env`)
+/// still gates the call on `operator_result_capture` itself, the same
+/// convention the fresh-spawn loop uses.
+pub(crate) fn collect_operator_native_events_from_stdout(
+    stdout: &str,
+) -> Vec<crate::runtime::NativeToolEvent> {
+    let mut events = Vec::new();
+    let mut open_calls: Vec<(String, usize)> = Vec::new();
+    for raw_line in stdout.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+            crate::claude_runner::ingest_stream_json_event_for_native_tools(
+                &event,
+                &mut events,
+                &mut open_calls,
+            );
+        }
+    }
+    events
+}
+
 /// Compose the args + env that the legacy `spawn_claude_cli_with_env`
 /// passes to `tokio::process::Command`. Extracted so the PTY variant can
 /// drive an identical CLI invocation.
@@ -8952,6 +9212,20 @@ async fn spawn_claude_cli_pty_with_env(
 ) -> Result<String, String> {
     let claude_path =
         duduclaw_core::which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
+
+    // R1 (2026-08): PTY-pool sibling of the Task C wiring in
+    // `spawn_claude_cli_with_env` above. This API-key one-shot PTY branch
+    // (the OTHER `[runtime] pty_pool_enabled = true` branch — OAuth's
+    // interactive REPL, see `invoke_pty_branch` below — is a different
+    // protocol with no stream-json event log reaching this file at all, so
+    // it is NOT covered by this change) was the one PTY sub-path that never
+    // fed `NATIVE_TOOL_COLLECTOR`, so a `system_operator` agent's Guide-path
+    // result card silently never appeared for API-key accounts on
+    // PTY-pool. Reuses the exact same gate + pairing function as the
+    // fresh-spawn path (`claude_runner::ingest_stream_json_event_for_native_tools`)
+    // — a non-`system_operator` agent's call pays nothing extra here.
+    let operator_result_capture =
+        capabilities.map(|c| c.system_operator).unwrap_or(false);
 
     // Install agent-file-guard hook (parity with the streaming variant). When
     // work_dir is set, this is a per-agent dir; otherwise skip.
@@ -9093,6 +9367,17 @@ async fn spawn_claude_cli_pty_with_env(
     };
     drop(prompt_guard); // tempfile lives until here
 
+    // R1: this one-shot path has no live stream to hook mid-flight (unlike
+    // `spawn_claude_cli_with_env`'s `tokio::select!` loop) — `output.stdout`
+    // is the same newline-delimited stream-json event log, just captured
+    // whole instead of line-by-line. Gated on `operator_result_capture` so a
+    // non-operator agent's call does zero extra parsing or allocation here.
+    let operator_native_events: Vec<crate::runtime::NativeToolEvent> = if operator_result_capture {
+        collect_operator_native_events_from_stdout(&output.stdout)
+    } else {
+        Vec::new()
+    };
+
     let parsed = parse_claude_stream_json_complete(&output.stdout)?;
     let text = parsed.text.trim().to_string();
     if text.is_empty() {
@@ -9135,6 +9420,17 @@ async fn spawn_claude_cli_pty_with_env(
                 )
                 .await;
         }
+    }
+
+    // R1: best-effort flush into whatever `NATIVE_TOOL_COLLECTOR` scope the
+    // caller entered — silent no-op with no scope, or for a non-operator
+    // agent whose loop above never populated this vec (same contract as the
+    // fresh-spawn flush; see `extend_native_tool_events`'s own doc comment).
+    // Only reached on the success path — the early `?`/empty-response
+    // returns above skip it, matching the fresh-spawn path's behavior of
+    // never producing a card for a failed/empty turn.
+    if operator_result_capture {
+        crate::runtime::extend_native_tool_events(operator_native_events);
     }
 
     Ok(text)
@@ -9402,6 +9698,46 @@ async fn invoke_pty_branch(
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<String, String> {
+    // P34 #3: a `system_operator`-capable agent's OAuth turn skips the
+    // interactive-REPL branch below entirely and falls straight through to
+    // the fresh-spawn `-p` primitive (same as the API-key branch, same as
+    // every agent when `pty_pool_enabled` is off — this is not a new code
+    // path, just routing a specific (agent, auth-method) combination onto
+    // an already-proven one). Reason: `PtySession`'s sentinel-framed
+    // protocol structurally never surfaces `tool_use`/`tool_result` events
+    // to this file (see the R1-residual note further down, kept below for
+    // the non-operator case) — an operator's Guide-path result card would
+    // be silently unavailable forever on this branch, not just "fail-closed
+    // once". Anthropic's OAuth `-p` block that originally motivated the PTY
+    // pool was paused shortly after it was announced, so fresh-spawn `-p` is
+    // a fully functional OAuth path today — every OAuth account already goes
+    // through it whenever `pty_pool_enabled` is off (the default), via the
+    // identical `spawn_claude_cli_with_env` call in `call_claude_cli_rotated`
+    // above. This guard costs nothing beyond losing the long-lived REPL's
+    // session reuse for operator turns specifically. Gate is
+    // `system_operator` only; every other agent's OAuth+PTY-pool routing
+    // below is byte-identical.
+    if should_route_operator_to_fresh_spawn(env_vars, capabilities) {
+        info!(
+            agent_id = %agent_id_from_work_dir(work_dir),
+            "channel_reply: system_operator agent — routing OAuth invoke through \
+             fresh-spawn `-p` instead of the interactive PTY REPL (Guide-path \
+             result capture requires stream-json tool events the REPL protocol \
+             doesn't expose)"
+        );
+        return spawn_claude_cli_with_env(
+            user_message,
+            model,
+            system_prompt,
+            home_dir,
+            work_dir,
+            on_progress,
+            capabilities,
+            env_vars,
+            None,
+        )
+        .await;
+    }
     if env_vars_indicate_oauth(env_vars) {
         // OAuth → interactive REPL. The bootstrap protocol + sentinel
         // pairing is owned by `PtySession`; we feed it the user message
@@ -9433,6 +9769,21 @@ async fn invoke_pty_branch(
             "channel_reply: routing OAuth invoke through interactive PTY pool"
         );
         let _ = (system_prompt, home_dir, on_progress, capabilities);
+        // R1 residual (2026-08), narrowed by P34 #3: `capabilities` is
+        // discarded below because `acquire_and_invoke_with` returns only the
+        // final answer `String` (see its signature in `pty_runtime.rs`),
+        // never the underlying stream-json event log — the interactive
+        // REPL's sentinel-framed protocol is owned by
+        // `duduclaw-cli-runtime::PtySession` and structurally doesn't surface
+        // individual `tool_use`/`tool_result` events to this file at all.
+        // A `system_operator` agent never reaches this branch any more (see
+        // the `operator_skips_pty_repl` guard above this OAuth check, which
+        // routes it to fresh-spawn `-p` instead, where Guide-path result
+        // capture works same as the API-key branch below). The residual gap
+        // described here is therefore scoped to non-operator agents, whose
+        // reply text is all this branch ever needed to produce anyway.
+        // Closing it fully would require exposing tool events from
+        // `PtySession`/`duduclaw-cli-runtime`, out of this file's scope.
         // Unbind from hardcoded Claude: derive the PtyPool kind from the agent's
         // configured provider. This OAuth interactive-REPL path is only reached
         // for Claude today (non-Claude providers route through `runtime_dispatch`
@@ -9543,6 +9894,19 @@ fn account_log_tag(account_id: &str) -> String {
     let digest = Sha256::digest(account_id.as_bytes());
     let bytes = &digest[..4];
     hex::encode(bytes)
+}
+
+/// P34 #3: pure routing decision — should this turn skip the PTY-pool
+/// OAuth interactive REPL and go straight to fresh-spawn `-p` instead? True
+/// only when both this env indicates an OAuth account AND the agent is
+/// `system_operator`-capable. Extracted as a standalone pure function (no
+/// I/O, no process spawn) so the decision is unit-testable in isolation —
+/// see `invoke_pty_branch` for the rationale and the call site.
+fn should_route_operator_to_fresh_spawn(
+    env_vars: &std::collections::HashMap<String, String>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> bool {
+    env_vars_indicate_oauth(env_vars) && capabilities.map(|c| c.system_operator).unwrap_or(false)
 }
 
 /// True when `env_vars` was emitted for an OAuth account by the rotator
@@ -9660,6 +10024,265 @@ pub async fn call_direct_api_delegate(
     let resp =
         crate::direct_api::call_direct_api(&api_key, model, system_prompt, prompt, &[]).await?;
     Ok(resp.text)
+}
+
+/// P34 #4: give a `system_operator`-capable agent real tool-calling ability
+/// on the user-facing Direct-API fallback (the branch above always sends an
+/// empty tool list, so an operator's `os_intent`/`os_operator` Guide hint —
+/// see `operator_guide_hint` further up this file — could never actually be
+/// acted on when a turn landed here: `call_direct_api`/`call_direct_api_attributed`
+/// (this file) build a hand-rolled Anthropic Messages request with no `tools`
+/// field at all, and the *dispatcher-side* Direct-API path
+/// (`claude_runner::try_direct_api`) has the identical limitation for
+/// Anthropic models — it explicitly keeps this file's tools-less handler for
+/// its cache attribution and only routes non-Anthropic providers through the
+/// MCP tool loop. `duduclaw_llm::providers::AnthropicProvider` already
+/// implements the tool-capable `ChatProvider` trait — it was written to
+/// "absorb the cache-placement behavior of ... `direct_api.rs`" (see that
+/// module's doc comment) for exactly this kind of caller — but had zero
+/// production call sites anywhere in the gateway before this. The wiring
+/// below mirrors the already-proven pattern used by
+/// `runtime/openai_compat.rs::execute_with_tools` and
+/// `local_llm::try_local_tool_loop`: build an MCP `ToolRegistry`, apply the
+/// same fail-closed capability filter (G2) and static `PolicyKernel` policy
+/// (I3) every other tool-loop caller applies, then drive
+/// `duduclaw_llm::run_tool_loop_with_provenance`.
+///
+/// Returns `Some(text)` only on a successful, non-empty tool-loop answer.
+/// Every other outcome returns `None` so the caller falls back to the plain
+/// `call_direct_api` call exactly as it did before this function existed
+/// (fail-safe, same contract as `local_llm::try_local_tool_loop`):
+/// - the MCP registry failed to spawn/handshake/list;
+/// - the capability filter left no tools (fail-closed — never re-seeds from
+///   the unfiltered registry);
+/// - the loop itself errored, or finished with empty answer text.
+///
+/// Gate: the ONLY caller is the `system_operator` branch inside
+/// `build_reply_with_session_inner`'s Direct-API fallback — every other
+/// agent's Direct-API path never calls this function, so its behavior is
+/// byte-identical to before. The O-0/O-4 MCP dispatch gates, capability
+/// scopes, and audit trail are unchanged: every dispatched call still goes
+/// through the same spawned `duduclaw mcp-server` subprocess and its
+/// existing enforcement, exactly as the CLI path already does — this
+/// function only decides whether a tool CAN be offered to the model, never
+/// whether a call is allowed to execute.
+///
+/// Build the normalized [`duduclaw_llm::ChatRequest`] for the operator tool
+/// loop: system prompt segmented on the same cache-breakpoint marker as this
+/// file's tools-less path (`split_system_segments`), then the current user
+/// message, then the pre-filtered tool defs. Pure and I/O-free — extracted
+/// out of `try_operator_direct_api_tool_loop` (which also spawns an MCP
+/// subprocess and makes the HTTP call) purely so this piece is directly
+/// unit-testable, mirroring `runtime/openai_compat.rs::build_tool_chat_request`
+/// and `local_llm.rs::flatten_chat_request`.
+fn build_operator_tool_chat_request(
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    tools: Vec<duduclaw_llm::ToolDef>,
+) -> duduclaw_llm::ChatRequest {
+    let mut req = duduclaw_llm::ChatRequest::new(model.to_string());
+    for seg in crate::direct_api::split_system_segments(system_prompt) {
+        req.system.push(duduclaw_llm::SystemBlock::cached(seg));
+    }
+    req.messages
+        .push(duduclaw_llm::ChatMessage::user(user_prompt.to_string()));
+    req.tools = tools;
+    req
+}
+
+async fn try_operator_direct_api_tool_loop(
+    agent_id: &str,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> Option<String> {
+    // Phase A — MCP tool registry (fail-safe: any spawn/handshake/list
+    // failure ⇒ None ⇒ caller degrades to the plain tools-less call).
+    let registry = crate::claude_runner::build_mcp_tool_registry(agent_id).await?;
+    let tools = crate::claude_runner::filter_tool_defs(registry.tool_defs(), capabilities);
+    if tools.is_empty() {
+        info!(
+            agent = %agent_id,
+            "operator Direct-API tool loop skipped — capability filter left no tools"
+        );
+        return None;
+    }
+
+    let auth = duduclaw_llm::ApiAuth::new(api_key.to_string());
+    let provider = duduclaw_llm::providers::AnthropicProvider::new(auth);
+
+    let req = build_operator_tool_chat_request(model, system_prompt, user_prompt, tools);
+
+    // Fail-closed capability filter already ran above; this is the static
+    // PolicyKernel layer (complete mediation, I3) every other tool-loop
+    // caller applies on top of it. Empty policy ⇒ the kernel abstains
+    // (passthrough) — byte-identical to no policy.
+    let empty_policy: Vec<duduclaw_core::types::ToolPolicy> = Vec::new();
+    let policy = capabilities
+        .map(|c| c.policy.as_slice())
+        .unwrap_or(&empty_policy);
+    let guarded = duduclaw_llm::PolicyExecutor::new(&registry, policy, agent_id);
+
+    let loop_result = duduclaw_llm::run_tool_loop_with_provenance(
+        &provider,
+        req,
+        &guarded,
+        duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
+        duduclaw_llm::ProvenanceConfig::default(),
+    )
+    .await;
+
+    match loop_result {
+        Ok(outcome) => {
+            let text = outcome.response.text();
+            if text.trim().is_empty() {
+                warn!(
+                    agent = %agent_id,
+                    stop = ?outcome.response.stop,
+                    "operator Direct-API tool loop returned empty text — falling back to plain call"
+                );
+                return None;
+            }
+            // R1 parity: feed the same best-effort NATIVE_TOOL_COLLECTOR sink
+            // every other tool-loop producer uses (openai-compat / local /
+            // claude_runner's non-Anthropic Direct-API path) — a Guide-path
+            // result card can render whenever the caller happens to be
+            // scoped, with the identical caveat as those paths: a silent
+            // no-op outside a scoped caller, never a failure.
+            crate::runtime::extend_native_tool_events(
+                outcome
+                    .tool_calls
+                    .into_iter()
+                    .map(|c| crate::runtime::NativeToolEvent {
+                        tool_name: c.tool_name,
+                        success: c.success,
+                        result_text: c.result_text,
+                        input_text: c.input_text,
+                    })
+                    .collect(),
+            );
+            info!(
+                agent = %agent_id,
+                model,
+                "operator answered Direct-API fallback via MCP tool loop"
+            );
+            Some(text)
+        }
+        Err(e) => {
+            warn!(
+                agent = %agent_id,
+                error = %e,
+                "operator Direct-API tool loop failed — falling back to plain call"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod operator_direct_api_tool_loop_tests {
+    use super::build_operator_tool_chat_request;
+    use duduclaw_core::types::CapabilitiesConfig;
+    use duduclaw_llm::{CacheHint, ContentPart, Role, ToolDef};
+
+    fn dummy_tool(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            description: "test tool".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    // ── build_operator_tool_chat_request (pure, no I/O) ─────────────────
+
+    #[test]
+    fn request_carries_model_user_message_and_tools() {
+        let req = build_operator_tool_chat_request(
+            "claude-sonnet-5",
+            "you are an operator",
+            "list files",
+            vec![dummy_tool("os_list_dir")],
+        );
+        assert_eq!(req.model, "claude-sonnet-5");
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, "os_list_dir");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(
+            req.messages[0].parts,
+            vec![ContentPart::Text("list files".to_string())]
+        );
+    }
+
+    #[test]
+    fn system_prompt_without_marker_becomes_one_cached_block() {
+        let req = build_operator_tool_chat_request(
+            "m",
+            "single static system prompt",
+            "hi",
+            Vec::new(),
+        );
+        assert_eq!(req.system.len(), 1);
+        // `split_system_segments` normalizes trailing whitespace per line via
+        // `normalize_system_prompt`, appending one trailing `\n` for a
+        // single-line input — the same normalization the tools-less
+        // `direct_api.rs` path already applies (see its own test suite).
+        assert_eq!(req.system[0].text, "single static system prompt\n");
+        // `split_system_segments` cache-marks every segment it emits — same
+        // "system_and_3" cache strategy as the tools-less `direct_api.rs`
+        // path this function mirrors.
+        assert_eq!(req.system[0].cache, CacheHint::Explicit);
+    }
+
+    #[test]
+    fn system_prompt_with_cache_split_marker_becomes_multiple_blocks() {
+        let system = format!(
+            "static soul{}semi-stable wiki",
+            duduclaw_llm::CACHE_SPLIT_MARKER
+        );
+        let req = build_operator_tool_chat_request("m", &system, "hi", Vec::new());
+        assert_eq!(req.system.len(), 2);
+        // Trailing `\n` per segment — see the normalization note above.
+        assert_eq!(req.system[0].text, "static soul\n");
+        assert_eq!(req.system[1].text, "semi-stable wiki\n");
+    }
+
+    #[test]
+    fn empty_tools_produces_empty_tool_list_on_the_request() {
+        // Exercised only via the `system_operator` caller — this asserts the
+        // request-building piece itself has no hidden default that would
+        // re-populate `req.tools` (that would defeat the fail-closed
+        // capability filter applied by the caller before this is invoked).
+        let req = build_operator_tool_chat_request("m", "sys", "hi", Vec::new());
+        assert!(req.tools.is_empty());
+    }
+
+    // ── non-operator gate parity (matches the call site's inline check) ─
+
+    #[test]
+    fn default_capabilities_are_not_system_operator() {
+        // The Direct-API fallback's `is_operator` gate is a plain
+        // `capabilities.map(|c| c.system_operator).unwrap_or(false)` inline
+        // at the call site (matching the same pattern used by the O-4 /
+        // Task-C / R1 gates elsewhere in this file) — this pins the default
+        // so every agent without an explicit `system_operator = true` never
+        // reaches `try_operator_direct_api_tool_loop`, keeping its
+        // Direct-API path byte-identical to before P34.
+        let caps = CapabilitiesConfig::default();
+        assert!(!caps.system_operator);
+    }
+
+    #[test]
+    fn explicit_system_operator_capability_is_true() {
+        let caps = CapabilitiesConfig {
+            system_operator: true,
+            ..Default::default()
+        };
+        assert!(caps.system_operator);
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -10743,6 +11366,155 @@ mod stream_json_parser_tests {
     }
 }
 
+// R1 (2026-08) — PTY-pool Guide-path result card tests ─────────────────────
+//
+// `collect_operator_native_events_from_stdout` is the PTY-pool (one-shot)
+// sibling of the fresh-spawn stream loop's per-event
+// `ingest_stream_json_event_for_native_tools` calls (see
+// `spawn_claude_cli_with_env` / `spawn_claude_cli_pty_with_env` above). These
+// tests pin: (1) the buffered-stdout tool_use/tool_result pairing works the
+// same as the streaming variant already tested in
+// `claude_runner::native_tool_collector_tests`, and (2) piping a destructive
+// tool's events through the SAME pairing + `os_operator` extraction the
+// production code uses never yields a result card — that guarantee lives in
+// `os_operator::readonly_result_tool_name`'s allowlist (untouched by this
+// change), exercised here end-to-end from the PTY-pool entry point. The
+// `operator_result_capture` gate itself (a non-operator agent's call never
+// even reaches this function) is a plain `if` at the `spawn_claude_cli_pty_with_env`
+// call site, structurally identical to the fresh-spawn gate — nothing to
+// mock there beyond what `CapabilitiesConfig` already covers.
+#[cfg(test)]
+mod pty_operator_result_capture_tests {
+    use super::collect_operator_native_events_from_stdout;
+
+    fn line(json: &str) -> String {
+        format!("{json}\n")
+    }
+
+    /// A read-only `os_*` tool call, buffered exactly like PTY-pool's
+    /// one-shot `output.stdout` would carry it — must pair and then map to
+    /// an O-3 artifact via the same `os_operator` function the fresh-spawn
+    /// path uses.
+    #[test]
+    fn readonly_os_tool_pairs_and_yields_artifact() {
+        let stdout = String::new()
+            + &line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"os_device_status","input":{}}]}}"#,
+            )
+            + &line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","is_error":false,"content":"{}"}]}}"#,
+            );
+        let events = collect_operator_native_events_from_stdout(&stdout);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "os_device_status");
+        assert!(events[0].success);
+
+        let artifact = crate::os_operator::extract_readonly_result_artifact(&events)
+            .expect("readonly os_* tool result must map to an artifact");
+        assert_eq!(artifact["type"], "device_status");
+    }
+
+    /// A destructive/write tool (`os_power`) must pair into a `NativeToolEvent`
+    /// just like any other tool (the collector itself does not filter by
+    /// tool identity — see its doc comment), but MUST NOT produce a result
+    /// card: `os_operator::readonly_result_tool_name` only allowlists
+    /// read-only tools, fail-closed for everything else.
+    #[test]
+    fn destructive_os_tool_pairs_but_yields_no_artifact() {
+        let stdout = String::new()
+            + &line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_2","name":"os_power","input":{"action":"shutdown"}}]}}"#,
+            )
+            + &line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_2","is_error":false,"content":"{\"ok\":true}"}]}}"#,
+            );
+        let events = collect_operator_native_events_from_stdout(&stdout);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "os_power");
+        assert!(events[0].success, "the call itself succeeded");
+
+        assert!(
+            crate::os_operator::extract_readonly_result_artifact(&events).is_none(),
+            "a destructive tool must never produce a Guide-path result card"
+        );
+    }
+
+    /// Only the LAST successful read-only result wins when several tool
+    /// calls happen in one turn — same "last wins" contract
+    /// `extract_readonly_result_artifact` documents, exercised via the
+    /// buffered PTY-pool entry point instead of the streaming one.
+    #[test]
+    fn multiple_tool_calls_last_readonly_result_wins() {
+        let stdout = String::new()
+            + &line(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"查一下狀態"},{"type":"tool_use","id":"tu_1","name":"os_network_info","input":{}}]}}"#,
+            )
+            + &line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","is_error":false,"content":"{\"interfaces\":[]}"}]}}"#,
+            )
+            + &line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_2","name":"os_device_status","input":{}}]}}"#,
+            )
+            + &line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_2","is_error":false,"content":"{}"}]}}"#,
+            )
+            + &line(r#"{"type":"result","subtype":"success","result":"完成"}"#);
+        let events = collect_operator_native_events_from_stdout(&stdout);
+        assert_eq!(events.len(), 2);
+        let artifact = crate::os_operator::extract_readonly_result_artifact(&events)
+            .expect("must yield the last readonly result");
+        assert_eq!(artifact["type"], "device_status");
+    }
+
+    /// Empty stdout (e.g. a PTY spawn that produced nothing before the
+    /// caller's own empty-response check fires) must never panic and must
+    /// collect zero events — parity with `parse_claude_stream_json_complete`'s
+    /// `returns_empty_text_when_no_events_present`.
+    #[test]
+    fn empty_stdout_yields_no_events() {
+        let events = collect_operator_native_events_from_stdout("");
+        assert!(events.is_empty());
+    }
+
+    /// Blank lines and unparseable JSON must be skipped, not panic — same
+    /// tolerance `parse_claude_stream_json_complete` and the fresh-spawn
+    /// stream loop both rely on (a CLI's stdout can be interleaved with
+    /// noise on some platforms).
+    #[test]
+    fn ignores_blank_lines_and_invalid_json() {
+        let stdout = String::new()
+            + "\n"
+            + "not-json-at-all\n"
+            + &line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            )
+            + "  \n"
+            + &line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","is_error":false,"content":"ok"}]}}"#,
+            );
+        let events = collect_operator_native_events_from_stdout(&stdout);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "Bash");
+    }
+
+    /// CRLF line endings (Windows PTY output) must parse identically to LF —
+    /// same guarantee `parse_claude_stream_json_complete::handles_crlf_line_endings`
+    /// already pins for the text-extraction half of this same buffered
+    /// `output.stdout`.
+    #[test]
+    fn handles_crlf_line_endings() {
+        let stdout = format!(
+            "{a}\r\n{b}\r\n",
+            a = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"os_device_status","input":{}}]}}"#,
+            b = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","is_error":false,"content":"{}"}]}}"#,
+        );
+        let events = collect_operator_native_events_from_stdout(&stdout);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].success);
+        assert!(crate::os_operator::extract_readonly_result_artifact(&events).is_some());
+    }
+}
+
 // Phase 3.C.4 routing-helper tests ────────────────────────────────────────
 //
 // These unit tests replace the manual "gray rollout" validation step by
@@ -10754,7 +11526,11 @@ mod stream_json_parser_tests {
 // smoke harness.
 #[cfg(test)]
 mod routing_helper_tests {
-    use super::{account_id_from_env_vars, agent_id_from_work_dir, env_vars_indicate_oauth};
+    use super::{
+        account_id_from_env_vars, agent_id_from_work_dir, env_vars_indicate_oauth,
+        should_route_operator_to_fresh_spawn,
+    };
+    use duduclaw_core::types::CapabilitiesConfig;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -10799,6 +11575,78 @@ mod routing_helper_tests {
         // which uses ambient auth (API key from config or env).
         let env: HashMap<String, String> = HashMap::new();
         assert!(!env_vars_indicate_oauth(&env));
+    }
+
+    // ── P34 #3: system_operator OAuth → fresh-spawn routing decision ────
+
+    fn oauth_env() -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        env
+    }
+
+    fn api_key_env() -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            ["sk-", "ant-", "real-key-value"].concat(),
+        );
+        env
+    }
+
+    fn operator_caps() -> CapabilitiesConfig {
+        CapabilitiesConfig {
+            system_operator: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn operator_oauth_turn_routes_to_fresh_spawn() {
+        let caps = operator_caps();
+        assert!(should_route_operator_to_fresh_spawn(
+            &oauth_env(),
+            Some(&caps)
+        ));
+    }
+
+    #[test]
+    fn non_operator_oauth_turn_stays_on_pty_repl() {
+        // Default capabilities ⇒ system_operator = false ⇒ every other
+        // agent's OAuth+PTY-pool routing is byte-identical to before P34.
+        let caps = CapabilitiesConfig::default();
+        assert!(!should_route_operator_to_fresh_spawn(
+            &oauth_env(),
+            Some(&caps)
+        ));
+    }
+
+    #[test]
+    fn operator_api_key_turn_does_not_trip_the_guard() {
+        // The guard is OAuth-specific — an operator's API-key branch already
+        // has result capture (spawn_claude_cli_pty_with_env), so this must
+        // stay false and let the existing API-key branch run unmodified.
+        let caps = operator_caps();
+        assert!(!should_route_operator_to_fresh_spawn(
+            &api_key_env(),
+            Some(&caps)
+        ));
+    }
+
+    #[test]
+    fn no_capabilities_never_trips_the_guard() {
+        // No agent resolved (capabilities = None) must behave exactly like
+        // non-operator: fail-closed to the existing PTY-REPL behavior.
+        assert!(!should_route_operator_to_fresh_spawn(&oauth_env(), None));
+    }
+
+    #[test]
+    fn non_operator_api_key_turn_does_not_trip_the_guard() {
+        let caps = CapabilitiesConfig::default();
+        assert!(!should_route_operator_to_fresh_spawn(
+            &api_key_env(),
+            Some(&caps)
+        ));
     }
 
     #[test]

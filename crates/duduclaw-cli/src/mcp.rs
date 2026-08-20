@@ -1862,6 +1862,94 @@ const TOOLS: &[ToolDef] = &[
             Requires the agent's [capabilities] os_native = true.",
         params: &[],
     },
+    // ── O-0: system-operator tool face — device.*/system.* bridge ─────────
+    // Design: commercial/docs/DESIGN-agent-os-native-apps-2026-08.md §6.3 O-0.
+    // Every tool here requires Admin scope (fail-closed default for an
+    // unmapped tool is already Admin — see `mcp_auth::tool_requires_scope`;
+    // these are mapped explicitly for clarity/lockability). The four
+    // `device.*`-backed read tools additionally require
+    // `duduclaw_core::is_appliance()`; `os_system_status`/`os_check_update`/
+    // `os_doctor_repair` do not (their underlying dashboard RPCs have no
+    // appliance requirement either). Destructive ops require
+    // `"confirm": true`; `os_factory_reset` additionally routes through
+    // ApprovalBroker. See `mcp_os_ops.rs` module doc for the full gate
+    // rationale and the cross-process constraints that shape these tools.
+    ToolDef {
+        name: "os_device_status",
+        description: "Read the appliance's CPU/RAM/disk/temperature/uptime/network snapshot. \
+            admin, appliance-only. Bridges the dashboard-only device.status RPC to agents (O-0).",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_system_status",
+        description: "Read a reduced system status snapshot (version, configured agent count, \
+            appliance flag, edition profile, best-effort channel connection count). admin. \
+            Live-only fields (uptime, exact connection state) are unavailable to this out-of-process \
+            tool and are omitted — see the returned `note`. Bridges system.status to agents (O-0).",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_check_update",
+        description: "Check for an available duduclaw self-update AND (appliance only) an available \
+            OS image update. admin. Bridges system.check_update + device.update_status to agents (O-0).",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_backup_list",
+        description: "List device backups stored under <home>/backups/. admin, appliance-only. \
+            Bridges the dashboard-only device.backup_list RPC to agents (O-0).",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_network_info",
+        description: "Read the appliance's network interfaces. admin, appliance-only. \
+            Bridges the dashboard-only device.network RPC to agents (O-0).",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_apply_update",
+        description: "Apply an update. admin; destructive (changes running binary or OS image). \
+            Requires `target`: \"device\" (appliance-only OS image update via duduclaw-sysd, no confirm \
+            required — mirrors device.update_apply) or \"system\" (duduclaw self-update, no confirm \
+            required — mirrors system.apply_update). Bridges both RPCs to agents (O-0).",
+        params: &[
+            ParamDef { name: "target", description: "\"device\" or \"system\" — which update to apply", required: true },
+        ],
+    },
+    ToolDef {
+        name: "os_backup_create",
+        description: "Archive the device's writable data partition for download. admin, appliance-only. \
+            Bridges the dashboard-only device.backup_create RPC to agents (O-0).",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_power",
+        description: "Restart or shut down the appliance. admin, appliance-only, destructive: requires \
+            confirm:true (mirrors device.power's require_confirm!() gate exactly). \
+            Bridges the dashboard-only device.power RPC to agents (O-0).",
+        params: &[
+            ParamDef { name: "action", description: "\"restart\" or \"shutdown\"", required: true },
+            ParamDef { name: "confirm", description: "Must be true — this is destructive", required: true },
+        ],
+    },
+    ToolDef {
+        name: "os_factory_reset",
+        description: "Wipe device state and re-provision on next boot. admin, appliance-only, \
+            IRREVERSIBLE: requires confirm:true AND live human approval via ApprovalBroker (a NEW gate \
+            beyond the dashboard RPC's confirm-only check — an agent-issued confirm:true is not a human \
+            decision the way a dashboard click is). Bridges the dashboard-only device.factory_reset RPC \
+            to agents (O-0).",
+        params: &[
+            ParamDef { name: "confirm", description: "Must be true — this is irreversible", required: true },
+        ],
+    },
+    ToolDef {
+        name: "os_doctor_repair",
+        description: "Run a reduced set of health checks (config file / agents / API key / MCP server \
+            cold-start) with repair hints. admin. Bridges a subset of system.doctor_repair to agents \
+            (O-0) — omits the dashboard's container_runtime/grok_cli probes (non-gate-relevant, heavier).",
+        params: &[],
+    },
     // ── Recording → skill (WP3.3; requires [capabilities] recording = true) ──
     ToolDef {
         name: "browser_record_start",
@@ -7434,7 +7522,11 @@ fn install_approval_required(agent_dir: &Path, tool_name: &str, _caller_is_admin
 }
 
 /// Outcome of an install-class approval gate.
-enum InstallApprovalOutcome {
+///
+/// `pub(crate)`: also reused (unchanged) by `mcp_os_ops::require_factory_reset_approval`
+/// (O-0) so the `os_factory_reset` MCP tool's ApprovalBroker gate shares the
+/// exact same fail-closed polling semantics instead of re-deriving them.
+pub(crate) enum InstallApprovalOutcome {
     /// Admin caller, no gate, or an explicit approval was granted.
     Proceed,
     /// Denied / expired / broker-unavailable — carries a zh-TW user message.
@@ -7444,8 +7536,9 @@ enum InstallApprovalOutcome {
 /// Run one approval round against a broker: request → block on decision.
 /// Denial, TTL-expiry, and request failure all map to `Denied` (fail-closed).
 /// Split out from [`gate_install_approval`] so tests can drive it with an
-/// in-memory broker and a short TTL/poll.
-async fn run_install_approval(
+/// in-memory broker and a short TTL/poll. `pub(crate)`: see
+/// [`InstallApprovalOutcome`]'s doc comment.
+pub(crate) async fn run_install_approval(
     broker: &duduclaw_gateway::approval::ApprovalBroker,
     agent_id: &str,
     summary: &str,
@@ -10244,6 +10337,22 @@ pub(crate) async fn handle_tools_call(
             | "desktop_record_start"
             | "desktop_record_stop"
             | "skill_from_recording"
+            // O-0 system-operator tool face: EVERY os_* system tool is
+            // audited on success, not just the destructive ones — design
+            // §6.4 "操作透明：操作員做完主動回報做了什麼（audit-transparent）"
+            // treats "an agent queried/changed the physical machine's state"
+            // as audit-worthy on its own, unlike high-frequency reads like
+            // memory_search which deliberately stay out of this list.
+            | "os_device_status"
+            | "os_system_status"
+            | "os_check_update"
+            | "os_backup_list"
+            | "os_network_info"
+            | "os_apply_update"
+            | "os_backup_create"
+            | "os_power"
+            | "os_factory_reset"
+            | "os_doctor_repair"
     );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
@@ -10482,6 +10591,22 @@ pub(crate) async fn handle_tools_call(
         "os_frontmost" => handle_os_frontmost().await,
         "os_spotlight_search" => handle_os_spotlight_search(&arguments).await,
         "os_calendar_today" => handle_os_calendar_today().await,
+        // O-0: system-operator tool face (device.*/system.* bridge). Admin
+        // scope is enforced upstream in mcp_dispatch (`tool_requires_scope`);
+        // appliance/confirm/ApprovalBroker gates live inside each handler —
+        // see `mcp_os_ops.rs` module doc.
+        "os_device_status" => crate::mcp_os_ops::handle_os_device_status(home_dir).await,
+        "os_system_status" => crate::mcp_os_ops::handle_os_system_status(home_dir).await,
+        "os_check_update" => crate::mcp_os_ops::handle_os_check_update().await,
+        "os_backup_list" => crate::mcp_os_ops::handle_os_backup_list(home_dir).await,
+        "os_network_info" => crate::mcp_os_ops::handle_os_network_info().await,
+        "os_apply_update" => crate::mcp_os_ops::handle_os_apply_update(&arguments, home_dir).await,
+        "os_backup_create" => crate::mcp_os_ops::handle_os_backup_create(home_dir).await,
+        "os_power" => crate::mcp_os_ops::handle_os_power(&arguments).await,
+        "os_factory_reset" => {
+            crate::mcp_os_ops::handle_os_factory_reset(&arguments, home_dir, caller_client_id).await
+        }
+        "os_doctor_repair" => crate::mcp_os_ops::handle_os_doctor_repair(home_dir).await,
         // Recording → skill tools (WP3.3). The [capabilities] recording gate +
         // Scope::Recording are enforced upstream in mcp_dispatch (fail-closed);
         // these handlers are the mechanism. Recording ownership follows the

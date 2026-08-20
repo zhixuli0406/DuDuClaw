@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 #![allow(unused_mut)]
 #![allow(unused_variables)]
 #![allow(clippy::collapsible_if)]
@@ -34,6 +34,13 @@ pub mod access_control;
 pub mod agent_binding;
 pub mod agent_hook_installer;
 pub mod auth;
+// ── WP-B: appliance-image device management (`device.*` dashboard RPCs) ──
+pub mod device;
+pub mod device_ops;
+// ── WP-G1: scheduled backups + device-migration restore ──────────────────
+pub mod backup_restore;
+pub mod backup_schedule;
+pub mod watchdog;
 pub mod channel_alerts;
 pub mod channel_capabilities;
 pub mod channel_format;
@@ -97,6 +104,12 @@ pub mod tick_headers;
 pub mod tick_source;
 pub mod tick_source_poll;
 pub mod tick_source_ws;
+// WP-E2: box-side relay client (crates/duduclaw-relay's WebSocket
+// counterpart) — reuses tick_source_ws's reconnect-backoff shape, hence the
+// grouping alongside the resident-sensing modules above.
+pub mod relay_client;
+pub mod relay_config;
+pub mod relay_device;
 pub mod rule_induction;
 pub mod approval;
 pub mod approval_notify;
@@ -390,3 +403,15 @@ pub mod self_study;
 //        channels into a confirmable goal-task suggestion, without a new
 //        cloud LLM call ──
 pub mod goal_intent;
+// ── O-1: system-operation intent router (DESIGN-agent-os-native-apps-2026-08.md
+//        §6.3 O-1) — natural language → the O-0 os_* tool face, param
+//        completion, and safety triage. Routing only, never execution; the
+//        O-0 tools' own gate chain is unchanged ──
+pub mod os_intent;
+// ── O-4: system-operator agent persona/guardrails — wires O-1's intent
+//        router into the conversational reply path for agents explicitly
+//        capability-gated as system operators ([capabilities]
+//        system_operator = true). Never calls an O-0 os_* tool handler
+//        itself; only shapes the turn (short-circuit reply or a guiding
+//        hint) — execution stays behind the O-0 tools' own unchanged gates ──
+pub mod os_operator;

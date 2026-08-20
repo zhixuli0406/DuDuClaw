@@ -27,6 +27,7 @@ import { useLocaleStore, localeNames } from '@/i18n';
 import { hasMinRole } from '@/lib/roles';
 import { filterVisible } from '@/lib/nav-visibility';
 import { useForksExist } from '@/hooks/useForksExist';
+import { useIsAppliance } from '@/hooks/useIsAppliance';
 import { useEffectiveName, useEffectiveLogo } from '@/lib/branding';
 import {
   SidebarHeader,
@@ -502,9 +503,18 @@ export function AppSidebar() {
   }, [connectionState, fetchInboxCount, fetchAgents]);
 
   const forksExist = useForksExist(hasMinRole(user?.role, 'manager'));
+  // WP-C: `/device` is admin-only server-side too, so only probe for admins —
+  // a manager/employee could never reach the RPC anyway.
+  const isAppliance = useIsAppliance(hasMinRole(user?.role, 'admin'));
   // D6: the org chart's progressive-disclosure gate reuses the roster that's
   // already being fetched for the LIVE staff zone — no second RPC.
-  const ctx = { hasOperatorAccess, forksExist, isDesktop: isTauri(), agentCount: agents.length };
+  const ctx = {
+    hasOperatorAccess,
+    forksExist,
+    isDesktop: isTauri(),
+    agentCount: agents.length,
+    isAppliance,
+  };
 
   const workItems = filterVisible(navGroups[0].items, user?.role, isPersonal, ctx);
   const companyItems = filterVisible(navGroups[1].items, user?.role, isPersonal, ctx);

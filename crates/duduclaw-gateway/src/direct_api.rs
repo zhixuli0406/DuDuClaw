@@ -364,7 +364,13 @@ pub async fn call_direct_api_attributed(
 /// Split the system prompt on [`CACHE_SPLIT_MARKER`] into normalized,
 /// non-empty segments, capped at [`MAX_SYSTEM_SEGMENTS`] (extras merge into
 /// the last segment so the 4-breakpoint API budget is never exceeded).
-fn split_system_segments(system_prompt: &str) -> Vec<String> {
+///
+/// `pub(crate)` (P34 #4): reused by `channel_reply.rs`'s operator Direct-API
+/// tool loop so its `duduclaw_llm::providers::AnthropicProvider` request gets
+/// the exact same cache-breakpoint segmentation as this file's own
+/// tools-less path, instead of a second hand-rolled copy of the same split
+/// logic.
+pub(crate) fn split_system_segments(system_prompt: &str) -> Vec<String> {
     let mut segments: Vec<String> = system_prompt
         .split(CACHE_SPLIT_MARKER)
         .map(normalize_system_prompt)

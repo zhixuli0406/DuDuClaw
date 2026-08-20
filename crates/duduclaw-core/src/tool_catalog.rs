@@ -629,6 +629,71 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "os:native",
         "os",
     ),
+    // ── O-0 system-operator tool face (admin) ─────────────────────────────
+    // DESIGN-agent-os-native-apps-2026-08.md §6.3 O-0: bridges the
+    // dashboard-only device.*/system.* RPCs to agents. Admin-scoped — a
+    // strictly higher trust tier than `os:native`'s host-automation tools,
+    // matching `mcp_auth::tool_requires_scope`'s explicit mapping.
+    (
+        "os_device_status",
+        "Appliance CPU/RAM/disk/temperature/uptime/network snapshot",
+        "admin",
+        "os",
+    ),
+    (
+        "os_system_status",
+        "Reduced system status (version/agent count/edition/channels)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_check_update",
+        "Check for a duduclaw self-update and/or appliance OS image update",
+        "admin",
+        "os",
+    ),
+    (
+        "os_backup_list",
+        "List device backups under <home>/backups/",
+        "admin",
+        "os",
+    ),
+    (
+        "os_network_info",
+        "Appliance network interfaces",
+        "admin",
+        "os",
+    ),
+    (
+        "os_apply_update",
+        "Apply an update (device OS image or duduclaw self-update)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_backup_create",
+        "Archive the device's writable data partition",
+        "admin",
+        "os",
+    ),
+    (
+        "os_power",
+        "Restart or shut down the appliance (destructive, confirm required)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_factory_reset",
+        "Wipe device state and re-provision (irreversible, confirm + approval required)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_doctor_repair",
+        "Reduced health checks with repair hints",
+        "admin",
+        "os",
+    ),
     // ── Office document scripting (skill:execute) ────────────────────────
     (
         "office_script",

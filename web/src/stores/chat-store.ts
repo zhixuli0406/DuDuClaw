@@ -4,6 +4,7 @@ import type { VisemeShape } from '@/components/mascot';
 import { REST_VISEME, sampleViseme } from '@/components/chat/viseme-sampler';
 import { loadTtsEnabled, saveTtsEnabled } from '@/components/chat/tts-playback';
 import { effectiveName, effectiveLogoGlyph } from '@/lib/branding';
+import type { ChatArtifact, ChatArtifactType } from '@/components/console/artifact-types';
 
 export interface ChatAttachmentMeta {
   readonly name: string;
@@ -18,6 +19,22 @@ export interface ChatMessage {
   readonly tokens?: number;
   /** Files attached to a user message (display chips). */
   readonly attachments?: readonly ChatAttachmentMeta[];
+  /**
+   * A structured result/confirmation card (O-3) an assistant reply carries
+   * alongside its plain text — see `@/components/console/artifact-types.ts`
+   * for the full contract. Populated from `assistant_done`'s optional
+   * `artifact` field (validated by `parseChatArtifact` below) when the
+   * backend's O-4 pending-op marker maps to one (`confirm_action` for a
+   * pending restart/shutdown/factory-reset, `update_confirm` for a pending
+   * `os_apply_update` — see `os_operator::marker_to_artifact` on the
+   * gateway). Also reconstructed by `historyToMessages` (resumed-conversation
+   * history): the gateway persists the raw marker into session storage and
+   * replays the same strip+map on `chat.sessions.history` reads
+   * (`handlers::chat_history_row_content_and_artifact`), so a resumed
+   * conversation's earlier confirmation card renders again instead of a bare
+   * marker tag or a silently-missing card.
+   */
+  readonly artifact?: ChatArtifact;
 }
 
 /** A file selected for upload, already read into base64. */
@@ -273,24 +290,38 @@ export interface HistoryMessageWire {
   /** RFC3339 timestamp. */
   readonly timestamp: string;
   readonly tokens?: number;
+  /**
+   * O-4→O-3 resume wiring: present only on an assistant row whose stored
+   * text carried an O-4 pending-op marker that mapped to an O-3 artifact
+   * (see `handlers::chat_history_row_content_and_artifact` on the gateway —
+   * `chat_history_row_content_and_artifact_tests` covers the strip+map).
+   * Untyped on the wire like `assistant_done`'s `artifact` field; validated
+   * below by the same `parseChatArtifact` guard before it ever reaches
+   * `ChatMessage` state.
+   */
+  readonly artifact?: unknown;
 }
 
 /**
  * Map history-RPC messages into the store's `ChatMessage` shape (pure — exported
  * for tests). Unknown roles collapse to `user`; an unparseable timestamp falls
- * back to "now" so a bad row never breaks the render.
+ * back to "now" so a bad row never breaks the render. A malformed/unknown
+ * `artifact` (older gateway, hand-crafted frame) degrades to "no card" via
+ * `parseChatArtifact`, never a broken render.
  */
 export function historyToMessages(raw: readonly HistoryMessageWire[]): ChatMessage[] {
   return raw.map((m) => {
     const role: ChatMessage['role'] =
       m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user';
     const ts = Date.parse(m.timestamp);
+    const artifact = role === 'assistant' ? parseChatArtifact(m.artifact) : undefined;
     return {
       id: nextId(),
       role,
       content: m.content ?? '',
       timestamp: Number.isFinite(ts) ? ts : Date.now(),
       ...(typeof m.tokens === 'number' ? { tokens: m.tokens } : {}),
+      ...(artifact ? { artifact } : {}),
     };
   });
 }
@@ -314,6 +345,46 @@ export function isResumeNotFound(message: string | null | undefined): boolean {
 export function frameBelongsToConversation(frameConv: unknown, currentConvId: string): boolean {
   if (typeof frameConv !== 'string' || frameConv.length === 0) return true;
   return frameConv === currentConvId;
+}
+
+/** Every `ChatArtifactType` enumerated as a runtime value — `artifact-types.ts`
+ *  is intentionally a pure type module with zero runtime code (see its own
+ *  doc comment), so the guard below needs its own copy. Keep in sync by hand;
+ *  `ChatArtifactCard`'s exhaustive switch (a `never` compile check) still
+ *  catches a genuinely new artifact type being added without this list being
+ *  updated — it just fails at the render call site instead of here. */
+const KNOWN_ARTIFACT_TYPES: ReadonlySet<ChatArtifactType> = new Set([
+  'device_status',
+  'update_status',
+  'backup_result',
+  'network_info',
+  'confirm_action',
+  'update_confirm',
+  'approval_request',
+]);
+
+/**
+ * O-4→O-3 wiring: type guard for `assistant_done`'s optional `artifact`
+ * field. The gateway sends a plain JSON value (see `webchat.rs`'s
+ * `ChatMessage::AssistantDone.artifact` doc comment) — this validates it into
+ * a real `ChatArtifact` before it ever reaches state, so an unknown `type` or
+ * a missing/malformed `payload` (an older/newer gateway build, a hand-crafted
+ * frame) degrades to "no card" instead of rendering garbage or throwing.
+ * Deliberately shallow: it checks `type` is one of the known artifact types
+ * and `payload` is present as an object, then trusts the rest — each card
+ * component in `@/components/console` already renders defensively against
+ * partially-missing nested fields (the same trust boundary O-3's own fixtures
+ * exercise). Pure — exported for tests.
+ */
+export function parseChatArtifact(raw: unknown): ChatArtifact | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined;
+  const type = (raw as { type?: unknown }).type;
+  if (typeof type !== 'string' || !KNOWN_ARTIFACT_TYPES.has(type as ChatArtifactType)) {
+    return undefined;
+  }
+  const payload = (raw as { payload?: unknown }).payload;
+  if (payload === null || typeof payload !== 'object') return undefined;
+  return raw as ChatArtifact;
 }
 
 // Module-level WebSocket reference — kept outside Zustand to avoid
@@ -529,7 +600,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
             break;
           }
 
-          case 'assistant_done':
+          case 'assistant_done': {
+            // O-4→O-3: validate the optional wire artifact once per frame —
+            // `undefined` for the overwhelming majority of replies (anything
+            // that never went through O-4's pending-op path on the backend).
+            const artifact = parseChatArtifact(data.artifact);
             set((state) => {
               const msgs = [...state.messages];
               const last = msgs[msgs.length - 1];
@@ -539,6 +614,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   ...last,
                   content: data.content,
                   tokens: data.tokens_used,
+                  ...(artifact ? { artifact } : {}),
                 };
               } else {
                 msgs.push({
@@ -547,6 +623,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   content: data.content,
                   timestamp: Date.now(),
                   tokens: data.tokens_used,
+                  ...(artifact ? { artifact } : {}),
                 });
               }
               return {
@@ -564,6 +641,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
             });
             clearVisemeIdle();
             break;
+          }
 
           case 'error':
             if (isResumeNotFound(data.message)) {

@@ -47,6 +47,8 @@ import {
   Radar as RadarIcon,
   Layers,
   ShieldCheck,
+  HardDrive,
+  Bot,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -100,19 +102,14 @@ export type NavItem = Gated & {
  * release's. An unknown running version keeps the chip (a spurious chip is
  * harmless; a missing one defeats the convention). Patch releases never
  * expire a chip — only the next minor does.
+ *
+ * N-1 (`DESIGN-agent-os-native-apps-2026-08.md` §3 C8): the implementation now
+ * lives in `@/apps/registry` so the sidebar's per-page chips and the
+ * launcher's per-app chips are driven by the same comparison — re-exported
+ * here unchanged so every existing `import { isNewFeature } from './nav-model'`
+ * (or `'@/components/layout/nav-model'`) keeps resolving exactly as before.
  */
-export function isNewFeature(newIn: string | undefined, currentVersion: string | null): boolean {
-  if (!newIn) return false;
-  const parse = (v: string): [number, number] | null => {
-    const m = v.trim().replace(/^v/, '').match(/^(\d+)\.(\d+)/);
-    return m ? [Number(m[1]), Number(m[2])] : null;
-  };
-  const target = parse(newIn);
-  if (!target) return false;
-  const current = currentVersion ? parse(currentVersion) : null;
-  if (!current) return true;
-  return current[0] < target[0] || (current[0] === target[0] && current[1] <= target[1]);
-}
+export { isNewFeature } from '@/apps/registry';
 
 export type NavGroup = {
   /** i18n message id for the group header. */
@@ -201,6 +198,13 @@ export const dailyItems: NavItem[] = [
     ownScope: true,
   },
   { to: '/', icon: Home, label: 'nav.home', desc: 'nav.home.desc', ownScope: true },
+  // 主控台 (O-2, `DESIGN-agent-os-native-apps-2026-08.md` §6.2/§6.3) — the
+  // conversational "operate the whole machine" surface. Lives in `dailyItems`
+  // (not `personalPrimaryItems`) so both editions get it from this one
+  // declaration — no separate Personal wiring to forget. On the appliance
+  // image this is the default landing page (see `App.tsx`'s `HomeLanding`);
+  // on every other install it's one click away, same as 新對話/首頁.
+  { to: '/console', icon: Bot, label: 'nav.console', desc: 'nav.console.desc', ownScope: true, newIn: '1.62.0' },
   // 收件匣 left the standing navigation on 2026-08-04 (D17). The page and its
   // route stay — the entry point is now the footer notification bell, which
   // lights up only when something actually needs a decision. See
@@ -326,6 +330,17 @@ export const navGroups: NavGroup[] = [
       // includes capability/security-relevant fields. Switching UI is P2,
       // not this wave — see the page's own doc comment.
       { to: '/presets', icon: Layers, label: 'nav.presets', desc: 'nav.presets.desc', minRole: 'admin', newIn: '1.61.0' },
+      // 裝置（WP-C，appliance device management, 2026-08）— CPU/RAM/磁碟/溫度/
+      // 網路快照、系統更新、備份、危險區（原廠重設／重新啟動／關機）。Admin-gated
+      // like its `/os`/`/presets` neighbours, PLUS a progressive-disclosure probe:
+      // the row only appears once `device.status` confirms this gateway IS the
+      // appliance image (`requiresData: 'appliance'`, see `useIsAppliance`) —
+      // every other install (the overwhelming majority) never sees a page that
+      // would just show a `not_appliance` refusal. N-3 (2026-08,
+      // `DESIGN-agent-os-native-apps-2026-08.md` §5): the page itself relocated
+      // to `/app/system/device` — the 系統設定 app now owns it — so `to` points
+      // there; the bare `/device` alias still works via a redirect (App.tsx).
+      { to: '/app/system/device', icon: HardDrive, label: 'nav.device', desc: 'nav.device.desc', minRole: 'admin', requiresData: 'appliance', newIn: '1.62.0' },
       // 任務看板 — demoted to the tail of the group (2026-08-04 WP14). Enterprise
       // has no 進階 group to fold it into, so "least prominent slot" is the
       // closest equivalent to the Personal treatment.
@@ -492,6 +507,12 @@ export const personalAdvancedGroup: NavGroup = {
     '/os',
     // 職務組合（WP-7I 2026-08-16）— same slot as its Enterprise `/os` neighbour.
     '/presets',
+    // 裝置（WP-C 2026-08）— same slot as its Enterprise `/presets` neighbour;
+    // `requiresData: 'appliance'` keeps it invisible on every non-appliance
+    // Personal install too (the common case). N-3: `to` moved to
+    // `/app/system/device` (see the Enterprise entry's own comment) — this
+    // lookup key has to match it, `pickItems` resolves by `to`, not by icon.
+    '/app/system/device',
     // Company cluster. 成長 leads it (高頻・低重要, matrix §4) — same slot it
     // holds in the Enterprise 公司 group. D6: the org chart is folded here
     // rather than on the primary rail; it is a progressive-disclosure surface
@@ -528,10 +549,17 @@ export const manageNav: NavItem[] = [
   { to: '/manage/integrations', icon: Plug, label: 'manage.integrations', desc: 'manage.integrations.desc', minRole: 'admin' },
   // 帳戶與登入 — lifted out of the billing page's second tab (2026-08-04, D16 /
   // D18). One-click CLI sign-in was the single most-asked-for thing nobody
-  // could find; it now has its own top-level management entry.
-  { to: '/manage/accounts', icon: LogIn, label: 'manage.accounts', desc: 'manage.accounts.desc', minRole: 'admin' },
+  // could find; it now has its own top-level management entry. N-3 (2026-08,
+  // `DESIGN-agent-os-native-apps-2026-08.md` §5): the page relocated out of
+  // `/manage/*` entirely, into the 系統設定 app — `to` follows it there. This
+  // row still renders inside ManageShell's own rail (it stays listed here so
+  // the row's position/grouping in that rail is unchanged, per §3 C8's "視覺
+  // 結構不變" — only its destination moved), and clicking it now navigates the
+  // viewer out of `/manage/*` to the new canonical page.
+  { to: '/app/system/accounts', icon: LogIn, label: 'manage.accounts', desc: 'manage.accounts.desc', minRole: 'admin' },
   // 系統更新 — lifted out of the settings page's tab rail (2026-08-04, D18).
-  { to: '/manage/updates', icon: Download, label: 'manage.updates', desc: 'manage.updates.desc', minRole: 'admin' },
+  // N-3: relocated to the 系統設定 app, same rationale as 帳戶與登入 above.
+  { to: '/app/system/updates', icon: Download, label: 'manage.updates', desc: 'manage.updates.desc', minRole: 'admin' },
   // 進階設定 — everything else, folded one level down. Nothing was removed;
   // `manageAdvancedNav` below is the full former list minus the four surfaces
   // promoted above.
@@ -583,8 +611,10 @@ export const manageAdvancedNav: NavItem[] = [
   // ── 1. 錢（客戶排序鐵律：帳務 → 授權 → 經銷，其餘一律排在後面）
   { to: '/manage/billing', icon: CreditCard, label: 'manage.billing', desc: 'manage.billing.desc', minRole: 'manager' },
   // 授權 hidden on Personal (2026-07-29 client feedback). The page stays
-  // URL-reachable (`/manage/license`) and ⌘K still finds it on other editions.
-  { to: '/manage/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager', personalHidden: true },
+  // URL-reachable and ⌘K still finds it on other editions. N-3 (2026-08,
+  // `DESIGN-agent-os-native-apps-2026-08.md` §5): relocated out of
+  // `/manage/*` into the 系統設定 app; `/manage/license` now redirects here.
+  { to: '/app/system/license', icon: KeyRound, label: 'manage.license', desc: 'manage.license.desc', minRole: 'manager', personalHidden: true },
   // 經銷商管理 signs real, machine-fingerprint-bound OEM licences — an
   // Enterprise-only capability that a Personal instance has no counterpart for.
   // It was the one such surface missing its gate (10-ia-scatter-audit D8), so a
@@ -594,7 +624,8 @@ export const manageAdvancedNav: NavItem[] = [
   // ── 2. 存取與安全（低頻・高重要：改一格就改變「誰可以做什麼」）
   // D9: no longer `personalHidden` — `SecurityPage` itself hides the
   // organisation-scale content on Personal (see the block comment above).
-  { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin' },
+  // N-3: relocated out of `/manage/*` into the 系統設定 app.
+  { to: '/app/system/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin' },
   // 安全審計（secaudit dashboard, DESIGN-code-security-audit-2026-08 §3.1）—
   // reviews reports written by `duduclaw secaudit --save`. Sits right after
   // 安全: same 存取與安全 cluster, but manager+ (not admin-only) — reviewing
@@ -621,7 +652,10 @@ export const manageAdvancedNav: NavItem[] = [
   // not the catch-all settings page.
   { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },
   // ── 4. 設定 last（2026-08-04 鐵律）
-  { to: '/manage/system', icon: Settings, label: 'manage.system', desc: 'manage.system.desc', minRole: 'admin' },
+  // N-3: relocated out of `/manage/*` into the 系統設定 app (path renamed
+  // `system` → `settings` at the new location to avoid colliding with the
+  // app's own id — same page, same tabs incl. `?tab=delegation`).
+  { to: '/app/system/settings', icon: Settings, label: 'manage.system', desc: 'manage.system.desc', minRole: 'admin' },
 ];
 
 /** Every management destination — the five rail entries plus what 進階設定 holds. */
@@ -643,6 +677,22 @@ export function crumbsFor(pathname: string): Array<{ labelId: string; to?: strin
       // Folded surfaces read as 管理 / 進階設定 / X so the trail matches the rail.
       ...(advanced ? [{ labelId: 'manage.advanced', to: '/manage/advanced' }] : []),
       ...(item ? [{ labelId: item.label }] : []),
+    ];
+  }
+  // N-3 (§5 WP N-3): the six 系統設定 pages left `/manage/*` for `/app/system/
+  // *` — five of them are still NavItem entries in `allManageNav` (their `to`
+  // just points here now), `device` lives in `navGroups` instead (it was
+  // never a 管理 row). Check both so every migrated page still gets a trail
+  // instead of silently falling through to the empty-array default below.
+  if (pathname.startsWith('/app/system')) {
+    const fromManage = allManageNav.find((i) => pathname.startsWith(i.to));
+    const fromNav = navGroups
+      .flatMap((g) => g.items)
+      .find((i) => i.to !== '/' && pathname.startsWith(i.to));
+    const item = fromManage ?? fromNav;
+    return [
+      { labelId: 'app.system.name', to: '/app/system' },
+      ...(item ? [{ labelId: item.crumb ?? item.label }] : []),
     ];
   }
   const flat: NavItem[] = [...dailyItems, inboxEntry, conversationsEntry, staffEntry];

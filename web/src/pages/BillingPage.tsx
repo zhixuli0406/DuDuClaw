@@ -234,10 +234,10 @@ function SpendCapsOverview() {
   const navigate = useNavigate();
 
   const rows: { key: string; linkLabelId: string; to: string }[] = [
-    { key: 'account', linkLabelId: 'billing.caps.account.link', to: '/manage/accounts' },
+    { key: 'account', linkLabelId: 'billing.caps.account.link', to: '/app/system/accounts' },
     { key: 'agent', linkLabelId: 'billing.caps.agent.link', to: '/agents' },
     { key: 'governance', linkLabelId: 'billing.caps.governance.link', to: '/manage/governance' },
-    { key: 'killswitch', linkLabelId: 'billing.caps.killswitch.link', to: '/manage/security' },
+    { key: 'killswitch', linkLabelId: 'billing.caps.killswitch.link', to: '/app/system/security' },
     { key: 'incidents', linkLabelId: 'billing.caps.incidents.link', to: '/inbox' },
   ];
 

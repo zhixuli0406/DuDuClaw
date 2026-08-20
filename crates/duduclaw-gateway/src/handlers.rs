@@ -484,6 +484,18 @@ fn apply_capabilities_to_table(
         section.insert("git_credentials".into(), toml::Value::Boolean(v));
         changes.push(format!("capabilities.git_credentials = {v}"));
     }
+    // ── system_operator (bool) — opt-in system-operator designation (O-4).
+    // Master switch for the `os_*` system-operation MCP tool face
+    // (device/system status, backup, power, update, factory reset, doctor);
+    // default false ⇒ denied at the dispatch gate even for an Admin-scoped
+    // agent. A materially higher trust tier than `os_native` (which only
+    // covers an agent's own host automation footprint), so this is a
+    // dashboard-facing danger-zone toggle like `git_credentials` above —
+    // same bool-write pattern, one field.
+    if let Some(v) = cap.get("system_operator").and_then(|v| v.as_bool()) {
+        section.insert("system_operator".into(), toml::Value::Boolean(v));
+        changes.push(format!("capabilities.system_operator = {v}"));
+    }
     // ── autonomy_level (string) — how much the autonomous goal loop may
     // drive this agent on its own (`goal_loop::AutonomyLevel`). Not a typed
     // `CapabilitiesConfig` field — read straight from this raw TOML key by
@@ -995,6 +1007,181 @@ fn enterprise_only_reject_frame() -> WsFrame {
                         升級後可解鎖成員、部門、治理政策與身分解析等多人協作功能：\
                         https://duduclaw.dudustudio.monster#pricing",
         })),
+    }
+}
+
+/// Machine-readable code returned to a caller reaching a `device.*` RPC on a
+/// non-appliance install. Stable string — mirrors
+/// `MUST_CHANGE_PASSWORD_ERROR_CODE`/`ENTERPRISE_ONLY_ERROR_CODE`'s pattern.
+pub const DEVICE_NOT_APPLIANCE_ERROR_CODE: &str = "not_appliance";
+
+/// Structured refusal for `device.*` RPCs outside appliance mode
+/// (`require_appliance!()` in `dispatch`). zh-TW copy, no internal method
+/// names, same discipline as `enterprise_only_reject_frame`.
+fn device_not_appliance_frame() -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({
+            "code": DEVICE_NOT_APPLIANCE_ERROR_CODE,
+            "message": "此功能僅限 DuDuClaw 裝置版（appliance image）使用。",
+        })),
+    }
+}
+
+/// Structured refusal for a destructive `device.*` RPC missing
+/// `"confirm": true` (`require_confirm!()` in `dispatch`).
+fn device_confirm_required_frame() -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({
+            "code": "confirm_required",
+            "message": "這是不可逆的操作，請在請求參數帶上 confirm: true 再次確認執行。",
+        })),
+    }
+}
+
+/// Turn a `device_ops::OpResult` into a `WsFrame` — the one place that maps
+/// [`crate::device_ops::DeviceOpError`] onto the dashboard's error-frame
+/// shape, so every `device.*` handler renders failures the same way.
+fn device_op_result_frame(result: crate::device_ops::OpResult) -> WsFrame {
+    match result {
+        Ok(out) => WsFrame::ok_response(
+            "",
+            json!({
+                "success": out.success,
+                "stdout": out.stdout,
+                "stderr": out.stderr,
+            }),
+        ),
+        Err(crate::device_ops::DeviceOpError::Unsupported(msg)) => WsFrame::Response {
+            id: String::new(),
+            ok: false,
+            payload: None,
+            error: Some(json!({ "code": "unsupported", "message": msg })),
+        },
+        Err(crate::device_ops::DeviceOpError::Io(msg)) => WsFrame::Response {
+            id: String::new(),
+            ok: false,
+            payload: None,
+            error: Some(json!({ "code": "io_error", "message": msg })),
+        },
+    }
+}
+
+/// Check if an API key is available (env var, `config.toml [api]`, or a
+/// non-empty `accounts` array). Pure function of `home_dir` — extracted from
+/// `MethodHandler::has_api_key` (now a thin delegate to this) so the O-0
+/// agent-facing `os_doctor_repair` MCP tool (`duduclaw-cli::mcp`) can reuse
+/// the EXACT same three-source check instead of re-deriving it, avoiding the
+/// two-implementation drift the O-0 design explicitly calls out.
+pub async fn has_api_key_configured(home_dir: &Path) -> bool {
+    // 1. Check environment variable
+    if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty()) {
+        return true;
+    }
+    // 2. Check config.toml [api] section
+    let table = match tokio::fs::read_to_string(home_dir.join("config.toml")).await {
+        Ok(content) => content.parse::<toml::Table>().unwrap_or_default(),
+        Err(_) => toml::Table::new(),
+    };
+    if let Some(api) = table.get("api").and_then(|v| v.as_table())
+        && api
+            .get("anthropic_api_key")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    {
+        return true;
+    }
+    // 3. Check accounts in config.toml
+    if let Some(accounts) = table.get("accounts")
+        && let Some(arr) = accounts.as_array()
+    {
+        return !arr.is_empty();
+    }
+    false
+}
+
+/// Repair-hint text for one failing/warning `system.doctor` check name.
+/// Extracted from `MethodHandler::handle_system_doctor_repair` (now a thin
+/// delegate) so the O-0 `os_doctor_repair` MCP tool (`duduclaw-cli::mcp`)
+/// shares the exact same hint copy instead of re-deriving it.
+pub fn doctor_repair_hint(check_name: &str) -> &'static str {
+    match check_name {
+        "agents" => "Run 'duduclaw agent create <name>' to create your first agent.",
+        "api_key" => "Set ANTHROPIC_API_KEY environment variable with a valid key.",
+        "config_file" => "Run 'duduclaw init' to create a default config.toml.",
+        _ => "Check the documentation for repair instructions.",
+    }
+}
+
+#[cfg(test)]
+mod has_api_key_configured_tests {
+    use super::*;
+
+    // No test here mutates `ANTHROPIC_API_KEY` (a process-global env var read
+    // by other tests too, potentially concurrently) — every assertion below
+    // is monotonic: it only checks a path that returns `true` regardless of
+    // whatever the ambient env var happens to be in this test run (env-var
+    // present would also yield `true`, never `false`), so there is no
+    // ordering dependency to get flaky.
+
+    #[tokio::test]
+    async fn true_when_config_toml_api_key_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[api]\nanthropic_api_key = \"sk-test-123\"\n",
+        )
+        .unwrap();
+        assert!(has_api_key_configured(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn true_when_accounts_array_non_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[accounts]]\nid = \"a1\"\ntype = \"oauth\"\n",
+        )
+        .unwrap();
+        assert!(has_api_key_configured(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn missing_config_toml_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        // No config.toml at all — must degrade gracefully (never panic);
+        // the boolean result itself depends on the ambient env, so it is
+        // deliberately not asserted here.
+        let _ = has_api_key_configured(dir.path()).await;
+    }
+}
+
+#[cfg(test)]
+mod doctor_repair_hint_tests {
+    use super::*;
+
+    #[test]
+    fn known_checks_map_to_their_specific_hint() {
+        assert!(doctor_repair_hint("config_file").contains("duduclaw init"));
+        assert!(doctor_repair_hint("agents").contains("duduclaw agent create"));
+        assert!(doctor_repair_hint("api_key").contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn unknown_check_falls_back_to_generic_hint() {
+        assert_eq!(
+            doctor_repair_hint("mcp_server"),
+            "Check the documentation for repair instructions."
+        );
+        assert_eq!(
+            doctor_repair_hint("totally_unknown"),
+            "Check the documentation for repair instructions."
+        );
     }
 }
 
@@ -4837,6 +5024,31 @@ impl MethodHandler {
                 }
             };
         }
+        // WP-B: fail-closed gate for the appliance-only `device.*` RPC
+        // surface — a non-appliance install (the overwhelming majority of
+        // installs) refuses every one of these methods with a structured
+        // `not_appliance` error, never a confusing "command not found"
+        // deep inside a shell-out. `is_appliance()` is the single authority
+        // (`duduclaw-core/src/appliance.rs`) — this macro never re-reads
+        // the env var itself.
+        macro_rules! require_appliance {
+            () => {
+                if !duduclaw_core::is_appliance() {
+                    return device_not_appliance_frame();
+                }
+            };
+        }
+        // WP-B: the three destructive `device.*` ops (factory reset,
+        // update rollback, restart/shutdown) refuse to run without an
+        // explicit `"confirm": true` param — no default-yes, no inferring
+        // intent from anything else in the payload.
+        macro_rules! require_confirm {
+            () => {
+                if params.get("confirm").and_then(Value::as_bool) != Some(true) {
+                    return device_confirm_required_frame();
+                }
+            };
+        }
         // Helper: check agent access from params, return error frame on failure.
         macro_rules! check_agent {
             ($min_level:expr) => {
@@ -6435,6 +6647,82 @@ impl MethodHandler {
                 self.handle_marketplace_install(params).await
             }
 
+            // ── WP-B: appliance device management ────────────────
+            // Every `device.*` method is admin-only AND fail-closed off the
+            // appliance image (`require_appliance!()` — see its doc comment
+            // next to `require_admin!` above). Three destructive ops also
+            // require an explicit `"confirm": true` param.
+            "device.status" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_status().await
+            }
+            "device.network" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_network(params).await
+            }
+            "device.update_status" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_update_status().await
+            }
+            "device.update_apply" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_update_apply().await
+            }
+            "device.update_rollback" => {
+                require_admin!();
+                require_appliance!();
+                require_confirm!();
+                self.handle_device_update_rollback().await
+            }
+            "device.backup_create" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_backup_create().await
+            }
+            // ── WP-G1: scheduled backups + device-migration restore ──
+            "device.backup_schedule_get" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_backup_schedule_get().await
+            }
+            "device.backup_schedule_set" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_backup_schedule_set(params).await
+            }
+            "device.backup_list" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_backup_list().await
+            }
+            "device.backup_delete" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_backup_delete(params).await
+            }
+            "device.backup_restore" => {
+                require_admin!();
+                require_appliance!();
+                require_confirm!();
+                self.handle_device_backup_restore(params).await
+            }
+            "device.factory_reset" => {
+                require_admin!();
+                require_appliance!();
+                require_confirm!();
+                self.handle_device_factory_reset().await
+            }
+            "device.power" => {
+                require_admin!();
+                require_appliance!();
+                require_confirm!();
+                self.handle_device_power(params).await
+            }
+
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
     }
@@ -6690,6 +6978,19 @@ impl MethodHandler {
                     { "name": "migrate.scan", "description": "Preview a migration from OpenClaw/Hermes/Paperclip (dry-run)" },
                     { "name": "migrate.apply", "description": "Apply a migration from OpenClaw/Hermes/Paperclip" },
                     { "name": "search.query", "description": "Cross-source search (⌘K) over conversations, files, memory and knowledge (I-5)" },
+                    { "name": "device.status", "description": "Appliance CPU/RAM/disk/temperature/uptime/network snapshot (admin, appliance-only)" },
+                    { "name": "device.network", "description": "Read network interfaces; setting a static IP is not implemented yet (admin, appliance-only)" },
+                    { "name": "device.update_status", "description": "Check for an available OS update via systemd-sysupdate (admin, appliance-only)" },
+                    { "name": "device.update_apply", "description": "Install the newest available OS update (admin, appliance-only)" },
+                    { "name": "device.update_rollback", "description": "Roll back to the previous OS version — not yet implemented, always returns unsupported (admin, appliance-only, destructive: requires confirm)" },
+                    { "name": "device.backup_create", "description": "Archive the device's writable data partition for download (admin, appliance-only)" },
+                    { "name": "device.backup_schedule_get", "description": "Read the scheduled-backup config (admin, appliance-only)" },
+                    { "name": "device.backup_schedule_set", "description": "Update the scheduled-backup config (schedule_enabled/interval_hours/retention_count) (admin, appliance-only)" },
+                    { "name": "device.backup_list", "description": "List scheduled backups stored under <home>/backups/ (admin, appliance-only)" },
+                    { "name": "device.backup_delete", "description": "Delete one scheduled backup file (admin, appliance-only)" },
+                    { "name": "device.backup_restore", "description": "Stage an uploaded backup for device-migration restore on next boot (admin, appliance-only, destructive: requires confirm)" },
+                    { "name": "device.factory_reset", "description": "Wipe device state and re-provision on next boot (admin, appliance-only, destructive: requires confirm)" },
+                    { "name": "device.power", "description": "Restart or shut down the device (admin, appliance-only, destructive: requires confirm)" },
                 ]
             }),
         )
@@ -18002,6 +18303,18 @@ impl MethodHandler {
             // frame has been observed since boot. Telemetry only; never
             // implies a failure (see `rate_limit_watch`).
             "quota_warning": crate::rate_limit_watch::latest(),
+            // R2 (2026-08): whether this gateway is the DuDuClaw appliance
+            // image. A direct, unmodified forward of the single authority
+            // (`duduclaw_core::is_appliance()`, also gating every `device.*`
+            // RPC below) — never re-derived here. Unlike `device.status`,
+            // `system.status` carries no `require_admin!()` gate, so this is
+            // the one non-sensitive appliance signal a manager/employee
+            // caller can read: just the yes/no fact, never the CPU/RAM/
+            // network detail `device.status` exposes (that surface stays
+            // admin-only, unchanged). The frontend's `useIsAppliance` hook
+            // reads this field to decide whether to land any authenticated
+            // role on the conversational console (`App.tsx::HomeLanding`).
+            "is_appliance": duduclaw_core::is_appliance(),
         })
     }
 
@@ -18040,13 +18353,7 @@ impl MethodHandler {
             .filter(|c| c["status"] != "pass")
             .map(|c| {
                 let name = c["name"].as_str().unwrap_or("unknown");
-                let hint = match name {
-                    "agents" => "Run 'duduclaw agent create <name>' to create your first agent.",
-                    "api_key" => "Set ANTHROPIC_API_KEY environment variable with a valid key.",
-                    "config_file" => "Run 'duduclaw init' to create a default config.toml.",
-                    _ => "Check the documentation for repair instructions.",
-                };
-                json!({ "check": name, "hint": hint })
+                json!({ "check": name, "hint": doctor_repair_hint(name) })
             })
             .collect();
 
@@ -23296,29 +23603,7 @@ impl MethodHandler {
 
     /// Check if an API key is available (from env var or config.toml [api] section).
     async fn has_api_key(&self) -> bool {
-        // 1. Check environment variable
-        if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty()) {
-            return true;
-        }
-        // 2. Check config.toml [api] section
-        let table = self
-            .read_config_table(&self.home_dir.join("config.toml"))
-            .await;
-        if let Some(api) = table.get("api").and_then(|v| v.as_table())
-            && api
-                .get("anthropic_api_key")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty())
-        {
-            return true;
-        }
-        // 3. Check accounts in config.toml
-        if let Some(accounts) = table.get("accounts")
-            && let Some(arr) = accounts.as_array()
-        {
-            return !arr.is_empty();
-        }
-        false
+        has_api_key_configured(&self.home_dir).await
     }
 
     /// Read config.toml into a TOML table, returning an empty table if the file
@@ -23415,37 +23700,10 @@ impl MethodHandler {
         // exists for operators (distributor deployments) whose only surface
         // is the dashboard.
         {
-            use crate::doctor_probes::McpColdStartOutcome as O;
-            let (status, message) = match &mcp.outcome {
-                O::Pass => ("pass", "MCP server 啟動並回應 initialize，工具面可用。".to_string()),
-                O::AuthFailed => (
-                    "fail",
-                    format!(
-                        "MCP server 因認證被拒而終止 — agent 會完全叫不到 duduclaw 工具。{}重啟 gateway 讓它自動配發 internal key，或設定 env DUDUCLAW_MCP_API_KEY。",
-                        mcp.provision_error
-                            .as_deref()
-                            .map(|e| format!("（internal key 配發失敗：{e}）"))
-                            .unwrap_or_default()
-                    ),
-                ),
-                O::BinaryUnresolved => (
-                    "fail",
-                    "duduclaw binary 無法解析為絕對路徑 — CLI runtime 無法註冊 MCP server。".to_string(),
-                ),
-                O::SpawnFailed(e) => ("fail", format!("mcp-server 無法啟動：{e}")),
-                O::Timeout => (
-                    "warn",
-                    "mcp-server 10 秒內未結束（stdin 已關閉），無法確認 initialize 是否成功。".to_string(),
-                ),
-                O::Abnormal { exit, stderr_tail } => (
-                    "fail",
-                    format!(
-                        "mcp-server 異常結束（exit={}，無 initialize 回應）。stderr：{}",
-                        exit.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
-                        if stderr_tail.is_empty() { "(空)" } else { stderr_tail }
-                    ),
-                ),
-            };
+            let (status, message) = crate::doctor_probes::mcp_cold_start_status_and_message(
+                &mcp.outcome,
+                mcp.provision_error.as_deref(),
+            );
             checks.push(json!({
                 "name": "mcp_server",
                 "status": status,
@@ -30254,19 +30512,18 @@ impl MethodHandler {
                     .iter()
                     .skip(start)
                     .map(|m| {
-                        json!({
+                        let (content, artifact) =
+                            chat_history_row_content_and_artifact(&m.role, &m.content);
+                        let mut row = json!({
                             "role": m.role,
-                            // CJK-safe cap — long single turns are bounded so the
-                            // payload stays sane; normal messages pass through whole.
-                            // The `[sender_id: …]` line is model plumbing and must
-                            // not be replayed into the user's own bubble.
-                            "content": duduclaw_core::truncate_chars(
-                                crate::channel_reply::strip_sender_prefix(&m.content),
-                                CHAT_HISTORY_MSG_MAX_CHARS,
-                            ),
+                            "content": content,
                             "timestamp": m.timestamp,
                             "tokens": m.tokens,
-                        })
+                        });
+                        if let Some(a) = artifact {
+                            row["artifact"] = a;
+                        }
+                        row
                     })
                     .collect();
                 WsFrame::ok_response(
@@ -35060,6 +35317,46 @@ policies:
         );
     }
 
+    // ── system_operator (dashboard toggle, O-4 follow-up) ─────────────────────
+
+    #[test]
+    fn cap_system_operator_round_trips_into_capabilities_config() {
+        let mut table = toml::Table::new();
+        let changes = apply_capabilities_to_table(
+            &mut table,
+            &json!({ "capabilities": { "system_operator": true } }),
+        )
+        .expect("apply");
+        let cap = table.get("capabilities").unwrap().as_table().unwrap();
+        assert_eq!(cap.get("system_operator").unwrap().as_bool(), Some(true));
+        assert!(changes.iter().any(|c| c.contains("system_operator = true")));
+        // Must deserialize back into a real CapabilitiesConfig.
+        let cfg: duduclaw_core::types::CapabilitiesConfig = cap
+            .clone()
+            .try_into()
+            .expect("deserializes into CapabilitiesConfig");
+        assert!(cfg.system_operator);
+
+        // Explicit false is also written (operator turning it back off).
+        let mut t2 = toml::Table::new();
+        let changes2 = apply_capabilities_to_table(
+            &mut t2,
+            &json!({ "capabilities": { "system_operator": false } }),
+        )
+        .expect("apply");
+        assert!(changes2.iter().any(|c| c.contains("system_operator = false")));
+
+        // Serialization of CapabilitiesConfig carries `system_operator` so
+        // agents.inspect exposes it to the dashboard (the switch must be able
+        // to reflect the agent's real on-disk state, not just write it).
+        let json = serde_json::to_value(duduclaw_core::types::CapabilitiesConfig::default())
+            .expect("serialize");
+        assert_eq!(
+            json.get("system_operator"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
     // ── autonomy_level (goal-loop dashboard editor) ───────────────────────────
 
     #[test]
@@ -35812,6 +36109,152 @@ pub(crate) const CHAT_HISTORY_MAX_LIMIT: usize = 2000;
 /// WP3 — per-message character cap for history payloads (CJK-safe; normal
 /// turns pass through whole, only pathological single messages are bounded).
 pub(crate) const CHAT_HISTORY_MSG_MAX_CHARS: usize = 20_000;
+
+/// O-4→O-3 resume wiring: reconstruct a `chat.sessions.history` row's display
+/// text and (for assistant turns) inline artifact from the raw session-store
+/// content.
+///
+/// `SessionManager::append_message("assistant", …)` is called from inside
+/// `channel_reply::build_reply_with_session_inner`, which runs BEFORE the
+/// live-path `strip_operator_pending_marker` call in its two `_with_artifact`
+/// wrappers (`build_reply_for_agent_with_artifact` /
+/// `build_reply_with_session_with_artifact` — see that function's doc
+/// comment). So the session store holds the RAW text, marker and all; only
+/// the live socket frame ever saw the stripped half. Replaying the same
+/// strip+map here on read is what makes a resumed conversation reconstruct
+/// the same confirm-action card the live frame carried, instead of leaking
+/// the bare `<system_operator_pending>…</system_operator_pending>` tag into
+/// the transcript.
+///
+/// Order matters: strip the sender-prefix and operator-pending tag BEFORE
+/// truncating. Truncating first could cut a marker in half, and
+/// `strip_system_operator_pending_tag` fails open (returns the input
+/// unchanged) when it can't find a matching close tag — that would leave a
+/// truncated, still-visible marker fragment in the displayed text. Stripping
+/// first guarantees the truncation only ever sees ordinary human text.
+///
+/// `os_operator::strip_system_operator_pending_tag` is a fail-open no-op on
+/// ordinary text (the overwhelming majority of rows never went through O-4),
+/// and `os_operator::marker_to_artifact` fails closed to `None` on anything
+/// it can't map — a malformed or unmappable marker degrades to plain text,
+/// never a broken card. Only assistant turns are ever eligible: the marker is
+/// only ever produced in assistant output, so user/system rows pass through
+/// with no artifact. Pure — exported for tests.
+fn chat_history_row_content_and_artifact(role: &str, raw_content: &str) -> (String, Option<Value>) {
+    let prefix_stripped = crate::channel_reply::strip_sender_prefix(raw_content);
+    let (body, artifact) = if role == "assistant" {
+        let (stripped, marker) =
+            crate::os_operator::strip_system_operator_pending_tag(prefix_stripped);
+        let artifact = marker.as_ref().and_then(crate::os_operator::marker_to_artifact);
+        (stripped, artifact)
+    } else {
+        (prefix_stripped.to_string(), None)
+    };
+    // CJK-safe cap — long single turns are bounded so the payload stays sane;
+    // normal messages pass through whole.
+    let content = duduclaw_core::truncate_chars(&body, CHAT_HISTORY_MSG_MAX_CHARS);
+    (content, artifact)
+}
+
+/// `chat_history_row_content_and_artifact` — the pure resume-path strip+map
+/// backing `chat.sessions.history`'s task-B artifact reconstruction. Session
+/// storage was confirmed (via `channel_reply::build_reply_with_session_inner`)
+/// to persist assistant replies BEFORE the live-path
+/// `strip_operator_pending_marker` call, so these tests exercise the read-side
+/// replay directly rather than standing up a full `ReplyContext` +
+/// `SessionManager` harness.
+#[cfg(test)]
+mod chat_history_row_content_and_artifact_tests {
+    use super::*;
+
+    #[test]
+    fn assistant_marker_is_stripped_and_mapped_to_artifact() {
+        let stored = "「重新開機」會變更這台機器的狀態，請先確認：要執行嗎？\n\n\
+            <system_operator_pending>{\"tool\":\"os_power\",\"params\":{\"action\":\"restart\"},\
+            \"needs_confirm\":true,\"needs_approval\":false}</system_operator_pending>";
+        let (content, artifact) = chat_history_row_content_and_artifact("assistant", stored);
+        assert!(
+            !content.contains("system_operator_pending"),
+            "marker tag must not leak into resumed history text: {content}"
+        );
+        assert!(content.contains("重新開機"), "human text must survive: {content}");
+        let artifact = artifact.expect("os_power/restart must map to a confirm_action artifact");
+        assert_eq!(artifact["type"], "confirm_action");
+        assert_eq!(artifact["payload"]["action"], "restart");
+    }
+
+    #[test]
+    fn assistant_text_without_marker_is_unchanged_and_has_no_artifact() {
+        let stored = "訂單 #42 已出貨，預計三天內送達。";
+        let (content, artifact) = chat_history_row_content_and_artifact("assistant", stored);
+        assert_eq!(content, stored);
+        assert!(artifact.is_none());
+    }
+
+    #[test]
+    fn unknown_tool_marker_is_stripped_but_produces_no_artifact() {
+        // marker_to_artifact fails closed to None on a tool it doesn't
+        // recognise; the tag itself must still never leak into `content`.
+        let stored = "任務已排入佇列。\n\n\
+            <system_operator_pending>{\"tool\":\"some_future_tool\",\"params\":{},\
+            \"needs_confirm\":true,\"needs_approval\":false}</system_operator_pending>";
+        let (content, artifact) = chat_history_row_content_and_artifact("assistant", stored);
+        assert!(!content.contains("system_operator_pending"), "got: {content}");
+        assert!(artifact.is_none());
+    }
+
+    #[test]
+    fn non_assistant_role_is_never_scanned_for_a_marker() {
+        // The marker is only ever produced in assistant output (render_pending
+        // in os_operator.rs); a user/system row is left exactly as stored —
+        // whatever literal text a user pasted is their own and is not treated
+        // as a system marker.
+        let stored = "使用者貼上的文字剛好包含 <system_operator_pending>不是真的標記</system_operator_pending>";
+        let (content, artifact) = chat_history_row_content_and_artifact("user", stored);
+        assert_eq!(content, stored);
+        assert!(artifact.is_none());
+    }
+
+    #[test]
+    fn strip_runs_before_truncate_so_a_split_marker_never_leaks() {
+        // Regression guard for the ordering bug this task's investigation
+        // flagged: truncating the raw (marker-included) text first could cut
+        // the closing tag off, which makes `strip_system_operator_pending_tag`
+        // fail open and return the ORIGINAL (now truncated, still tagged)
+        // text unchanged. Stripping first means truncation only ever sees
+        // plain human text, so no fragment of the tag can survive.
+        let human = "確認要繼續嗎？";
+        let marker = "<system_operator_pending>{\"tool\":\"os_power\",\"params\":{\"action\":\"shutdown\"},\
+            \"needs_confirm\":true,\"needs_approval\":false}</system_operator_pending>";
+        // Pad the human prefix well past the cap so a naive truncate-first
+        // implementation would slice through the marker.
+        let padded_human = human.repeat(CHAT_HISTORY_MSG_MAX_CHARS);
+        let stored = format!("{padded_human}\n\n{marker}");
+        let (content, artifact) = chat_history_row_content_and_artifact("assistant", &stored);
+        assert!(
+            !content.contains("system_operator_pending"),
+            "a split marker must never leak a fragment into the truncated text"
+        );
+        assert!(content.chars().count() <= CHAT_HISTORY_MSG_MAX_CHARS);
+        // The marker survives (it's stripped from the *front* text, not
+        // discarded by the cap) so the artifact still reconstructs.
+        let artifact = artifact.expect("marker must still map even though the human text is capped");
+        assert_eq!(artifact["payload"]["action"], "shutdown");
+    }
+
+    #[test]
+    fn sender_prefix_and_marker_both_strip_together() {
+        let stored = "[sender_id: alice]\n「回復原廠設定」是不可逆的系統操作，需要人工核准。\n\n\
+            <system_operator_pending>{\"tool\":\"os_factory_reset\",\"params\":{},\
+            \"needs_confirm\":false,\"needs_approval\":true}</system_operator_pending>";
+        let (content, artifact) = chat_history_row_content_and_artifact("assistant", stored);
+        assert!(!content.contains("sender_id"), "got: {content}");
+        assert!(!content.contains("system_operator_pending"), "got: {content}");
+        let artifact = artifact.expect("os_factory_reset must map to a confirm_action artifact");
+        assert_eq!(artifact["payload"]["action"], "factory_reset");
+    }
+}
+
 /// How many most-recent session messages are scanned per listing (bounds the
 /// full-table read; older turns simply fall off the "recent runs" horizon).
 pub(crate) const RUNS_SCAN_MSG_CAP: usize = 4000;
@@ -42942,5 +43385,569 @@ mod wp7g_batch2_tail_tests {
         assert_eq!(item.status, crate::mail::OutboxStatus::Rejected);
         assert_eq!(item.note.as_deref(), Some("已由人工拒絕，未寄出。"));
         assert!(item.decision_note.is_none(), "no note param ⇒ no decision_note row");
+    }
+}
+
+// ── WP-B: appliance device management ("device.*") ─────────────────────
+//
+// Dispatch (admin + `require_appliance!()` + `require_confirm!()` gates) is
+// in `dispatch()`'s method match above; data gathering lives in
+// `device.rs`, shell-outs in `device_ops.rs`. These handlers are thin glue
+// — the pure/mockable logic is unit-tested in those two modules instead of
+// here (see their own `#[cfg(test)]` blocks), so this module's own test
+// coverage focuses on the dispatch-level gates (admin / appliance / confirm)
+// that only exist at this layer.
+impl MethodHandler {
+    async fn handle_device_status(&self) -> WsFrame {
+        let status = crate::device::collect_status(self.home_dir());
+        match serde_json::to_value(&status) {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &format!("device status serialize failed: {e}")),
+        }
+    }
+
+    /// `device.network` — read path returns the current interface list;
+    /// any of the network-write-shaped keys in `params`
+    /// (`crate::device::is_network_write_request`) refuses with a
+    /// structured `not_implemented` error. Setting a static IP is real
+    /// future work, not a placeholder that silently no-ops.
+    async fn handle_device_network(&self, params: Value) -> WsFrame {
+        if crate::device::is_network_write_request(&params) {
+            return WsFrame::Response {
+                id: String::new(),
+                ok: false,
+                payload: None,
+                error: Some(json!({
+                    "code": "not_implemented",
+                    "message": "設定靜態 IP 尚未支援，本版僅提供網路介面讀取。",
+                })),
+            };
+        }
+        match serde_json::to_value(crate::device::collect_network()) {
+            Ok(v) => WsFrame::ok_response("", json!({ "interfaces": v })),
+            Err(e) => {
+                WsFrame::error_response("", &format!("network interfaces serialize failed: {e}"))
+            }
+        }
+    }
+
+    async fn handle_device_update_status(&self) -> WsFrame {
+        device_op_result_frame(crate::device_ops::select_device_ops().update_status().await)
+    }
+
+    async fn handle_device_update_apply(&self) -> WsFrame {
+        device_op_result_frame(crate::device_ops::select_device_ops().update_apply().await)
+    }
+
+    async fn handle_device_update_rollback(&self) -> WsFrame {
+        device_op_result_frame(crate::device_ops::select_device_ops().update_rollback().await)
+    }
+
+    async fn handle_device_factory_reset(&self) -> WsFrame {
+        device_op_result_frame(
+            crate::device_ops::select_device_ops()
+                .factory_reset(self.home_dir())
+                .await,
+        )
+    }
+
+    async fn handle_device_power(&self, params: Value) -> WsFrame {
+        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        match action {
+            "restart" => {
+                device_op_result_frame(crate::device_ops::select_device_ops().reboot().await)
+            }
+            "shutdown" => {
+                device_op_result_frame(crate::device_ops::select_device_ops().poweroff().await)
+            }
+            _ => WsFrame::error_response("", "action 必須是 \"restart\" 或 \"shutdown\""),
+        }
+    }
+
+    /// `device.backup_create` — archives the writable data partition (the
+    /// parent of `home_dir`; on the appliance image `home_dir` is
+    /// `/data/duduclaw` so its parent is `/data`, matching the "整個 /data
+    /// 打包匯出" requirement) and stages it under the shared attachments
+    /// directory so the EXISTING file-download mechanism
+    /// (`GET /api/files/download?name=<filename>`, `files_api.rs`) serves
+    /// it — no new download endpoint.
+    ///
+    /// The archive is built at a staging path OUTSIDE the source tree
+    /// first (`std::env::temp_dir()`) and only moved into the attachments
+    /// dir on success: tar-ing `/data` while writing the output file
+    /// *into* `/data` would make tar try to include the archive it is
+    /// still writing.
+    async fn handle_device_backup_create(&self) -> WsFrame {
+        match create_device_backup_archive(self.home_dir()).await {
+            DeviceBackupOutcome::Created { filename, stdout, stderr } => WsFrame::ok_response(
+                "",
+                json!({ "filename": filename, "stdout": stdout, "stderr": stderr }),
+            ),
+            DeviceBackupOutcome::OpFailed(out) => device_op_result_frame(Ok(out)),
+            DeviceBackupOutcome::OpError(e) => device_op_result_frame(Err(e)),
+            DeviceBackupOutcome::MoveFailed(msg) => WsFrame::error_response("", &msg),
+        }
+    }
+
+    // ── WP-G1: scheduled backups + device-migration restore ─────────────
+    //
+    // Scheduling config lives in `crate::backup_schedule`, the actual timer
+    // is spawned once at gateway startup (`server.rs::start_gateway`) —
+    // these handlers are the dashboard's read/write/list/delete surface
+    // over it. Restore (`backup_restore`) only ever STAGES an uploaded
+    // archive; the destructive swap runs exactly once, at the next boot,
+    // in `crate::backup_restore::perform_pending_restore_swap`.
+
+    async fn handle_device_backup_schedule_get(&self) -> WsFrame {
+        let cfg = crate::backup_schedule::BackupScheduleConfig::from_home(self.home_dir());
+        WsFrame::ok_response(
+            "",
+            json!({
+                "schedule_enabled": cfg.enabled,
+                "interval_hours": cfg.interval_hours,
+                "retention_count": cfg.retention_count,
+            }),
+        )
+    }
+
+    async fn handle_device_backup_schedule_set(&self, params: Value) -> WsFrame {
+        // Validate before touching the config file — fail-closed, no
+        // partial writes.
+        if let Some(v) = params.get("interval_hours").and_then(Value::as_u64)
+            && !(1..=8760).contains(&v)
+        {
+            return WsFrame::error_response("", "interval_hours 必須介於 1 到 8760 小時之間");
+        }
+        if let Some(v) = params.get("retention_count").and_then(Value::as_u64)
+            && !(1..=1000).contains(&v)
+        {
+            return WsFrame::error_response("", "retention_count 必須介於 1 到 1000 之間");
+        }
+        let has_any = ["schedule_enabled", "interval_hours", "retention_count"]
+            .iter()
+            .any(|k| params.get(*k).is_some());
+        if !has_any {
+            return WsFrame::error_response(
+                "",
+                "No valid fields to update. Supported: schedule_enabled, interval_hours, retention_count",
+            );
+        }
+
+        let config_path = self.home_dir().join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        let mut changes: Vec<String> = Vec::new();
+        {
+            let backup = table
+                .entry("backup")
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .unwrap();
+            if let Some(v) = params.get("schedule_enabled").and_then(Value::as_bool) {
+                backup.insert("schedule_enabled".into(), toml::Value::Boolean(v));
+                changes.push(format!("backup.schedule_enabled = {v}"));
+            }
+            if let Some(v) = params.get("interval_hours").and_then(Value::as_u64) {
+                backup.insert("interval_hours".into(), toml::Value::Integer(v as i64));
+                changes.push(format!("backup.interval_hours = {v}"));
+            }
+            if let Some(v) = params.get("retention_count").and_then(Value::as_u64) {
+                backup.insert("retention_count".into(), toml::Value::Integer(v as i64));
+                changes.push(format!("backup.retention_count = {v}"));
+            }
+        }
+
+        let tmp_path = config_path.with_extension("toml.tmp");
+        if let Err(e) = self.write_config_table(&tmp_path, &table).await {
+            return WsFrame::error_response("", &format!("Failed to write config: {e}"));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &config_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return WsFrame::error_response("", &format!("Failed to commit config: {e}"));
+        }
+
+        let cfg = crate::backup_schedule::BackupScheduleConfig::from_home(self.home_dir());
+        info!(?changes, "device.backup_schedule_set completed");
+        WsFrame::ok_response(
+            "",
+            json!({
+                "schedule_enabled": cfg.enabled,
+                "interval_hours": cfg.interval_hours,
+                "retention_count": cfg.retention_count,
+            }),
+        )
+    }
+
+    /// `device.backup_list` — lists `<home>/backups/` (never `attachments/`
+    /// — see `backup_schedule.rs`'s module doc for why the two stay
+    /// separate). Reuses `files_api::list_files`, the same listing helper
+    /// the task/channel attachments panel uses.
+    async fn handle_device_backup_list(&self) -> WsFrame {
+        let dir = crate::backup_schedule::backups_dir(self.home_dir());
+        let files = crate::files_api::list_files(&dir);
+        match serde_json::to_value(&files) {
+            Ok(v) => WsFrame::ok_response("", json!({ "files": v })),
+            Err(e) => WsFrame::error_response("", &format!("backup list serialize failed: {e}")),
+        }
+    }
+
+    /// `device.backup_delete` — reuses `files_api::resolve_download`'s
+    /// allowlist + canonicalize-containment check to locate the file before
+    /// removing it (the same fail-closed discipline as a download, just
+    /// followed by a delete instead of a stream).
+    async fn handle_device_backup_delete(&self, params: Value) -> WsFrame {
+        let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "name parameter is required");
+        };
+        let dir = crate::backup_schedule::backups_dir(self.home_dir());
+        match crate::files_api::resolve_download(&dir, name) {
+            Ok(path) => match std::fs::remove_file(&path) {
+                Ok(()) => WsFrame::ok_response("", json!({ "deleted": true })),
+                Err(e) => WsFrame::error_response("", &format!("刪除備份檔失敗: {e}")),
+            },
+            Err(crate::files_api::ResolveError::BadRequest) => WsFrame::error_response("", "無效的檔名"),
+            Err(crate::files_api::ResolveError::Denied) => WsFrame::error_response("", "存取被拒絕"),
+            Err(crate::files_api::ResolveError::NotFound) => WsFrame::error_response("", "備份檔不存在"),
+        }
+    }
+
+    /// `device.backup_restore` — WP-G1 device migration ("汰機搬家").
+    /// `path` must be a file this gateway itself staged via
+    /// `POST /api/device/backup-upload` (`server.rs`) —
+    /// `is_within_upload_dir` fail-closed rejects anything else, so a
+    /// caller cannot point this at an arbitrary filesystem path. Extracts
+    /// into the restore staging dir under the shared `RestoreLimits` gate,
+    /// then writes the pending-restore marker. Nothing destructive happens
+    /// in this call — the actual swap runs once, at the next gateway boot
+    /// (`crate::backup_restore::perform_pending_restore_swap`, wired into
+    /// `server.rs::start_gateway`).
+    async fn handle_device_backup_restore(&self, params: Value) -> WsFrame {
+        let Some(path) = params.get("path").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "path parameter is required");
+        };
+        let src = std::path::Path::new(path);
+        if !crate::backup_restore::is_within_upload_dir(self.home_dir(), src) {
+            return WsFrame::error_response("", "還原來源不存在（請重新上傳）");
+        }
+
+        let home = self.home_dir().to_path_buf();
+        let staging = crate::backup_restore::staging_dir(&home);
+        let limits = crate::backup_restore::RestoreLimits::from_home(&home);
+
+        let extract_result = {
+            let src = src.to_path_buf();
+            let staging = staging.clone();
+            tokio::task::spawn_blocking(move || crate::backup_restore::extract_tar_gz_safely(&src, &staging, &limits))
+                .await
+        };
+        let report = match extract_result {
+            Ok(Ok(report)) => report,
+            Ok(Err(violation)) => {
+                return WsFrame::Response {
+                    id: String::new(),
+                    ok: false,
+                    payload: None,
+                    error: Some(json!({ "code": "restore_rejected", "message": violation.to_string() })),
+                };
+            }
+            Err(e) => {
+                return WsFrame::error_response("", &format!("還原解壓時發生內部錯誤: {e}"));
+            }
+        };
+
+        let source_filename = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let marker = crate::backup_restore::RestoreMarker { staged_at: Utc::now(), source_filename };
+        if let Err(e) = crate::backup_restore::write_marker(&home, &marker) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return WsFrame::error_response("", &format!("寫入還原標記失敗: {e}"));
+        }
+
+        // Best-effort: the uploaded file's content is now safely inside
+        // `staging`; keeping the original around only wastes disk.
+        let _ = std::fs::remove_file(src);
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "staged": true,
+                "files_written": report.files_written,
+                "restart_required": true,
+            }),
+        )
+    }
+}
+
+/// Outcome of [`create_device_backup_archive`] — every branch the original
+/// `device.backup_create` RPC handler could reach, factored out of
+/// `MethodHandler::handle_device_backup_create` (now a thin match over this)
+/// so the O-0 `os_backup_create` MCP tool (`duduclaw-cli::mcp`) reuses the
+/// EXACT same archive-then-stage logic instead of re-deriving it — avoiding
+/// the two-implementation drift the O-0 design explicitly warns against.
+pub enum DeviceBackupOutcome {
+    /// Archive built and moved into the attachments dir.
+    Created { filename: String, stdout: String, stderr: String },
+    /// The op ran (spawned) but reported failure (`OpOutput::success == false`).
+    OpFailed(crate::device_ops::OpOutput),
+    /// The op itself could not run (see [`crate::device_ops::DeviceOpError`]).
+    OpError(crate::device_ops::DeviceOpError),
+    /// Archive succeeded but the staging→attachments move failed. Carries a
+    /// ready-to-display zh-TW message, byte-identical to the original inline
+    /// error strings.
+    MoveFailed(String),
+}
+
+/// `device.backup_create`'s data-gathering + orchestration half (dispatch
+/// gates — admin / appliance — live in `dispatch()`'s method match; this is
+/// the part both the dashboard RPC and the agent-facing `os_backup_create`
+/// MCP tool share). See the original handler's doc comment (now on
+/// [`MethodHandler::handle_device_backup_create`]) for the staging-path
+/// rationale: the archive is built OUTSIDE the source tree first so tar-ing
+/// the writable data partition never tries to include the archive it is
+/// still writing.
+pub async fn create_device_backup_archive(home_dir: &Path) -> DeviceBackupOutcome {
+    let home = home_dir.to_path_buf();
+    let source_dir = home
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| home.clone());
+    let filename = format!("device-backup-{}.tar.gz", Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let staging = std::env::temp_dir().join(format!("duduclaw-{filename}"));
+
+    let result = crate::device_ops::select_device_ops()
+        .backup_create(&source_dir, &staging)
+        .await;
+    let out = match result {
+        Ok(out) if out.success => out,
+        Ok(out) => {
+            let _ = std::fs::remove_file(&staging);
+            return DeviceBackupOutcome::OpFailed(out);
+        }
+        Err(e) => return DeviceBackupOutcome::OpError(e),
+    };
+
+    let Some(dest_dir) = crate::files_api::attachments_dir(&home, None) else {
+        let _ = std::fs::remove_file(&staging);
+        return DeviceBackupOutcome::MoveFailed("無法解析備份存放目錄".to_string());
+    };
+    if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+        let _ = std::fs::remove_file(&staging);
+        return DeviceBackupOutcome::MoveFailed(format!("建立備份目錄失敗: {e}"));
+    }
+    let dest_path = dest_dir.join(&filename);
+    if let Err(e) = std::fs::rename(&staging, &dest_path) {
+        // Cross-device rename (e.g. /tmp on a different filesystem than
+        // the attachments dir) falls back to copy+remove.
+        if let Err(e2) = std::fs::copy(&staging, &dest_path) {
+            let _ = std::fs::remove_file(&staging);
+            return DeviceBackupOutcome::MoveFailed(format!(
+                "搬移備份檔失敗: rename={e} copy={e2}"
+            ));
+        }
+        let _ = std::fs::remove_file(&staging);
+    }
+
+    DeviceBackupOutcome::Created { filename, stdout: out.stdout, stderr: out.stderr }
+}
+
+#[cfg(test)]
+mod device_rpc_tests {
+    use super::*;
+
+    fn admin_ctx() -> UserContext {
+        UserContext::admin_fallback()
+    }
+
+    fn employee_ctx() -> UserContext {
+        UserContext {
+            user_id: "u1".to_string(),
+            email: "u1@test.local".to_string(),
+            role: UserRole::Employee,
+            agent_access: std::collections::HashMap::new(),
+            must_change_password: false,
+        }
+    }
+
+    fn frame_error_code(f: &WsFrame) -> Option<String> {
+        match f {
+            WsFrame::Response { error: Some(e), .. } => {
+                e.get("code").and_then(|c| c.as_str()).map(str::to_string)
+            }
+            _ => None,
+        }
+    }
+
+    /// Every `device.*` method, tried with no `DUDUCLAW_APPLIANCE` set —
+    /// the default test-process state (this crate never sets that env var
+    /// in any other test). Every one must fail closed with
+    /// `not_appliance`, admin or not — the appliance gate runs regardless
+    /// of role.
+    #[tokio::test]
+    async fn all_device_methods_fail_closed_off_appliance() {
+        assert!(
+            std::env::var(duduclaw_core::APPLIANCE_ENV).is_err(),
+            "precondition: DUDUCLAW_APPLIANCE must be unset in the test process"
+        );
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = admin_ctx();
+
+        for (method, params) in [
+            ("device.status", json!({})),
+            ("device.network", json!({})),
+            ("device.update_status", json!({})),
+            ("device.update_apply", json!({})),
+            ("device.update_rollback", json!({"confirm": true})),
+            ("device.backup_create", json!({})),
+            ("device.backup_schedule_get", json!({})),
+            ("device.backup_schedule_set", json!({"schedule_enabled": true})),
+            ("device.backup_list", json!({})),
+            ("device.backup_delete", json!({"name": "x.tar.gz"})),
+            ("device.backup_restore", json!({"path": "/tmp/x.tar.gz", "confirm": true})),
+            ("device.factory_reset", json!({"confirm": true})),
+            ("device.power", json!({"action": "restart", "confirm": true})),
+        ] {
+            let frame = handler.handle(method, params, &ctx).await;
+            assert_eq!(
+                frame_error_code(&frame).as_deref(),
+                Some(DEVICE_NOT_APPLIANCE_ERROR_CODE),
+                "{method} must refuse off-appliance: {frame:?}"
+            );
+        }
+    }
+
+    /// Non-admin is refused even off-appliance — the admin gate runs
+    /// first, so a non-admin never learns whether the box is an appliance.
+    #[tokio::test]
+    async fn device_status_refuses_non_admin() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler
+            .handle("device.status", json!({}), &employee_ctx())
+            .await;
+        assert!(!matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+        // Off-appliance the admin gate error and the appliance gate error
+        // are both plausible depending on macro order; what matters is it
+        // is NOT a success and NOT the appliance-specific code (proving the
+        // admin gate — not the appliance gate — is what fired first).
+        assert_ne!(frame_error_code(&frame).as_deref(), Some(DEVICE_NOT_APPLIANCE_ERROR_CODE));
+    }
+
+    fn frame_data(f: &WsFrame) -> Value {
+        match f {
+            WsFrame::Response { payload: Some(p), .. } => p.clone(),
+            other => panic!("expected a payload: {other:?}"),
+        }
+    }
+
+    /// R2 (2026-08): unlike every `device.*` method above, the
+    /// `"system.status" => self.handle_system_status().await` dispatch arm
+    /// carries no `require_admin!()` — so a manager/employee caller can
+    /// already read it today, and it now also carries the non-sensitive
+    /// `is_appliance` boolean (a direct forward of the same single authority
+    /// `device.status`'s `require_appliance!()` gate reads,
+    /// `duduclaw_core::is_appliance()` — never re-derived). This is the
+    /// signal `useIsAppliance` (web) reads so a non-admin viewer on the
+    /// appliance image can also land on the conversational console
+    /// (`App.tsx::HomeLanding`), instead of only admins as before — `device.
+    /// status`'s CPU/RAM/network detail stays admin-only, untouched.
+    #[tokio::test]
+    async fn system_status_is_readable_by_non_admin_and_carries_is_appliance() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler.handle("system.status", json!({}), &employee_ctx()).await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: true, .. }),
+            "system.status must succeed for a non-admin caller: {frame:?}"
+        );
+        let data = frame_data(&frame);
+        // Test-process precondition (same one `all_device_methods_fail_closed_off_appliance`
+        // asserts above): `DUDUCLAW_APPLIANCE` is never set in this binary,
+        // so the live authority reads `false` here. The `true` branch of
+        // that boolean is intentionally NOT re-tested by flipping the real
+        // process-global env var — this module deliberately never does that
+        // (see this test's neighbors' doc comments) to avoid racing that
+        // precondition under parallel test execution; the on/off logic
+        // itself is already exhaustively covered by
+        // `duduclaw_core::appliance::appliance_flag`'s pure unit tests. What
+        // this assertion locks down is that the field is wired through
+        // byte-for-byte, not hand-rolled.
+        assert_eq!(
+            data.get("is_appliance").and_then(Value::as_bool),
+            Some(duduclaw_core::is_appliance()),
+            "is_appliance must be an unmodified forward of the single authority: {data:?}"
+        );
+        assert_eq!(
+            duduclaw_core::is_appliance(),
+            false,
+            "precondition: DUDUCLAW_APPLIANCE must be unset in this test process"
+        );
+    }
+
+    /// The three destructive ops refuse without `confirm: true`, even with
+    /// admin + (mocked) appliance mode — checked here without actually
+    /// flipping `DUDUCLAW_APPLIANCE` (avoids any risk of racing other
+    /// tests in this same process that read it indirectly via
+    /// `gateway_bind_for_home`) by asserting the confirm gate fires FIRST,
+    /// before the appliance gate even runs — `require_confirm!()` is
+    /// checked after `require_appliance!()` in dispatch, so on this
+    /// non-appliance test host the observed code is always
+    /// `not_appliance`, not `confirm_required`. The meaningful invariant
+    /// this test locks down is the ORDER-INDEPENDENT one: omitting confirm
+    /// must never itself be treated as `Some(true)` — see the pure
+    /// `params.get("confirm")` check exercised directly below instead.
+    #[test]
+    fn confirm_gate_only_accepts_literal_true() {
+        assert_eq!(json!({}).get("confirm").and_then(Value::as_bool), None);
+        assert_eq!(
+            json!({"confirm": false}).get("confirm").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            json!({"confirm": "true"}).get("confirm").and_then(Value::as_bool),
+            None,
+            "a string \"true\" must not satisfy the gate — only the JSON boolean does"
+        );
+        assert_eq!(
+            json!({"confirm": true}).get("confirm").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn device_not_appliance_frame_carries_stable_code() {
+        let frame = device_not_appliance_frame();
+        assert_eq!(frame_error_code(&frame).as_deref(), Some("not_appliance"));
+    }
+
+    #[test]
+    fn device_confirm_required_frame_carries_stable_code() {
+        let frame = device_confirm_required_frame();
+        assert_eq!(frame_error_code(&frame).as_deref(), Some("confirm_required"));
+    }
+
+    #[test]
+    fn device_op_result_frame_maps_success_and_error_variants() {
+        use crate::device_ops::{DeviceOpError, OpOutput};
+
+        let ok = device_op_result_frame(Ok(OpOutput {
+            success: true,
+            stdout: "done".to_string(),
+            stderr: String::new(),
+        }));
+        assert!(matches!(ok, WsFrame::Response { ok: true, .. }));
+
+        let unsupported = device_op_result_frame(Err(DeviceOpError::Unsupported("nope".to_string())));
+        assert_eq!(frame_error_code(&unsupported).as_deref(), Some("unsupported"));
+
+        let io_err = device_op_result_frame(Err(DeviceOpError::Io("disk full".to_string())));
+        assert_eq!(frame_error_code(&io_err).as_deref(), Some("io_error"));
+    }
+
+    #[test]
+    fn network_write_detection_gates_static_ip_params() {
+        assert!(crate::device::is_network_write_request(&json!({"static_ip": "10.0.0.5"})));
+        assert!(!crate::device::is_network_write_request(&json!({})));
     }
 }

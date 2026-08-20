@@ -189,28 +189,40 @@ pub struct LineState {
 
 // ── Public API ──────────────────────────────────────────────
 
+impl LineState {
+    /// Build a `LineState` sharing the same `channel_status`/`event_tx` as
+    /// the rest of the gateway (both are cloned off `ctx`, which is itself
+    /// an `Arc` — cloning the fields shares the underlying state, it does
+    /// not fork it). Used by both `start_line_bot` (the direct HTTP
+    /// `/webhook/line` route) and the box-side relay client
+    /// (`relay_client.rs`, WP-E2), so a webhook delivered via either
+    /// transport goes through byte-identical verification + dispatch.
+    pub(crate) fn new(home_dir: &Path, ctx: Arc<ReplyContext>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        Self {
+            home_dir: home_dir.to_path_buf(),
+            channel_status: ctx.channel_status.clone(),
+            event_tx: ctx.event_tx.clone(),
+            http,
+            ctx,
+        }
+    }
+}
+
 /// Mount the LINE webhook endpoint. The route is ALWAYS mounted (even when LINE
 /// is not yet configured) and the handler reads the token/secret from config on
 /// every request — so configuring or changing LINE in the dashboard takes effect
 /// immediately, with no gateway restart. A best-effort token check runs now to
 /// set the initial channel status.
 pub async fn start_line_bot(home_dir: &Path, ctx: Arc<ReplyContext>) -> Router {
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
+    let state = LineState::new(home_dir, ctx.clone());
 
     // Initial status (best-effort) so the dashboard reflects an already-configured
     // LINE channel without waiting for the first webhook.
-    verify_line_status(home_dir, &http, &ctx.channel_status, &ctx.event_tx).await;
-
-    let state = LineState {
-        home_dir: home_dir.to_path_buf(),
-        channel_status: ctx.channel_status.clone(),
-        event_tx: ctx.event_tx.clone(),
-        http,
-        ctx,
-    };
+    verify_line_status(home_dir, &state.http, &ctx.channel_status, &ctx.event_tx).await;
 
     info!("   LINE webhook endpoint mounted: /webhook/line (token read per request — no restart needed on config change)");
     Router::new()
@@ -288,6 +300,21 @@ async fn line_webhook_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
+    handle_line_webhook(state, &headers, body).await
+}
+
+/// WP-E2: the shared verify + dispatch entry point used by both the direct
+/// `/webhook/line` HTTP route (above) and the box-side relay client
+/// (`relay_client.rs`) when it receives a `channel = "line"` `HookFrame`
+/// from `duduclaw-relay`. LINE signature verification and event handling
+/// exist in exactly one place regardless of which transport delivered the
+/// webhook body — the relay path never re-implements or bypasses it.
+///
+/// The returned `StatusCode` matters to the direct HTTP route (LINE reads
+/// it); the relay path only needs to know success (`is_success()`) vs
+/// failure to classify the frame for its own `relay_frames_total` metric —
+/// see `relay_client::inject_line_hook`.
+pub(crate) async fn handle_line_webhook(state: LineState, headers: &HeaderMap, body: Bytes) -> StatusCode {
     // Load the current LINE credentials per request — config changes apply live.
     let (token, secret) = match read_line_config(&state.home_dir).await {
         Some((t, s)) if !t.is_empty() && !s.is_empty() => (t, s),

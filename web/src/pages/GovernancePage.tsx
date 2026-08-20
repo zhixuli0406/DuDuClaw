@@ -165,7 +165,8 @@ export function GovernancePage() {
       {/* X03 (UX audit §3.3) — SecurityPage's RBAC card already links back
           here (`security.rbac.editLink` → `/manage/governance?tab=governance`);
           this is the missing reverse direction, shown while looking at
-          permission-type policies specifically. */}
+          permission-type policies specifically. N-3 (2026-08): the target
+          relocated to `/app/system/security`. */}
       {filter === 'permission' && (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-muted/40 px-3 py-2">
           <p className="text-xs text-muted-foreground">
@@ -173,7 +174,7 @@ export function GovernancePage() {
           </p>
           <CrossLink
             label={intl.formatMessage({ id: 'crosslink.governance.rbacMatrix' })}
-            onClick={() => navigate('/manage/security')}
+            onClick={() => navigate('/app/system/security')}
           />
         </div>
       )}

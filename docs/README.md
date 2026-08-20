@@ -60,6 +60,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/47-agent-mail.md](features/47-agent-mail.md) | Agent Mail — per-agent inbox (Gmail / drop folder); outbound mail always requires human confirmation |
 | [features/48-goal-intent-router.md](features/48-goal-intent-router.md) | Goal intent router — chat channels notice task delegation and offer to create a goal; never auto-created |
 | [features/49-code-security-audit.md](features/49-code-security-audit.md) | Code security audit — `duduclaw secaudit`: static scanners + AI deep audit + adversarial review + sandboxed PoC |
+| [features/50-duduclaw-os-appliance.md](features/50-duduclaw-os-appliance.md) | DuDuClaw OS appliance — bootable image, LAN dashboard onboarding, device page, sysd privilege separation, webhook relay |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
@@ -153,6 +154,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/white-label.md](guides/white-label.md) | White-label branding (reseller logo/name) + distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`) | Current |
 | [guides/recording-to-skill.md](guides/recording-to-skill.md) | 錄製 → 技能：瀏覽器/桌面示範錄製、HAR 脫敏、蒸餾成 SKILL.md 草稿＋審批安裝（`[capabilities] recording`） | Current |
 | [guides/feedback-page.md](guides/feedback-page.md) | 問題回報與建議網頁（GitHub Pages 表單 → issue 預填 → Actions + Haiku 自動分類/格式化/上標籤） | Current |
+| [guides/appliance-build.md](guides/appliance-build.md) | Community build guide for the DuDuClaw OS appliance image — `build.sh` usage, Docker/QEMU prerequisites, self-install USB flow, known limitations | Current |
 
 ## API Reference
 
@@ -190,7 +192,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 ├── features/                          # Feature highlight articles (+ ja-JP, zh-TW)
 │   ├── README.md
 │   ├── feature-inventory.md
-│   └── 01-…-47-…                      #   47 feature deep-dives
+│   └── 01-…-50-…                      #   50 feature deep-dives
 ├── spec/                              # Open format specifications
 │   ├── soul-md-spec.md                #   SOUL.md format v1.0
 │   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0
@@ -201,7 +203,8 @@ docs/                                  # L1 PUBLIC — product & developer docum
 │   ├── custom-mcp-tool.md
 │   ├── evals.md
 │   ├── observability.md
-│   └── docker.md
+│   ├── docker.md
+│   └── appliance-build.md
 └── api/
     ├── README.md                      # WebSocket RPC protocol
     └── openapi.yaml                   # OpenAPI spec

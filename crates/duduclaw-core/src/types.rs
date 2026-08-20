@@ -740,6 +740,21 @@ pub struct CapabilitiesConfig {
     #[serde(default)]
     pub git_credentials: bool,
 
+    /// Opt-in system-operator designation: master switch for the `os_*`
+    /// system-operation MCP tool face (device/system status, backup,
+    /// power, update, factory reset, doctor). Default `false` — every
+    /// agent, even one holding `Scope::Admin`, is denied these tools at
+    /// the dispatch gate unless an operator explicitly sets this to
+    /// `true` on that specific agent. Distinct from `os_native` (host
+    /// automation for an ordinary agent's own machine footprint): this
+    /// flag marks an agent as the machine's designated operator persona,
+    /// a materially higher trust tier reserved for the small number of
+    /// agents meant to run/restart/update/reset the box on a human's
+    /// behalf. Also gates whether the conversational reply path routes a
+    /// turn through the system-operation intent router before answering.
+    #[serde(default)]
+    pub system_operator: bool,
+
     // ── Formerly-untyped `[capabilities]` keys (R2 unification) ─────────
     //
     // These six lived in the same `[capabilities]` table as the fields above
@@ -943,6 +958,7 @@ impl Default for CapabilitiesConfig {
             os_native: false,
             recording: false,
             git_credentials: false,
+            system_operator: false,
             scoped_tools: Vec::new(),
             grant_ttl_secs: None,
             approval_required_tools: Vec::new(),

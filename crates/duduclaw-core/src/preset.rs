@@ -153,6 +153,65 @@ pub fn agent_home_dir(agent_dir: &Path) -> Option<PathBuf> {
     parent.parent().map(|p| p.to_path_buf())
 }
 
+// ── Free built-in preset (no license gate) — P2 ─────────────────────────
+//
+// The 9 department kits under `commercial/templates-premium/presets/` are
+// gated by the `premium_templates` license feature AND only reachable when
+// the gitignored `commercial/` nested repo is checked out (see
+// `duduclaw-cli::premium_templates::find_premium_templates_dir`). Neither
+// applies here: this one preset ships inside the public repo's `templates/`
+// tree (L1 public) and is compiled directly into the binary via
+// `include_str!`, the same mechanism already used for
+// `templates/wiki/CLAUDE_WIKI.md` in `duduclaw-cli`'s agent scaffold. Every
+// OSS build has it — no license, no `commercial/` checkout, no network call.
+
+/// Id of the one free built-in preset this crate ships: a system-operator
+/// persona (`agent.toml [capabilities] system_operator = true`, `os_operator`
+/// module docs' own recommended snippet, now installable with one command
+/// instead of hand-editing `agent.toml`).
+pub const SYSTEM_OPERATOR_PRESET_ID: &str = "system-operator";
+
+const SYSTEM_OPERATOR_PRESET_TOML: &str =
+    include_str!("../../../templates/presets/system-operator/preset.toml");
+
+/// Suggested SOUL.md persona body for an agent created with the
+/// `system-operator` preset. Presets only cover `agent.toml`-shaped config
+/// (module docs above) — SOUL.md is a separate per-agent file, never merged
+/// by [`resolve_for_agent`] — so this is exposed alongside the preset rather
+/// than folded into [`ParsedPreset`]. See [`builtin_soul_template`].
+const SYSTEM_OPERATOR_SOUL_TEMPLATE: &str =
+    include_str!("../../../templates/presets/system-operator/SOUL.md");
+
+/// Write the one free built-in preset to
+/// `<home>/presets/system-operator/preset.toml`, unless a file is already
+/// there (or unconditionally when `force`, mirroring `duduclaw preset
+/// install-builtin`'s existing `--force` semantics for the premium kits).
+/// Returns `true` when a file was actually written. No license/feature
+/// gate — this preset is free by design, unlike the premium department kits.
+pub fn install_system_operator_preset(home: &Path, force: bool) -> io::Result<bool> {
+    let dest = preset_file_path(home, SYSTEM_OPERATOR_PRESET_ID);
+    if dest.is_file() && !force {
+        return Ok(false);
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&dest, SYSTEM_OPERATOR_PRESET_TOML)?;
+    Ok(true)
+}
+
+/// Suggested SOUL.md body for a known free built-in preset id, or `None`
+/// for anything else (including every premium preset id — those carry no
+/// persona template here and callers fall back to their own default SOUL.md
+/// template).
+pub fn builtin_soul_template(preset_id: &str) -> Option<&'static str> {
+    if preset_id == SYSTEM_OPERATOR_PRESET_ID {
+        Some(SYSTEM_OPERATOR_SOUL_TEMPLATE)
+    } else {
+        None
+    }
+}
+
 // ── Sanitization ─────────────────────────────────────────────────────────
 
 /// Result of stripping per-agent-only content out of a preset's raw table.
@@ -1217,6 +1276,101 @@ max_active_skills = 2
         )
         .unwrap();
         assert!(load_bindings(h.path()).is_empty());
+    }
+
+    // ── Free built-in preset (system-operator) — P2 ─────────────────────
+
+    /// The embedded `templates/presets/system-operator/preset.toml` must
+    /// parse cleanly through the exact production path (`parse_preset`),
+    /// carry `system_operator = true` + `autonomy_level = "operator"` under
+    /// `[capabilities]`, and strip nothing (it deliberately carries no
+    /// `[agent]` table — the sanitizer would strip it silently, but a
+    /// well-authored preset shouldn't have one to begin with).
+    #[test]
+    fn system_operator_preset_toml_parses_with_expected_capabilities() {
+        let parsed = parse_preset(SYSTEM_OPERATOR_PRESET_ID, SYSTEM_OPERATOR_PRESET_TOML).unwrap();
+        assert_eq!(parsed.meta.id, SYSTEM_OPERATOR_PRESET_ID);
+        assert_eq!(parsed.meta.label, "系統操作員");
+        assert!(parsed.stripped_org.is_empty());
+        assert!(parsed.stripped_other.is_empty(), "{:?}", parsed.stripped_other);
+
+        let caps = parsed.config.get("capabilities").and_then(|v| v.as_table()).expect("[capabilities]");
+        assert_eq!(caps.get("system_operator"), Some(&toml::Value::Boolean(true)));
+        assert_eq!(
+            caps.get("autonomy_level").and_then(|v| v.as_str()),
+            Some("operator"),
+            "os_operator.rs's own module docs recommend autonomy_level = \"operator\" \
+             for a system-operator persona"
+        );
+    }
+
+    /// `install_system_operator_preset` writes the embedded content to
+    /// `<home>/presets/system-operator/preset.toml`, is a no-op on a second
+    /// call without `force` (existing file wins), and overwrites with
+    /// `force: true` — same shape as `cmd_preset_install_builtin`'s existing
+    /// skip/force semantics for the premium kits.
+    #[test]
+    fn install_system_operator_preset_is_idempotent_unless_forced() {
+        let h = home();
+        assert!(install_system_operator_preset(h.path(), false).unwrap(), "first install must write");
+        let dest = preset_file_path(h.path(), SYSTEM_OPERATOR_PRESET_ID);
+        assert!(dest.is_file());
+        let original = std::fs::read_to_string(&dest).unwrap();
+        assert_eq!(original, SYSTEM_OPERATOR_PRESET_TOML);
+
+        // Simulate a local hand-edit, then a non-forced re-install must not
+        // touch it.
+        std::fs::write(&dest, "# hand-edited\n").unwrap();
+        assert!(!install_system_operator_preset(h.path(), false).unwrap(), "must skip an existing file");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "# hand-edited\n");
+
+        // `force: true` overwrites back to the embedded content.
+        assert!(install_system_operator_preset(h.path(), true).unwrap());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), SYSTEM_OPERATOR_PRESET_TOML);
+    }
+
+    /// The installed preset is immediately usable through the real
+    /// `bind` → `resolve_for_agent` pipeline — end-to-end proof that
+    /// `agent create --preset system-operator` (which calls exactly this
+    /// pipeline) lands `system_operator = true` + `autonomy_level =
+    /// "operator"` in the agent's resolved config, without the caller
+    /// hand-editing `agent.toml`.
+    #[test]
+    fn bound_system_operator_preset_materializes_capability_into_resolved_config() {
+        let h = home();
+        assert!(install_system_operator_preset(h.path(), false).unwrap());
+        let dir = write_agent(h.path(), "front-desk-bot", MINIMAL_AGENT);
+
+        let outcome =
+            bind(h.path(), "front-desk-bot", &dir, SYSTEM_OPERATOR_PRESET_ID, "tester", "test").unwrap();
+        assert_eq!(outcome.binding.preset_id, SYSTEM_OPERATOR_PRESET_ID);
+
+        let table: toml::value::Table =
+            std::fs::read_to_string(dir.join("agent.toml")).unwrap().parse().unwrap();
+        let (merged, resolution) = resolve_for_agent(h.path(), "front-desk-bot", &table);
+        assert!(resolution.is_applied());
+
+        let caps = merged.get("capabilities").and_then(|v| v.as_table()).expect("[capabilities] must be inherited from the preset — MINIMAL_AGENT has none of its own");
+        assert_eq!(caps.get("system_operator"), Some(&toml::Value::Boolean(true)));
+        assert_eq!(caps.get("autonomy_level").and_then(|v| v.as_str()), Some("operator"));
+
+        // O-0/O-4's own gates (Admin scope / is_appliance() / confirm /
+        // ApprovalBroker) live entirely outside this table and are untouched
+        // by a preset bind — nothing here can widen them, only the module
+        // this crate owns (which fields a resolved agent.toml carries).
+    }
+
+    /// `builtin_soul_template` is the one lookup `cmd_agent_create` uses to
+    /// decide whether to override the generic default SOUL.md — must return
+    /// the embedded persona for the known free id and `None` for everything
+    /// else (typos, premium preset ids, empty string).
+    #[test]
+    fn builtin_soul_template_only_matches_the_known_free_preset_id() {
+        let body = builtin_soul_template(SYSTEM_OPERATOR_PRESET_ID).expect("must have a template");
+        assert!(body.contains("系統操作員"));
+        assert!(builtin_soul_template("sales-followup").is_none());
+        assert!(builtin_soul_template("system-operator-typo").is_none());
+        assert!(builtin_soul_template("").is_none());
     }
 
     /// WP-6F P1 item ⑤ — design §4.2 Step A: the 9 shared department kits

@@ -65,14 +65,15 @@ export function SettingsPage() {
   // Legacy deep-link redirects (bookmarks / older links) instead of a blank tab:
   //  - branding moved to /manage/distributors (R5)
   //  - the cron/排程任務 settings tab was unified into the /routines page.
-  //  - 系統更新 became its own management entry (2026-08-04, D18).
+  //  - 系統更新 became its own management entry (2026-08-04, D18), then
+  //    relocated again to `/app/system/updates` (N-3, 2026-08).
   useEffect(() => {
     if (tabParam === 'branding') {
       navigate('/manage/distributors?tab=branding', { replace: true });
     } else if (tabParam === 'cron') {
       navigate('/routines', { replace: true });
     } else if (tabParam === 'update') {
-      navigate('/manage/updates', { replace: true });
+      navigate('/app/system/updates', { replace: true });
     }
   }, [tabParam, navigate]);
 

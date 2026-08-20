@@ -1,0 +1,33 @@
+[package]
+name = "duduclaw-sysd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Privilege-separated root system service (reboot / poweroff / sysupdate / factory-reset / hostname) for the DuDuClaw appliance image — reached only over a peer-credential-verified Unix domain socket, never a network port."
+
+[[bin]]
+name = "duduclaw-sysd"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

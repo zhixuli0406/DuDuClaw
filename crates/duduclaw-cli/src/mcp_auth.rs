@@ -848,6 +848,30 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // as the P1 tools, gated by [capabilities] os_native at the dispatch
         // gate; no ActionGuard (they have no host side-effect).
         "os_frontmost" | "os_spotlight_search" | "os_calendar_today" => Some(Scope::OsNative),
+        // O-0: system-operator tool face bridging the dashboard-only
+        // `device.*`/`system.*` RPCs to agents. Explicitly Admin-scoped
+        // (matches the unmapped-tool fail-closed default byte-for-byte,
+        // mapped here for clarity/lockability) — these operate the
+        // physical/production machine, a strictly higher trust tier than
+        // `os:native`'s host-automation tools. External clients can never
+        // reach Admin (not in `EXTERNALLY_GRANTABLE_SCOPES`), so this
+        // surface is internal-agent only. O-4 additionally requires the
+        // agent's own explicit `agent.toml [capabilities] system_operator =
+        // true` at the dispatch gate (`mcp_dispatch.rs`'s
+        // `SYSTEM_OPERATOR_TOOLS` check) — Admin scope alone is no longer
+        // sufficient, closing the "any internal agent could try these"
+        // residual risk. Per-agent access is further scoped by `agent.toml
+        // [capabilities] allowed_tools`/`denied_tools`.
+        "os_device_status"
+        | "os_system_status"
+        | "os_check_update"
+        | "os_backup_list"
+        | "os_network_info"
+        | "os_apply_update"
+        | "os_backup_create"
+        | "os_power"
+        | "os_factory_reset"
+        | "os_doctor_repair" => Some(Scope::Admin),
         // Server-side office-document script execution (docx/xlsx/pptx/pdf).
         // Its own least-privilege scope instead of the Admin `execute_program`
         // uses: the tool is constrained to the four bundled skills' vetted
@@ -1216,6 +1240,57 @@ is_external = {is_external}
     fn test_tool_requires_scope_unknown_tool() {
         // C2: fail-closed — unknown tools require Admin, not None.
         assert_eq!(tool_requires_scope("totally_unknown"), Some(Scope::Admin));
+    }
+
+    // ── O-0: system-operator tool face (DESIGN-agent-os-native-apps-2026-08.md
+    //    §6.3) — every os_* system tool maps to Admin, and is therefore never
+    //    reachable by an external MCP client (Admin is not in
+    //    EXTERNALLY_GRANTABLE_SCOPES). ──────────────────────────────────────
+
+    #[test]
+    fn os_ops_tools_require_admin_scope() {
+        for tool in [
+            "os_device_status",
+            "os_system_status",
+            "os_check_update",
+            "os_backup_list",
+            "os_network_info",
+            "os_apply_update",
+            "os_backup_create",
+            "os_power",
+            "os_factory_reset",
+            "os_doctor_repair",
+        ] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::Admin),
+                "tool {tool} must require Admin scope"
+            );
+        }
+    }
+
+    #[test]
+    fn os_ops_tools_never_reachable_by_external_clients() {
+        // Even an external principal that explicitly claims Admin cannot
+        // reach these — `external_tool_allowed` only substitutes within
+        // `EXTERNALLY_GRANTABLE_SCOPES`, which does not include Admin.
+        let principal = Principal {
+            client_id: "external-client".to_string(),
+            scopes: [Scope::Admin].into_iter().collect(),
+            is_external: true,
+            created_at: chrono::Utc::now(),
+        };
+        for tool in [
+            "os_device_status",
+            "os_factory_reset",
+            "os_power",
+            "os_apply_update",
+        ] {
+            assert!(
+                !external_tool_allowed(tool, &principal),
+                "tool {tool} must never be reachable by an external client"
+            );
+        }
     }
 
     // ── Drift guard: dashboard tool catalog ↔ security gate ──────────────────

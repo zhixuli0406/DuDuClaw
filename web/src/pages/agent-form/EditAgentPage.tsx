@@ -760,6 +760,7 @@ export function EditAgentPage() {
           os_native: caps.os_native,
           recording: caps.recording,
           git_credentials: caps.git_credentials,
+          system_operator: caps.system_operator,
           autonomy_level: caps.autonomy_level,
           computer_use_config: { ...caps.computer_use_config },
         };
@@ -1342,9 +1343,13 @@ export function EditAgentPage() {
               <RowSwitch label={t('agents.cap.browserViaBash')} description={t('agents.cap.browserViaBash.help')} checked={caps.browser_via_bash} onChange={guardDanger(t('agents.cap.browserViaBash'), (v) => updateCap('browser_via_bash', v), 'agents.edit.dangerConfirm.browserViaBash')} />
               <RowSwitch label={t('agents.cap.recording')} description={t('agents.cap.recording.help')} checked={caps.recording} onChange={guardDanger(t('agents.cap.recording'), (v) => updateCap('recording', v), 'agents.edit.dangerConfirm.recording')} />
               <RowSwitch label={t('agents.cap.gitCredentials')} description={t('agents.cap.gitCredentials.help')} checked={caps.git_credentials} onChange={guardDanger(t('agents.cap.gitCredentials'), (v) => updateCap('git_credentials', v), 'agents.edit.dangerConfirm.gitCredentials')} />
+              <RowSwitch label={t('agents.cap.systemOperator')} description={t('agents.cap.systemOperator.help')} checked={caps.system_operator} onChange={guardDanger(t('agents.cap.systemOperator'), (v) => updateCap('system_operator', v), 'agents.edit.dangerConfirm.systemOperator')} />
             </SettingsCard>
             {caps.computer_use_mode === 'native' && (
               <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.nativeWarning')}</p>
+            )}
+            {caps.system_operator && (
+              <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.systemOperatorWarning')}</p>
             )}
             <FieldBlock label={t('agents.cap.allowedApps')}>
               <ChipEditor values={caps.computer_use_config.allowed_apps ?? []} onChange={(v) => updateCapConfig('allowed_apps', v)} placeholder="Safari" addLabel={t('common.add')} />
@@ -1559,7 +1564,7 @@ export function EditAgentPage() {
             <FieldBlock label={t('agents.adv.accountPool')} description={t('agentForm.brain.accountPool.hint')}>
               <AccountPoolSelect values={adv.account_pool} onChange={(v) => updateAdv('account_pool', v)} />
             </FieldBlock>
-            <CrossLink label={t('agentForm.brain.accountPool.manageLink')} onClick={() => navigate('/manage/accounts')} />
+            <CrossLink label={t('agentForm.brain.accountPool.manageLink')} onClick={() => navigate('/app/system/accounts')} />
           </SettingsSection>
 
           <SettingsSection title={t('agentForm.brain.section.utility')} description={t('agentForm.brain.section.utility.desc')}>
@@ -1619,7 +1624,7 @@ export function EditAgentPage() {
               <RowNumber label={t('agents.edit.warnThreshold')} description={t('agents.edit.warnThreshold.help')} value={form.warn_threshold_percent ?? 80} min={0} max={100} onChange={(v) => updateField('warn_threshold_percent', v)} />
               <RowSwitch label={t('agents.edit.hardStop')} description={t('agents.edit.hardStop.help')} checked={form.hard_stop ?? true} onChange={(v) => updateField('hard_stop', v)} />
             </SettingsCard>
-            <CrossLink label={t('agentForm.brain.budget.manageLink')} onClick={() => navigate('/manage/accounts')} />
+            <CrossLink label={t('agentForm.brain.budget.manageLink')} onClick={() => navigate('/app/system/accounts')} />
           </SettingsSection>
         </SettingsTab>
 
