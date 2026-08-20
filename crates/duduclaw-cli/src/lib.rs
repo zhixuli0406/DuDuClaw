@@ -11,6 +11,7 @@ use duduclaw_core::types::CheckStatus;
 mod acp;
 mod docs_cmd;              // Stripe-style `duduclaw docs [<topic>]` (E12) — GitHub doc links, browser hand-off
 mod eval;                 // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
+mod secaudit;              // Code security audit MVP: intake + OSS scanner orchestration (`duduclaw secaudit`)
 mod playbook_export;      // WP2.2/B4 batch: gene JSON export CLI (`duduclaw playbook export`)
 mod eval_scaffold;        // WP2.1: free-tier eval draft bootstrap (`duduclaw eval-scaffold`)
 mod playbook_migrate;     // WP1.4: SOUL.md → playbook migration drafts (`duduclaw playbook migrate-soul`)
@@ -605,6 +606,73 @@ enum Commands {
         /// Omit to include everything (current behavior, unchanged).
         #[arg(long = "exclude-dir")]
         exclude_dir: Vec<String>,
+    },
+
+    /// Code security audit (DESIGN-code-security-audit-2026-08 §3.2):
+    /// deterministic repo intake (language census, entry points, git
+    /// hotspots) + OSS scanner orchestration (semgrep/gitleaks/osv-scanner/
+    /// cargo-audit), then — on `--profile deep` — AI deep audit (per-module
+    /// LLM review), zero-shared-context adversarial re-verification of every
+    /// AI candidate, and (opt-in `--poc`) sandboxed PoC generation for
+    /// High+/Critical findings adversarial review judged plausible. Missing
+    /// scanners/LLM are reported honestly, never silently skipped. No model
+    /// is ever hardcoded — `--agent` follows that agent's `[runtime]`
+    /// config, otherwise the global `config.toml [runtime]` applies.
+    ///
+    /// Exit code: 0 no finding at/above --fail-on (also what a machine with
+    /// every scanner/LLM missing reports), 1 at least one does, 2 an infra
+    /// error (bad repo path, unwritable --report/--save path) — never "a
+    /// scanner/the LLM was unavailable".
+    ///
+    /// Examples:
+    ///     duduclaw secaudit .                              # quick scan, summary only
+    ///     duduclaw secaudit . --profile deep --report out.json
+    ///     duduclaw secaudit . --profile deep --max-modules 3 --agent agnes
+    ///     duduclaw secaudit . --profile deep --poc --save
+    ///     duduclaw secaudit /path/to/repo --fail-on critical
+    Secaudit {
+        /// Path to the repo to scan.
+        repo_path: PathBuf,
+
+        /// `quick` (scanners only, default) or `deep` (+ intake/threat-model
+        /// hotspot analysis + AI deep audit + adversarial review).
+        #[arg(long, default_value = "quick")]
+        profile: String,
+
+        /// Write the full JSON report to this path (summary is always
+        /// printed to stdout regardless).
+        #[arg(long)]
+        report: Option<PathBuf>,
+
+        /// Minimum severity that triggers a non-zero (1) exit:
+        /// critical|high|medium|low|info.
+        #[arg(long = "fail-on", default_value = "high")]
+        fail_on: String,
+
+        /// Follow this agent's `[runtime]` config for the AI deep-audit /
+        /// adversarial-review / PoC steps (拍板 D2 — no model hardcoded).
+        /// Omit to use the global `config.toml [runtime]` utility
+        /// provider/model. Only relevant with `--profile deep`.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Cap on how many modules the AI deep-audit step analyzes — the
+        /// primary cost guard (each module is one LLM call).
+        #[arg(long = "max-modules", default_value_t = 5)]
+        max_modules: usize,
+
+        /// Explicitly enable sandboxed PoC generation + execution (拍板
+        /// D3). Only ever applies to High+/Critical findings adversarial
+        /// review judged "plausible"; requires --profile deep. No container
+        /// runtime available ⇒ honestly recorded as `poc_skipped`, never
+        /// run on the host.
+        #[arg(long)]
+        poc: bool,
+
+        /// Also save a timestamped copy of the report under
+        /// `<DUDUCLAW_HOME>/secaudit/reports/` (read by the dashboard).
+        #[arg(long)]
+        save: bool,
     },
 
     /// Playbook maintenance (§1.4 gene JSON export, D5=B).
@@ -1777,6 +1845,35 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 },
             )
             .await
+        }
+        Commands::Secaudit {
+            repo_path,
+            profile,
+            report,
+            fail_on,
+            agent,
+            max_modules,
+            poc,
+            save,
+        } => {
+            // Custom 0/1/2 exit contract (task spec) — not the generic
+            // "any Err ⇒ exit 1" wrapper `run()`'s caller applies, same
+            // reasoning as `Commands::DesktopRecordWorker` above.
+            let code = secaudit::cmd_secaudit(
+                &duduclaw_home(),
+                secaudit::SecauditOptions {
+                    repo_path,
+                    profile,
+                    report,
+                    fail_on,
+                    agent,
+                    max_modules,
+                    poc,
+                    save,
+                },
+            )
+            .await;
+            std::process::exit(code);
         }
         Commands::Playbook(PlaybookCommands::Export { agent, out }) => {
             playbook_export::cmd_playbook_export(

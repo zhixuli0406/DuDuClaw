@@ -119,6 +119,7 @@ pub mod redteam;
 pub mod mast;
 pub mod foresight;
 pub mod security_posture;
+pub mod secaudit_reports;
 pub mod events_store;
 pub mod dashboard_feedback;
 pub mod dashboard_navigate;

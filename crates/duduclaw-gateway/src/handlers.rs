@@ -32,6 +32,7 @@ use crate::partner_store::{
 };
 use crate::playbook;
 use crate::protocol::WsFrame;
+use crate::secaudit_reports;
 use crate::task_store::{
     ActivityRow, CommentRow, PlanRow, PlanStepRow, TaskIterationRow, TaskRow, TaskStore,
 };
@@ -5656,6 +5657,24 @@ impl MethodHandler {
                 self.handle_security_credential_cleanup(ctx).await
             }
 
+            // ── Security Audit (secaudit dashboard, DESIGN-code-security-
+            // audit-2026-08 §3.1, manager+) — reads/reviews reports written
+            // by `duduclaw secaudit --save`. Read RPCs and the human-review
+            // write RPC are all manager+ (same bar as `analytics.*` below,
+            // not the admin-only `security.*` credential surfaces above).
+            "secaudit.reports" => {
+                require_manager!();
+                self.handle_secaudit_reports().await
+            }
+            "secaudit.report" => {
+                require_manager!();
+                self.handle_secaudit_report(params).await
+            }
+            "secaudit.finding_status" => {
+                require_manager!();
+                self.handle_secaudit_finding_status(params, ctx).await
+            }
+
             // ── Analytics (manager+) ────────────────────────
             "analytics.summary" => {
                 require_manager!();
@@ -6662,6 +6681,9 @@ impl MethodHandler {
                     { "name": "security.credential_hygiene", "description": "Scan config.toml for plaintext credentials (paths only, never values)" },
                     { "name": "security.credential_inventory", "description": "List every credential field with its source (secret:// reference / encrypted / plaintext), never a value" },
                     { "name": "security.credential_cleanup", "description": "Remove plaintext credential fields that already have an encrypted twin" },
+                    { "name": "secaudit.reports", "description": "List code security audit reports written by `duduclaw secaudit --save` (shallow summary, newest first)" },
+                    { "name": "secaudit.report", "description": "Read one full code security audit report (findings + evidence chains)" },
+                    { "name": "secaudit.finding_status", "description": "Record an operator's confirm/suppress/refute decision on a security audit finding" },
                     { "name": "analytics.summary", "description": "Analytics summary for a period" },
                     { "name": "analytics.conversations", "description": "Daily conversation counts" },
                     { "name": "analytics.cost_savings", "description": "Monthly cost savings" },
@@ -19817,6 +19839,101 @@ impl MethodHandler {
                 "backup_path": backup_path.display().to_string(),
             }),
         )
+    }
+
+    // ── Security Audit (secaudit dashboard) ───────────────────
+    //
+    // Reads/reviews reports written by `duduclaw secaudit --save` to
+    // `<home>/secaudit/reports/<UTC ISO8601 basic>.json`
+    // (DESIGN-code-security-audit-2026-08 §3.1). `secaudit_reports.rs`
+    // owns all the file I/O (containment, size cap, atomic write); these
+    // three handlers are thin RPC adapters — params in, `WsFrame` out.
+
+    /// `secaudit.reports` — shallow-summary listing, newest first. A missing
+    /// `secaudit/reports/` directory (nobody has run `--save` yet) is an
+    /// empty list, not an error.
+    async fn handle_secaudit_reports(&self) -> WsFrame {
+        let home_dir = self.home_dir.clone();
+        let rows = tokio::task::spawn_blocking(move || secaudit_reports::list_reports(&home_dir))
+            .await
+            .unwrap_or_default();
+        WsFrame::ok_response("", json!({ "reports": rows }))
+    }
+
+    /// `secaudit.report` — full `AuditReport` JSON for one file.
+    /// Params: `{ file: <basename> }` (no separators, no `..` — validated in
+    /// `secaudit_reports::read_report`).
+    async fn handle_secaudit_report(&self, params: Value) -> WsFrame {
+        let Some(file) = params.get("file").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return WsFrame::error_response("", "file is required");
+        };
+        let home_dir = self.home_dir.clone();
+        let file = file.to_string();
+        let result =
+            tokio::task::spawn_blocking(move || secaudit_reports::read_report(&home_dir, &file)).await;
+        match result {
+            Ok(Ok(report)) => WsFrame::ok_response("", json!({ "report": report })),
+            Ok(Err(e)) => WsFrame::error_response("", &e),
+            Err(e) => WsFrame::error_response("", &format!("secaudit.report: {e}")),
+        }
+    }
+
+    /// `secaudit.finding_status` — operator confirm/suppress/refute action on
+    /// one finding (design §3.1's "operator 確認 finding" entry point).
+    /// Params: `{ file, finding_id, status }`, `status` ∈
+    /// `confirmed|suppressed|refuted`. Read-modify-write, locked + atomic;
+    /// every successful mutation is also written to the security audit log.
+    async fn handle_secaudit_finding_status(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let Some(file) = params.get("file").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return WsFrame::error_response("", "file is required");
+        };
+        let Some(finding_id) =
+            params.get("finding_id").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return WsFrame::error_response("", "finding_id is required");
+        };
+        let Some(status) = params.get("status").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return WsFrame::error_response("", "status is required");
+        };
+        let home_dir = self.home_dir.clone();
+        let file = file.to_string();
+        let finding_id = finding_id.to_string();
+        let status = status.to_string();
+        let result = tokio::task::spawn_blocking({
+            let file = file.clone();
+            let finding_id = finding_id.clone();
+            let status = status.clone();
+            move || secaudit_reports::set_finding_status(&home_dir, &file, &finding_id, &status)
+        })
+        .await;
+        match result {
+            Ok(Ok(finding)) => {
+                duduclaw_security::audit::append_audit_event(
+                    &self.home_dir,
+                    &duduclaw_security::audit::AuditEvent::new(
+                        "secaudit_finding_status_changed",
+                        &finding_id,
+                        duduclaw_security::audit::Severity::Info,
+                        json!({
+                            "actor": ctx.user_id,
+                            "file": file,
+                            "finding_id": finding_id,
+                            "status": status,
+                            "source": "dashboard",
+                        }),
+                    ),
+                );
+                WsFrame::ok_response(
+                    "",
+                    json!({ "success": true, "file": file, "finding": finding }),
+                )
+            }
+            Ok(Err(e)) => WsFrame::error_response("", &e),
+            Err(e) => WsFrame::error_response("", &format!("secaudit.finding_status: {e}")),
+        }
     }
 
     // ── Analytics ────────────────────────────────────────────

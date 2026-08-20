@@ -46,6 +46,7 @@ import {
   Crosshair,
   Radar as RadarIcon,
   Layers,
+  ShieldCheck,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -594,6 +595,12 @@ export const manageAdvancedNav: NavItem[] = [
   // D9: no longer `personalHidden` — `SecurityPage` itself hides the
   // organisation-scale content on Personal (see the block comment above).
   { to: '/manage/security', icon: Shield, label: 'manage.security', desc: 'manage.security.desc', minRole: 'admin' },
+  // 安全審計（secaudit dashboard, DESIGN-code-security-audit-2026-08 §3.1）—
+  // reviews reports written by `duduclaw secaudit --save`. Sits right after
+  // 安全: same 存取與安全 cluster, but manager+ (not admin-only) — reviewing
+  // a finding is closer to `analytics.*`'s bar than the credential-rotation
+  // surfaces above it.
+  { to: '/manage/secaudit', icon: ShieldCheck, label: 'manage.secaudit', desc: 'manage.secaudit.desc', minRole: 'manager', newIn: '1.62.0' },
   { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
   { to: '/manage/users', icon: Users, label: 'manage.users', desc: 'manage.users.desc', minRole: 'admin', enterprise: true },
   // Departments are an org grouping — an Enterprise concept. Personal is a

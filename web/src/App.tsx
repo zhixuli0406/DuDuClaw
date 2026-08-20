@@ -58,11 +58,11 @@ const WorldPage = lazyPage(() => import('./pages/WorldPage'), 'WorldPage');
 // route below, which redirects instead.
 const ReportPage = lazyPage(() => import('./pages/ReportPage'), 'ReportPage');
 const BillingPage = lazyPage(() => import('./pages/BillingPage'), 'BillingPage');
-const LicensePage = lazyPage(() => import('./pages/LicensePage'), 'LicensePage');
 const LogsPage = lazyPage(() => import('./pages/LogsPage'), 'LogsPage');
 const ChannelsPage = lazyPage(() => import('./pages/ChannelsPage'), 'ChannelsPage');
 const AccountsPage = lazyPage(() => import('./pages/AccountsPage'), 'AccountsPage');
 const SecurityPage = lazyPage(() => import('./pages/SecurityPage'), 'SecurityPage');
+const SecauditPage = lazyPage(() => import('./pages/SecauditPage'), 'SecauditPage');
 const GovernancePage = lazyPage(() => import('./pages/GovernancePage'), 'GovernancePage');
 const ReliabilityPage = lazyPage(() => import('./pages/ReliabilityPage'), 'ReliabilityPage');
 const SettingsPage = lazyPage(() => import('./pages/SettingsPage'), 'SettingsPage');
