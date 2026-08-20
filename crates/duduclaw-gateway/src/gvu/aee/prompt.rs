@@ -481,6 +481,8 @@ mod tests {
                     reason_prefix: "forbidden pattern: refund".into(),
                 }],
                 checked_at: chrono::Utc::now(),
+                latest_real_rejection_at: None,
+                latest_escalation_at: None,
             }),
             ..Default::default()
         };

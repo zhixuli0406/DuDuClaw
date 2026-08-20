@@ -21073,13 +21073,16 @@ mod evolution_v3_dashboard_tests {
         let home = tempfile::tempdir().expect("tempdir");
         let db_path = home.path().join("evolution.db");
         let vs = VersionStore::new(&db_path);
+        // Real rejected attempts — `skipped` rounds (cooldown / "no change")
+        // deliberately no longer count toward any stagnation signal
+        // (2026-08-20 self-feeding escalation fix).
         for _ in 0..5 {
             vs.record_experiment(&ExperimentLogEntry::new(
                 "agent-a",
                 3,
                 3,
                 std::time::Duration::from_secs(60),
-                "skipped",
+                "abandoned",
                 "cap exceeded",
             ));
         }
