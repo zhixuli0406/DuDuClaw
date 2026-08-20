@@ -1,0 +1,111 @@
+# DuDuClaw kiosk — display-detection Wayland compositor + Chromium session.
+#
+# Off in effect, not in config: this unit is always enabled (see
+# postinst.d/20-users-and-units.sh — same explicit-enable convention
+# as every other unit in this image), but ExecCondition= below makes it a
+# clean no-op on every headless boot, which is the overwhelming majority
+# of real deployments (README.md "What gets built": this appliance's whole
+# premise is a screenless box on the LAN). The moment a display is
+# physically attached and this unit (re)starts, it drives that display —
+# there is no separate config flag to flip either way.
+#
+# ExecCondition= semantics (systemd.service(5), verified against the
+# upstream manual): a 1-254 exit skips ExecStart and moves the unit
+# active->inactive WITHOUT marking it failed; only a crash/exit-255 from
+# the condition command itself would be a real failure. That is exactly
+# what makes "no monitor" a clean skip instead of a boot error — see
+# duduclaw-kiosk-detect-display.sh for the actual check. Boot-time
+# detection only: a display plugged in after this unit has already
+# started (or skipped) is NOT picked up without a restart of this unit —
+# hot-plug re-detection is out of scope for this round.
+#
+# Why cage, not a full desktop session: cage (Debian package "cage",
+# trixie 0.2.0-2, upstream description "kiosk compositor for Wayland")
+# draws exactly one maximized client and blocks all interaction outside
+# it — precisely "there is only the dashboard", and vastly smaller than
+# pulling in an actual desktop session manager for one browser window.
+#
+# Device access chain — every piece verified against upstream/Debian
+# source this round, not guessed (see postinst.d/20-users-and-units.sh
+# for the matching useradd rationale):
+#   - seatd.service (Requires=/After= below) opens the DRM "card" device
+#     as root and hands the fd to cage over its own control socket; cage/
+#     chromium never need direct filesystem permission on /dev/dri/card*.
+#   - The kiosk user's "video" group membership is what's allowed to even
+#     CONNECT to that socket — Debian's own seatd packaging runs
+#     `seatd -g video` (debian/seatd.service, debian/seatd.default: "Allow
+#     access to video group members"), not upstream's contrib unit's
+#     "-g seat".
+#   - The kiosk user's "render" group membership is separately required
+#     for Chromium's GPU process to open /dev/dri/renderD* directly (a
+#     plain filesystem open, NOT brokered through seatd). Debian's systemd
+#     package builds with -Dgroup-render-mode=0660 (debian/rules, systemd
+#     source package, trixie 257.13-1~deb13u1) — NOT upstream systemd's
+#     own default of 0666 (world-accessible) — so this group membership is
+#     not optional on Debian specifically.
+#
+# Conflicts=/After=getty@tty1.service mirrors greetd's own documented
+# pattern for exactly this situation (greetd.service; greetd-5.scd: "If
+# using systemd with autovt and getty, conflict avoidance can be handled
+# in the service unit with Conflicts=getty@ttyN.service") — without it, an
+# auto-spawned login prompt on tty1 (Debian's systemd default preset) and
+# this compositor would both fight over the same virtual terminal.
+#
+# KNOWN OPEN POINT (not live-tested this round, see README.md): seatd's
+# own VT-allocation behavior beyond the tty1 conflict handled here — e.g.
+# what happens if some other autovt unit has already claimed a *different*
+# VT by the time this unit starts — was not traced end-to-end against a
+# real multi-VT boot. Likewise the sandboxing depth below is deliberately
+# moderate (NoNewPrivileges= only, no ProtectSystem=), matching this
+# image's existing "moderate not maximal, not live-tested this round"
+# stance in duduclaw-gateway.service — Chromium's own internal sandbox
+# already needs unprivileged user namespaces to function, and layering an
+# unverified systemd sandbox on top of an already GPU/DRM/Wayland-heavy
+# stack risks breaking it silently rather than protecting it.
+[Unit]
+Description=DuDuClaw kiosk display session (starts only if a monitor is attached)
+After=seatd.service systemd-udev-settle.service duduclaw-gateway.service getty@tty1.service
+Requires=seatd.service
+Wants=duduclaw-gateway.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+User=duduclaw-kiosk
+Group=duduclaw-kiosk
+# video/render supplementary groups come from the user's own passwd/group
+# database entry (useradd -G video,render, postinst.d/
+# 20-users-and-units.sh) — one source of truth, not duplicated here via
+# SupplementaryGroups=; systemd applies a User='s full system group
+# membership by default, same as duduclaw-gateway.service does for the
+# `duduclaw` user.
+
+# RuntimeDirectory=/RuntimeDirectoryMode= create+own /run/duduclaw-kiosk
+# for this service (systemd.exec(5): "the innermost specified directories
+# will be owned by the user and group specified in User=/Group=", removed
+# again when the unit stops). Used as $XDG_RUNTIME_DIR below — this is a
+# plain systemd service, not a PAM/logind login session, so nothing else
+# would ever create /run/user/<uid> for it. Mode 0700 is not a style
+# choice: the XDG Base Directory Specification requires it verbatim ("Its
+# Unix access mode MUST be 0700"), and this is exactly where cage creates
+# its Wayland socket.
+RuntimeDirectory=duduclaw-kiosk
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/duduclaw-kiosk
+# $HOME is NOT set here — it comes from the duduclaw-kiosk user's own
+# passwd entry (-d /data/duduclaw-kiosk), which systemd applies
+# automatically for a User=-configured service. One source of truth,
+# same reasoning as the group membership comment above.
+
+ExecCondition=/usr/local/sbin/duduclaw-kiosk-detect-display.sh
+ExecStart=/usr/local/sbin/duduclaw-kiosk-launch.sh
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+NoNewPrivileges=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

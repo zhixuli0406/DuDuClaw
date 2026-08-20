@@ -1,0 +1,21 @@
+# Default-off units for a fresh DuDuClaw OS install.
+#
+# This must land via mkosi.skeleton/ (copied into the OS tree BEFORE the
+# package manager runs — see mkosi manual, SkeletonTrees=), not
+# mkosi.extra/ (copied after). Debian's openssh-server postinst enables the
+# service at install time by consulting systemd's preset chain
+# (systemd-sysv-generator / `deb-systemd-helper enable`, which itself reads
+# /etc/systemd/system-preset/*.preset before /usr/lib/systemd/system-preset/
+# *.preset) — the preset file has to already exist at that moment for
+# "disable" to win, hence skeleton (pre-install) not extra (post-install).
+#
+# SSH stays off by default on this appliance — openssh-server is still
+# installed (Packages= in mkosi.conf) so a support session can be turned
+# on later (e.g. via a future dashboard toggle) without re-flashing; it
+# just doesn't start out of the box on an internet-reachable device.
+#
+# Not independently re-verified by an actual build this round — see
+# appliance/README.md "known open points" (skeleton-before-package-manager
+# ordering is documented mkosi behavior, but the resulting preset outcome
+# on a real Debian openssh-server postinst wasn't observed).
+disable ssh.service

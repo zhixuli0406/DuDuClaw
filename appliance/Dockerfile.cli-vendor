@@ -1,0 +1,33 @@
+# Vendors the multi-runtime AI CLIs (claude-code / codex / gemini-cli) into a
+# self-contained tree at /clis, to be copied out and ExtraTree'd into the
+# appliance image at /usr/local — instead of `npm install`-ing them from a
+# postinstall script inside the mkosi build.
+#
+# Why not npm-in-postinst: mkosi runs postinst scripts in a sandbox with no
+# outbound network (its design keeps image content coming from the package
+# manager + local sources, not arbitrary build-time network fetches), so
+# `npm install` there fails with EAI_AGAIN. A Docker build has reliable
+# network, so the fetch happens here and the image build stays offline.
+#
+# Base MUST match the image's userland: debian:trixie-slim, same as the
+# appliance's Debian trixie. claude-code ships a NATIVE arch-specific
+# launcher (bin/claude.exe is an ELF, not JS), so this image must be built
+# with --platform matching APPLIANCE_ARCH (build.sh passes it) or the
+# vendored claude binary would be the wrong machine type. codex/gemini are
+# JS and run under the image's apt-installed nodejs at runtime.
+#
+# --prefix /clis lays the tree out as /clis/bin (relative symlinks into
+# ../lib/node_modules) + /clis/lib/node_modules, which maps cleanly onto
+# /usr/local in the image (so /usr/local/bin/{claude,codex,gemini} resolve
+# to /usr/local/lib/node_modules/...). Versions are unpinned (@latest),
+# matching container/Dockerfile.server's own npm-global step.
+FROM debian:trixie-slim AS cli-vendor
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends nodejs npm ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+RUN npm install -g --prefix /clis \
+        @anthropic-ai/claude-code \
+        @openai/codex \
+        @google/gemini-cli && \
+    npm cache clean --force

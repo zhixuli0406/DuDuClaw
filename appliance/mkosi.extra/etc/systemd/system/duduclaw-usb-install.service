@@ -1,0 +1,30 @@
+# Self-install USB: the exact same disk image serves both as the bootable
+# installer AND as the shipped product — there is no separate "installer"
+# build. Every boot, this
+# checks whether it is currently running from removable media with an
+# internal NVMe present; if so (and the safety gate in the script passes)
+# it dd's its own whole boot disk onto the NVMe and powers off. Booting
+# from the resulting NVMe install is a completely ordinary boot (this unit
+# no-ops immediately — see the script's first check).
+#
+# Ordered ahead of duduclaw-gateway.service on purpose: if an install is
+# about to happen there's no point starting the full app stack first just
+# to power it off again a moment later.
+[Unit]
+Description=DuDuClaw OS self-install USB detector
+After=systemd-udev-settle.service local-fs.target
+Before=duduclaw-gateway.service
+# No ConditionPathExists guard here on purpose: the script's own
+# is-this-removable-media check (not a stamp file) is what makes this a
+# no-op on an ordinary NVMe boot — see duduclaw-usb-install.sh. A stamp
+# file under /data would be ambiguous anyway, since /data means a
+# different physical partition depending on which disk this boot came
+# from.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/duduclaw-usb-install.sh
+
+[Install]
+WantedBy=multi-user.target

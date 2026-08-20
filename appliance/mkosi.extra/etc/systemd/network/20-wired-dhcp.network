@@ -1,0 +1,19 @@
+# Wired DHCP only. Wi-Fi provisioning is out of scope (see README.md).
+# Match any wired NIC by both name-glob and link type so this works across
+# different mini-PC hardware without per-board tuning. Kept strictly ASCII:
+# a non-ASCII byte anywhere in this file (even in a comment) has been seen to
+# make systemd-networkd skip the whole file, leaving the NIC unmanaged with
+# no DHCP -- which is exactly the "dashboard unreachable" failure it caused.
+[Match]
+Name=en* eth*
+Type=ether
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+
+[DHCP]
+# Router-provided NTP servers are merged with systemd-timesyncd's own
+# fallback list; this feeds timesyncd, it does not disable it.
+UseNTP=yes
+UseDNS=yes

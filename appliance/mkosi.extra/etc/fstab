@@ -1,0 +1,21 @@
+# DuDuClaw OS static mounts.
+#
+# Root and the ESP are NOT listed here — both are auto-discovered and
+# auto-mounted by systemd-gpt-auto-generator per the Discoverable
+# Partitions Specification (root via the kernel cmdline's root=PARTUUID=
+# that mkosi wires into the UKI at build time; the ESP at /efi because its
+# GPT partition type is the well-known "esp" type). Adding explicit fstab
+# entries for either would just duplicate what the generator already does.
+#
+# /data has no defined auto-mount role in the spec (Type=linux-generic,
+# see mkosi.repart/30-data.conf), so it needs this explicit entry.
+# Mounted by PARTLABEL — stable across A/B rebuilds since /data is never
+# recreated, unlike the root partitions' PARTUUIDs which change every
+# update.
+#
+# x-systemd.growfs re-runs the filesystem-level resize at mount time in
+# case the partition itself grew (e.g. after the first-boot repart pass on
+# real hardware, see mkosi.extra/etc/systemd/system/duduclaw-firstboot-repart.service)
+# since a partition-table resize alone doesn't resize the ext4 filesystem
+# living inside it.
+PARTLABEL=duduclaw-data /data ext4 defaults,x-systemd.growfs 0 2

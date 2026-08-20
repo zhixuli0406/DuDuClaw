@@ -1,0 +1,24 @@
+# First-boot step 1 of 2: grow /data to fill the disk. Ordered via
+# local-fs-pre.target, the standard systemd hook point for "must run before
+# the bulk of fstab-declared filesystems are mounted" (systemd.special(7));
+# root itself is already mounted by this point (that happens in the
+# initrd, ahead of any regular unit).
+#
+# Idempotent via the /var/lib/duduclaw/.repart-grown stamp file rather than
+# a self-disable — kept re-triggerable on purpose so a future factory-reset
+# flow can delete the stamp to force a re-grow after a disk swap, without
+# needing to re-enable a disabled unit first.
+[Unit]
+Description=DuDuClaw OS first-boot: grow /data to fill the disk
+Documentation=man:systemd-repart(8)
+DefaultDependencies=no
+Before=local-fs-pre.target
+ConditionPathExists=!/var/lib/duduclaw/.repart-grown
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/duduclaw-firstboot-repart.sh
+
+[Install]
+WantedBy=local-fs-pre.target

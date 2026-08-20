@@ -1,0 +1,59 @@
+# Runner image for building the DuDuClaw OS appliance image via mkosi from
+# a non-Linux host (macOS) using Docker. Not used at all on native Linux
+# build hosts — see build.sh, which only invokes this when `uname` isn't
+# Linux.
+#
+# Debian trixie to match the target OS as closely as possible (mkosi's own
+# [Build] ToolsTree=yes bootstraps its OWN separate tools tree for the
+# actual image build regardless, but keeping the *runner* on the same
+# release avoids glibc/kernel-header skew for anything that isn't routed
+# through the tools tree).
+FROM debian:trixie-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        mkosi \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# `mkosi dependencies` is mkosi's own authoritative list of host packages
+# it needs to build+boot images (verified against the upstream manual,
+# 2026-08) — deliberately NOT hand-curated here. Two hard-won caveats from
+# the first real run (2026-08-18):
+#   1. The previous layer removed /var/lib/apt/lists/*, so this layer MUST
+#      apt-get update first or every package is "unable to locate".
+#   2. The list is mkosi's cross-distro maximal set — it includes packages
+#      that don't exist on Debian trixie at all (zypper, pacman-package-
+#      manager, ubuntu-keyring, ...). Those are optional on a Debian host,
+#      and [Build] ToolsTree=yes bootstraps mkosi's own tools tree for the
+#      actual build anyway, so install per-package and skip what's
+#      unavailable instead of letting one exotic name abort the image.
+RUN apt-get update && \
+    for pkg in $(mkosi dependencies); do \
+        apt-get install -y --no-install-recommends "$pkg" >/dev/null 2>&1 \
+        || echo "[mkosi-runner] skipped unavailable host package: $pkg"; \
+    done && \
+    rm -rf /var/lib/apt/lists/*
+
+# The image build runs WITHOUT a mkosi tools tree (see mkosi.conf for why:
+# 25.3's tools-tree bootstrap hard-requires x86-only grub-pc-bin, which
+# breaks arm64 builds outright). That makes THIS container the toolbox, so
+# the tools the build actually needs are installed explicitly and
+# hard-fail here if any is missing — no silent skip for these.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        systemd-repart \
+        systemd-ukify \
+        systemd-boot \
+        systemd-boot-efi \
+        debian-archive-keyring \
+        apt \
+        mtools \
+        dosfstools \
+        e2fsprogs \
+        zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+ENTRYPOINT ["mkosi"]

@@ -1,0 +1,33 @@
+# DuDuClaw privileged system helper (duduclaw-sysd).
+#
+# Runs as root ON PURPOSE — it is the only process allowed to execute the
+# narrow privileged verb set (reboot / poweroff / sysupdate status+apply /
+# factory-reset finalize / hostname). The gateway itself runs unprivileged
+# (User=duduclaw in duduclaw-gateway.service) and reaches these verbs
+# exclusively through the unix socket below; duduclaw-sysd verifies the
+# caller's uid via SO_PEERCRED before reading a single request byte, and
+# refuses everything when no --allowed-uid is configured (fail-closed).
+#
+# --allowed-uid 1000 must match the fixed `useradd -u 1000 duduclaw` in
+# postinst.d/20-users-and-units.sh — if that uid ever changes, change
+# both places in the same commit.
+#
+# RuntimeDirectory=duduclaw (0700) makes systemd create /run/duduclaw/
+# before ExecStart; the daemon's own bind() also creates it defensively —
+# the duplication is intentional, either alone is sufficient.
+[Unit]
+Description=DuDuClaw privileged system helper
+
+[Service]
+Type=simple
+User=root
+RuntimeDirectory=duduclaw
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/duduclaw-sysd --allowed-uid 1000
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

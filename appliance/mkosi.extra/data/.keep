@@ -1,0 +1,4 @@
+# Pre-creates /data as the fstab mount point (see ../etc/fstab) so the
+# .mount unit has an existing directory to mount onto. Empty on a real
+# device — everything under here lives on the /data partition, not the
+# read-only root.

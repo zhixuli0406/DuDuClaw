@@ -1,0 +1,76 @@
+# DuDuClaw gateway — appliance profile.
+#
+# DUDUCLAW_APPLIANCE=1 is live (no longer a placeholder): the gateway
+# branches on it for the LAN-default bind, the device.* RPC family's
+# appliance gate, and sysd socket selection (crates/duduclaw-core/src/
+# appliance.rs is the single authority). The firstboot-written config.toml
+# [gateway] bind remains an explicit setting that wins over the env-driven
+# default, per resolve_gateway_bind's priority order.
+#
+# Type=notify + WatchdogSec=60: the gateway-side half of this landed in
+# crates/duduclaw-gateway/src/watchdog.rs (notify_ready() / spawn_
+# watchdog_pings(), called from server.rs right after the listener binds)
+# — this comment previously said the app-side ping didn't exist yet; it
+# now does, so enabling the unit side is no longer "systemd kill+restarts
+# a perfectly healthy process on the timer alone" (the exact failure mode
+# this comment used to warn against). Semantics verified against
+# systemd.service(5): Type=notify expects a "READY=1" sd_notify call once
+# startup is complete; WatchdogSec=60 requires a "WATCHDOG=1" keep-alive
+# ping at least every 60s or the service is placed in a failed state and
+# terminated with SIGABRT — watchdog.rs pings at half the deadline (30s),
+# the standard "2x the required rate" practice. NotifyAccess=main is set
+# explicitly even though Type=notify auto-forces it when unset ("If
+# NotifyAccess= is missing or set to none, it will be forcibly set to
+# main") — explicit over implicit, matching this file's own house style.
+# Restart=on-failure already covers a watchdog-triggered restart without
+# any change ("the service will be restarted ... when the configured
+# watchdog timeout is triggered" — systemd.service(5)); the new part is
+# the [Unit]-section StartLimitIntervalSec=/StartLimitBurst= pair below —
+# without it, a gateway that crash-loops immediately after every restart
+# (e.g. a config it can never recover from) would restart forever at
+# RestartSec=5 instead of settling into a visible failed state — 5
+# attempts in 5 minutes is a reasonable, generous ceiling for a binary
+# that also has to bind a network listener and reach the Docker socket on
+# every start.
+#
+# Hardening kept moderate, not maximal, this round: ProtectSystem=full
+# (not =strict) because the gateway needs to reach the Docker socket
+# (/var/run/docker.sock, for the container sandbox) and spawn CLI runtimes
+# from /usr/local/bin — a =strict sandbox across that whole surface hasn't
+# been live-tested against this appliance profile yet.
+[Unit]
+Description=DuDuClaw gateway (appliance profile)
+# Deliberately NOT ordered after network-online.target (2026-08-19): the
+# gateway binds to 0.0.0.0 and works with whatever network state exists, and
+# its channels/relay reconnect on their own with backoff — so waiting for
+# "fully online" only stalls the dashboard. systemd-networkd-wait-online was
+# observed blocking ~120s before failing under QEMU's virtio-net, delaying
+# the whole boot; the gateway must not inherit that wait.
+After=duduclaw-firstboot-provision.service docker.service duduclaw-sysd.service
+Wants=duduclaw-sysd.service
+Requires=duduclaw-firstboot-provision.service
+# StartLimitIntervalSec=/StartLimitBurst= belong in [Unit], not [Service]
+# (systemd.unit(5)) — "units which are started more than burst times
+# within an interval time span are not permitted to start any more".
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=duduclaw
+Group=duduclaw
+Environment=DUDUCLAW_APPLIANCE=1
+Environment=DUDUCLAW_HOME=/data/duduclaw
+ExecStart=/usr/local/bin/duduclaw run --yes
+Restart=on-failure
+RestartSec=5
+WatchdogSec=60
+
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/data
+
+[Install]
+WantedBy=multi-user.target
