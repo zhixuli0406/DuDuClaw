@@ -236,7 +236,7 @@ fn apply_claim_result(view: &mut ShellView, result: Result<claim::ClaimOutcome, 
     }
 }
 
-fn labeled_field(label: &'static str, field: gpui::Entity<widgets::OobeTextField>, palette: crate::oobe::palette::OobePalette) -> Div {
+fn labeled_field(label: &'static str, field: gpui::Entity<widgets::OobeTextField>, palette: crate::palette::ShellPalette) -> Div {
     div()
         .flex()
         .flex_col()
@@ -247,7 +247,7 @@ fn labeled_field(label: &'static str, field: gpui::Entity<widgets::OobeTextField
 
 /// Shared small-text line for both the (red) validation/claim-failure
 /// messages and the (green) already-claimed info line — `color` is the
-/// already-resolved `OobePalette` token (`.destructive` or `.success`) the
+/// already-resolved `ShellPalette` token (`.destructive` or `.success`) the
 /// caller picked; this helper is just the shared size/layout.
 fn message_line(text: &'static str, color: u32) -> Div {
     div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(color, 1.0)).child(text)

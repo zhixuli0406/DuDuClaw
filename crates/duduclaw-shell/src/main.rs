@@ -86,6 +86,7 @@ mod home;
 mod i18n;
 mod oobe;
 mod overlay;
+mod palette;
 mod surface;
 
 use gpui::{
@@ -150,6 +151,17 @@ pub struct ShellView {
     /// plain data with no gpui types) and why they're created once,
     /// unconditionally, at window-open time rather than lazily.
     pub(crate) oobe_account_fields: oobe::AccountFields,
+    /// Home/overlay's own theme choice — Shell-S1 (2026-08-20). Set
+    /// once at window-open time from `oobe::boot_theme(&persisted_oobe_
+    /// state)` (see that fn's own doc comment for why it's read independent
+    /// of `initial_oobe`'s Home-vs-OOBE decision), and updated exactly once
+    /// more, in `on_oobe_next`, at the moment OOBE completes — so a THEME
+    /// step pick made during THIS run reaches Home on its very first frame,
+    /// not just on the next restart. `ShellView::render` resolves this into
+    /// a `palette::ShellPalette` fresh every render pass (same "recompute,
+    /// never cache" convention `OobeFlow::palette()` already established)
+    /// and threads it into `home::render`/`overlay::render`.
+    theme: oobe::ThemeChoice,
     /// Root-level focus handle — see this file's header comment ("Keyboard
     /// dispatch needs a focused element, full stop."). Tracked on the root
     /// element in `Render::render`, focused once in `main()` right after the
@@ -225,6 +237,15 @@ impl ShellView {
         flow.next();
         oobe::save_state(flow.state());
         if flow.completed() {
+            // Carry the Theme step's pick (if any was made) onto Home in
+            // this SAME process — see `ShellView.theme`'s own doc comment.
+            // Reading `flow.state().selections.theme` here (not `oobe::
+            // boot_theme` again) is deliberate: `boot_theme` is specifically
+            // about the PERSISTED file at boot, whereas this is reading the
+            // in-memory flow's live selection at the exact moment it
+            // transitions to completed — same source `save_state` just
+            // wrote to disk two lines up, so the two never disagree.
+            self.theme = flow.state().selections.theme;
             self.oobe = None;
         }
         cx.notify();
@@ -266,11 +287,17 @@ impl Render for ShellView {
         // OOBE, when active, is the root's ENTIRE child — see this file's
         // header comment and `oobe/render.rs`'s own for why this replaces
         // `home::render(cx)` outright rather than layering as another
-        // overlay (no app chrome during first-run).
+        // overlay (no app chrome during first-run). `home_palette` is
+        // resolved fresh here every render pass from `self.theme` — same
+        // "recompute, never cache" convention `OobeFlow::palette()`
+        // establishes for OOBE itself (see `ShellView.theme`'s own doc
+        // comment) — and threaded into both `home::render` below and the
+        // overlay-render call further down.
+        let home_palette = palette::ShellPalette::for_choice(self.theme);
         root = if let Some(flow) = &self.oobe {
             root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, cx))
         } else {
-            root.child(home::render(cx))
+            root.child(home::render(home_palette, cx))
         };
         if self.diag {
             root = root
@@ -308,7 +335,7 @@ impl Render for ShellView {
                     view.surface.close();
                     cx.notify();
                 });
-                root = root.child(overlay::render(active, &self.overlay_ui, on_close, cx));
+                root = root.child(overlay::render(active, &self.overlay_ui, home_palette, on_close, cx));
             }
         }
         root
@@ -341,6 +368,14 @@ fn main() {
         // window so `ShellView` is constructed already in the right mode —
         // no post-open "flash of Home then swap to OOBE".
         let persisted_oobe_state = oobe::load_state();
+        // Shell-S1: read the boot-time theme choice BEFORE
+        // `resolve_boot_flow` (next) consumes `persisted_oobe_state` by
+        // value — `oobe::boot_theme`'s own doc comment explains why this is
+        // a SEPARATE read rather than derived from `initial_oobe` (the most
+        // common boot path resolves that to `None`, which carries no
+        // selections at all). `ThemeChoice` is `Copy`, so reading this
+        // field first doesn't need to clone the state.
+        let initial_theme = oobe::boot_theme(&persisted_oobe_state);
         let force_oobe = std::env::var("DUDUCLAW_SHELL_FORCE_OOBE").ok();
         let skip_oobe = std::env::var("DUDUCLAW_SHELL_SKIP_OOBE").ok();
         let debug_oobe_step = std::env::var("DUDUCLAW_SHELL_DEBUG_OOBE_STEP").ok();
@@ -350,6 +385,7 @@ fn main() {
             Some(flow) => eprintln!("[main] OOBE boot resolution: OOBE at {:?}", flow.current()),
             None => eprintln!("[main] OOBE boot resolution: Home (OOBE already completed or skipped)"),
         }
+        eprintln!("[main] Home/overlay boot theme: {initial_theme:?}");
 
         let window = cx
             .open_window(
@@ -368,6 +404,7 @@ fn main() {
                         oobe: initial_oobe,
                         oobe_ui: oobe::OobeUiState::default(),
                         oobe_account_fields,
+                        theme: initial_theme,
                         focus_handle: cx.focus_handle(),
                         diag: std::env::var("DUDUCLAW_SHELL_DIAG").is_ok_and(|v| v == "1"),
                         diag_scheduled: false,

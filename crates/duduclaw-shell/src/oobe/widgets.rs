@@ -12,7 +12,7 @@
 // own elements instead of using the facade.
 //
 // ── Theme (2026-08-20) ────────────────────────────────────────────────
-// Every helper below that paints anything now takes an `OobePalette` (see
+// Every helper below that paints anything now takes a `ShellPalette` (see
 // `palette.rs`) instead of reaching for `theme::light::*` directly — passed
 // BY VALUE (the type is `Copy`, ~70 bytes of plain fields) rather than by
 // reference, which sidesteps borrow-checker friction against the `move`
@@ -21,9 +21,9 @@
 // its palette the same way `locale` already is (`flow.palette()`, fresh per
 // render call — see that method's own doc comment in `oobe/mod.rs`), so
 // there is nothing to keep in sync here: swap the operator's pick and the
-// very next render call threads a different `OobePalette` through this
+// very next render call threads a different `ShellPalette` through this
 // entire file. The one exception is `OobeTextField` below, which reads the
-// ambient `OobePalette` global instead — see its own doc comment for why.
+// ambient `ShellPalette` global instead — see its own doc comment for why.
 
 use gpui::{
     div, prelude::*, px, App, ClickEvent, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton,
@@ -32,13 +32,13 @@ use gpui::{
 
 use duduclaw_native_gui::theme;
 
-use super::palette::OobePalette;
+use crate::palette::ShellPalette;
 
-pub(super) fn title(text: &'static str, palette: OobePalette) -> Div {
+pub(super) fn title(text: &'static str, palette: ShellPalette) -> Div {
     div().text_size(px(theme::TEXT_2XL)).font_weight(FontWeight::BOLD).text_color(theme::alpha(palette.foreground, 1.0)).child(text)
 }
 
-pub(super) fn subtitle(text: &'static str, palette: OobePalette) -> Div {
+pub(super) fn subtitle(text: &'static str, palette: ShellPalette) -> Div {
     div().text_size(px(theme::TEXT_BASE)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(text)
 }
 
@@ -46,7 +46,7 @@ pub(super) fn subtitle(text: &'static str, palette: OobePalette) -> Div {
 /// <ssid>") — `.child()` accepts an owned `String` directly (gpui's own
 /// `impl IntoElement for String`), so this is just the `&'static str`
 /// version's twin with a different parameter type.
-pub(super) fn subtitle_dynamic(text: String, palette: OobePalette) -> Div {
+pub(super) fn subtitle_dynamic(text: String, palette: ShellPalette) -> Div {
     div().text_size(px(theme::TEXT_BASE)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(text)
 }
 
@@ -54,7 +54,7 @@ pub(super) fn subtitle_dynamic(text: String, palette: OobePalette) -> Div {
 /// `surface_shadow()` + `RADIUS_XL` + `border()` recipe `overlay/
 /// notifications.rs`'s own floating panel uses, just full-width within the
 /// step's centered column instead of docked to a screen edge.
-pub(super) fn card(content: impl IntoElement, palette: OobePalette) -> Div {
+pub(super) fn card(content: impl IntoElement, palette: ShellPalette) -> Div {
     div()
         .w_full()
         .bg(theme::alpha(palette.surface, 1.0))
@@ -86,7 +86,7 @@ pub(super) fn step_button(
     label: &'static str,
     variant: StepButtonVariant,
     disabled: bool,
-    palette: OobePalette,
+    palette: ShellPalette,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let (bg, bg_hover, text) = match variant {
@@ -125,7 +125,7 @@ pub(super) fn step_button(
 /// 條", §A "主要分歧" progress-indicator row) which does not apply here:
 /// DuDuClaw OS's OOBE is a fixed ten-step linear sequence, so a dot per
 /// step is an honest indicator, not a promise the flow can't keep.
-pub(super) fn progress_dots(current_index: usize, total: usize, palette: OobePalette) -> Div {
+pub(super) fn progress_dots(current_index: usize, total: usize, palette: ShellPalette) -> Div {
     let mut row = div().flex().items_center().gap(px(6.));
     for i in 0..total {
         let active = i == current_index;
@@ -144,14 +144,17 @@ pub(super) fn progress_dots(current_index: usize, total: usize, palette: OobePal
 /// brief step 6: "3-4 個 opt-in 開關"). Palette-driven re-derivation of
 /// `overlay/controlcenter.rs`'s own `toggle_pill` (same shape: a rounded
 /// track + a circular handle that slides left/right), not a shared function
-/// — that one is hardwired to `overlay::controlcenter`'s own literal hex
-/// constants (`0xe4e4e7`/`0xf0f0f2`, never routed through `theme::light::*`
-/// or `theme::dark::*`) rather than this crate's `OobePalette` token set,
-/// and pulling it in would mean either reaching across module boundaries
-/// into a sibling `overlay::` submodule that doesn't expose it (`fn
-/// toggle_pill` there is private to `controlcenter.rs`) or making it public
-/// for a single OOBE call site — a one-screen-only re-derivation is the
-/// smaller change. Purely presentational — no click handling of its own
+/// — that one (as of Shell-S1) IS palette-aware too, but its
+/// "off" track color is a bespoke gray (`#e4e4e7`/`#3f3f46`) private to that
+/// file's own ControlCenter-specific literals, distinct from this step's
+/// own `surface_border`-based off state, so sharing one fn would mean
+/// threading a THIRD divergent color parameter through both call sites for
+/// no real gain — and pulling the type in would still mean either reaching
+/// across module boundaries into a sibling `overlay::` submodule that
+/// doesn't expose it (`fn toggle_pill` there is private to
+/// `controlcenter.rs`) or making it public for a single OOBE call site — a
+/// one-screen-only re-derivation is the smaller change either way. Purely
+/// presentational — no click handling of its own
 /// (the caller's own `.on_click(...)` sits on the row, not this pill, same
 /// division `controlcenter.rs`'s `switch_row`/`toggle_pill` split
 /// establishes). The knob itself stays hardcoded white regardless of theme —
@@ -159,7 +162,7 @@ pub(super) fn progress_dots(current_index: usize, total: usize, palette: OobePal
 /// correctly against both a colored "on" track and a muted "off" track in
 /// either theme), so this is not a residual un-palette-driven color, it's
 /// the one part of this widget the design intentionally never re-skins.
-pub(super) fn toggle_pill(on: bool, palette: OobePalette) -> Div {
+pub(super) fn toggle_pill(on: bool, palette: ShellPalette) -> Div {
     let track = if on { theme::alpha(palette.brand, 1.0) } else { palette.surface_border };
     let mut handle = div().absolute().top(px(2.)).w(px(19.)).h(px(19.)).rounded(px(19.)).bg(theme::alpha(0xffffff, 1.0));
     handle = if on { handle.right(px(2.)) } else { handle.left(px(2.)) };
@@ -252,7 +255,7 @@ impl Render for OobeTextField {
         // pass runs (it's the OOBE frame's top-level fn); `unwrap_or_default`
         // is a defensive fail-open (light), never a panic, on the
         // theoretical chance nothing has set it yet.
-        let palette = cx.try_global::<OobePalette>().copied().unwrap_or_default();
+        let palette = cx.try_global::<ShellPalette>().copied().unwrap_or_default();
 
         let display: SharedString = if is_empty {
             self.placeholder.clone()

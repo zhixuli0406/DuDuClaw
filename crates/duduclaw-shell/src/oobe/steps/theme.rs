@@ -41,7 +41,7 @@ use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 use duduclaw_native_gui::theme;
 
 use crate::i18n::{t, Key, Locale};
-use crate::oobe::palette::OobePalette;
+use crate::palette::ShellPalette;
 use crate::oobe::widgets;
 use crate::oobe::{OobeFlow, ThemeChoice};
 use crate::ShellView;
@@ -67,7 +67,7 @@ pub(super) fn render(flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
         .child(widgets::card(body, palette))
 }
 
-fn theme_option_card(choice: ThemeChoice, selected: bool, locale: Locale, palette: OobePalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+fn theme_option_card(choice: ThemeChoice, selected: bool, locale: Locale, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     let id = match choice {
         ThemeChoice::Light => "oobe-theme-light",
         ThemeChoice::Dark => "oobe-theme-dark",

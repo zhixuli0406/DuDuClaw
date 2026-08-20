@@ -32,7 +32,7 @@ use gpui::{div, prelude::*, px, Div, FontWeight};
 use duduclaw_native_gui::theme;
 
 use crate::i18n::{t, t1, Key};
-use crate::oobe::palette::OobePalette;
+use crate::palette::ShellPalette;
 use crate::oobe::widgets;
 use crate::oobe::{OobeFlow, PrivacyToggle, TemplateChoice};
 
@@ -92,7 +92,7 @@ pub(super) fn render(flow: &OobeFlow) -> Div {
         .child(widgets::card(rows, palette))
 }
 
-fn summary_row(label: &'static str, value: String, palette: OobePalette) -> Div {
+fn summary_row(label: &'static str, value: String, palette: ShellPalette) -> Div {
     div()
         .flex()
         .items_center()

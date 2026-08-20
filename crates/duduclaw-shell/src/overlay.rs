@@ -55,6 +55,7 @@
 
 use gpui::{div, prelude::*, rgb, App, ClickEvent, Context, Div, Stateful, Window};
 
+use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::ShellView;
 
@@ -152,26 +153,36 @@ impl OverlayUiState {
 /// the shared backdrop — see this module's header comment for why backdrop
 /// and panel are siblings, not nested. `on_close` fires on a backdrop click
 /// only; a click anywhere inside the panel (including its buttons) never
-/// reaches it.
+/// reaches it. `palette` is resolved once per render pass by the caller
+/// (`ShellView::render` in `main.rs`) — same convention `home::render`
+/// establishes (see that fn's own doc comment).
 pub fn render(
     overlay: Overlay,
     ui: &OverlayUiState,
+    palette: ShellPalette,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &mut Context<ShellView>,
 ) -> Div {
     let dim = matches!(overlay, Overlay::Launcher);
 
+    // Launcher.dc.html: `rgba(15,23,42,0.28)` light / `rgba(0,0,0,0.45)`
+    // dark — the ONLY overlay with a dimmed backdrop (see this module's
+    // header comment); Notifications/ControlCenter stay fully transparent
+    // in both themes, unaffected by this branch.
+    let dim_opacity_base = if palette.is_dark() { 0x000000 } else { 0x0f172a };
+    let dim_opacity = if palette.is_dark() { 0.45 } else { 0.28 };
+
     let backdrop: Stateful<Div> = div()
         .id("shell-overlay-backdrop")
         .absolute()
         .inset_0()
-        .bg(rgb(0x0f172a).opacity(if dim { 0.28 } else { 0.0 }))
+        .bg(rgb(dim_opacity_base).opacity(if dim { dim_opacity } else { 0.0 }))
         .on_click(on_close);
 
     let panel: Stateful<Div> = match overlay {
-        Overlay::Launcher => launcher::render(),
-        Overlay::Notifications => notifications::render(ui, cx),
-        Overlay::ControlCenter => controlcenter::render(ui, cx),
+        Overlay::Launcher => launcher::render(palette),
+        Overlay::Notifications => notifications::render(ui, palette, cx),
+        Overlay::ControlCenter => controlcenter::render(ui, palette, cx),
     };
 
     // The wrapper MUST be absolutely positioned (`absolute().inset_0()`),

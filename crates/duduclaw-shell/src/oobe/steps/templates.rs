@@ -18,7 +18,7 @@ use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 use duduclaw_native_gui::theme;
 
 use crate::i18n::{t, Key, Locale};
-use crate::oobe::palette::OobePalette;
+use crate::palette::ShellPalette;
 use crate::oobe::widgets::{self, StepButtonVariant};
 use crate::oobe::{fake_data, OobeFlow, TemplateChoice};
 use crate::ShellView;
@@ -97,7 +97,7 @@ fn template_card(
     index: usize,
     choice: &Option<TemplateChoice>,
     locale: Locale,
-    palette: OobePalette,
+    palette: ShellPalette,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
     let id = tpl.id;

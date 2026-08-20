@@ -19,7 +19,7 @@ use gpui::{div, prelude::*, px, Div, FontWeight};
 use duduclaw_native_gui::theme;
 
 use crate::i18n::{t, Key, Locale};
-use crate::oobe::palette::OobePalette;
+use crate::palette::ShellPalette;
 use crate::oobe::widgets;
 use crate::oobe::OobeFlow;
 
@@ -45,7 +45,7 @@ pub(super) fn render(flow: &OobeFlow) -> Div {
         ))
 }
 
-fn detected_row(label: &'static str, locale: Locale, palette: OobePalette) -> Div {
+fn detected_row(label: &'static str, locale: Locale, palette: ShellPalette) -> Div {
     div()
         .flex()
         .items_center()
