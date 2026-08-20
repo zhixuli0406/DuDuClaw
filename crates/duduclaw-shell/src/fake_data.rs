@@ -45,11 +45,11 @@ pub const DOCK_APPS: &[DockApp] = &[
 ];
 
 /// A pinned agent avatar in the dock (right of the app icons, after the
-/// divider) — the design board's "杜"/"財" circles. `status_hex` is the
-/// small corner dot: `running` (busy, matches its own avatar's brand hue)
-/// vs `needs_human` (amber) per the task brief's "running 藍/needs_human
-/// 紅橘" status convention (the design board's actual sample data has one
-/// of each, not one of every state — kept verbatim rather than inventing a
+/// divider) — the design board's "杜"/"財" circles. The small corner status
+/// dot is `running` (busy, matches its own avatar's brand hue) vs
+/// `needs_human` (amber) per the task brief's "running 藍/needs_human 紅橘"
+/// status convention (the design board's actual sample data has one of
+/// each, not one of every state — kept verbatim rather than inventing a
 /// third example).
 pub struct DockAgent {
     pub id: &'static str,
@@ -64,18 +64,35 @@ pub enum AgentDockStatus {
     NeedsHuman,
 }
 
-impl AgentDockStatus {
-    /// Status-dot color — `theme::light::BRAND` for running,
-    /// `theme::light::WARNING` for needs_human (see `home.rs`, which is the
-    /// only consumer of this and already imports those tokens; kept as a
-    /// literal hex here so `fake_data.rs` stays gpui-free and independently
-    /// unit-testable, per this module's header comment).
-    pub fn dot_hex(self) -> u32 {
-        match self {
-            AgentDockStatus::Running => 0x2171cc, // theme::light::BRAND
-            AgentDockStatus::NeedsHuman => 0xdca400, // theme::light::WARNING
-        }
-    }
+/// Shell-S1 (2026-08-20, Home/overlay dark theme): which SEMANTIC
+/// color family a status ring / badge belongs to. This file used to resolve
+/// `GoalCard`'s dot and each badge's text/bg pair below straight to a
+/// literal hex, appropriate when there was only ONE design board to lift
+/// colors from. Now that Home/overlay has a light AND a dark board, the
+/// concrete hex for each kind differs per theme (see `crate::palette::
+/// ShellPalette`'s own header comment for the exact pairs) — resolving that
+/// here would mean either importing the palette type (which owns gpui
+/// `Rgba`/`Hsla` fields, breaking this module's own "stays gpui-free,
+/// independently unit-testable" discipline, see this file's header comment)
+/// or duplicating every literal twice per field. Storing the semantic KIND
+/// instead and letting `ShellPalette::badge_accent`/`badge_bg`/`badge_text`
+/// resolve the actual color at render time (`home/home_dock.rs`, `overlay/
+/// notifications.rs`) keeps this file plain data while still being
+/// theme-correct.
+///
+/// `AgentDockStatus`'s own status dot deliberately does NOT go through this
+/// enum: `NeedsHuman`'s dot resolves through `ShellPalette::warning_dot`,
+/// NOT `badge_accent(Warning)` — the small circular dot and the badge/ring
+/// token are different fields in dark (see `warning_dot`'s own doc comment
+/// on `ShellPalette`), so forcing `AgentDockStatus` through this 3-member
+/// vocabulary would need a dead `Success` match arm for no actual gain;
+/// `home/home_dock.rs::dock_agent` matches on `AgentDockStatus` directly
+/// instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeKind {
+    Warning,
+    Success,
+    Brand,
 }
 
 pub const DOCK_AGENTS: &[DockAgent] = &[
@@ -83,51 +100,51 @@ pub const DOCK_AGENTS: &[DockAgent] = &[
     DockAgent { id: "finance", initial: "財", bg_hex: 0x0f766e, status: AgentDockStatus::NeedsHuman },
 ];
 
-/// One "進行中 goal" card in the Home surface's mid-canvas row.
+/// One "進行中 goal" card in the Home surface's mid-canvas row. `badge_kind`
+/// drives BOTH the badge pill (text/bg) AND `dot`'s own ring/fill color —
+/// see `BadgeKind`'s own doc comment for why a semantic kind replaces the
+/// raw hex pair this struct used to carry (light-only precedent).
 pub struct GoalCard {
     pub id: &'static str,
     pub dot: GoalDot,
     pub title: &'static str,
     pub badge_label: &'static str,
-    pub badge_text_hex: u32,
-    pub badge_bg_hex: u32,
+    pub badge_kind: BadgeKind,
     pub meta: &'static str,
 }
 
 /// The small status ring left of a goal card's title — an unfilled ring
-/// (still running / awaiting a decision) or a filled dot (done).
+/// (still running / awaiting a decision) or a filled dot (done). Carries a
+/// `BadgeKind`, not a raw hex — see that type's own doc comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalDot {
-    Outline(u32),
-    Filled(u32),
+    Outline(BadgeKind),
+    Filled(BadgeKind),
 }
 
 pub const GOAL_CARDS: &[GoalCard] = &[
     GoalCard {
         id: "goal-daily-revenue",
-        dot: GoalDot::Outline(0xdca400),
+        dot: GoalDot::Outline(BadgeKind::Warning),
         title: "每日營收日報自動化",
         badge_label: "等你決定",
-        badge_text_hex: 0xb45309,
-        badge_bg_hex: 0xfef3c7,
+        badge_kind: BadgeKind::Warning,
         meta: "第 3/5 輪 · 財務助理 · 判官指出兩處數字落差",
     },
     GoalCard {
         id: "goal-site-copy",
-        dot: GoalDot::Outline(0x2171cc),
+        dot: GoalDot::Outline(BadgeKind::Brand),
         title: "官網改版文案",
         badge_label: "進行中",
-        badge_text_hex: 0x2171cc,
-        badge_bg_hex: 0xe8f1fb,
+        badge_kind: BadgeKind::Brand,
         meta: "第 1/5 輪 · 小杜 · 正在讀現有頁面",
     },
     GoalCard {
         id: "goal-support-report",
-        dot: GoalDot::Filled(0x1c882d),
+        dot: GoalDot::Filled(BadgeKind::Success),
         title: "客服月報",
         badge_label: "已完成",
-        badge_text_hex: 0x1c882d,
-        badge_bg_hex: 0xe9f6eb,
+        badge_kind: BadgeKind::Success,
         meta: "10 分鐘前 · 小杜 · 已存到 工作/月報",
     },
 ];
@@ -264,9 +281,10 @@ pub struct ActivityRow {
     pub avatar: RowAvatar,
     pub line1: &'static str,
     pub line2: &'static str,
-    /// `(label, text_hex, bg_hex)` — `None` for the system-update row, which
-    /// has no status pill in the design board.
-    pub badge: Option<(&'static str, u32, u32)>,
+    /// `(label, kind)` — `None` for the system-update row, which has no
+    /// status pill in the design board. `kind` replaces the old raw
+    /// `(text_hex, bg_hex)` pair — see `BadgeKind`'s own doc comment.
+    pub badge: Option<(&'static str, BadgeKind)>,
 }
 
 pub const TODAY_ACTIVITY: &[ActivityRow] = &[
@@ -275,14 +293,14 @@ pub const TODAY_ACTIVITY: &[ActivityRow] = &[
         avatar: RowAvatar::Agent { initial: "杜", bg_hex: 0x2171cc },
         line1: "完成 客服月報-9月 草稿",
         line2: "22:47 · 存到 工作/月報",
-        badge: Some(("完成", 0x1c882d, 0xe9f6eb)),
+        badge: Some(("完成", BadgeKind::Success)),
     },
     ActivityRow {
         id: "activity-daily-revenue",
         avatar: RowAvatar::Agent { initial: "財", bg_hex: 0x0f766e },
         line1: "每日營收日報 · 第 3/5 輪暫停",
         line2: "21:12 · 兩處數字落差，等你決定口徑",
-        badge: Some(("等你決定", 0xb45309, 0xfef3c7)),
+        badge: Some(("等你決定", BadgeKind::Warning)),
     },
     ActivityRow {
         id: "activity-system-update",
@@ -437,13 +455,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_dock_status_dot_hex_matches_theme_tokens() {
-        // Cross-checked against `duduclaw_native_gui::theme::light::{BRAND,
-        // WARNING}` literally (this file stays gpui-free, see its header
-        // comment) — a drift here would silently desync the dock avatar's
-        // status dot from the rest of the light-themed Home surface.
-        assert_eq!(AgentDockStatus::Running.dot_hex(), 0x2171cc);
-        assert_eq!(AgentDockStatus::NeedsHuman.dot_hex(), 0xdca400);
+    fn agent_dock_status_has_exactly_the_two_documented_variants() {
+        // `AgentDockStatus` no longer carries its own `BadgeKind` mapping
+        // (see that enum's own doc comment for why — `home/home_dock.rs::
+        // dock_agent` matches on these variants directly instead) — this
+        // file's remaining stake in the status/color relationship is just
+        // that the two variants themselves stay exactly Running/NeedsHuman,
+        // pinned via `Debug` formatting so a future rename or a third
+        // variant fails loudly here rather than silently in the renderer.
+        assert_eq!(format!("{:?}", AgentDockStatus::Running), "Running");
+        assert_eq!(format!("{:?}", AgentDockStatus::NeedsHuman), "NeedsHuman");
     }
 
     // ── Launcher ─────────────────────────────────────────────────────────

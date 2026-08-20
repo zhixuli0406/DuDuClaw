@@ -36,7 +36,7 @@ use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 use duduclaw_native_gui::theme;
 
 use crate::i18n::{t, Key};
-use crate::oobe::palette::OobePalette;
+use crate::palette::ShellPalette;
 use crate::oobe::widgets;
 use crate::oobe::{LanguageChoice, OobeFlow, OobeUiState};
 use crate::ShellView;
@@ -110,7 +110,7 @@ fn language_row(
     index: usize,
     selected: bool,
     locale: crate::i18n::Locale,
-    palette: OobePalette,
+    palette: ShellPalette,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
     let on_click = cx.listener(move |view, _ev, _window, cx| {

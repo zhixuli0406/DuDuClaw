@@ -49,7 +49,6 @@
 
 mod claim;
 mod fake_data;
-mod palette;
 mod render;
 mod steps;
 mod widgets;
@@ -165,6 +164,16 @@ pub enum OobeStep {
     /// actually happens (short version: every OOBE render call resolves the
     /// palette fresh from `selections().theme`, the same way `flow.locale()`
     /// already does for language — there is no separate "apply theme" step).
+    ///
+    /// Shell-S1 (2026-08-20) extends the SAME choice to Home + its
+    /// overlays, once OOBE finishes — not live during OOBE itself, since
+    /// Home isn't even rendered underneath OOBE (see `main.rs`'s header
+    /// comment: OOBE replaces Home outright, it doesn't overlay it). `main::
+    /// on_oobe_next` copies `selections().theme` onto `ShellView.theme` at
+    /// the exact moment `oobe` flips back to `None`, so Home's very first
+    /// frame already paints in whichever theme was picked here — see
+    /// `crate::palette`'s own header comment for the Home/overlay color
+    /// mapping this unlocks.
     Theme,
     /// §B-1 step 8: "完成屏 …＋quiet period" — terminal step. Continuing
     /// from here marks the whole flow `completed` (see `OobeFlow::next`).
@@ -682,23 +691,24 @@ impl OobeFlow {
     /// very next frame for free: there is no distinct "apply theme" action,
     /// picking IS applying.
     ///
-    /// `palette::OobePalette` is plain data (u32 hex + one precomposited
-    /// `Rgba` + a couple of derived-shadow/border methods) defined in a
-    /// SIBLING module of this one specifically so it can lean on gpui types
-    /// internally (see `palette.rs`'s own header comment) — this method only
-    /// NAMES that type in its signature, it does not import or construct a
-    /// gpui value itself, so this file's "no gpui types anywhere in THIS
-    /// file" discipline (see the header comment) still holds at the level
-    /// that discipline is actually about: no gpui CODE runs here.
+    /// `crate::palette::ShellPalette` is plain data (u32 hex + a couple of
+    /// precomposited `Rgba` fields + a handful of derived-shadow/border/
+    /// badge methods) defined at CRATE ROOT — not inside `oobe/` — since
+    /// Shell-S1 extended theming to Home + its overlays, which are
+    /// siblings of `oobe`, not descendants (see `palette.rs`'s own header
+    /// comment for the full rename/move rationale). This method only NAMES
+    /// that type in its signature, it does not import or construct a gpui
+    /// value itself, so this file's "no gpui types anywhere in THIS file"
+    /// discipline (see the header comment) still holds at the level that
+    /// discipline is actually about: no gpui CODE runs here.
     ///
     /// No `pub` modifier (module-private, same default-visibility rule
-    /// `fake_data`/`palette` themselves rely on) — this is only ever called
-    /// from `render.rs`/`steps/*.rs`, both descendants of `oobe`, which
-    /// already see a bare `fn` here; a `pub(crate)` annotation would widen
-    /// this method's own reach past `OobePalette`'s `pub(super)` return
-    /// type and trip rustc's private-interface lint for no actual caller.
-    fn palette(&self) -> palette::OobePalette {
-        palette::OobePalette::for_choice(self.state.selections.theme)
+    /// `fake_data` itself relies on) — this is only ever called from
+    /// `render.rs`/`steps/*.rs`, both descendants of `oobe`, which already
+    /// see a bare `fn` here; a `pub(crate)` annotation would widen this
+    /// method's own reach for no actual caller outside this module.
+    fn palette(&self) -> crate::palette::ShellPalette {
+        crate::palette::ShellPalette::for_choice(self.state.selections.theme)
     }
 }
 
@@ -940,6 +950,25 @@ pub fn resolve_boot_flow(force: Option<&str>, skip: Option<&str>, debug_step: Op
     } else {
         Some(OobeFlow::from_state(persisted))
     }
+}
+
+/// The boot-time theme Home should render in — Shell-S1 (2026-08-20,
+/// Home/overlay dark theme). Deliberately SEPARATE from `resolve_boot_flow`
+/// above: that function only returns `Some(flow)` when OOBE ITSELF should
+/// render, which on the most common boot path (a returning operator who
+/// already finished OOBE) is `None` — reading the theme choice back OUT of
+/// that `Option` would silently lose it on exactly the path real users hit
+/// every day. This reads straight off the persisted state instead, before
+/// `resolve_boot_flow` ever gets to decide Home-vs-OOBE, so it answers the
+/// SAME regardless of that decision — `main()` calls this first (`ThemeChoice`
+/// is `Copy`, so reading the field doesn't need to clone `persisted` before
+/// moving it into `resolve_boot_flow` next). Default (no persisted choice,
+/// e.g. a fresh install) is `ThemeChoice::Light` — `OobeSelections::
+/// default()`'s own `#[default]`, same value `OobeStep::Theme`'s own doc
+/// comment already documents as this crate's honest "no choice made yet"
+/// baseline.
+pub fn boot_theme(persisted: &OobeState) -> ThemeChoice {
+    persisted.selections.theme
 }
 
 #[cfg(test)]
@@ -1706,6 +1735,39 @@ mod tests {
         let flow = resolve_boot_flow(None, None, Some("finish"), state).unwrap();
         assert_eq!(flow.current(), OobeStep::Finish);
         assert_eq!(flow.selections().language, LanguageChoice::En);
+    }
+
+    // ── boot_theme — Shell-S1 (Home/overlay dark theme) ────────
+
+    #[test]
+    fn boot_theme_defaults_to_light_on_a_fresh_install() {
+        assert_eq!(boot_theme(&OobeState::default()), ThemeChoice::Light);
+    }
+
+    #[test]
+    fn boot_theme_reads_the_persisted_selection_even_when_oobe_is_skipped() {
+        // The whole point of splitting `boot_theme` out of
+        // `resolve_boot_flow` (see that function's own doc comment): a
+        // returning operator's boot path resolves `resolve_boot_flow` to
+        // `None` (OOBE doesn't render), but Home still needs the theme they
+        // picked. Both are asserted here from the SAME state value to prove
+        // neither reading interferes with the other.
+        let mut state = OobeState { completed: true, ..OobeState::default() };
+        state.selections.theme = ThemeChoice::Dark;
+        assert_eq!(boot_theme(&state), ThemeChoice::Dark);
+        assert_eq!(resolve_boot_flow(None, None, None, state), None, "a completed state must still resolve to Home");
+    }
+
+    #[test]
+    fn boot_theme_reads_the_persisted_selection_when_oobe_is_still_in_progress() {
+        // The other boot path: OOBE itself resolves to `Some`, but a
+        // mid-flow operator may already have visited the Theme step and
+        // backed out (or the state was seeded pre-completion) — `boot_theme`
+        // must not depend on `resolve_boot_flow`'s own `Option` shape at all.
+        let mut state = OobeState::default();
+        state.selections.theme = ThemeChoice::Dark;
+        assert_eq!(boot_theme(&state), ThemeChoice::Dark);
+        assert!(resolve_boot_flow(None, None, None, state).is_some());
     }
 
     // ── Shell-S2 round 1: AccountClaimState / OobeUiState transitions ──

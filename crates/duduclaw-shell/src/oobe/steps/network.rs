@@ -24,7 +24,7 @@ use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 use duduclaw_native_gui::theme;
 
 use crate::i18n::{t, t1, Key};
-use crate::oobe::palette::OobePalette;
+use crate::palette::ShellPalette;
 use crate::oobe::widgets;
 use crate::oobe::{fake_data, OobeFlow};
 use crate::ShellView;
@@ -61,7 +61,7 @@ fn wifi_row(
     index: usize,
     selected: bool,
     locale: crate::i18n::Locale,
-    palette: OobePalette,
+    palette: ShellPalette,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
     let ssid = net.ssid;
@@ -116,7 +116,7 @@ fn wifi_row(
 /// `strength`. Plain colored `div()`s, not a glyph — same "no `gpui::
 /// svg()` usage yet, no guaranteed pictographic glyph coverage" constraint
 /// `home.rs`'s header comment documents for this whole crate.
-fn signal_bars(strength: u8, palette: OobePalette) -> Div {
+fn signal_bars(strength: u8, palette: ShellPalette) -> Div {
     let mut row = div().flex().items_end().gap(px(2.));
     for bar in 1..=4u8 {
         let filled = bar <= strength;

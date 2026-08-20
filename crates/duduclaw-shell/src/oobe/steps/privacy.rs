@@ -16,7 +16,7 @@ use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 use duduclaw_native_gui::theme;
 
 use crate::i18n::{t, Key, Locale};
-use crate::oobe::palette::OobePalette;
+use crate::palette::ShellPalette;
 use crate::oobe::widgets;
 use crate::oobe::{OobeFlow, PrivacyToggle};
 use crate::ShellView;
@@ -39,7 +39,7 @@ pub(super) fn render(flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
         .child(widgets::card(rows, palette))
 }
 
-fn toggle_row(flow: &OobeFlow, toggle: PrivacyToggle, locale: Locale, palette: OobePalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+fn toggle_row(flow: &OobeFlow, toggle: PrivacyToggle, locale: Locale, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     let on = flow.privacy_toggle_on(toggle);
     let click = cx.listener(move |view, _ev, _window, cx| {
         if let Some(flow) = view.oobe.as_mut() {
