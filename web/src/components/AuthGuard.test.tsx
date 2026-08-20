@@ -38,7 +38,7 @@ function renderGuarded(edition: string | undefined) {
 beforeEach(() => {
   useSystemStore.setState({ status: null });
   useAuthStore.setState({ isAuthenticated: false, initialized: false, jwt: null });
-  useConnectionStore.setState({ state: 'disconnected', everAuthenticated: false });
+  useConnectionStore.setState({ state: 'disconnected', everAuthenticated: false, mustChangePassword: false });
 });
 
 /**
@@ -120,6 +120,66 @@ describe('<AuthGuard> WS gate', () => {
 
     expect(screen.getByText('login page')).toBeInTheDocument();
     expect(screen.queryByText('protected content')).toBeNull();
+  });
+});
+
+/**
+ * WP-0 (bootstrap-admin recovery): a `must_change_password`-flagged account
+ * (the standard bootstrap `admin@local`, or any account an operator just
+ * reset) is refused every RPC outside the self-service allowlist
+ * (`handlers.rs::is_password_change_allowlisted`). Before this fix the
+ * dashboard had no way to know this ahead of time — every page just failed
+ * its first RPC with an opaque error. The `connect` handshake now surfaces
+ * the flag on `useConnectionStore().mustChangePassword`, and `AuthGuard`
+ * force-redirects to the account-settings password form until it clears.
+ *
+ * Route is `/app/system/settings` (not `/settings`) — N-3 relocated the page
+ * there; `AuthGuard`'s `CHANGE_PASSWORD_PATH` constant points at the current
+ * canonical path, not the now-redirecting legacy alias (see that constant's
+ * own doc comment for why the alias would infinite-loop here).
+ */
+function renderAuthGuardWithSettingsRoute(initialPath = '/some/deep/page') {
+  return render(
+    <IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={[initialPath]}>
+        <Routes>
+          <Route element={<AuthGuard />}>
+            <Route path="/some/deep/page" element={<div>protected content</div>} />
+            <Route path="/app/system/settings" element={<div>account settings page</div>} />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    </IntlProvider>,
+  );
+}
+
+describe('<AuthGuard> must-change-password gate (WP-0)', () => {
+  it('redirects to the account-settings password form when the flag is set', () => {
+    useAuthStore.setState({ isAuthenticated: true, initialized: true });
+    useConnectionStore.setState({ state: 'authenticated', everAuthenticated: true, mustChangePassword: true });
+
+    renderAuthGuardWithSettingsRoute('/some/deep/page');
+
+    expect(screen.getByText('account settings page')).toBeInTheDocument();
+    expect(screen.queryByText('protected content')).toBeNull();
+  });
+
+  it('does NOT redirect once the flag is clear — normal navigation resumes', () => {
+    useAuthStore.setState({ isAuthenticated: true, initialized: true });
+    useConnectionStore.setState({ state: 'authenticated', everAuthenticated: true, mustChangePassword: false });
+
+    renderAuthGuardWithSettingsRoute('/some/deep/page');
+
+    expect(screen.getByText('protected content')).toBeInTheDocument();
+  });
+
+  it('renders the settings route itself instead of looping when already there', () => {
+    useAuthStore.setState({ isAuthenticated: true, initialized: true });
+    useConnectionStore.setState({ state: 'authenticated', everAuthenticated: true, mustChangePassword: true });
+
+    renderAuthGuardWithSettingsRoute('/app/system/settings?tab=account');
+
+    expect(screen.getByText('account settings page')).toBeInTheDocument();
   });
 });
 

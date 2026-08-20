@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Navigate, Outlet } from 'react-router';
+import { Navigate, Outlet, useLocation } from 'react-router';
 import { FormattedMessage } from 'react-intl';
 import { WifiOff } from 'lucide-react';
 import { useAuthStore, type UserRole } from '@/stores/auth-store';
@@ -7,6 +7,22 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useSystemStore } from '@/stores/system-store';
 import { ErrorState } from '@/components/mds/error-state';
 import { ROLE_LEVELS } from '@/lib/roles';
+
+/** The account-settings tab that owns self-service password change (the only
+ *  RPC a `must_change_password` account may call besides `users.me`). Kept as
+ *  one constant so the redirect target and the "am I already there?" check
+ *  below can never drift apart.
+ *
+ *  N-3 (2026-08, `DESIGN-agent-os-native-apps-2026-08.md` §5 WP N-3): this
+ *  page physically relocated from `/settings` to `/app/system/settings` (the
+ *  系統設定 app). This constant MUST track the CURRENT canonical path, never
+ *  a redirect alias — `/settings` now itself redirects to
+ *  `/app/system/settings`, so pointing this constant at the old path would
+ *  force-navigate here, land on the redirect, bounce to the new path, and
+ *  fail the exact-match check below on every subsequent render: an infinite
+ *  redirect loop, not a one-time landing. */
+const CHANGE_PASSWORD_PATH = '/app/system/settings';
+const CHANGE_PASSWORD_QUERY = 'tab=account';
 
 /** The first-paint / first-handshake loading spinner. Kept bare on purpose —
  *  it appears for at most a moment while the stored session resolves and the WS
@@ -50,6 +66,8 @@ export function AuthGuard() {
   const wsState = useConnectionStore((s) => s.state);
   const everAuthenticated = useConnectionStore((s) => s.everAuthenticated);
   const connectWithAuth = useConnectionStore((s) => s.connectWithAuth);
+  const mustChangePassword = useConnectionStore((s) => s.mustChangePassword);
+  const location = useLocation();
 
   useEffect(() => {
     if (!initialized) {
@@ -90,6 +108,28 @@ export function AuthGuard() {
 
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
+  }
+
+  // 3. WP-0 (bootstrap-admin recovery): an account still flagged
+  //    `must_change_password` (the standard bootstrap `admin@local`, or any
+  //    account an operator just reset) can only reach the self-service
+  //    change-password form — every other RPC is refused server-side
+  //    (`handlers.rs::is_password_change_allowlisted`). Force the redirect
+  //    here instead of letting each page discover the refusal on its own
+  //    first RPC. Not applied while already on that page (would loop), and
+  //    the original destination rides along in `state.from` so `AccountTab`
+  //    can send the user back once the password is actually changed.
+  const onChangePasswordPage =
+    location.pathname === CHANGE_PASSWORD_PATH &&
+    new URLSearchParams(location.search).get('tab') === 'account';
+  if (mustChangePassword && !onChangePasswordPage) {
+    return (
+      <Navigate
+        to={`${CHANGE_PASSWORD_PATH}?${CHANGE_PASSWORD_QUERY}`}
+        replace
+        state={{ from: `${location.pathname}${location.search}` }}
+      />
+    );
   }
 
   return <Outlet />;

@@ -8,6 +8,26 @@ export type WsFrame =
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'authenticated';
 
+/**
+ * Stable machine-readable code the gateway returns for any RPC (outside the
+ * self-service allowlist — `users.me`/`users.change_password`/`connect`/
+ * `connect.challenge`/`ping`) reached by a caller whose account still carries
+ * `must_change_password` (`handlers.rs::MUST_CHANGE_PASSWORD_ERROR_CODE`).
+ */
+export const MUST_CHANGE_PASSWORD_ERROR_CODE = 'must_change_password_required';
+
+/** Best-effort check for the `{ code, message }` shape a structured RPC
+ *  rejection carries — mirrors the small helpers pages inline for the same
+ *  purpose (`OSPage`, `useIsAppliance`). */
+function hasErrorCode(err: unknown, code: string): boolean {
+  return (
+    !!err &&
+    typeof err === 'object' &&
+    'code' in err &&
+    (err as { code?: unknown }).code === code
+  );
+}
+
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
@@ -39,18 +59,41 @@ export class DuDuClawClient {
   private getToken?: TokenGetter;
   private authRefreshHook?: AuthRefreshHook;
   private needsAuthRefresh = false;
+  // WP-0 (bootstrap-admin recovery): whether the currently-authenticated
+  // account still must change its password. Captured from the `connect`
+  // handshake response's `must_change_password` field, AND kept in sync by
+  // watching every subsequent RPC rejection for
+  // `MUST_CHANGE_PASSWORD_ERROR_CODE` — belt (explicit flag at handshake) and
+  // suspenders (any RPC can reveal it, in case a session gets flagged
+  // mid-connection by an operator password reset).
+  private _mustChangePassword = false;
+  private _onMustChangePasswordChange: ((flag: boolean) => void) | null = null;
 
   get state(): ConnectionState {
     return this._state;
+  }
+
+  get mustChangePassword(): boolean {
+    return this._mustChangePassword;
   }
 
   set onStateChange(handler: (state: ConnectionState) => void) {
     this._onStateChange = handler;
   }
 
+  set onMustChangePasswordChange(handler: (flag: boolean) => void) {
+    this._onMustChangePasswordChange = handler;
+  }
+
   private setState(state: ConnectionState) {
     this._state = state;
     this._onStateChange?.(state);
+  }
+
+  private setMustChangePassword(flag: boolean) {
+    if (this._mustChangePassword === flag) return;
+    this._mustChangePassword = flag;
+    this._onMustChangePasswordChange?.(flag);
   }
 
   // H7 fix: accept a getter function instead of a static token
@@ -116,7 +159,10 @@ export class DuDuClawClient {
             const params = token.includes('.')
               ? { jwt: token }
               : { token };
-            await this.call('connect', params, true);
+            const payload = (await this.call('connect', params, true)) as
+              | { must_change_password?: boolean }
+              | undefined;
+            this.setMustChangePassword(payload?.must_change_password === true);
             this.setState('authenticated');
           } catch (e) {
             // H10 fix: do NOT set authenticated on failure
@@ -133,7 +179,10 @@ export class DuDuClawClient {
         } else {
           // No token — try server handshake for local-only mode
           try {
-            await this.call('connect', { version: '0.6.5' }, true);
+            const payload = (await this.call('connect', { version: '0.6.5' }, true)) as
+              | { must_change_password?: boolean }
+              | undefined;
+            this.setMustChangePassword(payload?.must_change_password === true);
             this.setState('authenticated');
           } catch {
             // H10 fix: if server requires auth and we have no token, don't fake authenticated
@@ -172,6 +221,12 @@ export class DuDuClawClient {
 
   private handleFrame(frame: WsFrame) {
     if (frame.type === 'res') {
+      // Suspenders: any RPC rejection can reveal the must-change-password
+      // gate, not just the initial handshake (belt) — see the field's doc
+      // comment above.
+      if (!frame.ok && hasErrorCode(frame.error, MUST_CHANGE_PASSWORD_ERROR_CODE)) {
+        this.setMustChangePassword(true);
+      }
       const pending = this.pendingRequests.get(frame.id);
       if (pending) {
         clearTimeout(pending.timeout);
@@ -282,6 +337,12 @@ export class DuDuClawClient {
     this.ws = null; // Clear ref BEFORE close — onclose guard checks this
     ws?.close();
     this.setState('disconnected');
+    // An explicit disconnect (logout, or the WP-0 forced reconnect after a
+    // successful password change) starts the next session fresh — never
+    // carry a stale must-change-password flag across it. A mid-session drop
+    // that auto-reconnects does NOT go through this method, so a genuine
+    // still-must-change-password account keeps the gate through a network blip.
+    this.setMustChangePassword(false);
     this.rejectAllPending('Disconnected');
   }
 

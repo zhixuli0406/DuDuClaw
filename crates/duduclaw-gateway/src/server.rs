@@ -3340,6 +3340,32 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 // The response shape is unchanged (`{"files": [...]}`) — these only narrow
 // which rows are included, never add new top-level fields.
 
+/// Refuse a REST caller whose account still carries `must_change_password`.
+///
+/// `authenticate_jwt` used to refuse such a caller outright (see its own doc
+/// comment / `jwt_account_gate`), which fail-closed every REST route right
+/// along with the WS handshake. Now that it authenticates a flagged account
+/// instead of erroring, each REST helper below calls this immediately after
+/// `authenticate_jwt` succeeds so the pre-fix fail-closed behaviour is
+/// preserved for every route except the one that is deliberately exempt:
+/// `POST /api/change-password` (`handle_change_password`) does not call
+/// `authenticate_jwt` at all, precisely so a flagged account can still reach
+/// it. This mirrors `handlers.rs::is_password_change_allowlisted` on the WS
+/// RPC side and shares its machine-readable error code.
+fn require_password_changed(ctx: &UserContext) -> Result<(), axum::response::Response> {
+    if ctx.must_change_password {
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "password change required before any operation",
+                "code": crate::handlers::MUST_CHANGE_PASSWORD_ERROR_CODE,
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
 /// Authenticate a file request and authorize it for the requested `agent`,
 /// mirroring the per-agent fail-closed gate the dashboard RPC layer applies.
 ///
@@ -3369,6 +3395,7 @@ fn authorize_file_access(
         .or(token_query)
         .ok_or_else(unauthorized)?;
     let ctx = authenticate_jwt(state, token).map_err(|_| unauthorized())?;
+    require_password_changed(&ctx)?;
 
     let allowed = match agent {
         Some(a) => ctx.can_access_agent(a),
@@ -3790,13 +3817,14 @@ fn require_bearer(
         )
             .into_response()
     })?;
-    authenticate_jwt(state, token).map(|_| ()).map_err(|_| {
+    let ctx = authenticate_jwt(state, token).map_err(|_| {
         (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "invalid or expired token" })),
         )
             .into_response()
-    })
+    })?;
+    require_password_changed(&ctx)
 }
 
 /// POST /api/experts/upload — stage an expert-pack `.zip` for installation.
@@ -3834,6 +3862,9 @@ async fn handle_expert_upload(
                 .into_response();
         }
     };
+    if let Err(resp) = require_password_changed(&ctx) {
+        return resp;
+    }
     if !ctx.is_admin() {
         return (
             axum::http::StatusCode::FORBIDDEN,
@@ -4388,6 +4419,7 @@ fn require_admin_bearer(
         )
             .into_response()
     })?;
+    require_password_changed(&ctx)?;
     if !ctx.is_admin() {
         return Err((
             axum::http::StatusCode::FORBIDDEN,
@@ -4651,6 +4683,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             if let Some(jwt_str) = params.get("jwt").and_then(|v| v.as_str()) {
                                 match authenticate_jwt(&state, jwt_str) {
                                     Ok(ctx) => {
+                                        // `must_change_password` is surfaced here so a
+                                        // future frontend can route straight to a
+                                        // change-password screen on the handshake
+                                        // response itself, instead of waiting to
+                                        // discover the restriction from the first
+                                        // rejected RPC (handlers.rs::is_password_change_allowlisted).
                                         let ok = WsFrame::ok_response(
                                             &id,
                                             serde_json::json!({
@@ -4659,7 +4697,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                                     "id": ctx.user_id,
                                                     "email": ctx.email,
                                                     "role": ctx.role.to_string(),
-                                                }
+                                                },
+                                                "must_change_password": ctx.must_change_password,
                                             }),
                                         );
                                         let _ = socket
@@ -5096,27 +5135,53 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     info!("WebSocket connection terminated");
 }
 
+/// Pure decision extracted from [`authenticate_jwt`] so the fix for
+/// `docs/todo/TODO-bootstrap-admin-ws-deadlock.md` is unit-testable without a
+/// full `AppState`/DB fixture (same rationale as `is_enterprise_only_method`
+/// in handlers.rs). Given the account status + forced-password-change flag
+/// from a *fresh* DB read (never the JWT's own claims — a token can outlive
+/// a password change), decides whether the account may authenticate at all
+/// and, if so, whether the session should carry the forced-password-change
+/// restriction.
+///
+/// Before this fix, `must_change_password = true` made this whole function
+/// return `Err`, which refused the WS handshake outright — indistinguishable,
+/// from the frontend's perspective, from a hung connection (`/api/login` and
+/// `/api/me` never consulted this gate, so nothing warned the caller before
+/// the socket connect). This check is address-blind: unlike
+/// `local_session::evaluate`'s Personal+loopback auto-login escape hatch, it
+/// authenticates a LAN client hitting an Enterprise container exactly the
+/// same as a loopback one — the restriction that follows is enforced at the
+/// RPC dispatch chokepoint (`handlers.rs::is_password_change_allowlisted`),
+/// not by refusing to authenticate.
+fn jwt_account_gate(
+    status: duduclaw_auth::UserStatus,
+    must_change_password: bool,
+) -> Result<bool, String> {
+    if status != duduclaw_auth::UserStatus::Active {
+        return Err("account is suspended or offboarded".to_string());
+    }
+    Ok(must_change_password)
+}
+
 /// Verify a JWT access token and build a UserContext.
 /// Single DB lookup, fail-closed on error (R2 fix for double-lookup + fail-open).
 fn authenticate_jwt(state: &AppState, jwt_str: &str) -> Result<UserContext, String> {
     let claims = state.jwt_config.verify_access_token(jwt_str)?;
 
-    // Single DB lookup — fail-closed: DB error = reject
-    match state.user_db.get_user(&claims.sub) {
-        Ok(Some(user)) if user.status == duduclaw_auth::UserStatus::Active => {
-            // C1: block all operations until the bootstrap/forced password is
-            // changed. The dedicated POST /api/change-password endpoint does not
-            // pass through this gate, so the user can still recover.
-            if user.must_change_password {
-                return Err("password change required before any operation".to_string());
-            }
-        }
-        Ok(Some(_)) => return Err("account is suspended or offboarded".to_string()),
+    // Single DB lookup — fail-closed: DB error = reject.
+    let must_change_password = match state.user_db.get_user(&claims.sub) {
+        Ok(Some(user)) => jwt_account_gate(user.status, user.must_change_password)?,
         Ok(None) => return Err("user not found".to_string()),
         Err(_) => return Err("authentication service unavailable".to_string()),
-    }
+    };
 
-    UserContext::from_claims(&claims)
+    // The handshake succeeds for every Active account, flagged or not.
+    // `must_change_password` rides along on the UserContext; the RPC
+    // dispatch chokepoint restricts such a caller to the self-service
+    // change-password allowlist until the flag clears (C1's original intent
+    // — block all operations — is preserved, just enforced one layer up).
+    UserContext::from_claims(&claims, must_change_password)
 }
 
 /// Check if any users exist in the database (to decide whether auth is needed).
@@ -5661,6 +5726,47 @@ mod origin_allowlist_tests {
         }
         // Reset the cell to empty for a clean slate.
         *allowed_origins_cell().write().unwrap() = Vec::new();
+    }
+}
+
+#[cfg(test)]
+mod jwt_account_gate_tests {
+    use super::*;
+
+    /// TODO-bootstrap-admin-ws-deadlock.md core regression: a flagged but
+    /// Active account (the bootstrap `admin@local`, or any operator-reset
+    /// account) now authenticates instead of the handshake being refused
+    /// outright, AND the flag is reported rather than swallowed. This
+    /// function takes no address at all, so it is exactly as true for a LAN
+    /// client hitting an Enterprise container over a Docker bridge network
+    /// as it is for a loopback caller — the deadlock was address-independent
+    /// even though the old symptom (`local_session` 403) looked address-related.
+    #[test]
+    fn active_but_flagged_account_authenticates_with_the_flag_reported() {
+        let must_change_password =
+            jwt_account_gate(duduclaw_auth::UserStatus::Active, true).unwrap();
+        assert!(
+            must_change_password,
+            "the handshake must succeed AND report the flag, not refuse the connection"
+        );
+    }
+
+    #[test]
+    fn active_unflagged_account_authenticates_clear() {
+        let must_change_password =
+            jwt_account_gate(duduclaw_auth::UserStatus::Active, false).unwrap();
+        assert!(!must_change_password);
+    }
+
+    /// The account-status gate (suspended/offboarded) is untouched by this
+    /// fix — only the must-change-password branch stopped refusing the
+    /// handshake. A non-Active account is still refused outright, regardless
+    /// of the password flag.
+    #[test]
+    fn non_active_account_is_still_refused_regardless_of_the_flag() {
+        assert!(jwt_account_gate(duduclaw_auth::UserStatus::Suspended, false).is_err());
+        assert!(jwt_account_gate(duduclaw_auth::UserStatus::Suspended, true).is_err());
+        assert!(jwt_account_gate(duduclaw_auth::UserStatus::Offboarded, false).is_err());
     }
 }
 

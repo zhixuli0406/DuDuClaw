@@ -11,6 +11,17 @@ pub struct UserContext {
     pub role: UserRole,
     /// Agent name → access level mapping.
     pub agent_access: HashMap<String, AccessLevel>,
+    /// Set for a user whose account still carries the DB-level
+    /// `must_change_password` flag (the bootstrap `admin@local`, or any
+    /// account an operator has reset). The WS handshake authenticates such a
+    /// user normally — see `server.rs::authenticate_jwt` — rather than
+    /// refusing the handshake outright, which previously left the frontend
+    /// stuck on an unexplained connecting spinner
+    /// (`docs/todo/TODO-bootstrap-admin-ws-deadlock.md`). The single RPC
+    /// dispatch chokepoint (`MethodHandler::dispatch`) reads this flag and
+    /// restricts the caller to a small self-service allowlist
+    /// (`users.change_password` chief among them) until it clears.
+    pub must_change_password: bool,
 }
 
 impl UserContext {
@@ -29,11 +40,19 @@ impl UserContext {
             email: "admin@local".to_string(),
             role: UserRole::Admin,
             agent_access: HashMap::new(),
+            must_change_password: false,
         }
     }
 
     /// Build from JWT claims.
-    pub fn from_claims(claims: &crate::jwt::Claims) -> Result<Self, String> {
+    ///
+    /// `must_change_password` is deliberately NOT part of the JWT claims
+    /// (a token issued at login can outlive a password change, and claims
+    /// are never re-verified against the DB mid-session) — the caller passes
+    /// in a value it just read fresh from the user table, mirroring how
+    /// `role` and `agent_access` are already point-in-time snapshots taken
+    /// at handshake time, not re-checked per RPC.
+    pub fn from_claims(claims: &crate::jwt::Claims, must_change_password: bool) -> Result<Self, String> {
         let role: UserRole = claims.role.parse()
             .map_err(|e: String| format!("invalid role in JWT: {e}"))?;
         let mut agent_access = HashMap::new();
@@ -49,6 +68,7 @@ impl UserContext {
             email: claims.email.clone(),
             role,
             agent_access,
+            must_change_password,
         })
     }
 
@@ -60,6 +80,14 @@ impl UserContext {
     /// Returns `true` if the user is an admin.
     pub fn is_admin(&self) -> bool {
         self.role == UserRole::Admin
+    }
+
+    /// Returns `true` if this caller must change their password before doing
+    /// anything else. `MethodHandler::dispatch` is the enforcement point; this
+    /// is just the named predicate so call sites read as intent, not a raw
+    /// field poke.
+    pub fn requires_password_change(&self) -> bool {
+        self.must_change_password
     }
 
     /// Check if the user can access a specific agent (any level).
@@ -147,11 +175,42 @@ mod tests {
             email: "emp@test.com".to_string(),
             role: UserRole::Employee,
             agent_access: access,
+            must_change_password: false,
         }
     }
 
     fn admin_ctx() -> UserContext {
         UserContext::admin_fallback()
+    }
+
+    fn claims(role: &str) -> crate::jwt::Claims {
+        crate::jwt::Claims {
+            sub: "u1".to_string(),
+            email: "u1@test.local".to_string(),
+            role: role.to_string(),
+            bound_agents: Vec::new(),
+            access_levels: HashMap::new(),
+            exp: 0,
+            iat: 0,
+            token_type: "access".to_string(),
+        }
+    }
+
+    #[test]
+    fn admin_fallback_never_requires_password_change() {
+        assert!(!admin_ctx().requires_password_change());
+    }
+
+    #[test]
+    fn from_claims_carries_the_caller_supplied_must_change_password_flag() {
+        // The flag is a fresh DB read the caller passes in, NOT decoded from
+        // the JWT itself (see the doc comment on `from_claims`) — this locks
+        // that contract down: both `true` and `false` pass through verbatim.
+        let flagged = UserContext::from_claims(&claims("admin"), true).unwrap();
+        assert!(flagged.requires_password_change());
+
+        let clear = UserContext::from_claims(&claims("admin"), false).unwrap();
+        assert!(!clear.requires_password_change());
     }
 
     #[test]

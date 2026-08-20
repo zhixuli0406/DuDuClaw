@@ -17,6 +17,14 @@ interface ConnectionStore {
    * `disconnect()` (logout) so a fresh login starts from "never connected".
    */
   readonly everAuthenticated: boolean;
+  /**
+   * WP-0 (bootstrap-admin recovery): true while the currently-authenticated
+   * account still must change its password before doing anything else
+   * (`ws-client.ts`'s `mustChangePassword`, driven by the `connect` handshake
+   * response AND any subsequent RPC rejection). `AuthGuard` redirects to the
+   * account-settings password form while this is true.
+   */
+  readonly mustChangePassword: boolean;
   connectWithAuth: (getToken: TokenGetter) => Promise<void>;
   disconnect: () => void;
 }
@@ -31,11 +39,13 @@ export const useConnectionStore = create<ConnectionStore>((set) => {
       everAuthenticated: prev.everAuthenticated || state === 'authenticated',
     }));
   };
+  client.onMustChangePasswordChange = (flag) => set({ mustChangePassword: flag });
 
   return {
     state: 'disconnected',
     error: null,
     everAuthenticated: false,
+    mustChangePassword: false,
     connectWithAuth: async (getToken: TokenGetter) => {
       try {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';

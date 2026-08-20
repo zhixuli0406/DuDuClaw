@@ -453,6 +453,8 @@
   "settings.account.mismatch": "新しいパスワードが一致しません",
   "settings.account.tooShort": "新しいパスワードは8文字以上必要です",
   "settings.account.sameAsOld": "新しいパスワードは現在のものと異なる必要があります",
+  "settings.account.mustChange.title": "先にパスワードを設定してください",
+  "settings.account.mustChange.desc": "このアカウントはまだパスワードが設定されていません。他の機能を使う前に、下でパスワードを設定してください。",
   "settings.container": "コンテナエンジン",
   "settings.heartbeat": "ハートビートスケジュール",
   "settings.cron": "スケジュールタスク",
