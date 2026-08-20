@@ -3109,9 +3109,26 @@ export type McpScope =
   | 'odoo:read'
   | 'odoo:write'
   | 'odoo:execute'
+  | 'google:read'
+  | 'google:write'
+  | 'notion:read'
+  | 'notion:write'
+  | 'github:read'
+  | 'github:write'
+  | 'fork:execute'
+  | 'os:native'
+  | 'skill:execute'
+  | 'recording'
+  | 'mail:read'
+  | 'mail:send'
   | 'admin';
 
-/** All known MCP scopes — mirrors gateway `KNOWN_MCP_SCOPES`. */
+/** All known MCP scopes — mirrors the shared canonical list
+ *  (`duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS`, read by both the gateway's
+ *  `KNOWN_MCP_SCOPES` validator and `duduclaw-cli::mcp_auth::Scope`). Was a
+ *  10-entry list that had drifted from the real 22 scopes (2026-08 audit) —
+ *  dashboard operators could not grant 12 of them without hand-editing
+ *  config.toml. */
 export const MCP_SCOPES: ReadonlyArray<McpScope> = [
   'memory:read',
   'memory:write',
@@ -3122,6 +3139,18 @@ export const MCP_SCOPES: ReadonlyArray<McpScope> = [
   'odoo:read',
   'odoo:write',
   'odoo:execute',
+  'google:read',
+  'google:write',
+  'notion:read',
+  'notion:write',
+  'github:read',
+  'github:write',
+  'fork:execute',
+  'os:native',
+  'skill:execute',
+  'recording',
+  'mail:read',
+  'mail:send',
   'admin',
 ];
 

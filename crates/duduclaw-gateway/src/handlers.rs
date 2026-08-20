@@ -321,21 +321,13 @@ fn unarchive_restore_table(table: &mut toml::Table) -> Result<(), String> {
 // They never touch the network or the filesystem; the async `handle_*` wrappers
 // own the read → mutate → atomic-write + encryption side of things.
 
-/// Known MCP scope strings (mirrors `duduclaw-cli::mcp_auth::parse_scopes`).
-/// The gateway crate does not depend on duduclaw-cli, so the list is duplicated
-/// here. Keep in sync with `Scope::as_str` in mcp_auth.rs.
-const KNOWN_MCP_SCOPES: &[&str] = &[
-    "memory:read",
-    "memory:write",
-    "wiki:read",
-    "wiki:write",
-    "messaging:send",
-    "identity:read",
-    "odoo:read",
-    "odoo:write",
-    "odoo:execute",
-    "admin",
-];
+/// Known MCP scope strings — the single authority is
+/// `duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS`. The gateway crate cannot
+/// depend on `duduclaw-cli` (the dependency runs the other way), so it can't
+/// read `duduclaw-cli::mcp_auth::Scope` directly; that shared module is what
+/// both crates read instead, replacing a hand-copied 10-of-22 list that had
+/// silently drifted (2026-08 audit — see that module's doc comment).
+const KNOWN_MCP_SCOPES: &[&str] = duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS;
 
 /// Validate an MCP API key against `^ddc_(prod|staging|dev)_[a-f0-9]{32}$`
 /// (mirrors `duduclaw-cli::mcp_auth::is_valid_key_format`).
@@ -381,6 +373,46 @@ fn mask_mcp_key(key: &str) -> String {
         // Unrecognised shape — mask aggressively.
         let head: String = key.chars().take(6).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod known_mcp_scopes_tests {
+    use super::KNOWN_MCP_SCOPES;
+
+    /// P0-S3 (2026-08 audit): `mcp_keys.create` used to reject 12 of the 22
+    /// real scopes ("Unknown scope") because this list was a hand-copied
+    /// 10-entry duplicate that fell out of sync with
+    /// `duduclaw-cli::mcp_auth::Scope`. It is now a direct alias of
+    /// `duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS`, so this test is really
+    /// asserting the shared list itself — but it pins the count at the call
+    /// site the dashboard actually validates against, catching a future
+    /// accidental re-introduction of a local override here.
+    #[test]
+    fn known_mcp_scopes_has_all_22_entries() {
+        assert_eq!(KNOWN_MCP_SCOPES.len(), 22);
+    }
+
+    /// Spot-check a sample of the 12 scopes that were previously missing —
+    /// these used to make `mcp_keys.create` fail with "Unknown scope".
+    #[test]
+    fn previously_missing_scopes_are_now_known() {
+        for s in [
+            "google:read",
+            "google:write",
+            "notion:read",
+            "notion:write",
+            "github:read",
+            "github:write",
+            "fork:execute",
+            "os:native",
+            "skill:execute",
+            "recording",
+            "mail:read",
+            "mail:send",
+        ] {
+            assert!(KNOWN_MCP_SCOPES.contains(&s), "{s} should be a known scope");
+        }
     }
 }
 

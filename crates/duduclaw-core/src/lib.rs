@@ -15,6 +15,7 @@ pub mod identity_token;
 pub mod keychain;
 pub mod lenient;
 pub mod match_utils;
+pub mod mcp_scopes;
 pub mod org;
 pub mod org_field_guard;
 pub mod org_store;

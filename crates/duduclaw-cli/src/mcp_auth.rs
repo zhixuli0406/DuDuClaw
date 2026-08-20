@@ -594,6 +594,40 @@ fn default_internal_principal() -> Principal {
     }
 }
 
+/// Map a single canonical scope wire string to its `Scope` variant. The
+/// reverse of `Scope`'s `Display` impl above — kept immediately next to
+/// `parse_scopes` so the two stay easy to eyeball together, and locked
+/// bidirectionally against `duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS` (the
+/// shared canonical list the gateway also reads) by the
+/// `scope_enum_matches_canonical_list` test below.
+fn scope_from_str(s: &str) -> Option<Scope> {
+    Some(match s {
+        "memory:read" => Scope::MemoryRead,
+        "memory:write" => Scope::MemoryWrite,
+        "wiki:read" => Scope::WikiRead,
+        "wiki:write" => Scope::WikiWrite,
+        "messaging:send" => Scope::MessagingSend,
+        "identity:read" => Scope::IdentityRead,
+        "odoo:read" => Scope::OdooRead,
+        "odoo:write" => Scope::OdooWrite,
+        "odoo:execute" => Scope::OdooExecute,
+        "google:read" => Scope::GoogleRead,
+        "google:write" => Scope::GoogleWrite,
+        "notion:read" => Scope::NotionRead,
+        "notion:write" => Scope::NotionWrite,
+        "github:read" => Scope::GithubRead,
+        "github:write" => Scope::GithubWrite,
+        "fork:execute" => Scope::ForkExecute,
+        "os:native" => Scope::OsNative,
+        "skill:execute" => Scope::SkillExecute,
+        "mail:read" => Scope::MailRead,
+        "mail:send" => Scope::MailSend,
+        "recording" => Scope::Recording,
+        "admin" => Scope::Admin,
+        _ => return None,
+    })
+}
+
 /// Parse a comma-separated scope string into a HashSet<Scope>.
 /// e.g. "memory:read,wiki:write" → {MemoryRead, WikiWrite}
 pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
@@ -604,74 +638,11 @@ pub fn parse_scopes(s: &str) -> Result<HashSet<Scope>, AuthError> {
     let mut result = HashSet::new();
     for part in s.split(',') {
         let part = part.trim();
-        match part {
-            "memory:read" => {
-                result.insert(Scope::MemoryRead);
+        match scope_from_str(part) {
+            Some(scope) => {
+                result.insert(scope);
             }
-            "memory:write" => {
-                result.insert(Scope::MemoryWrite);
-            }
-            "wiki:read" => {
-                result.insert(Scope::WikiRead);
-            }
-            "wiki:write" => {
-                result.insert(Scope::WikiWrite);
-            }
-            "messaging:send" => {
-                result.insert(Scope::MessagingSend);
-            }
-            "identity:read" => {
-                result.insert(Scope::IdentityRead);
-            }
-            "odoo:read" => {
-                result.insert(Scope::OdooRead);
-            }
-            "odoo:write" => {
-                result.insert(Scope::OdooWrite);
-            }
-            "odoo:execute" => {
-                result.insert(Scope::OdooExecute);
-            }
-            "google:read" => {
-                result.insert(Scope::GoogleRead);
-            }
-            "google:write" => {
-                result.insert(Scope::GoogleWrite);
-            }
-            "notion:read" => {
-                result.insert(Scope::NotionRead);
-            }
-            "notion:write" => {
-                result.insert(Scope::NotionWrite);
-            }
-            "github:read" => {
-                result.insert(Scope::GithubRead);
-            }
-            "github:write" => {
-                result.insert(Scope::GithubWrite);
-            }
-            "fork:execute" => {
-                result.insert(Scope::ForkExecute);
-            }
-            "os:native" => {
-                result.insert(Scope::OsNative);
-            }
-            "skill:execute" => {
-                result.insert(Scope::SkillExecute);
-            }
-            "mail:read" => {
-                result.insert(Scope::MailRead);
-            }
-            "mail:send" => {
-                result.insert(Scope::MailSend);
-            }
-            "recording" => {
-                result.insert(Scope::Recording);
-            }
-            "admin" => {
-                result.insert(Scope::Admin);
-            }
-            other => return Err(AuthError::InvalidScope(other.to_string())),
+            None => return Err(AuthError::InvalidScope(part.to_string())),
         }
     }
     Ok(result)
@@ -1115,6 +1086,80 @@ is_external = {is_external}
     fn test_parse_scopes_unknown_returns_invalid_scope() {
         let result = parse_scopes("unknown:scope");
         assert!(matches!(result, Err(AuthError::InvalidScope(_))));
+    }
+
+    // ── P0-S3 (2026-08 audit): lock `Scope` ↔ the shared canonical list in
+    // duduclaw-core bidirectionally. The gateway's `mcp_keys.create` scope
+    // validator and the frontend's scope picker both read
+    // `duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS` (gateway can't depend on
+    // this crate to read `Scope` directly — see that module's doc comment).
+    // If a future scope is added to the enum but not the shared list (or vice
+    // versa), this test goes red instead of the drift silently reappearing as
+    // "Unknown scope" in the dashboard for the new scope.
+    #[test]
+    fn scope_enum_matches_canonical_list() {
+        use duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS;
+
+        // Every enum variant, listed explicitly (Scope has no EnumIter — this
+        // hardcoded list IS the trip-wire: forgetting to add a new variant
+        // here is caught by the length assertion below).
+        let all_variants = [
+            Scope::MemoryRead,
+            Scope::MemoryWrite,
+            Scope::WikiRead,
+            Scope::WikiWrite,
+            Scope::MessagingSend,
+            Scope::IdentityRead,
+            Scope::OdooRead,
+            Scope::OdooWrite,
+            Scope::OdooExecute,
+            Scope::GoogleRead,
+            Scope::GoogleWrite,
+            Scope::NotionRead,
+            Scope::NotionWrite,
+            Scope::GithubRead,
+            Scope::GithubWrite,
+            Scope::ForkExecute,
+            Scope::OsNative,
+            Scope::SkillExecute,
+            Scope::Recording,
+            Scope::MailRead,
+            Scope::MailSend,
+            Scope::Admin,
+        ];
+
+        assert_eq!(
+            all_variants.len(),
+            MCP_SCOPE_STRINGS.len(),
+            "Scope enum and duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS have \
+             drifted in size — add the new variant to BOTH lists"
+        );
+
+        // Direction 1: every enum variant's Display string is in the shared
+        // list, and parses back to the same variant.
+        for variant in &all_variants {
+            let wire = variant.to_string();
+            assert!(
+                MCP_SCOPE_STRINGS.contains(&wire.as_str()),
+                "Scope::{variant:?} ({wire}) missing from \
+                 duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS"
+            );
+            let mut parsed = parse_scopes(&wire).expect("must parse its own Display string");
+            assert_eq!(parsed.len(), 1);
+            assert!(
+                parsed.remove(variant),
+                "parse_scopes({wire}) did not round-trip to Scope::{variant:?}"
+            );
+        }
+
+        // Direction 2: every string in the shared list parses successfully
+        // (no orphan entries the enum doesn't back).
+        for s in MCP_SCOPE_STRINGS {
+            assert!(
+                parse_scopes(s).is_ok(),
+                "canonical scope string '{s}' does not parse via Scope::from_str"
+            );
+        }
     }
 
     // ── OS-native Phase 1: os:native scope round-trips ───────────────────────
