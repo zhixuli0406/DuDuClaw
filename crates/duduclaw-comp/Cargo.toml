@@ -1,0 +1,41 @@
+[package]
+name = "duduclaw-comp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shell-S0 spike: a self-built Wayland compositor (smithay), adapted from the smithay `smallvil` example."
+
+# Detach from the parent DuDuClaw workspace. smithay is Linux-only — it pulls
+# wayland-server/wayland-client, libxkbcommon, and (transitively, via the
+# winit backend) EGL/GLES bindings that don't exist on macOS. Keeping this
+# crate out of the main workspace (see the root Cargo.toml `[workspace]
+# exclude` entry) keeps that dependency tree from ever touching the mac
+# gateway build or its Cargo.lock. Mirrors the same pattern already used by
+# crates/duduclaw-native-gui (gpui) and crates/duduclaw-shell (gpui shell).
+[workspace]
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+bitflags = "2.2.1"
+
+# Version pin rationale (2026-08-19, Shell-S0 spike):
+# smithay's latest crates.io release is 0.7.0 (published 2025-06-24,
+# rust-version = "1.80.1"). We deliberately pin to the published release
+# rather than git-pinning master: the `smallvil` example on `master` has
+# already moved to edition 2024 and diverged from 0.7.0's API in ways not
+# needed for this spike (winit backend + xdg-shell + single output). A git
+# pin is the documented fallback if a future run of this crate needs an API
+# only present post-0.7.0 — none was needed to get `cargo build` green.
+[dependencies.smithay]
+version = "0.7.0"
+default-features = false
+features = [
+    "backend_winit",
+    "wayland_frontend",
+    "desktop",
+]
+
+[[bin]]
+name = "duduclaw-comp"
+path = "src/main.rs"
