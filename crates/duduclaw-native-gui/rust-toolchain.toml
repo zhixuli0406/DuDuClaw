@@ -1,0 +1,10 @@
+[toolchain]
+# gpui (zed-industries/zed git dependency) uses std::hint::cold_path in
+# crates/gpui/src/profiler.rs, stabilized after the rustc this machine's
+# rustup "stable" was pinned to (1.94.x, installed 2026-03 — 5 months stale
+# as of this crate's creation). Matches the zed checkout's own
+# rust-toolchain.toml (channel = "1.97.1") for the rev this Cargo.lock
+# resolved to. Bump this if the gpui git rev is ever updated and the build
+# again fails with "use of unstable library feature".
+channel = "1.97.1"
+profile = "minimal"

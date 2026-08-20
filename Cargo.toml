@@ -6,6 +6,16 @@ exclude = [
     # Desktop app shell (Tauri 2). Its own lockfile/target and heavy GUI deps;
     # built via `cargo tauri build` from src-tauri/, not the main workspace.
     "src-tauri",
+    # Phase 0a gpui native GUI spike. Its own lockfile/target; gpui is a git
+    # dependency on zed-industries/zed with heavy transitive deps (wgpu,
+    # font-kit, metal) that must never touch the gateway build.
+    "crates/duduclaw-native-gui",
+    # Shell-S0: DuDuClaw OS gpui shell app (same gpui git dep tree as
+    # duduclaw-native-gui; own detached workspace/lockfile).
+    "crates/duduclaw-shell",
+    # Shell-S0: smithay compositor spike. Linux-only deps (wayland-server,
+    # libinput, udev) that must never touch the mac gateway build.
+    "crates/duduclaw-comp",
 ]
 members = [
     "crates/duduclaw-core",

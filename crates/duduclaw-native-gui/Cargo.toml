@@ -1,0 +1,50 @@
+[package]
+name = "duduclaw-native-gui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Detach from the parent DuDuClaw workspace. gpui pulls the entire
+# zed-industries/zed monorepo plus wgpu/metal/font-kit and hundreds of
+# transitive crates; keeping this crate out of the main workspace (see the
+# root Cargo.toml `[workspace] exclude` entry) keeps that heavy dep tree
+# from ever touching the gateway build or its Cargo.lock.
+[workspace]
+
+[dependencies]
+# Shell-S0 (2026-08-19): pinned by `rev`, not just left to float and get
+# locked incidentally by Cargo.lock — a NEW workspace (e.g. `duduclaw-shell`,
+# which depends on this crate by path) resolving these git deps from scratch
+# would otherwise drift to zed's default-branch HEAD, which is exactly the
+# "two incompatible `gpui` package instances" failure mode the `mds_gpui`
+# D4 spike hit and rejected `gpui-component` over (see that module's doc
+# comment). `rev` must match across every crate that shares this dependency
+# tree — `duduclaw-shell/Cargo.toml` pins the identical rev.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef", features = ["profiler"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef", features = ["font-kit"] }
+gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# S2: HTTP auth client (`api.rs`). `default-features = false` drops
+# reqwest's default TLS backend (rustls/native-tls) — every call this crate
+# makes targets `http://127.0.0.1:18789` (the local gateway over loopback),
+# so a TLS connector would be pure dead weight on top of an already-heavy
+# gpui dependency tree. `ureq` (sync/blocking) was the lighter-looking
+# alternative, but reqwest is already the workspace-standard HTTP client
+# (duduclaw-gateway/-cli/-agent/-odoo/...) and this crate already runs a
+# tokio runtime on its background thread (see `ws_status.rs`), so async
+# reqwest costs nothing extra to host — a second, blocking HTTP stack would
+# have been the actual yak-shave.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# S4: grapheme-cluster-aware cursor movement for the chat composer
+# (`ime_input/text_engine.rs`) — already an indirect dependency via gpui's
+# own text layout, but Rust doesn't leak transitive deps, so it needs its
+# own direct entry here. Pinned to the version Cargo.lock already resolved
+# for gpui's copy (1.13.3) so this doesn't pull in a second version.
+unicode-segmentation = "1.13"
