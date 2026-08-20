@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use thiserror::Error;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 use crate::protocol::{SysdError, SysdOpOutput, SysdRequest, SysdResponse};
@@ -86,6 +88,24 @@ impl SysdClient {
     /// Same as [`Self::call`] but returns the full envelope (including
     /// `audit_id`) even on rejection — useful for callers that want to
     /// surface the audit id alongside a failure, not just on success.
+    ///
+    /// Non-unix targets have no UDS: every call fails closed with the same
+    /// `Connect` variant the "socket missing" path produces on unix, so
+    /// callers' error handling stays uniform across platforms (the v1.62.0
+    /// Windows release-CI break was this transport compiling ungated).
+    #[cfg(not(unix))]
+    pub async fn call_raw(&self, _req: &SysdRequest) -> Result<SysdResponse, SysdClientError> {
+        Err(SysdClientError::Connect {
+            path: self.socket_path.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "duduclaw-sysd requires Unix domain sockets — it only runs on the Linux appliance image",
+            ),
+        })
+    }
+
+    /// See the non-unix twin above for why this is platform-split.
+    #[cfg(unix)]
     pub async fn call_raw(&self, req: &SysdRequest) -> Result<SysdResponse, SysdClientError> {
         let connect = tokio::time::timeout(self.timeout, UnixStream::connect(&self.socket_path))
             .await

@@ -5,6 +5,10 @@
 //! `src/server.rs`'s unit tests, which reach into server internals from
 //! within the crate.
 
+// Real-UDS test — meaningless on non-unix targets, where `bind` is the
+// fail-closed stub (see `lib.rs`).
+#![cfg(unix)]
+
 use std::time::Duration;
 
 use duduclaw_sysd::{SysdClient, SysdServerConfig, SysdRequest, bind, serve};
