@@ -147,6 +147,34 @@ impl GvuStagnationConfig {
     }
 }
 
+// ── Row classification ──────────────────────────────────────────────────
+
+/// Outcome label `gvu/aee/run.rs` records for a round that exited at the
+/// pre-flight stagnation check without attempting anything.
+pub const ESCALATED_OUTCOME: &str = "escalated";
+
+/// Description prefix `run.rs` stamps on those escalation records. Doubles
+/// as the legacy filter: rows written before the `escalated` label existed
+/// (≤ 2026-08-20) carry outcome `abandoned` with this prefix.
+pub const ESCALATION_DESCRIPTION_PREFIX: &str = "AEE escalated to a human";
+
+/// A monitor meta-record — the log echo of a stagnation escalation — not an
+/// evolution attempt. Counting these as attempts/rejections is what armed
+/// the 2026-08 trader-lead deadlock: each escalation record became the
+/// "repeated rejection" that escalated the next round, forever.
+fn is_escalation_meta(e: &ExperimentLogEntry) -> bool {
+    e.outcome == ESCALATED_OUTCOME || e.description.starts_with(ESCALATION_DESCRIPTION_PREFIX)
+}
+
+/// A real evolution attempt: the inner loop generated candidate(s) that then
+/// applied or failed. `skipped` rounds (cooldown, generator unavailable,
+/// "proposed no change — a legitimate empty answer") and escalation
+/// meta-records are neither attempts nor rejections, so no signal counts
+/// them (2026-08-20 拍板 B：卡片上的「嘗試」只算真的試過的輪).
+fn is_real_attempt(e: &ExperimentLogEntry) -> bool {
+    e.outcome != "skipped" && !is_escalation_meta(e)
+}
+
 // ── Signals & snapshot ──────────────────────────────────────────────────
 
 /// One fired stagnation signal, with the numbers that triggered it.
@@ -206,6 +234,14 @@ pub struct StagnationSnapshot {
     pub agent_id: String,
     pub signals: Vec<StagnationSignal>,
     pub checked_at: DateTime<Utc>,
+    /// Timestamp of the newest real non-applied attempt (see
+    /// [`is_real_attempt`]), if any. Together with `latest_escalation_at`
+    /// this lets the AEE pre-flight escalate once per rejection streak
+    /// instead of once per round: it only escalates when rejection evidence
+    /// NEWER than the last escalation exists (the deadlock exit).
+    pub latest_real_rejection_at: Option<DateTime<Utc>>,
+    /// Timestamp of the newest escalation meta-record, if any.
+    pub latest_escalation_at: Option<DateTime<Utc>>,
 }
 
 impl StagnationSnapshot {
@@ -242,8 +278,10 @@ impl StagnationSnapshot {
 // ── Pure detection logic ────────────────────────────────────────────────
 
 /// Signal 1: scan `experiments` (must be newest-first) from the front;
-/// count consecutive non-`applied` outcomes. Stops (returns `None`) as soon
-/// as an `applied` row is hit before reaching `threshold`.
+/// count consecutive non-`applied` outcomes among real attempts
+/// ([`is_real_attempt`] — `skipped` rounds and escalation meta-records are
+/// transparent: they neither count nor break the streak). Stops (returns
+/// `None`) as soon as an `applied` row is hit before reaching `threshold`.
 fn detect_consecutive_non_applied(
     experiments: &[ExperimentLogEntry],
     threshold: u32,
@@ -252,7 +290,7 @@ fn detect_consecutive_non_applied(
         return None;
     }
     let mut count: u32 = 0;
-    for e in experiments {
+    for e in experiments.iter().filter(|e| is_real_attempt(e)) {
         if e.outcome == "applied" {
             break;
         }
@@ -276,7 +314,7 @@ fn detect_zero_apply_window(
     let cutoff = Utc::now() - chrono::Duration::days(window_days as i64);
     let in_window: Vec<&ExperimentLogEntry> = experiments
         .iter()
-        .filter(|e| e.timestamp >= cutoff)
+        .filter(|e| e.timestamp >= cutoff && is_real_attempt(e))
         .collect();
     if in_window.is_empty() {
         return None;
@@ -312,8 +350,15 @@ fn detect_repeated_rejection_reason(
     }
     const PREFIX_CHARS: usize = 24;
     let mut counts: HashMap<String, u32> = HashMap::new();
+    // Filter BEFORE take_while/take: `skipped` rounds and escalation
+    // meta-records are not rejections — a "legitimate empty answer" repeated
+    // N times is a quiet agent, and counting the escalation records
+    // themselves made the signal self-feeding (2026-08 trader-lead deadlock:
+    // "AEE escalated to a human" is exactly 24 chars, so every escalation
+    // reinforced the very signal that caused it).
     for e in experiments
         .iter()
+        .filter(|e| is_real_attempt(e))
         .take_while(|e| e.outcome != "applied")
         .take(lookback as usize)
     {
@@ -348,6 +393,8 @@ pub fn stagnation_snapshot(
             agent_id: agent_id.to_string(),
             signals: Vec::new(),
             checked_at: Utc::now(),
+            latest_real_rejection_at: None,
+            latest_escalation_at: None,
         };
     }
     // One history fetch big enough to serve all three signals: signal 2
@@ -378,10 +425,24 @@ pub fn stagnation_snapshot(
         signals.push(s);
     }
 
+    // Streak bookkeeping for the AEE pre-flight's once-per-streak escalation
+    // (see the field docs on `StagnationSnapshot`). `experiments` is
+    // newest-first, so `find` returns the newest qualifying row.
+    let latest_real_rejection_at = experiments
+        .iter()
+        .find(|e| is_real_attempt(e) && e.outcome != "applied")
+        .map(|e| e.timestamp);
+    let latest_escalation_at = experiments
+        .iter()
+        .find(|e| is_escalation_meta(e))
+        .map(|e| e.timestamp);
+
     StagnationSnapshot {
         agent_id: agent_id.to_string(),
         signals,
         checked_at: Utc::now(),
+        latest_real_rejection_at,
+        latest_escalation_at,
     }
 }
 
@@ -790,6 +851,140 @@ mod tests {
         assert!(detect_repeated_rejection_reason(&experiments, 8, 3).is_none());
     }
 
+    // ── 2026-08-20 self-feeding escalation deadlock regression ──────
+
+    #[test]
+    fn skipped_rounds_fire_no_signal() {
+        // 10 identical "no change" rounds = a quiet agent, not a stuck one.
+        // Pre-fix, their shared description prefix tripped signal 3, which
+        // armed the AEE pre-flight escalation and started the deadlock.
+        let now = Utc::now();
+        let experiments: Vec<_> = (0..10)
+            .map(|i| {
+                entry(
+                    "a",
+                    "skipped",
+                    "AEE inner loop proposed no change (a legitimate empty answer)",
+                    now - chrono::Duration::hours(i),
+                )
+            })
+            .collect();
+        assert!(detect_consecutive_non_applied(&experiments, 5).is_none());
+        assert!(detect_zero_apply_window(&experiments, 14).is_none());
+        assert!(detect_repeated_rejection_reason(&experiments, 8, 3).is_none());
+    }
+
+    #[test]
+    fn escalation_meta_records_fire_no_signal() {
+        // The exact trader-lead incident shape: 7 escalation records (legacy
+        // label — outcome `abandoned` + the escalation description prefix)
+        // stacked on 3 quiet skipped rounds. All three signals fired
+        // pre-fix; none may fire now.
+        let now = Utc::now();
+        let mut experiments: Vec<_> = (0..7)
+            .map(|i| {
+                entry(
+                    "a",
+                    "abandoned",
+                    "AEE escalated to a human: the same rejection has fired 3 times",
+                    now - chrono::Duration::hours(i),
+                )
+            })
+            .collect();
+        experiments.extend((7..10).map(|i| {
+            entry(
+                "a",
+                "skipped",
+                "AEE inner loop proposed no change (a legitimate empty answer)",
+                now - chrono::Duration::hours(i),
+            )
+        }));
+        assert!(detect_consecutive_non_applied(&experiments, 5).is_none());
+        assert!(detect_zero_apply_window(&experiments, 14).is_none());
+        assert!(detect_repeated_rejection_reason(&experiments, 8, 3).is_none());
+    }
+
+    #[test]
+    fn new_escalated_outcome_is_meta_regardless_of_description() {
+        let now = Utc::now();
+        let experiments: Vec<_> = (0..5)
+            .map(|i| {
+                entry(
+                    "a",
+                    ESCALATED_OUTCOME,
+                    "some future wording",
+                    now - chrono::Duration::hours(i),
+                )
+            })
+            .collect();
+        assert!(detect_consecutive_non_applied(&experiments, 5).is_none());
+        assert!(detect_repeated_rejection_reason(&experiments, 8, 3).is_none());
+    }
+
+    #[test]
+    fn meta_rows_are_transparent_not_streak_breaking() {
+        // Real rejections interleaved with escalation meta rows: the meta
+        // rows neither count nor reset the consecutive streak, and the REAL
+        // repeated reason still surfaces through signal 3.
+        let now = Utc::now();
+        let mut experiments = Vec::new();
+        for i in 0..5i64 {
+            experiments.push(entry(
+                "a",
+                "abandoned",
+                "L1 blocked: forbidden phrase",
+                now - chrono::Duration::hours(2 * i),
+            ));
+            experiments.push(entry(
+                "a",
+                ESCALATED_OUTCOME,
+                "AEE escalated to a human: x",
+                now - chrono::Duration::hours(2 * i + 1),
+            ));
+        }
+        assert!(matches!(
+            detect_consecutive_non_applied(&experiments, 5),
+            Some(StagnationSignal::ConsecutiveNonApplied { count: 5, .. })
+        ));
+        assert!(matches!(
+            detect_repeated_rejection_reason(&experiments, 8, 3),
+            Some(StagnationSignal::RepeatedRejectionReason { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_streak_bookkeeping_via_real_db() {
+        // Newest row is an escalation meta-record, below it a real
+        // rejection: `latest_escalation_at >= latest_real_rejection_at`,
+        // which is exactly the state where the AEE pre-flight must NOT
+        // escalate again (once per streak).
+        let (_dir, db_path) = temp_db();
+        let vs = VersionStore::new(&db_path);
+        vs.record_experiment(&ExperimentLogEntry::new(
+            "agent-w",
+            3,
+            3,
+            StdDuration::from_secs(60),
+            "abandoned",
+            "L1 blocked: forbidden phrase",
+        ));
+        vs.record_experiment(&ExperimentLogEntry::new(
+            "agent-w",
+            0,
+            3,
+            StdDuration::from_secs(1),
+            ESCALATED_OUTCOME,
+            "AEE escalated to a human: L1 blocked repeated",
+        ));
+        let cfg = GvuStagnationConfig::default();
+        let snap = stagnation_snapshot(&vs, "agent-w", &cfg);
+        let (esc, rej) = (
+            snap.latest_escalation_at.expect("escalation recorded"),
+            snap.latest_real_rejection_at.expect("rejection recorded"),
+        );
+        assert!(esc >= rej, "escalation row is newer than the rejection");
+    }
+
     // ── Snapshot / fingerprint ───────────────────────────────────────
 
     #[test]
@@ -798,6 +993,8 @@ mod tests {
             agent_id: "a".to_string(),
             signals: vec![],
             checked_at: Utc::now(),
+            latest_real_rejection_at: None,
+            latest_escalation_at: None,
         };
         assert!(!snap.is_stagnant());
         assert_eq!(snap.fingerprint(), "none");
@@ -812,6 +1009,8 @@ mod tests {
                 threshold: 5,
             }],
             checked_at: Utc::now(),
+            latest_real_rejection_at: None,
+            latest_escalation_at: None,
         };
         let snap2 = StagnationSnapshot {
             agent_id: "a".to_string(),
@@ -820,6 +1019,8 @@ mod tests {
                 threshold: 5,
             }],
             checked_at: Utc::now(),
+            latest_real_rejection_at: None,
+            latest_escalation_at: None,
         };
         // Same signal *kind*, different count — fingerprint must not change,
         // otherwise a standing stagnation would re-alert every tick.
@@ -835,6 +1036,8 @@ mod tests {
                 threshold: 5,
             }],
             checked_at: Utc::now(),
+            latest_real_rejection_at: None,
+            latest_escalation_at: None,
         };
         let snap2 = StagnationSnapshot {
             agent_id: "a".to_string(),
@@ -843,6 +1046,8 @@ mod tests {
                 trigger_count: 3,
             }],
             checked_at: Utc::now(),
+            latest_real_rejection_at: None,
+            latest_escalation_at: None,
         };
         assert_ne!(snap1.fingerprint(), snap2.fingerprint());
     }

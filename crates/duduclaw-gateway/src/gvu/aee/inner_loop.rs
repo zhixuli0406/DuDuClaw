@@ -195,8 +195,24 @@ fn enforce_intent_ops(
 }
 
 /// Should the loop stop early and ask a human?
+///
+/// Once per rejection streak, not once per round: if we already escalated
+/// and no rejection evidence NEWER than that escalation has arrived, the
+/// round runs normally. Without this exit the escalation records themselves
+/// kept the loop parked forever — each pre-flight exit wrote a log row, the
+/// next pre-flight read it as ongoing stagnation, and no AEE round could
+/// ever run again (2026-08 trader-lead deadlock; the stagnation module doc
+/// says detection must never block a run — this check is the one deliberate
+/// exception, so it must not be able to feed itself).
 fn stagnation_escalation(stag: &Option<StagnationSnapshot>) -> Option<String> {
     let s = stag.as_ref()?;
+    if let (Some(escalated_at), Some(rejected_at)) =
+        (s.latest_escalation_at, s.latest_real_rejection_at)
+    {
+        if escalated_at >= rejected_at {
+            return None; // already escalated for this streak — let the round run
+        }
+    }
     s.signals.iter().find_map(|sig| match sig {
         StagnationSignal::RepeatedRejectionReason { occurrences, reason_prefix, .. }
             if *occurrences >= 2 =>

@@ -461,9 +461,17 @@ where
             InnerLoopExit::GeneratorUnavailable { error } => {
                 ("skipped", format!("AEE generator unavailable: {error}"))
             }
-            InnerLoopExit::EscalateToHuman { reason } => {
-                ("abandoned", format!("AEE escalated to a human: {reason}"))
-            }
+            InnerLoopExit::EscalateToHuman { reason } => (
+                // Distinct outcome label + shared prefix: the stagnation
+                // detector must be able to tell this meta-record apart from a
+                // real rejected attempt, or the record feeds the very signal
+                // that produced it (the 2026-08 self-feeding deadlock).
+                crate::gvu::stagnation::ESCALATED_OUTCOME,
+                format!(
+                    "{}: {reason}",
+                    crate::gvu::stagnation::ESCALATION_DESCRIPTION_PREFIX
+                ),
+            ),
             _ => (
                 "abandoned",
                 "AEE inner loop produced no gate-clearing candidate".to_string(),

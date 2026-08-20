@@ -257,10 +257,44 @@ async fn repeated_rejection_stagnation_escalates_before_spending_a_call() {
             reason_prefix: "forbidden pattern".into(),
         }],
         checked_at: Utc::now(),
+        // No prior escalation on record → the pre-flight may escalate.
+        latest_real_rejection_at: Some(Utc::now()),
+        latest_escalation_at: None,
     });
     let out = run_inner_loop(inp, &NullScorer, |_p| async { Ok("[]".to_string()) }).await;
     assert!(matches!(out.exit, InnerLoopExit::EscalateToHuman { .. }));
     assert_eq!(out.llm_calls, 0, "a known wall costs zero LLM calls");
+}
+
+/// Once-per-streak escalation (2026-08-20 deadlock fix): a snapshot whose
+/// newest escalation is at/after the newest real rejection means "we already
+/// asked a human about this streak" — the round must RUN, not park itself
+/// behind another escalation record forever.
+#[tokio::test]
+async fn already_escalated_streak_lets_the_round_run() {
+    let root = eval_root();
+    let none: Vec<String> = Vec::new();
+    let canaries: Vec<CanaryTest> = Vec::new();
+    let mut inp = input(root.path(), &none, &canaries, PlaybookSnapshot::default());
+    let t = Utc::now();
+    inp.stagnation = Some(StagnationSnapshot {
+        agent_id: "agent-aee".into(),
+        signals: vec![StagnationSignal::RepeatedRejectionReason {
+            occurrences: 4,
+            threshold: 3,
+            reason_prefix: "forbidden pattern".into(),
+        }],
+        checked_at: t,
+        latest_real_rejection_at: Some(t - chrono::Duration::hours(2)),
+        latest_escalation_at: Some(t - chrono::Duration::hours(1)),
+    });
+    let out = run_inner_loop(inp, &NullScorer, |_p| async { Ok("[]".to_string()) }).await;
+    assert!(
+        !matches!(out.exit, InnerLoopExit::EscalateToHuman { .. }),
+        "round must run instead of re-escalating: {:?}",
+        out.exit
+    );
+    assert!(out.llm_calls > 0, "the generator must actually be consulted");
 }
 
 #[tokio::test]
