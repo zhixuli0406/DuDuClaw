@@ -1037,6 +1037,7 @@ async fn poll_loop(
                 // Check voice mode
                 let session_key = format!("telegram:{chat_id}");
                 let voice_enabled = ctx.voice_sessions.lock().await.contains(&session_key);
+                let markup = conversation_markup(&session_id, &reply);
 
                 if voice_enabled {
                     let tts_provider = crate::tts::EdgeTtsProvider::new();
@@ -1053,17 +1054,17 @@ async fn poll_loop(
                                 // to leave the user with nothing. Send the full text
                                 // reply as a fallback so the turn is never silently lost.
                                 warn!(chat_id, "Telegram: sendAudio failed — falling back to text reply");
-                                send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons()), &ctx.home_dir).await;
+                                send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(markup.clone()), &ctx.home_dir).await;
                             }
                         }
                         Err(e) => {
                             warn!("TTS synthesis failed, falling back to text: {e}");
-                            send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons()), &ctx.home_dir).await;
+                            send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(markup.clone()), &ctx.home_dir).await;
                         }
                     }
                 } else {
                     // Send with inline keyboard buttons
-                    send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(channel_format::telegram_conversation_buttons()), &ctx.home_dir).await;
+                    send_reply_markdown(&client, &api_base, chat_id, &reply, thread_id, msg_id, Some(markup), &ctx.home_dir).await;
                 }
             }
         }
@@ -1116,6 +1117,41 @@ async fn handle_callback_query(
             answer_callback_query(client, api_base, &cb.id, &text).await;
             return;
         }
+    }
+
+    // Goal-intent confirmation buttons (P1) — a separate, deliberately
+    // UN-authorized codec from `decision_action` above (see
+    // `channel_format`'s "Goal-intent confirmation" module doc): consuming
+    // it needs no pressing-user identity, only the single-use nonce.
+    //
+    // The outcome (`accept-as-goal`'s reply especially, and `plan-first`'s
+    // narrative plan) can run well past Telegram's short callback-toast
+    // limit, so it is delivered as a proper follow-up message, not folded
+    // into the toast. `handle_gintent_button` may also call a live LLM
+    // (plan-first) — this whole branch runs in a detached spawn, unlike the
+    // decision-button branch above, because `handle_callback_query` itself
+    // is awaited inline in the update-polling loop (see the caller) and must
+    // not stall subsequent updates for however long that call takes.
+    if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(data) {
+        answer_callback_query(client, api_base, &cb.id, "").await;
+        let ctx = ctx.clone();
+        let client = client.clone();
+        let api_base = api_base.to_string();
+        tokio::spawn(async move {
+            let outcome = crate::goal_intent::handle_gintent_button(&ctx, choice, &nonce).await;
+            send_reply_markdown(
+                &client,
+                &api_base,
+                chat_id,
+                &outcome,
+                thread_id,
+                None,
+                Some(channel_format::telegram_conversation_buttons()),
+                &ctx.home_dir,
+            )
+            .await;
+        });
+        return;
     }
 
     let answer = match data {
@@ -1269,7 +1305,7 @@ async fn handle_command(
                 }
             };
             drop(typing_guard);
-            send_reply_markdown(client, api_base, chat_id, &reply, thread_id, None, Some(channel_format::telegram_conversation_buttons()), &ctx.home_dir).await;
+            send_reply_markdown(client, api_base, chat_id, &reply, thread_id, None, Some(conversation_markup(&session_id, &reply)), &ctx.home_dir).await;
         }
         "/status" => {
             let agent_info = {
@@ -1393,6 +1429,29 @@ async fn handle_command(
                 send_reply(client, api_base, chat_id, &reply, thread_id, None, None).await;
             }
             // Still-unknown slash command — ignore (legacy behavior).
+            //
+            // P1 goal-intent-router audit (DESIGN-goal-intent-router-2026-08.md
+            // §1): confirmed deliberate, kept as-is. Discord/Slack/LINE fall
+            // through an unrecognized `/foo` to the normal AI reply pipeline
+            // instead (see e.g. `discord.rs`'s `is_command`/`parse_command`
+            // block, which does NOT `return` on a `None` parse); Telegram has
+            // silently dropped it since this dispatcher's very first version
+            // (`d16d967`, v1.1.0) and every later refactor (including the
+            // `/takeover` carve-out right above) preserved that, never
+            // "fixed" it — a repeated, deliberate choice, not a regression.
+            // The likely reason: Telegram groups routinely host multiple
+            // bots sharing the same slash-command namespace, and this bot
+            // responding to every command meant for a DIFFERENT bot in the
+            // group would be noisy — silence is the safer default there,
+            // unlike Discord/Slack/LINE where slash commands are rarely
+            // shared across unrelated bots the same way. This has no effect
+            // on `/goal` itself (including this P1's `想一想`/`plan`
+            // sub-syntax): `/goal[@BotName] …` is always a RECOGNIZED
+            // command (`chat_commands::parse_command` returns `Some`), so it
+            // never reaches this branch — confirmed via the `cmd = raw_cmd.
+            // split('@').next()` stripping above, which already normalizes
+            // `/goal@BotName` to plain `/goal` before `parse_command` ever
+            // sees it.
         }
     }
 }
@@ -1851,6 +1910,23 @@ async fn edit_progress_message(
 /// and tags inflate the text, so chunk well under Telegram's 4096-char
 /// post-parse limit.
 const TG_MARKDOWN_CHUNK: usize = 3400;
+
+/// The inline keyboard to attach to an outgoing reply: the P1 goal-intent
+/// confirmation buttons when `reply` is the specific turn that just
+/// appended the confirmation menu (`goal_intent::reply_has_confirmation_
+/// menu`), otherwise the ordinary conversation-control buttons unchanged
+/// from P0. A raced/consumed nonce (`pending_button_nonce` returning `None`
+/// — e.g. a fast `1`/`2`/`3` text reply already beat this send) degrades to
+/// the ordinary buttons; the text menu embedded in `reply` still works fine
+/// on its own.
+fn conversation_markup(session_id: &str, reply: &str) -> serde_json::Value {
+    if crate::goal_intent::reply_has_confirmation_menu(reply) {
+        if let Some(nonce) = crate::goal_intent::pending_button_nonce(session_id) {
+            return channel_format::telegram_gintent_buttons(&nonce);
+        }
+    }
+    channel_format::telegram_conversation_buttons()
+}
 
 /// Send an AI reply: markdown → Telegram HTML (tables → <pre>, code fences
 /// → <pre><code>, headings → bold). Each chunk falls back to plain text if

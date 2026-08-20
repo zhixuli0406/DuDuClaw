@@ -1693,8 +1693,19 @@ async fn handle_message_create(
         }
     }
 
-    // Add conversation buttons to the LAST message of the reply.
-    let buttons = channel_format::discord_conversation_buttons(&session_id);
+    // Add conversation buttons to the LAST message of the reply — the P1
+    // goal-intent confirmation buttons when this is the specific reply that
+    // just appended the confirmation menu, otherwise the ordinary
+    // conversation-control buttons (unchanged from before P1). A raced/
+    // consumed nonce degrades to the ordinary buttons; the text menu
+    // embedded in `reply` still works fine on its own.
+    let buttons = if crate::goal_intent::reply_has_confirmation_menu(&reply) {
+        crate::goal_intent::pending_button_nonce(&session_id)
+            .map(|nonce| channel_format::discord_gintent_buttons(&nonce))
+            .unwrap_or_else(|| channel_format::discord_conversation_buttons(&session_id))
+    } else {
+        channel_format::discord_conversation_buttons(&session_id)
+    };
     if let Some(obj) = payloads.last_mut().and_then(|p| p.as_object_mut()) {
         obj.insert("components".to_string(), json!([buttons]));
     }
@@ -1971,7 +1982,7 @@ async fn handle_interaction(
         }
         // Message Component (button = component type 2, select menu = type 3)
         3 => {
-            handle_component_interaction(data, interaction_id, interaction_token, http, ctx).await;
+            handle_component_interaction(data, interaction_id, interaction_token, app_id, http, ctx).await;
         }
         _ => {
             debug!("Discord: unhandled interaction type {interaction_type}");
@@ -1988,6 +1999,7 @@ async fn handle_component_interaction(
     data: &Value,
     interaction_id: &str,
     interaction_token: &str,
+    app_id: &str,
     http: &reqwest::Client,
     ctx: &Arc<ReplyContext>,
 ) {
@@ -1997,6 +2009,31 @@ async fn handle_component_interaction(
     };
     let custom_id = cdata["custom_id"].as_str().unwrap_or("");
     let guild_id = data["guild_id"].as_str().unwrap_or("");
+
+    // Goal-intent confirmation buttons (P1) — a separate, deliberately
+    // UN-authorized codec from `decision_action` below (see
+    // `channel_format`'s "Goal-intent confirmation" module doc): wire format
+    // `gintent:<choice>:<nonce>`, NOT `duduclaw:…`, so this must be checked
+    // BEFORE the `ns != "duduclaw"` gate right below — that gate would
+    // otherwise silently swallow every gintent press before it's ever
+    // decoded (custom_id.splitn(3, ':').next() would be "gintent", not
+    // "duduclaw"). Consuming it needs no pressing-user identity, only the
+    // single-use nonce.
+    //
+    // Deferred response (type 5, "thinking…"): `handle_gintent_button`'s
+    // plan-first branch calls a live LLM (`goal_plan::generate_plan_first`),
+    // which can easily exceed Discord's 3-second interaction-ack window —
+    // same reason the `/ask` slash command defers (see `handle_slash_
+    // command`). The follow-up is a real (non-ephemeral) message so its
+    // content is visible to the whole channel, matching what typing `1`/`2`/
+    // `3` as plain text would have produced.
+    if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(custom_id) {
+        send_interaction_response(http, interaction_id, interaction_token, 5, None).await;
+        let outcome = crate::goal_intent::handle_gintent_button(ctx, choice, &nonce).await;
+        let payload = channel_format::to_discord_message(&outcome, None, false);
+        edit_interaction_response(http, app_id, interaction_token, &payload).await;
+        return;
+    }
 
     let mut parts = custom_id.splitn(3, ':');
     let ns = parts.next().unwrap_or("");

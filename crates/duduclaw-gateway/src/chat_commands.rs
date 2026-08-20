@@ -87,12 +87,19 @@ pub enum GoalCommand {
     /// `邊界:<text>` / `risk:<text>` (per-goal risk boundary; absent ⇒ the
     /// baseline boundary is applied at injection time, same as the dashboard
     /// form). Segments are position-independent, mirroring `outcome:`.
+    ///
+    /// P1 (DESIGN-goal-intent-router-2026-08.md §4): a `||`-delimited segment
+    /// that is EXACTLY `想一想` or `plan` (no value, position-independent —
+    /// same parsing shape as `時限:`/`邊界:`) sets `plan_first = true`,
+    /// bringing the dashboard's I-1c "想一想" execution mode to the chat
+    /// `/goal` command — see `handle_goal_create`.
     Create {
         description: String,
         acceptance_criteria: Option<String>,
         outcome: Option<String>,
         duration_hours: Option<f64>,
         risk_boundary: Option<String>,
+        plan_first: bool,
     },
 }
 
@@ -122,6 +129,12 @@ fn parse_goal_args(args: Option<&str>) -> GoalCommand {
     // `<desc> [|| <criteria>]` semantics byte-identically.
     let mut duration_hours: Option<f64> = None;
     let mut risk_boundary: Option<String> = None;
+    // P1: a standalone (no-value) `||` segment that is exactly "想一想" or
+    // "plan" (position-independent, same shape as the prefixed segments
+    // above) opts into I-1c plan-first mode. Unlike `時限:`/`邊界:` this has
+    // no `key:value` prefix — it IS the whole segment — so it is matched by
+    // exact equality, not `strip_any_prefix`.
+    let mut plan_first = false;
     let mut plain: Vec<&str> = Vec::new();
     for seg in head.split("||") {
         let seg = seg.trim();
@@ -137,6 +150,8 @@ fn parse_goal_args(args: Option<&str>) -> GoalCommand {
             if !v.is_empty() {
                 risk_boundary = Some(v.to_string());
             }
+        } else if seg == "想一想" || seg.eq_ignore_ascii_case("plan") {
+            plan_first = true;
         } else if !seg.is_empty() {
             plain.push(seg);
         }
@@ -150,6 +165,7 @@ fn parse_goal_args(args: Option<&str>) -> GoalCommand {
         outcome,
         duration_hours,
         risk_boundary,
+        plan_first,
     }
 }
 
@@ -814,7 +830,7 @@ async fn handle_rollback(ctx: &ReplyContext, session_id: &str) -> String {
 /// `source_channel` / `source_chat_id` so goal-loop progress and needs_human
 /// notices push back to the conversation that launched the goal (falling back to
 /// the agent's `[proactive]` channel when a task has no source).
-fn source_from_session(session_id: &str) -> (String, String) {
+pub(crate) fn source_from_session(session_id: &str) -> (String, String) {
     let parts: Vec<&str> = session_id.splitn(3, ':').collect();
     match parts.as_slice() {
         [] | [_] => (String::new(), session_id.to_string()),
@@ -848,6 +864,7 @@ fn goal_usage_text() -> String {
      • `outcome:json:<JSON Schema>` — 校驗最終回覆裡的 ```json 區塊（object/array/string/number/boolean）\n\
      • `outcome:files:<glob,glob>` — 斷言工作目錄下有對應產出檔（例 `outcome:files:report.docx`）\n\
      `/goal <目標> || 時限:36h || 邊界:<紅線>` — 任一段可加時限（`36h`／`3天`，逾期回到你手上）與風險邊界（沒給就套基本款：法規／資安／風控／人審紅線）\n\
+     `/goal <目標> || 想一想` — 先請 AI 員工產出一份執行計畫給你核准，核准後才開始執行（不會自動開工；也可寫 `plan`，任一段皆可）\n\
      `/goal status` — 查看進行中的目標任務\n\n\
      範例：`/goal 整理這批客戶資料成月報並寄出 || 報表含每月營收圖表 || 時限:2天 || outcome:files:report.docx`"
         .to_string()
@@ -885,6 +902,7 @@ async fn handle_goal(
             outcome,
             duration_hours,
             risk_boundary,
+            plan_first,
         } => {
             handle_goal_create(
                 ctx,
@@ -895,6 +913,7 @@ async fn handle_goal(
                 outcome.as_deref(),
                 *duration_hours,
                 risk_boundary.as_deref(),
+                *plan_first,
             )
             .await
         }
@@ -903,7 +922,22 @@ async fn handle_goal(
 
 /// Create a `goal_mode` task assigned to the current conversation's agent and
 /// stamp its source conversation for progress write-back.
-async fn handle_goal_create(
+///
+/// `pub(crate)`: the channel-side goal intent router (`goal_intent.rs`,
+/// DESIGN-goal-intent-router-2026-08.md) reuses this exact path for its "1"
+/// (立為目標任務) confirmation — same acceptance-criteria defaulting, same
+/// baseline freeze, same four-element guidance, same optional decomposition
+/// — so confirming a suggestion is byte-identical in effect to typing
+/// `/goal <description>` by hand (always with `plan_first = false`; "2" 想一想
+/// goes through the separate `goal_intent::accept_as_plan_first` path).
+///
+/// `plan_first` (P1) brings the dashboard's I-1c "想一想" mode to this path:
+/// same `goal_plan::generate_plan_first` + `apply_plan_first_result` pair as
+/// `handlers::handle_tasks_goal_create`'s `plan_first` branch, so a chat
+/// `/goal <desc> || 想一想` parks `needs_human` with a narrative plan awaiting
+/// approval instead of opening straight to `todo` — see the branch below.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_goal_create(
     ctx: &ReplyContext,
     session_id: &str,
     agent_id: &str,
@@ -912,6 +946,7 @@ async fn handle_goal_create(
     outcome: Option<&str>,
     duration_hours: Option<f64>,
     risk_boundary: Option<&str>,
+    plan_first: bool,
 ) -> String {
     let store = match crate::task_store::TaskStore::open(&ctx.home_dir) {
         Ok(s) => s,
@@ -944,10 +979,14 @@ async fn handle_goal_create(
     // applies to one final deliverable, not to each decomposed subtask.
     // Also skipped when a per-goal deadline or risk boundary is set: the
     // contract applies to one task, and decomposed subtasks would not
-    // inherit it (same reasoning as the outcome-spec skip above).
+    // inherit it (same reasoning as the outcome-spec skip above). P1: also
+    // skipped when `plan_first` is set — 想一想 is a single-task narrative
+    // plan for human approval, not a machine-parsed DAG (same independence
+    // the dashboard's I-1c doc comment on `handle_tasks_goal_create` notes).
     if outcome_tag.is_none()
         && duration_hours.is_none()
         && risk_boundary.is_none()
+        && !plan_first
         && crate::goal_plan::planner_enabled(&ctx.home_dir)
     {
         if let Some(reply) = try_decompose_goal(
@@ -1015,6 +1054,43 @@ async fn handle_goal_create(
     }
     task.source_chat_id = Some(chat_id);
     task.source_discord_guild_id = source_discord_guild_id;
+
+    // P1 "想一想": generate a narrative plan and park the task `needs_human`
+    // instead of `todo` — same precedent as the decomposer call above (runs
+    // synchronously here, before `insert_task`, so no dispatch-engine round
+    // — not even a restricted one — ever starts before a human approves).
+    // Fail-closed: a planner failure never falls through to the normal
+    // `todo` path — `apply_plan_first_result`'s `Err` branch still parks
+    // `needs_human` under the `infra` pause class for a human to retry or
+    // cancel. Mirrors `handlers::handle_tasks_goal_create`'s `plan_first`
+    // branch exactly (same two functions, same field semantics).
+    if plan_first {
+        let criteria_for_plan = task.acceptance_criteria.as_deref().unwrap_or("");
+        let plan_result =
+            crate::goal_plan::generate_plan_first(&ctx.home_dir, &task.description, criteria_for_plan)
+                .await;
+        if let Err(e) = &plan_result {
+            warn!(
+                agent = %agent_id,
+                error = %e,
+                "goal: plan-first generation failed — parking needs_human (infra class) instead of auto-starting"
+            );
+        }
+        crate::goal_plan::apply_plan_first_result(&mut task, plan_result);
+
+        if let Err(e) = store.insert_task(&task).await {
+            warn!(error = %e, "goal: insert plan-first task failed");
+            return format!("⚠️ 無法建立目標任務：{e}");
+        }
+        return match &task.plan_pending {
+            Some(plan) => format!(
+                "🧭 已建立目標任務 #{short}，並產生執行計畫，等你核准後才會開始執行：\n\n{plan}\n\n請到 /goals 儀表板核准或修改。"
+            ),
+            None => format!(
+                "⚠️ 已建立目標任務 #{short}，但計畫生成失敗，已標記為待你決定，請到 /goals 儀表板處理。"
+            ),
+        };
+    }
 
     if let Err(e) = store.insert_task(&task).await {
         warn!(error = %e, "goal: insert task failed");
@@ -1611,6 +1687,7 @@ mod tests {
                 outcome: None,
                 duration_hours: None,
                 risk_boundary: None,
+                plan_first: false,
             }))
         );
 
@@ -1623,6 +1700,7 @@ mod tests {
                 outcome: None,
                 duration_hours: None,
                 risk_boundary: None,
+                plan_first: false,
             }))
         );
 
@@ -1635,6 +1713,7 @@ mod tests {
                 outcome: None,
                 duration_hours: None,
                 risk_boundary: None,
+                plan_first: false,
             }))
         );
 
@@ -1650,6 +1729,7 @@ mod tests {
                 outcome: Some("files:report.docx".to_string()),
                 duration_hours: None,
                 risk_boundary: None,
+                plan_first: false,
             }))
         );
 
@@ -1662,6 +1742,7 @@ mod tests {
                 outcome: Some("text".to_string()),
                 duration_hours: None,
                 risk_boundary: None,
+                plan_first: false,
             }))
         );
 
@@ -1677,6 +1758,7 @@ mod tests {
                 outcome: Some(r#"json:{"type":"object","required":["a||b"]}"#.to_string()),
                 duration_hours: None,
                 risk_boundary: None,
+                plan_first: false,
             }))
         );
 
@@ -1689,6 +1771,7 @@ mod tests {
                 outcome: None,
                 duration_hours: Some(36.0),
                 risk_boundary: Some("不得寄給客戶草稿".to_string()),
+                plan_first: false,
             }))
         );
         // Days multiply ×24; ASCII `duration:`/`risk:` spellings accepted.
@@ -1700,8 +1783,86 @@ mod tests {
                 outcome: None,
                 duration_hours: Some(48.0),
                 risk_boundary: Some("no external email".to_string()),
+                plan_first: false,
             }))
         );
+        // P1: standalone `想一想` segment opts into plan-first mode.
+        assert_eq!(
+            parse_command("/goal 做月報 || 想一想", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: None,
+                outcome: None,
+                duration_hours: None,
+                risk_boundary: None,
+                plan_first: true,
+            }))
+        );
+        // Co-exists with an explicit acceptance-criteria segment.
+        assert_eq!(
+            parse_command("/goal 做月報 || 含營收圖表並寄出 || 想一想", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: Some("含營收圖表並寄出".to_string()),
+                outcome: None,
+                duration_hours: None,
+                risk_boundary: None,
+                plan_first: true,
+            }))
+        );
+        // ASCII `plan` spelling, case-insensitive.
+        assert_eq!(
+            parse_command("/goal 做月報 || PLAN", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: None,
+                outcome: None,
+                duration_hours: None,
+                risk_boundary: None,
+                plan_first: true,
+            }))
+        );
+        // Position-independent: the plan-first token may appear BEFORE the
+        // description segment — the first remaining plain segment still
+        // becomes the description, matching `時限:`/`邊界:`'s own
+        // position-independence.
+        assert_eq!(
+            parse_command("/goal 想一想 || 做月報 || 含營收圖表", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: Some("含營收圖表".to_string()),
+                outcome: None,
+                duration_hours: None,
+                risk_boundary: None,
+                plan_first: true,
+            }))
+        );
+        // Co-exists with duration/boundary segments too.
+        assert_eq!(
+            parse_command("/goal 做月報 || 時限:36h || 想一想 || 邊界:不得寄給客戶草稿", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "做月報".to_string(),
+                acceptance_criteria: None,
+                outcome: None,
+                duration_hours: Some(36.0),
+                risk_boundary: Some("不得寄給客戶草稿".to_string()),
+                plan_first: true,
+            }))
+        );
+        // A description that merely CONTAINS "想一想" (not a standalone
+        // segment) is plain text, not the plan-first token.
+        assert_eq!(
+            parse_command("/goal 想一想這個活動怎麼辦比較好", None),
+            Some(ChatCommand::Goal(GoalCommand::Create {
+                description: "想一想這個活動怎麼辦比較好".to_string(),
+                acceptance_criteria: None,
+                outcome: None,
+                duration_hours: None,
+                risk_boundary: None,
+                plan_first: false,
+            }))
+        );
+
         // Malformed / out-of-range duration fails closed to usage, never
         // silently becoming part of the description.
         assert_eq!(
@@ -2435,6 +2596,7 @@ mod goal_contract_tests {
             None,
             None,
             None,
+            false,
         )
         .await;
         assert!(msg.contains("目標："), "{msg}");
@@ -2461,6 +2623,7 @@ mod goal_contract_tests {
             None,
             None,
             None,
+            false,
         )
         .await;
         assert!(
@@ -2482,6 +2645,7 @@ mod goal_contract_tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 
@@ -2513,6 +2677,7 @@ mod goal_contract_tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 

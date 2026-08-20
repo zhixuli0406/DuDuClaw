@@ -18,12 +18,19 @@ pub mod limits {
 /// (inbound direction). CJK-safe truncation via `truncate_bytes`.
 pub const QUOTED_CONTEXT_MAX_BYTES: usize = 2000;
 
+/// Opening delimiter of [`format_quoted_context`]'s block — exposed so other
+/// modules (e.g. `goal_intent::is_quoted_majority`) can detect a quoted block
+/// without duplicating the literal.
+pub const QUOTED_OPEN_MARKER: &str = "〔引用訊息｜";
+/// Closing delimiter of [`format_quoted_context`]'s block.
+pub const QUOTED_CLOSE_MARKER: &str = "〔引用結束〕";
+
 /// Inbound quoted-reply block: when a user replies to (quotes) an earlier
 /// message, every channel prepends this same block ahead of the user's new
 /// text so the agent sees what was quoted. One format across all channels.
 pub fn format_quoted_context(who: &str, excerpt: &str) -> String {
     let excerpt = duduclaw_core::truncate_bytes(excerpt.trim(), QUOTED_CONTEXT_MAX_BYTES);
-    format!("〔引用訊息｜{who}〕\n{excerpt}\n〔引用結束〕")
+    format!("{QUOTED_OPEN_MARKER}{who}〕\n{excerpt}\n{QUOTED_CLOSE_MARKER}")
 }
 
 /// Label for a quoted message the bot itself sent — the primary reply-quote
@@ -1083,6 +1090,78 @@ pub fn line_autopilot_pause_quick_reply(rule_id: &str) -> Value {
     })
 }
 
+// ── Goal-intent confirmation (P1) — accept as goal / plan first / dismiss ──
+//
+// A separate, deliberately UN-authorized codec from `decision_action`'s
+// `duduclaw:decide:` family above (see `goal_intent`'s module doc): a
+// goal-intent suggestion is a low-stakes clarification anyone in the
+// conversation may answer, the same bar the text confirmation path already
+// applies. Wire format `gintent:<choice>:<nonce>`, encoded/decoded by
+// `goal_intent::{encode_gintent_action, parse_gintent_action}` — this module
+// only owns the per-platform button shape, the same split every other
+// button family in this file uses.
+
+use crate::goal_intent::{encode_gintent_action, GIntentChoice};
+
+/// Telegram inline keyboard: accept as goal / plan first / dismiss to chat.
+pub fn telegram_gintent_buttons(nonce: &str) -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "🎯 立為目標", "callback_data": encode_gintent_action(GIntentChoice::AcceptGoal, nonce) },
+            { "text": "🧭 想一想", "callback_data": encode_gintent_action(GIntentChoice::PlanFirst, nonce) },
+            { "text": "💬 只是聊聊", "callback_data": encode_gintent_action(GIntentChoice::DismissChat, nonce) }
+        ]]
+    })
+}
+
+/// Discord action row: accept as goal / plan first / dismiss to chat.
+pub fn discord_gintent_buttons(nonce: &str) -> Value {
+    json!({
+        "type": 1,
+        "components": [
+            { "type": 2, "style": 3, "label": "🎯 立為目標",
+              "custom_id": encode_gintent_action(GIntentChoice::AcceptGoal, nonce) },
+            { "type": 2, "style": 2, "label": "🧭 想一想",
+              "custom_id": encode_gintent_action(GIntentChoice::PlanFirst, nonce) },
+            { "type": 2, "style": 2, "label": "💬 只是聊聊",
+              "custom_id": encode_gintent_action(GIntentChoice::DismissChat, nonce) }
+        ]
+    })
+}
+
+/// Slack actions block: accept as goal / plan first / dismiss to chat.
+pub fn slack_gintent_buttons(nonce: &str) -> Value {
+    json!({
+        "type": "actions",
+        "elements": [
+            { "type": "button", "style": "primary",
+              "text": { "type": "plain_text", "text": "🎯 立為目標" },
+              "action_id": encode_gintent_action(GIntentChoice::AcceptGoal, nonce), "value": nonce },
+            { "type": "button", "text": { "type": "plain_text", "text": "🧭 想一想" },
+              "action_id": encode_gintent_action(GIntentChoice::PlanFirst, nonce), "value": nonce },
+            { "type": "button", "text": { "type": "plain_text", "text": "💬 只是聊聊" },
+              "action_id": encode_gintent_action(GIntentChoice::DismissChat, nonce), "value": nonce }
+        ]
+    })
+}
+
+/// LINE quickReply: accept as goal / plan first / dismiss to chat.
+pub fn line_gintent_quick_reply(nonce: &str) -> Value {
+    json!({
+        "items": [
+            { "type": "action", "action": { "type": "postback", "label": "🎯 立為目標",
+                "data": encode_gintent_action(GIntentChoice::AcceptGoal, nonce),
+                "displayText": "立為目標任務" } },
+            { "type": "action", "action": { "type": "postback", "label": "🧭 想一想",
+                "data": encode_gintent_action(GIntentChoice::PlanFirst, nonce),
+                "displayText": "先給我計畫" } },
+            { "type": "action", "action": { "type": "postback", "label": "💬 只是聊聊",
+                "data": encode_gintent_action(GIntentChoice::DismissChat, nonce),
+                "displayText": "繼續聊天" } }
+        ]
+    })
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1591,5 +1670,57 @@ mod tests {
         let apv = telegram_broker_approval_buttons("a1");
         assert_eq!(apv["inline_keyboard"][0][0]["text"], "✅ 同意");
         assert_eq!(apv["inline_keyboard"][0][1]["text"], "❌ 拒絕");
+    }
+
+    // ── P1: goal-intent confirmation buttons ────────────────────────
+
+    #[test]
+    fn gintent_buttons_carry_the_gintent_wire_format_not_the_decision_codec() {
+        use crate::goal_intent::parse_gintent_action;
+
+        let tg = telegram_gintent_buttons("nonce-1");
+        let row = tg["inline_keyboard"][0].as_array().unwrap();
+        assert_eq!(row.len(), 3);
+        let (choice, nonce) = parse_gintent_action(row[0]["callback_data"].as_str().unwrap()).unwrap();
+        assert_eq!(choice, GIntentChoice::AcceptGoal);
+        assert_eq!(nonce, "nonce-1");
+        // Never accidentally routed through the unified decision codec —
+        // that would silently subject it to `authorize_press`'s role gate.
+        assert!(crate::decision_action::parse(row[0]["callback_data"].as_str().unwrap()).is_none());
+
+        let dc = discord_gintent_buttons("nonce-2");
+        let comps = dc["components"].as_array().unwrap();
+        assert_eq!(comps.len(), 3);
+        let (choice, nonce) = parse_gintent_action(comps[1]["custom_id"].as_str().unwrap()).unwrap();
+        assert_eq!(choice, GIntentChoice::PlanFirst);
+        assert_eq!(nonce, "nonce-2");
+
+        let sl = slack_gintent_buttons("nonce-3");
+        let elements = sl["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3);
+        let (choice, nonce) = parse_gintent_action(elements[2]["action_id"].as_str().unwrap()).unwrap();
+        assert_eq!(choice, GIntentChoice::DismissChat);
+        assert_eq!(nonce, "nonce-3");
+        assert_eq!(elements[2]["value"], "nonce-3");
+
+        let ln = line_gintent_quick_reply("nonce-4");
+        let items = ln["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        let (choice, nonce) =
+            parse_gintent_action(items[0]["action"]["data"].as_str().unwrap()).unwrap();
+        assert_eq!(choice, GIntentChoice::AcceptGoal);
+        assert_eq!(nonce, "nonce-4");
+    }
+
+    #[test]
+    fn gintent_buttons_fit_every_platform_payload_cap() {
+        // Telegram is the tightest (64-byte callback_data); a v4 UUID nonce
+        // (36 chars) is what every real nonce looks like.
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let tg = telegram_gintent_buttons(&nonce);
+        for btn in tg["inline_keyboard"][0].as_array().unwrap() {
+            let data = btn["callback_data"].as_str().unwrap();
+            assert!(data.len() <= 64, "{data} is {} bytes", data.len());
+        }
     }
 }

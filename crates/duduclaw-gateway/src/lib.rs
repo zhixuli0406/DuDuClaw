@@ -384,3 +384,8 @@ pub mod pending_agent_notice;
 //        §3 「自主研究」) — per-agent nightly self-study goal creation when
 //        today produced a belief miss ──
 pub mod self_study;
+// ── P0: channel-side goal intent router (DESIGN-goal-intent-router-2026-08.md)
+//        — upgrades plain-language delegation typed into any of the 11 chat
+//        channels into a confirmable goal-task suggestion, without a new
+//        cloud LLM call ──
+pub mod goal_intent;
