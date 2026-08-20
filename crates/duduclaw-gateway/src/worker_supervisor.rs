@@ -220,8 +220,13 @@ async fn spawn_child(
     // those env vars the spawned worker (and the CLI it spawns) will
     // fail to authenticate and the pool will churn rebuilding
     // doomed sessions. `HOME` covers Unix only.
+    //
+    // 2026-08-20: converged onto the shared platform const — this used
+    // to be a hand copy of four names that silently missed the Windows
+    // system set (`SystemRoot` & co.) when the field incident added it,
+    // the exact drift a hand copy invites.
     #[cfg(windows)]
-    for key in ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "COMPUTERNAME"] {
+    for key in duduclaw_core::spawn_env::AGENT_CLI_ENV_ALLOWLIST_WINDOWS {
         if let Ok(v) = std::env::var(key) {
             cmd.env(key, v);
         }
