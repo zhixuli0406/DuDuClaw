@@ -1363,6 +1363,105 @@ export interface BeliefStats {
   per_subject: BeliefSubjectStat[];
 }
 
+// ── Security Audit (secaudit dashboard, DESIGN-code-security-audit-2026-08
+// §3.1) — reports written by `duduclaw secaudit --save`. Field names mirror
+// `crates/duduclaw-cli/src/secaudit/schema.rs`'s snake_case JSON contract
+// verbatim; the gateway passes the report through as JSON rather than
+// re-typing it (see `secaudit_reports.rs`'s doc comment), so these
+// interfaces are the dashboard's own mirror of that same contract. */
+
+/** critical | high | medium | low | info counts (`Summary.by_severity`). */
+export interface SecauditSeverityCounts {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  info: number;
+}
+
+/** One row of `secaudit.reports` — shallow summary only, tolerant of a
+ *  broken file (`parse_error` set, every other field `null`/absent). */
+export interface SecauditReportRow {
+  file: string;
+  /** RFC3339, filesystem mtime. */
+  mtime: string;
+  repo: string | null;
+  started_at: string | null;
+  /** quick | deep */
+  profile_mode: string | null;
+  total_findings: number | null;
+  by_severity: SecauditSeverityCounts | null;
+  engines_run_count: number | null;
+  engines_missing_count: number | null;
+  parse_error: string | null;
+}
+
+/** One piece of a finding's evidence chain
+ *  (static_hit | ai_analysis | adversarial_review | poc_transcript). */
+export interface SecauditEvidenceItem {
+  kind: string;
+  source: string;
+  detail: string;
+  recorded_at: string;
+}
+
+/** candidate | confirmed | refuted | needs_human | suppressed. Only the
+ *  first three of "confirmed/refuted/suppressed" are operator-writable via
+ *  `secaudit.finding_status`. */
+export type SecauditFindingStatus = 'confirmed' | 'suppressed' | 'refuted';
+
+export interface SecauditFinding {
+  id: string;
+  source_engine: string;
+  /** secret | static_analysis | dependency_vulnerability | other */
+  kind: string;
+  /** critical | high | medium | low | info */
+  severity: string;
+  title: string;
+  file: string;
+  line: number | null;
+  snippet: string;
+  rule_id: string;
+  evidence: SecauditEvidenceItem[];
+  /** candidate | confirmed | refuted | needs_human | suppressed */
+  status: string;
+}
+
+export interface SecauditEngineRun {
+  engine: string;
+  findings_count: number;
+  duration_ms: number;
+  parse_error: string | null;
+  timed_out: boolean;
+}
+
+export interface SecauditEngineMissing {
+  engine: string;
+  reason: string;
+}
+
+/** Full `AuditReport` JSON (`secaudit.report`). */
+export interface SecauditReport {
+  repo: string;
+  started_at: string;
+  profile: { mode: string; intake: unknown | null };
+  engines_run: SecauditEngineRun[];
+  engines_missing: SecauditEngineMissing[];
+  findings: SecauditFinding[];
+  summary: {
+    total_findings: number;
+    by_severity: SecauditSeverityCounts;
+    engines_run_count: number;
+    engines_missing_count: number;
+    /** AI deep-audit + PoC counters (§3.2 steps 3-5) — additive fields, may
+     *  be absent on a report written before those waves shipped. */
+    ai_audit_candidates?: number;
+    ai_audit_refuted?: number;
+    ai_audit_needs_human?: number;
+    poc_ran?: number;
+  };
+}
+
 /** One recorded file effect from a task's rounds (`tasks.changes`).
  *  `path` carries the touched file — except for `op: 'shell'`, where it is the
  *  command itself (we never guess which files a shell line touched). */
@@ -4696,6 +4795,24 @@ export const api = {
       }>,
     summary: (agentId: string) =>
       client.call('belief.summary', { agent_id: agentId }) as Promise<{ stats: BeliefStats }>,
+  },
+  /** Security audit dashboard (DESIGN-code-security-audit-2026-08 §3.1) —
+   *  reports written by `duduclaw secaudit --save`. Manager+ gated
+   *  server-side (`require_manager!()`), same bar as `forward`/`belief`. */
+  secaudit: {
+    reports: () =>
+      client.call('secaudit.reports') as Promise<{ reports: SecauditReportRow[] }>,
+    report: (file: string) =>
+      client.call('secaudit.report', { file }) as Promise<{ report: SecauditReport }>,
+    /** Operator confirm/suppress/refute decision on one finding. Returns the
+     *  server's updated finding object so the caller can reconcile its
+     *  optimistic update rather than assume the write matched intent. */
+    findingStatus: (file: string, findingId: string, status: SecauditFindingStatus) =>
+      client.call('secaudit.finding_status', {
+        file,
+        finding_id: findingId,
+        status,
+      }) as Promise<{ success: boolean; file: string; finding: SecauditFinding }>,
   },
   evolution: {
     status: () =>

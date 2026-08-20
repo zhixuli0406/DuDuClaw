@@ -58,6 +58,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 46 | [Belief Loop](46-belief-loop.md) | State a prediction about the outside world, get scored against reality, see your own calibration next time |
 | 47 | [Agent Mail](47-agent-mail.md) | Per-agent inbox for incoming mail; nothing goes out until a person confirms it |
 | 48 | [Goal Intent Router](48-goal-intent-router.md) | Chat channels notice task delegation and offer to create a goal; never auto-created |
+| 49 | [Code Security Audit](49-code-security-audit.md) | `duduclaw secaudit`: static scanners + AI deep audit + adversarial review + sandboxed PoC |
 
 ---
 

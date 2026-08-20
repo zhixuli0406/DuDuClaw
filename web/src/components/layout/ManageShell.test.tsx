@@ -165,8 +165,11 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
       en['manage.billing'],
       en['manage.license'],
       en['manage.distributors'],
-      // 存取與安全 — 低頻・高重要.
+      // 存取與安全 — 低頻・高重要. 安全審計 (secaudit dashboard) sits right
+      // after 安全 — same cluster, manager+ bar (DESIGN-code-security-audit-
+      // 2026-08 §3.1).
       en['manage.security'],
+      en['manage.secaudit'],
       en['manage.governance'],
       en['manage.users'],
       en['manage.departments'],
