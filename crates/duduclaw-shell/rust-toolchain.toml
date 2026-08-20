@@ -1,0 +1,7 @@
+[toolchain]
+# Must match `duduclaw-native-gui/rust-toolchain.toml` — this crate pulls
+# the same gpui rev, which needs the same post-1.94 rustc feature
+# (`std::hint::cold_path`, `crates/gpui/src/profiler.rs`). See that file's
+# comment for the full story; bump both together if the gpui rev ever moves.
+channel = "1.97.1"
+profile = "minimal"
