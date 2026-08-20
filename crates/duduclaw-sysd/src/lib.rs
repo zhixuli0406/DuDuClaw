@@ -27,9 +27,51 @@
 //! - [`client`] — the gateway-side (or test-side) caller SDK.
 
 pub mod client;
+#[cfg(unix)]
 pub mod dispatch;
 pub mod protocol;
+#[cfg(unix)]
 pub mod server;
+
+/// Non-unix stand-in for [`server`] — `duduclaw-sysd` is a Linux-appliance
+/// root daemon (UDS + `SO_PEERCRED`), so on other targets the server surface
+/// compiles to a fail-closed stub: `bind` refuses at startup with a clear
+/// error, never a silent no-op. Exists so workspace-wide builds (the Windows
+/// release CI matrix — the v1.62.0 tag build broke here) keep compiling,
+/// matching `main.rs`'s already-stated "keep this crate compiling
+/// everywhere" intent.
+#[cfg(not(unix))]
+pub mod server {
+    use std::io;
+    use std::path::Path;
+
+    #[derive(Debug, Clone)]
+    pub struct SysdServerConfig {
+        pub socket_path: std::path::PathBuf,
+        pub allowed_uid: Option<u32>,
+    }
+
+    /// Never constructible — [`bind`] always errors on non-unix targets.
+    pub struct SysdListener(());
+
+    pub fn bind(_socket_path: &Path) -> io::Result<SysdListener> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "duduclaw-sysd requires Unix domain sockets — it only runs on the Linux appliance image",
+        ))
+    }
+
+    pub async fn serve(
+        _listener: SysdListener,
+        _config: SysdServerConfig,
+        _shutdown: impl std::future::Future<Output = ()>,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "duduclaw-sysd requires Unix domain sockets — it only runs on the Linux appliance image",
+        ))
+    }
+}
 
 pub use client::{SysdClient, SysdClientError};
 pub use protocol::{
