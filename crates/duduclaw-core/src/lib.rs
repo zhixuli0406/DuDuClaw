@@ -876,9 +876,17 @@ mod resolve_bin_tests {
     fn pro_exe_prefers_sibling_open_source_binary() {
         let dir = std::env::temp_dir().join(format!("ddc-bin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pro = dir.join("duduclaw-pro");
+        // Platform-correct fixture names: the resolver probes for the
+        // sibling as `duduclaw.exe` on Windows (matching how the binaries
+        // are actually shipped there) — extensionless fixtures made this
+        // test fail on the Windows CI matrix while production was correct.
+        #[cfg(windows)]
+        let (pro_name, oss_name) = ("duduclaw-pro.exe", "duduclaw.exe");
+        #[cfg(not(windows))]
+        let (pro_name, oss_name) = ("duduclaw-pro", "duduclaw");
+        let pro = dir.join(pro_name);
         std::fs::write(&pro, b"x").unwrap();
-        let oss = dir.join("duduclaw");
+        let oss = dir.join(oss_name);
         std::fs::write(&oss, b"x").unwrap();
         assert_eq!(resolve_duduclaw_bin_from_exe(&pro), oss);
         // Open-source exe keeps itself.
