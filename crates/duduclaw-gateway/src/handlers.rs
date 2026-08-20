@@ -12600,8 +12600,12 @@ impl MethodHandler {
     /// Prefers `agents/<id>/state/memory.db`, then `agents/<id>/memory.db`,
     /// then the shared `<home>/memory.db` — the live write path
     /// (`server.rs` `.with_memory_db`) points every engine at the shared file,
-    /// so per-agent files only exist on old installs. Every engine query
-    /// filters by `agent_id`, so reading the shared file stays agent-scoped.
+    /// so per-agent files should not exist on a healthy install: boot runs
+    /// `memory_migrate::merge_per_agent_memory_dbs`, which merges any stray /
+    /// legacy per-agent file into the shared db and archives it (the
+    /// 2026-08-20 關鍵洞察 incident — a stray per-agent file silently hijacked
+    /// every memory read RPC for that agent). Every engine query filters by
+    /// `agent_id`, so reading the shared file stays agent-scoped.
     fn agent_memory_db_path(&self, agent_id: &str) -> PathBuf {
         let agent_dir = self.home_dir.join("agents").join(agent_id);
         let state_path = agent_dir.join("state").join("memory.db");

@@ -625,7 +625,8 @@ async fn graduate_trajectories(
 ///
 /// The DB path mirrors `handlers.rs::agent_memory_db_path`:
 /// `agents/<id>/state/memory.db` preferred, then `agents/<id>/memory.db`,
-/// then the shared `<home>/memory.db` (the live write path).
+/// then the shared `<home>/memory.db` (the live write path; boot-time
+/// `memory_migrate` merges stray per-agent files back into it).
 async fn fetch_episodic_evidence(
     home_dir: &Path,
     agent_id: &str,

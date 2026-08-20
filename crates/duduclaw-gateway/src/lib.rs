@@ -152,6 +152,7 @@ pub mod cli_noise;
 pub mod handlers;
 pub mod knowledge_guard;
 pub mod memory_factory;
+pub mod memory_migrate;
 // WP5c — conversation → knowledge-base semantic routing.
 pub mod knowledge_route;
 pub mod auto_wiki_page;
