@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- **sysd 拒絕未授權連線時，拒絕回應可能被 Linux RST 摧毀**：server 對 uid 不符的 peer 寫完 `unauthorized` 回應後直接關閉，socket 收件佇列裡未讀的 request 使 close 變成 RST——client 收到 `ECONNRESET` 而非結構化錯誤（macOS 語義不同從未在本機重現，只在 Linux CI 以 `mismatched_uid_is_rejected` 閃失敗現形）。現在回應寫出後做尺寸與時間雙重上限（500ms）的 bounded drain 再關閉，未授權 peer 也無法藉此拖住連線。
+- **`resolve_duduclaw_bin_from_exe` 測試在 Windows 矩陣必失敗**：解析器在 Windows 探測的是 `duduclaw.exe`（與實際出貨檔名一致，生產行為正確），但測試 fixture 用無副檔名檔名。fixture 改依平台命名。
+
+### Security
+- **h2 0.4.13 → 0.4.18 修補 RUSTSEC-2026-0258**（unbounded empty DATA frames，2026-08-17 公告）——透過 reqwest/hyper 間接依賴，`cargo update -p h2` 鎖檔升版。
+
 ## [1.62.0] - 2026-08-21 — goal 意圖路由×代碼安全審計×記憶與停滯修復
 
 ### Added
