@@ -4615,6 +4615,36 @@ export const api = {
       client.call('accounts.list') as Promise<{ accounts: AccountInfo[] }>,
     budgetSummary: () =>
       client.call('accounts.budget_summary') as Promise<BudgetSummary>,
+    // WP-D: "訂閱帳號" device-code-style setup wizard — a guided, single-
+    // flight, pre-validated specialization of the auth.cliLogin* flow above,
+    // scoped to Claude subscription accounts. See setup_token_wizard.rs.
+    setupTokenStart: () =>
+      client.call('accounts.setup_token_start') as Promise<{
+        session_id: string;
+        /** `null` until the CLI has printed it — poll `setupTokenStatus`. */
+        auth_url: string | null;
+        expires_in_seconds: number;
+        program: string;
+      }>,
+    setupTokenStatus: (sessionId: string) =>
+      client.call('accounts.setup_token_status', { session_id: sessionId }) as Promise<{
+        session_id: string;
+        status: 'running' | 'succeeded' | 'failed' | 'exited';
+        auth_url: string | null;
+        expires_in_seconds: number;
+      }>,
+    setupTokenCancel: (sessionId: string) =>
+      client.call('accounts.setup_token_cancel', { session_id: sessionId }) as Promise<{
+        success: boolean;
+      }>,
+    // Rejects with a structured `{code, message}` — code is one of
+    // 'not_installed' | 'no_active_session' | 'expired' | 'invalid_code' |
+    // 'timeout' | 'validation_failed' | 'already_submitting' | 'io_error'.
+    setupTokenSubmit: (sessionId: string, code: string) =>
+      client.call('accounts.setup_token_submit', { session_id: sessionId, code }) as Promise<{
+        success: boolean;
+        account_id: string;
+      }>,
     /** CLI-store credentials (grok/codex/gemini) — subscription logins that
      *  live in the CLI's own credential file, not in rotator accounts. */
     cliCredentials: () =>

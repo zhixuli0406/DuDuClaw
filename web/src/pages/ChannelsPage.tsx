@@ -1,8 +1,9 @@
-import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import qrcode from 'qrcode-generator';
 import { cn } from '@/lib/utils';
+import { QrCode } from '@/components/shared/QrCode';
 import {
   api,
   type ChannelStatus,
@@ -494,29 +495,6 @@ function ChannelRow({
         )}
       </CardContent>
     </Card>
-  );
-}
-
-/// Pure-frontend QR renderer (no external CDN/service): encodes `value` with
-/// the zero-dependency `qrcode-generator` and renders the resulting SVG.
-function QrCode({ value, size = 200 }: { value: string; size?: number }) {
-  const svg = useMemo(() => {
-    if (!value) return '';
-    // typeNumber 0 = auto-size; 'M' error correction tolerates ~15% damage.
-    const qr = qrcode(0, 'M');
-    qr.addData(value);
-    qr.make();
-    // scalable SVG so it renders crisp at any size; the input is a t.me URL we
-    // control, so the generated markup is safe to inline.
-    return qr.createSvgTag({ scalable: true });
-  }, [value]);
-  return (
-    <div
-      className="rounded-lg bg-white p-3"
-      style={{ width: size, height: size }}
-      aria-hidden
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
   );
 }
 
