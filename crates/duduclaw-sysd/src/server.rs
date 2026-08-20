@@ -111,6 +111,23 @@ async fn handle_connection(stream: UnixStream, allowed_uid: Option<u32>) {
         );
         let resp = SysdResponse::err(audit_id, SysdError::unauthorized());
         let _ = write_response(writer, &resp).await;
+        // Drain (bounded) whatever the peer already sent before closing:
+        // on Linux, closing a socket with unread inbound data turns the
+        // close into an RST that can destroy the just-written rejection
+        // response in flight — the client then sees ECONNRESET instead of
+        // the structured `unauthorized` error (surfaced as the CI-only
+        // `mismatched_uid_is_rejected` failure; macOS delivers the
+        // response first, which is why it never reproduced locally). The
+        // drain is size-capped AND time-capped, so a hostile unauthorized
+        // peer cannot hold the connection open past ~500ms.
+        let mut sink = Vec::new();
+        let mut bounded =
+            tokio::io::AsyncReadExt::take(reader, MAX_REQUEST_LINE_BYTES as u64);
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::io::AsyncReadExt::read_to_end(&mut bounded, &mut sink),
+        )
+        .await;
         return;
     }
 
