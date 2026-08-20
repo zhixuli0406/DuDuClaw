@@ -92,6 +92,25 @@ pub enum Key {
     AccountValidationError,
     AccountCreateButton,
     AccountCreatedButton,
+    /// Shell-S2 round 1 (real `/api/first-run/claim` RPC wiring) — see
+    /// `oobe::claim`'s own header comment. Button label while a claim
+    /// request is in flight.
+    AccountCreatingButton,
+    /// Client-side pre-validation mirroring the gateway's own `< 8 chars`
+    /// rule (`handle_first_run_claim`), shown before ever dispatching a
+    /// request — and also the message shown if the gateway rejects the
+    /// password anyway (`ClaimError::RejectedTooShort`).
+    AccountPasswordTooShortError,
+    /// Shown when `GET /api/first-run/status` already reports
+    /// `claimable: false` (or the claim itself raced and lost, 409) — this
+    /// device already has an administrator account, informational rather
+    /// than an error.
+    AccountAlreadyClaimedInfo,
+    /// Shown for any claim failure that isn't a rejected password —
+    /// connection refused, timeout, unexpected HTTP status, malformed
+    /// response — collapsed to one retryable message (see
+    /// `oobe::AccountClaimFailureKind`'s own doc comment for why).
+    AccountUnreachableError,
 
     RuntimeAuthTitle,
     RuntimeAuthSubtitle,
@@ -208,6 +227,10 @@ fn zh_tw(key: Key) -> &'static str {
         Key::AccountValidationError => "請輸入操作者名稱與密碼",
         Key::AccountCreateButton => "建立帳號",
         Key::AccountCreatedButton => "已建立帳號",
+        Key::AccountCreatingButton => "建立中…",
+        Key::AccountPasswordTooShortError => "密碼至少需要 8 個字元",
+        Key::AccountAlreadyClaimedInfo => "此裝置已完成初始設定，沿用既有的管理者帳號。",
+        Key::AccountUnreachableError => "無法連線到本機服務，請稍後重試。",
 
         Key::RuntimeAuthTitle => "AI Runtime 授權",
         Key::RuntimeAuthSubtitle => "這台機器的 AI runtime 需要授權才能開始工作",
@@ -300,6 +323,10 @@ fn en(key: Key) -> &'static str {
         Key::AccountValidationError => "Enter an operator name and password",
         Key::AccountCreateButton => "Create account",
         Key::AccountCreatedButton => "Account created",
+        Key::AccountCreatingButton => "Creating…",
+        Key::AccountPasswordTooShortError => "Password must be at least 8 characters",
+        Key::AccountAlreadyClaimedInfo => "This device has already been set up. Using the existing administrator account.",
+        Key::AccountUnreachableError => "Couldn't reach the local service. Please try again shortly.",
 
         Key::RuntimeAuthTitle => "Authorize AI runtime",
         Key::RuntimeAuthSubtitle => "This device's AI runtime needs authorization before it can start working",
@@ -392,6 +419,10 @@ fn ja_jp(key: Key) -> &'static str {
         Key::AccountValidationError => "オペレーター名とパスワードを入力してください",
         Key::AccountCreateButton => "アカウントを作成",
         Key::AccountCreatedButton => "作成済み",
+        Key::AccountCreatingButton => "作成中…",
+        Key::AccountPasswordTooShortError => "パスワードは8文字以上で入力してください",
+        Key::AccountAlreadyClaimedInfo => "この端末はすでにセットアップ済みです。既存の管理者アカウントを使用します。",
+        Key::AccountUnreachableError => "ローカルサービスに接続できません。しばらくしてから再試行してください。",
 
         Key::RuntimeAuthTitle => "AI ランタイムの認証",
         Key::RuntimeAuthSubtitle => "この端末の AI ランタイムを使い始めるには認証が必要です",
@@ -492,6 +523,10 @@ mod tests {
         Key::AccountValidationError,
         Key::AccountCreateButton,
         Key::AccountCreatedButton,
+        Key::AccountCreatingButton,
+        Key::AccountPasswordTooShortError,
+        Key::AccountAlreadyClaimedInfo,
+        Key::AccountUnreachableError,
         Key::RuntimeAuthTitle,
         Key::RuntimeAuthSubtitle,
         Key::RuntimeAuthAuthorized,
@@ -550,7 +585,7 @@ mod tests {
         // `ALL_KEYS` silently drifting out of sync with a newly added `Key`
         // variant (the compiler won't catch THAT half; only the per-locale
         // match arms are compiler-enforced).
-        assert_eq!(ALL_KEYS.len(), 76);
+        assert_eq!(ALL_KEYS.len(), 80);
         let mut seen = std::collections::HashSet::new();
         for key in ALL_KEYS {
             assert!(seen.insert(key), "duplicate key in ALL_KEYS: {key:?}");

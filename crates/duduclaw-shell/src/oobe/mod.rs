@@ -47,6 +47,7 @@
 // establishes for `SurfaceState`, extended here to also cover disk
 // persistence (still plain data in, plain data out, no gpui).
 
+mod claim;
 mod fake_data;
 mod palette;
 mod render;
@@ -112,6 +113,16 @@ pub enum OobeStep {
     /// row. Not skippable — the one mandatory identity step, and the
     /// structural fix for the bootstrap-admin two-phase WS-handshake
     /// deadlock incident §B-1 row 4 cites by name.
+    ///
+    /// Shell-S2 round 1 (2026-08-20) replaces this step's local-only click
+    /// (round 1's `flow.set_account_created(true)` with no I/O at all) with
+    /// a real call to the gateway's own `GET/POST /api/first-run/*` REST
+    /// endpoints — see `oobe::claim`'s own header comment for the network
+    /// layer and `steps::account`'s for how the click handler drives it.
+    /// `account_created` (the field `can_advance` actually gates on, below)
+    /// still only flips `true` on a server-confirmed outcome, never
+    /// optimistically — the state machine's contract with `can_advance`
+    /// hasn't changed, only how it gets satisfied.
     AccountCreate,
     /// §B-1 step 5: "AI runtime 授權（可『稍後設定』→明示降級）" —
     /// SKIPPABLE, explicit defer semantics (not a silent skip: choosing it
@@ -393,6 +404,19 @@ pub struct OobeSelections {
     pub network_connected: bool,
     pub network_ssid: Option<String>,
     pub account_created: bool,
+    /// The `AccountCreate` step's typed name value — LOCAL DISPLAY ONLY.
+    /// Shell-S2 round 1's real `/api/first-run/claim` gateway endpoint is
+    /// password-only for the fixed `admin@local` user (see `oobe::claim`'s
+    /// own header comment) — this crate has no account-profile RPC to send
+    /// a display name to anywhere, so this field never reaches the gateway.
+    /// Kept anyway (rather than discarded after the click) so a resumed
+    /// OOBE run after a restart still shows what the operator typed; covered
+    /// by this struct's own STRUCT-LEVEL `#[serde(default)]` above, same as
+    /// every other field here, so an older on-disk state file with no
+    /// `operator_name` key at all still loads fine (see
+    /// `load_state_tolerates_an_older_schema_missing_the_operator_name_field`
+    /// below).
+    pub operator_name: Option<String>,
     pub runtime_deferred: bool,
     /// Set when the `RuntimeAuth` step's "立即設定" path is taken — the
     /// OTHER outcome of that step's two-button choice (`runtime_deferred`,
@@ -587,6 +611,17 @@ impl OobeFlow {
         self.state.selections.account_created = created;
     }
 
+    /// Records the `AccountCreate` step's typed operator name — LOCAL
+    /// DISPLAY ONLY, see `OobeSelections::operator_name`'s own doc comment
+    /// for why this never reaches the gateway. Called at click time
+    /// regardless of whether the network claim itself succeeds (a typed
+    /// name is worth remembering across a retry even if the first attempt
+    /// failed to reach the gateway) — same "click records, a later step
+    /// advances" split every other setter here follows.
+    pub fn set_operator_name(&mut self, name: &str) {
+        self.state.selections.operator_name = Some(name.to_string());
+    }
+
     /// `RuntimeAuth`'s "立即設定" path — the counterpart to `skip()`'s
     /// "稍後再說" path (`runtime_deferred`) for this same step. Unlike
     /// `skip()`, this does NOT advance the step on its own: clicking "立即
@@ -673,6 +708,65 @@ impl Default for OobeFlow {
     }
 }
 
+/// The `AccountCreate` step's real-time gateway-claim progress (Shell-S2
+/// round 1) — driven by `steps::account`'s click handler +
+/// `oobe::claim::create_account` (see that module's own header comment for
+/// the network layer this wraps). Deliberately separate from
+/// `OobeSelections::account_created` (the flow-advance authority
+/// `OobeFlow::can_advance` reads): `account_created` only ever flips `true`
+/// on an actual server-confirmed outcome (`Claimed`/`AlreadyClaimed`), never
+/// on `InFlight` — a mid-flight restart (or a request that never resolves)
+/// can never leave the flow able to advance past a claim that never actually
+/// completed, because this whole enum is ephemeral (not part of
+/// `OobeState`/persistence — same split every other field on `OobeUiState`
+/// already follows) and simply reverts to `Idle` on the next launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccountClaimState {
+    #[default]
+    Idle,
+    /// A claim request is in flight — `steps::account`'s render fn shows a
+    /// "建立中…" button label and disables further clicks while this holds
+    /// (see that module's own click handler for the guard).
+    InFlight,
+    /// The gateway confirmed the account — either THIS click set the
+    /// password (`already: false`) or the instance was already set up by an
+    /// earlier run (`already: true`, `oobe::claim::ClaimOutcome::
+    /// AlreadyClaimed`). Both set `account_created = true`; only `already`
+    /// changes which message `steps::account` renders.
+    Done { already: bool },
+    /// The claim did not resolve to either `Idle` above — see
+    /// `AccountClaimFailureKind`'s own doc comment for which of the two
+    /// operator-facing messages this maps to. Deliberately NOT reset back to
+    /// `Idle` automatically: the whole point of landing here is so the error
+    /// message stays on screen until the operator's next action (either a
+    /// fresh validation failure or a fresh submit attempt) replaces it — see
+    /// `steps::account`'s click handler.
+    Failed(AccountClaimFailureKind),
+}
+
+/// Which message `steps::account`'s render fn shows for a `Failed` claim —
+/// collapses `oobe::claim::ClaimError`'s five network-layer variants down to
+/// the two an OPERATOR actually needs to act on differently: "you typed a
+/// password the gateway will reject, fix it and resubmit" vs. "something
+/// about reaching the local service went wrong, just retry". Which of
+/// `Unreachable`/`Http`/`Malformed`/`NonLoopback` actually happened is
+/// diagnostic detail logged to stderr at the call site (`steps::account`'s
+/// `apply_claim_result`), not something the OOBE surface needs to render
+/// three different ways — the operator's retry action is identical either
+/// way (click "建立帳號" again).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountClaimFailureKind {
+    /// The gateway rejected the password as too short, OR the client-side
+    /// pre-check (`steps::account`, mirroring the gateway's own `< 8 chars`
+    /// rule) caught it before ever dispatching a request — either path lands
+    /// here, so the render side doesn't need to know which one happened.
+    PasswordTooShort,
+    /// Couldn't complete the round trip, or the gateway answered with
+    /// something this module doesn't have specific handling for — see this
+    /// enum's own doc comment for why these all collapse to one message.
+    Unreachable,
+}
+
 /// Ephemeral view-only UI state — NOT part of `OobeState`/persistence (same
 /// split `overlay::OverlayUiState` establishes vs. `surface::SurfaceState`,
 /// applied here for OOBE instead of the overlay surfaces). Reset on every
@@ -694,6 +788,14 @@ pub struct OobeUiState {
     /// visit to the step. Ephemeral, like `accessibility_open` above — not
     /// worth persisting across a restart.
     pub account_validation_error: bool,
+    /// The `AccountCreate` step's gateway-claim progress — see
+    /// `AccountClaimState`'s own doc comment. Also ephemeral, for the same
+    /// reason `account_validation_error` above is: a page reload/restart
+    /// mid-flight just shows `Idle` again and the operator re-clicks, which
+    /// is harmless (the gateway's own claim endpoint is single-shot but
+    /// idempotent-FROM-THE-CLIENT'S-VIEW: a retry after a real success just
+    /// reports `AlreadyClaimed`, never a silent double-charge of anything).
+    pub account_claim: AccountClaimState,
 }
 
 impl OobeUiState {
@@ -703,6 +805,27 @@ impl OobeUiState {
 
     pub fn set_account_validation_error(&mut self, on: bool) {
         self.account_validation_error = on;
+    }
+
+    pub fn set_account_claim_in_flight(&mut self) {
+        self.account_claim = AccountClaimState::InFlight;
+    }
+
+    pub fn set_account_claim_done(&mut self, already: bool) {
+        self.account_claim = AccountClaimState::Done { already };
+    }
+
+    pub fn set_account_claim_failed(&mut self, kind: AccountClaimFailureKind) {
+        self.account_claim = AccountClaimState::Failed(kind);
+    }
+
+    /// Clears back to `Idle` — called when a fresh validation error (empty
+    /// name/password) supersedes whatever claim-related message was
+    /// showing, so the two message sources (`account_validation_error` vs.
+    /// `account_claim`) never render on top of each other. See
+    /// `steps::account`'s click handler for the one call site.
+    pub fn reset_account_claim(&mut self) {
+        self.account_claim = AccountClaimState::Idle;
     }
 }
 
@@ -1246,6 +1369,7 @@ mod tests {
             privacy_usage_stats: true,
             privacy_marketing: true,
             theme: ThemeChoice::Dark,
+            operator_name: Some("Louis".to_string()),
             ..OobeSelections::default()
         };
         selections.template_choice = Some(TemplateChoice::Custom("retail".to_string()));
@@ -1361,6 +1485,48 @@ mod tests {
         assert!(!loaded.completed);
         assert!(loaded.selections.runtime_authorized);
         assert_eq!(loaded.selections.theme, ThemeChoice::Light, "a missing `theme` key must default in, not error the whole file out");
+    }
+
+    #[test]
+    fn load_state_tolerates_an_older_schema_missing_the_operator_name_field() {
+        // Same forward-compat contract as the `theme` test just above,
+        // pinned for Shell-S2 round 1's own new field: a state file written
+        // before `operator_name` existed must still load, with the missing
+        // key defaulting to `None` rather than erroring the whole file out.
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("duduclaw-shell-oobe-test-preopname-{}", std::process::id()));
+        let prev = std::env::var("DUDUCLAW_HOME").ok();
+        unsafe { std::env::set_var("DUDUCLAW_HOME", &tmp) };
+
+        let old_schema = r#"{
+            "completed": false,
+            "current_step": "account-create",
+            "selections": {
+                "language": "zh-tw",
+                "network_connected": true,
+                "network_ssid": "DuDu-Office",
+                "account_created": false,
+                "runtime_deferred": false,
+                "theme": "light"
+            }
+        }"#;
+        let dir = tmp.join("shell");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("oobe_state.json"), old_schema).unwrap();
+
+        let loaded = load_state();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DUDUCLAW_HOME", v),
+                None => std::env::remove_var("DUDUCLAW_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(loaded.current_step, OobeStep::AccountCreate, "must NOT fall back to step 0 just because `operator_name` is missing");
+        assert!(!loaded.completed);
+        assert_eq!(loaded.selections.operator_name, None, "a missing `operator_name` key must default to None, not error the whole file out");
     }
 
     #[test]
@@ -1540,5 +1706,87 @@ mod tests {
         let flow = resolve_boot_flow(None, None, Some("finish"), state).unwrap();
         assert_eq!(flow.current(), OobeStep::Finish);
         assert_eq!(flow.selections().language, LanguageChoice::En);
+    }
+
+    // ── Shell-S2 round 1: AccountClaimState / OobeUiState transitions ──
+    // Pure logic only, same style every other `OobeUiState` test in this
+    // module already uses — no gpui, no network, no `oobe::claim` mock
+    // server needed here (that lives in `claim.rs`'s own `tests` module).
+
+    #[test]
+    fn account_claim_defaults_to_idle() {
+        let ui = OobeUiState::default();
+        assert_eq!(ui.account_claim, AccountClaimState::Idle);
+    }
+
+    #[test]
+    fn set_account_claim_in_flight_transitions_from_idle() {
+        let mut ui = OobeUiState::default();
+        ui.set_account_claim_in_flight();
+        assert_eq!(ui.account_claim, AccountClaimState::InFlight);
+    }
+
+    #[test]
+    fn set_account_claim_done_records_whether_it_was_already_claimed() {
+        let mut ui = OobeUiState::default();
+        ui.set_account_claim_in_flight();
+        ui.set_account_claim_done(false);
+        assert_eq!(ui.account_claim, AccountClaimState::Done { already: false });
+
+        let mut ui2 = OobeUiState::default();
+        ui2.set_account_claim_in_flight();
+        ui2.set_account_claim_done(true);
+        assert_eq!(ui2.account_claim, AccountClaimState::Done { already: true });
+    }
+
+    #[test]
+    fn set_account_claim_failed_records_the_failure_kind() {
+        let mut ui = OobeUiState::default();
+        ui.set_account_claim_in_flight();
+        ui.set_account_claim_failed(AccountClaimFailureKind::PasswordTooShort);
+        assert_eq!(ui.account_claim, AccountClaimState::Failed(AccountClaimFailureKind::PasswordTooShort));
+
+        let mut ui2 = OobeUiState::default();
+        ui2.set_account_claim_in_flight();
+        ui2.set_account_claim_failed(AccountClaimFailureKind::Unreachable);
+        assert_eq!(ui2.account_claim, AccountClaimState::Failed(AccountClaimFailureKind::Unreachable));
+    }
+
+    #[test]
+    fn reset_account_claim_returns_to_idle_from_any_state() {
+        for mut ui in [
+            {
+                let mut u = OobeUiState::default();
+                u.set_account_claim_in_flight();
+                u
+            },
+            {
+                let mut u = OobeUiState::default();
+                u.set_account_claim_done(true);
+                u
+            },
+            {
+                let mut u = OobeUiState::default();
+                u.set_account_claim_failed(AccountClaimFailureKind::Unreachable);
+                u
+            },
+        ] {
+            ui.reset_account_claim();
+            assert_eq!(ui.account_claim, AccountClaimState::Idle);
+        }
+    }
+
+    #[test]
+    fn account_claim_and_validation_error_are_independent_fields() {
+        // The two error sources `steps::account`'s render fn checks
+        // (`account_validation_error` vs. `account_claim`) are separate
+        // fields — setting one must never implicitly touch the other. The
+        // click handler itself is what keeps them from both rendering at
+        // once (see `steps::account`'s own doc comment), not this struct.
+        let mut ui = OobeUiState::default();
+        ui.set_account_claim_failed(AccountClaimFailureKind::PasswordTooShort);
+        ui.set_account_validation_error(true);
+        assert_eq!(ui.account_claim, AccountClaimState::Failed(AccountClaimFailureKind::PasswordTooShort));
+        assert!(ui.account_validation_error);
     }
 }
