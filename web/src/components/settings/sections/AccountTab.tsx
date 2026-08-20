@@ -1,7 +1,10 @@
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
+import { useLocation, useNavigate } from 'react-router';
+import { KeyRound } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
+import { useConnectionStore } from '@/stores/connection-store';
 import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -28,6 +31,17 @@ export function AccountTab() {
   // UI (turning it off from inside a session you got for free is a footgun:
   // you would need a password you have never set).
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
+  // WP-0 (bootstrap-admin recovery): `AuthGuard` force-redirected here because
+  // this account still must change its password before doing anything else.
+  // Say so, and once the change succeeds, force a fresh WS handshake (the
+  // gateway bakes `must_change_password` into the connection's UserContext
+  // once at `connect` time — a plain RPC success does NOT refresh it on the
+  // live socket) then send the user back to wherever they were headed.
+  const mustChangePassword = useConnectionStore((s) => s.mustChangePassword);
+  const connectWithAuth = useConnectionStore((s) => s.connectWithAuth);
+  const disconnectWs = useConnectionStore((s) => s.disconnect);
+  const location = useLocation();
+  const navigate = useNavigate();
   const [current, setCurrent] = useState('');
   const [next, setNext] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -58,6 +72,20 @@ export function AccountTab() {
       setCurrent('');
       setNext('');
       setConfirm('');
+      if (mustChangePassword) {
+        // The gateway bakes `must_change_password` into this connection's
+        // UserContext once at handshake time — a successful RPC alone never
+        // refreshes it. Force a fresh handshake so the rest of the dashboard
+        // unlocks, then send the user back only if the server actually
+        // confirms the flag is gone (never navigate away and leave the
+        // account still locked out with no explanation on screen).
+        disconnectWs();
+        await connectWithAuth(() => useAuthStore.getState().jwt ?? undefined);
+        if (!useConnectionStore.getState().mustChangePassword) {
+          const from = (location.state as { from?: string } | null)?.from;
+          navigate(from && from !== location.pathname + location.search ? from : '/', { replace: true });
+        }
+      }
     } catch (e) {
       console.warn('[api]', e);
       setSubmitError(e);
@@ -69,6 +97,22 @@ export function AccountTab() {
 
   return (
     <div className="space-y-8">
+      {mustChangePassword && (
+        <div
+          role="status"
+          className="flex items-start gap-2.5 rounded-lg border border-warning/30 bg-warning/5 px-3 py-2.5"
+        >
+          <KeyRound className="mt-0.5 size-4 shrink-0 text-warning" />
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-foreground">
+              {intl.formatMessage({ id: 'settings.account.mustChange.title' })}
+            </p>
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              {intl.formatMessage({ id: 'settings.account.mustChange.desc' })}
+            </p>
+          </div>
+        </div>
+      )}
       <SettingsSection>
         <SettingsCard>
           <SettingRow

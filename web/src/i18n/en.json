@@ -458,6 +458,8 @@
   "settings.account.mismatch": "The new passwords do not match",
   "settings.account.tooShort": "New password must be at least 8 characters",
   "settings.account.sameAsOld": "New password must differ from the current one",
+  "settings.account.mustChange.title": "Set your password first",
+  "settings.account.mustChange.desc": "This account hasn't set a password yet. Set one below before using anything else.",
   "settings.container": "Container Engine",
   "settings.heartbeat": "Heartbeat Schedule",
   "settings.cron": "Scheduled Tasks",

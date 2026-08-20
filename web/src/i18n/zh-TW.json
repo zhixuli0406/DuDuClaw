@@ -453,6 +453,8 @@
   "settings.account.mismatch": "兩次輸入的新密碼不一致",
   "settings.account.tooShort": "新密碼至少需 8 個字元",
   "settings.account.sameAsOld": "新密碼不可與目前密碼相同",
+  "settings.account.mustChange.title": "請先設定密碼",
+  "settings.account.mustChange.desc": "這個帳號還沒有設定過密碼，請在下方設定新密碼後才能繼續使用其他功能。",
   "settings.container": "容器引擎",
   "settings.heartbeat": "心跳排程",
   "settings.cron": "排程任務",

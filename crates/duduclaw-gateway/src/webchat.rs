@@ -422,13 +422,6 @@ fn widget_authenticate(home_dir: &std::path::Path, presented: &str) -> Result<St
     Ok(format!("widget-visitor:{}", uuid::Uuid::new_v4()))
 }
 
-/// C5: core WebChat authentication logic, decoupled from `WebChatState` so it
-/// is unit-testable with just a `JwtConfig` + `UserDb` (no `ReplyContext`).
-///
-/// Verifies the JWT and confirms the named user is still a live, usable account:
-/// the token must be valid, the user must exist, be `Active`, and not be flagged
-/// `must_change_password`. Production behavior is identical — `authenticate`
-/// delegates here.
 /// Stable, id-safe owner tag for an authenticated user.
 ///
 /// A raw user id cannot go into a session id directly: ids are `:`-delimited
@@ -461,20 +454,34 @@ pub fn owns_webchat_session(want: &str, owner_tag: &str) -> bool {
     want.starts_with(&scope)
 }
 
+/// C5: core WebChat authentication logic, decoupled from `WebChatState` so it
+/// is unit-testable with just a `JwtConfig` + `UserDb` (no `ReplyContext`).
+///
+/// Verifies the JWT and confirms the named user is still a live, usable
+/// account: the token must be valid, the user must exist, and be `Active`.
+/// Production behavior is identical — `authenticate` delegates here.
+///
+/// Returns `(user_id, must_change_password)`. A caller flagged
+/// `must_change_password` (the bootstrap `admin@local`, or any account an
+/// operator has reset) is NOT refused here — the flag rides along instead,
+/// mirroring `server.rs::jwt_account_gate`'s C1 fix on the dashboard WS
+/// path. Before this, an `Err("password change required")` here closed the
+/// socket outright; WebChat has no self-service change-password flow to
+/// redirect a stuck visitor to (unlike the dashboard, which at least has an
+/// account-settings screen behind the same gate), so that was a dead end,
+/// not a recoverable failure. The socket loop reads this flag and restricts
+/// the connection to a guidance-only reply for every `user_message` instead.
 fn authenticate_with(
     jwt_config: &JwtConfig,
     user_db: &UserDb,
     token: &str,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let claims = jwt_config
         .verify_access_token(token)
         .map_err(|e| format!("invalid token: {e}"))?;
     match user_db.get_user(&claims.sub) {
         Ok(Some(u)) if u.status == duduclaw_auth::UserStatus::Active => {
-            if u.must_change_password {
-                return Err("password change required".to_string());
-            }
-            Ok(claims.sub)
+            Ok((claims.sub, u.must_change_password))
         }
         Ok(Some(_)) => Err("account suspended".to_string()),
         Ok(None) => Err("user not found".to_string()),
@@ -538,7 +545,12 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     // The first frame MUST be `{"type":"auth","token":"<jwt>"}`. Without a
     // valid token the connection is closed before any agent/LLM interaction.
     // Timeout-guarded to prevent Slowloris-style resource exhaustion.
-    let auth_user = {
+    // `must_change_password` rides along here rather than being refused —
+    // see `authenticate_with`'s doc comment. The connection still opens
+    // normally; every `user_message` from a flagged account gets a
+    // guidance-only reply instead of reaching the agent (checked below,
+    // inside the message loop).
+    let (auth_user, must_change_password) = {
         let auth_timeout = std::time::Duration::from_secs(10);
         let authed = match tokio::time::timeout(auth_timeout, stream.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
@@ -664,6 +676,27 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
 
                         match chat_msg {
                             ChatMessage::UserMessage { content, session_id: custom_session, agent: requested_agent, attachments, conv } => {
+                                // ── Forced password-change gate ──────────
+                                // Mirrors `handlers.rs::dispatch`'s gate on the
+                                // dashboard WS path (same error code, so a
+                                // frontend can branch on one constant regardless
+                                // of transport): the socket stayed open (see
+                                // `authenticate_with`'s doc comment) but every
+                                // turn gets a guidance-only reply instead of
+                                // reaching the agent, until the account's
+                                // `must_change_password` flag clears via the
+                                // dashboard. Not a silent drop — the visitor
+                                // sees exactly why nothing happened.
+                                if must_change_password {
+                                    let err = ChatMessage::error_coded(
+                                        "此帳號尚未設定密碼，請先前往帳號設定完成密碼變更後再繼續使用。",
+                                        crate::handlers::MUST_CHANGE_PASSWORD_ERROR_CODE,
+                                    );
+                                    if let Ok(json) = serde_json::to_string(&err) {
+                                        let _ = sink.send(Message::Text(json.into())).await;
+                                    }
+                                    continue;
+                                }
                                 // Sanitize the client conversation nonce once —
                                 // it scopes the session bucket AND is echoed on
                                 // every reply frame so the browser attributes the
@@ -1480,7 +1513,7 @@ mod tests {
         let token = token_for(&jwt, &user);
 
         let result = authenticate_with(&jwt, &db, &token);
-        assert_eq!(result.as_deref(), Ok(user.id.as_str()));
+        assert_eq!(result, Ok((user.id.clone(), false)));
     }
 
     #[test]
@@ -1490,8 +1523,14 @@ mod tests {
         assert!(result.is_err(), "garbage token must be rejected");
     }
 
+    /// C1 fix (mirrors `server.rs::jwt_account_gate`): a `must_change_password`
+    /// account is allowed to CONNECT — the flag rides along on the `Ok`
+    /// tuple instead of refusing the handshake. `handle_chat_socket` is the
+    /// layer that turns the flag into a guidance-only reply per turn (not
+    /// unit-tested here — no live socket in this test module, see the
+    /// module doc on `authenticate_with`).
     #[test]
-    fn authenticate_rejects_must_change_password_user() {
+    fn authenticate_allows_must_change_password_user_with_flag_set() {
         let (jwt, db, _dir) = fixtures();
         // The default admin is created with `must_change_password = true`.
         db.ensure_default_admin().expect("bootstrap admin");
@@ -1505,9 +1544,12 @@ mod tests {
 
         let token = token_for(&jwt, &admin);
         let result = authenticate_with(&jwt, &db, &token);
-        assert!(
-            result.is_err(),
-            "a user pending a forced password change must be rejected"
+        assert_eq!(
+            result,
+            Ok((admin.id.clone(), true)),
+            "a user pending a forced password change must still be allowed to \
+             connect, with the flag surfaced so the caller can degrade to \
+             guidance-only replies"
         );
     }
 
