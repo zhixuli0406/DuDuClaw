@@ -1,0 +1,67 @@
+// Column 2 of the app shell — the selected area's own page list. Split out
+// of `shell.rs` during the P0-1 three-column rebuild (2026-08-19); see that
+// file's header comment for the overall three-column design.
+
+use gpui::{div, prelude::*, px, Context, Stateful};
+
+use crate::i18n;
+use crate::nav;
+use crate::screens::shell_row::nav_row;
+use crate::theme;
+use crate::RootView;
+
+/// Column 2 width — same order of magnitude as Column 1; it lists at most 5
+/// short page names for any one area (`nav.rs::AREAS`' longest is `任務與
+/// 目標` with 5 items).
+const CONTENT_LIST_WIDTH: f32 = 224.0;
+
+/// `None` when the current page's area holds only one page (nothing to
+/// disambiguate — HIG: "area 只有單頁時欄 2 可隱藏", see `shell.rs`'s header
+/// comment) or when the current page is a footer item (belongs to no area
+/// at all, e.g. `manage`/`componentLibrary`).
+pub(super) fn render(state: &RootView, cx: &mut Context<RootView>) -> Option<Stateful<gpui::Div>> {
+    let area = nav::area_for_page(state.active_page)?;
+    if area.items.len() <= 1 {
+        return None;
+    }
+    let locale = state.locale;
+    let active_id = state.active_page;
+
+    let mut rows = Vec::with_capacity(area.items.len());
+    for item in area.items {
+        rows.push(nav_row(*item, active_id, locale, cx));
+    }
+
+    Some(
+        div()
+            .id("content-list")
+            .w(px(CONTENT_LIST_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded(px(theme::RADIUS_XL))
+            .overflow_hidden()
+            .bg(theme::alpha(theme::SIDEBAR, 1.0))
+            .border_1()
+            .border_color(theme::sidebar_border())
+            .shadow(theme::surface_shadow())
+            .child(
+                // Column-2 header names the selected area — MDS spec §5.1
+                // group-header scale, same bucket the old flat sidebar's
+                // `工作`/`公司`/`設定` headers used.
+                div()
+                    .h_8()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .text_size(px(theme::TEXT_XS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme::alpha(theme::SIDEBAR_FOREGROUND, 0.7))
+                    .child(i18n::t(locale, area.label_key)),
+            )
+            .children(rows),
+    )
+}
