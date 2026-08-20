@@ -115,16 +115,61 @@ pub const AGENT_CLI_ENV_ALLOWLIST: &[&str] = &[
 /// accounts (the default `claude auth login` session, i.e. anything that
 /// isn't an explicit API key or `setup-token`) can fail to authenticate.
 /// Carried over from `worker_supervisor.rs`'s Round 3 fix.
-#[cfg(target_os = "macos")]
+///
+/// Declared unconditionally (only the usage loop in
+/// [`agent_cli_spawn_env_pairs`] is `#[cfg]`-gated) so the secret-shape test
+/// below guards it on every development platform.
 pub const AGENT_CLI_ENV_ALLOWLIST_MACOS: &[&str] = &["__CF_USER_TEXT_ENCODING"];
 
-/// Windows only: `claude` CLI locates its OAuth credentials + settings via
-/// `%APPDATA%\claude\`. Carried over from `worker_supervisor.rs`'s Round 4
-/// fix (MED-C3) — without these, the spawned CLI fails to authenticate and
-/// (for the PTY-pool path) the pool churns rebuilding doomed sessions.
-#[cfg(windows)]
-pub const AGENT_CLI_ENV_ALLOWLIST_WINDOWS: &[&str] =
-    &["USERPROFILE", "APPDATA", "LOCALAPPDATA", "COMPUTERNAME"];
+/// Windows only. Declared unconditionally (only the usage loop is
+/// `#[cfg(windows)]`-gated) so the secret-shape test guards it on every
+/// development platform. Windows env lookups are case-insensitive
+/// (`GetEnvironmentVariableW`), so the canonical casings below match however
+/// the host spells them.
+///
+/// Two entry families:
+/// - Credential/settings location (`worker_supervisor.rs` Round 4, MED-C3):
+///   `claude` locates its OAuth credentials + settings via `%APPDATA%\claude\`;
+///   without these the spawned CLI cannot authenticate.
+/// - The Windows system set (2026-08-20 field incident): the v1.61.x scrub
+///   omitted it entirely, and a Node-based CLI (`claude.exe`) fail-fasts at
+///   startup without `SystemRoot` — exit 0xC0000409, no output, nothing to
+///   debug from. These are machine-shape variables (paths, sizes, arch), not
+///   operator data — the same class as `PATH`/`TMPDIR` on the base list.
+pub const AGENT_CLI_ENV_ALLOWLIST_WINDOWS: &[&str] = &[
+    // Credential + settings resolution.
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "COMPUTERNAME",
+    // System roots — DLL/runtime initialization. `SystemRoot` is the one
+    // whose absence instantly crashes Node (and therefore claude.exe).
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    // Shell + executable resolution: `cmd.exe` location and the extension
+    // search list (spawning `npm`/`claude` without `.cmd`/`.exe` needs it).
+    "ComSpec",
+    "PATHEXT",
+    // Temp-file creation (Windows has no `TMPDIR`).
+    "TEMP",
+    "TMP",
+    // Platform detection + pool sizing read by Node/libuv and build tools.
+    "OS",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    // Home/profile resolution beyond USERPROFILE (tools composing
+    // HOMEDRIVE+HOMEPATH; USERNAME is Windows' USER/LOGNAME).
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+    // Install-location probing (git/node system config, Program Files
+    // lookups by npm and installer-based CLIs).
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramData",
+    "ALLUSERSPROFILE",
+];
 
 /// The `DUDUCLAW_*` names set in THIS process's environment that the
 /// allowlist will drop from every spawn. Pure helper for
@@ -331,6 +376,8 @@ mod tests {
         for name in AGENT_CLI_ENV_ALLOWLIST
             .iter()
             .chain(GIT_CREDENTIALS_ENV_ALLOWLIST)
+            .chain(AGENT_CLI_ENV_ALLOWLIST_MACOS)
+            .chain(AGENT_CLI_ENV_ALLOWLIST_WINDOWS)
         {
             for suffix in secret_suffixes {
                 assert!(
