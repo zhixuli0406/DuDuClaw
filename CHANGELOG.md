@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.62.0] - 2026-08-21 — goal 意圖路由×代碼安全審計×記憶與停滯修復
+
 ### Added
 - **通道 goal 意圖路由（`[goal_intent]`，預設開）**：通道自然語言現在會被判斷是否為交辦——三層分類（L0 零成本硬排除 → L1 訊號分數表零 LLM → L2 灰帶問小模型），命中即回覆確認選單（TG/Discord/Slack/LINE 三按鈕「建立目標／想一想／只是聊聊」，其餘七通道文字 1/2/3），**絕不自動建立**。確認後走與 `/goal` 完全相同的建立路徑（存取閘、autonomy 開工審批照舊），誤判成本壓到一則可忽略的訊息，因此敢預設開。L2 引擎 `mode`：`auto`（有本地推論引擎則走本地 YES/NO screening，否則摺進本來就要發生的主回覆、零額外呼叫）／`local`／`reply_tag`／`off`；任何模型不可用一律 fail-open 回聊天。`/goal ... || 想一想` 讓通道也能要求先出計畫再執行（原本只有 dashboard 有）。設計：`commercial/docs/DESIGN-goal-intent-router-2026-08.md`；使用者說明：`docs/features/48-goal-intent-router.md`。
 - **代碼安全審計 `duduclaw secaudit`（對標 CodeBuddy Security）**：靜態掃描器編排（gitleaks/semgrep/cargo-audit/osv-scanner，缺工具誠實列 `engines_missing` 不靜默跳過）＋威脅建模式 intake（git 安全熱點）＋AI 深度審計（`--profile deep`，per-module 讀碼找靜態掃描追不到的路徑漏洞，`--max-modules` 防燒錢）＋**零共享上下文對抗式覆核**（新 agent 從乾淨重讀證偽候選，可疑留待人審、絕不自動 confirm）＋PoC 沙箱（`--poc`＋High 以上，container 內無網路執行，無沙箱一律不在宿主機裸跑）。`--save` 落報告到 `<home>/secaudit/reports/`；dashboard「安全審計」頁（manager 限定）看 findings 證據鏈＋人審三鍵。CI：exit 0/1/2，缺所有掃描器仍 exit 0；已證偽/已壓制不計入嚴重度統計與 `--fail-on`。設計：`commercial/docs/DESIGN-code-security-audit-2026-08.md`；使用者說明：`docs/features/49-code-security-audit.md`。
