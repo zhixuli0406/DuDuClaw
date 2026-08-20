@@ -315,6 +315,19 @@ impl Render for ShellView {
     }
 }
 
+// Two more `DUDUCLAW_SHELL_*` env vars exist as of Shell-S2 round 1
+// (2026-08-20, real `/api/first-run/*` claim RPC — see `oobe/claim.rs`'s own
+// header comment) but are read from THEIR OWN call sites rather than here in
+// `main()`, since neither one is a boot-time decision like
+// `FORCE_OOBE`/`SKIP_OOBE`/`DEBUG_OOBE_STEP` above:
+//   - `DUDUCLAW_SHELL_GATEWAY_URL` — overrides the gateway base URL
+//     `oobe::claim::create_account` dials (default `http://127.0.0.1:18789`).
+//     Read in `oobe/claim.rs`'s `gateway_base_url()`.
+//   - `DUDUCLAW_SHELL_OOBE_LOCAL_ACCOUNT=1` — DEV-ONLY escape hatch: skips
+//     the network claim entirely and reproduces the `AccountCreate` step's
+//     original (pre-round-1) local-only click behavior, for headless smoke
+//     runs with no gateway reachable. Read in `oobe/steps/account.rs`'s
+//     click handler — see that file's own header comment.
 fn main() {
     eprintln!("[main] starting duduclaw-shell S0");
 
