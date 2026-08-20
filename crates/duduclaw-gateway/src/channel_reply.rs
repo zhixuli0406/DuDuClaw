@@ -4023,16 +4023,22 @@ async fn build_reply_with_session_inner(
                         let preview: String = content.chars().take(80).collect();
                         debug!(agent = %agent_id_for_pred, "Storing episodic observation: {preview}");
 
-                        // Persist to per-agent memory.db
-                        let mem_dir = home_for_pred
-                            .join("agents")
-                            .join(&agent_id_for_pred)
-                            .join("state");
-                        if let Err(e) = std::fs::create_dir_all(&mem_dir) {
-                            warn!(agent = %agent_id_for_pred, "Failed to create memory state dir: {e}");
-                        } else {
-                            let db_path = mem_dir.join("memory.db");
-                            match duduclaw_memory::engine::SqliteMemoryEngine::new(&db_path) {
+                        // Persist to the shared `<home>/memory.db` — the same
+                        // file every other production write path uses. This
+                        // used to create `agents/<id>/state/memory.db`, which
+                        // broke the invariant `handlers.rs::agent_memory_db_path`
+                        // documents ("per-agent files only exist on old
+                        // installs"): one stray episodic write here flipped
+                        // every dashboard memory read RPC for the agent onto a
+                        // near-empty per-agent file while key facts and rules
+                        // kept accumulating, unseen, in the shared db (the
+                        // 2026-08-20 關鍵洞察 empty-tab incident). Stray files
+                        // already created are re-merged at boot by
+                        // `memory_migrate::merge_per_agent_memory_dbs`.
+                        if memory_db_path_for_pred.is_none() {
+                            debug!(agent = %agent_id_for_pred, "Cognitive memory disabled — episodic observation not persisted");
+                        } else if let Some(ref db_path) = memory_db_path_for_pred {
+                            match crate::memory_factory::build_memory_engine(db_path, &home_for_pred) {
                                 Ok(engine) => {
                                     let entry = duduclaw_core::types::MemoryEntry {
                                         id: uuid::Uuid::new_v4().to_string(),

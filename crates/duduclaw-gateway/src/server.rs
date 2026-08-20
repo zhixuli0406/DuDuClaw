@@ -153,6 +153,29 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     );
 
     let home_dir = config.home_dir.clone();
+    // ── Memory-db split self-heal (2026-08-20 關鍵洞察 incident) ─────────
+    // Merge any per-agent `agents/<id>/[state/]memory.db` back into the
+    // shared `<home>/memory.db` and archive the source file, restoring the
+    // invariant `handlers.rs::agent_memory_db_path` relies on (reads prefer
+    // the per-agent file when it exists, but the live write path is the
+    // shared file). Runs before any subsystem opens memory engines. Cheap
+    // no-op when no per-agent files exist — the overwhelming majority of
+    // boots. Failures leave the source files in place and never abort boot.
+    {
+        let report = crate::memory_migrate::merge_per_agent_memory_dbs(&home_dir);
+        if report.merged_files > 0 {
+            info!(
+                files = report.merged_files,
+                memories = report.memories_rows,
+                key_facts = report.key_facts_rows,
+                "per-agent memory.db files merged into shared memory.db"
+            );
+        }
+        for e in &report.errors {
+            tracing::warn!(error = %e, "per-agent memory.db merge failure (file left in place)");
+        }
+    }
+
     let extension = config.extension.clone();
     let edition_override = config.edition;
     {
