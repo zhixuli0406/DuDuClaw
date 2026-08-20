@@ -381,3 +381,48 @@ debug spam.
   reap children) — irrelevant to the one-shot `docker run --rm` reproduction
   command above, where the whole container (and all its processes) is torn
   down on exit regardless.
+
+## VM cage real-seat input verification (verified 2026-08-20)
+
+The "Option A" plan above, executed — closing the honest limitation the
+nested headless live-run recorded ("鍵鼠輸入轉發未驗（headless 無輸入裝
+置）——grabs/input.rs 未被活體覆蓋"). Run by the Shell-S2 acceptance side
+inside the appliance QEMU VM (same instrumented invocation as
+`duduclaw-shell/BUILD-LINUX.md`'s stage B-③ — virtio-gpu + usb-kbd +
+usb-tablet + QMP + serial debug shell; see that file for the offline
+injection recipe, which additionally placed this crate's binary at
+`/usr/local/bin/duduclaw-comp` plus the `foot` + GL-runtime deb closure).
+
+The three-layer stack, now on a REAL seat instead of weston headless:
+
+```
+cage (DRM/KMS + seatd — the appliance image's own kiosk compositor)
+  └─ duduclaw-comp (winit backend, cage's single fullscreen client)
+       └─ foot (xdg-shell client on duduclaw-comp's own wayland-1 socket)
+```
+
+**Evidence (QMP screendump PNGs in `appliance/.vm/s2-evidence/`):**
+- `comp-foot.png` — foot's window (CSD titlebar + root shell prompt)
+  rendered inside duduclaw-comp inside cage on the virtio-gpu output;
+  comp's pointer cursor visible.
+- `comp-input.png` — after QMP-injected REAL input: pointer moved into
+  foot's window + left-click (click-to-focus), then key events typed
+  `echo compinputok42` + Enter — the terminal shows the command line, its
+  output, and a fresh prompt. Every event crossed
+  virtio-kbd/tablet → cage (libinput/seat) → wayland → comp's winit
+  window → **this crate's input forwarding** → foot.
+
+**Launch details worth keeping:** `LIBGL_ALWAYS_SOFTWARE=1` must be scoped
+to the duduclaw-comp CHILD only (`cage -d -- env LIBGL_ALWAYS_SOFTWARE=1
+duduclaw-comp`) — putting it on cage itself makes Mesa refuse
+("Not allowed to force software rendering when API explicitly selects a
+hardware device") and cage segfaults. Also `$XDG_RUNTIME_DIR` must exist
+with mode 0700 BEFORE cage starts (it segfaults, not errors, on a missing
+dir — observed twice). Inside cage, comp negotiated
+`PLATFORM_WAYLAND_KHR` EGL → GLES 3.2 on `llvmpipe (LLVM 19.1.7)` and
+created its `wayland-1` socket exactly as in the headless run.
+
+**Still unverified:** window-management grabs (move/resize drags — the
+smallvil-inherited `grabs/` module beyond plain focus-click), multi-client,
+popup grabs (still no-op upstream), and everything R1 (all software
+rendering; no frame-rate claims).
