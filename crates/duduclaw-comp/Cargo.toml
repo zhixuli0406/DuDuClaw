@@ -19,6 +19,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
 bitflags = "2.2.1"
 
+# CD-0 codrive spike (2026-08-21, DESIGN-codrive-desktop-2026-08.md §5):
+# the agent injection channel speaks JSON-lines over a private Unix socket
+# (not a Wayland protocol — see BUILD.md's "CD-0 codrive spike" section for
+# why). serde/serde_json are the standard, pure-Rust, cross-platform choice
+# for that; no Linux-only dependency risk beyond what smithay already pulls.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Version pin rationale (2026-08-19, Shell-S0 spike):
 # smithay's latest crates.io release is 0.7.0 (published 2025-06-24,
 # rust-version = "1.80.1"). We deliberately pin to the published release
