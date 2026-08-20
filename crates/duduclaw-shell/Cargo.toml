@@ -23,7 +23,30 @@ publish = false
 # incompatible with this crate's own gpui types — the whole point of
 # depending on that crate's `theme`/`mds_gpui` facade would be defeated.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef", features = ["profiler"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef", features = ["font-kit"] }
+# Shell-S2 (2026-08-20): `wayland` added to this list for Linux buildability
+# (DuDuClaw OS's actual target platform — macOS is the dev-loop host, not
+# the ship target). Verified at this pinned rev (vendored checkout
+# `crates/gpui_platform/Cargo.toml`): `gpui_platform`'s OWN feature default
+# is `[]`, and its Linux-only dependency `gpui_linux` is declared at the zed
+# workspace root with `default-features = false` — so without this,
+# `gpui_linux` compiles on Linux with NO windowing backend at all (its
+# `wayland`/`x11` features, which `gpui_linux`'s own crate-level `default =
+# ["wayland", "x11"]` would normally turn on, never reach it, because
+# `default-features = false` at the workspace-dependency level overrides
+# that). `gpui_platform`'s `wayland = ["gpui_linux/wayland"]` feature is the
+# only path that re-enables it. `x11` was deliberately left off: this crate
+# targets Wayland-only environments (weston headless for this round's
+# verification, real compositors for the appliance image later) and adding
+# an unused backend would just be extra build surface. Safe to add
+# unconditionally (not `[target.'cfg(...)'.dependencies]`-gated) because
+# `gpui_platform`'s own `[target.'cfg(any(target_os = "linux", target_os =
+# "freebsd"))'.dependencies] gpui_linux.workspace = true` entry already
+# means `gpui_linux` (and therefore this feature) is a no-op on macOS/
+# Windows — cargo's feature unification just never activates code that
+# isn't in the dependency graph for the host target. Confirmed inert on
+# macOS: `cargo test` here stays green after this change (see
+# `BUILD-LINUX.md`'s "macOS regression check" section).
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef", features = ["font-kit", "wayland"] }
 gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef" }
 
 # MDS theme tokens + hand-rolled component facade (`theme.rs` / `mds_gpui/`)
