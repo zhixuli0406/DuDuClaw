@@ -1,0 +1,43 @@
+[package]
+name = "duduclaw-shell"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Detach from the parent DuDuClaw workspace — same reasoning as
+# `duduclaw-native-gui`'s own Cargo.toml (see that file's comment): gpui
+# pulls the entire zed-industries/zed monorepo plus wgpu/metal/font-kit and
+# hundreds of transitive crates, and this crate additionally depends on
+# duduclaw-native-gui by PATH (not by registry). The root `Cargo.toml`
+# `[workspace] exclude` list already accounts for this crate
+# (`crates/duduclaw-shell` — added there by the parent task, not touched
+# from here).
+[workspace]
+
+[dependencies]
+# Pinned to the exact rev `duduclaw-native-gui/Cargo.toml` pins — required
+# to match: two different revs resolve to two distinct, incompatible `gpui`
+# package instances (D4 spike finding, see
+# `duduclaw-native-gui/src/mds_gpui/mod.rs`'s header comment), which would
+# make `duduclaw_native_gui::mds_gpui`'s `Div`/`Context`/etc. types
+# incompatible with this crate's own gpui types — the whole point of
+# depending on that crate's `theme`/`mds_gpui` facade would be defeated.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef", features = ["profiler"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef", features = ["font-kit"] }
+gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "7a7c3e1d2f03195c5fa19bc890da330ad7f3abef" }
+
+# MDS theme tokens + hand-rolled component facade (`theme.rs` / `mds_gpui/`)
+# — see `duduclaw-native-gui/src/lib.rs` for exactly what's exposed. Path
+# dependency: both crates are internal, unpublished (`publish = false`),
+# and live in the same repo.
+duduclaw-native-gui = { path = "../duduclaw-native-gui" }
+
+# Shell-S1: OOBE state persistence (`src/oobe/mod.rs`'s `oobe_state.json`).
+# Plain `serde`/`serde_json`, not `duduclaw-core` — same "hand-duplicate the
+# tiny bit of shared logic, don't pull in the gateway's dependency tree"
+# reasoning `duduclaw-native-gui/src/config.rs`'s own `config_path()` doc
+# comment gives (this crate is detached from the root workspace precisely
+# to keep gpui's build isolated). serde/serde_json are already common
+# transitive deps of gpui's own tree, so this adds negligible build cost.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
