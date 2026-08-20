@@ -665,9 +665,18 @@ async fn line_webhook_handler(
 
             // Attach quick-reply buttons to the LAST message (LINE only shows
             // quickReply on the most recent message). Presses arrive as
-            // `postback` events handled above.
+            // `postback` events handled above. P1: the goal-intent
+            // confirmation buttons when `reply` is the specific turn that
+            // just appended the confirmation menu, otherwise the ordinary
+            // conversation-control quick reply (unchanged from before P1).
             if let Some(last) = messages.last_mut() {
-                last["quickReply"] = channel_format::line_quick_reply();
+                last["quickReply"] = if crate::goal_intent::reply_has_confirmation_menu(&reply) {
+                    crate::goal_intent::pending_button_nonce(&session_id)
+                        .map(|nonce| channel_format::line_gintent_quick_reply(&nonce))
+                        .unwrap_or_else(channel_format::line_quick_reply)
+                } else {
+                    channel_format::line_quick_reply()
+                };
             }
 
             // Try Reply API first; if it fails (e.g. reply token expired after
@@ -722,6 +731,27 @@ async fn handle_postback(event: &LineEvent, state: &LineState, token: &str) {
                 Err(msg) => format!("⚠️ {msg}"),
             };
             let messages = vec![serde_json::json!({ "type": "text", "text": answer })];
+            if !send_reply_rich(&state.http, token, reply_token, messages.clone()).await {
+                push_message_rich(&state.http, token, sender, messages).await;
+            }
+            return;
+        }
+    }
+
+    // Goal-intent confirmation buttons (P1) — a separate, deliberately
+    // UN-authorized codec from `decision_action` above (see
+    // `channel_format`'s "Goal-intent confirmation" module doc): consuming
+    // it needs no pressing-user identity, only the single-use nonce. This
+    // whole webhook handler already runs in a `tokio::spawn`ed detached task
+    // (see the caller: "LINE times out a slow webhook response… blocking the
+    // 200 on a multi-second model reply gets the handler future… cancelled"),
+    // so awaiting `handle_gintent_button`'s possible plan-first LLM call here
+    // is safe — a since-expired reply token just falls through to the same
+    // Push API fallback every other LINE reply already uses.
+    if sender != "unknown" {
+        if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(data) {
+            let outcome = crate::goal_intent::handle_gintent_button(&state.ctx, choice, &nonce).await;
+            let messages = vec![serde_json::json!({ "type": "text", "text": outcome })];
             if !send_reply_rich(&state.http, token, reply_token, messages.clone()).await {
                 push_message_rich(&state.http, token, sender, messages).await;
             }

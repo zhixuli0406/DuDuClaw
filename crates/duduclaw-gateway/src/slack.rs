@@ -949,6 +949,22 @@ async fn handle_interactive_envelope(
         }
     }
 
+    // Goal-intent confirmation buttons (P1) — a separate, deliberately
+    // UN-authorized codec from `decision_action` above (see
+    // `channel_format`'s "Goal-intent confirmation" module doc): consuming
+    // it needs no pressing-user identity, only the single-use nonce.
+    // `handle_interactive_envelope` already runs detached (see the caller's
+    // own comment: "an AI reply can take minutes… blocking here would delay
+    // acks for subsequent envelopes"), so awaiting `handle_gintent_button`'s
+    // possible plan-first LLM call directly is safe. Posted `in_channel` (not
+    // ephemeral) so the result — a created goal task, or a generated plan —
+    // is visible the same way a plain-text `1`/`2`/`3` reply would have been.
+    if let Some((choice, nonce)) = crate::goal_intent::parse_gintent_action(action_data) {
+        let outcome = crate::goal_intent::handle_gintent_button(ctx, choice, &nonce).await;
+        respond_via_response_url(http, response_url, "in_channel", &outcome).await;
+        return;
+    }
+
     match action_id {
         "duduclaw:new_session" => {
             let session_id = if value.is_empty() {
@@ -1030,7 +1046,18 @@ async fn send_markdown_message(
         blocks.push(json!({ "type": "markdown", "text": chunk }));
         if i == last_idx {
             if let Some(sid) = session_id {
-                blocks.push(channel_format::slack_action_buttons(sid));
+                // P1: the goal-intent confirmation buttons when `markdown`
+                // (the full un-chunked reply) is the specific turn that just
+                // appended the confirmation menu, otherwise the ordinary
+                // conversation-control buttons (unchanged from before P1).
+                let buttons = if crate::goal_intent::reply_has_confirmation_menu(markdown) {
+                    crate::goal_intent::pending_button_nonce(sid)
+                        .map(|nonce| channel_format::slack_gintent_buttons(&nonce))
+                        .unwrap_or_else(|| channel_format::slack_action_buttons(sid))
+                } else {
+                    channel_format::slack_action_buttons(sid)
+                };
+                blocks.push(buttons);
             }
         }
 

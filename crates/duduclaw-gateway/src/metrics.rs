@@ -122,6 +122,17 @@ pub struct MetricsRegistry {
     /// `goal_bail_detect::pattern_names()` (a closed, small, code-defined
     /// set — safe to use directly as a Prometheus label, unlike free text).
     pub goal_loop_bail_pattern: RwLock<std::collections::HashMap<String, u64>>,
+
+    // ── Goal intent router (P0, `goal_intent.rs`) ──────────────────────
+    /// Outcomes for a channel-side goal suggestion, keyed by the closed,
+    /// code-defined outcome token (`suggested` / `accepted` / `plan_first` /
+    /// `dismissed` / `expired`) — never free text.
+    pub goal_intent: RwLock<std::collections::HashMap<String, u64>>,
+    /// L2 grey-band arbitration verdicts, keyed by `(engine, verdict)` — both
+    /// closed, code-defined vocabularies (`engine` ∈ {`local`, `reply_tag`};
+    /// `verdict` ∈ {`suggested`, `chat`}).
+    pub goal_intent_l2: RwLock<std::collections::HashMap<(String, String), u64>>,
+
 }
 
 const DURATION_BOUNDS_MS: [u64; 7] = [100, 250, 500, 1000, 2500, 5000, 10000];
@@ -200,6 +211,10 @@ impl MetricsRegistry {
             tick_wakes: RwLock::new(std::collections::HashMap::new()),
 
             goal_loop_bail_pattern: RwLock::new(std::collections::HashMap::new()),
+
+            goal_intent: RwLock::new(std::collections::HashMap::new()),
+            goal_intent_l2: RwLock::new(std::collections::HashMap::new()),
+
         }
     }
 
@@ -281,6 +296,21 @@ impl MetricsRegistry {
     pub async fn goal_loop_bail_pattern_hit(&self, pattern: &str) {
         let mut map = self.goal_loop_bail_pattern.write().await;
         *map.entry(pattern.to_string()).or_insert(0) += 1;
+    }
+
+    // ── Goal intent router (P0) ─────────────────────────────────────────
+
+    /// Record one `outcome` for `goal_intent_total` (`suggested` /
+    /// `accepted` / `plan_first` / `dismissed` / `expired`).
+    pub async fn goal_intent_event(&self, outcome: &str) {
+        let mut map = self.goal_intent.write().await;
+        *map.entry(outcome.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record one L2 grey-band verdict for `goal_intent_l2_total`.
+    pub async fn goal_intent_l2_event(&self, engine: &str, verdict: &str) {
+        let mut map = self.goal_intent_l2.write().await;
+        *map.entry((engine.to_string(), verdict.to_string())).or_insert(0) += 1;
     }
 
     // ── PTY pool helpers (Phase 8 production-rollout observability) ───
@@ -744,6 +774,24 @@ impl MetricsRegistry {
             out.push_str(&format!("goal_loop_bail_pattern_total{{pattern=\"{pattern}\"}} {count}\n"));
         }
 
+        // ── Goal intent router (P0) ──
+        out.push_str(
+            "# HELP goal_intent_total Channel-side goal suggestion outcomes, by outcome.\n",
+        );
+        out.push_str("# TYPE goal_intent_total counter\n");
+        for (outcome, count) in self.goal_intent.read().await.iter() {
+            out.push_str(&format!("goal_intent_total{{outcome=\"{outcome}\"}} {count}\n"));
+        }
+        out.push_str(
+            "# HELP goal_intent_l2_total L2 grey-band arbitration verdicts, by engine and verdict.\n",
+        );
+        out.push_str("# TYPE goal_intent_l2_total counter\n");
+        for ((engine, verdict), count) in self.goal_intent_l2.read().await.iter() {
+            out.push_str(&format!(
+                "goal_intent_l2_total{{engine=\"{engine}\",verdict=\"{verdict}\"}} {count}\n"
+            ));
+        }
+
         out
     }
 }
@@ -1149,4 +1197,39 @@ mod tests {
         assert!(output.contains("tick_screen_total{outcome=\"drop\"} 0"));
         assert!(output.contains("tick_wakes_total{rule=\"rule-1\"} 1"));
     }
+
+    // ── Goal intent router (P0) ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn goal_intent_event_counts_by_outcome() {
+        let r = MetricsRegistry::new();
+        r.goal_intent_event("suggested").await;
+        r.goal_intent_event("suggested").await;
+        r.goal_intent_event("accepted").await;
+        let map = r.goal_intent.read().await;
+        assert_eq!(map.get("suggested"), Some(&2));
+        assert_eq!(map.get("accepted"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn goal_intent_l2_event_counts_by_engine_and_verdict() {
+        let r = MetricsRegistry::new();
+        r.goal_intent_l2_event("reply_tag", "suggested").await;
+        r.goal_intent_l2_event("reply_tag", "chat").await;
+        r.goal_intent_l2_event("reply_tag", "chat").await;
+        let map = r.goal_intent_l2.read().await;
+        assert_eq!(map.get(&("reply_tag".to_string(), "suggested".to_string())), Some(&1));
+        assert_eq!(map.get(&("reply_tag".to_string(), "chat".to_string())), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn render_emits_goal_intent_metric_labels() {
+        let r = MetricsRegistry::new();
+        r.goal_intent_event("suggested").await;
+        r.goal_intent_l2_event("reply_tag", "suggested").await;
+        let output = r.render().await;
+        assert!(output.contains("goal_intent_total{outcome=\"suggested\"} 1"));
+        assert!(output.contains("goal_intent_l2_total{engine=\"reply_tag\",verdict=\"suggested\"} 1"));
+    }
+
 }

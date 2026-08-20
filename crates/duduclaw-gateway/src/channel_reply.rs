@@ -1497,6 +1497,26 @@ async fn build_reply_with_session_inner(
     let agent_id = agent
         .map(|a| a.config.agent.name.clone())
         .unwrap_or_default();
+
+    // ── Goal intent router (P0, `goal_intent.rs`) ──────────────────────
+    // Placed after the access gate and takeover interception above (never
+    // bypasses either) and after `agent_id` resolution, so both the pending-
+    // suggestion confirmation and the L0/L1 classifier have the same
+    // resolved-agent identity every other gate on this path uses. A bare
+    // "1"/"2"/"3" reply to a live suggestion is handled entirely here, at
+    // zero LLM cost — the caller returns immediately without touching the
+    // AI pipeline below. `goal_intent_precheck` (used further down, both for
+    // the L2-B system-prompt injection and the post-reply `finalize` call)
+    // is computed unconditionally so classification runs on every turn that
+    // reaches this far, exactly once.
+    if let Some(pending_reply) =
+        crate::goal_intent::intercept_pending_confirmation(ctx, session_id, user_id, text).await
+    {
+        return pending_reply;
+    }
+    let goal_intent_precheck =
+        crate::goal_intent::precheck(ctx, session_id, &agent_id, user_id, text).await;
+
     // OTel: record resolved agent/model on the `invoke_agent` span. The
     // channel-reply path is Claude-first (rotator/CLI/Direct API); a routed
     // non-Claude call carries its own provider on the nested `chat` span.
@@ -2320,6 +2340,25 @@ async fn build_reply_with_session_inner(
             {
                 prompt = format!("{prompt}\n\n{section}");
             }
+        }
+
+        // Goal intent router (P0) — L2-B grey-band instruction. Only present
+        // when THIS turn's own L0/L1 score landed in the grey band
+        // (`goal_intent_precheck`, computed once above); a per-turn
+        // condition, so it must never enter the cached prefix. Fixed text,
+        // no user input embedded — see `goal_intent::l2b_reply_tag_instruction`.
+        if matches!(goal_intent_precheck.action, crate::goal_intent::GoalIntentAction::GrayCandidate)
+        {
+            prompt = format!("{prompt}\n\n{}", crate::goal_intent::l2b_reply_tag_instruction());
+        }
+
+        // O-4: system-operator guidance. Only present when `os_operator::decide`
+        // (computed once above, before this prompt-build block) resolved this
+        // turn to a ready, non-destructive `SystemOp` for a `system_operator`-
+        // capable agent — a per-turn condition, so it must never enter the
+        // cached prefix, same placement rule as the goal-intent block above.
+        if let Some(hint) = &operator_guide_hint {
+            prompt = format!("{prompt}\n\n{hint}");
         }
 
         if !compression_summary.is_empty() {
@@ -4539,6 +4578,31 @@ async fn build_reply_with_session_inner(
                 }
             }
         });
+
+        // ── Goal intent router (P0) — append the confirmation menu (or
+        // parse+strip the L2-B `<goal_suggest>` tag) on the way out. A
+        // `GoalIntentAction::None` action — the overwhelming common case —
+        // is a pure pass-through (one `to_string`, no other work). Runs
+        // AFTER the background spawns above capture their own clones of the
+        // pre-finalize `reply`, so wiki_ingest / skill_recorder see the raw
+        // model output (including an unstripped `<goal_suggest>` tag on a
+        // Gray-band hit) rather than the user-facing confirmation menu —
+        // documented, low-severity P0 gap (the tag is routing metadata, not
+        // secret data; follow-up would move this earlier if it matters).
+        //
+        // `text` (the raw function parameter), NOT `sanitized_text` — the
+        // latter carries a `[user_id]\n` sender-metadata prefix
+        // (`SENDER_PREFIX_OPEN`) that must never leak into a goal task's
+        // description.
+        let reply = crate::goal_intent::finalize(
+            ctx,
+            session_id,
+            &agent_id,
+            goal_intent_precheck.action,
+            text,
+            &reply,
+        )
+        .await;
 
         return reply;
     }

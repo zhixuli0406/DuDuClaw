@@ -1740,7 +1740,14 @@ impl AutopilotEngine {
             "goal:os_watch".to_string(),
         );
         task.goal_mode = true;
-        task.acceptance_criteria = Some(criteria);
+        task.acceptance_criteria = Some(criteria.clone());
+        // H9-G goal contract freeze (harness-borrowings 2026-08 WP-D): same
+        // immutable-baseline snapshot as the other two goal-creation paths
+        // (`chat_commands::handle_goal_create`, `handlers::handle_tasks_goal_create`)
+        // — this was the one creation path that left the column NULL, so the
+        // acceptance judge read an unset baseline for an os_watch-kicked-off
+        // goal (goal-intent-router 2026-08-17 audit).
+        task.acceptance_criteria_baseline = Some(criteria);
 
         self.task_store.insert_task(&task).await?;
 
@@ -3101,6 +3108,14 @@ mod tests {
         assert_eq!(t.description, "整理發票.pdf 到月報");
         assert_eq!(t.acceptance_criteria.as_deref(), Some("月報含發票金額"));
         assert_eq!(t.status, "todo");
+        // goal-intent-router 2026-08-17 audit: os_watch was the one goal-
+        // creation path that left this column NULL — the judge must read the
+        // same frozen baseline every other `/goal` path freezes.
+        assert_eq!(
+            t.acceptance_criteria_baseline.as_deref(),
+            Some("月報含發票金額"),
+            "baseline must be frozen at creation, same as the chat/dashboard goal paths"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3123,6 +3138,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tasks[0].acceptance_criteria.as_deref(), Some("整理發票"));
+        assert_eq!(
+            tasks[0].acceptance_criteria_baseline.as_deref(),
+            Some("整理發票"),
+            "baseline must match the description-as-criteria default too"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

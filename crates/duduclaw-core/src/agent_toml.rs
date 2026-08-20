@@ -223,6 +223,37 @@ pub struct ExternalMcpEntryView {
     pub denied_tools: Tri<Vec<String>>,
 }
 
+/// `agent.toml [goal_intent]` — per-agent override for the channel-side goal
+/// intent router (P0, `commercial/docs/DESIGN-goal-intent-router-2026-08.md`).
+///
+/// Every field is optional: an absent key falls back to the global
+/// `config.toml [goal_intent]` value, which itself falls back to the hard
+/// default. The merge (global → per-agent, per-field) lives in
+/// `duduclaw_gateway::goal_intent::GoalIntentConfig::resolve` — this type is
+/// only the typed, no-shadow-reader parse point for the agent.toml side,
+/// same discipline as every other section in this file.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct GoalIntentSectionView {
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub enabled: Option<bool>,
+    /// `"auto"` / `"local"` / `"reply_tag"` / `"off"`. Unrecognized values are
+    /// handled by the caller (falls back to `auto`), not here — this is a raw
+    /// projection, same convention as `resume_on_restart` elsewhere.
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub mode: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub t_goal: Option<i64>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub t_gray: Option<i64>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub cooldown_minutes: Option<i64>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub daily_cap: Option<i64>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
+    pub suggest_ttl_minutes: Option<i64>,
+}
+
 /// Every `agent.toml` section the migrated readers touch, in one tolerant
 /// parse.
 ///
@@ -262,6 +293,8 @@ pub struct AgentTomlSections {
     pub skills: SkillsSectionView,
     #[serde(deserialize_with = "crate::lenient::or_default")]
     pub mcp: McpSectionView,
+    #[serde(deserialize_with = "crate::lenient::or_default")]
+    pub goal_intent: GoalIntentSectionView,
 }
 
 /// Parse the sections out of an `agent.toml` string.
