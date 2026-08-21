@@ -113,6 +113,7 @@ pub mod relay_device;
 pub mod rule_induction;
 pub mod approval;
 pub mod approval_notify;
+pub mod codrive;
 pub mod channel_link;
 pub mod deep_link;
 pub(crate) mod local_session;

@@ -1,0 +1,358 @@
+//! CD-1 co-drive script orchestration entry point: [`run_script`].
+//!
+//! Handles the whole-script refuse-list (§8-3), connects to comp, then
+//! walks the steps via [`super::step::run_one_step`] — per-step
+//! ApprovalBroker gating, wire dispatch, and freeze/resume retry live in
+//! `step.rs` (split out to keep both files under this project's per-file
+//! size convention). This file owns the report shape, the activity-feed
+//! ticker, and the top-level control flow.
+//!
+//! Design authority: `commercial/docs/DESIGN-codrive-desktop-2026-08.md`
+//! §3.4 (approval reuse), §6 (safety red lines), §8-3 (refuse-list).
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use serde_json::json;
+
+use crate::approval::ApprovalBroker;
+use crate::events_store::EventBusStore;
+use crate::task_store::{ActivityRow, TaskStore};
+
+use super::client::CodriveClient;
+use super::config::CodriveConfig;
+use super::script::{CodriveScript, ConsequentialClass};
+use super::step::{TOOL_NAME, run_one_step};
+
+/// Refuse-list keywords (design §8-3 initial list): hitting one of these
+/// in `target_app` / `task_summary` / any step narration refuses the WHOLE
+/// script before any connection is attempted — not even an approval row is
+/// created.
+const DENY_KEYWORDS: &[&str] = &["網銀", "netbank", "online banking", "captcha"];
+
+/// Per-step outcome of one `codrive_run` call.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodriveStepReport {
+    pub index: usize,
+    pub narration: String,
+    /// One of: `applied` / `refused` / `denied` / `dropped_frozen_reapplied`
+    /// / `aborted`.
+    pub outcome: &'static str,
+    pub detail: Option<String>,
+    pub approval_id: Option<String>,
+    pub at: String,
+}
+
+/// Full report of one `codrive_run` call — this IS the tool's JSON
+/// response shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodriveRunReport {
+    pub session_id: String,
+    /// e.g. `completed` / `refused_invalid` / `refused_denylist` /
+    /// `refused_credential` / `aborted_connect` / `aborted_approval_denied`
+    /// / `aborted_approval_expired` / `aborted_frozen_timeout` /
+    /// `aborted_emergency_stop` / `aborted_connection_lost`.
+    pub final_state: &'static str,
+    pub detail: Option<String>,
+    pub steps: Vec<CodriveStepReport>,
+}
+
+/// Run one co-drive script end to end. Never panics; every failure path
+/// (refuse-list hit, connect failure, approval denial, freeze timeout,
+/// emergency stop) returns an honest report instead — "空結果優於假結果".
+pub async fn run_script(
+    home_dir: &Path,
+    agent_id: &str,
+    script: CodriveScript,
+) -> CodriveRunReport {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut steps: Vec<CodriveStepReport> = Vec::new();
+
+    let script = match script.sanitize() {
+        Ok(s) => s,
+        Err(e) => {
+            return CodriveRunReport {
+                session_id,
+                final_state: "refused_invalid",
+                detail: Some(e),
+                steps,
+            };
+        }
+    };
+
+    // ── §8-3 refuse-list: hit ⇒ refuse the whole script, no approval row. ─
+    if let Some(reason) = denylist_hit(&script) {
+        duduclaw_security::audit::append_tool_call_denied(
+            home_dir,
+            agent_id,
+            TOOL_NAME,
+            "codrive_refused_denylist",
+            &reason,
+            None,
+        );
+        ticker(
+            home_dir,
+            agent_id,
+            "codrive_session",
+            &session_id,
+            &format!("共駕請求被拒（拒做清單）：{reason}"),
+        )
+        .await;
+        return CodriveRunReport {
+            session_id,
+            final_state: "refused_denylist",
+            detail: Some(reason),
+            steps,
+        };
+    }
+    if let Some(reason) = credential_hit(&script) {
+        duduclaw_security::audit::append_tool_call_denied(
+            home_dir,
+            agent_id,
+            TOOL_NAME,
+            "codrive_refused_credential",
+            &reason,
+            None,
+        );
+        ticker(
+            home_dir,
+            agent_id,
+            "codrive_session",
+            &session_id,
+            &format!("共駕請求被拒（憑證類一律交人）：{reason}"),
+        )
+        .await;
+        return CodriveRunReport {
+            session_id,
+            final_state: "refused_credential",
+            detail: Some(reason),
+            steps,
+        };
+    }
+
+    let cfg = CodriveConfig::from_home(home_dir);
+    let (socket_path, token) = match resolve_endpoint(&cfg).await {
+        Ok(v) => v,
+        Err(e) => {
+            ticker(
+                home_dir,
+                agent_id,
+                "codrive_session",
+                &session_id,
+                &format!("共駕連線設定錯誤：{e}"),
+            )
+            .await;
+            return CodriveRunReport {
+                session_id,
+                final_state: "aborted_connect",
+                detail: Some(e),
+                steps,
+            };
+        }
+    };
+    let connect_timeout = Duration::from_secs(cfg.connect_timeout_secs.max(1));
+    let mut client = match CodriveClient::connect(&socket_path, &token, connect_timeout).await {
+        Ok(c) => c,
+        Err(e) => {
+            let detail = e.to_string();
+            ticker(
+                home_dir,
+                agent_id,
+                "codrive_session",
+                &session_id,
+                &format!("共駕連線失敗：{detail}"),
+            )
+            .await;
+            return CodriveRunReport {
+                session_id,
+                final_state: "aborted_connect",
+                detail: Some(detail),
+                steps,
+            };
+        }
+    };
+
+    ticker(
+        home_dir,
+        agent_id,
+        "codrive_session",
+        &session_id,
+        &format!("開始共駕：{}", script.task_summary),
+    )
+    .await;
+
+    // Fail-closed: if the broker can't even open, every consequential step
+    // is denied (see `step::run_one_step`'s `broker.is_none()` branch) — a
+    // script with no consequential steps still runs fine.
+    let broker = ApprovalBroker::open(home_dir).ok();
+    let started = Instant::now();
+    let deadline = Duration::from_secs(cfg.max_session_secs.max(1));
+
+    let mut final_state: &'static str = "completed";
+    let mut final_detail: Option<String> = None;
+
+    for (index, step) in script.steps.iter().enumerate() {
+        ticker(
+            home_dir,
+            agent_id,
+            "codrive_step",
+            &session_id,
+            &step.narration,
+        )
+        .await;
+        match run_one_step(
+            &mut client,
+            broker.as_ref(),
+            home_dir,
+            agent_id,
+            &session_id,
+            &script.target_app,
+            index,
+            step,
+            &cfg,
+            started,
+            deadline,
+        )
+        .await
+        {
+            Ok(s) => {
+                let outcome = if s.reapplied {
+                    "dropped_frozen_reapplied"
+                } else {
+                    "applied"
+                };
+                steps.push(step_report(
+                    index,
+                    &step.narration,
+                    outcome,
+                    None,
+                    s.approval_id,
+                ));
+            }
+            Err(a) => {
+                steps.push(step_report(
+                    index,
+                    &step.narration,
+                    a.step_outcome,
+                    Some(a.detail.clone()),
+                    a.approval_id,
+                ));
+                final_state = a.final_state;
+                final_detail = Some(a.detail);
+                break;
+            }
+        }
+    }
+
+    ticker(
+        home_dir,
+        agent_id,
+        "codrive_session",
+        &session_id,
+        &format!("共駕結束：{final_state}"),
+    )
+    .await;
+    CodriveRunReport {
+        session_id,
+        final_state,
+        detail: final_detail,
+        steps,
+    }
+}
+
+fn denylist_hit(script: &CodriveScript) -> Option<String> {
+    let mut haystacks: Vec<&str> = vec![script.target_app.as_str(), script.task_summary.as_str()];
+    haystacks.extend(script.steps.iter().map(|s| s.narration.as_str()));
+    for kw in DENY_KEYWORDS {
+        if haystacks
+            .iter()
+            .any(|h| duduclaw_core::word_contains_ci(h, kw))
+        {
+            return Some(format!("命中拒做關鍵詞「{kw}」"));
+        }
+    }
+    None
+}
+
+fn credential_hit(script: &CodriveScript) -> Option<String> {
+    script.steps.iter().enumerate().find_map(|(i, step)| {
+        step.consequential
+            .as_ref()
+            .filter(|c| c.class == ConsequentialClass::Credential)
+            .map(|_| format!("步驟 {} 含憑證類後果動作，一律交人", i + 1))
+    })
+}
+
+async fn resolve_endpoint(cfg: &CodriveConfig) -> Result<(std::path::PathBuf, String), String> {
+    let socket_path = cfg.resolved_socket_path()?;
+    let token_path = cfg.resolved_token_path()?;
+    let token = tokio::fs::read_to_string(&token_path)
+        .await
+        .map_err(|e| format!("讀取共駕鑑別 token 失敗（{}）：{e}", token_path.display()))?;
+    Ok((socket_path, token.trim().to_string()))
+}
+
+fn step_report(
+    index: usize,
+    narration: &str,
+    outcome: &'static str,
+    detail: Option<String>,
+    approval_id: Option<String>,
+) -> CodriveStepReport {
+    CodriveStepReport {
+        index,
+        narration: narration.to_string(),
+        outcome,
+        detail,
+        approval_id,
+        at: now_rfc3339(),
+    }
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Post one activity-feed entry (menu-bar / notification ticker). MCP
+/// subprocesses have no `event_tx` back into the gateway, so this goes
+/// through the same durable path `handle_activity_post` uses
+/// (`duduclaw-cli/src/mcp.rs`): `TaskStore::append_activity` +
+/// `EventBusStore` `activity.new` broadcast. `session_id` is stamped as
+/// `task_id` purely to group a session's rows in the feed — this is a
+/// co-drive session, not a task-board task, and `activity.task_id` carries
+/// no foreign-key constraint. `pub(super)` so `step.rs` can post its own
+/// freeze/resume ticker entries through the same path.
+pub(super) async fn ticker(
+    home_dir: &Path,
+    agent_id: &str,
+    event_type: &str,
+    session_id: &str,
+    summary: &str,
+) {
+    let Ok(store) = TaskStore::open(home_dir) else {
+        tracing::warn!("codrive: failed to open task store for ticker");
+        return;
+    };
+    let row = ActivityRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: event_type.to_string(),
+        agent_id: agent_id.to_string(),
+        task_id: Some(session_id.to_string()),
+        summary: duduclaw_core::truncate_chars(summary, 500),
+        timestamp: now_rfc3339(),
+        metadata: None,
+    };
+    if store.append_activity(&row).await.is_err() {
+        tracing::warn!("codrive: append_activity failed");
+        return;
+    }
+    if let Ok(bus) = EventBusStore::open(home_dir) {
+        let payload = json!({
+            "id": row.id, "type": row.event_type, "agent_id": row.agent_id,
+            "task_id": row.task_id, "summary": row.summary,
+            "timestamp": row.timestamp, "metadata": row.metadata,
+        });
+        let _ = bus.append("activity.new", &payload.to_string()).await;
+    }
+}

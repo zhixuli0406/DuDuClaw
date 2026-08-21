@@ -90,6 +90,15 @@ const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
     "os_doctor_repair",
 ];
 
+/// The human-machine co-drive MCP tool face gated by the `[capabilities]
+/// codrive` master switch (CD-1,
+/// `commercial/docs/DESIGN-codrive-desktop-2026-08.md` §6 red line 1).
+/// Same deny-by-default shape as [`OS_NATIVE_TOOLS`] / [`RECORDING_TOOLS`]
+/// / [`SYSTEM_OPERATOR_TOOLS`] — `codrive_run` is already `Scope::Admin`
+/// (mcp_auth.rs), but scope alone is opt-out; this makes it opt-in per
+/// agent regardless of scope.
+const CODRIVE_TOOLS: &[&str] = &["codrive_run"];
+
 /// Neutralize `os_notify` `title`/`body` in place for the user's visual surface
 /// (P2-5). Each value is replaced by its perception-sanitized form (control
 /// chars stripped, angle brackets defanged, CJK-safe truncation) and any
@@ -144,6 +153,7 @@ struct AgentGateConfig {
     os_native: bool,
     recording: bool,
     system_operator: bool,
+    codrive: bool,
     denied_tools: Vec<String>,
     allowed_tools: Vec<String>,
 }
@@ -170,6 +180,7 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
             os_native: cfg.capabilities.os_native,
             recording: cfg.capabilities.recording,
             system_operator: cfg.capabilities.system_operator,
+            codrive: cfg.capabilities.codrive,
             denied_tools: cfg.capabilities.denied_tools,
             allowed_tools: cfg.capabilities.allowed_tools,
         },
@@ -178,7 +189,7 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
                 agent = %agent_id,
                 error = %e,
                 "malformed agent.toml [capabilities] — PolicyKernel abstains (empty policy) \
-                 and os_native / recording / system_operator default to false (fail-closed)"
+                 and os_native / recording / system_operator / codrive default to false (fail-closed)"
             );
             AgentGateConfig::default()
         }
@@ -769,6 +780,22 @@ impl McpDispatcher {
                      [capabilities] system_operator = true 後再使用。"
                 ),
             );
+        }
+
+        // ── 3.627 Co-drive capability gate (CD-1, deny-by-default, I5) ───────
+        // `codrive_run` is already `Scope::Admin`-scoped, but scope alone is
+        // an opt-out posture (design red line 1: "共駕能力預設關；開啟是
+        // per-agent 明確授權"). Same fail-closed shape as the OS-native/
+        // recording/system-operator gates above: missing/malformed config
+        // resolves to `codrive = false` in `load_agent_gate_config`.
+        if CODRIVE_TOOLS.contains(&tool_name) && !agent_gate.codrive {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            let msg = format!(
+                "工具「{tool_name}」需要人機共駕能力，但此代理未啟用。請在 agent.toml 設定 \
+                 [capabilities] codrive = true 後再使用。"
+            );
+            self.audit_dispatch_denial(tool_name, &params_owned, "codrive_capability_missing", &msg);
+            return jsonrpc_error(id, -32003, &msg);
         }
 
         // ── 3.63 os_notify perception-load neutralization (P2-5) ────────────

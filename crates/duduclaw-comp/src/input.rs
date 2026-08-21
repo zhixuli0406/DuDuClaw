@@ -61,6 +61,21 @@ impl DuduclawComp {
                             && handle.modified_sym() == Keysym::new(keysyms::KEY_Escape)
                         {
                             data.emergency_stop("super+esc");
+                        } else if key_state == KeyState::Pressed
+                            && modifiers.logo
+                            && handle.modified_sym() == Keysym::new(keysyms::KEY_Return)
+                        {
+                            // CD-1 human-side "交還" (DESIGN §3.1: "『交還』
+                            // 是明確動作（按鈕/Super+Enter）", task brief
+                            // req 2). Same structural guarantee as
+                            // Super+Esc above: only the human keyboard
+                            // path can ever reach this, so the agent
+                            // cannot self-resume by forging the combo.
+                            // Same container-vs-VM verification split as
+                            // Super+Esc too — see `codrive/debug_sim.rs`'s
+                            // `simulate_super_enter` line for the
+                            // container-level state-machine coverage.
+                            data.human_resume();
                         }
                         FilterResult::Forward
                     },

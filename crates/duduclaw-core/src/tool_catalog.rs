@@ -949,6 +949,16 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "mail:send",
         "channel",
     ),
+    // ── Human-machine co-drive (CD-1, DESIGN-codrive-desktop-2026-08.md) ──
+    // GUI-level mouse/keyboard injection into a shared desktop, gated by
+    // `[capabilities] codrive` (deny-by-default) on top of Admin scope —
+    // matching `tool_requires_scope`'s explicit `codrive_run` arm.
+    (
+        "codrive_run",
+        "Run a scripted human-machine co-drive session (GUI mouse/keyboard, human-supervised)",
+        "admin",
+        "codrive",
+    ),
     (
         "activity_list",
         "List recent Activity Feed events",

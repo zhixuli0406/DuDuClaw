@@ -755,6 +755,18 @@ pub struct CapabilitiesConfig {
     #[serde(default)]
     pub system_operator: bool,
 
+    /// Opt-in human-machine co-drive (人機共駕, CD-1,
+    /// `commercial/docs/DESIGN-codrive-desktop-2026-08.md` §6 red line 1:
+    /// "共駕能力預設關；開啟是 per-agent 明確授權"). Master switch for the
+    /// `codrive_run` MCP tool — GUI-level mouse/keyboard injection into a
+    /// shared desktop via the `duduclaw-comp` compositor's agent-injection
+    /// socket. Default `false`: even an Admin-scoped agent is denied
+    /// `codrive_run` at the dispatch gate unless an operator explicitly
+    /// sets this to `true` on that specific agent — fail-closed, same
+    /// deny-by-default shape as `system_operator` / `recording`.
+    #[serde(default)]
+    pub codrive: bool,
+
     // ── Formerly-untyped `[capabilities]` keys (R2 unification) ─────────
     //
     // These six lived in the same `[capabilities]` table as the fields above
@@ -959,6 +971,7 @@ impl Default for CapabilitiesConfig {
             recording: false,
             git_credentials: false,
             system_operator: false,
+            codrive: false,
             scoped_tools: Vec::new(),
             grant_ttl_secs: None,
             approval_required_tools: Vec::new(),

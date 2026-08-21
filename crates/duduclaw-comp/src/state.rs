@@ -14,7 +14,7 @@ use smithay::{
             Display, DisplayHandle,
         },
     },
-    utils::{Logical, Point},
+    utils::{Logical, Point, Rectangle},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         output::OutputManagerState,
@@ -71,6 +71,13 @@ pub struct DuduclawComp {
     /// `codrive::handle_agent_inject`. `None` until the first human input
     /// of this process's lifetime.
     pub codrive_freeze_set_at: Option<std::time::Instant>,
+    /// CD-1 (DESIGN §3.3.2(b) target highlight box, task brief req 5): the
+    /// currently active highlight rectangle and its expiry instant, or
+    /// `None` if no highlight is active. Set by `codrive::handle_agent_
+    /// inject`'s `Highlight` arm; read (and cleared on expiry) by
+    /// `codrive::highlight::DuduclawComp::codrive_highlight_elements`,
+    /// called once per redraw from `winit_backend.rs`.
+    pub codrive_highlight: Option<(Rectangle<f64, Logical>, std::time::Instant)>,
 }
 
 impl DuduclawComp {
@@ -126,6 +133,7 @@ impl DuduclawComp {
             agent_seat,
             codrive,
             codrive_freeze_set_at: None,
+            codrive_highlight: None,
         }
     }
 
