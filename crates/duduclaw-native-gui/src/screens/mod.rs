@@ -41,6 +41,17 @@ pub mod canvas;
 pub mod channels;
 pub mod chat;
 pub mod console;
+// WP-S6b2-N (S6b 第二波, 2026-08-21) — "新增員工" (CreateAgent, `CreateAgent.
+// dc.html`). No `nav.rs` entry — reached from the "AI 員工" list's own
+// "新員工" button (`agents_list.rs`, this pass flips it from an honest
+// disabled stub to a real `active_page = "createAgent"` click). `create_
+// agent_data` (types + pure parsing) is a sibling, split off for the same
+// file-size reason `agents_data.rs`/`goals_data.rs` are split from their own
+// page modules — see `create_agent.rs`'s own module doc comment for RPC
+// shapes and the assembled-vs-wired boundary.
+pub mod create_agent;
+mod create_agent_data;
+mod create_agent_sections;
 pub mod dashboard;
 mod dashboard_cards;
 // S5b1-A (2026-08-21) — the "裝置" page. `device_backup` (backup/restore +
@@ -54,6 +65,19 @@ mod device_backup;
 // `distributor.list` RPC shape, why `distributor.status` isn't ALSO called,
 // and the tier-badge/fingerprint-mask canvas deviations.
 pub mod distributors;
+// WP-S6b2-N (S6b 第二波, 2026-08-21) — "編輯員工" (EditAgent, `EditAgent.dc.
+// html`). `edit_agent_data` (types + pure parsing), `edit_agent_tabs_a`
+// (技能/工具/整合/一般), `edit_agent_tabs_b` (大腦/預算/自動化/進階) are
+// siblings of `edit_agent`, split off for the same file-size reason
+// `tasks`/`tasks_data`/`tasks_detail`/`tasks_detail_data`/`tasks_quickview`
+// are split (see `edit_agent.rs`'s own module doc comment for the RPC
+// shapes, the read-only-this-round scope decision, and the per-tab "誠實
+// 偏差" field citations). No `nav.rs` entry — reached via `screens::agents_
+// detail`'s own "編輯" button, or `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=editAgent`.
+pub mod edit_agent;
+mod edit_agent_data;
+mod edit_agent_tabs_a;
+mod edit_agent_tabs_b;
 // WP-S5b2-E (2026-08-21) — "AI 團隊" (`Experts.dc.html`). Single-file page —
 // see the module's own doc comment for RPC shapes and canvas deviations
 // (the catalog-card skill/wiki-count fabrication the canvas draws but the
@@ -127,6 +151,16 @@ pub mod mcp;
 // for RPC shapes and why it carries its own local breadcrumb instead of
 // widening `settings_common::breadcrumb`.
 pub mod mcp_keys;
+// WP-S6b2-M (S6b 第二波, 2026-08-21) — "資料搬家" (`Migrate.dc.html`, B16
+// full-screen wizard). `migrate_views` (its own `screens/migrate/`
+// subdirectory, `mod migrate_views;` declared inside `migrate.rs` itself —
+// same page-private-sibling shape `plans.rs`/`routines.rs` establish) holds
+// the three per-step content panels. See `migrate.rs`'s own module doc
+// comment for the `migrate.scan`/`migrate.apply` RPC shapes, why this page
+// bypasses the normal sidebar/content-list/content_shell composition
+// entirely (a `shell.rs`-level root swap, not an overlay), and the canvas-
+// fidelity deviations (outer window-mockup chrome dropped).
+pub mod migrate;
 // WP-S5b3-I (2026-08-21) — 記憶 (`Memory.dc.html`, B14). `memory_rows`
 // (category rail + list column) / `memory_detail` (right detail column) are
 // nested submodules declared inside `memory.rs` itself (files at
@@ -160,6 +194,14 @@ pub mod os;
 // mod, `pub fn`/`pub struct` items reachable via `crate::screens::panzoom::…`"
 // shape `agents_data`/`goals_data`/`catalog_common` already establish.
 mod panzoom;
+// WP-S6b2-O (S6b 第二波, 2026-08-21) — "桌寵工作室" (`PetStudio.dc.html`, B21
+// 獨立工具視窗). No `nav.rs` entry (the canvas frames it as reached from the
+// mascot's right-click menu / menu bar, not the sidebar) — self-attached in
+// `screens/shell.rs` only, `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=petStudio`. See
+// the module's own doc comment for why this is the one page in the batch
+// with NO reachable RPC/bridge at all (Tauri-only `pet_*` commands, a
+// different runtime than this crate).
+pub mod pet_studio;
 // WP-S6b1-J (2026-08-21) — "經銷夥伴入口" (`PartnerPortalPage.dc.html`, B19),
 // the LicenseShell's second tab (see `screens::license`). See the module's
 // own doc comment for the `partner.*` RPC shapes and canvas deviations.
@@ -248,6 +290,25 @@ pub mod shell;
 // Single-file page — see the module's own doc comment for RPC shapes and
 // the real 8-token category list vs the canvas's illustrative zh-TW chips.
 pub mod skills;
+// WP-S6b2-N (S6b 第二波, 2026-08-21) — 自建技能詳情 (SkillCustomDetail,
+// `SkillCustomDetail.dc.html`). No `nav.rs` entry of its own — a
+// `skills.rs` drill-down conceptually, same shape `skill_new.rs` right
+// below already establishes; reachable only via
+// `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=skillCustom` this round (no "我的技能"
+// list row exists yet to click into it from). See the module's own doc
+// comment for the `skills.custom_list`/`skills.custom_retire` RPC shapes,
+// the client-side "find by id" reason (no dedicated get-by-id RPC exists),
+// and the assembled-not-wired "封存這個技能" button.
+pub mod skill_custom_detail;
+// WP-S6b2-M (S6b 第二波, 2026-08-21) — "新增技能" (`SkillNew.dc.html`, B16
+// in-page wizard, sidebar retained). No `nav.rs` entry of its own — a
+// `skills.rs` drill-down conceptually (see that module's own doc comment
+// for the full disambiguation). See `skill_new.rs`'s own module doc comment
+// for the six `skills.custom_*` RPC line numbers cited (none wired this
+// pass — a local-only step wizard, per this task's own brief) and the
+// canvas fidelity notes (only the "生成" step is drawn; describe/form/
+// review are honest minimal stubs).
+pub mod skill_new;
 // WP-gpui-spike-T7 (2026-08-21): debug-only Chromium-risk-page feasibility
 // spike, NOT a real product page — see `spike_t7.rs`'s own module doc
 // comment for the full rationale. Reachable only via
@@ -286,6 +347,12 @@ mod tasks_quickview;
 // Single-file page — see the module's own doc comment for the `users.list`
 // RPC shape and the 通道身分-column/status-label canvas deviations.
 pub mod users;
+// WP-S6b2-O (S6b 第二波, 2026-08-21) — "新增 Widget" (`WidgetComposer.dc.
+// html`, B21 複合編輯器桶), a creation-only leaf of `screens::widgets`. See
+// the module's own doc comment for the `cost.agents` RPC shape feeding the
+// real live preview and why the 儲存/產生/依回饋重新生成 decision-class
+// actions are assembled but not wired.
+pub mod widget_composer;
 // WP-S5b2-E (2026-08-21) — "Widget 工坊" (`Widgets.dc.html`). Single-file
 // page — see the module's own doc comment for RPC shapes, the `RootView::
 // user_id` addition it needed for the 我的/團隊分享 split, and the
