@@ -80,6 +80,37 @@ pub enum Key {
     NetworkConnectedTo,
     NetworkSecuredBadge,
     NetworkConnectedBadge,
+    /// Shell-S3 (2026-08-21, real Wi-Fi backend — see `oobe::network`'s own
+    /// header comment) — the `NeverScanned` scan state's prompt, before the
+    /// operator has clicked "掃描 Wi-Fi" even once.
+    NetworkNeverScanned,
+    NetworkScanButton,
+    /// Same click target as `NetworkScanButton`, different label for
+    /// re-scanning from `Failed`/`Loaded`/empty-list states — see
+    /// `steps::network`'s `kick_off_scan`, shared by every caller.
+    NetworkRescanButton,
+    NetworkScanningStatus,
+    NetworkScanFailedStatus,
+    NetworkScanEmptyStatus,
+    /// Task brief: "在 UI 誠實標示（不可假裝連線成功）" — shown whenever the
+    /// CURRENT scan/connect calls used the demo backend, see
+    /// `oobe::network::NetBackendKind`'s own doc comment for every
+    /// situation that covers (not only Linux/NetworkManager-unreachable).
+    NetworkDemoModeNotice,
+    NetworkPskLabel,
+    NetworkConnectButton,
+    NetworkConnectingButton,
+    /// Inline status line inside the connect panel while `Connecting` — as
+    /// opposed to `NetworkConnectingButton`, which is the BUTTON's own
+    /// label while busy; both render at once.
+    NetworkConnectingStatus,
+    NetworkCancelButton,
+    /// Client-side pre-check mirroring the real WPA-PSK passphrase length
+    /// rule (8–63 characters) — see `oobe::NetConnectFailureKind::
+    /// PasswordTooShort`'s own doc comment.
+    NetworkPskLengthError,
+    NetworkWrongPasswordError,
+    NetworkConnectUnreachableError,
 
     UpdateTitle,
     UpdateChecking,
@@ -215,6 +246,21 @@ fn zh_tw(key: Key) -> &'static str {
         Key::NetworkConnectedTo => "已連線：{}",
         Key::NetworkSecuredBadge => "需密碼",
         Key::NetworkConnectedBadge => "已連線",
+        Key::NetworkNeverScanned => "尚未掃描 Wi-Fi 網路",
+        Key::NetworkScanButton => "掃描 Wi-Fi",
+        Key::NetworkRescanButton => "重新整理",
+        Key::NetworkScanningStatus => "正在掃描 Wi-Fi…",
+        Key::NetworkScanFailedStatus => "掃描失敗，請重試",
+        Key::NetworkScanEmptyStatus => "找不到任何 Wi-Fi 網路",
+        Key::NetworkDemoModeNotice => "示範模式：目前顯示的是範例 Wi-Fi 清單，並非真實掃描結果",
+        Key::NetworkPskLabel => "Wi-Fi 密碼",
+        Key::NetworkConnectButton => "連線",
+        Key::NetworkConnectingButton => "連線中…",
+        Key::NetworkConnectingStatus => "正在連線…",
+        Key::NetworkCancelButton => "取消",
+        Key::NetworkPskLengthError => "密碼長度需為 8–63 個字元",
+        Key::NetworkWrongPasswordError => "密碼錯誤，請重新輸入",
+        Key::NetworkConnectUnreachableError => "無法連線，請稍後重試",
 
         Key::UpdateTitle => "系統更新",
         Key::UpdateChecking => "正在檢查更新…",
@@ -311,6 +357,21 @@ fn en(key: Key) -> &'static str {
         Key::NetworkConnectedTo => "Connected to {}",
         Key::NetworkSecuredBadge => "Password required",
         Key::NetworkConnectedBadge => "Connected",
+        Key::NetworkNeverScanned => "Wi-Fi networks haven't been scanned yet",
+        Key::NetworkScanButton => "Scan for Wi-Fi",
+        Key::NetworkRescanButton => "Refresh",
+        Key::NetworkScanningStatus => "Scanning for Wi-Fi networks…",
+        Key::NetworkScanFailedStatus => "Scan failed, please try again",
+        Key::NetworkScanEmptyStatus => "No Wi-Fi networks found",
+        Key::NetworkDemoModeNotice => "Demo mode: the Wi-Fi list shown is example data, not a real scan",
+        Key::NetworkPskLabel => "Wi-Fi password",
+        Key::NetworkConnectButton => "Connect",
+        Key::NetworkConnectingButton => "Connecting…",
+        Key::NetworkConnectingStatus => "Connecting…",
+        Key::NetworkCancelButton => "Cancel",
+        Key::NetworkPskLengthError => "Password must be 8–63 characters",
+        Key::NetworkWrongPasswordError => "Incorrect password, please try again",
+        Key::NetworkConnectUnreachableError => "Couldn't connect, please try again",
 
         Key::UpdateTitle => "System update",
         Key::UpdateChecking => "Checking for updates…",
@@ -407,6 +468,21 @@ fn ja_jp(key: Key) -> &'static str {
         Key::NetworkConnectedTo => "{} に接続済み",
         Key::NetworkSecuredBadge => "パスワードが必要",
         Key::NetworkConnectedBadge => "接続済み",
+        Key::NetworkNeverScanned => "まだ Wi-Fi ネットワークをスキャンしていません",
+        Key::NetworkScanButton => "Wi-Fi をスキャン",
+        Key::NetworkRescanButton => "更新",
+        Key::NetworkScanningStatus => "Wi-Fi ネットワークをスキャン中…",
+        Key::NetworkScanFailedStatus => "スキャンに失敗しました。もう一度お試しください",
+        Key::NetworkScanEmptyStatus => "Wi-Fi ネットワークが見つかりません",
+        Key::NetworkDemoModeNotice => "デモモード：表示されている Wi-Fi 一覧はサンプルデータで、実際のスキャン結果ではありません",
+        Key::NetworkPskLabel => "Wi-Fi パスワード",
+        Key::NetworkConnectButton => "接続",
+        Key::NetworkConnectingButton => "接続中…",
+        Key::NetworkConnectingStatus => "接続中…",
+        Key::NetworkCancelButton => "キャンセル",
+        Key::NetworkPskLengthError => "パスワードは8〜63文字で入力してください",
+        Key::NetworkWrongPasswordError => "パスワードが正しくありません。もう一度お試しください",
+        Key::NetworkConnectUnreachableError => "接続できませんでした。もう一度お試しください",
 
         Key::UpdateTitle => "システムアップデート",
         Key::UpdateChecking => "アップデートを確認しています…",
@@ -513,6 +589,21 @@ mod tests {
         Key::NetworkConnectedTo,
         Key::NetworkSecuredBadge,
         Key::NetworkConnectedBadge,
+        Key::NetworkNeverScanned,
+        Key::NetworkScanButton,
+        Key::NetworkRescanButton,
+        Key::NetworkScanningStatus,
+        Key::NetworkScanFailedStatus,
+        Key::NetworkScanEmptyStatus,
+        Key::NetworkDemoModeNotice,
+        Key::NetworkPskLabel,
+        Key::NetworkConnectButton,
+        Key::NetworkConnectingButton,
+        Key::NetworkConnectingStatus,
+        Key::NetworkCancelButton,
+        Key::NetworkPskLengthError,
+        Key::NetworkWrongPasswordError,
+        Key::NetworkConnectUnreachableError,
         Key::UpdateTitle,
         Key::UpdateChecking,
         Key::UpdateUpToDate,
@@ -585,7 +676,7 @@ mod tests {
         // `ALL_KEYS` silently drifting out of sync with a newly added `Key`
         // variant (the compiler won't catch THAT half; only the per-locale
         // match arms are compiler-enforced).
-        assert_eq!(ALL_KEYS.len(), 80);
+        assert_eq!(ALL_KEYS.len(), 95);
         let mut seen = std::collections::HashSet::new();
         for key in ALL_KEYS {
             assert!(seen.insert(key), "duplicate key in ALL_KEYS: {key:?}");
