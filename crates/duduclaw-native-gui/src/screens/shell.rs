@@ -63,6 +63,17 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         return crate::screens::migrate::render(state, cx);
     }
 
+    // WP-S6b3-R (S6b 第三波, 2026-08-22) — Launcher full-bleed bypass. Same
+    // root-swap shape as `migrate` right above (see `screens::launcher`'s
+    // own module doc comment for why: a spotlight-style search grid has no
+    // sidebar/content-list of its own, and this crate's `duduclaw-shell`
+    // stacking-context incident already ruled out an absolutely-positioned
+    // overlay for full-bleed pages). Must also run before every other
+    // branch below for the same reason `migrate`'s check does.
+    if active_id == "launcher" {
+        return crate::screens::launcher::render(state, cx);
+    }
+
     // ── Content-area placeholder heading ─────────────────────────────────
     let active_item = nav::find(active_id);
     let page_label = active_item.map(|i| i18n::t(locale, i.label_key)).unwrap_or_else(|| active_id.to_string().into());
@@ -443,6 +454,37 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // comment. Same "skip the generic placeholder heading entirely"
         // pattern as every other real (non-stub) page in this match.
         content_shell.child(crate::screens::distributors::render(state, cx))
+    // ── WP-S6b3-Q (S6b 第三波, 2026-08-22) — 系統/市集/知識中樞/知識審核/共享
+    // 知識庫 (`SystemHome.dc.html`/`Marketplace.dc.html`/`KnowledgeHub.dc.
+    // html`/`KnowledgeCuration.dc.html`/`SharedWiki.dc.html`, B2+B25). No
+    // `nav.rs` entry for any of the five — self-attached here per the same
+    // "D 先掛好分支就直接可達，未掛就自己掛" precedent every prior wave's own
+    // comments above already establish. ─────────────────────────────────
+    } else if active_id == "systemHome" {
+        // WP-S6b3-Q: 系統 — see `screens/system_home.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::system_home::render(state, cx))
+    } else if active_id == "marketplace" {
+        // WP-S6b3-Q: 市集 — see `screens/marketplace.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::marketplace::render(state, cx))
+    } else if active_id == "knowledgeHub" {
+        // WP-S6b3-Q: 知識中樞 — see `screens/knowledge_hub.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::knowledge_hub::render(state, cx))
+    } else if active_id == "knowledgeCuration" {
+        // WP-S6b3-Q: 知識審核 — see `screens/knowledge_curation.rs`'s module
+        // doc comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::knowledge_curation::render(state, cx))
+    } else if active_id == "sharedWiki" {
+        // WP-S6b3-Q: 共享知識庫 — see `screens/shared_wiki.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::shared_wiki::render(state, cx))
     // ── WP-S6b2-O (S6b 第二波, 2026-08-21) — "新增 Widget"/"桌寵工作室"
     // (`WidgetComposer.dc.html`/`PetStudio.dc.html`, B21). No `nav.rs` entry
     // for either — `widgetComposer` is reached via `screens::widgets`'s own
@@ -460,6 +502,67 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // comment. Same "skip the generic placeholder heading entirely"
         // pattern as every other real (non-stub) page in this match.
         content_shell.child(crate::screens::pet_studio::render(state, cx))
+    // ── WP-S6b3-R (S6b 第三波, 2026-08-22) — "桌寵浮層"/"GatewayPicker"
+    // (`MascotOverlay.dc.html`/`GatewayPicker.dc.html`, B24/B23). Neither
+    // page's canvas is a persistent sidebar-driven destination in the
+    // original Tauri desktop shell (a second overlay window / a pre-login
+    // landing page respectively), but both keep the normal three-column
+    // shell here (unlike `launcher`'s full-bleed bypass above) per this
+    // pass's own "小視窗版面在標準視窗內以置中卡呈現" instruction — self-
+    // attached, no `nav.rs` entry, same "D 先掛好分支就直接可達，未掛就自己
+    // 掛" precedent every prior self-attached S5b/S6b page already
+    // establishes. ─────────────────────────────────────────────────────
+    } else if active_id == "mascotOverlay" {
+        // WP-S6b3-R: 桌寵浮層 — see `screens/mascot_overlay.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::mascot_overlay::render(state, cx))
+    } else if active_id == "gatewayPicker" {
+        // WP-S6b3-R: GatewayPicker — see `screens/gateway_picker.rs`'s
+        // module doc comment. Same "skip the generic placeholder heading
+        // entirely" pattern as every other real (non-stub) page in this
+        // match.
+        content_shell.child(crate::screens::gateway_picker::render(state, cx))
+    // ── WP-S6b3-P (S6b 第三波, 2026-08-22) — 進階設定維運類七頁（日誌/可靠性/
+    // 模型用量/本地模型市集/系統設定/安全審計/部門）, all wired for real this
+    // same pass from `manage_advanced.rs`'s own rows (no `nav.rs` entry for
+    // any of the seven — the "進階設定" drill-down convention every sibling
+    // batch in this shell already establishes). ─────────────────────────────
+    } else if active_id == "logs" {
+        // WP-S6b3-P: 日誌 — see `screens/logs.rs`'s module doc comment. Same
+        // "skip the generic placeholder heading entirely" pattern as every
+        // other real (non-stub) page in this match.
+        content_shell.child(crate::screens::logs::render(state, cx))
+    } else if active_id == "reliability" {
+        // WP-S6b3-P: 可靠性 — see `screens/reliability.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::reliability::render(state, cx))
+    } else if active_id == "inference" {
+        // WP-S6b3-P: 模型用量 — see `screens/inference.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::inference::render(state, cx))
+    } else if active_id == "localModels" {
+        // WP-S6b3-P: 本地模型市集 — see `screens/local_models.rs`'s module
+        // doc comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::local_models::render(state, cx))
+    } else if active_id == "settings" {
+        // WP-S6b3-P: 系統設定 — see `screens/settings.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::settings::render(state, cx))
+    } else if active_id == "secaudit" {
+        // WP-S6b3-P: 安全審計 — see `screens/secaudit.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::secaudit::render(state, cx))
+    } else if active_id == "departments" {
+        // WP-S6b3-P: 部門 — see `screens/departments.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::departments::render(state, cx))
     } else if active_id == "spike_t7" {
         // WP-gpui-spike-T7: debug-only Chromium-risk-page feasibility spike
         // (see `screens/spike_t7.rs`'s module doc comment). No `nav.rs`

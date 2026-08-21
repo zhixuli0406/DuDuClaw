@@ -140,18 +140,29 @@
 // above already established for `channels`/`integrations`. A future wave
 // that builds a cost/usage report page should point it at that page.
 //
-// `KNOWLEDGE_ITEMS` is UNCHANGED (still `memory`/`widgets`, 2 items) despite
-// the unified table listing "知識與記憶（3）記憶・知識中樞・Widget 工坊" — the
-// viz-pages cover's own delta note is explicit that this area gets "不變" in
-// this batch, and the "知識中樞" ("Knowledge Hub"/WikiGraph) concept has a
-// real precedent to follow: `web/src/pages/MemoryPage.tsx` embeds
-// `KnowledgeHubPage` as an in-page VIEW TAB (`view === 'wiki'`), not a
-// separate top-level route — there is no `/wiki` entry anywhere in `web/
-// src/components/layout/nav-model.ts` either. The unified table's "3" count
-// describes a tab inside `/memory`, not a third sidebar row; adding a
-// `knowledgeHub`/`org`-style nav id here would misrepresent that as a
-// second page. A future wave giving `/memory` its own tab set should follow
-// the web precedent, not add a new nav id.
+// `KNOWLEDGE_ITEMS` was UNCHANGED (`memory`/`widgets`, 2 items) through
+// S5b2-D/S5b3-G despite the unified table listing "知識與記憶（3）記憶・知識
+// 中樞・Widget 工坊" — those waves' own delta notes reasoned the "知識中樞"
+// concept was an in-page VIEW TAB on the `web/src/pages/MemoryPage.tsx`
+// precedent (`KnowledgeHubPage` embedded at `view === 'wiki'`, no `/wiki`
+// route in `web/src/components/layout/nav-model.ts`), so a third nav id
+// here would misrepresent a tab as a second page.
+//
+// ── WP-S6b3-fix (2026-08-22) update: `knowledgeHub` id ADDED ─────────────
+// That reasoning no longer holds. WP-S6b3-Q (same wave-3 batch) landed
+// `knowledge_hub.rs`/`knowledge_curation.rs`/`shared_wiki.rs` as three real,
+// separate gpui pages (not a `web`-style in-page tab set) — see `screens/
+// knowledge_common.rs`'s own module doc comment for why one shared module
+// backs all three, and its "nav.rs 不歸你動" note for why that wave couldn't
+// add this id itself. Per the approved unified sidebar table
+// (`commercial/design/duduclaw-s5-settings-pages/Main.dc.html`, "知識與記憶
+// （3）記憶・知識中樞・Widget 工坊"), `knowledgeHub` is now a real third
+// item, inserted between `memory` and `widgets` to match that table's own
+// order. `knowledgeCuration`/`sharedWiki` still get no `nav.rs` id of their
+// own — they are drill-down leaves of `knowledgeHub` (reached via its own
+// 5-tab strip's 審核 tab, or a debug page env var), mapped onto the
+// `knowledgeHub` row for sidebar-highlight purposes only by
+// `sidebar_active_id` below (see that function's own doc comment).
 //
 // ── S5b2-D update (2026-08-21): four areas reshuffled per the work-pages
 // canvas ──────────────────────────────────────────────────────────────────
@@ -312,8 +323,12 @@ const TASKS_ITEMS: &[NavItem] = &[
 // S5b3-G (2026-08-21): UNCHANGED — see this file's header comment for why
 // "知識中樞" does NOT get a third nav id here (it is a `/memory` view tab on
 // the web precedent, not a separate page).
+// WP-S6b3-fix (2026-08-22) update: `knowledgeHub` ADDED, between `memory`
+// and `widgets` — see this file's header comment for the reasoning reversal
+// (real gpui pages now exist, not a `web`-style in-page tab).
 const KNOWLEDGE_ITEMS: &[NavItem] = &[
     item("memory", "nav.memory", "nav.memory.desc", 'M', theme::INFO),
+    item("knowledgeHub", "nav.knowledgeHub", "nav.knowledgeHub.desc", 'H', theme::INFO),
     item("widgets", "nav.widgets", "nav.widgets.desc", 'W', theme::INFO),
 ];
 
@@ -416,6 +431,35 @@ pub fn area_for_page(id: &str) -> Option<&'static NavArea> {
     AREAS.iter().find(|a| a.items.iter().any(|i| i.id == id))
 }
 
+/// Maps a self-attached "drill-down leaf" page (one with no `nav.rs` id of
+/// its own — reached only via another page's own in-content link or
+/// `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE`, per the "D 先掛好分支就直接可達，未掛就
+/// 自己掛" convention every S5b/S6b wave's own doc comments establish) onto
+/// the real nav id whose row should carry the sidebar's persistent selection
+/// highlight while that leaf is showing (Apple HIG, `area_for_page`'s own
+/// doc comment). Every OTHER drill-down leaf this crate has shipped so far
+/// (`mcp`/`odoo`/`googleIntegration`/`identity`/`marketplace`) has nothing
+/// to map onto — their conceptual parent (`integrations`) never lit up
+/// either, a gap each of those pages' own module doc comments flags as a
+/// QA-deferred ("暫掛") known gap, not a resolved pattern to copy literally.
+/// `knowledgeCuration`/`sharedWiki` are different: WP-S6b3-fix gave their
+/// shared parent concept a real id (`knowledgeHub`, see `KNOWLEDGE_ITEMS`'s
+/// own update note above), so for these two specifically a real mapping is
+/// possible — this function is that mapping, applied by `shell_sidebar.rs`
+/// (Column 1) and `shell_content_list.rs` (Column 2) instead of the raw
+/// `RootView::active_page` those two files used before. Content ROUTING
+/// (which page component actually renders) is untouched — `shell.rs`'s own
+/// `active_id == "knowledgeCuration"`/`"sharedWiki"` match arms still key
+/// off the real, unmapped `active_page` value; only the sidebar highlight
+/// goes through this indirection. Every id not named here passes through
+/// unchanged, so this is a no-op for the crate's other ~60 pages.
+pub fn sidebar_active_id(active_page: &str) -> &str {
+    match active_page {
+        "knowledgeCuration" | "sharedWiki" => "knowledgeHub",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +497,11 @@ mod tests {
     const S5B3_G_NEW_IDS: &[&str] =
         &["inbox", "mail", "org", "forks", "usage", "foresight", "os", "timeline", "canvas"];
 
+    /// WP-S6b3-fix (2026-08-22): the one brand-new id this fix pass
+    /// introduces — same resolvability trip-wire as `S5B2_D_NEW_IDS`/
+    /// `S5B3_G_NEW_IDS` above.
+    const S6B3_FIX_NEW_IDS: &[&str] = &["knowledgeHub"];
+
     #[test]
     fn every_s5b2_d_new_id_resolves() {
         for id in S5B2_D_NEW_IDS {
@@ -463,6 +512,13 @@ mod tests {
     #[test]
     fn every_s5b3_g_new_id_resolves() {
         for id in S5B3_G_NEW_IDS {
+            assert!(find(id).is_some(), "new nav id {id:?} does not resolve via find()");
+        }
+    }
+
+    #[test]
+    fn every_s6b3_fix_new_id_resolves() {
+        for id in S6B3_FIX_NEW_IDS {
             assert!(find(id).is_some(), "new nav id {id:?} does not resolve via find()");
         }
     }
@@ -509,14 +565,29 @@ mod tests {
         assert_eq!(ids, vec!["goals", "tasks", "routines", "plans", "files", "forks"]);
     }
 
-    /// S5b3-G (2026-08-21): UNCHANGED from S5b2-D — `memory` + `widgets`,
-    /// still 2 items (see this file's header comment for why "知識中樞"
-    /// does not add a third id here).
+    /// WP-S6b3-fix (2026-08-22): `knowledgeHub` is NEW, inserted between
+    /// `memory` and `widgets` (see this file's header comment and
+    /// `KNOWLEDGE_ITEMS`'s own update note for why). Supersedes the
+    /// S5b2-D/S5b3-G-era 2-item assertion this test used to make.
     #[test]
-    fn knowledge_area_has_the_s5b2_d_membership_in_order() {
+    fn knowledge_area_has_the_s6b3_fix_membership_in_order() {
         let knowledge = AREAS.iter().find(|a| a.id == "areaKnowledge").expect("areaKnowledge must exist");
         let ids: Vec<&str> = knowledge.items.iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec!["memory", "widgets"]);
+        assert_eq!(ids, vec!["memory", "knowledgeHub", "widgets"]);
+    }
+
+    /// WP-S6b3-fix (2026-08-22): `knowledgeCuration`/`sharedWiki` (both
+    /// self-attached drill-down leaves with no `nav.rs` id of their own) map
+    /// onto the real `knowledgeHub` row for sidebar-highlight purposes;
+    /// every other id — including `knowledgeHub` itself and every one of
+    /// this crate's ~60 other pages — passes through unchanged.
+    #[test]
+    fn sidebar_active_id_maps_the_two_knowledge_drill_down_leaves() {
+        assert_eq!(sidebar_active_id("knowledgeCuration"), "knowledgeHub");
+        assert_eq!(sidebar_active_id("sharedWiki"), "knowledgeHub");
+        assert_eq!(sidebar_active_id("knowledgeHub"), "knowledgeHub");
+        assert_eq!(sidebar_active_id("memory"), "memory");
+        assert_eq!(sidebar_active_id("mcp"), "mcp");
     }
 
     /// S5b3-G (2026-08-21): the "監控" area's full 7-item membership —

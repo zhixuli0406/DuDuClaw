@@ -21,12 +21,20 @@ const CONTENT_LIST_WIDTH: f32 = 224.0;
 /// comment) or when the current page is a footer item (belongs to no area
 /// at all, e.g. `manage`/`componentLibrary`).
 pub(super) fn render(state: &RootView, cx: &mut Context<RootView>) -> Option<Stateful<gpui::Div>> {
-    let area = nav::area_for_page(state.active_page)?;
+    // WP-S6b3-fix (2026-08-22): `nav::sidebar_active_id` maps a drill-down
+    // leaf with no `nav.rs` id of its own (`knowledgeCuration`/`sharedWiki`)
+    // onto its real parent row (`knowledgeHub`) — both so `area_for_page`
+    // finds the owning area at all (a bare leaf id resolves to `None`) and
+    // so the row loop below highlights the right row. A no-op for every
+    // other page (see that function's own doc comment). Content ROUTING is
+    // untouched — `shell.rs` still keys off the real, unmapped
+    // `state.active_page`.
+    let active_id = nav::sidebar_active_id(state.active_page);
+    let area = nav::area_for_page(active_id)?;
     if area.items.len() <= 1 {
         return None;
     }
     let locale = state.locale;
-    let active_id = state.active_page;
 
     let mut rows = Vec::with_capacity(area.items.len());
     for item in area.items {

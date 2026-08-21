@@ -60,6 +60,21 @@
 // same "unwired id degrades to a placeholder, not a crash" property
 // `settings_common::breadcrumb`'s own doc comment already relies on for
 // exactly this kind of cross-workstream forward reference.
+//
+// ── WP-S6b3-P (S6b 第三波, 2026-08-22) — final wiring: all 14 rows go live ─
+// This pass builds the remaining 7 target pages (secaudit/departments/logs/
+// reliability/inference/localModels/settings — see each module's own doc
+// comment for its RPC citations) and, being the only WP this round that
+// touches `manage_advanced.rs` itself, also flips the 8th still-inert row
+// this wave's brief doesn't name but leaves dangling otherwise: `migrate`
+// (`screens/migrate.rs` already existed and already had a live `shell.rs`
+// branch since WP-S6b2-M — only this file's own row was never pointed at
+// it). Every one of the 14 rows now carries `target: Some(...)`; the
+// "即將推出" trailing label (see `item_row` below) no longer renders
+// anywhere on this page. `advanced_item` (the `target: None` constructor)
+// stays in the file — `#[allow(dead_code)]`, not deleted — as the same
+// "inert row is honest" mechanism a future 15th row would reuse; removing
+// it would just have to be re-added the next time this page grows.
 
 use gpui::{div, prelude::*, px, Context, Div, Stateful};
 
@@ -78,6 +93,10 @@ struct AdvancedItem {
     target: Option<&'static str>,
 }
 
+/// Kept for the next inert row this page ever grows — see this file's own
+/// WP-S6b3-P header-comment note for why it stays despite having zero call
+/// sites now that all 14 current rows are wired.
+#[allow(dead_code)]
 const fn advanced_item(glyph: char, title_key: &'static str, desc_key: &'static str) -> AdvancedItem {
     AdvancedItem { glyph, title_key, desc_key, target: None }
 }
@@ -109,7 +128,7 @@ const BILLING_GROUP_ITEMS: &[AdvancedItem] = &[
 
 const ACCESS_GROUP_ITEMS: &[AdvancedItem] = &[
     advanced_item_wired('S', "manageAdvanced.item.security.title", "manageAdvanced.item.security.desc", "security"),
-    advanced_item('A', "manageAdvanced.item.secaudit.title", "manageAdvanced.item.secaudit.desc"),
+    advanced_item_wired('A', "manageAdvanced.item.secaudit.title", "manageAdvanced.item.secaudit.desc", "secaudit"),
     advanced_item_wired(
         'G',
         "manageAdvanced.item.governance.title",
@@ -117,19 +136,34 @@ const ACCESS_GROUP_ITEMS: &[AdvancedItem] = &[
         "governance",
     ),
     advanced_item_wired('M', "manageAdvanced.item.users.title", "manageAdvanced.item.users.desc", "users"),
-    advanced_item('P', "manageAdvanced.item.departments.title", "manageAdvanced.item.departments.desc"),
+    advanced_item_wired(
+        'P',
+        "manageAdvanced.item.departments.title",
+        "manageAdvanced.item.departments.desc",
+        "departments",
+    ),
 ];
 
 const OPS_GROUP_ITEMS: &[AdvancedItem] = &[
-    advanced_item('L', "manageAdvanced.item.logs.title", "manageAdvanced.item.logs.desc"),
-    advanced_item('R', "manageAdvanced.item.reliability.title", "manageAdvanced.item.reliability.desc"),
-    advanced_item('U', "manageAdvanced.item.inference.title", "manageAdvanced.item.inference.desc"),
-    advanced_item('O', "manageAdvanced.item.localModels.title", "manageAdvanced.item.localModels.desc"),
-    advanced_item('I', "manageAdvanced.item.migrate.title", "manageAdvanced.item.migrate.desc"),
+    advanced_item_wired('L', "manageAdvanced.item.logs.title", "manageAdvanced.item.logs.desc", "logs"),
+    advanced_item_wired(
+        'R',
+        "manageAdvanced.item.reliability.title",
+        "manageAdvanced.item.reliability.desc",
+        "reliability",
+    ),
+    advanced_item_wired('U', "manageAdvanced.item.inference.title", "manageAdvanced.item.inference.desc", "inference"),
+    advanced_item_wired(
+        'O',
+        "manageAdvanced.item.localModels.title",
+        "manageAdvanced.item.localModels.desc",
+        "localModels",
+    ),
+    advanced_item_wired('I', "manageAdvanced.item.migrate.title", "manageAdvanced.item.migrate.desc", "migrate"),
 ];
 
 const OTHER_GROUP_ITEMS: &[AdvancedItem] =
-    &[advanced_item('#', "manageAdvanced.item.settings.title", "manageAdvanced.item.settings.desc")];
+    &[advanced_item_wired('#', "manageAdvanced.item.settings.title", "manageAdvanced.item.settings.desc", "settings")];
 
 const GROUPS: &[AdvancedGroup] = &[
     AdvancedGroup { label_key: "manageAdvanced.group.billing", items: BILLING_GROUP_ITEMS },
@@ -312,17 +346,36 @@ mod tests {
         assert_eq!(OTHER_GROUP_ITEMS.len(), 1);
     }
 
-    /// Trip-wire for this task's own wiring instruction: exactly 6 of the 14
-    /// rows carry a `target` this wave (billing/license/distributors/
-    /// security/governance/users) — everything else, including the two
-    /// group-1/2 siblings the brief deliberately left inert (secaudit/
-    /// departments), stays `None`. A future edit that silently wires or
-    /// un-wires a row updates this test too.
+    /// Trip-wire for WP-S6b3-P's own closing instruction: ALL 14 rows now
+    /// carry a `target` — no more "即將推出" trailing label anywhere on this
+    /// page. Supersedes the S6b1-L-era `exactly_six_rows_are_wired_this_wave`
+    /// (renamed: that name would now be misleading — 8 more rows joined this
+    /// same pass: secaudit/departments/logs/reliability/inference/
+    /// localModels/migrate/settings). A future edit that silently un-wires a
+    /// row updates this test too.
     #[test]
-    fn exactly_six_rows_are_wired_this_wave() {
+    fn all_fourteen_rows_are_wired() {
         let mut wired: Vec<&str> = GROUPS.iter().flat_map(|g| g.items.iter()).filter_map(|i| i.target).collect();
         wired.sort_unstable();
-        assert_eq!(wired, vec!["billing", "distributors", "governance", "license", "security", "users"]);
+        assert_eq!(
+            wired,
+            vec![
+                "billing",
+                "departments",
+                "distributors",
+                "governance",
+                "inference",
+                "license",
+                "localModels",
+                "logs",
+                "migrate",
+                "reliability",
+                "secaudit",
+                "security",
+                "settings",
+                "users",
+            ]
+        );
     }
 
     #[test]
