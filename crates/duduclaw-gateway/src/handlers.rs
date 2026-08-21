@@ -496,6 +496,15 @@ fn apply_capabilities_to_table(
         section.insert("system_operator".into(), toml::Value::Boolean(v));
         changes.push(format!("capabilities.system_operator = {v}"));
     }
+    // ── codrive (bool) — opt-in human-machine co-drive (CD-1). Master
+    // switch for the `codrive_run` MCP tool (GUI mouse/keyboard injection
+    // via the duduclaw-comp compositor); default false ⇒ denied at the
+    // dispatch gate even for an Admin-scoped agent. Same danger-zone
+    // bool-write pattern as `git_credentials` / `system_operator` above.
+    if let Some(v) = cap.get("codrive").and_then(|v| v.as_bool()) {
+        section.insert("codrive".into(), toml::Value::Boolean(v));
+        changes.push(format!("capabilities.codrive = {v}"));
+    }
     // ── autonomy_level (string) — how much the autonomous goal loop may
     // drive this agent on its own (`goal_loop::AutonomyLevel`). Not a typed
     // `CapabilitiesConfig` field — read straight from this raw TOML key by
@@ -35884,6 +35893,36 @@ policies:
             json.get("system_operator"),
             Some(&serde_json::Value::Bool(false))
         );
+    }
+
+    // ── codrive (dashboard toggle, CD-1) ───────────────────────────────────────
+
+    #[test]
+    fn cap_codrive_round_trips_into_capabilities_config() {
+        let mut table = toml::Table::new();
+        let changes = apply_capabilities_to_table(&mut table, &json!({ "capabilities": { "codrive": true } }))
+            .expect("apply");
+        let cap = table.get("capabilities").unwrap().as_table().unwrap();
+        assert_eq!(cap.get("codrive").unwrap().as_bool(), Some(true));
+        assert!(changes.iter().any(|c| c.contains("codrive = true")));
+        // Must deserialize back into a real CapabilitiesConfig.
+        let cfg: duduclaw_core::types::CapabilitiesConfig = cap
+            .clone()
+            .try_into()
+            .expect("deserializes into CapabilitiesConfig");
+        assert!(cfg.codrive);
+
+        // Explicit false is also written (operator turning it back off).
+        let mut t2 = toml::Table::new();
+        let changes2 = apply_capabilities_to_table(&mut t2, &json!({ "capabilities": { "codrive": false } }))
+            .expect("apply");
+        assert!(changes2.iter().any(|c| c.contains("codrive = false")));
+
+        // Serialization of CapabilitiesConfig carries `codrive` so
+        // agents.inspect exposes it to the dashboard.
+        let json = serde_json::to_value(duduclaw_core::types::CapabilitiesConfig::default())
+            .expect("serialize");
+        assert_eq!(json.get("codrive"), Some(&serde_json::Value::Bool(false)));
     }
 
     // ── autonomy_level (goal-loop dashboard editor) ───────────────────────────

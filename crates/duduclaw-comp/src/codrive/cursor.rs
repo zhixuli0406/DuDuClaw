@@ -23,8 +23,11 @@ const HUMAN_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 0.95];
 /// legible at a glance without reading any log, matching DESIGN §3.4's
 /// "系統級『共駕中』指示…不可隱藏" spirit at the cursor-overlay scale.
 const AGENT_COLOR_FROZEN: [f32; 4] = [0.65, 0.12, 0.12, 0.85];
-/// Brand amber while live.
-const AGENT_COLOR_LIVE: [f32; 4] = [1.0, 0.62, 0.0, 0.92];
+/// Brand amber while live. `pub(super)` (not private) since CD-1's
+/// `highlight.rs` reuses the exact same color for the target highlight box
+/// (task brief req 5: "顏色用 cursor.rs 的 `AGENT_COLOR_LIVE` 琥珀") — one
+/// shared constant rather than a second copy that could drift.
+pub(super) const AGENT_COLOR_LIVE: [f32; 4] = [1.0, 0.62, 0.0, 0.92];
 
 /// Builds the human-pointer square and the agent-pointer cross reticle for
 /// this frame. `human_pos`/`agent_pos` are each seat's current pointer

@@ -7,20 +7,20 @@
 // REAL human-input path (`input.rs::process_input_event` →
 // `DuduclawComp::on_human_input`, wired to actual winit-forwarded
 // keyboard/pointer events) can never fire inside this container, and
-// neither can the real Super+Esc detector in `input.rs`'s keyboard filter
-// closure. Both are implemented for real hardware and exercised on a real
-// seat in the VM/`cage` round (matching the same "implemented but
-// container-unverified, VM-verified later" pattern BUILD.md already
-// documents for `grabs/move_grab.rs`/`resize_grab.rs`).
+// neither can the real Super+Esc/Super+Enter detectors in `input.rs`'s
+// keyboard filter closure. All three are implemented for real hardware and
+// exercised on a real seat in the VM/`cage` round (matching the same
+// "implemented but container-unverified, VM-verified later" pattern
+// BUILD.md already documents for `grabs/move_grab.rs`/`resize_grab.rs`).
 //
 // This module exists ONLY so this round's container-level verification can
-// still exercise the freeze/emergency-stop *state machine* end-to-end (does
-// the flag flip, does it log with a latency figure, does the connection get
-// force-closed — all logic strictly downstream of "a human input event
-// happened," not the hardware event delivery itself). It is opt-in via
-// `DUDUCLAW_CODRIVE_DEBUG_STDIN=1` — unset (the default, including any real
-// deployment), this reads nothing from stdin and registers nothing with the
-// event loop.
+// still exercise the freeze/resume/emergency-stop *state machine*
+// end-to-end (does the flag flip, does it log with a latency figure, does
+// the connection get force-closed — all logic strictly downstream of "a
+// human input event happened," not the hardware event delivery itself). It
+// is opt-in via `DUDUCLAW_CODRIVE_DEBUG_STDIN=1` — unset (the default,
+// including any real deployment), this reads nothing from stdin and
+// registers nothing with the event loop.
 
 use std::io::BufRead;
 
@@ -28,13 +28,16 @@ use smithay::reexports::calloop::{generic::Generic, EventLoop, Interest, Mode, P
 
 use crate::CalloopData;
 
-/// Registers a stdin-reading calloop source that turns two magic lines into
-/// synthetic human-seat events, iff `DUDUCLAW_CODRIVE_DEBUG_STDIN=1` is set.
-/// Lines recognized: `simulate_human` (calls `on_human_input`, the same
-/// entry point `input.rs` calls for a real event) and `simulate_super_esc`
+/// Registers a stdin-reading calloop source that turns three magic lines
+/// into synthetic human-seat events, iff `DUDUCLAW_CODRIVE_DEBUG_STDIN=1` is
+/// set. Lines recognized: `simulate_human` (calls `on_human_input`, the
+/// same entry point `input.rs` calls for a real event), `simulate_super_esc`
 /// (calls `emergency_stop` directly — the real Super+Esc detector lives in
-/// `input.rs` and is not reachable from here, matching "this only drives
-/// the state machine, not the hardware detection path" above).
+/// `input.rs` and is not reachable from here), and `simulate_super_enter`
+/// (CD-1: calls `human_resume` directly — the real Super+Enter detector
+/// likewise lives in `input.rs` and is not reachable from here). All three
+/// match "this only drives the state machine, not the hardware detection
+/// path" above.
 pub fn maybe_init_stdin_simulator(event_loop: &mut EventLoop<CalloopData>) {
     if std::env::var_os("DUDUCLAW_CODRIVE_DEBUG_STDIN").is_none() {
         return;
@@ -42,10 +45,10 @@ pub fn maybe_init_stdin_simulator(event_loop: &mut EventLoop<CalloopData>) {
 
     tracing::warn!(
         "codrive: DEBUG_STDIN human-input simulator ENABLED — reading lines from stdin \
-         (\"simulate_human\" / \"simulate_super_esc\"). This exists only for headless- \
-         container verification where no real input device can originate the events \
-         (see codrive/debug_sim.rs module doc) — never set this env var in a real \
-         deployment."
+         (\"simulate_human\" / \"simulate_super_esc\" / \"simulate_super_enter\"). This \
+         exists only for headless-container verification where no real input device can \
+         originate the events (see codrive/debug_sim.rs module doc) — never set this env \
+         var in a real deployment."
     );
 
     let stdin = std::io::stdin();
@@ -81,6 +84,10 @@ pub fn maybe_init_stdin_simulator(event_loop: &mut EventLoop<CalloopData>) {
                 "simulate_super_esc" => {
                     tracing::info!("codrive: debug stdin — simulating Super+Esc emergency stop");
                     data.state.emergency_stop("debug_stdin_simulated_super_esc");
+                }
+                "simulate_super_enter" => {
+                    tracing::info!("codrive: debug stdin — simulating Super+Enter human resume");
+                    data.state.human_resume();
                 }
                 "" => {}
                 other => {

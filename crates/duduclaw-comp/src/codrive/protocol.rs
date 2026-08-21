@@ -12,29 +12,49 @@
 // the *protocol* shapes itself for the wlr world, never as source to copy —
 // this module's shapes were designed from scratch against DESIGN
 // §3.3.1's op list, not transcribed from any GPL source.
+//
+// CD-1 additions (BUILD.md "CD-1 comp-side additions" has the full wire
+// table): `key_name` (named functional keys), `status` (read-only query),
+// `highlight` (target highlight box). `auth` is deliberately NOT a variant
+// here — see `AuthLine` below.
 
 use serde::Deserialize;
 
 /// One line of the injection protocol, `{"op": "...", ...}`.
 ///
-/// Wire shape (see DESIGN §3.3.1 CD-0 bullet 2):
+/// Wire shape (see DESIGN §3.3.1 CD-0 bullet 2, extended for CD-1):
 /// - `{"op":"move","x":100.0,"y":200.0}` — absolute logical-space position.
 /// - `{"op":"button","btn":"left","state":"press"}` — press/release.
 /// - `{"op":"key","keycode":38,"state":"press"}` — raw XKB keycode
 ///   (evdev keycode + 8, matching what `smithay::input::keyboard::Keycode`
 ///   represents), press/release.
+/// - `{"op":"key_name","name":"enter","state":"press"}` — a named
+///   functional key from a fixed allowlist (see `keymap_ascii::
+///   key_name_to_xkb`) that has no printable-ASCII representation for
+///   `text` to reach — press/release.
 /// - `{"op":"text","s":"hello"}` — synthesized key-by-key from an ASCII-only
 ///   table (see `keymap_ascii.rs` for the honest limitation).
-/// - `{"op":"resume"}` — clears the freeze set by the most recent human
-///   input; the only op accepted while frozen.
+/// - `{"op":"resume"}` — CD-1: always denied over this channel now
+///   (`resume_is_human_only`) — "交還" moved to the human side (Super+Enter,
+///   `DuduclawComp::human_resume`). Kept as a variant so a caller still
+///   trying the CD-0-era path gets a specific, named denial.
+/// - `{"op":"status"}` — CD-1: read-only query, answered directly by the
+///   listener thread (never reaches the main-thread channel), allowed even
+///   while frozen.
+/// - `{"op":"highlight","x":0.0,"y":0.0,"w":100.0,"h":40.0,"ms":800}` —
+///   CD-1: draws a hollow border around this rectangle for `ms`
+///   milliseconds (optional, default 800, clamped to [100, 5000]).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum InjectCmd {
     Move { x: f64, y: f64 },
     Button { btn: String, state: String },
     Key { keycode: u32, state: String },
+    KeyName { name: String, state: String },
     Text { s: String },
     Resume,
+    Status,
+    Highlight { x: f64, y: f64, w: f64, h: f64, ms: Option<u64> },
 }
 
 impl InjectCmd {
@@ -46,10 +66,30 @@ impl InjectCmd {
             InjectCmd::Move { x, y } => ("move", Some(*x), Some(*y)),
             InjectCmd::Button { .. } => ("button", None, None),
             InjectCmd::Key { .. } => ("key", None, None),
+            InjectCmd::KeyName { .. } => ("key_name", None, None),
             InjectCmd::Text { .. } => ("text", None, None),
             InjectCmd::Resume => ("resume", None, None),
+            InjectCmd::Status => ("status", None, None),
+            InjectCmd::Highlight { x, y, .. } => ("highlight", Some(*x), Some(*y)),
         }
     }
+}
+
+/// The mandatory first line of every new connection (CD-1, DESIGN §3.3.1's
+/// "EIS 界線"): `{"op":"auth","token":"<hex>"}`. Deliberately NOT a variant
+/// of `InjectCmd` — auth only ever applies to exactly the first line of a
+/// connection (`listener.rs`'s `authenticate`), never to the ongoing
+/// per-command loop, so keeping it a separate, narrower type makes "an
+/// `auth` op showing up mid-stream" a plain parse error instead of a case
+/// every `InjectCmd` match arm has to consider. `token` is a required field
+/// (not `Option`/`#[serde(default)]`): a missing token is exactly as much
+/// an auth failure as a wrong one, and letting serde reject it outright
+/// keeps `listener.rs::authenticate` from having to special-case "absent"
+/// vs. "present but wrong."
+#[derive(Debug, Deserialize)]
+pub struct AuthLine {
+    pub op: String,
+    pub token: String,
 }
 
 /// `"press"` / `"release"` → pressed?

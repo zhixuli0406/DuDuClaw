@@ -104,8 +104,16 @@ pub fn init_winit(
                 let human_pos = state.seat.get_pointer().unwrap().current_location();
                 let agent_pos = state.agent_seat.get_pointer().unwrap().current_location();
                 let agent_frozen = state.codrive.is_frozen();
-                let cursor_elements =
+                let mut cursor_elements =
                     crate::codrive::build_cursor_elements(human_pos, agent_pos, agent_frozen);
+                // CD-1 (DESIGN §3.3.2(b) target highlight box): appended
+                // into the same custom-elements slice as the cursors —
+                // `codrive_highlight_elements` takes `&mut self` since it
+                // also clears an expired highlight as a side effect (see
+                // `codrive/highlight.rs`), so this has to run through
+                // `state` (already `&mut` in this closure) rather than as
+                // a free function like `build_cursor_elements`.
+                cursor_elements.extend(state.codrive_highlight_elements(std::time::Instant::now()));
 
                 {
                     let (renderer, mut framebuffer) = backend.bind().unwrap();

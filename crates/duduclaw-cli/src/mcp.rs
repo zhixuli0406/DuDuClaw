@@ -281,6 +281,24 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "in_reply_to", description: "Optional mail_id from your inbox that this replies to", required: false },
         ],
     },
+    // ── Human-machine co-drive (CD-1) ────────────────────────────────────
+    // GUI-level mouse/keyboard injection into a shared desktop, human
+    // supervised throughout: every step is narrated to an activity-feed
+    // ticker, consequential steps (send/submit/delete/purchase/other) stop
+    // and wait for ApprovalBroker approval before the action is sent, a
+    // credential-class step or a refuse-list hit (banking pages, CAPTCHA
+    // bypass, ...) is refused outright before any connection is even
+    // attempted, and human input on the shared desktop always freezes the
+    // agent immediately. Requires `[capabilities] codrive = true` on this
+    // agent (deny-by-default) in addition to Admin scope.
+    ToolDef {
+        name: "codrive_run",
+        description: "Run a scripted human-machine co-drive session: move the mouse, click, type, and press keys in a shared, human-visible desktop, narrating each step to the activity feed. Every consequential step (send/submit/delete/purchase/other) pauses for human approval before the action is dispatched; a credential-class step (login/password/payment) or a refuse-list hit is rejected outright, before any connection is even attempted. Any human input on the shared desktop immediately freezes your seat — the dropped step is automatically retried once a person hands control back. Requires the codrive capability to be explicitly enabled on this agent.",
+        params: &[
+            ParamDef { name: "script", description: "JSON object: {target_app, task_summary, steps:[{narration, highlight?:{x,y,w,h}, action:{kind:'move'|'click'|'text'|'key_name'|'wait', ...}, consequential?:{class:'send'|'submit'|'delete'|'purchase'|'credential'|'other', description}}]}. Max 50 steps.", required: true },
+            ParamDef { name: "agent", description: "Optional: run (and capability-check) as a different agent id instead of the caller's own identity. Omit to use your own identity.", required: false },
+        ],
+    },
     ToolDef {
         name: "memory_read",
         description: "Read a single memory entry by ID",
@@ -10308,6 +10326,9 @@ pub(crate) async fn handle_tools_call(
             | "working_state_handoff"
             | "belief_submit"
             | "belief_settle"
+            // CD-1 co-drive: drives real mouse/keyboard input on a shared
+            // desktop — audit-worthy on every call, success or refusal.
+            | "codrive_run"
             // Agent Mail: `mail_send` writes a pending outbound draft (it
             // cannot transmit). `mail_read` flips a message to read.
             | "mail_send"
@@ -10369,6 +10390,8 @@ pub(crate) async fn handle_tools_call(
         "belief_submit" => handle_belief_submit(&arguments, home_dir, default_agent).await,
         "belief_settle" => handle_belief_settle(&arguments, home_dir, default_agent).await,
         "belief_stats" => handle_belief_stats(home_dir, default_agent).await,
+        // ── Human-machine co-drive (CD-1) ──
+        "codrive_run" => handle_codrive_run(&arguments, home_dir, default_agent).await,
         // ── Agent Mail (P2-d) ──
         "mail_list" => handle_mail_list(&arguments, home_dir, default_agent).await,
         "mail_read" => handle_mail_read(&arguments, home_dir, default_agent).await,
@@ -15937,6 +15960,68 @@ async fn handle_belief_stats(home_dir: &Path, default_agent: &str) -> Value {
         Ok(stats) => tool_text(&serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string())),
         Err(e) => tool_error(&format!("belief_stats join error: {e}")),
     }
+}
+
+// ── Human-machine co-drive (CD-1) ────────────────────────────────────────────
+// Thin shell over `duduclaw_gateway::codrive::run_script` — all the actual
+// orchestration (refuse-list, ApprovalBroker gate, freeze/resume, emergency
+// stop, activity-feed ticker) lives there. This front door does three things:
+// parse `script` (accept either a native JSON object or a JSON-encoded
+// string, since MCP callers serialize nested objects either way), resolve the
+// acting agent identity, and re-check `[capabilities] codrive` for THAT
+// identity before dispatching.
+//
+// Identity note: an explicit `agent` param overrides the caller's own
+// identity for BOTH this capability re-check AND the downstream audit/
+// approval attribution inside `run_script` — deliberately never split. The
+// dispatch-level `CODRIVE_TOOLS` gate in `mcp_dispatch.rs` is keyed to the
+// CALLING principal (`principal.client_id`) and would not see an `agent`
+// override, so this handler-local re-check is the actual enforcement point
+// for the resolved identity — the two together are the "雙保險 fail-closed"
+// the WP brief calls for, not a redundant duplicate of the same check.
+async fn handle_codrive_run(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
+    let script_value = match args.get("script") {
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+            Ok(v) => v,
+            Err(e) => return tool_error(&format!("script is not valid JSON: {e}")),
+        },
+        Some(v) => v.clone(),
+        None => return tool_error("script is required"),
+    };
+    let script: duduclaw_gateway::codrive::CodriveScript = match serde_json::from_value(script_value) {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("script does not match the expected shape: {e}")),
+    };
+
+    let agent_id = args
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| resolve_audit_agent(|| default_agent.to_string()));
+    if !is_valid_agent_id(&agent_id) {
+        return tool_error("invalid agent id");
+    }
+
+    // Handler-local fail-closed gate — see the module-level doc comment
+    // above for why this is not redundant with the dispatch-level check.
+    let agent_dir = home_dir.join("agents").join(&agent_id);
+    if !duduclaw_core::agent_toml::load(&agent_dir).capabilities.codrive {
+        let msg = "此代理未啟用人機共駕能力（agent.toml [capabilities] codrive = true）。".to_string();
+        duduclaw_security::audit::append_tool_call_denied(
+            home_dir,
+            &agent_id,
+            "codrive_run",
+            "codrive_capability_missing",
+            &msg,
+            None,
+        );
+        return tool_error(&msg);
+    }
+
+    let report = duduclaw_gateway::codrive::run_script(home_dir, &agent_id, script).await;
+    tool_text(&serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()))
 }
 
 // ── Agent Mail (P2-d) ───────────────────────────────────────────────────────

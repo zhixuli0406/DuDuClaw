@@ -885,6 +885,16 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "desktop_record_start"
         | "desktop_record_stop"
         | "skill_from_recording" => Some(Scope::Recording),
+        // CD-1 human-machine co-drive: GUI mouse/keyboard injection into a
+        // shared desktop via `duduclaw-comp`. Explicitly Admin — the
+        // highest internal trust tier, never externally grantable — same
+        // tier as the other high-blast-radius tools below; enumerated on
+        // its own line (not the Admin fall-through) so a future scope
+        // split for co-drive is a one-line diff, not a silent behavior
+        // change. The dispatch gate ADDITIONALLY requires the agent's own
+        // `[capabilities] codrive = true` (deny-by-default, defence in
+        // depth — see `mcp_dispatch.rs`'s `CODRIVE_TOOLS` check).
+        "codrive_run" => Some(Scope::Admin),
         // ── High-impact tools — explicitly Admin (C2 fix) ────────────────
         // Arbitrary code execution, agent lifecycle/identity mutation, prompt
         // rewrite, cross-agent dispatch, scheduling, and evolution control.

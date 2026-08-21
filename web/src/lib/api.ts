@@ -2914,6 +2914,12 @@ export interface AgentCapabilities {
    *  capability: default false, denied at the dispatch gate even for an
    *  Admin-scoped agent until explicitly enabled here. */
   system_operator?: boolean;
+  /** CD-1 — opt-in human-machine co-drive: master switch for the
+   *  `codrive_run` MCP tool (GUI mouse/keyboard injection into a shared
+   *  desktop via the duduclaw-comp compositor, human-supervised throughout).
+   *  Danger-zone capability: default false, denied at the dispatch gate even
+   *  for an Admin-scoped agent until explicitly enabled here. */
+  codrive?: boolean;
   /** How much the autonomous goal loop may drive this agent on its own. */
   autonomy_level?: AutonomyLevel;
 }

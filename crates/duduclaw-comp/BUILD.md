@@ -1113,3 +1113,328 @@ was to leave a debuggable disk for whichever round needs it next).
   so the stop-loss-at-5-attempts contingency in the task brief was never
   invoked) — a second independent run was not performed to check for
   flakiness, same evidentiary bar the container round itself used.
+
+## CD-1 comp-side additions (2026-08-21)
+
+Closes the three CD-0 carry-forward gaps DESIGN-codrive-desktop-2026-08.md
+§9 named ("CD-1 承接欠帳：socket 未鑑別、resume 走 socket 暫代人側交還、
+keymap ASCII 子集") plus three new comp-side primitives CD-1 needs: a
+`status` query, named functional keys, and a target highlight box. All six
+requirements landed in one round; see each file's own doc comments for the
+detailed "why."
+
+### What changed
+
+- **`src/codrive/mod.rs`**: `CodriveShared` gained `auth_token: Option
+  <String>` (generated fresh every process start via `/dev/urandom`, no
+  new crate dependency), `check_token()` (best-effort constant-time-ish
+  compare), and `push_event()` (best-effort state-transition push to the
+  active connection, reused for both `frozen` and `resumed`). New
+  `DuduclawComp::human_resume()` — the only code path that clears
+  `frozen`, reachable solely from `input.rs`'s Super+Enter and
+  `debug_sim.rs`'s `simulate_super_enter`. `handle_agent_inject` gained
+  `KeyName` and `Highlight` arms (`Resume`/`Status` stay as
+  never-actually-reached fail-safe arms, matching the pre-existing
+  `Resume` pattern). `DuduclawComp::on_human_input` now pushes
+  `{"event":"frozen"}` on the not-frozen→frozen transition.
+- **`src/codrive/listener.rs`**: new `authenticate()` gate — every
+  connection's first line must be `{"op":"auth","token":"<hex>"}` before
+  anything else. **Security-relevant reordering**: session bookkeeping
+  (clear `terminated`, record `session_started`, publish `active_conn`)
+  moved from unconditional-on-`accept()` (in `accept_loop`) to
+  after-auth-succeeds (in `handle_conn`) — the same class of gap the CD-0
+  acceptance re-run already caught once for the plain-reconnect case (see
+  that section above), now closed at the socket layer itself rather than
+  relying on `frozen` alone staying untouched. `resume` is now
+  unconditionally denied (`resume_is_human_only`); `status` is answered
+  directly from the shared atomics, bypassing both the `frozen` and
+  `terminated` gates (it's read-only and never touches the seat).
+- **`src/codrive/protocol.rs`**: `InjectCmd` gained `KeyName`, `Status`,
+  `Highlight` variants; new standalone `AuthLine` struct (deliberately NOT
+  an `InjectCmd` variant — see its doc comment).
+- **`src/codrive/keymap_ascii.rs`**: `ascii_to_xkb` now covers the full
+  printable-ASCII range (0x20..=0x7E) — 23 punctuation marks added this
+  round (the shifted number row, backtick/tilde, brackets/braces,
+  backslash/pipe, quotes, colon, question mark) on top of CD-0's smaller
+  table. New `key_name_to_xkb` allowlist (14 named keys). Non-ASCII
+  (CJK/Unicode) stays unsupported — see "Honest stub" below, this is a
+  researched decision, not an unresearched gap.
+- **`src/codrive/cursor.rs`**: `AGENT_COLOR_LIVE` changed from private to
+  `pub(super)` so `highlight.rs` can reuse the exact same amber, one
+  constant instead of two copies that could drift.
+- **`src/codrive/highlight.rs`** (new file, ~110 lines): target highlight
+  box — `clamp_highlight_ms` (pure, unit-tested) and
+  `DuduclawComp::codrive_highlight_elements` (called once per redraw from
+  `winit_backend.rs`; clears the highlight as a side effect once expired).
+  Four `SolidColorRenderElement` bars forming a hollow border, same
+  zero-texture mechanism as `cursor.rs`.
+- **`src/state.rs`**: `DuduclawComp` gained `codrive_highlight: Option<
+  (Rectangle<f64, Logical>, Instant)>`, initialized `None`.
+- **`src/input.rs`**: the keyboard filter closure that already detects
+  Super+Esc now also detects Super+Enter (`Keysym::new(keysyms::
+  KEY_Return)`) and calls `data.human_resume()` — structurally
+  unreachable from the agent seat, same guarantee Super+Esc already has.
+- **`src/codrive/debug_sim.rs`**: third magic stdin line,
+  `simulate_super_enter` → `human_resume()` directly (headless containers
+  have no keyboard device to originate a real Super+Enter from — real
+  hardware coverage is VM/`cage` territory, same split as Super+Esc).
+- **`src/winit_backend.rs`**: the redraw path's custom-elements vector now
+  also gets `state.codrive_highlight_elements(Instant::now())` appended
+  after the two cursors.
+- **`Cargo.toml`**: unchanged — no new dependency was needed (the auth
+  token uses `/dev/urandom` + a hand-rolled hex encoder, both already
+  necessary since this crate is Linux-only). Checked before finishing this
+  round per the task brief's explicit instruction not to touch it; no
+  unexplained diff was found this time (contrast with the CD-0 round's
+  "Environment hazard hit this round" note above).
+
+### Wire protocol (final CD-1 shape)
+
+Every connection's mandatory first line:
+
+```
+→ {"op":"auth","token":"<64-hex-char token from $XDG_RUNTIME_DIR/duduclaw-codrive.token>"}
+← {"ok":true,"authenticated":true}          (success — proceed to the ops below)
+← {"ok":false,"error":"auth_failed"}        (wrong/missing/malformed — connection closed)
+```
+
+Ops available after authentication (all existing CD-0 shapes unchanged
+except `resume`; new ones marked **CD-1**):
+
+| op | example | notes |
+|---|---|---|
+| `move` | `{"op":"move","x":100.0,"y":200.0}` | unchanged |
+| `button` | `{"op":"button","btn":"left","state":"press"}` | unchanged |
+| `key` | `{"op":"key","keycode":38,"state":"press"}` | unchanged (raw XKB keycode) |
+| `text` | `{"op":"text","s":"hello"}` | unchanged (ASCII synthesis, now full printable range) |
+| `key_name` **(CD-1)** | `{"op":"key_name","name":"enter","state":"press"}` | allowlist: enter/tab/backspace/escape/delete/space/up/down/left/right/home/end/pageup/pagedown |
+| `status` **(CD-1)** | `{"op":"status"}` → `{"ok":true,"frozen":false,"terminated":false}` | read-only, answered even while frozen, never touches the seat |
+| `highlight` **(CD-1)** | `{"op":"highlight","x":0.0,"y":0.0,"w":100.0,"h":40.0,"ms":800}` | `ms` optional, default 800, clamped [100,5000]; frozen → dropped like any other injection op |
+| `resume` **(changed)** | `{"op":"resume"}` → always `{"ok":false,"error":"resume_is_human_only"}` | CD-0 behavior (clears `frozen`) is gone; "交還" is Super+Enter only |
+
+Async push events on the connection (best-effort, unchanged shape from
+CD-0's `emergency_stop`, now joined by two new ones):
+
+```
+{"event":"frozen"}          (CD-1: pushed on the not-frozen→frozen transition)
+{"event":"resumed"}         (CD-1: pushed when human_resume actually clears frozen)
+{"event":"emergency_stop"}  (unchanged from CD-0, connection force-closed right after)
+```
+
+### Token file
+
+`$XDG_RUNTIME_DIR/duduclaw-codrive.token` — 64 lowercase hex characters (32
+random bytes from `/dev/urandom`), mode 0600, created (not chmod'd
+after-the-fact) with the correct mode via `OpenOptionsExt::mode` to avoid
+any window where the secret is briefly world/group-readable. Regenerated
+every process start; a stale file from a prior run is removed first. If
+either the read from `/dev/urandom` or the file write fails, the injection
+socket is disabled entirely for that run (fail-closed — logged at `error`
+level) rather than falling back to any unauthenticated mode.
+
+### Super+Enter
+
+Human-side "交還", the CD-1 replacement for CD-0's socket-`resume`
+stand-in. Detected in the exact same keyboard filter closure as Super+Esc
+in `input.rs` (`modifiers.logo && handle.modified_sym() ==
+Keysym::new(keysyms::KEY_Return)`), which only ever sees real/winit-seat
+events — there is no code path from an injected agent key event into this
+closure, so the agent cannot forge its own resume. Clears `frozen`, logs an
+audit line (`kind:"resume", op:"human_super_enter"`), and pushes
+`{"event":"resumed"}` to the connected client — but only if the seat was
+actually frozen (a resume attempt while already live is a silent no-op,
+per the task brief: no audit line, no event push).
+
+### Verification (2026-08-21, this round)
+
+**Build/clippy/test, container-level** (same volumes/command shape as the
+CD-0 section above, `cargo check --all-targets` / `cargo clippy
+--all-targets -- -D warnings` / `cargo test`, run separately rather than
+chained in one script this round for faster iteration):
+
+```
+cargo check --all-targets   -> Finished, zero warnings, zero errors (first try)
+cargo clippy --all-targets -- -D warnings   -> Finished, zero warnings (first try)
+cargo test                  -> running 32 tests ... test result: ok. 32 passed; 0 failed
+```
+
+32 tests (up from CD-0's 5): auth token compare/generation (`codrive::
+tests`), highlight ms clamp + border geometry (`codrive::highlight::
+tests`), full-ASCII coverage + key_name allowlist (`codrive::keymap_ascii::
+tests`), and — the load-bearing one — `codrive::listener::tests::
+unauthenticated_connection_does_not_clear_terminated`, a real-socket
+integration test that simulates a just-happened emergency stop, connects
+with a WRONG token, and asserts `terminated` was never cleared. Companion
+tests cover a correctly-authenticated connection, `resume` being denied
+without ever clearing an active freeze, and `status` answering while
+frozen without touching seat state.
+
+**Live functional smoke test** (weston-headless → duduclaw-comp → foot,
+same three-layer stack as CD-0's own live-run sections, driven via a real
+socket client): wrong-token auth denied, correct-token auth accepted,
+`status` while live, `resume` denied over the socket, then a real
+functional proof stronger than CD-0's own — `text` synthesized a shell
+command WITHOUT its own trailing Enter, and a separate `key_name":"enter"`
+press+release was what actually submitted it to `foot`'s real shell
+(`cat /tmp/cd1-proof.txt` → `cd1agentok654`), proving `key_name` drives the
+agent seat for real, not just that `validate()` accepts it. `highlight`
+was accepted and applied without any panic across the whole run (the
+redraw path's `codrive_highlight_elements` executed every frame with the
+new custom element in the slice) — audit line confirms `op":"highlight"`
+with `x`/`y` recorded. Then: `simulate_human` (debug stdin) froze the
+seat — a *second, freshly-authenticated* connection's `{"op":"status"}`
+correctly read back `"frozen":true` (proving the freeze-during-a-new-
+connection case DESIGN §6 red line 3 requires, matching the CD-0
+acceptance re-run's earlier finding for the analogous case) — then
+`simulate_super_enter` cleared it, verified via a third connection's
+`status` reading `"frozen":false`. Audit trail end-to-end for this run
+(abbreviated): `auth_fail(token mismatch)` → `session_started` →
+`resume_denied` → `inject_applied`×7 (move/button×2/highlight/text/
+key_name×2) → `session_ended` → `session_started`/`session_ended` (the
+status-only connection) → `freeze(op:debug_stdin_simulated)` →
+`session_started(frozen:true)`/`session_ended` → `resume(op:
+human_super_enter)` → `session_started(frozen:false)`/`session_ended`. No
+gaps, no out-of-order timestamps. Separately verified: a connection that
+opens and disconnects WITHOUT ever sending an auth line (EOF before the
+first `read_line` returns any bytes) does not crash or hang the
+compositor — `authenticate`'s `Ok(0) => deny(...)` arm handles it, process
+stayed alive and error/panic-free (`grep -c panic` → 0) afterward.
+
+### Honest stub / limitation list (this round)
+
+- **Real-hardware Super+Enter is implemented but container-unverified** —
+  same category as CD-0's Super+Esc: headless weston has no keyboard
+  device to originate a real chord from. The debug stdin path
+  (`simulate_super_enter`) verifies everything downstream of detection;
+  closing this for real hardware is VM/`cage`/QMP acceptance-side work,
+  left to the acceptance round per the task brief ("留 VM 輪").
+- **Highlight box visual rendering is implemented but not visually
+  verified** — this round confirmed the code path executes every redraw
+  without panicking and that the `highlight` op is accepted/applied/
+  audited correctly, but headless weston has no screendump/framebuffer
+  capture available (same limitation category as CD-0's cursor-
+  distinctness check, which needed the VM/QMP round's `screendump` to
+  close). A real pixel-level check (does the amber hollow border actually
+  appear at the right position/size, distinct from the two cursors) is
+  VM/QMP acceptance-side work, same as CD-0's own dual-cursor visual
+  check.
+- **Non-ASCII (CJK/Unicode) text synthesis is still unsupported** — this
+  round specifically researched whether it's feasible (checked
+  `smithay::input::keyboard::KeyboardHandle`'s actual 0.7.0 API rather
+  than guessing) and found real capability (`set_keymap_from_string`/
+  `set_xkb_config`/`with_xkb_state`), but judged implementing it a
+  separate, independently-risky engineering effort — not a same-round
+  bolt-on alongside five other requirements. Full reasoning (why it's not
+  an incremental "add one symbol" API, why it's a whole-seat operation,
+  why this crate's container-level verification has no cheap way to
+  validate a generated keymap) is in `keymap_ascii.rs`'s module doc
+  comment, specifically so a future round doesn't have to re-derive it
+  from scratch. Unicode chars still hit `ascii_to_xkb`'s `_ => None`
+  fallthrough and are warned-and-skipped, byte-identical to CD-0.
+- **Constant-time token comparison is best-effort, not cryptographic-
+  grade** — `CodriveShared::check_token` XOR-folds every byte position
+  without early-returning on the first mismatch, but doesn't use SIMD or
+  compiler timing barriers, and the `.get(i)` bounds check itself
+  branches on length. Sized to this channel's actual threat model (a
+  same-host Unix socket with filesystem-permission-gated access to the
+  token file to begin with — not a network-exposed timing-attack
+  surface), documented as such in the function's own doc comment rather
+  than overclaiming.
+- **Token file has no rotation story** — a fresh token is generated every
+  process start (so a compositor restart naturally invalidates any
+  previously-leaked token), but there's no in-process rotation while
+  running. Not required by the task brief; noted for completeness.
+
+## CD-1 live-bridge verification (2026-08-21, acceptance side)
+
+First live proof that BOTH real CD-1 endpoints speak the same wire protocol:
+the real gateway driver (`duduclaw-gateway/src/codrive/` — `run_script` +
+`CodriveClient` + the real `ApprovalBroker`) driving THIS crate's real
+compositor across a byte-verbatim TCP relay. The fake-comp integration tests
+on the gateway side and this crate's own 32 tests each pin their half of the
+contract; this round pins the two halves against each other. Harness:
+`duduclaw-gateway/src/codrive/live_tests.rs` (permanent `#[ignore]`, module
+doc = playbook).
+
+### Topology
+
+```
+mac host                                   container (this crate's stack)
+cargo test …codrive::live_tests            weston(headless) → duduclaw-comp → foot
+   │  real CodriveClient                        ▲ socket: $XDG_RUNTIME_DIR/duduclaw-codrive.sock
+   ▼                                            │
+/tmp/cd1-live.sock ── python pump ── tcp:17777 ── socat ──┘
+```
+
+Why a bridge: Docker-for-Mac cannot share a Unix socket across the VM
+boundary, and cross-building the gateway for Linux just to co-locate it with
+comp is the expensive path this round didn't need. The relay copies bytes
+verbatim — the protocol endpoints under test are both real; only the
+transport hop is rigging. The full same-host chain (gateway + comp on the
+appliance VM, MCP `codrive_run` entry, dashboard approval card as the
+deciding surface) is the VM round's job, deliberately not claimed here.
+
+### One-shot container command
+
+Same as the CD-0 stack plus `socat` and a published port (host port 17777 —
+7777 was taken on the verifying machine):
+
+```bash
+docker run -d --name cd1-live -p 127.0.0.1:17777:7777 \
+  -v /Users/lizhixu/Project/DuDuClaw:/work \
+  -v duduclaw-shell-cargo:/usr/local/cargo/registry \
+  -v duduclaw-shell-cargo-git:/usr/local/cargo/git \
+  -v duduclaw-shell-target:/target \
+  -e CARGO_TARGET_DIR=/target -w /work/crates/duduclaw-comp \
+  rust:bookworm bash -c '…apt-get install … socat; cargo build;
+    weston --backend=headless-backend.so --socket=wayland-host … &
+    WAYLAND_DISPLAY=wayland-host LIBGL_ALWAYS_SOFTWARE=1 /target/debug/duduclaw-comp &
+    WAYLAND_DISPLAY=wayland-1 foot &
+    exec socat TCP-LISTEN:7777,fork,reuseaddr,bind=0.0.0.0 \
+      UNIX-CONNECT:$XDG_RUNTIME_DIR/duduclaw-codrive.sock'
+docker cp cd1-live:/tmp/xdg-runtime/duduclaw-codrive.token /tmp/cd1-live-token
+# host side: a ~20-line python pump binds /tmp/cd1-live.sock and pipes both
+# directions to 127.0.0.1:17777 (see live_tests.rs module doc), then:
+DUDUCLAW_CODRIVE_LIVE_SOCK=/tmp/cd1-live.sock \
+DUDUCLAW_CODRIVE_LIVE_TOKEN=/tmp/cd1-live-token \
+cargo test -p duduclaw-gateway --lib codrive::live_tests -- --ignored --nocapture
+```
+
+### Evidence (verified 2026-08-21 run)
+
+- **Approve path**: driver report `final_state: "completed"`; the
+  consequential Enter step carries the exact approval id the (test-side,
+  real-`ApprovalBroker`) decider granted; container ground truth
+  `cat /tmp/cd1-live.txt` → `cd1live` — foot's real shell executed the typed
+  command only after approval.
+- **Deny path**: report `final_state: "aborted_approval_denied"`, Enter step
+  `outcome: "denied"` with the denied approval id; `/tmp/cd1-deny.txt` does
+  NOT exist in the container; comp's audit for that session shows `text`
+  applied and **zero** `key_name` events — the denied action was never
+  injected, not injected-and-ignored.
+- **Audit chain (comp side)**: session 1 `session_started → highlight → move
+  → button×2 → text → key_name×2 → session_ended`; the ~505ms gap between
+  `text` and `key_name` is the approval await, visible in the timestamps.
+- **Ticker**: the temp gateway home's task store holds the full activity
+  sequence (`codrive_session` start → four `codrive_step` narrations →
+  `codrive_session` end) and `events.db` carries the `activity.new`
+  broadcasts — the feed a dashboard/shell ticker consumes.
+- **Auth, implicitly**: `session_started` only ever follows a successful
+  handshake (see "CD-1 comp-side additions"), and the driver read the token
+  file copied out of the container — a real end-to-end token round trip.
+
+### Honest limitation list (this round)
+
+- **Freeze/resume full-chain** not live-exercised across the bridge: this
+  container ran without `DUDUCLAW_CODRIVE_DEBUG_STDIN`, so no mid-script
+  human input could be simulated. Comp-side freeze/resume/status behavior is
+  live-verified in the CD-1 comp-side round; driver-side pause/poll/re-apply
+  is pinned by the fake-comp tests. The combined proof belongs to the VM
+  round, where real QMP input events (the honest signal) exist.
+- **Highlight visual** still pixel-unverified (no screendump here) — VM/QMP
+  round, same as the CD-0 cursor precedent. The op is wire-accepted and
+  audit-logged end to end.
+- **MCP entry (`codrive_run` tool) and the dashboard approval card** were
+  not the deciding surface here (the harness decides via the same
+  `ApprovalBroker::decide` API the dashboard RPC calls). Full product-path
+  decision flow is VM-round scope.

@@ -761,6 +761,7 @@ export function EditAgentPage() {
           recording: caps.recording,
           git_credentials: caps.git_credentials,
           system_operator: caps.system_operator,
+          codrive: caps.codrive,
           autonomy_level: caps.autonomy_level,
           computer_use_config: { ...caps.computer_use_config },
         };
@@ -1344,12 +1345,16 @@ export function EditAgentPage() {
               <RowSwitch label={t('agents.cap.recording')} description={t('agents.cap.recording.help')} checked={caps.recording} onChange={guardDanger(t('agents.cap.recording'), (v) => updateCap('recording', v), 'agents.edit.dangerConfirm.recording')} />
               <RowSwitch label={t('agents.cap.gitCredentials')} description={t('agents.cap.gitCredentials.help')} checked={caps.git_credentials} onChange={guardDanger(t('agents.cap.gitCredentials'), (v) => updateCap('git_credentials', v), 'agents.edit.dangerConfirm.gitCredentials')} />
               <RowSwitch label={t('agents.cap.systemOperator')} description={t('agents.cap.systemOperator.help')} checked={caps.system_operator} onChange={guardDanger(t('agents.cap.systemOperator'), (v) => updateCap('system_operator', v), 'agents.edit.dangerConfirm.systemOperator')} />
+              <RowSwitch label={t('agents.cap.codrive')} description={t('agents.cap.codrive.help')} checked={caps.codrive} onChange={guardDanger(t('agents.cap.codrive'), (v) => updateCap('codrive', v), 'agents.edit.dangerConfirm.codrive')} />
             </SettingsCard>
             {caps.computer_use_mode === 'native' && (
               <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.nativeWarning')}</p>
             )}
             {caps.system_operator && (
               <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.systemOperatorWarning')}</p>
+            )}
+            {caps.codrive && (
+              <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{t('agents.cap.codriveWarning')}</p>
             )}
             <FieldBlock label={t('agents.cap.allowedApps')}>
               <ChipEditor values={caps.computer_use_config.allowed_apps ?? []} onChange={(v) => updateCapConfig('allowed_apps', v)} placeholder="Safari" addLabel={t('common.add')} />
