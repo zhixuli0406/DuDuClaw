@@ -16,9 +16,7 @@ use std::time::Duration;
 
 use smithay::{
     backend::{
-        renderer::{
-            damage::OutputDamageTracker, element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer,
-        },
+        renderer::{damage::OutputDamageTracker, element::solid::SolidColorRenderElement, gles::GlesRenderer},
         winit::{self, WinitEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
@@ -35,7 +33,13 @@ pub fn init_winit(
     let display_handle = &mut data.display_handle;
     let state = &mut data.state;
 
-    let (mut backend, winit) = winit::init()?;
+    // Explicit `GlesRenderer` turbofish: previously inferred from the
+    // render_output turbofish's `WaylandSurfaceRenderElement<GlesRenderer>`
+    // custom-element type argument; that argument is now
+    // `SolidColorRenderElement` (renderer-agnostic — see the redraw arm
+    // below), so nothing else in this function fixes `R` for
+    // `winit::init::<R>()` without this annotation.
+    let (mut backend, winit) = winit::init::<GlesRenderer>()?;
 
     let mode = Mode {
         size: backend.window_size(),
@@ -87,11 +91,27 @@ pub fn init_winit(
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
 
+                // CD-0 codrive spike (DESIGN §3.3.2): both cursors are
+                // compositor-internal render elements, not client
+                // surfaces — queried fresh every frame directly from each
+                // seat's pointer handle rather than tracked as duplicate
+                // state on `DuduclawComp`. `custom_elements`'s element type
+                // `C` is independent of the space's own element type (see
+                // `render_output`'s signature — `C: RenderElement<R>` has
+                // no relation to `E: SpaceElement`), so this doesn't need a
+                // combined enum: `SolidColorRenderElement` implements
+                // `RenderElement<R>` for any `R`.
+                let human_pos = state.seat.get_pointer().unwrap().current_location();
+                let agent_pos = state.agent_seat.get_pointer().unwrap().current_location();
+                let agent_frozen = state.codrive.is_frozen();
+                let cursor_elements =
+                    crate::codrive::build_cursor_elements(human_pos, agent_pos, agent_frozen);
+
                 {
                     let (renderer, mut framebuffer) = backend.bind().unwrap();
                     smithay::desktop::space::render_output::<
                         _,
-                        WaylandSurfaceRenderElement<GlesRenderer>,
+                        SolidColorRenderElement,
                         _,
                         _,
                     >(
@@ -101,7 +121,7 @@ pub fn init_winit(
                         1.0,
                         0,
                         [&state.space],
-                        &[],
+                        &cursor_elements,
                         &mut damage_tracker,
                         [0.1, 0.1, 0.1, 1.0],
                     )
