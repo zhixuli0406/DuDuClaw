@@ -471,6 +471,19 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
                         .border_color(theme::surface_border())
                         .text_size(px(theme::TEXT_XS))
                         .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
+                        // WP-NG-debt: the version string reads as a version
+                        // string (tabular digits, no ambiguity between "l"/
+                        // "1"/"I") when set in the same system monospace
+                        // face `chat/markdown.rs::mono_font` already
+                        // establishes for this crate's other "this is code/
+                        // a version, not prose" text (`SF Mono`, macOS
+                        // system font — see that module's doc comment on why
+                        // it isn't bundled). Only `.font_family()`, not the
+                        // full `Font` struct with fallbacks: a short digits-
+                        // and-dots token has none of the glyph-coverage risk
+                        // that motivates `mono_font()`'s Menlo/Courier New
+                        // fallback chain for arbitrary code content.
+                        .font_family("SF Mono")
                         .child(version_text),
                 )
                 .children(show_offline_note.then(|| {

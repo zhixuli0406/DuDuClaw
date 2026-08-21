@@ -10,8 +10,8 @@ use crate::chat_ws::ConnState;
 use crate::i18n::{self, Locale};
 use crate::mds_gpui::{button, empty_state, ButtonVariant};
 use crate::screens::dashboard::{
-    error_row, loading_row, ActivityItem, AgentsCard, BudgetCard, ChannelsCard, GoalCard, Loadable,
-    TasksCard,
+    error_row, loading_row, ActivityItem, AgentsCard, BudgetCard, ChannelsCard, DashboardState, GoalCard,
+    Loadable, TasksCard,
 };
 use crate::theme;
 use crate::RootView;
@@ -80,8 +80,8 @@ pub(super) fn refresh_button(locale: Locale, cx: &mut Context<RootView>) -> Stat
         ButtonVariant::Ghost,
         false,
         None,
-        cx.listener(|this, _ev, _window, cx| {
-            this.dashboard.request_refresh();
+        cx.listener(|_this, _ev, _window, cx| {
+            cx.default_global::<DashboardState>().request_refresh();
             cx.notify();
         }),
     )
@@ -196,7 +196,7 @@ pub(super) fn chip(id: &'static str, label: SharedString, cx: &mut Context<RootV
 
 pub(super) fn approvals_card(state: &RootView, cx: &mut Context<RootView>) -> Div {
     let locale = state.locale;
-    let (dot, body) = match &state.dashboard.approvals {
+    let (dot, body) = match &cx.default_global::<DashboardState>().approvals {
         Loadable::Loading => (theme::MUTED_FOREGROUND, loading_row()),
         Loadable::Failed(msg) => (theme::DESTRUCTIVE, error_row(locale, msg)),
         Loadable::Ready(0) => {
@@ -246,7 +246,7 @@ fn status_label(locale: Locale, status: &str) -> SharedString {
 
 pub(super) fn goal_card(state: &RootView, cx: &mut Context<RootView>) -> Div {
     let locale = state.locale;
-    let (dot, body) = match &state.dashboard.goal {
+    let (dot, body) = match &cx.default_global::<DashboardState>().goal {
         Loadable::Loading => (theme::MUTED_FOREGROUND, loading_row()),
         Loadable::Failed(msg) => (theme::DESTRUCTIVE, error_row(locale, msg)),
         Loadable::Ready(GoalCard { highlight: None, .. }) => (
@@ -288,7 +288,7 @@ pub(super) fn goal_card(state: &RootView, cx: &mut Context<RootView>) -> Div {
 
 pub(super) fn tasks_card(state: &RootView, cx: &mut Context<RootView>) -> Div {
     let locale = state.locale;
-    let (dot, body) = match &state.dashboard.tasks {
+    let (dot, body) = match &cx.default_global::<DashboardState>().tasks {
         Loadable::Loading => (theme::MUTED_FOREGROUND, loading_row()),
         Loadable::Failed(msg) => (theme::DESTRUCTIVE, error_row(locale, msg)),
         Loadable::Ready(TasksCard { active_count: 0, .. }) => (
@@ -334,7 +334,7 @@ fn format_dollars(cents: i64) -> String {
 
 pub(super) fn budget_card(state: &RootView, cx: &mut Context<RootView>) -> Div {
     let locale = state.locale;
-    let (dot, body) = match &state.dashboard.budget {
+    let (dot, body) = match &cx.default_global::<DashboardState>().budget {
         Loadable::Loading => (theme::MUTED_FOREGROUND, loading_row()),
         Loadable::Failed(msg) => (theme::DESTRUCTIVE, error_row(locale, msg)),
         Loadable::Ready(BudgetCard { spent_cents, total_cents }) if *total_cents <= 0 => (
@@ -399,7 +399,7 @@ pub(super) fn budget_card(state: &RootView, cx: &mut Context<RootView>) -> Div {
 
 pub(super) fn channels_card(state: &RootView, cx: &mut Context<RootView>) -> Div {
     let locale = state.locale;
-    let (dot, body) = match &state.dashboard.channels {
+    let (dot, body) = match &cx.default_global::<DashboardState>().channels {
         Loadable::Loading => (theme::MUTED_FOREGROUND, loading_row()),
         Loadable::Failed(msg) => (theme::DESTRUCTIVE, error_row(locale, msg)),
         Loadable::Ready(ChannelsCard { total: 0, .. }) => (
@@ -437,7 +437,7 @@ pub(super) fn channels_card(state: &RootView, cx: &mut Context<RootView>) -> Div
 
 pub(super) fn agents_card(state: &RootView, cx: &mut Context<RootView>) -> Div {
     let locale = state.locale;
-    let (dot, body) = match &state.dashboard.agents {
+    let (dot, body) = match &cx.default_global::<DashboardState>().agents {
         Loadable::Loading => (theme::MUTED_FOREGROUND, loading_row()),
         Loadable::Failed(msg) => (theme::DESTRUCTIVE, error_row(locale, msg)),
         Loadable::Ready(AgentsCard { total: 0, .. }) => (
@@ -501,14 +501,14 @@ fn activity_row(item: &ActivityItem) -> Div {
         .child(div().text_size(px(10.)).text_color(theme::alpha(theme::MUTED_FOREGROUND, 0.8)).child(item.when.clone()))
 }
 
-pub(super) fn activity_shelf(state: &RootView, locale: Locale) -> Div {
+pub(super) fn activity_shelf(locale: Locale, cx: &mut Context<RootView>) -> Div {
     let title = div()
         .text_size(px(theme::TEXT_XS))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
         .child(i18n::t(locale, "native.home.activity.title"));
 
-    let body = match &state.dashboard.activity {
+    let body = match &cx.default_global::<DashboardState>().activity {
         Loadable::Loading => div().flex().gap_3().children([loading_row(), loading_row(), loading_row()]),
         Loadable::Failed(msg) => error_row(locale, msg),
         Loadable::Ready(items) if items.is_empty() => {
