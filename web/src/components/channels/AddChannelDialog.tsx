@@ -268,7 +268,10 @@ export function AddChannelDialog({
   };
 
   const guide = channelGuide[channelType] ?? { tokenLabel: 'Token', stepKeys: [] };
-  const steps = guide.stepKeys.map((id) => intl.formatMessage({ id }));
+  // WP-WEB-emoji: keep the source `id` alongside the resolved text so the
+  // "this step is a warning" signal comes from the key name, not from
+  // sniffing a leading emoji character baked into the translated string.
+  const steps = guide.stepKeys.map((id) => ({ id, text: intl.formatMessage({ id }) }));
   const typeLabel = CHANNEL_TYPES.find((c) => c.value === channelType)?.label ?? channelType;
   const lockedAgentLabel = lockedAgent
     ? agents.find((a) => a.name === lockedAgent)?.display_name || lockedAgent
@@ -349,11 +352,18 @@ export function AddChannelDialog({
           {/* Setup guide */}
           <div className="rounded-lg bg-warning/10 p-3 text-xs text-warning">
             <p className="mb-1 font-medium">{intl.formatMessage({ id: 'channels.dialog.setupGuide' })}</p>
-            {steps.map((step, i) => (
-              <p key={i} className={step.startsWith('⚠') ? 'font-semibold text-destructive' : ''}>
-                {step}
-              </p>
-            ))}
+            {steps.map((step) => {
+              const isWarning = step.id.toLowerCase().includes('warning');
+              return (
+                <p
+                  key={step.id}
+                  className={isWarning ? 'flex items-start gap-1.5 font-semibold text-destructive' : ''}
+                >
+                  {isWarning && <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden="true" />}
+                  <span>{step.text}</span>
+                </p>
+              );
+            })}
           </div>
 
           <DialogField label={guide.tokenLabel}>

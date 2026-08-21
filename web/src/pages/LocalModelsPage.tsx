@@ -301,7 +301,9 @@ export function LocalModelsPage() {
                         {m.moe &&
                           m.active_params_b != null &&
                           ` (${intl.formatMessage({ id: 'localmodels.moe.active' }, { n: m.active_params_b })})`}
-                        {` · ${Intl.NumberFormat().format(m.downloads)} ⬇`}
+                        {' · '}
+                        {Intl.NumberFormat().format(m.downloads)}
+                        <Download className="ml-0.5 inline size-3 align-text-bottom" aria-hidden="true" />
                       </p>
                     </div>
                     {eff && (

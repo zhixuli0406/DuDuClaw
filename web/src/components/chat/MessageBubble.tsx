@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import type { ChatMessage } from '@/stores/chat-store';
 import { cn } from '@/lib/utils';
 import { AttachmentChip } from './AttachmentChip';
@@ -32,7 +33,12 @@ export function MessageBubble({ message, leading }: { message: ChatMessage; lead
             ))}
           </div>
         )}
-        {message.content && <div className="whitespace-pre-wrap break-words">{message.content}</div>}
+        {message.content && (
+          <div className={cn('whitespace-pre-wrap break-words', isSystem && 'flex items-start gap-1.5')}>
+            {isSystem && <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />}
+            <span>{message.content}</span>
+          </div>
+        )}
         {message.tokens != null && message.tokens > 0 && (
           <div className="mt-1 font-mono text-xs tabular-nums text-muted-foreground">{message.tokens} tokens</div>
         )}

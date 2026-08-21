@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
+import { RefreshCw } from 'lucide-react';
 import { inputClass, selectClass } from './controlClass';
 import type { AvailableModel } from '@/hooks/useAvailableModels';
 
@@ -17,7 +18,7 @@ interface ModelSelectProps {
   discoveredAt?: string | null;
   /** True while a live re-probe is in flight (disables the refresh button). */
   refreshing?: boolean;
-  /** When provided, renders a 🔄 refresh button that triggers a live re-probe. */
+  /** When provided, renders a refresh button that triggers a live re-probe. */
   onRefresh?: () => void;
 }
 
@@ -87,7 +88,7 @@ export function ModelSelect({
       )
     : intl.formatMessage({ id: 'model.select.neverUpdated' });
 
-  // Header row: "updated N ago" + optional 🔄 refresh button. Shown whenever a
+  // Header row: "updated N ago" + optional refresh button. Shown whenever a
   // refresh handler is wired, regardless of list/manual mode.
   const header = onRefresh ? (
     <div className="flex items-center justify-between gap-2">
@@ -100,7 +101,7 @@ export function ModelSelect({
         aria-label={intl.formatMessage({ id: 'model.select.refresh' })}
         className="cursor-pointer text-xs text-muted-foreground transition hover:text-brand disabled:cursor-not-allowed disabled:opacity-50"
       >
-        <span className={refreshing ? 'inline-block animate-spin' : undefined}>🔄</span>
+        <RefreshCw className={refreshing ? 'size-3.5 animate-spin' : 'size-3.5'} aria-hidden="true" />
       </button>
     </div>
   ) : null;

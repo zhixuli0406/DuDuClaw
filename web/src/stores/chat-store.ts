@@ -654,7 +654,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   {
                     id: nextId(),
                     role: 'system',
-                    content: '⚠️ 找不到這個對話（可能已被封存或移除），已為你開啟新對話。',
+                    content: '找不到這個對話（可能已被封存或移除），已為你開啟新對話。',
                     timestamp: Date.now(),
                   },
                 ],
@@ -674,7 +674,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 {
                   id: nextId(),
                   role: 'system',
-                  content: `⚠️ ${data.message}`,
+                  content: data.message,
                   timestamp: Date.now(),
                 },
               ],
