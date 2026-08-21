@@ -170,6 +170,70 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // generic placeholder heading entirely" pattern as every other real
         // (non-stub) page in this match.
         content_shell.child(crate::screens::identity::render(state, cx))
+    } else if active_id == "routines" {
+        // WP-S5b2-D: 例行工作 — see `screens/routines.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::routines::render(state, cx))
+    } else if active_id == "plans" {
+        // WP-S5b2-D: 共同計畫 — see `screens/plans.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::plans::render(state, cx))
+    // ── WP-S5b2-E ("型錄/商店卡片牆", B2) — five pages added by this pass,
+    // `nav.rs`/`shell.rs` wiring done here per the "D 先掛好分支就直接可達，
+    // 未掛就自己掛" precedent `channels.rs`'s own first-S5b-wave doc comment
+    // set (D's nav.rs S5b2-D header comment confirms these five ids are
+    // this pass's own scope, not D's). ─────────────────────────────────
+    } else if active_id == "presets" {
+        // WP-S5b2-E: 職務組合 — see `screens/presets.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::presets::render(state, cx))
+    } else if active_id == "skills" {
+        // WP-S5b2-E: 技能庫 — see `screens/skills.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::skills::render(state, cx))
+    } else if active_id == "experts" {
+        // WP-S5b2-E: AI 團隊 — see `screens/experts.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::experts::render(state, cx))
+    } else if active_id == "gallery" {
+        // WP-S5b2-E: 靈感畫廊 — routes to `screens::inspiration_gallery`,
+        // NOT `screens::gallery` (that module is the unrelated S3
+        // component-library dogfood page reached via `componentLibrary`
+        // below) — see `inspiration_gallery.rs`'s own doc comment for the
+        // full disambiguation. Same "skip the generic placeholder heading
+        // entirely" pattern as every other real (non-stub) page here.
+        content_shell.child(crate::screens::inspiration_gallery::render(state, cx))
+    } else if active_id == "widgets" {
+        // WP-S5b2-E: Widget 工坊 — see `screens/widgets.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::widgets::render(state, cx))
+    // ── WP-S5b2-F (2026-08-21), same wave — `files`/`runs`/`mcpKeys` wired
+    // by this pass itself, per the "D 先掛好分支就直接可達，未掛就自己掛"
+    // precedent WP-S5b2-E's own comment above already established (D had
+    // not reached these three by the time this pass landed). ─────────────
+    } else if active_id == "files" {
+        // WP-S5b2-F: 檔案 (B3 檔案總管) — see `screens/files.rs`'s module
+        // doc comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::files::render(state, cx))
+    } else if active_id == "runs" {
+        // WP-S5b2-F: 執行紀錄 (B4) — see `screens/runs.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::runs::render(state, cx))
+    } else if active_id == "mcpKeys" {
+        // WP-S5b2-F: 存取金鑰 (McpKeysPage) — no `nav.rs` entry of its own,
+        // reached via `screens::mcp`'s "存取金鑰管理 →" row. See
+        // `screens/mcp_keys.rs`'s module doc comment. Same "skip the
+        // generic placeholder heading entirely" pattern as every other real
+        // (non-stub) page in this match.
+        content_shell.child(crate::screens::mcp_keys::render(state, cx))
     } else if active_id == "componentLibrary" {
         content_shell.child(crate::screens::gallery::render(state, cx))
     } else if active_id == "newChat" {
