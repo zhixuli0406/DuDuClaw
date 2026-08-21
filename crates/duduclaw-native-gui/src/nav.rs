@@ -87,6 +87,72 @@
 // this one page until a future pass gives it one — an accepted, documented
 // gap, not a silent regression (tracked by this comment, not hidden).
 //
+// ── S5b3-G update (2026-08-21): sidebar wrap-up — the viz-pages canvas's
+// 11 remaining pages land, `home` moves into 對話, `usage` is documented as
+// a still-unbuilt placeholder ─────────────────────────────────────────────
+// WP-S5b3-G ("S5b 第三波" — this wave's sole `nav.rs` editor, per its own
+// task brief) reconciles this file against the authoritative unified-
+// sidebar table (`commercial/design/duduclaw-s5-settings-pages/Main.dc.
+// html`'s "統一側欄組成" panel, most recently updated 2026-08-21 to cover
+// batch 1+2+3+S4a) AND the viz-pages batch cover's own "側欄六群組吸收方式"
+// delta note (`commercial/design/duduclaw-s5-viz-pages/Main.dc.html`). Six
+// changes, one per bullet:
+//   1. `home` MOVES from `MONITOR_ITEMS` to `CHAT_ITEMS` (first position) —
+//      the unified table's 對話 group is "總覽・對話・主控台・收件匣・信箱"
+//      (`home`/`newChat`/`console`/`inbox`/`mail`), five items, matching the
+//      S5b2-D update's own forward-looking note below ("home's position is
+//      deliberately left untouched" — deferred to "a later (viz-pages)
+//      wave", i.e. this one).
+//   2. `inbox` is NEW to `nav.rs` — its screen has existed since S4b
+//      (`screens/inbox.rs`, wired into `shell.rs`'s `active_id == "inbox"`
+//      branch) but never had a sidebar row (absent from every prior
+//      `LEGACY_IDS` list, confirmed by reading this file's own git
+//      history) — a genuine pre-existing gap this pass closes, not a new
+//      page.
+//   3. `mail` is NEW (screen is a sibling package's scope this wave,
+//      `Mail.dc.html`/B15 — self-attaches into `shell.rs` per the same
+//      "D 先掛好分支就直接可達，未掛就自己掛" precedent this file's other
+//      updates already establish).
+//   4. `org` (組織架構, `OrgIndented.dc.html`/B11) is NEW, inserted into
+//      `AGENTS_ITEMS` between `gallery` and `world` — exactly where the
+//      S5b2-D update below already predicted it would land ("A future wave
+//      that lands 組織架構 should insert it between gallery and world to
+//      match the canvas exactly").
+//   5. `forks` (分支決戰, `Forks.dc.html`/B13) is NEW, appended to
+//      `TASKS_ITEMS` — the S5b2-D update's own note flagged this as
+//      "explicitly deferred to a later wave" ("分支決戰留波三"), landing now.
+//   6. `MONITOR_ITEMS` becomes the unified table's 7-item "監控" membership
+//      verbatim (執行紀錄・用量・預測與驗證・OS・分析報表・工作時間軸・畫布 =
+//      `runs`/`usage`/`foresight`/`os`/`reports`/`timeline`/`canvas`) — this
+//      is the viz-pages cover's own explicitly-flagged "本批次唯一密度張力"
+//      (7 items in one area, left unsplit on purpose, "是否要再拆子群組留你
+//      裁決" — not this pass's call to make unilaterally, so it stays flat).
+//
+// `usage` (用量) is a known, DOCUMENTED gap: the unified table lists it as
+// part of 監控's 7 items, but no page/screen for it exists anywhere in this
+// wave's 11-page batch (`foresight`/`os`/`growth`/`reports`/`timeline`/
+// `org`/`canvas`/`world`/`forks`/`memory`/`mail` — eleven ids, no twelfth
+// "usage"). Rather than silently dropping it from the sidebar (which would
+// leave `MONITOR_ITEMS` short of the authoritative 7-item count) or
+// inventing a page nobody asked for, it is added here as an honest
+// placeholder row — same "pre-declare the id, `shell.rs`'s generic fallback
+// renders its label/desc until a real page lands" pattern the S5b1-A update
+// above already established for `channels`/`integrations`. A future wave
+// that builds a cost/usage report page should point it at that page.
+//
+// `KNOWLEDGE_ITEMS` is UNCHANGED (still `memory`/`widgets`, 2 items) despite
+// the unified table listing "知識與記憶（3）記憶・知識中樞・Widget 工坊" — the
+// viz-pages cover's own delta note is explicit that this area gets "不變" in
+// this batch, and the "知識中樞" ("Knowledge Hub"/WikiGraph) concept has a
+// real precedent to follow: `web/src/pages/MemoryPage.tsx` embeds
+// `KnowledgeHubPage` as an in-page VIEW TAB (`view === 'wiki'`), not a
+// separate top-level route — there is no `/wiki` entry anywhere in `web/
+// src/components/layout/nav-model.ts` either. The unified table's "3" count
+// describes a tab inside `/memory`, not a third sidebar row; adding a
+// `knowledgeHub`/`org`-style nav id here would misrepresent that as a
+// second page. A future wave giving `/memory` its own tab set should follow
+// the web precedent, not add a new nav id.
+//
 // ── S5b2-D update (2026-08-21): four areas reshuffled per the work-pages
 // canvas ──────────────────────────────────────────────────────────────────
 // WP-S5b2-D ("S5b 第二波" — this crate's sole `nav.rs`/`shell.rs` editor for
@@ -172,9 +238,16 @@ const fn area(
     NavArea { id, label_key, badge_letter, badge_color, items }
 }
 
+// S5b3-G (2026-08-21) update: `home` MOVES IN (first position) from
+// `MONITOR_ITEMS`; `inbox`/`mail` are NEW — see this file's header comment
+// for the full reasoning. Order matches the unified table's own "總覽・
+// 對話・主控台・收件匣・信箱" listing exactly.
 const CHAT_ITEMS: &[NavItem] = &[
+    item("home", "nav.home", "nav.home.desc", 'D', theme::BRAND),
     item("newChat", "nav.newChat", "nav.newChat.desc", '+', theme::BRAND),
     item("console", "nav.console", "nav.console.desc", 'C', theme::CHART_2),
+    item("inbox", "nav.inbox", "nav.inbox.desc", 'I', theme::CHART_2),
+    item("mail", "nav.mail", "nav.mail.desc", 'M', theme::BRAND),
 ];
 
 // S5b2-D (2026-08-21) update: this area is now the S5a work-pages canvas's
@@ -195,12 +268,16 @@ const CHAT_ITEMS: &[NavItem] = &[
 // this one) — so keeping them here is the closer reading of the two
 // documents, not just the safer one. A future wave that lands 組織架構 should
 // insert it between `gallery` and `world` to match the canvas exactly.
+// S5b3-G (2026-08-21) update: `org` is NEW, inserted between `gallery` and
+// `world` — see this file's header comment (the S5b2-D update below already
+// predicted this exact slot).
 const AGENTS_ITEMS: &[NavItem] = &[
     item("agents", "nav.agents", "nav.agents.desc", 'E', theme::WARNING),
     item("presets", "nav.presets", "nav.presets.desc", 'P', theme::WARNING),
     item("skills", "nav.skills", "nav.skills.desc", 'S', theme::WARNING),
     item("experts", "nav.experts", "nav.experts.desc", 'X', theme::WARNING),
     item("gallery", "nav.gallery", "nav.gallery.desc", 'I', theme::WARNING),
+    item("org", "nav.org", "nav.org.desc", 'O', theme::WARNING),
     item("world", "nav.world", "nav.world.desc", 'W', theme::WARNING),
     item("growth", "nav.growth", "nav.growth.desc", 'G', theme::WARNING),
 ];
@@ -213,12 +290,16 @@ const AGENTS_ITEMS: &[NavItem] = &[
 // `files` MOVES IN from the old `KNOWLEDGE_ITEMS`. The canvas's full unified
 // sidebar shows a 6th row here, `分支決戰` (`forks`) — explicitly deferred to
 // a later wave per the task brief ("分支決戰留波三"), so it is NOT added yet.
+// S5b3-G (2026-08-21) update: `forks` is NEW, appended last — see this
+// file's header comment (the S5b2-D update below already flagged this as
+// "留波三").
 const TASKS_ITEMS: &[NavItem] = &[
     item("goals", "nav.goals", "nav.goals.desc", 'G', theme::SUCCESS),
     item("tasks", "nav.tasks", "nav.tasks.desc", 'T', theme::SUCCESS),
     item("routines", "nav.routines", "nav.routines.desc", 'R', theme::SUCCESS),
     item("plans", "nav.plans", "nav.plans.desc", 'P', theme::SUCCESS),
     item("files", "nav.files", "nav.files.desc", 'F', theme::SUCCESS),
+    item("forks", "nav.forks", "nav.forks.desc", 'K', theme::SUCCESS),
 ];
 
 // S5b2-D (2026-08-21) update: `files` and `skills` MOVE OUT (see
@@ -228,6 +309,9 @@ const TASKS_ITEMS: &[NavItem] = &[
 // 工坊" instruction). The canvas's full unified sidebar also shows a
 // `知識中樞` ("Knowledge Hub"/WikiGraph) row here with no id in this crate
 // yet — a later (viz-pages) wave's page, not this one's, so it is not added.
+// S5b3-G (2026-08-21): UNCHANGED — see this file's header comment for why
+// "知識中樞" does NOT get a third nav id here (it is a `/memory` view tab on
+// the web precedent, not a separate page).
 const KNOWLEDGE_ITEMS: &[NavItem] = &[
     item("memory", "nav.memory", "nav.memory.desc", 'M', theme::INFO),
     item("widgets", "nav.widgets", "nav.widgets.desc", 'W', theme::INFO),
@@ -239,11 +323,22 @@ const KNOWLEDGE_ITEMS: &[NavItem] = &[
 // total, "監控 7 項不拆" per the 2026-08-21 status-map decision log) and
 // drops `home` to the "對話" group entirely; both of those are OUTSIDE this
 // wave's brief (only "加 執行紀錄" was asked for) and belong to a later
-// (viz-pages) wave, so `home`'s position is deliberately left untouched here.
+// (viz-pages) wave — S5b3-G below is that wave.
+//
+// S5b3-G (2026-08-21) update: the full 7-item membership lands — `home`
+// MOVES OUT (see `CHAT_ITEMS`'s own update note above); `usage`/`foresight`/
+// `os`/`timeline`/`canvas` are NEW. Order matches the unified table's own
+// "執行紀錄・用量・預測與驗證・OS・分析報表・工作時間軸・畫布" listing
+// exactly. `usage` has no page yet — see this file's header comment's
+// "known, DOCUMENTED gap" paragraph.
 const MONITOR_ITEMS: &[NavItem] = &[
-    item("home", "nav.home", "nav.home.desc", 'D', theme::CHART_2),
-    item("reports", "nav.reports", "nav.reports.desc", 'A', theme::CHART_2),
     item("runs", "nav.runs", "nav.runs.desc", 'L', theme::CHART_2),
+    item("usage", "nav.usage", "nav.usage.desc", 'U', theme::CHART_2),
+    item("foresight", "nav.foresight", "nav.foresight.desc", 'P', theme::CHART_2),
+    item("os", "nav.os", "nav.os.desc", 'O', theme::CHART_2),
+    item("reports", "nav.reports", "nav.reports.desc", 'A', theme::CHART_2),
+    item("timeline", "nav.timeline", "nav.timeline.desc", 'T', theme::CHART_2),
+    item("canvas", "nav.canvas", "nav.canvas.desc", 'V', theme::CHART_2),
 ];
 
 // S5b1-A (2026-08-21): the real 6-item "管理" membership — order matches
@@ -350,9 +445,24 @@ mod tests {
     /// comment are specifically about pre-existing ids).
     const S5B2_D_NEW_IDS: &[&str] = &["presets", "gallery", "widgets"];
 
+    /// S5b3-G (2026-08-21): the nine brand-new ids this wave's sidebar
+    /// wrap-up introduces (see this file's header comment) — same
+    /// resolvability trip-wire as `S5B2_D_NEW_IDS` above. `home` is NOT
+    /// here — it already resolved before this wave, it only moved areas
+    /// (covered by `chat_area_has_the_s5b3_g_membership_in_order` below).
+    const S5B3_G_NEW_IDS: &[&str] =
+        &["inbox", "mail", "org", "forks", "usage", "foresight", "os", "timeline", "canvas"];
+
     #[test]
     fn every_s5b2_d_new_id_resolves() {
         for id in S5B2_D_NEW_IDS {
+            assert!(find(id).is_some(), "new nav id {id:?} does not resolve via find()");
+        }
+    }
+
+    #[test]
+    fn every_s5b3_g_new_id_resolves() {
+        for id in S5B3_G_NEW_IDS {
             assert!(find(id).is_some(), "new nav id {id:?} does not resolve via find()");
         }
     }
@@ -378,30 +488,30 @@ mod tests {
         );
     }
 
-    /// S5b2-D (2026-08-21): the "AI 員工" area's 7-item membership — the
-    /// canvas's own 5-item list (員工總覽/職務組合/技能庫/AI團隊/靈感畫廊) in
-    /// exact order, followed by the pre-existing `world`/`growth` (kept, per
-    /// this file's header comment on the S5b2-D update's reasoning).
+    /// S5b3-G (2026-08-21): the "AI 員工" area's 8-item membership — `org`
+    /// is NEW, inserted between `gallery` and `world` (see this file's
+    /// header comment). Supersedes the S5b2-D-era 7-item assertion this
+    /// test used to make.
     #[test]
-    fn agents_area_has_the_s5b2_d_membership_in_order() {
+    fn agents_area_has_the_s5b3_g_membership_in_order() {
         let agents = AREAS.iter().find(|a| a.id == "areaAgents").expect("areaAgents must exist");
         let ids: Vec<&str> = agents.items.iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec!["agents", "presets", "skills", "experts", "gallery", "world", "growth"]);
+        assert_eq!(ids, vec!["agents", "presets", "skills", "experts", "gallery", "org", "world", "growth"]);
     }
 
-    /// S5b2-D (2026-08-21): the "任務與目標" area's 5-item membership, in the
-    /// exact order the task brief and the canvas's embedded sidebar both
-    /// give (目標/任務/例行工作/共同計畫/檔案).
+    /// S5b3-G (2026-08-21): the "任務與目標" area's 6-item membership —
+    /// `forks` is NEW, appended last (see this file's header comment).
+    /// Supersedes the S5b2-D-era 5-item assertion this test used to make.
     #[test]
-    fn tasks_area_has_the_s5b2_d_membership_in_order() {
+    fn tasks_area_has_the_s5b3_g_membership_in_order() {
         let tasks = AREAS.iter().find(|a| a.id == "areaTasks").expect("areaTasks must exist");
         let ids: Vec<&str> = tasks.items.iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec!["goals", "tasks", "routines", "plans", "files"]);
+        assert_eq!(ids, vec!["goals", "tasks", "routines", "plans", "files", "forks"]);
     }
 
-    /// S5b2-D (2026-08-21): the "知識與記憶" area shrinks to `memory` +
-    /// `widgets` — `files`/`skills` moved out (see `TASKS_ITEMS`/
-    /// `AGENTS_ITEMS`'s own membership tests above).
+    /// S5b3-G (2026-08-21): UNCHANGED from S5b2-D — `memory` + `widgets`,
+    /// still 2 items (see this file's header comment for why "知識中樞"
+    /// does not add a third id here).
     #[test]
     fn knowledge_area_has_the_s5b2_d_membership_in_order() {
         let knowledge = AREAS.iter().find(|a| a.id == "areaKnowledge").expect("areaKnowledge must exist");
@@ -409,14 +519,27 @@ mod tests {
         assert_eq!(ids, vec!["memory", "widgets"]);
     }
 
-    /// S5b2-D (2026-08-21): `runs` joins `home`/`reports` in "監控" — this
-    /// wave's only instructed change to this area ("home"'s position is
-    /// deliberately left untouched, see `MONITOR_ITEMS`'s own comment).
+    /// S5b3-G (2026-08-21): the "監控" area's full 7-item membership —
+    /// `home` MOVES OUT (now in `areaChat`, see the test below), `usage`/
+    /// `foresight`/`os`/`timeline`/`canvas` are NEW. Supersedes the
+    /// S5b2-D-era 3-item assertion this test used to make.
     #[test]
-    fn monitor_area_has_the_s5b2_d_membership_in_order() {
+    fn monitor_area_has_the_s5b3_g_membership_in_order() {
         let monitor = AREAS.iter().find(|a| a.id == "areaMonitor").expect("areaMonitor must exist");
         let ids: Vec<&str> = monitor.items.iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec!["home", "reports", "runs"]);
+        assert_eq!(ids, vec!["runs", "usage", "foresight", "os", "reports", "timeline", "canvas"]);
+    }
+
+    /// S5b3-G (2026-08-21): the "對話" area's full 5-item membership —
+    /// `home` MOVES IN (first position, from `areaMonitor`), `inbox`/`mail`
+    /// are NEW. No prior test asserted this area's membership at all (it
+    /// was a fixed 2-item array `newChat`/`console` since the P0-1
+    /// restructuring); this is that area's first membership trip-wire.
+    #[test]
+    fn chat_area_has_the_s5b3_g_membership_in_order() {
+        let chat = AREAS.iter().find(|a| a.id == "areaChat").expect("areaChat must exist");
+        let ids: Vec<&str> = chat.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec!["home", "newChat", "console", "inbox", "mail"]);
     }
 
     /// `about` is intentionally absent from every area and from the footer

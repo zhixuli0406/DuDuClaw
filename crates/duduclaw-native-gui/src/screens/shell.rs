@@ -246,6 +246,84 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // caption bar + preview (see `screens/prototypes/mod.rs`), same
         // "skip the generic placeholder heading" pattern.
         content_shell.child(crate::screens::prototypes::render(state, cx))
+    // ── WP-S5b3-H ("S5b 第三波" — three visualization pages, `Timeline.dc.
+    // html`/`OrgIndented.dc.html`/`Forks.dc.html`) — no `nav.rs` entry yet
+    // (this task's own "nav.rs 不歸你動" boundary; a later "G 包" pass wires
+    // the sidebar and will replace this comment block), so each branch is
+    // only reachable via `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=<id>` for now —
+    // same "D 先掛好分支就直接可達，未掛就自己掛" precedent WP-S5b2-E's own
+    // comment above already establishes for a page whose nav id lands in a
+    // sibling pass. ───────────────────────────────────────────────────────
+    } else if active_id == "timeline" {
+        // WP-S5b3-H: 工作時間軸 — see `screens/timeline.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::timeline::render(state, cx))
+    } else if active_id == "org" {
+        // WP-S5b3-H: 組織架構（方案 A 縮排階層清單）— see `screens/org.rs`'s
+        // module doc comment. Same "skip the generic placeholder heading
+        // entirely" pattern as every other real (non-stub) page in this
+        // match.
+        content_shell.child(crate::screens::org::render(state, cx))
+    } else if active_id == "forks" {
+        // WP-S5b3-H: 分支決戰 — see `screens/forks.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::forks::render(state, cx))
+    // ── WP-S5b3-G ("S5b 第三波" — the "監控" cluster's own 4 pages,
+    // `Foresight.dc.html`/`Os.dc.html`/`Growth.dc.html`/`Reports.dc.html`)
+    // AND this wave's sidebar/nav consolidation pass — see `nav.rs`'s own
+    // S5b3-G header-comment update for the full membership reasoning. ─────
+    } else if active_id == "foresight" {
+        // WP-S5b3-G: 預測與驗證 — see `screens/foresight.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::foresight::render(state, cx))
+    } else if active_id == "os" {
+        // WP-S5b3-G: OS — see `screens/os.rs`'s module doc comment. Same
+        // "skip the generic placeholder heading entirely" pattern as every
+        // other real (non-stub) page in this match.
+        content_shell.child(crate::screens::os::render(state, cx))
+    } else if active_id == "growth" {
+        // WP-S5b3-G: 成長 — see `screens/growth.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::growth::render(state, cx))
+    } else if active_id == "reports" {
+        // WP-S5b3-G: 分析報表 — see `screens/reports.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::reports::render(state, cx))
+    // ── WP-S5b3-I ("S5b 第三波" — 畫布/世界/記憶/信箱) — this pass's own four
+    // pages, self-attached here per the "D 先掛好分支就直接可達，未掛就自己掛"
+    // precedent this file's own comment block above already establishes for
+    // `timeline`/`org`/`forks`/`foresight`/`os`/`growth`/`reports`. ────────
+    } else if active_id == "canvas" {
+        // WP-S5b3-I: 畫布 — see `screens/canvas.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::canvas::render(state, cx))
+    } else if active_id == "world" {
+        // WP-S5b3-I: 世界 — see `screens/world.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::world::render(state, cx))
+    } else if active_id == "memory" {
+        // WP-S5b3-I: 記憶 — see `screens/memory.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::memory::render(state, cx))
+    } else if active_id == "mail" {
+        // WP-S5b3-I: 信箱 — see `screens/mail.rs`'s module doc comment. Same
+        // "skip the generic placeholder heading entirely" pattern as every
+        // other real (non-stub) page in this match.
+        content_shell.child(crate::screens::mail::render(state, cx))
+    // `timeline`/`org`/`forks` (WP-S5b3-H, above) and `canvas`/`world`/
+    // `memory`/`mail` (WP-S5b3-I, just above) are this wave's viz-pages
+    // batch, all now self-attached — each package wired its own branch per
+    // the established "D 先掛好分支就直接可達，未掛就自己掛" precedent, so
+    // none of the seven fall through to the generic placeholder below
+    // anymore.
     } else if active_id == "spike_t7" {
         // WP-gpui-spike-T7: debug-only Chromium-risk-page feasibility spike
         // (see `screens/spike_t7.rs`'s module doc comment). No `nav.rs`
