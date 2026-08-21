@@ -27,14 +27,29 @@
 // this is a real, load-bearing design choice worth naming explicitly here
 // rather than a gap that happens to look like one.
 
-use gpui::{div, prelude::*, px, Div, FontWeight};
+use gpui::{div, img, prelude::*, px, Div, FontWeight};
 
 use duduclaw_native_gui::theme;
 
+use crate::home;
 use crate::i18n::{t, t1, Key};
 use crate::palette::ShellPalette;
 use crate::oobe::widgets;
 use crate::oobe::{OobeFlow, PrivacyToggle, TemplateChoice};
+
+/// Brand mark for this step's header glyph (2026-08-21 — replaces the `🐾`
+/// emoji placeholder; repo-wide OS-shell convention is zero emoji, brand
+/// marks are asset PNGs, not glyphs — see `home.rs`'s header comment on
+/// `MARK_32`/`CAT_512` for the convention this follows). Same
+/// `appliance/branding/png/` + `include_bytes!` + `home::png()` pipeline
+/// `home.rs` already established, reused here via `home::png` (that fn is
+/// `pub(super)` on `home`, i.e. crate-visible, precisely for this kind of
+/// reuse) rather than duplicating the byte->Arc<Image> helper. `mark-128.png`
+/// (not `mark-32.png`) is the source so the 40×40 on-screen size the
+/// original glyph occupied stays crisp under 2x/3x HiDPI scaling (128/40 =
+/// 3.2x oversampling) — the `.rounded(px(20.))` mask below matches the same
+/// full-circle treatment `home.rs` already applies to `MARK_32`.
+const MARK_128: &[u8] = include_bytes!("../../../../../appliance/branding/png/mark-128.png");
 
 pub(super) fn render(flow: &OobeFlow) -> Div {
     let s = flow.selections();
@@ -86,7 +101,7 @@ pub(super) fn render(flow: &OobeFlow) -> Div {
         .flex_col()
         .items_center()
         .gap(px(20.))
-        .child(div().text_size(px(40.)).line_height(px(44.)).child("🐾"))
+        .child(img(home::png(MARK_128)).w(px(40.)).h(px(40.)).rounded(px(20.)))
         .child(widgets::title(t(locale, Key::FinishTitle), palette))
         .child(widgets::subtitle(t(locale, Key::FinishSubtitle), palette))
         .child(widgets::card(rows, palette))
