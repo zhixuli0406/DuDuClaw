@@ -113,6 +113,63 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // comment. Same "skip the generic placeholder heading entirely"
         // pattern as every other real (non-stub) page in this match.
         content_shell.child(crate::screens::agents::render(state, cx))
+    } else if active_id == "device" {
+        // S5b1-A: 裝置 — see `screens/device.rs`'s module doc comment. Same
+        // "skip the generic placeholder heading entirely" pattern as every
+        // other real (non-stub) page in this match.
+        content_shell.child(crate::screens::device::render(state, cx))
+    } else if active_id == "manageAdvanced" {
+        // S5b1-A: 進階設定殼 — see `screens/manage_advanced.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::manage_advanced::render(state, cx))
+    } else if active_id == "systemUpdates" {
+        // S5b1-A: 系統更新 — see `screens/system_updates.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::system_updates::render(state, cx))
+    } else if active_id == "accounts" {
+        // S5b1-A: 帳戶與登入 — see `screens/accounts.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::accounts::render(state, cx))
+    } else if active_id == "channels" {
+        // S5b (first wave): 通道 — see `screens/channels.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::channels::render(state, cx))
+    } else if active_id == "integrations" {
+        // S5b (first wave): 整合總覽 — see `screens/integrations.rs`'s
+        // module doc comment. Same "skip the generic placeholder heading
+        // entirely" pattern as every other real (non-stub) page in this
+        // match. Its four drill-down targets (`mcp`/`odoo`/
+        // `googleIntegration`/`identity`) are wired in the four branches
+        // right below (WP-S5b1-C's own pages).
+        content_shell.child(crate::screens::integrations::render(state, cx))
+    } else if active_id == "mcp" {
+        // WP-S5b1-C: 工具伺服器（MCP）— "整合" drill-down leaf, see
+        // `screens/mcp.rs`'s module doc comment. Same "skip the generic
+        // placeholder heading entirely" pattern as every other real
+        // (non-stub) page in this match.
+        content_shell.child(crate::screens::mcp::render(state, cx))
+    } else if active_id == "odoo" {
+        // WP-S5b1-C: Odoo ERP — "整合" drill-down leaf, see
+        // `screens/odoo.rs`'s module doc comment. Same "skip the generic
+        // placeholder heading entirely" pattern as every other real
+        // (non-stub) page in this match.
+        content_shell.child(crate::screens::odoo::render(state, cx))
+    } else if active_id == "googleIntegration" {
+        // WP-S5b1-C: Google 工作區 — "整合" drill-down leaf, see
+        // `screens/google_integration.rs`'s module doc comment. Same "skip
+        // the generic placeholder heading entirely" pattern as every other
+        // real (non-stub) page in this match.
+        content_shell.child(crate::screens::google_integration::render(state, cx))
+    } else if active_id == "identity" {
+        // WP-S5b1-C: 身分解析 — "整合" drill-down leaf, see
+        // `screens/identity.rs`'s module doc comment. Same "skip the
+        // generic placeholder heading entirely" pattern as every other real
+        // (non-stub) page in this match.
+        content_shell.child(crate::screens::identity::render(state, cx))
     } else if active_id == "componentLibrary" {
         content_shell.child(crate::screens::gallery::render(state, cx))
     } else if active_id == "newChat" {
