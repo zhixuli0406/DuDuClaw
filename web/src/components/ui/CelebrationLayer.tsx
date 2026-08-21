@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { Trophy, TrendingUp } from 'lucide-react';
 import { toast } from '@/lib/toast';
 
 /**
@@ -90,8 +91,15 @@ export function CelebrationLayer() {
       {events.map((ev) =>
         ev.kind === 'badge' || ev.kind === 'level_up' ? (
           <div key={ev.id} className="absolute inset-0 grid place-items-center">
-            <span className="animate-badge-pop text-6xl">
-              {ev.kind === 'level_up' ? '⬆️' : '🏆'}
+            <span
+              className="animate-badge-pop grid size-16 place-items-center"
+              style={{ color: 'var(--xp)' }}
+            >
+              {ev.kind === 'level_up' ? (
+                <TrendingUp className="size-14" strokeWidth={2} aria-hidden="true" />
+              ) : (
+                <Trophy className="size-14" strokeWidth={2} aria-hidden="true" />
+              )}
             </span>
           </div>
         ) : (

@@ -43,6 +43,7 @@ import {
   Minus,
   Copy,
   Ticket,
+  FlaskConical,
 } from 'lucide-react';
 
 const PRICING_URL = 'https://duduclaw.dudustudio.monster#pricing';
@@ -330,9 +331,7 @@ export function LicensePage() {
               role="status"
               className="flex items-center gap-3 rounded-xl border border-amber-400/50 bg-amber-50 px-4 py-3 text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200"
             >
-              <span className="text-lg" aria-hidden>
-                🧪
-              </span>
+              <FlaskConical className="size-5 shrink-0" aria-hidden="true" />
               <div>
                 <p className="text-sm font-semibold">
                   {intl.formatMessage({ id: 'license.nfr.title' })}

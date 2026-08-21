@@ -7,7 +7,7 @@ import { useConversationsStore } from '@/stores/conversations-store';
 import { cn } from '@/lib/utils';
 import { isImeComposing } from '@/lib/keyboard';
 import { useUrlStateNullable } from '@/lib/use-url-state';
-import { Plus, Paperclip, Eye, EyeOff, MessagesSquare } from 'lucide-react';
+import { Plus, Paperclip, Eye, EyeOff, MessagesSquare, AlertTriangle } from 'lucide-react';
 import { toast } from '@/lib/toast';
 import {
   Button,
@@ -454,11 +454,14 @@ export function WebChatPage() {
           </div>
 
           {showVisionWarning && (
-            <div className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
-              {intl.formatMessage({
-                id: 'webchat.visionWarning',
-                defaultMessage: '⚠️ 目前模型不支援圖片理解 — 圖片仍會送出,但模型可能無法看見內容。',
-              })}
+            <div className="flex items-start gap-1.5 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+              <span>
+                {intl.formatMessage({
+                  id: 'webchat.visionWarning',
+                  defaultMessage: '目前模型不支援圖片理解 — 圖片仍會送出,但模型可能無法看見內容。',
+                })}
+              </span>
             </div>
           )}
 

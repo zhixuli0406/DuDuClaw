@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { act, render, screen } from '@testing-library/react';
+import { act, render } from '@testing-library/react';
 import { toastBus } from '@/lib/toast';
 import { CelebrationLayer, celebrate } from './CelebrationLayer';
 
@@ -13,7 +13,7 @@ describe('CelebrationLayer', () => {
     act(() => {
       celebrate('badge', { message: '解鎖成就' });
     });
-    expect(screen.getByText('🏆')).toBeInTheDocument();
+    expect(document.querySelector('.lucide-trophy')).toBeInTheDocument();
   });
 
   it('emits confetti pieces for a confetti burst', () => {
