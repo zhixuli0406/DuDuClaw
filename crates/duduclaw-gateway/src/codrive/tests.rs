@@ -3,6 +3,14 @@
 //! brief (`commercial/docs/DESIGN-codrive-desktop-2026-08.md`). unix-only
 //! (see `mod.rs`'s `#[cfg(all(test, unix))]`) — `CodriveClient` itself is
 //! a no-op stub on non-unix targets.
+//!
+//! **CD-2 file-size note**: this file is already near this project's
+//! per-file convention (200-400 lines typical, 800 max). New test
+//! scenarios for a DIFFERENT codrive concern should open their own
+//! `tests_<topic>.rs` (declared from `mod.rs`, same pattern as
+//! `tests_identity.rs`) instead of growing this file further — reserve
+//! additions here for genuine variations on `run_script`'s fake-comp
+//! integration tests this file already covers.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

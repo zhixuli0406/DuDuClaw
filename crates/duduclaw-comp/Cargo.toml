@@ -27,6 +27,19 @@ bitflags = "2.2.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# CD-2 (2026-08-21, DESIGN-codrive-desktop-2026-08.md §9 CD-1 carry-forward
+# "socket rotation"): SIGHUP-triggered token rotation needs `pthread_sigmask`
+# + `sigwait` (the standard "block on every thread, dequeue synchronously on
+# one dedicated thread" pattern — see `codrive/mod.rs`'s
+# `block_sighup_on_current_thread`/`spawn_sighup_rotation_thread` doc
+# comments for why a real `signal()`/`sigaction()` handler is NOT used
+# instead). `libc` is already resolved transitively (smithay's dependency
+# tree pulls it in) — this just promotes it to a direct dependency for
+# these bindings, same "no new crate, no portability concern (already
+# Linux-only)" reasoning `generate_token_bytes`'s `/dev/urandom` read used
+# in the CD-1 round.
+libc = "0.2"
+
 # Version pin rationale (2026-08-19, Shell-S0 spike):
 # smithay's latest crates.io release is 0.7.0 (published 2025-06-24,
 # rust-version = "1.80.1"). We deliberately pin to the published release

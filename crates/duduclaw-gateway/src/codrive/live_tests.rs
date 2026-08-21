@@ -174,3 +174,62 @@ async fn live_bridge_approve_then_deny_round() {
     assert_eq!(enter_step.outcome, "denied");
     assert_eq!(enter_step.approval_id.as_deref(), Some(decided_id.as_str()));
 }
+
+/// CD-2 VM/QMP acceptance round: the real driver against the real comp,
+/// bridged the same way `live_bridge_approve_then_deny_round` is (see this
+/// module's playbook doc — only the far end differs: a QEMU VM's real
+/// `cage`+comp seat instead of a Docker container's headless weston, so
+/// the freeze this test relies on is fired by an ACTUAL QMP-injected
+/// keyboard event landing on real hardware (`input.rs::process_input_
+/// event`), never the container round's `DUDUCLAW_CODRIVE_DEBUG_STDIN`
+/// shortcut, which has no real input path to freeze from at all.
+///
+/// No `consequential` step here (freeze/resume needs no `ApprovalBroker`),
+/// so unlike the approve/deny test this one drives no decider — the ONLY
+/// external actor is whoever fires the QMP events during the script's
+/// `Wait` step (this test's own module-doc playbook, or an operator's
+/// shell, timed against the `Wait` step's window).
+///
+/// Expects a `Click` step to focus the target app's shell, a `Wait` long
+/// enough to fire real QMP human input during it (freezing the seat before
+/// the next step's own actions are attempted), then a `Text` step whose
+/// first attempt gets dropped-frozen and is only actually applied after a
+/// real QMP Super+Enter clears `frozen` — `driver::run_script`'s
+/// `wait_for_resume` (`step.rs`) polls `status` once a second for exactly
+/// this.
+#[tokio::test]
+#[ignore = "live bridge harness — needs the comp VM stack + relay, and a real QMP human-input event fired during the script's Wait step (see this module's doc + duduclaw-comp/BUILD.md's CD-2 VM round)"]
+async fn live_bridge_real_human_freeze_and_resume() {
+    let (sock, token) = live_env();
+    let home = live_home("live-freeze", &sock, &token);
+
+    let script = CodriveScript {
+        target_app: "foot".to_string(),
+        task_summary: "VM 真人凍結/交還活測（CD-2 收官）".to_string(),
+        steps: vec![
+            CodriveStep {
+                narration: "點擊終端機輸入區".to_string(),
+                highlight: None,
+                action: CodriveAction::Click { x: 200.0, y: 150.0, btn: super::client::CodriveButton::Left },
+                consequential: None,
+            },
+            step(
+                "等待外部注入真人輸入（QMP 真鍵盤事件，非 debug stdin）",
+                CodriveAction::Wait { ms: 20000 },
+            ),
+            step(
+                "輸入驗證指令（預期先被凍結，真人 Super+Enter 交還後重發）",
+                CodriveAction::Text { s: "echo cd2vmfreeze123 > /tmp/cd2-freeze-proof.txt\n".to_string() },
+            ),
+        ],
+    };
+
+    let report = run_script(&home, "live-test-agent", script).await;
+    println!("freeze/resume report: {}", serde_json::to_string_pretty(&serde_json::to_value(&report).unwrap()).unwrap());
+    assert_eq!(report.final_state, "completed", "freeze/resume round must complete: {:?}", report.detail);
+    assert_eq!(report.steps.len(), 3);
+    assert_eq!(
+        report.steps[2].outcome, "dropped_frozen_reapplied",
+        "the Text step must have been dropped once (frozen) then reapplied after a real Super+Enter"
+    );
+}

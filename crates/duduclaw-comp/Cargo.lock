@@ -347,6 +347,7 @@ name = "duduclaw-comp"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
+ "libc",
  "serde",
  "serde_json",
  "smithay",

@@ -46,6 +46,44 @@
 //! is now always denied (`listener.rs`). (3) a `status` query. (4) named
 //! functional keys (`key_name`). (5) a target highlight box
 //! (`highlight.rs`).
+//!
+//! CD-2 addition (task brief item 1, DESIGN §9 CD-1 carry-forward "socket
+//! rotation"): (6) the socket-auth token can be rotated WITHOUT restarting
+//! this process — a fresh token is still generated every process start
+//! (unchanged from CD-1), but a long-running comp instance no longer has to
+//! be killed and relaunched to get a new one. Two triggers, both routed
+//! through `CodriveShared::rotate_token`: an authenticated connection
+//! sending `{"op":"rotate_token"}` (`listener.rs`), or this process
+//! receiving `SIGHUP` (`rotation::block_sighup_on_current_thread` +
+//! `rotation::spawn_sighup_rotation_thread`). Either way: the token file is
+//! rewritten in place and the in-memory value `check_token` reads is
+//! swapped atomically under a mutex, so the OLD token stops authenticating
+//! brand-new connections immediately, while any connection already past
+//! `authenticate()` — including the one that may have just requested the
+//! rotation — keeps running untouched (see `rotate_token`'s doc for why
+//! that falls out of `authenticate()`'s existing structure rather than
+//! needing new bookkeeping).
+//!
+//! CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): (7)
+//! `{"op":"shadow","enable":true|false}` moves the agent's currently
+//! focused window to/from a second, headless `Output` ("duduclaw-shadow-0")
+//! that never touches the real display backend — invisible on the main
+//! desktop, not stealing the human's cursor/focus. A small PiP preview of
+//! the shadow output renders into a fixed corner of the main output so the
+//! human can always see what the agent is doing there. Full detail —
+//! including the honest scope limits (no per-window off-screening; fixed
+//! geometry) — lives in `codrive/shadow.rs`'s own module doc, since this
+//! addition needed only two new call-outs into this file's existing state
+//! machine (see `emergency_stop`/`human_resume` below).
+//!
+//! WP-CD2-freeze-scope (DESIGN §3.1 point 3, "凍結的粒度是該共駕 session 的
+//! agent seat…不連坐"): (8) the frozen gate below no longer applies
+//! uniformly — a command may bypass an active freeze iff `shadow::
+//! is_freeze_bypass_eligible` confirms both a shadow session is active AND
+//! this command's own target is confined to the shadow output (never the
+//! `Shadow` toggle op itself — see that function's doc for the decision
+//! table; `listener.rs` mirrors just enough (`CodriveShared::shadow_active`)
+//! for an optimistic pre-check).
 
 mod audit;
 mod cursor;
@@ -54,10 +92,13 @@ mod highlight;
 mod keymap_ascii;
 mod listener;
 mod protocol;
+mod rotation;
+mod shadow;
 
 pub use cursor::build_cursor_elements;
 pub use debug_sim::maybe_init_stdin_simulator;
 pub use protocol::InjectCmd;
+pub use shadow::{create_shadow_output, SHADOW_ORIGIN};
 
 use std::{
     io::Write,
@@ -104,6 +145,11 @@ pub struct CodriveShared {
     /// True after a Super+Esc emergency stop, until a *new* connection is
     /// accepted (see `listener.rs::handle_conn`).
     pub terminated: AtomicBool,
+    /// WP-CD2-freeze-scope: mirror of `DuduclawComp::codrive_shadow_active`,
+    /// kept ONLY for `listener.rs`'s optimistic pre-check (no `self.space`
+    /// access there). Never authoritative — see `shadow::
+    /// is_freeze_bypass_eligible`. Written in lockstep by `shadow.rs`.
+    pub shadow_active: AtomicBool,
     /// The currently-connected agent's stream, kept so `emergency_stop`
     /// can force-close it and so state-transition events (`frozen`/
     /// `resumed`) can be pushed to it — both from the main thread.
@@ -115,7 +161,20 @@ pub struct CodriveShared {
     /// `false` (fail-closed: no listener is even spawned in that case, but
     /// the field stays `None` rather than some sentinel value so there's
     /// no "empty token" to accidentally match against).
-    auth_token: Option<String>,
+    ///
+    /// A `Mutex` (CD-2, was a plain `Option<String>` at CD-1) so
+    /// `rotate_token` can swap it while the process keeps running — see
+    /// that method's doc. Read once per connection, inside
+    /// `authenticate()`'s `check_token` call, never anywhere else, so this
+    /// lock is never held across a blocking or long-running operation.
+    auth_token: Mutex<Option<String>>,
+    /// Where `auth_token`'s value lives on disk (CD-1:
+    /// `$XDG_RUNTIME_DIR/duduclaw-codrive.token`). `None` in lockstep with
+    /// `auth_token` being permanently unusable — mirrors it rather than
+    /// being derived from it so `rotate_token` can fail fast with a clear
+    /// reason instead of re-deriving "do we even have a token" from the
+    /// mutex's contents.
+    token_path: Option<PathBuf>,
 }
 
 impl CodriveShared {
@@ -123,9 +182,11 @@ impl CodriveShared {
         Self {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
+            shadow_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             audit: None,
-            auth_token: None,
+            auth_token: Mutex::new(None),
+            token_path: None,
         }
     }
 
@@ -138,9 +199,11 @@ impl CodriveShared {
         Self {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
+            shadow_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             audit,
-            auth_token: None,
+            auth_token: Mutex::new(None),
+            token_path: None,
         }
     }
 
@@ -175,7 +238,11 @@ impl CodriveShared {
     /// always fails: with no token durably shared with a legitimate
     /// caller, nothing should ever authenticate.
     pub(crate) fn check_token(&self, presented: &str) -> bool {
-        let Some(expected) = self.auth_token.as_deref() else {
+        let guard = match self.auth_token.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(expected) = guard.as_deref() else {
             return false;
         };
         let a = expected.as_bytes();
@@ -187,6 +254,15 @@ impl CodriveShared {
         }
         diff == 0
     }
+
+    // `rotate_token` (CD-2 task brief item 1) lives in a SECOND `impl
+    // CodriveShared` block in the `rotation` submodule, not here — see that
+    // module's doc comment. Rust allows an inherent type's methods to be
+    // split across multiple `impl` blocks in different files within the
+    // same crate; this one was moved out for the same file-size reason
+    // `driver.rs`'s CD-2 note documents on the gateway side (this module
+    // was already near this project's per-file convention — 200-400 lines
+    // typical, 800 max — before CD-2 added it).
 
     /// Best-effort push of a one-line JSON event to the currently connected
     /// agent client (task brief req 3; mirrors `emergency_stop`'s existing
@@ -212,9 +288,29 @@ impl CodriveShared {
         Self {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
+            shadow_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             audit: None,
-            auth_token,
+            auth_token: Mutex::new(auth_token),
+            token_path: None,
+        }
+    }
+
+    /// Same as [`Self::for_test`], but with a real `token_path` set — for
+    /// `rotate_token` tests, which need somewhere on disk to actually write
+    /// the rotated token (mirrors `init`'s real construction; plain
+    /// `for_test` deliberately has no path, matching the "listener never
+    /// started" `rotate_token` failure mode).
+    #[cfg(test)]
+    pub(crate) fn for_test_with_token_path(auth_token: Option<String>, token_path: PathBuf) -> Self {
+        Self {
+            frozen: AtomicBool::new(false),
+            terminated: AtomicBool::new(false),
+            shadow_active: AtomicBool::new(false),
+            active_conn: Mutex::new(None),
+            audit: None,
+            auth_token: Mutex::new(auth_token),
+            token_path: Some(token_path),
         }
     }
 }
@@ -264,6 +360,11 @@ fn write_token_file(path: &Path, token: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+// `block_sighup_on_current_thread` and `spawn_sighup_rotation_thread` (CD-2
+// task item 1) live in the `rotation` submodule, not here — see that
+// module's doc comment for the full "why", and the file-size note on
+// `rotate_token`'s removal above for why they moved.
+
 /// Creates the agent seat and starts the injection listener + audit log.
 /// Called from `DuduclawComp::new`, which already owns the `SeatState` and
 /// `EventLoop` this needs.
@@ -272,6 +373,22 @@ pub fn init(
     dh: &DisplayHandle,
     event_loop: &mut EventLoop<CalloopData>,
 ) -> (Seat<DuduclawComp>, Arc<CodriveShared>) {
+    // CD-2 (task item 1): must be the very first statement in this
+    // function — see `rotation::block_sighup_on_current_thread`'s doc for
+    // why.
+    let sighup_blocked = match rotation::block_sighup_on_current_thread() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "codrive: failed to block SIGHUP on the main thread — SIGHUP-triggered token \
+                 rotation will be unavailable this run (every other codrive feature, including \
+                 socket-op rotation, is unaffected)"
+            );
+            false
+        }
+    };
+
     let mut agent_seat: Seat<DuduclawComp> = seat_state.new_wl_seat(dh, "duduclaw-agent");
     agent_seat
         .add_keyboard(XkbConfig::default(), 200, 25)
@@ -319,15 +436,24 @@ pub fn init(
     let shared = Arc::new(CodriveShared {
         frozen: AtomicBool::new(false),
         terminated: AtomicBool::new(false),
+        shadow_active: AtomicBool::new(false),
         active_conn: Mutex::new(None),
         audit,
-        auth_token: Some(auth_token),
+        auth_token: Mutex::new(Some(auth_token)),
+        token_path: Some(token_path),
     });
 
     let (tx, rx) = calloop::channel::channel::<InjectCmd>();
 
     if let Err(e) = listener::spawn(sock_path, Arc::clone(&shared), tx) {
         tracing::error!(error = %e, "codrive: failed to start the agent injection socket listener — agent seat will receive no events this run");
+    }
+
+    // CD-2 (task item 1): only meaningful once the listener above actually
+    // has a token file to rewrite — mirrors why the listener itself is
+    // only spawned in this same success path.
+    if sighup_blocked {
+        rotation::spawn_sighup_rotation_thread(Arc::clone(&shared));
     }
 
     event_loop
@@ -379,6 +505,14 @@ impl DuduclawComp {
             self.codrive.record("resume", Some("human_super_enter"), None, None, None);
             self.codrive.push_event(r#"{"event":"resumed"}"#);
         }
+        // CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4 / task brief
+        // item 4 "接手＝shadow 視窗搬回主 output"): unconditional, not
+        // nested inside the `if was_frozen` branch above — a shadow session
+        // is separate state from the freeze flag (see `shadow.rs` module
+        // doc), so "交還" collects any active shadow session back to the
+        // main output regardless of whether the real desktop ever actually
+        // froze the seat.
+        self.codrive_handback_shadow_if_active("human_super_enter");
     }
 
     /// Super+Esc (DESIGN §3.3.3 / §6.3): global emergency stop, not
@@ -390,6 +524,13 @@ impl DuduclawComp {
         self.codrive.terminated.store(true, Ordering::SeqCst);
         tracing::warn!(reason, "codrive: EMERGENCY STOP — terminating the co-drive session");
         self.codrive.record("emergency_stop", None, None, None, Some(reason.to_string()));
+        // CD-2 shadow workspace (WP-CD2-shadow, DESIGN §6 red line 3 "急停
+        // 鍵永遠有效" / task brief item 4 "Super+Esc 急停一樣殺 shadow
+        // session"): emergency stop is a global kill switch — it collects
+        // any active shadow session back to the main output too, not just
+        // the foreground Watch/Takeover case this function already handled
+        // before this addition.
+        self.codrive_handback_shadow_if_active(reason);
 
         if let Ok(mut guard) = self.codrive.active_conn.lock() {
             if let Some(stream) = guard.take() {
@@ -409,24 +550,30 @@ impl DuduclawComp {
     /// freeze re-check here, not just the socket thread's, is the
     /// authoritative one.
     pub fn handle_agent_inject(&mut self, cmd: InjectCmd) {
-        if self.codrive.frozen.load(Ordering::SeqCst) {
+        let frozen = self.codrive.frozen.load(Ordering::SeqCst);
+        // WP-CD2-freeze-scope (module doc item 8): drops everything while
+        // frozen UNLESS THIS command's actual target is confirmed confined
+        // to the shadow output — see `shadow::is_freeze_bypass_eligible`.
+        let shadow_bypass = frozen && shadow::is_freeze_bypass_eligible(self, &cmd);
+
+        if frozen && !shadow_bypass {
             let (op, x, y) = cmd.describe();
             let latency = self.codrive_freeze_set_at.map(|t| t.elapsed());
+            // Distinguish a plain queued-then-frozen race from a failed
+            // shadow-scope check, so the audit trail tells them apart.
+            let shadow_note = if self.codrive_shadow_active {
+                " — shadow active but this op's target is not confirmed inside the shadow output (fail-closed)"
+            } else {
+                " (queued-then-frozen race)"
+            };
+            let detail = format!("frozen at execution time{shadow_note}, latency_us={:?}", latency.map(|d| d.as_micros()));
             tracing::debug!(
                 op,
                 latency_us = latency.map(|d| d.as_micros()),
+                shadow_active = self.codrive_shadow_active,
                 "codrive: dropping a queued agent command — seat frozen by the time its turn came up"
             );
-            self.codrive.record(
-                "inject_dropped",
-                Some(op),
-                x,
-                y,
-                Some(format!(
-                    "frozen at execution time (queued-then-frozen race, latency_us={:?})",
-                    latency.map(|d| d.as_micros())
-                )),
-            );
+            self.codrive.record("inject_dropped", Some(op), x, y, Some(detail));
             return;
         }
 
@@ -554,9 +701,33 @@ impl DuduclawComp {
                 tracing::warn!("codrive: Status reached handle_agent_inject unexpectedly — no-op (see listener.rs)");
                 return;
             }
+            InjectCmd::RotateToken => {
+                // Handled synchronously by the socket thread (listener.rs) —
+                // touches only `CodriveShared`/the token file, never the
+                // seat, so it never reaches this channel. Kept as an arm
+                // for the same fail-safe reasoning as Resume/Status above.
+                tracing::warn!("codrive: RotateToken reached handle_agent_inject unexpectedly — no-op (see listener.rs)");
+                return;
+            }
+            InjectCmd::Shadow { enable } => {
+                // CD-2 shadow workspace (WP-CD2-shadow) — full logic lives
+                // in `shadow.rs`'s own `impl DuduclawComp` block (window
+                // lookup/move + its own detailed audit lines); this arm
+                // falls through to the generic `inject_applied` record
+                // below like Move/Button/Key/Text/Highlight already do.
+                self.codrive_set_shadow(enable);
+            }
         }
 
-        self.codrive.record("inject_applied", Some(op), x, y, None);
+        // WP-CD2-freeze-scope: tag shadow-bypassed applies for the audit
+        // trail; `None` (unchanged) for every non-bypass apply.
+        self.codrive.record(
+            "inject_applied",
+            Some(op),
+            x,
+            y,
+            if shadow_bypass { Some("scope:shadow".to_string()) } else { None },
+        );
     }
 
     fn agent_key(&mut self, xkb_code: u32, pressed: bool) {
@@ -615,4 +786,8 @@ mod tests {
         assert_eq!(token.len(), 64);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
+
+    // `rotate_token`'s own tests (CD-2 task brief item 1) live in the
+    // `rotation` submodule's test block, alongside the code they test — see
+    // this file's other "moved to `rotation`" notes above.
 }

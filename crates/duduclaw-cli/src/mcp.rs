@@ -15969,16 +15969,17 @@ async fn handle_belief_stats(home_dir: &Path, default_agent: &str) -> Value {
 // parse `script` (accept either a native JSON object or a JSON-encoded
 // string, since MCP callers serialize nested objects either way), resolve the
 // acting agent identity, and re-check `[capabilities] codrive` for THAT
-// identity before dispatching.
+// identity before dispatching — the identity resolution + capability
+// re-check itself is `duduclaw_gateway::codrive::resolve_run_identity`
+// (CD-2), not duplicated here; see that function's doc comment for the full
+// "`agent` overrides the WHOLE call identity" semantics and why.
 //
-// Identity note: an explicit `agent` param overrides the caller's own
-// identity for BOTH this capability re-check AND the downstream audit/
-// approval attribution inside `run_script` — deliberately never split. The
-// dispatch-level `CODRIVE_TOOLS` gate in `mcp_dispatch.rs` is keyed to the
-// CALLING principal (`principal.client_id`) and would not see an `agent`
-// override, so this handler-local re-check is the actual enforcement point
-// for the resolved identity — the two together are the "雙保險 fail-closed"
-// the WP brief calls for, not a redundant duplicate of the same check.
+// The dispatch-level `CODRIVE_TOOLS` gate in `mcp_dispatch.rs` is keyed to
+// the CALLING principal (`principal.client_id`) and would not see an `agent`
+// override, so `resolve_run_identity`'s re-check below is the actual
+// enforcement point for the resolved identity — the two together are the
+// "雙保險 fail-closed" the WP brief calls for, not a redundant duplicate of
+// the same check.
 async fn handle_codrive_run(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     let script_value = match args.get("script") {
         Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
@@ -15993,32 +15994,26 @@ async fn handle_codrive_run(args: &Value, home_dir: &Path, default_agent: &str) 
         Err(e) => return tool_error(&format!("script does not match the expected shape: {e}")),
     };
 
-    let agent_id = args
-        .get("agent")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| resolve_audit_agent(|| default_agent.to_string()));
-    if !is_valid_agent_id(&agent_id) {
-        return tool_error("invalid agent id");
-    }
-
-    // Handler-local fail-closed gate — see the module-level doc comment
-    // above for why this is not redundant with the dispatch-level check.
-    let agent_dir = home_dir.join("agents").join(&agent_id);
-    if !duduclaw_core::agent_toml::load(&agent_dir).capabilities.codrive {
-        let msg = "此代理未啟用人機共駕能力（agent.toml [capabilities] codrive = true）。".to_string();
-        duduclaw_security::audit::append_tool_call_denied(
-            home_dir,
-            &agent_id,
-            "codrive_run",
-            "codrive_capability_missing",
-            &msg,
-            None,
-        );
-        return tool_error(&msg);
-    }
+    let caller_agent_id = resolve_audit_agent(|| default_agent.to_string());
+    let requested_agent = args.get("agent").and_then(|v| v.as_str());
+    let agent_id = match duduclaw_gateway::codrive::resolve_run_identity(home_dir, &caller_agent_id, requested_agent) {
+        Ok(id) => id,
+        Err(duduclaw_gateway::codrive::RunIdentityError::InvalidAgentId) => {
+            return tool_error("invalid agent id");
+        }
+        Err(duduclaw_gateway::codrive::RunIdentityError::CapabilityMissing(id)) => {
+            let msg = "此代理未啟用人機共駕能力（agent.toml [capabilities] codrive = true）。".to_string();
+            duduclaw_security::audit::append_tool_call_denied(
+                home_dir,
+                &id,
+                "codrive_run",
+                "codrive_capability_missing",
+                &msg,
+                None,
+            );
+            return tool_error(&msg);
+        }
+    };
 
     let report = duduclaw_gateway::codrive::run_script(home_dir, &agent_id, script).await;
     tool_text(&serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()))
