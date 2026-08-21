@@ -18,6 +18,28 @@
 // the OS/session-manager already keeps 0700 per-user), and only one
 // connection is accepted at a time (a second connect attempt just queues
 // in the kernel backlog until the first disconnects).
+//
+// **CD-2 update (task brief req 1, DESIGN §9 CD-1 carry-forward "socket
+// rotation"): the token can now be rotated without restarting this
+// process.** Two triggers, both funnelling into `CodriveShared::
+// rotate_token`: an authenticated connection sending `{"op":
+// "rotate_token"}` (handled below, alongside `status`/`resume`), or this
+// process receiving `SIGHUP` (see `mod.rs`'s `block_sighup_on_current_
+// thread`/`spawn_sighup_rotation_thread`). Either way the OLD token stops
+// authenticating new connections immediately (the in-memory value
+// `check_token` reads is swapped under a mutex) while any connection that
+// is already past `authenticate()` below — including the one that may have
+// just requested the rotation — is completely unaffected, since
+// `check_token` is only ever consulted once, right here, at the very start
+// of a connection's life.
+//
+// **WP-CD2-freeze-scope update (DESIGN §3.1 point 3): the frozen check
+// below is no longer an unconditional deny.** It stays an OPTIMISTIC
+// pre-check (this thread has no `self.space`/seat access — see `mod.rs`'s
+// "Authority for the freeze gate" note), but now forwards a command to the
+// main thread instead of denying outright when a shadow session might make
+// it eligible for a freeze bypass; the main thread's `handle_agent_inject`
+// (`shadow::is_freeze_bypass_eligible`) makes the real, per-op decision.
 
 use std::{
     io::{BufRead, BufReader, Write},
@@ -255,6 +277,25 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
                 let _ = writeln!(writer, r#"{{"ok":false,"error":"resume_is_human_only"}}"#);
                 continue;
             }
+            InjectCmd::RotateToken => {
+                // CD-2 (task brief item 1): control-plane, like Status/
+                // Resume above — never touches the seat, so it's handled
+                // synchronously here rather than going through the
+                // channel. Reaching this arm already proves the caller
+                // held the token being replaced (it's past `authenticate`
+                // above); see `CodriveShared::rotate_token`'s doc for why
+                // this connection stays unaffected by its own request.
+                match shared.rotate_token("socket_op") {
+                    Ok(()) => {
+                        let _ = writeln!(writer, r#"{{"ok":true,"rotated":true}}"#);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "codrive: socket-triggered token rotation failed");
+                        let _ = writeln!(writer, r#"{{"ok":false,"error":"rotate_failed"}}"#);
+                    }
+                }
+                continue;
+            }
             _ => {}
         }
 
@@ -273,16 +314,33 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
             // simply losing that one intent. The agent finds out via this
             // ack (`"frozen":true`) and can re-issue the command after a
             // human resume.
-            let (op, x, y) = cmd.describe();
-            shared.record(
-                "inject_dropped",
-                Some(op),
-                x,
-                y,
-                Some("agent seat frozen (human input active) — dropped, not buffered".into()),
-            );
-            let _ = writeln!(writer, r#"{{"ok":false,"frozen":true,"reason":"agent_seat_frozen"}}"#);
-            continue;
+            //
+            // WP-CD2-freeze-scope: this thread has no `self.space`/seat
+            // access to confirm a specific op's target is inside the
+            // shadow output — only the main thread's `handle_agent_inject`
+            // can make that precise, authoritative call (`shadow::
+            // is_freeze_bypass_eligible`). So this is only an OPTIMISTIC
+            // pre-check: if a shadow session is active at all AND `cmd`
+            // isn't the `Shadow` toggle itself (never bypass-eligible, in
+            // either direction — DESIGN's "凍結中不可進入 shadow"), forward
+            // it and let the main thread decide for real; it may still get
+            // dropped there. Everything else denies here exactly as
+            // before this WP — byte-identical for the non-shadow case.
+            let shadow_bypass_candidate =
+                shared.shadow_active.load(Ordering::SeqCst) && !matches!(cmd, InjectCmd::Shadow { .. });
+
+            if !shadow_bypass_candidate {
+                let (op, x, y) = cmd.describe();
+                shared.record(
+                    "inject_dropped",
+                    Some(op),
+                    x,
+                    y,
+                    Some("agent seat frozen (human input active) — dropped, not buffered".into()),
+                );
+                let _ = writeln!(writer, r#"{{"ok":false,"frozen":true,"reason":"agent_seat_frozen"}}"#);
+                continue;
+            }
         }
 
         if tx.send(cmd).is_err() {
@@ -290,7 +348,12 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
             let _ = writeln!(writer, r#"{{"ok":false,"error":"compositor_unavailable"}}"#);
             break;
         }
-        let _ = writeln!(writer, r#"{{"ok":true,"frozen":false}}"#);
+        // `frozen` here may be `true` (a shadow-bypass candidate just got
+        // forwarded above) — the ack's `frozen` field always reflects
+        // reality now rather than being hardcoded `false`, matching the
+        // gateway client's own doc'd contract (`{"ok":true,"frozen":bool}`,
+        // `duduclaw-gateway/src/codrive/client.rs`).
+        let _ = writeln!(writer, r#"{{"ok":true,"frozen":{frozen}}}"#);
     }
 
     // Cleanup for every exit path above (EOF, read error, or the injection
@@ -342,7 +405,11 @@ fn validate(cmd: &InjectCmd) -> Result<(), String> {
             }
             Ok(())
         }
-        InjectCmd::Text { .. } | InjectCmd::Resume | InjectCmd::Status => Ok(()),
+        InjectCmd::Text { .. }
+        | InjectCmd::Resume
+        | InjectCmd::Status
+        | InjectCmd::RotateToken
+        | InjectCmd::Shadow { .. } => Ok(()),
     }
 }
 
@@ -498,6 +565,194 @@ mod tests {
         br.read_line(&mut reply).unwrap();
         assert!(reply.contains(r#""frozen":true"#), "unexpected status response: {reply}");
         assert!(reply.contains(r#""terminated":false"#), "unexpected status response: {reply}");
+
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// The load-bearing CD-2 regression test (task brief item 1): rotating
+    /// the token over the socket must (a) make the OLD token immediately
+    /// unusable for a brand-new connection, (b) leave the connection that
+    /// requested the rotation completely unaffected — proven here by
+    /// sending a normal `status` op on it right after — and (c) hand out a
+    /// token a fresh connection can actually authenticate with.
+    #[test]
+    fn rotate_token_over_socket_invalidates_old_token_without_dropping_the_caller() {
+        let sock_path =
+            std::env::temp_dir().join(format!("duduclaw-codrive-test-rotate-{}.sock", std::process::id()));
+        let token_path =
+            std::env::temp_dir().join(format!("duduclaw-codrive-test-rotate-{}.token", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&token_path);
+
+        let shared = Arc::new(CodriveShared::for_test_with_token_path(Some("old-token".to_string()), token_path.clone()));
+        let (tx, _rx) = calloop::channel::channel::<InjectCmd>();
+        spawn(sock_path.clone(), Arc::clone(&shared), tx).expect("test listener failed to bind");
+
+        // Connection A authenticates with the original token, then asks
+        // for a rotation.
+        let conn_a = UnixStream::connect(&sock_path).expect("conn A failed to connect");
+        let mut writer_a = conn_a.try_clone().unwrap();
+        let mut br_a = BufReader::new(&conn_a);
+        writeln!(writer_a, r#"{{"op":"auth","token":"old-token"}}"#).unwrap();
+        let mut reply = String::new();
+        br_a.read_line(&mut reply).unwrap();
+        assert!(reply.contains(r#""authenticated":true"#));
+
+        writeln!(writer_a, r#"{{"op":"rotate_token"}}"#).unwrap();
+        reply.clear();
+        br_a.read_line(&mut reply).unwrap();
+        assert!(reply.contains(r#""ok":true"#) && reply.contains("rotated"), "unexpected rotate response: {reply}");
+
+        // (b) Connection A is still alive and unauthenticated-gate-free —
+        // an ordinary post-auth op still works on it.
+        writeln!(writer_a, r#"{{"op":"status"}}"#).unwrap();
+        reply.clear();
+        br_a.read_line(&mut reply).unwrap();
+        assert!(reply.contains(r#""ok":true"#), "connection A should survive its own rotation request: {reply}");
+
+        // `spawn`'s listener accepts one connection at a time (module doc)
+        // — `accept_loop` only calls `accept()` again once the current
+        // `handle_conn` returns, which requires connection A to actually
+        // disconnect first. Drop every handle referencing its socket (the
+        // borrowed reader, the cloned writer, and the stream itself) so the
+        // OS delivers EOF to the server side before conn_b tries to connect.
+        drop(br_a);
+        drop(writer_a);
+        drop(conn_a);
+
+        // (a) A brand-new connection presenting the OLD token is denied.
+        let conn_b = UnixStream::connect(&sock_path).expect("conn B failed to connect");
+        let mut writer_b = conn_b.try_clone().unwrap();
+        let mut br_b = BufReader::new(&conn_b);
+        writeln!(writer_b, r#"{{"op":"auth","token":"old-token"}}"#).unwrap();
+        reply.clear();
+        br_b.read_line(&mut reply).unwrap();
+        assert!(reply.contains("auth_failed"), "the pre-rotation token must no longer authenticate: {reply}");
+        // Same reasoning as conn_a above: both owned handles (the clone AND
+        // the original) must be dropped for the OS to actually close the
+        // connection, or conn_c below would hang waiting to be accepted.
+        drop(br_b);
+        drop(writer_b);
+        drop(conn_b);
+
+        // (c) A fresh connection presenting the NEW token (read back from
+        // the same file `init` would have pointed the gateway at) succeeds.
+        let new_token = std::fs::read_to_string(&token_path).expect("rotated token file must exist");
+        assert_ne!(new_token, "old-token", "the token file must actually have changed");
+        let conn_c = UnixStream::connect(&sock_path).expect("conn C failed to connect");
+        let mut writer_c = conn_c.try_clone().unwrap();
+        let mut br_c = BufReader::new(&conn_c);
+        writeln!(writer_c, r#"{{"op":"auth","token":"{new_token}"}}"#).unwrap();
+        reply.clear();
+        br_c.read_line(&mut reply).unwrap();
+        assert!(reply.contains(r#""authenticated":true"#), "the freshly rotated token must authenticate: {reply}");
+
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&token_path);
+    }
+
+    // ── WP-CD2-freeze-scope: socket-thread optimistic pre-check ──
+
+    /// Invariant (d): with no shadow session active, a frozen seat denies a
+    /// `move` at the socket thread exactly as it always did — byte-
+    /// identical to the pre-WP behavior for the non-shadow case.
+    #[test]
+    fn frozen_without_shadow_active_denies_move_before_reaching_channel() {
+        let sock_path = std::env::temp_dir().join(format!("duduclaw-codrive-test-fzns-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+
+        let shared = Arc::new(CodriveShared::for_test(Some("tok".to_string())));
+        shared.frozen.store(true, Ordering::SeqCst);
+        // shadow_active left false (the default) — deliberately not set.
+        let (tx, rx) = calloop::channel::channel::<InjectCmd>();
+        spawn(sock_path.clone(), Arc::clone(&shared), tx).expect("test listener failed to bind");
+
+        let conn = UnixStream::connect(&sock_path).expect("test client failed to connect");
+        let mut writer = conn.try_clone().unwrap();
+        let mut br = BufReader::new(&conn);
+        writeln!(writer, r#"{{"op":"auth","token":"tok"}}"#).unwrap();
+        let mut reply = String::new();
+        br.read_line(&mut reply).unwrap();
+
+        writeln!(writer, r#"{{"op":"move","x":1.0,"y":1.0}}"#).unwrap();
+        reply.clear();
+        br.read_line(&mut reply).unwrap();
+        assert!(reply.contains("agent_seat_frozen"), "unexpected response with no shadow session active: {reply}");
+        assert!(rx.try_recv().is_err(), "a denied command must never reach the main-thread channel");
+
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// Invariant (c)'s socket-thread half: a shadow session being active
+    /// makes the socket thread FORWARD a non-`shadow` op instead of denying
+    /// it outright — the precise per-op decision is left to the main
+    /// thread's `shadow::is_freeze_bypass_eligible` (untestable here
+    /// without a full `DuduclawComp`; see that function's own unit tests
+    /// in `shadow.rs`). This test only proves the forwarding half.
+    #[test]
+    fn frozen_with_shadow_active_forwards_non_shadow_op_to_channel() {
+        let sock_path = std::env::temp_dir().join(format!("duduclaw-codrive-test-fzsa-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+
+        let shared = Arc::new(CodriveShared::for_test(Some("tok".to_string())));
+        shared.frozen.store(true, Ordering::SeqCst);
+        shared.shadow_active.store(true, Ordering::SeqCst);
+        let (tx, rx) = calloop::channel::channel::<InjectCmd>();
+        spawn(sock_path.clone(), Arc::clone(&shared), tx).expect("test listener failed to bind");
+
+        let conn = UnixStream::connect(&sock_path).expect("test client failed to connect");
+        let mut writer = conn.try_clone().unwrap();
+        let mut br = BufReader::new(&conn);
+        writeln!(writer, r#"{{"op":"auth","token":"tok"}}"#).unwrap();
+        let mut reply = String::new();
+        br.read_line(&mut reply).unwrap();
+
+        writeln!(writer, r#"{{"op":"move","x":1.0,"y":1.0}}"#).unwrap();
+        reply.clear();
+        br.read_line(&mut reply).unwrap();
+        assert!(!reply.contains("agent_seat_frozen"), "a shadow-active session must not be denied at the socket thread: {reply}");
+        assert!(reply.contains(r#""frozen":true"#), "the ack must honestly report the seat is still frozen: {reply}");
+
+        match rx.try_recv() {
+            Ok(InjectCmd::Move { x, y }) => {
+                assert_eq!((x, y), (1.0, 1.0));
+            }
+            other => panic!("expected the move command forwarded to the main-thread channel, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// Invariant (a)'s socket-thread half: the `shadow` toggle op is
+    /// ALWAYS denied while frozen — even when a shadow session is already
+    /// active — never forwarded to let the main thread decide. This is
+    /// stricter than the non-toggle ops precisely because DESIGN forbids
+    /// using this one op, in either direction, to change freeze exposure.
+    #[test]
+    fn frozen_shadow_toggle_always_denied_even_when_shadow_already_active() {
+        let sock_path = std::env::temp_dir().join(format!("duduclaw-codrive-test-fzsh-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+
+        let shared = Arc::new(CodriveShared::for_test(Some("tok".to_string())));
+        shared.frozen.store(true, Ordering::SeqCst);
+        shared.shadow_active.store(true, Ordering::SeqCst);
+        let (tx, rx) = calloop::channel::channel::<InjectCmd>();
+        spawn(sock_path.clone(), Arc::clone(&shared), tx).expect("test listener failed to bind");
+
+        let conn = UnixStream::connect(&sock_path).expect("test client failed to connect");
+        let mut writer = conn.try_clone().unwrap();
+        let mut br = BufReader::new(&conn);
+        writeln!(writer, r#"{{"op":"auth","token":"tok"}}"#).unwrap();
+        let mut reply = String::new();
+        br.read_line(&mut reply).unwrap();
+
+        for enable in [true, false] {
+            writeln!(writer, r#"{{"op":"shadow","enable":{enable}}}"#).unwrap();
+            reply.clear();
+            br.read_line(&mut reply).unwrap();
+            assert!(reply.contains("agent_seat_frozen"), "shadow(enable:{enable}) must be denied while frozen: {reply}");
+        }
+        assert!(rx.try_recv().is_err(), "a denied shadow toggle must never reach the main-thread channel");
 
         let _ = std::fs::remove_file(&sock_path);
     }

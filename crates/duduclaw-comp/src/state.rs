@@ -6,6 +6,7 @@ use std::{ffi::OsString, sync::Arc};
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState},
+    output::Output,
     reexports::{
         calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
         wayland_server::{
@@ -78,6 +79,36 @@ pub struct DuduclawComp {
     /// `codrive::highlight::DuduclawComp::codrive_highlight_elements`,
     /// called once per redraw from `winit_backend.rs`.
     pub codrive_highlight: Option<(Rectangle<f64, Logical>, std::time::Instant)>,
+    /// CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): the headless
+    /// second `Output`, mapped into `space` at `codrive::SHADOW_ORIGIN`.
+    /// Never bound to any real display backend — `winit_backend.rs` only
+    /// ever renders it offscreen (`DuduclawComp::codrive_render_pip`,
+    /// `codrive/shadow.rs`) for the PiP preview, never directly to the host
+    /// window. Created here (not in `winit_backend.rs`, unlike the main
+    /// "winit" output) because it needs no real backend/window-size
+    /// dependency — see `codrive::create_shadow_output`.
+    pub shadow_output: Output,
+    /// True while a shadow-workspace session is active for this agent seat
+    /// (set by `{"op":"shadow","enable":true}` — `codrive::shadow`). Plain
+    /// `bool`, not an atomic: only ever touched on this calloop main
+    /// thread, same as `codrive_highlight`/`codrive_freeze_set_at` above —
+    /// the `{"op":"shadow",…}` command reaches the seat-owning main thread
+    /// via the same `InjectCmd` channel every other seat-touching op uses
+    /// (see `codrive::handle_agent_inject`'s `Shadow` arm), unlike
+    /// `status`/`resume`/`rotate_token`, which the socket thread answers
+    /// synchronously and never need main-thread state at all.
+    pub codrive_shadow_active: bool,
+    /// CD-2 VM round bugfix: true if the human keyboard's Logo (Super)
+    /// modifier was held during the *previous* keyboard event on the human
+    /// seat. See `input.rs::is_system_gesture_tail`'s doc comment for why
+    /// this exists — real-hardware verification found that the trailing
+    /// key-release events of a physical Super+Enter/Super+Esc chord (which
+    /// themselves count as "human touched input") immediately re-froze the
+    /// seat the same chord had just un-frozen, making Super+Enter unable to
+    /// durably hand control back on real hardware. Plain `bool`, not an
+    /// atomic — only ever touched on this calloop main thread, from the
+    /// human ("winit") seat's own keyboard arm.
+    pub codrive_logo_held_prev: bool,
 }
 
 impl DuduclawComp {
@@ -108,7 +139,17 @@ impl DuduclawComp {
         // to register the injection channel's calloop source.
         let (agent_seat, codrive) = codrive::init(&mut seat_state, &dh, event_loop);
 
-        let space = Space::default();
+        let mut space = Space::default();
+
+        // CD-2 shadow workspace (WP-CD2-shadow): the headless second
+        // output is created here (needs only `&DisplayHandle`, no real
+        // backend/window-size dependency, unlike the "winit" output that
+        // `winit_backend::init_winit` creates once `backend.window_size()`
+        // is available) and mapped into the SAME space the main output
+        // will later join — see `codrive::SHADOW_ORIGIN`'s doc for why
+        // that location gives the two outputs structural isolation.
+        let shadow_output = codrive::create_shadow_output(&dh);
+        space.map_output(&shadow_output, codrive::SHADOW_ORIGIN);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
@@ -134,6 +175,9 @@ impl DuduclawComp {
             codrive,
             codrive_freeze_set_at: None,
             codrive_highlight: None,
+            shadow_output,
+            codrive_shadow_active: false,
+            codrive_logo_held_prev: false,
         }
     }
 

@@ -1344,6 +1344,7 @@ stayed alive and error/panic-free (`grep -c panic` → 0) afterward.
   process start (so a compositor restart naturally invalidates any
   previously-leaked token), but there's no in-process rotation while
   running. Not required by the task brief; noted for completeness.
+  **Closed in CD-2 — see the "CD-2 socket token rotation" section below.**
 
 ## CD-1 live-bridge verification (2026-08-21, acceptance side)
 
@@ -1438,3 +1439,698 @@ cargo test -p duduclaw-gateway --lib codrive::live_tests -- --ignored --nocaptur
   not the deciding surface here (the harness decides via the same
   `ApprovalBroker::decide` API the dashboard RPC calls). Full product-path
   decision flow is VM-round scope.
+
+## CD-2 socket token rotation (2026-08-21)
+
+Closes the CD-1 carry-forward item DESIGN-codrive-desktop-2026-08.md §9
+flagged ("socket rotation") — the socket-auth token can now be rotated
+WITHOUT restarting `duduclaw-comp`. Two independent triggers, both routed
+through one function (`CodriveShared::rotate_token`, `codrive/mod.rs`):
+
+1. An already-authenticated connection sending `{"op":"rotate_token"}`
+   (`codrive/listener.rs`, alongside `status`/`resume`).
+2. This process receiving `SIGHUP` — a dedicated thread turns the signal
+   into the same `rotate_token` call (`block_sighup_on_current_thread` +
+   `spawn_sighup_rotation_thread`, `codrive/mod.rs`).
+
+### Design
+
+- **Mechanism**: `auth_token` changed from a plain `Option<String>` (set
+  once at process start) to `Mutex<Option<String>>`; `rotate_token`
+  generates a fresh 32-byte token via the exact same
+  `generate_token_bytes`/`hex_encode`/`write_token_file` path `init` used
+  at startup, then swaps the mutex's value.
+- **Old token invalidated immediately, existing connections unbroken**:
+  this falls out of `authenticate()`'s existing structure rather than
+  needing new bookkeeping — `check_token` is consulted exactly once per
+  connection, at the very start (`listener.rs::authenticate`). Once past
+  that gate, a connection never calls `check_token` again, so rotating the
+  in-memory value only affects the NEXT connection attempt; nothing needs
+  to notify or re-validate a connection that's already running (including
+  the one that may have just requested the rotation itself).
+- **SIGHUP via mask + `sigwait`, not a signal handler**: `rotate_token`
+  does file I/O and takes a mutex — neither is async-signal-safe, so a
+  real `signal()`/`sigaction()` handler was never an option. Instead:
+  `block_sighup_on_current_thread` blocks SIGHUP on the main thread as the
+  very first statement of `codrive::init` (before the agent seat, before
+  any thread is spawned — every subsequently-spawned thread inherits the
+  blocked mask via `pthread_create`'s standard inheritance rule), then
+  `spawn_sighup_rotation_thread` runs a plain `loop { sigwait(...) }` that
+  calls `rotate_token` as ordinary code. Getting the masking ORDER wrong
+  (mask on some threads but not others) is the actual danger here — SIGHUP's
+  default disposition is "terminate the process", so an unmasked thread
+  receiving it instead of the dedicated `sigwait` thread would kill the
+  whole compositor. This is why the live verification below sends a REAL
+  signal to a REAL running process rather than trusting the reasoning alone.
+- **`libc` promoted from a transitive to a direct dependency** (`Cargo.toml`)
+  for `pthread_sigmask`/`sigwait`/`sigset_t` bindings — no new crate (already
+  resolved via smithay's tree), no portability concern (crate is already
+  Linux-only).
+- **Fail-closed, matches init's existing posture**: `rotate_token` refuses
+  (before touching `/dev/urandom`) if this run has no token file path at all
+  (the listener was never started — CD-1's existing fail-closed disabled
+  path); on a random-byte-read or file-write failure it returns `Err`
+  without touching the in-memory token, so a failed rotation can never leave
+  `auth_token` cleared or half-written. The SIGHUP thread is only spawned
+  when masking AND the listener's own startup both succeeded — a broken
+  setup gets no rotation thread instead of a thread that would just fail on
+  every signal.
+- **Audit**: `token_rotated` (existing event shape — `kind`/`op`/`detail`/
+  `frozen`), `op` carrying the trigger (`"socket_op"` / `"sighup"`) purely
+  for operator visibility.
+
+### What changed
+
+- **`Cargo.toml`**: added `libc = "0.2"` (see "Design" above).
+- **`src/codrive/protocol.rs`**: `InjectCmd` gained a `RotateToken` variant
+  (wire op `rotate_token`, no fields) + `describe()` arm.
+- **`src/codrive/listener.rs`**: new `InjectCmd::RotateToken` match arm
+  (control-plane, handled synchronously like `status`/`resume`, before the
+  frozen/terminated gates); `validate()` updated; module doc updated; new
+  integration test `rotate_token_over_socket_invalidates_old_token_without_
+  dropping_the_caller` (a real `UnixListener`, three sequential connections
+  — the middle two must each be FULLY closed, both the original stream and
+  its `try_clone()`, before the next connects, since the listener accepts
+  one connection at a time; the first draft of this test hung for exactly
+  that reason and was caught before this round's container verification,
+  not left as a debt).
+- **`src/codrive/mod.rs`**: `CodriveShared::auth_token` is now
+  `Mutex<Option<String>>` (was `Option<String>`), new `token_path:
+  Option<PathBuf>` field; `check_token` adapted for the mutex; `init` now
+  masks SIGHUP as its very first statement and, on the listener's success
+  path, spawns the SIGHUP-rotation thread (both via the new `rotation`
+  submodule below); new `for_test_with_token_path` test constructor; module
+  doc updated. Grew past this project's 800-line file cap partway through
+  this round (CD-1 already had it near the limit at 619 lines) — see
+  `src/codrive/rotation.rs` below for the fix.
+- **`src/codrive/rotation.rs`** (new file, 228 lines): everything CD-2
+  actually added that isn't inline plumbing in `mod.rs`/`listener.rs` — a
+  second `impl CodriveShared` block holding `rotate_token` (Rust allows an
+  inherent type's methods to be split across multiple `impl` blocks in
+  different files of the same crate), plus `block_sighup_on_current_thread`
+  and `spawn_sighup_rotation_thread` (both `pub(super)`, called only from
+  `mod.rs::init`). Its own `#[cfg(test)] mod tests` holds the three unit
+  tests (`rotate_token_swaps_check_token_and_rewrites_the_file`,
+  `rotate_token_two_rotations_produce_different_tokens`,
+  `rotate_token_fails_closed_without_a_token_path`) — moved here, not
+  duplicated, alongside the code they test. This mirrors the same
+  "new focused file, not a bigger existing one" split
+  `duduclaw-gateway/src/codrive/identity.rs` demonstrates for CD-2 item 2 on
+  the gateway side (see that crate's own `BUILD.md`-equivalent — its
+  `tests.rs`/`driver.rs` header comments — for the parallel convention
+  note).
+
+### Verification (2026-08-21, this round)
+
+**Build/clippy/test, container-level** (same volumes/command shape as prior
+rounds):
+
+```
+cargo build                                 -> Finished, zero errors
+cargo clippy --all-targets -- -D warnings   -> Finished, zero warnings
+cargo test                                  -> running 36 tests ... test result: ok. 36 passed; 0 failed
+```
+
+36 tests, up from CD-1's 32 (all 32 prior tests still pass unchanged; 4 new:
+3 `rotate_token` unit tests in `codrive::rotation::tests` + 1 real-socket
+integration test in `codrive::listener::tests`) — re-confirmed after the
+file split above (moving code between modules is exactly the kind of change
+that's easy to get subtly wrong via a stray visibility or import mistake, so
+this was a full rebuild+clippy+test, not just a compile check).
+
+**Live SIGHUP verification** (weston-headless → duduclaw-comp, real process,
+real signal — not a unit test double): read the token file, confirmed it
+authenticates; sent a REAL `kill -HUP <pid>` to the running compositor;
+confirmed the process **survived** (`kill -0` still succeeds — this is the
+check that actually matters, since SIGHUP's default disposition is to
+terminate the process, and a masking-order bug would kill it silently);
+confirmed the token file **changed**; confirmed the OLD token now gets
+`auth_failed` on a fresh connection while the NEW token authenticates;
+repeated a SECOND `SIGHUP` to confirm rotation is repeatable, not one-shot
+(third token differs from the second, process still alive); grepped the
+audit log:
+
+```
+{"kind":"token_rotated","op":"sighup", ...}
+{"kind":"token_rotated","op":"sighup", ...}
+```
+
+Zero panics across the whole run (`grep -ci panic` → 0).
+
+**Live socket-op verification** (same stack, a real Python client over the
+real Unix socket): authenticated, sent `{"op":"rotate_token"}` →
+`{"ok":true,"rotated":true}`, then sent `{"op":"status"}` on the SAME
+connection → succeeded (proving the requesting connection survives its own
+rotation request); a NEW connection presenting the pre-rotation token got
+`auth_failed`; a NEW connection presenting the freshly-rotated token
+authenticated. Audit: `{"kind":"token_rotated","op":"socket_op", ...}`. Zero
+panics.
+
+### Honest stub / limitation list (this round)
+
+- **SIGHUP masking is scoped to threads spawned by this process after
+  `codrive::init` runs** — correct for this binary's actual startup order
+  (verified: `codrive::init` runs before `winit_backend::init_winit`, and
+  nothing before `init` spawns a thread), but this is a structural
+  invariant of `main.rs`'s call order, not something the type system
+  enforces. A future refactor that spawns a thread before `codrive::init`
+  runs would silently reopen the "SIGHUP might kill the process instead of
+  rotating the token" risk — flagged in `block_sighup_on_current_thread`'s
+  doc comment specifically so this is checked, not re-derived, if that
+  order ever changes.
+- **No rate limit on rotation** — a caller (or a script sending repeated
+  `SIGHUP`s) can rotate arbitrarily often. Not a concern for THIS channel's
+  threat model (same reasoning as `check_token`'s "best-effort constant-time"
+  doc comment — a same-host, filesystem-permission-gated control channel,
+  not a network-exposed one), but noted for completeness since nothing
+  currently caps it.
+- **The gateway driver (`duduclaw-gateway/src/codrive/`) has no code path
+  that requests a rotation** — `CodriveCmd` (the gateway's independent,
+  hand-mirrored copy of this wire protocol) was deliberately NOT extended
+  with a `RotateToken` variant this round: the task brief asked for comp to
+  SUPPORT rotation, not for the gateway to actively trigger it as part of
+  script execution. An operator-facing "rotate now" gateway-side trigger
+  (CLI command, dashboard button, or a cron-style periodic rotation) is a
+  reasonable follow-up but is new scope, not part of this round's "small
+  debt" brief.
+
+## CD-2 shadow workspace verification (WP-CD2-shadow, headless output + PiP)
+
+Implements `commercial/docs/DESIGN-codrive-desktop-2026-08.md` §3.3.4 —
+"影子工作區（headless output＋PiP 旁觀）", the item both that design's own
+staged plan (as CD-3) and the unified roadmap
+(`commercial/docs/REPORT-duduclaw-os-status-map-2026-08-20.md` §3 milestone
+10, todo item ②) call out. Scoped strictly to headless output + PiP per the
+task brief's charter — freeze/handback semantics were extended just enough
+to satisfy the task brief's own item 4 (see `codrive/shadow.rs`'s module
+doc for the honest scope line against DESIGN §3.1 point 2's fuller
+"shadow work runs unaffected by human-desktop freeze" claim, which this
+round deliberately did NOT implement).
+
+### What changed
+
+- **`src/codrive/shadow.rs`** (new file, 396 lines): everything CD-2 shadow
+  workspace actually added.
+  - `create_shadow_output(&DisplayHandle) -> Output` — a second
+    `smithay::output::Output` ("duduclaw-shadow-0"), registered as a real
+    `wl_output` global, never bound to any real display backend.
+  - `SHADOW_ORIGIN: (i32, i32) = (0, 100_000)` — the logical-space point the
+    shadow output is mapped at (`Space::map_output`, called from
+    `state.rs::new`). Chosen so `Space`'s own per-output geometry filtering
+    (`smithay::desktop::space::space_render_elements` →
+    `Space::render_elements_for_region`, confirmed by reading the vendored
+    smithay 0.7.0 source before relying on it, not guessed) gives the main
+    output and the shadow output structural, zero-manual-filtering
+    isolation: a window mapped at `SHADOW_ORIGIN` is never a geometry match
+    for the main output's own render pass, and vice versa — the same trick
+    real multi-monitor desktops use for extended-desktop layouts.
+  - `DuduclawComp::codrive_set_shadow(enable: bool)` — the
+    `{"op":"shadow","enable":true|false}` handler (reached via
+    `codrive::handle_agent_inject`'s new `Shadow` arm, `mod.rs`). Moves the
+    window currently focused by the AGENT seat's keyboard to/from
+    `SHADOW_ORIGIN`; idempotent re-assertion is audited as a no-op rather
+    than silently ignored.
+  - `DuduclawComp::codrive_handback_shadow_if_active(reason)` — shared
+    handback path (task brief item 4's MVP reading: "接手＝shadow 視窗搬回
+    主 output 並列印稽核事件"), called unconditionally (not nested inside a
+    frozen check) from both `emergency_stop` (Super+Esc — DESIGN §6 red
+    line 3, "急停一樣殺 shadow session") and `human_resume` (Super+Enter) in
+    `mod.rs`.
+  - `DuduclawComp::codrive_render_pip(...)` — the PiP: offscreen-renders
+    the shadow output into a persistent `GlesTexture` (`Offscreen<
+    GlesTexture>::create_buffer` + `Bind<GlesTexture>::bind`, both real
+    smithay 0.7.0 GLES APIs checked against the vendored source, not
+    assumed), then wraps it as a `TextureRenderElement<GlesTexture>`
+    positioned at a fixed bottom-right corner of the main output. Full
+    native-texture `src` + smaller destination `size` (240×150, same 8:5
+    aspect ratio as the shadow output's 1280×800) is what makes this an
+    actual downscale rather than a crop — the exact pitfall (a `size`-only
+    call silently defaulting `src` to `size` itself) is documented in the
+    function's own comment since it's the one place in this round's design
+    research a wrong-but-compiling call would have produced a subtly wrong
+    picture instead of an error.
+  - Two unit tests: `PIP_SIZE`/`SHADOW_SIZE` aspect-ratio parity, and a
+    guard that `SHADOW_ORIGIN`'s margin stays large enough for the
+    isolation property above to hold.
+- **`src/codrive/protocol.rs`**: `InjectCmd` gained a `Shadow { enable:
+  bool }` variant + `describe()` arm (`"shadow"`). Unlike `Status`/
+  `Resume`/`RotateToken`, this is NOT answered synchronously by the socket
+  thread — it touches `self.space`, so it goes through the same
+  `InjectCmd` channel and frozen/terminated gates as `move`/`button`/
+  `key`/`text`/`highlight`.
+- **`src/codrive/listener.rs`**: `validate()` gained a
+  `Shadow { .. } => Ok(())` arm (bool payload, nothing to range-check).
+- **`src/codrive/mod.rs`**: `mod shadow;` + `pub use shadow::
+  {create_shadow_output, SHADOW_ORIGIN};`; `handle_agent_inject`'s match
+  gained a `Shadow { enable }` arm delegating to `codrive_set_shadow`
+  (falls through to the existing generic `inject_applied` audit line,
+  same as `Highlight`); `emergency_stop`/`human_resume` each gained one
+  call to `codrive_handback_shadow_if_active`. Grew from 723 to 761
+  lines — still under this project's 800-line cap, but flagged here per
+  convention (same note `rotation.rs`'s own module doc left for its own
+  split) in case the next CD-2+ round needs to split further.
+- **`src/state.rs`**: `DuduclawComp` gained `shadow_output: Output` and
+  `codrive_shadow_active: bool` fields; `new()` creates the shadow output
+  and maps it into `space` right after `codrive::init` (needs only
+  `&DisplayHandle`, no real-backend dependency — unlike the main "winit"
+  output, which `winit_backend::init_winit` creates later once
+  `backend.window_size()` is available).
+- **`src/handlers/xdg_shell.rs`**: `new_toplevel` now branches on
+  `self.codrive_shadow_active` — a toplevel created while shadow mode is
+  already active maps straight to `SHADOW_ORIGIN` instead of the main
+  output's `(0, 0)` (covers the case where the agent opens a SECOND client
+  mid-shadow-session; a window that already existed before shadow mode
+  turned on is instead moved by `codrive_set_shadow` itself).
+- **`src/winit_backend.rs`**: top-level `render_elements! { pub
+  CodriveElement<=GlesRenderer>; Solid=SolidColorRenderElement,
+  Pip=TextureRenderElement<GlesTexture>, }` — the same "compositor-internal
+  render element" convention `codrive/cursor.rs`/`codrive/highlight.rs`
+  established for the two cursors and the highlight box, extended with a
+  real sampled texture via smithay's own `render_elements!` macro (checked
+  against the vendored source's own macro-doc example for a
+  concrete-renderer enum, `MyRenderElements<=GlesRenderer>`, not
+  guessed). `init_winit` gained `pip_texture: Option<GlesTexture>` and
+  `pip_damage_tracker: OutputDamageTracker` locals (same capture shape as
+  the pre-existing `output`/`damage_tracker` locals); the `WinitEvent::
+  Redraw` arm now builds `Vec<CodriveElement>` instead of `Vec<
+  SolidColorRenderElement>`, calls `backend.renderer()` to do the offscreen
+  PiP render BEFORE `backend.bind()`'s own (separately-borrowed) renderer
+  access, and pushes the resulting `CodriveElement::Pip` into the same
+  custom-elements slice `render_output` already consumed for the two
+  cursors and the highlight box.
+
+### Wire protocol addition
+
+```
+{"op":"shadow","enable":true}   -> {"ok":true,"frozen":false}   (window(s) moved to the shadow output)
+{"op":"shadow","enable":false}  -> {"ok":true,"frozen":false}   (window(s) moved back to the main output)
+```
+
+Same auth/frozen/terminated gating as every other seat-touching op (`move`/
+`button`/`key`/`text`/`highlight`) — NOT special-cased like `status`/
+`resume`/`rotate_token`.
+
+### Verification (2026-08-21, this round)
+
+**Build/clippy/test, container-level** (same volumes/command shape as prior
+CD-0/CD-1/CD-2 rounds):
+
+```
+cargo build                                 -> Finished, zero errors (first try — every smithay 0.7.0
+                                                API used here was checked against the vendored
+                                                registry source before writing the call, not guessed)
+cargo clippy --all-targets -- -D warnings   -> Finished, zero warnings
+cargo test                                  -> running 38 tests ... test result: ok. 38 passed; 0 failed
+```
+
+38 tests, up from CD-2 token-rotation's 36 (all 36 prior tests still pass
+byte-for-byte unchanged — confirms non-shadow paths are untouched; 2 new:
+`codrive::shadow::tests::shadow_origin_and_size_share_an_aspect_ratio_with_pip_size`
++ `codrive::shadow::tests::shadow_origin_is_far_from_any_realistic_main_output_rect`).
+
+**Live functional verification** (weston-headless → duduclaw-comp → foot,
+same three-layer stack as every prior round, driven via a real authenticated
+socket client — no `DEBUG_STDIN` needed for the socket-op half of this
+test):
+
+1. **Baseline control**: `move`+`button`(press/release, focuses `foot`)+
+   `text` synthesizes `echo pre-shadow-ok987 > /tmp/cd2-pre.txt\n` — real
+   shell executes it (`cat /tmp/cd2-pre.txt` → `pre-shadow-ok987`), proving
+   the ordinary main-output path is unaffected before any `shadow` op.
+2. **`{"op":"shadow","enable":true}`** while `foot` already holds agent
+   keyboard focus — audit trail: `shadow_window_moved(to_shadow)` →
+   `shadow_enabled` → `inject_applied(op:shadow)`, in order.
+3. **The SAME window, now at `SHADOW_ORIGIN`+local offset (100, 100100)**,
+   is driven again with `move`/`button`/`text` — real shell executes
+   `echo shadow-active-ok654 > /tmp/cd2-shadow.txt` (`cat` confirms) —
+   proving the window is fully interactive after relocation, not just
+   moved-and-inert.
+4. **Isolation, a second dedicated run** (`cd2_shadow_isolation.py`): after
+   enabling shadow, a click at the OLD main-output coordinate
+   `(50, 50)` where `foot` used to sit hits nothing —
+   `handle_agent_inject`'s click-to-focus `else` branch explicitly clears
+   agent keyboard focus (`set_focus(None)`) when nothing is under the
+   pointer — and a `text` op sent right after produces **no file at all**
+   (`/tmp/cd2-mainclick-nowhere.txt` does not exist), while an immediately
+   following click+text at the shadow-region coordinates DOES write
+   `/tmp/cd2-shadowclick-still-works.txt` — a positive control ruling out
+   "comp just broke" as the explanation for the main-output click producing
+   nothing. This is the concrete evidence for "在主畫面上不可見、不搶焦點"
+   from the task brief, at the audit/file-side-effect layer this
+   container's headless environment can actually produce (no screendump
+   available here — see "Honest stub" below).
+5. **Handback via Super+Enter** (`DUDUCLAW_CODRIVE_DEBUG_STDIN=1`,
+   `simulate_super_enter`): re-enabling shadow then simulating Super+Enter
+   produces `shadow_window_moved(to_main x1)` → `shadow_disabled(detail:
+   "handback (human_super_enter) — 1 window(s) moved to the main output")`
+   — matches the task brief's MVP handback rule exactly, and fires even
+   though the seat was never actually frozen in this run (confirms the
+   handback call is NOT nested inside `human_resume`'s `if was_frozen`
+   branch, as designed).
+6. **Handback via Super+Esc emergency stop**: re-enabling shadow again then
+   simulating Super+Esc produces, in order: `emergency_stop(detail:
+   "debug_stdin_simulated_super_esc")` → `shadow_window_moved(to_main x1)`
+   → `shadow_disabled(detail: "handback (debug_stdin_simulated_super_esc) —
+   1 window(s) moved to the main output")` — confirms DESIGN §6 red line
+   3's "急停鍵永遠有效" extends to tearing down an active shadow session,
+   per the task brief's own explicit example for this item.
+7. **PiP render path executed for real, every frame, with zero failures**:
+   across both live-run sessions above (several seconds of continuous,
+   unthrottled redraw with shadow mode active — see BUILD.md's earlier
+   "Honest stub" notes on this crate's tight redraw loop), `grep -c panic
+   duduclaw-comp*.log` → 0, and none of `codrive_render_pip`'s three
+   fail-open warning strings ("failed to allocate the shadow-workspace PiP
+   texture" / "failed to bind…" / "failed to render the shadow output…")
+   appear anywhere in either log — meaning `Offscreen<GlesTexture>::
+   create_buffer`, `Bind<GlesTexture>::bind`, and `render_output` into that
+   bound texture all succeeded on real (`llvmpipe`) software GLES, every
+   single redraw, for the whole duration shadow mode was active in both
+   runs — not just "the code compiles," an actual repeated live exercise of
+   the GL offscreen-render code path this round added.
+
+### Honest stub / limitation list (this round)
+
+- **PiP pixel content is not visually verified** — this headless container
+  has no screendump/framebuffer capture (same limitation category as CD-0's
+  cursor-distinctness check and CD-1's highlight-box check, both of which
+  needed the VM/QMP round's `screendump` to close visually). This round's
+  evidence is one layer down from pixels: the render path runs successfully
+  every frame with no fail-open warnings (item 7 above), and the underlying
+  shadow-output content is independently proven correct via file
+  side-effects (items 3–4) — but whether the PiP texture's pixels actually
+  land in the right on-screen corner, at the right size, showing the right
+  content, right-side-up, is VM/QMP acceptance-side work, same as the prior
+  two visual checks.
+- **`Fourcc::Abgr8888` channel order is unverified** — chosen as a common,
+  GLES-supported RGBA format for the offscreen texture (confirmed to exist
+  in the vendored `drm-fourcc` crate before using it), but whether the
+  resulting picture's color channels are exactly right (vs., say,
+  channel-swapped) is a pixel-level question this round's evidence can't
+  answer — same VM/QMP dependency as the point above.
+- **Freeze scope was deliberately unchanged by this round — closed by
+  WP-CD2-freeze-scope, see the section below.** DESIGN §3.1 point 2/3:
+  "並行零干擾" with the human's real desktop. This round's
+  `handle_agent_inject` applied its frozen gate uniformly to every op
+  including `Shadow`/subsequent shadow-window commands; a later round
+  scoped the gate so shadow-confined commands bypass a freeze while every
+  other op (and the `Shadow` toggle itself) still doesn't.
+- **No multi-window tiling** — every window moved into (or out of) shadow
+  lands at the exact same point (`SHADOW_ORIGIN` / `(0, 0)`) — matches this
+  crate's pre-existing single-window-at-a-time assumption (every brand-new
+  toplevel already maps to a fixed `(0, 0)` on the main output too), not a
+  new limitation introduced by this round.
+- **Per-window off-screening was never attempted** — DESIGN §7 R-C2
+  already ruled this out ("無先例") in favor of session-level headless
+  output, which is what this round implements; restated here only so a
+  BUILD.md reader doesn't wonder why every shadow window shares one region.
+- **Real hardware / VM round not run this session** — every item above
+  that says "VM/QMP" is carried forward exactly as CD-0/CD-1's own
+  honest-stub lists already did for their respective visual/hardware
+  checks; this round did not attempt a VM pass (task brief scoped
+  verification to "container 內... nested weston 模式", with real-hardware
+  work explicitly left to the acceptance side, matching the CD-0/CD-1
+  precedent this file already established).
+
+## WP-CD2-freeze-scope: freeze scope segmentation (shadow work doesn't get frozen)
+
+Implements `commercial/docs/DESIGN-codrive-desktop-2026-08.md` §3.1 point 3
+(the 2026-08-20 "凍結作用域" clarification): the human-input freeze gate
+protects the SHARED main desktop the instant a human touches it — it was
+never meant to also pause an agent's shadow session running in parallel on
+a headless output the human can't even see ("並行零干擾"). This closes the
+gap the CD-2 shadow-workspace round left open by design (see its own
+section above, and `codrive/shadow.rs`'s pre-existing module doc, which
+flagged it explicitly rather than glossing over it).
+
+### What changed
+
+- **`src/codrive/shadow.rs`** (396 → 629 lines): the actual policy.
+  - `point_in_shadow_bounds(x, y)` / `rect_in_shadow_bounds(x, y, w, h)` —
+    pure geometry against [`SHADOW_ORIGIN`]/`SHADOW_SIZE`.
+  - `freeze_bypass_decision(shadow_active, cmd, agent_pointer_pos,
+    agent_keyboard_focus_in_shadow) -> bool` — the actual policy, kept
+    **pure** (no `&DuduclawComp`) specifically so it's unit-testable
+    without constructing a full compositor state (`EventLoop`+`Display`+
+    `DuduclawComp::new`) — this crate has never done that in a unit test;
+    see BUILD.md's many "Honest stub" notes on why live/container
+    verification, not unit tests, is this crate's usual tool for anything
+    touching real seat/space state. Fail-closed on every axis: `Shadow`
+    (both `enable:true` and `enable:false`) never bypasses; `Move`/
+    `Highlight` bypass only if their own coordinates are confirmed inside
+    the shadow output; `Button` bypasses only if the agent pointer's
+    CURRENT live position is inside it; `Key`/`KeyName`/`Text` bypass only
+    if the agent keyboard's CURRENT focus is a shadow-region window;
+    `Resume`/`Status`/`RotateToken` never bypass (they never reach this
+    path in practice — listed explicitly, not via `_`, so a future new
+    `InjectCmd` variant fails the match at compile time instead of
+    silently inheriting a bypass).
+  - `agent_keyboard_focus_is_shadowed(comp)` / `is_freeze_bypass_eligible
+    (comp, cmd)` — the thin, untested wrapper that extracts live
+    agent-seat facts (pointer position, keyboard-focus-window location)
+    from a real `&DuduclawComp` and defers to `freeze_bypass_decision`.
+  - `codrive_set_shadow`/`codrive_handback_shadow_if_active` each gained
+    one line mirroring `codrive_shadow_active` into the new
+    `CodriveShared::shadow_active` atomic (below) — every write to one
+    goes through these two functions, never directly.
+  - 10 new unit tests (bounds edge cases + every `freeze_bypass_decision`
+    branch).
+- **`src/codrive/mod.rs`** (761 → 793 lines, still under the 800 cap):
+  - `CodriveShared` gained `shadow_active: AtomicBool` — a mirror of
+    `DuduclawComp::codrive_shadow_active` kept ONLY for `listener.rs`'s
+    socket-thread optimistic pre-check (no `self.space`/seat access
+    there); never itself the authoritative bypass decision. All five
+    `CodriveShared` constructors updated.
+  - `handle_agent_inject`'s frozen gate: was an unconditional "frozen ⇒
+    drop", now `let shadow_bypass = frozen &&
+    shadow::is_freeze_bypass_eligible(self, &cmd);` gates the drop instead.
+    The drop path's audit `detail` now distinguishes a plain queued-then-
+    frozen race from a failed shadow-scope check. The `inject_applied`
+    audit line at the bottom now tags `detail:"scope:shadow"` when the op
+    was a bypass — `None` (byte-identical) for every non-bypass apply.
+- **`src/codrive/listener.rs`** (623 → 759 lines): the socket thread's
+  frozen pre-check was an unconditional deny; it now only denies outright
+  when `!(shared.shadow_active && cmd is not Shadow)` — otherwise it
+  forwards to the main thread's authoritative check (this thread has no
+  way to confirm a specific op's target itself). The success ack's
+  `"frozen"` field is no longer hardcoded `false` — it now reflects
+  `shared.frozen`'s real value (`true` for a forwarded bypass candidate),
+  matching the gateway client's own already-documented wire contract
+  (`{"ok":true,"frozen":bool}`, `duduclaw-gateway/src/codrive/client.rs` —
+  its `CodriveAck.frozen` field was already `Option<bool>`, permissive of
+  either value; no gateway-side change needed). 3 new tests.
+- No wire protocol addition — this round only changes WHEN existing ops
+  are allowed through, not the JSON shapes themselves.
+
+### Verification (2026-08-21, this round)
+
+**Build/clippy/test, container-level** (same volumes/command shape as
+every prior round):
+
+```
+cargo build                                 -> Finished, zero errors
+cargo clippy --all-targets -- -D warnings   -> Finished, zero warnings
+cargo test                                  -> running 51 tests ... test result: ok. 51 passed; 0 failed
+```
+
+51 tests, up from CD-2 shadow's 38 (all 38 prior tests still pass
+byte-for-byte unchanged — confirms invariant (d), the non-shadow path is
+untouched; 13 new: 10 in `codrive::shadow::tests`, 3 in
+`codrive::listener::tests`).
+
+**The four invariants, each with its own test(s):**
+
+| # | Invariant | Test(s) | Layer |
+|---|---|---|---|
+| (a) | 凍結中不可進入 shadow（雙向） | `shadow::tests::freeze_bypass_decision_shadow_toggle_never_bypasses_either_direction`, `listener::tests::frozen_shadow_toggle_always_denied_even_when_shadow_already_active` | unit + real-socket |
+| (b) | Super+Esc 全域急停不變（含 shadow） | live run step 8 below (this crate has no precedent for unit-testing `emergency_stop`/`human_resume` — both need a full `DuduclawComp`; CD-2's own verification used the same live-only approach) | live/container |
+| (c) | shadow 注入不可觸主桌面 | `shadow::tests::freeze_bypass_decision_move_follows_target_coordinate`, `_button_follows_live_pointer_position`, `_key_and_text_follow_keyboard_focus_flag`, `_highlight_follows_whole_rect`, `point_in_shadow_bounds_*`, `rect_in_shadow_bounds_*`; live run steps 4/5 | unit + real-socket + live/container |
+| (d) | 非 shadow 路徑逐位不變 | `shadow::tests::freeze_bypass_decision_shadow_inactive_never_bypasses`; the 38 pre-existing tests all still pass; live run step 1 (baseline) | unit + live/container |
+
+**Live functional verification** (weston-headless → duduclaw-comp → foot,
+same three-layer stack as every prior round, driven via a real
+authenticated socket client + `DUDUCLAW_CODRIVE_DEBUG_STDIN=1` for
+`simulate_human`/`simulate_super_esc`):
+
+1. **Baseline** (no shadow, no freeze): `move`+`button`+`text` writes
+   `/tmp/fz-baseline.txt` = `baseline-ok111` via real shell execution —
+   confirms the ordinary path is untouched before this WP's logic is
+   exercised at all.
+2. **`{"op":"shadow","enable":true}`**, then a shadow-relocated `move`+
+   `button`+`text` at `(100, 100100)` (`SHADOW_ORIGIN`-local) writes
+   `/tmp/fz-preshadow.txt` = `pre-freeze-shadow-ok222` — shadow session
+   interactive before any freeze.
+3. **`simulate_human`** — audit: `freeze(op:debug_stdin_simulated)`.
+4. **Frozen + shadow-targeted commands still execute for real**: a NEW
+   authenticated connection (proving reconnect-during-freeze doesn't
+   clear `frozen`, per CD-0/CD-1 precedent) sends `move`+`button`+`text`
+   at `(120, 100120)` — writes `/tmp/fz-frozen-shadow.txt` =
+   `shadow-bypasses-freeze-ok333`. Audit: all four `inject_applied` lines
+   carry `"detail":"scope:shadow"`. **This is the load-bearing proof of
+   invariant (1)/(c)'s positive half — real shell execution, not just an
+   `"ok":true` ack.**
+5. **Frozen + a main-output-targeted `move` is dropped**: `{"op":"move",
+   "x":50.0,"y":50.0}` (nowhere near `SHADOW_ORIGIN`) gets an optimistic
+   `"ok":true,"frozen":true"` ack from the socket thread (it can't know
+   the target itself), but the audit trail shows what the main thread
+   actually decided: `"kind":"inject_dropped","op":"move","x":50.0,
+   "y":50.0,"detail":"frozen at execution time — shadow active but this
+   op's target is not confirmed inside the shadow output (fail-closed)…"`
+   — the real `is_freeze_bypass_eligible`, fed real `SHADOW_ORIGIN`/
+   `SHADOW_SIZE` geometry, correctly rejected it. (A file-side-effect
+   proof for this specific negative would be ambiguous here: since the
+   agent's only window had already relocated to the shadow output before
+   the freeze, there was nothing left on the main output for a stray
+   click to hit either way — the audit trail is the precise, unambiguous
+   evidence that IT WAS THE FREEZE GATE that rejected the command, not
+   "there was nothing there.")
+6. **Frozen + `shadow` toggle denied both directions**: `{"op":"shadow",
+   "enable":true}` → `{"ok":false,"frozen":true,"reason":
+   "agent_seat_frozen"}`; `{"op":"shadow","enable":false}` → the same.
+   Audit: two `inject_dropped` lines, `op:"shadow"`, same denial detail
+   as an ordinary frozen non-shadow op — proving `Shadow` stays behind
+   the PLAIN gate, never even reaching the bypass-eligibility check.
+7. **Shadow still works after the denied attempts**: `move`+`button`+
+   `text` at `(140, 100140)` writes `/tmp/fz-frozen-shadow-2.txt` =
+   `shadow-still-alive-ok444` — rejecting the main-output escape attempt
+   and the toggle-denial attempts didn't collaterally wedge the
+   legitimate parallel shadow session.
+8. **`simulate_super_esc`**: audit, in order —
+   `emergency_stop(detail:"debug_stdin_simulated_super_esc")` →
+   `shadow_window_moved(to_main x1)` → `shadow_disabled(detail:"handback
+   (debug_stdin_simulated_super_esc) — 1 window(s) moved to the main
+   output")` — confirms invariant (b): Super+Esc still tears down the
+   shadow session exactly as CD-2's own round proved, unaffected by this
+   round's gate changes.
+9. **Post-ESC lockdown, from a brand-new connection**: `frozen` stays
+   `true` (only human-side `Super+Enter` clears it — unchanged CD-1
+   invariant) and `shadow_active` is now `false` (handed back in step 8),
+   so a fresh connection's shadow-targeted `move`/`button`/`text` (the
+   SAME coordinates that worked in step 4) are ALL denied —
+   `/tmp/fz-frozen-shadow.txt` is confirmed unchanged (still
+   `shadow-bypasses-freeze-ok333`, no new write) — proving Super+Esc's
+   lockdown is total, not just "shadow session torn down but somehow
+   still reachable."
+10. **Zero panics**: `grep -ci panic /tmp/duduclaw-comp.log` → `0` across
+    the whole run.
+
+The full audit trail from this run (abbreviated `ts_ms` for readability)
+is coherent end-to-end with no gaps and no out-of-order transitions —
+`session_started`/`session_ended` bracket each of the 8 reconnects
+cleanly, and every `inject_applied`/`inject_dropped` line's `frozen`
+column matches the freeze timeline exactly.
+
+### Honest stub / limitation list (this round)
+
+- **Invariant (b) has no unit test** — this crate has never unit-tested
+  `emergency_stop`/`human_resume` (both need a full `DuduclawComp`, which
+  needs a real `EventLoop`+`Display`); CD-2's own shadow-workspace round
+  hit the identical limitation and used the same live-only verification.
+  Not a regression introduced by this round — restated here so a reader
+  doesn't wonder why the invariant table above has no unit-test entry for
+  it.
+- **`is_freeze_bypass_eligible` (the `&DuduclawComp` wrapper) has no unit
+  test of its own** — only the pure `freeze_bypass_decision` it defers to
+  does. The wrapper's own correctness (does it extract the RIGHT live
+  facts from a real seat/space) is exactly what live run steps 4/5
+  exercise instead.
+- **No new coordinate-space concept was introduced** — "inside the shadow
+  output" is exactly `SHADOW_ORIGIN..SHADOW_ORIGIN+SHADOW_SIZE`, the same
+  fixed region CD-2 already established; this round adds no per-window or
+  dynamic geometry tracking (matches CD-2's own "no multi-window tiling"
+  scope limit, restated here since freeze-bypass eligibility depends on
+  that same fixed region holding).
+- **Real hardware / VM round not run this session** — same category as
+  every prior round's own list; this round's task brief scoped
+  verification to the container/nested-weston level, with real Super+Esc/
+  human-input-triggered-freeze-while-shadow-active on real hardware left
+  to acceptance-side VM/QMP work (the `simulate_human`/`simulate_super_esc`
+  debug stdin path verifies everything downstream of hardware detection,
+  same split as CD-0/CD-1's own honest-stub notes).
+
+## WP-CD2-vmround: CD-2 收官 VM/QMP 真輸入輪 (verified 2026-08-21)
+
+Closes the "real hardware / VM round" gap the freeze-scope section above
+(and the shadow-workspace section before it) left explicitly open. Same
+appliance QEMU VM (arm64, `qemu-system-aarch64 -accel hvf`) and injection
+recipe as the CD-0 VM/QMP round; comp rebuilt fresh from this round's
+working tree (CD-2 rotation + shadow + freeze-scope, 54 container tests
+green) and re-injected before driving anything.
+
+**Real bug found and fixed**: a genuine physical Super+Enter chord (Logo
+down → Return down → Return up → Logo up — the way real hardware reports a
+held-modifier chord, not a synthetic single event) left the agent seat
+**frozen again immediately after `human_resume()` un-froze it**, because
+`input.rs`'s keyboard arm called `on_human_input` unconditionally for
+every keyboard event including the chord's own trailing key-release
+events — releasing Return (still `frozen:false → true`) or Logo re-armed
+the freeze gate with no counteracting resume, since the resume-detecting
+closure only matches on `KeyState::Pressed`. On real hardware this made
+Super+Enter **structurally unable to durably hand control back** — every
+real "交還" attempt self-defeated a few hundred ms after the human
+released the keys. Neither the CD-0/CD-1 container debug-stdin rounds nor
+this round's own first QMP attempt (a single held/synthetic key event)
+could have caught this — it only shows up with real down/down/up/up
+timing. Fixed in `src/input.rs` (`is_system_gesture_tail`, a pure/
+unit-tested exemption: any keyboard event where Logo is currently held OR
+was held on the immediately-preceding event is chord activity, not
+ordinary desktop touch) + one new `DuduclawComp` field (`src/state.rs`,
+`codrive_logo_held_prev`). 3 new unit tests (54 total, up from 51);
+container `cargo build`/`clippy -D warnings`/`test` all clean. Regression
+evidence: three independent real QMP Super+Enter chords across this
+round (initial repro, post-fix confirmation, post-item-3 handback) all
+left `frozen:false` durably — audit `resume(op:human_super_enter)` with
+no trailing re-freeze line, vs. the pre-fix run's `resume` immediately
+followed by `freeze(op:keyboard)`.
+
+**Four-item verification, all PASS**:
+1. **Freeze/handback full chain, real driver**: `duduclaw-gateway`'s real
+   `codrive::driver::run_script` (new permanent `#[ignore]` test
+   `live_bridge_real_human_freeze_and_resume` in `duduclaw-gateway/src/
+   codrive/live_tests.rs`, same TCP-bridge pattern as the CD-1 live-bridge
+   test — here bridging to the VM's `tcp_unix_bridge.py` instead of a
+   Docker container) drove a real script against real comp; a real QMP
+   keyboard event fired mid-script froze the seat (audit `op:"keyboard"`,
+   not `debug_stdin_simulated`), the driver's `wait_for_resume` correctly
+   observed it via `status` polling, a real QMP Super+Enter chord resumed
+   it, and the driver reapplied the dropped step — `final_state:
+   "completed"`, step outcome `dropped_frozen_reapplied`. Guest file
+   `/tmp/cd2-freeze-proof.txt` = `cd2vmfreeze123`.
+2. **Highlight visual**: QMP `screendump` while a `{"op":"highlight",...}`
+   box was live confirms a hollow amber border at the requested rect,
+   visually distinct from both cursors.
+3. **Shadow + PiP visual + isolation**: screendump after `{"op":"shadow",
+   "enable":true}` shows the main output blank (agent's window relocated)
+   with a real PiP thumbnail (foot's terminal content, downscaled) in the
+   bottom-right corner. Isolation confirmed at the strongest evidence
+   layer (real shell execution, not just acks): during a real-hardware
+   freeze, shadow-targeted move/button/text still executed for real
+   (`/tmp/cd2-frozen-shadow.txt` written, audit `detail:"scope:shadow"`)
+   while a main-output-targeted `move` was `inject_dropped` (fail-closed,
+   "not confirmed inside the shadow output"). Handback via Super+Enter
+   screendumped back to the plain foot window.
+4. **MCP `codrive_run` + dashboard approval, full product path**: a real
+   `duduclaw run` gateway (test `DUDUCLAW_HOME`, `DUDUCLAW_PORT=18799`)
+   plus a real `duduclaw mcp-server` stdio JSON-RPC client (NOT a direct
+   Rust call) issued `codrive_run`; the resulting `codrive_action`
+   approval appeared via the same `approvals.list` dashboard WebSocket RPC
+   the web UI uses (`simulation` field populated), authenticated with a
+   real admin JWT obtained via the passwordless `/api/session/local`
+   local-auto-login flow. Approve path: `approvals.decide` → comp executed
+   the consequential `key_name:enter` for real (`/tmp/cd2-mcp-approve.txt`
+   = `cd2mcpapprove456`), driver report `final_state: "completed"` with
+   the step's `approval_id` matching the decided approval. Deny path: comp
+   audit shows the typed `text` applied but **zero** `key_name` events —
+   `/tmp/cd2-mcp-deny.txt` never created, driver report `final_state:
+   "aborted_approval_denied"`. Web UI visual approval card itself was not
+   opened this round (RPC-level product path only, per the task brief's
+   own fallback) — left for a human to eyeball.
+
+**Environment notes for whoever picks this VM up next**: the appliance
+disk (`appliance/.vm/duduclaw-os-vm.raw`) now carries this round's rebuilt
+comp binary (includes the Super+Enter fix); root password and serial
+getty are unchanged durable state from the CD-0 round. The guest's
+`nftables` `inet filter input` chain default-denies new inbound ports —
+this round added a `tcp dport 7778 accept` rule (for a guest-local
+`tcp_unix_bridge.py` Unix↔TCP relay, QEMU `hostfwd`'d to the host) that is
+**not persisted** (VM was stopped via QMP `quit`, not a graceful `nft
+save`), so a future round needing host→guest TCP again must re-add it.

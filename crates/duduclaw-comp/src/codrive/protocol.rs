@@ -44,6 +44,23 @@ use serde::Deserialize;
 /// - `{"op":"highlight","x":0.0,"y":0.0,"w":100.0,"h":40.0,"ms":800}` —
 ///   CD-1: draws a hollow border around this rectangle for `ms`
 ///   milliseconds (optional, default 800, clamped to [100, 5000]).
+/// - `{"op":"rotate_token"}` — CD-2 (DESIGN §9 CD-1 carry-forward "socket
+///   rotation"): asks this run to generate a fresh socket-auth token right
+///   now and write it over `$XDG_RUNTIME_DIR/duduclaw-codrive.token`,
+///   without restarting the process. Like `status`, this is answered
+///   directly by the listener thread (`listener.rs`) and never reaches the
+///   main-thread channel — see `CodriveShared::rotate_token`. Only reachable
+///   AFTER the auth handshake, same as every other op here, so requesting a
+///   rotation already proves the caller held the token being replaced.
+/// - `{"op":"shadow","enable":true|false}` — CD-2 shadow workspace
+///   (DESIGN §3.3.4 / task brief "WP-CD2-shadow"): toggles whether this
+///   session's agent-driven window(s) run on the headless shadow output
+///   (invisible on the main desktop, PiP-previewed) or the main output.
+///   Unlike `status`/`resume`/`rotate_token`, this DOES reach the main
+///   thread (`codrive::handle_agent_inject` → `DuduclawComp::
+///   codrive_set_shadow`, `codrive/shadow.rs`) — it moves real windows in
+///   `self.space`, so it's subject to the same frozen/terminated gates as
+///   `move`/`button`/`key`/`text`/`highlight`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum InjectCmd {
@@ -55,6 +72,8 @@ pub enum InjectCmd {
     Resume,
     Status,
     Highlight { x: f64, y: f64, w: f64, h: f64, ms: Option<u64> },
+    RotateToken,
+    Shadow { enable: bool },
 }
 
 impl InjectCmd {
@@ -71,6 +90,8 @@ impl InjectCmd {
             InjectCmd::Resume => ("resume", None, None),
             InjectCmd::Status => ("status", None, None),
             InjectCmd::Highlight { x, y, .. } => ("highlight", Some(*x), Some(*y)),
+            InjectCmd::RotateToken => ("rotate_token", None, None),
+            InjectCmd::Shadow { .. } => ("shadow", None, None),
         }
     }
 }

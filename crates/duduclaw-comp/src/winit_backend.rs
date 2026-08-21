@@ -16,7 +16,11 @@ use std::time::Duration;
 
 use smithay::{
     backend::{
-        renderer::{damage::OutputDamageTracker, element::solid::SolidColorRenderElement, gles::GlesRenderer},
+        renderer::{
+            damage::OutputDamageTracker,
+            element::{render_elements, solid::SolidColorRenderElement, texture::TextureRenderElement},
+            gles::{GlesRenderer, GlesTexture},
+        },
         winit::{self, WinitEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
@@ -25,6 +29,27 @@ use smithay::{
 };
 
 use crate::{CalloopData, DuduclawComp};
+
+// CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): the same
+// "compositor-internal render element" convention `codrive/cursor.rs` and
+// `codrive/highlight.rs` already use for the two cursors and the target
+// highlight box (both zero-texture `SolidColorRenderElement`s), extended
+// with a real sampled texture for the PiP thumbnail
+// (`DuduclawComp::codrive_render_pip`, `codrive/shadow.rs`). smithay's
+// `render_elements!` macro (used the same way anvil-class compositors
+// combine heterogeneous custom-element types) generates the `Element`/
+// `RenderElement<GlesRenderer>` glue for this enum so `render_output`'s
+// single `custom_elements: &[C]` slice can carry both element kinds without
+// either `codrive/cursor.rs` or `codrive/shadow.rs` needing to know about
+// each other or about `GlesRenderer` specifically — this enum is the one
+// place in the crate that combines them, mirroring why this file (not
+// `codrive/`) is the one place that already knows about `GlesRenderer`
+// concretely.
+render_elements! {
+    pub CodriveElement<=GlesRenderer>;
+    Solid=SolidColorRenderElement,
+    Pip=TextureRenderElement<GlesTexture>,
+}
 
 pub fn init_winit(
     event_loop: &mut EventLoop<CalloopData>,
@@ -62,6 +87,20 @@ pub fn init_winit(
     state.space.map_output(&output, (0, 0));
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
+
+    // CD-2 shadow workspace (WP-CD2-shadow): PiP render target state,
+    // captured by the `move` closure below alongside `output`/
+    // `damage_tracker` — same lifetime shape, just for the second
+    // (offscreen) render pass. `pip_texture` starts `None` and is
+    // allocated lazily on first use (`DuduclawComp::codrive_render_pip`,
+    // `codrive/shadow.rs`) rather than eagerly here, since a shadow session
+    // may never start this run. `pip_damage_tracker` is built against
+    // `state.shadow_output` right away, same as the main `damage_tracker`
+    // above is built against `output` — the shadow output's mode is
+    // already set by `codrive::create_shadow_output` (called from
+    // `DuduclawComp::new`, before this function ever runs).
+    let mut pip_texture: Option<GlesTexture> = None;
+    let mut pip_damage_tracker = OutputDamageTracker::from_output(&state.shadow_output);
 
     // SAFETY: single-threaded at this point in startup, before the event
     // loop starts running client callbacks — matches smallvil's own use of
@@ -104,8 +143,15 @@ pub fn init_winit(
                 let human_pos = state.seat.get_pointer().unwrap().current_location();
                 let agent_pos = state.agent_seat.get_pointer().unwrap().current_location();
                 let agent_frozen = state.codrive.is_frozen();
-                let mut cursor_elements =
-                    crate::codrive::build_cursor_elements(human_pos, agent_pos, agent_frozen);
+                // CD-2: cursor/highlight elements now go through the
+                // combined `CodriveElement` enum (see this file's top-level
+                // `render_elements!` invocation) so the PiP texture element
+                // below can share the same `custom_elements` slice.
+                let mut cursor_elements: Vec<CodriveElement> =
+                    crate::codrive::build_cursor_elements(human_pos, agent_pos, agent_frozen)
+                        .into_iter()
+                        .map(CodriveElement::Solid)
+                        .collect();
                 // CD-1 (DESIGN §3.3.2(b) target highlight box): appended
                 // into the same custom-elements slice as the cursors —
                 // `codrive_highlight_elements` takes `&mut self` since it
@@ -113,13 +159,40 @@ pub fn init_winit(
                 // `codrive/highlight.rs`), so this has to run through
                 // `state` (already `&mut` in this closure) rather than as
                 // a free function like `build_cursor_elements`.
-                cursor_elements.extend(state.codrive_highlight_elements(std::time::Instant::now()));
+                cursor_elements.extend(
+                    state
+                        .codrive_highlight_elements(std::time::Instant::now())
+                        .into_iter()
+                        .map(CodriveElement::Solid),
+                );
+
+                // CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): a
+                // second, offscreen render pass of the shadow output into a
+                // persistent GLES texture, wrapped as a PiP element and
+                // appended to the SAME custom-elements slice the main
+                // output's own render pass below consumes. Scoped to its
+                // own block so `backend`'s mutable borrow from
+                // `backend.renderer()` ends before `backend.bind()` is
+                // called a few lines down — the two calls are independent
+                // per-call borrows of `backend` (same shape as
+                // `backend.bind()` itself already returning `(&mut R,
+                // Framebuffer<'_>)` as two separately-borrowed values, not
+                // one derived from the other), so there is no live overlap
+                // to resolve as long as this block doesn't hold `renderer`
+                // past its own end.
+                let pip_element = {
+                    let renderer = backend.renderer();
+                    state.codrive_render_pip(renderer, &mut pip_texture, &mut pip_damage_tracker, size)
+                };
+                if let Some(pip) = pip_element {
+                    cursor_elements.push(CodriveElement::Pip(pip));
+                }
 
                 {
                     let (renderer, mut framebuffer) = backend.bind().unwrap();
                     smithay::desktop::space::render_output::<
                         _,
-                        SolidColorRenderElement,
+                        CodriveElement,
                         _,
                         _,
                     >(

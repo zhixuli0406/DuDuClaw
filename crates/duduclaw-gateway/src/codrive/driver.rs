@@ -9,6 +9,12 @@
 //!
 //! Design authority: `commercial/docs/DESIGN-codrive-desktop-2026-08.md`
 //! §3.4 (approval reuse), §6 (safety red lines), §8-3 (refuse-list).
+//!
+//! **CD-2 file-size note**: this file is already near this project's
+//! per-file convention (200-400 lines typical, 800 max). New orchestration
+//! logic that doesn't fit `step.rs`'s existing per-step split should get
+//! its own module (see `identity.rs` for the pattern: a focused concern,
+//! `pub use`-re-exported from `mod.rs`) rather than being appended here.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -61,6 +67,22 @@ pub struct CodriveRunReport {
 /// Run one co-drive script end to end. Never panics; every failure path
 /// (refuse-list hit, connect failure, approval denial, freeze timeout,
 /// emergency stop) returns an honest report instead — "空結果優於假結果".
+///
+/// `agent_id` is TRUSTED here — this function does not re-check
+/// `[capabilities] codrive` for it, mirroring the "trust boundary at the
+/// edge, trusted executor at the core" split `duduclaw-comp`'s
+/// `listener.rs`/`codrive::exec` already use for the wire protocol (see
+/// that crate's module docs). The caller (today: `duduclaw-cli/src/
+/// mcp.rs::handle_codrive_run`) MUST have already resolved and authorized
+/// `agent_id` via [`super::identity::resolve_run_identity`] before calling
+/// this — see that function's doc comment for the full "`agent` parameter
+/// overrides the WHOLE call identity, including the capability re-check"
+/// semantics (CD-2 task brief item 2), why it's the conservative/correct
+/// reading, and exactly what would need to change to narrow it to
+/// approval-attribution-only. Every consequential step's approval row
+/// (`step::gate_consequential` → `ApprovalBroker::request_with_simulation
+/// (agent_id, ...)`) and every audit-denial line in this file is filed
+/// under this same `agent_id`.
 pub async fn run_script(
     home_dir: &Path,
     agent_id: &str,

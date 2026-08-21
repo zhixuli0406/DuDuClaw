@@ -46,7 +46,26 @@ impl XdgShellHandler for DuduclawComp {
             "xdg_shell: new toplevel created, mapping into space"
         );
         let window = Window::new_wayland_window(surface);
-        self.space.map_element(window, (0, 0), false);
+        // CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): a toplevel
+        // created while a shadow session is already active (e.g. the agent
+        // launches a second client mid-session) maps straight into the
+        // shadow region instead of the main output's `(0, 0)` — see
+        // `codrive::SHADOW_ORIGIN`'s doc for the isolation this location
+        // gives for free. A window that already existed BEFORE shadow mode
+        // was enabled is instead moved by `DuduclawComp::codrive_set_shadow`
+        // (`codrive/shadow.rs`), not here.
+        if self.codrive_shadow_active {
+            self.space.map_element(window, crate::codrive::SHADOW_ORIGIN, false);
+            self.codrive.record(
+                "shadow_window_moved",
+                Some("shadow"),
+                None,
+                None,
+                Some("to_shadow (mapped directly — shadow was already active at toplevel-creation time)".into()),
+            );
+        } else {
+            self.space.map_element(window, (0, 0), false);
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
