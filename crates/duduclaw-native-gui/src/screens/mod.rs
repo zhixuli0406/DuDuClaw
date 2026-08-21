@@ -54,6 +54,13 @@ mod create_agent_data;
 mod create_agent_sections;
 pub mod dashboard;
 mod dashboard_cards;
+// WP-S6b3-P (S6b 第三波, 2026-08-22) — "部門" (`Departments.dc.html`, B1
+// 降規二欄 左清單/右詳情). A "進階設定" drill-down leaf reached via
+// `active_page == "departments"` — wired from `manage_advanced.rs`'s 部門
+// row by this same pass. See the module's own doc comment for the
+// `departments.list` RPC shape and the description/role-title canvas
+// deviations (no such fields exist on `DepartmentInfo`).
+pub mod departments;
 // S5b1-A (2026-08-21) — the "裝置" page. `device_backup` (backup/restore +
 // danger-zone sections) is a sibling of `device`, split off for the same
 // file-size reason `dashboard`/`dashboard_cards` are split (see `device.rs`'s
@@ -105,6 +112,15 @@ pub mod foresight;
 pub mod forks;
 mod forks_data;
 pub mod gallery;
+// WP-S6b3-R (S6b 第三波, 2026-08-22) — "GatewayPicker" (`GatewayPicker.dc.
+// html`, B23 獨立小視窗). No `nav.rs` entry — self-attached in `screens/
+// shell.rs` only, `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=gatewayPicker`. See the
+// module's own doc comment for the execution-time attribution (Tauri-only
+// `gateway_*` IPC commands, structurally unreachable from this crate — same
+// shape `pet_studio.rs` documents) and the one real value this crate DOES
+// have (`api::GATEWAY_BASE_URL` + live `WsConnState`), rendered as a
+// centered card inside the normal shell rather than a root-swap.
+pub mod gateway_picker;
 // WP-S5b1-C (2026-08-21) — "Google 工作區" (`GoogleIntegration.dc.html`), an
 // "整合" drill-down leaf reached via `RootView::active_page == "googleIntegration"`
 // (the id `screens::integrations`'s own drill-down navigation contract
@@ -141,6 +157,22 @@ pub mod manage_advanced;
 // comment for why this is its own module rather than widening
 // `settings_common` (a different batch's "整合" breadcrumb root).
 mod manage_advanced_common;
+// WP-S6b3-Q (S6b 第三波, 2026-08-22) — "市集" (`Marketplace.dc.html`, B2),
+// an "整合" (Integrations) conceptual drill-down. See the module's own doc
+// comment for the `marketplace.list` RPC shape, the real 10-entry catalog
+// vs. the canvas's illustrative mockup names, and why the search box is
+// decorative while the 5 category chips are real.
+pub mod marketplace;
+// WP-S6b3-R (S6b 第三波, 2026-08-22) — "桌寵浮層" (`MascotOverlay.dc.html`,
+// B24 透明浮層). No `nav.rs` entry — self-attached in `screens/shell.rs`
+// only, `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=mascotOverlay`. See the module's own
+// doc comment for the execution-time attribution (a Tauri transparent/
+// borderless/always-on-top second window this crate cannot open — `main.rs`
+// opens exactly one window) and the one thing this page DOES fetch for
+// real, unlike `pet_studio.rs`'s zero-RPC page: the pending-approvals badge
+// count (`approvals.list`, the same RPC `dashboard.rs`/`console.rs`/
+// `inbox.rs` already call).
+pub mod mascot_overlay;
 // WP-S5b1-C (2026-08-21) — "工具伺服器（MCP）" (`Mcp.dc.html`), an "整合"
 // drill-down leaf reached via `active_page == "mcp"`. See the module's own
 // doc comment for RPC shapes and canvas deviations.
@@ -216,6 +248,15 @@ pub mod plans;
 // — see the module's own doc comment for RPC shapes (`presets.list` +
 // per-agent `presets.status` fan-out) and canvas fidelity notes.
 pub mod presets;
+// WP-S6b3-P (S6b 第三波, 2026-08-22) — "可靠性" (`Reliability.dc.html`, B9
+// Tabs 切資源 + 單一大圖表). A "進階設定" drill-down leaf reached via
+// `active_page == "reliability"` — wired from `manage_advanced.rs`'s 可靠性
+// 列 by this same pass. See the module's own doc comment for why `audit.
+// unified_log`'s real `channel_failure` source is used instead of the
+// per-agent `audit.reliability_summary`/`audit.evolution_query` family
+// `web/src/pages/ReliabilityPage.tsx` calls, and the "one real tab, three
+// honest stubs" scope cut.
+pub mod reliability;
 // WP-S5b3-G (S5b 第三波, 2026-08-21) — "分析報表" (`Reports.dc.html`, B9,
 // 總覽→深潛). Single-file page — see the module's own doc comment for the
 // `analytics.summary`/`analytics.conversations`/`analytics.cost_savings`/
@@ -243,6 +284,14 @@ mod goals_inspector;
 pub mod inbox;
 mod inbox_data;
 mod inbox_rows;
+// WP-S6b3-P (S6b 第三波, 2026-08-22) — "模型用量" (`Inference.dc.html`, B9
+// Tabs 切模型供應商 + KPI 磚 + 單一大圖表). A "進階設定" drill-down leaf
+// reached via `active_page == "inference"` — wired from `manage_advanced.
+// rs`'s 模型用量 row by this same pass. See the module's own doc comment for
+// the `cost.summary`/`cost.recent`/`inference.get` RPC shapes and why the 4
+// provider tabs are derived from `cost.recent`'s real `model` field rather
+// than 4 separate RPC calls.
+pub mod inference;
 // WP-S5b2-E (2026-08-21) — "靈感畫廊" (`Gallery.dc.html`, `nav.rs` id
 // `gallery`). Module named `inspiration_gallery`, NOT `gallery` — that name
 // is already taken by `screens::gallery` above (the S3 component-library
@@ -254,13 +303,58 @@ pub mod inspiration_gallery;
 // doc comment for the four RPC shapes and the C-package drill-down
 // navigation contract.
 pub mod integrations;
+// WP-S6b3-Q (S6b 第三波, 2026-08-22) — shared primitives for this pass's
+// three "知識中樞" pages (`knowledge_hub`/`knowledge_curation`/
+// `shared_wiki`, all below) — see the module's own doc comment for the
+// shared `WikiPageMeta` parser, `namespace_of` folder-grouping key, and the
+// 5-tab `KnowledgeView` switcher + how WP-S6b3-fix (2026-08-22) resolved the
+// side-nav highlight this task's brief asked for (a real `nav.rs` id plus a
+// drill-down mapping — see that module's own doc comment). Not `pub`: same
+// "private
+// `mod`, `pub(super) fn`/`pub(super) struct` items reachable via `crate::
+// screens::knowledge_common::…`" shape `catalog_common`/`settings_common`
+// already establish.
+mod knowledge_common;
+// WP-S6b3-Q (S6b 第三波, 2026-08-22) — "知識審核" (`KnowledgeCuration.dc.
+// html`, B25+頁型3). See the module's own doc comment for the `wiki.
+// auto_pages`/`wiki.read` RPC shapes and the assembled-not-wired 核准歸檔/
+// 退回 buttons.
+pub mod knowledge_curation;
+// WP-S6b3-Q (S6b 第三波, 2026-08-22) — "知識中樞" (`KnowledgeHub.dc.html`,
+// B25). See the module's own doc comment for the `wiki.pages`/`wiki.read`/
+// `wiki.stats`/`wiki.lint` RPC shapes and the 5-tab scope cut (only 瀏覽/
+// 健康度 wired to real data; 搜尋 decorative, 圖譜 an explicit placeholder,
+// 審核 navigates to `knowledge_curation`).
+pub mod knowledge_hub;
 pub mod language_picker;
+// WP-S6b3-R (S6b 第三波, 2026-08-22) — "Launcher" (`Launcher.dc.html`, B22
+// APPS 網格). No `nav.rs` entry — self-attached in `screens/shell.rs` only
+// as a full-bleed root swap (same shape `migrate.rs` establishes),
+// `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=launcher`. See the module's own doc
+// comment for the two OTHER "launcher" surfaces in this codebase this page
+// is neither of (web's `/launcher` route, `duduclaw-shell`'s Super-K
+// overlay), the static APPS-registry mirror (no backend RPC exists), and
+// the real client-side search filter + real in-shell navigation wiring.
+pub mod launcher;
 // WP-S6b1-J (2026-08-21) — "授權" (`LicensePage.dc.html`, B16+B18), a
 // "進階設定" drill-down leaf; also hosts the LicenseShell tab strip shared
 // with `screens::partner_portal`. See the module's own doc comment for the
 // `license.status` RPC shape, the verified tier-string wire values, and the
 // canvas deviations.
 pub mod license;
+// WP-S6b3-P (S6b 第三波, 2026-08-22) — "本地模型市集" (`LocalModels.dc.html`,
+// B2 已安裝/可下載雙態型錄卡). A "進階設定" drill-down leaf reached via
+// `active_page == "localModels"` — wired from `manage_advanced.rs`'s 本地
+// 模型市集 row by this same pass. See the module's own doc comment for the
+// `localmodels.installed`/`.search` RPC shapes and the derived (never
+// fabricated) market-card description.
+pub mod local_models;
+// WP-S6b3-P (S6b 第三波, 2026-08-22) — "日誌" (`Logs.dc.html`, B4 flat
+// table + filter row). A "進階設定" drill-down leaf reached via
+// `active_page == "logs"` — wired from `manage_advanced.rs`'s 日誌 row by
+// this same pass. See the module's own doc comment for the `audit.
+// unified_log` RPC shape and the real `Entity<TextField>` search box.
+pub mod logs;
 pub mod login;
 pub mod prototypes;
 // WP-S5b2-D (2026-08-21) — 例行工作 (`Routines.dc.html`). `routines_rows`
@@ -279,11 +373,32 @@ pub mod routines;
 // own doc comment for the `runs.list`/`runs.get` RPC shapes.
 pub mod runs;
 mod runs_data;
+// WP-S6b3-P (S6b 第三波, 2026-08-22) — "安全審計" (`Secaudit.dc.html`, B4
+// flat findings table + filter row). A "進階設定" drill-down leaf reached
+// via `active_page == "secaudit"` — wired from `manage_advanced.rs`'s 安全
+// 審計列 by this same pass. See the module's own doc comment for the
+// `secaudit.reports`/`secaudit.report` RPC shapes and why this page shows
+// only the single newest report's findings rather than a cross-scan
+// aggregation.
+pub mod secaudit;
 // WP-S6b1-K (S6b 第一波, 2026-08-21) — "安全" (`SecurityPage.dc.html`, B5+
 // B18 合併版). Single-file page — see the module's own doc comment for the
 // `security.status` RPC shape and canvas fidelity deviations (緊急控制 has
 // no backing RPC field at all; RBAC "最後變更" column has none either).
 pub mod security;
+// WP-S6b3-Q (S6b 第三波, 2026-08-22) — "共享知識庫" (`SharedWiki.dc.html`,
+// B25). See the module's own doc comment for the `shared_wiki.pages`/
+// `shared_wiki.read`/`wiki_scope.get` RPC shapes and the real (not
+// mockup-copied) folder-grouping + policy-mode subtitle.
+pub mod shared_wiki;
+// WP-S6b3-P (S6b 第三波, 2026-08-22) — "系統設定" (`Settings.dc.html`, B5
+// Tabs 索引 5 個 + boxed-list, only 通用 has real content). A "進階設定"
+// drill-down leaf reached via `active_page == "settings"` — wired from
+// `manage_advanced.rs`'s 系統設定列 by this same pass. See the module's own
+// doc comment for the `system.config`/`system.version` RPC shapes and the
+// three dropped rows (時區/啟動時檢查健康狀態/需要人工決策時通知 — no
+// backing field in either RPC).
+pub mod settings;
 pub mod shell;
 // WP-S5b2-E (2026-08-21) — "技能庫" (`Skills.dc.html`, "市場" tab only —
 // the other three tabs render as an honest stub per this WP's brief).
@@ -321,6 +436,12 @@ pub mod skill_new;
 pub mod spike_t7;
 mod spike_t7_panzoom;
 mod spike_t7_timeline;
+// WP-S6b3-Q (S6b 第三波, 2026-08-22) — "系統" (`SystemHome.dc.html`, 頁型2
+// 分區索引卡). See the module's own doc comment for the six-card → real-page
+// mapping and why the side-nav highlight is DELIBERATELY zero (QA #3
+// ruling, not a gap — quoted verbatim from the canvas's own leading HTML
+// comment).
+pub mod system_home;
 pub mod system_updates;
 // WP-S5b3-H (S5b 第三波, 2026-08-21) — "工作時間軸" (`Timeline.dc.html`,
 // B10). `timeline_data` (types + lane-packing/kind-color layout) is a

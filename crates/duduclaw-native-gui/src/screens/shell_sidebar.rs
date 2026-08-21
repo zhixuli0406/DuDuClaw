@@ -69,7 +69,14 @@ fn status_dot(status: WsConnState) -> Div {
 /// FOOTER_ITEMS`) → edition badge, in that order top to bottom.
 pub(super) fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
     let locale = state.locale;
-    let active_id = state.active_page;
+    // WP-S6b3-fix (2026-08-22): `nav::sidebar_active_id` maps a drill-down
+    // leaf with no `nav.rs` id of its own (`knowledgeCuration`/`sharedWiki`)
+    // onto its real parent row (`knowledgeHub`) so Column 1's area
+    // highlight — and, via the same mapped id threaded into `nav_row`
+    // below, the footer rows' own highlight — keeps working across the
+    // drill-down instead of going dark. A no-op for every other page (see
+    // that function's own doc comment).
+    let active_id = nav::sidebar_active_id(state.active_page);
 
     let mut area_rows = Vec::with_capacity(nav::AREAS.len());
     for (index, a) in nav::AREAS.iter().enumerate() {
