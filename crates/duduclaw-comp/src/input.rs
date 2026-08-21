@@ -8,10 +8,10 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     },
     input::{
-        keyboard::FilterResult,
+        keyboard::{keysyms, FilterResult, Keysym},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -21,23 +21,57 @@ use smithay::{
 use crate::state::DuduclawComp;
 
 impl DuduclawComp {
+    /// Every arm below runs exclusively on the real human ("winit") seat —
+    /// the agent seat's own events are applied through a completely
+    /// separate path (`codrive::handle_agent_inject`) that never calls
+    /// into this function. That separation is what makes `on_human_input`
+    /// safe to call unconditionally at the top of every arm here: nothing
+    /// coming through `process_input_event` can ever be agent-originated
+    /// input freezing itself.
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
+                self.on_human_input("keyboard");
+
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = Event::time_msec(&event);
+                let key_state = event.state();
 
                 self.seat.get_keyboard().unwrap().input::<(), _>(
                     self,
                     event.key_code(),
-                    event.state(),
+                    key_state,
                     serial,
                     time,
-                    |_, _, _| FilterResult::Forward,
+                    |data, modifiers, handle| {
+                        // Super+Esc global emergency stop (DESIGN
+                        // §3.3.3/§6.3): the human keyboard's filter
+                        // closure is the only code path that can ever
+                        // observe this combo — there is no route from an
+                        // injected agent key event into this closure, so
+                        // the agent structurally cannot trigger or
+                        // intercept it. NOT hardware-verified by this
+                        // round's container live-run (headless weston has
+                        // no keyboard device at all — see
+                        // `codrive/debug_sim.rs` module doc); the debug
+                        // stdin path exercises the resulting state machine
+                        // instead.
+                        if key_state == KeyState::Pressed
+                            && modifiers.logo
+                            && handle.modified_sym() == Keysym::new(keysyms::KEY_Escape)
+                        {
+                            data.emergency_stop("super+esc");
+                        }
+                        FilterResult::Forward
+                    },
                 );
             }
-            InputEvent::PointerMotion { .. } => {}
+            InputEvent::PointerMotion { .. } => {
+                self.on_human_input("pointer_motion");
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
+                self.on_human_input("pointer_motion_absolute");
+
                 let output = self.space.outputs().next().unwrap();
                 let output_geo = self.space.output_geometry(output).unwrap();
 
@@ -59,6 +93,8 @@ impl DuduclawComp {
                 pointer.frame(self);
             }
             InputEvent::PointerButton { event, .. } => {
+                self.on_human_input("pointer_button");
+
                 let pointer = self.seat.get_pointer().unwrap();
                 let keyboard = self.seat.get_keyboard().unwrap();
 
@@ -102,6 +138,8 @@ impl DuduclawComp {
                 pointer.frame(self);
             }
             InputEvent::PointerAxis { event, .. } => {
+                self.on_human_input("pointer_axis");
+
                 let source = event.source();
 
                 let horizontal_amount = event

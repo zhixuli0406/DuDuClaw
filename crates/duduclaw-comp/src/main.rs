@@ -26,6 +26,7 @@
 
 mod handlers;
 
+mod codrive;
 mod grabs;
 mod input;
 mod state;
@@ -65,6 +66,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     crate::winit_backend::init_winit(&mut event_loop, &mut data)?;
 
+    // CD-0 codrive spike verification aid — see codrive/debug_sim.rs module
+    // doc. No-op (reads nothing, registers nothing) unless
+    // DUDUCLAW_CODRIVE_DEBUG_STDIN=1 is set; never set that in a real
+    // deployment.
+    codrive::maybe_init_stdin_simulator(&mut event_loop);
+
     // Spawn an optional test client so a run of this binary is
     // self-verifying: `-c/--command <client>` picks the wl client to launch
     // against the freshly created socket (e.g. `foot`, `weston-terminal`,
@@ -76,11 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flag = args.next();
     let arg = args.next();
 
-    match (flag.as_deref(), arg) {
-        (Some("-c") | Some("--command"), Some(command)) => {
-            std::process::Command::new(command).spawn().ok();
-        }
-        _ => {}
+    if let (Some("-c") | Some("--command"), Some(command)) = (flag.as_deref(), arg) {
+        std::process::Command::new(command).spawn().ok();
     }
 
     tracing::info!(

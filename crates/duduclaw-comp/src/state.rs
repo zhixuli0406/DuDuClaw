@@ -25,7 +25,7 @@ use smithay::{
     },
 };
 
-use crate::CalloopData;
+use crate::{codrive, CalloopData};
 
 /// Top-level compositor state. One instance per compositor process — this
 /// is the `D` type parameter smithay's `delegate_*!` macros generate
@@ -52,7 +52,25 @@ pub struct DuduclawComp {
     pub data_device_state: DataDeviceState,
     pub popups: PopupManager,
 
+    /// The real human seat — every hardware/winit-forwarded input event
+    /// goes here (see `input.rs`).
     pub seat: Seat<Self>,
+
+    /// CD-0 codrive spike (DESIGN-codrive-desktop-2026-08.md §3.3.1): the
+    /// agent-only `wl_seat`. Injected commands from `codrive::listener` are
+    /// applied through this seat's keyboard/pointer handles, never through
+    /// `seat` above — that separation is what makes per-seat event
+    /// attribution (audit, freeze) trivial instead of needing a tag on
+    /// every event.
+    pub agent_seat: Seat<Self>,
+    /// Cross-thread freeze/terminated/audit state shared with the
+    /// injection-socket thread. See `codrive/mod.rs` module doc.
+    pub codrive: std::sync::Arc<codrive::CodriveShared>,
+    /// Set the instant the agent seat most recently transitioned
+    /// not-frozen → frozen; used to log freeze-to-next-command latency in
+    /// `codrive::handle_agent_inject`. `None` until the first human input
+    /// of this process's lifetime.
+    pub codrive_freeze_set_at: Option<std::time::Instant>,
 }
 
 impl DuduclawComp {
@@ -77,6 +95,12 @@ impl DuduclawComp {
         seat.add_keyboard(Default::default(), 200, 25).unwrap();
         seat.add_pointer();
 
+        // CD-0 codrive spike: agent seat + injection socket + audit log.
+        // Must happen while we still hold `&mut seat_state` locally (before
+        // it moves into `Self` below) and while `event_loop` is available
+        // to register the injection channel's calloop source.
+        let (agent_seat, codrive) = codrive::init(&mut seat_state, &dh, event_loop);
+
         let space = Space::default();
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
@@ -98,6 +122,10 @@ impl DuduclawComp {
             data_device_state,
             popups,
             seat,
+
+            agent_seat,
+            codrive,
+            codrive_freeze_set_at: None,
         }
     }
 

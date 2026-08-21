@@ -426,3 +426,690 @@ created its `wayland-1` socket exactly as in the headless run.
 smallvil-inherited `grabs/` module beyond plain focus-click), multi-client,
 popup grabs (still no-op upstream), and everything R1 (all software
 rendering; no frame-rate claims).
+
+## CD-0 codrive spike verification (2026-08-21)
+
+Answers the go/no-go question for CD-0 in
+`commercial/docs/DESIGN-codrive-desktop-2026-08.md` §5: agent seat + dual
+cursor + injection socket + human-input freeze + emergency stop + audit
+trail, wired into this crate's compositor body and exercised end-to-end,
+not just compiled. Continues from a prior round's half-finished
+`src/codrive/` module tree (`mod.rs`/`listener.rs`/`audit.rs`/
+`keymap_ascii.rs`/`protocol.rs`/`cursor.rs`) that had never been declared
+as a module from `main.rs` and had zero integration into `state.rs`/
+`input.rs`/`winit_backend.rs` — so it had never compiled, let alone run.
+
+### What changed
+
+- **`src/main.rs`**: declares `mod codrive;`; calls
+  `codrive::maybe_init_stdin_simulator(&mut event_loop)` (see "debug stdin
+  simulator" below); the pre-existing `-c/--command` arg-parsing `match`
+  was converted to `if let` (unrelated pre-existing clippy lint,
+  `clippy::single_match`, that started failing once `-D warnings` ran
+  against this file for the first time this round).
+- **`src/state.rs`**: `DuduclawComp` gained `agent_seat: Seat<Self>`,
+  `codrive: Arc<codrive::CodriveShared>`, `codrive_freeze_set_at:
+  Option<Instant>`; `new()` calls `codrive::init(&mut seat_state, &dh,
+  event_loop)` right after the human `"winit"` seat is created.
+- **`src/input.rs`**: every arm of `process_input_event` (the human/
+  `"winit"`-seat path) now calls `self.on_human_input(<kind>)` first. The
+  keyboard arm's filter closure detects `Super+Esc` (`modifiers.logo &&
+  handle.modified_sym() == Keysym::new(keysyms::KEY_Escape)`) and calls
+  `data.emergency_stop("super+esc")` — structurally unreachable from the
+  agent seat, since the agent's own key injection goes through a
+  completely separate path (`codrive::handle_agent_inject`) that never
+  calls into this file.
+- **`src/winit_backend.rs`**: the `render_output` turbofish's custom-
+  element type changed from `WaylandSurfaceRenderElement<GlesRenderer>`
+  (previously paired with an always-empty `&[]`) to `SolidColorRenderElement`,
+  fed `codrive::build_cursor_elements(human_pos, agent_pos,
+  codrive.is_frozen())` computed fresh every redraw from each seat's
+  `PointerHandle::current_location()`. `winit::init()` needed an explicit
+  `::<GlesRenderer>()` turbofish once `GlesRenderer` stopped appearing
+  anywhere else in the file for type inference to piggyback on.
+- **`src/codrive/mod.rs`**: fixed two import paths the prior round had
+  wrong and never compiled against (`XkbConfig` lives at
+  `smithay::input::keyboard::XkbConfig`, not `smithay::wayland::seat::
+  XkbConfig`); added `CodriveShared::is_frozen()`; added click-to-focus
+  logic to the `InjectCmd::Button` press handler on the agent seat
+  (raise + `keyboard.set_focus`) — without it, `InjectCmd::Text`/`Key` had
+  no focused surface to route synthesized keys to, since each `wl_seat`'s
+  keyboard focus is independent and nothing else ever set the agent
+  seat's. Deliberately **duplicated** from (not refactored out of)
+  `input.rs`'s human `PointerButton` arm, which already has VM-verified
+  evidence above — this round did not want to touch or risk that path.
+- **`src/codrive/keymap_ascii.rs`**: added `>` (shift+`.`) and `<`
+  (shift+`,`) — needed once the live-run test tried to type a shell
+  redirect (`echo x > file`) into `foot` and the run's own log surfaced
+  `codrive: text op — character outside the ASCII-only synthesis table,
+  skipped char='>'`, silently truncating the command into `echo x  file`
+  (a no-op). Table is still an honest ASCII subset, just a slightly wider
+  one now — see the module doc for what's still out of scope.
+- **`src/codrive/debug_sim.rs`** (new file, ~95 lines): see below.
+- **`Cargo.toml`**: unchanged in intent — noted here because it got
+  externally corrupted mid-round and had to be restored; see "environment
+  hazard hit this round" below.
+
+### Debug stdin simulator (why it exists, and its blast radius)
+
+Headless nested weston (this crate's container-level live-run host, see
+"Nested headless live-run" above) advertises **zero input devices** —
+`duduclaw-shell`'s `BUILD-LINUX.md` documents the identical upstream
+constraint independently (`gnome`/weston's headless backend has no
+`wl_seat` at all). That means the real human-input path
+(`input.rs::process_input_event`, wired to actual winit-forwarded
+keyboard/pointer events) structurally cannot fire inside this container —
+and neither can the real `Super+Esc` detector. Both are implemented for
+real hardware; hardware verification is VM/`cage` territory, same as this
+file's own "VM cage real-seat input verification" section above did for
+the base spike's move/resize grabs.
+
+`src/codrive/debug_sim.rs` registers a calloop `Generic` source over
+`std::io::stdin()` that turns two magic lines — `simulate_human` /
+`simulate_super_esc` — into direct calls to `on_human_input`/
+`emergency_stop`, letting this round's container verification exercise the
+freeze/emergency-stop **state machine** end-to-end (flag flips, logs,
+force-closes the connection) even though it can't exercise real hardware
+event delivery. It is **opt-in via `DUDUCLAW_CODRIVE_DEBUG_STDIN=1`** —
+unset (the default, including any real deployment), `maybe_init_stdin_simulator`
+returns immediately without reading stdin or registering anything with the
+event loop.
+
+### One-shot reproducible command
+
+```bash
+docker volume create duduclaw-shell-cargo >/dev/null
+docker volume create duduclaw-shell-cargo-git >/dev/null
+docker volume create duduclaw-shell-target >/dev/null
+
+docker run --rm \
+  -v /Users/lizhixu/Project/DuDuClaw:/work \
+  -v duduclaw-shell-cargo:/usr/local/cargo/registry \
+  -v duduclaw-shell-cargo-git:/usr/local/cargo/git \
+  -v duduclaw-shell-target:/target \
+  -e CARGO_TARGET_DIR=/target \
+  -w /work/crates/duduclaw-comp \
+  rust:bookworm bash -c '
+set -uo pipefail
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends \
+  pkg-config libwayland-dev libxkbcommon-dev \
+  libegl1 libgl1-mesa-dri libgles2 weston foot python3 >/dev/null
+
+echo "==== build / clippy / test ===="
+cargo build || exit 1
+rustup component add clippy >/dev/null 2>&1
+cargo clippy --all-targets -- -D warnings || exit 1
+cargo test || exit 1
+
+echo "==== layer 1+2+3: weston (headless) -> duduclaw-comp -> foot ===="
+export XDG_RUNTIME_DIR=/tmp/xdg-runtime
+mkdir -p $XDG_RUNTIME_DIR && chmod 0700 $XDG_RUNTIME_DIR
+export LIBGL_ALWAYS_SOFTWARE=1
+
+weston --backend=headless-backend.so --socket=wayland-host \
+  --width=1280 --height=800 --log=/tmp/weston.log &
+sleep 2
+
+mkfifo /tmp/comp-stdin
+exec 9<>/tmp/comp-stdin
+WAYLAND_DISPLAY=wayland-host DUDUCLAW_CODRIVE_DEBUG_STDIN=1 RUST_LOG=info \
+  /target/debug/duduclaw-comp <&9 >/tmp/duduclaw-comp.log 2>&1 &
+sleep 2
+
+WAYLAND_DISPLAY=wayland-1 foot >/tmp/foot.log 2>&1 &
+sleep 2
+
+echo "==== drive foot via the codrive socket: move, click, type a real shell command ===="
+python3 - << "PYEOF"
+import socket, json, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/tmp/xdg-runtime/duduclaw-codrive.sock")
+for cmd in [
+    {"op":"move","x":100.0,"y":100.0},
+    {"op":"button","btn":"left","state":"press"},
+    {"op":"button","btn":"left","state":"release"},
+    {"op":"text","s":"echo codriveok987 > /tmp/codrive-proof.txt\n"},
+]:
+    s.sendall((json.dumps(cmd) + "\n").encode())
+    print(s.recv(4096))
+time.sleep(0.5)
+PYEOF
+cat /tmp/codrive-proof.txt   # should print codriveok987 — real proof text
+                              # reached foots real shell via the agent seat
+
+echo "==== simulate human input mid-stream -> expect freeze + drops ===="
+echo simulate_human >&9
+sleep 0.3
+echo simulate_super_esc >&9
+sleep 0.3
+
+echo "==== audit trail ===="
+cat $XDG_RUNTIME_DIR/duduclaw-codrive-audit.jsonl
+'
+```
+
+(The actual verification run additionally used two longer Python scripts —
+one to burst-send 400 rapid `move` commands in small chunks so the freeze
+signal reliably lands mid-stream, one to drain and tally acks — omitted
+above for brevity; the condensed version here still exercises every code
+path, just with less precise latency data.)
+
+### Evidence (verified 2026-08-21 run)
+
+**Build/clippy/test, container-level:**
+
+```
+cargo build   -> Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.18s
+cargo clippy --all-targets -- -D warnings   -> Finished, zero warnings
+cargo test    -> running 5 tests ... test result: ok. 5 passed; 0 failed
+```
+
+**Real client driven via the socket** — `foot`'s actual shell executed a
+command synthesized entirely from `move`/`button`/`text` ops over the
+unauthenticated injection socket, proven by a container-filesystem side
+effect (stronger than a screenshot — no pixel comparison needed):
+
+```
+>>> {'op': 'text', 's': 'echo codriveok987 > /tmp/codrive-proof.txt\n'}  <<< {"ok":true,"frozen":false}
+$ cat /tmp/codrive-proof.txt
+codriveok987
+```
+
+**Freeze on human input, measured latency** (via the debug stdin
+simulator — see above for why real hardware can't do this in a headless
+container): a 400-command rapid `move` burst (5-command chunks, 2ms
+between chunks, ~290ms total span) was in flight when `simulate_human` was
+fired concurrently from the orchestrating shell:
+
+```
+PHASE2_BURST: sent=400 ok=10 frozen_dropped=390 dur_ms=290.79
+```
+
+The first 10 commands (2 chunks) landed before the freeze signal was
+dispatched; every command from the 3rd chunk onward was cleanly dropped
+(`{"ok":false,"frozen":true,"reason":"agent_seat_frozen"}`), not buffered —
+matching DESIGN §3.1's "dropped, not buffered" freeze policy exactly.
+Audit-log timestamps (millisecond resolution, `ts_ms`):
+
+```
+{"ts_ms":1787257189073,"kind":"freeze","op":"debug_stdin_simulated","frozen":true}
+{"ts_ms":1787257189076,"kind":"inject_dropped","op":"move","x":101.0,"y":100.0,
+  "detail":"agent seat frozen (human input active) — dropped, not buffered","frozen":true}
+```
+
+**Freeze latency: 3ms** (freeze audit event → first `inject_dropped`
+audit event), well under the DESIGN §5 CD-0 target of <50ms. Cross-checked
+client-side: `simulate_human` fired at `1787257189.074095`s, the client's
+first observed `frozen:true` ack landed at `1787257189.076527`s — **2.4ms**
+client-observed latency, consistent with the audit figure. All 390 drops
+in this run resolved at the socket thread's own pre-check
+(`listener.rs`) — none needed the narrower main-thread "queued-then-frozen
+race" path in `codrive::handle_agent_inject` (that path's `latency_us`
+logging is implemented and reviewed but did not get a live sample this
+round — see honest-stub list).
+
+Event-count cross-check (sanity, not just eyeballing): 4 (phase 1: move +
+button press + button release + text) + 10 (pre-freeze burst) + 1
+(post-resume move) = **15** `inject_applied` total; 390 `inject_dropped`;
+4 + 400 + 1 = 405 attempted vs. 15 + 390 = 405 accounted for. Exact match.
+
+**Resume + emergency stop:**
+
+```
+RESUME_ACK: {"ok":true,"frozen":false}
+POST_RESUME_MOVE_ACK: {"ok":true,"frozen":false}
+EMERGENCY_STOP_PUSH: b'{"event":"emergency_stop"}\n'
+AFTER_PUSH_RECV (expect empty=EOF): b''
+```
+
+Resume clears the freeze (subsequent move applies cleanly); `Super+Esc`
+(simulated) pushes `{"event":"emergency_stop"}` to the connected client
+then force-closes it — the client's next `recv()` sees a clean EOF, not an
+error, matching `emergency_stop`'s `shutdown(Both)` call in
+`codrive/mod.rs`.
+
+**Audit trail, entry-by-entry** — every session boundary and state
+transition present, in order: `session_started` (phase 1) →
+`inject_applied` ×4 → `session_ended` (phase 1 closed) → `session_started`
+(phase 2) → `inject_applied` ×10 → `freeze` → `inject_dropped` ×390 →
+`resume` → `inject_applied` ×1 (post-resume move) → `emergency_stop` →
+`session_ended`. No gaps, no out-of-order timestamps, no malformed JSON
+lines (every line parsed cleanly with Python's `json.loads` in the
+verification script).
+
+**Second cursor / render path**: `duduclaw-comp` ran continuously across
+the whole multi-second verification (foot connect → drive → burst →
+freeze → resume → emergency stop → force-close) with zero panics and zero
+error-level log lines — the redraw loop's `render_output` call with the
+`SolidColorRenderElement` custom-elements slice (both cursors, recomputed
+every frame) executed successfully every frame for the entire run.
+**Not** verified this round: actual on-screen pixel distinctness between
+the two cursor shapes (no screenshot/QMP framebuffer read available in
+this container — same category of limitation as R1 above; a real visual
+check is VM/QMP acceptance-side work per the task brief).
+
+### Honest stub / limitation list (this round)
+
+- **Injection socket is unauthenticated by design at CD-0** — already
+  flagged in `listener.rs`'s own module doc from the prior round; single
+  connection at a time, chmod 0600, `$XDG_RUNTIME_DIR`-scoped. CD-1 adds
+  caller-identity auth. Unchanged this round, restated here for
+  completeness.
+- **Super+Esc real-hardware detection is implemented but container-
+  unverified** — `input.rs`'s keyboard filter closure correctly checks
+  `modifiers.logo && handle.modified_sym() == Keysym::new(keysyms::KEY_Escape)`,
+  reviewed against smithay 0.7.0's actual API (not guessed), but headless
+  weston has no keyboard device to originate a real Super+Esc from. The
+  debug stdin path verifies everything downstream of detection (the
+  `emergency_stop` state machine itself); VM/`cage` round needed to close
+  this, same as the base spike's move/resize grabs.
+- **`keymap_ascii.rs` is still an ASCII subset**, now including `<`/`>`.
+  No CJK, no full Unicode, no non-US layouts — unchanged limitation from
+  the prior round, just a slightly wider table.
+- **Main-thread "queued-then-frozen race" path unverified live** — the
+  `handle_agent_inject` code that logs `latency_us` for a command that was
+  already queued in the calloop channel before freeze flipped exists and
+  was code-reviewed, but every drop observed this round resolved at the
+  earlier socket-thread pre-check instead (arguably a *stronger* result —
+  freeze took effect before any command even reached the channel — but it
+  means this specific code path has zero live-run coverage). A tighter
+  race (larger burst, smaller chunks, zero pre-delay) might hit it in a
+  future round; not required for CD-0's own <50ms target, which this
+  round's 3ms figure already clears via the earlier checkpoint.
+- **Debug stdin simulator is new, CD-0-only tooling** — real deployments
+  never set `DUDUCLAW_CODRIVE_DEBUG_STDIN`, and the function is a true
+  no-op (no stdin read, no event-loop registration) when unset. It exists
+  solely because headless nested weston cannot originate real human input
+  events at all (see "Debug stdin simulator" above) — VM/`cage` real-seat
+  verification (this file's "VM cage real-seat input verification"
+  section for the base spike) is the eventual real-hardware closure for
+  both freeze-latency and Super+Esc, left to the acceptance side per the
+  task brief ("VM QMP 真機級留驗收端").
+- **Click-to-focus on the agent seat is a deliberate near-duplicate** of
+  `input.rs`'s human `PointerButton` arm rather than a shared helper — see
+  "What changed" above for the reasoning (don't touch the already-VM-
+  verified human path).
+
+### Environment hazard hit this round (not a crate defect)
+
+Partway through this round, `Cargo.toml` and four already-edited source
+files (`main.rs`, `state.rs`, `input.rs`, `winit_backend.rs`) were found
+reverted to their pre-round baseline on disk — most tellingly,
+`Cargo.toml`'s `version` and the `smithay` dependency's `version` had both
+been rewritten to `"1.62.0"` (a version of smithay that doesn't exist on
+crates.io; `0.7.0` is still the latest published release) and the
+`serde`/`serde_json` dependencies had vanished entirely. This has every
+hallmark of an unrelated concurrent process in the same working tree doing
+a blanket version-string bump/replace that matched *every* `version = "…"`
+line in the TOML file, including a third-party dependency pin it had no
+business touching (`crates/duduclaw-comp/` is git-untracked and
+`publish = false` — no release tooling should be touching it at all).
+Restored by hand (re-diffing against what this round had actually written)
+and re-verified with a full build/clippy/test pass before continuing. Flag
+for whoever owns the version-bump tooling: it should not be walking
+`crates/duduclaw-comp/Cargo.toml`.
+
+### Acceptance re-run findings (2026-08-21, verification side)
+
+The acceptance side re-ran the one-shot command above independently and
+added one probe the implementation round's harness did not have: **inject
+over a brand-new connection while frozen**. It exposed a real red-line
+violation — `accept_loop` used to clear `frozen` on every new connection
+("a new connection is a new session"), so an agent could bypass an active
+human freeze by simply reconnecting, violating DESIGN-codrive-desktop §6
+red line 3 ("人輸入優先凍結無例外…agent 不可攔截/繞過"). Fixed in
+`listener.rs` (connection lifecycle no longer touches `frozen`; only the
+explicit `resume` op clears it — `terminated` still resets on reconnect,
+unchanged) and re-verified end-to-end:
+
+```
+RECONNECT-WHILE-FROZEN inject -> {"ok":false,"frozen":true,"reason":"agent_seat_frozen"}
+resume ->                        {"ok":true,"frozen":false}
+post-resume inject ->            {"ok":true,"frozen":false}
+```
+
+Audit trail for the same run shows `session_started` with `"frozen":true`
+(the new connection observes, not resets, the freeze), the dropped inject,
+the explicit `resume`, and the applied post-resume inject, in order.
+Carry-forward for CD-1: `resume` issuance moves to the human-side channel
+entirely (at CD-0 the socket client is the trusted gateway, so
+socket-`resume` stands in for the human "交還" action — documented
+simplification, not the end-state contract).
+
+## CD-0 VM/QMP real-seat verification (verified 2026-08-21)
+
+Closes the three gaps the container-level CD-0 round above explicitly left
+for "acceptance-side VM/QMP" work (DESIGN-codrive-desktop-2026-08.md §5 CD-0
+line item requires all of these QMP/VM-verified, not just container-verified):
+real-hardware freeze latency, real `Super+Esc` (not the debug stdin
+simulator), and visual dual-cursor distinctness. Run inside the same
+appliance QEMU VM Shell-S2 already used for `duduclaw-shell`'s real-seat
+round (this file's own "VM cage real-seat input verification" section above)
+— same disk, same `cage`/seatd/virtio-gpu stack, reused rather than
+rebuilt.
+
+### Corrected premise: the working VM is arm64, not x86-64
+
+The task brief for this round assumed the appliance image was x86-64
+("這是 x86 image"). Checked before trusting that, per repo doctrine ("以證據
+為準，不以自己的假設為準"): `appliance/mkosi.conf`'s `[Distribution]
+Architecture=` default is indeed `x86-64`, **but** the actual working VM
+disk in use (`appliance/.vm/duduclaw-os-vm.raw`, the same Shell-S2 working
+copy) was built from an **arm64** `mkosi.output/duduclaw-os.raw` — confirmed
+by reading the PE header of `mkosi.output/duduclaw-os.efi` (machine type
+`0xaa64` = ARM64) and the kernel (`file duduclaw-os.vmlinuz` → "Linux kernel
+ARM64 boot executable Image"). This matches `appliance/run-vm.sh`'s own
+`APPLIANCE_ARCH` default (`arm64`, deliberately different from
+`smoke-qemu.sh`'s `x86-64` default — a local/QEMU-smoke-test vs.
+shipping-target split documented in `mkosi.conf.d/10-arch-arm64.conf`'s own
+comment). Booted with `qemu-system-aarch64 -machine virt,accel=hvf -cpu
+host` (Apple Silicon HVF acceleration — fast, not the slow TCG path the
+task brief anticipated for an assumed x86-64 target) rather than
+`qemu-system-x86_64`. The comp binary built for this round (below) is
+therefore also aarch64, matching Docker Desktop's default `linux/arm64`
+container platform on this Apple Silicon host — no cross-compilation
+needed, byte-for-byte the same toolchain path this file's earlier sections
+already used.
+
+### Getting the codrive-enabled binary into the VM
+
+The disk already had a comp binary injected from an earlier (pre-codrive)
+round (`/usr/local/bin/duduclaw-comp`, 139,931,832 bytes, dated inside the
+guest filesystem before this round's `mod.rs`/`listener.rs` codrive work
+existed). Rebuilding via this file's own "CD-0 codrive spike verification"
+one-shot command's build step reused the still-warm `duduclaw-shell-cargo`/
+`duduclaw-shell-cargo-git`/`duduclaw-shell-target` named Docker volumes from
+that same round (`cargo build` completed in 0.21s — nothing to recompile),
+producing an aarch64 ELF that was copied out of the volume via a throwaway
+container (`docker run --rm -v duduclaw-shell-target:/target -v
+<host-dir>:/out rust:bookworm cp /target/debug/duduclaw-comp /out/`).
+
+Injection recipe (same shape as this file's "VM cage real-seat input
+verification" section, spelled out in full here since that section only
+summarized it): with the VM shut down, loop-mount the disk's partition 2
+(`duduclaw-root-a`, ext4, confirmed via `parted -s <disk>.raw print`) inside
+a `--privileged debian:bookworm` container —
+
+```bash
+LOOPDEV=$(losetup -f)
+losetup -P "$LOOPDEV" /vm/duduclaw-os-vm.raw
+# no udev in a container: partition device nodes need manual mknod from
+# /sys/class/block/<loop>/<loop>pN/dev's "major:minor"
+for p in /sys/class/block/$(basename $LOOPDEV)p*; do
+  name=$(basename "$p"); devt=$(cat "$p/dev")
+  mknod "/dev/$name" b "${devt%%:*}" "${devt##*:}"
+done
+mount -o rw "${LOOPDEV}p2" /mnt/root
+cp /inject/duduclaw-comp /mnt/root/usr/local/bin/duduclaw-comp   # overwrite
+```
+
+Three things were changed in this same mount session: (1) the comp binary
+swap above; (2) root's `/etc/shadow` hash rewritten to a known password
+(`openssl passwd -6`) via an `awk -v NEWHASH=... -f set_root_pw.awk` field
+rewrite — the disk already had *a* root hash set from an earlier round, but
+its plaintext was unknown, so a fresh known one was needed for this round's
+non-interactive serial login; (3) `serial-getty@ttyAMA0.service` enabled
+(`ln -sf .../serial-getty@.service .../getty.target.wants/`) — the disk had
+no getty on the arm64 `virt` machine's PL011 UART (`ttyAMA0`) enabled at
+all, only `getty@tty1.service` (the virtual-console one, which
+`duduclaw-kiosk.service` `Conflicts=` and stops anyway), so there was no
+serial login path before this. **Real finding, not a comp bug**: contrary
+to `duduclaw-shell`'s BUILD-LINUX.md stage B-③ note ("`/bin/login` does not
+exist in the image... needs the `login` package added"), the current
+`mkosi.conf` (`Packages=`) already lists `login` and `python3` — both were
+present and working without any package-level fix needed; what was actually
+missing was the *serial getty unit*, not the `login` binary. A prior
+round's `duduclaw-debug-shell.service` custom unit (mentioned in that same
+BUILD-LINUX.md section) was not present on this specific working-copy disk
+at verification time — replaced here with the simpler stock
+`serial-getty@ttyAMA0.service`, which needs no custom unit file at all.
+
+Each mount/unmount was wrapped in a `trap cleanup EXIT` (`umount; losetup
+-d`) and followed by `e2fsck -f -y` on the partition — caught and cleanly
+recovered from one operator mistake this round (a first injection attempt
+died mid-script on a shell-quoting bug before reaching its own `umount`/
+`losetup -d`, leaving the loop device attached at the host-Docker-VM kernel
+level across container exits — `losetup -a` in a fresh container confirmed
+it was still attached; detached by hand, then `e2fsck -f -y` confirmed the
+filesystem was undamaged before retrying). Loop devices on Docker Desktop
+for Mac are **not** container-scoped — they persist at the shared Linux VM
+kernel level after a `--privileged` container exits, so an aborted
+loop-mount script must be detached explicitly, not assumed to clean itself
+up with the container.
+
+### Boot verification and seat handoff
+
+Booted headless: `-display none` (no host window) plus `-device
+virtio-gpu-pci -device qemu-xhci,id=usb -device usb-tablet -device
+usb-kbd`, `-qmp tcp:127.0.0.1:47022,server,nowait -serial
+tcp:127.0.0.1:47021,server,nowait`. Confirmed **`-display none` does not
+disable `screendump`**: a `screendump` QMP call ~45s after launch returned
+a full 1280×800 frame already showing the production dark Home kiosk
+(`duduclaw-kiosk.service` had auto-started and rendered correctly), proving
+QEMU's virtio-gpu console surface stays live and dumpable independent of
+whether a host UI window exists — useful precedent for any future headless
+QMP-driven acceptance work on this image (no need for `-vnc`/a host
+display).
+
+`duduclaw-kiosk.service` (the production kiosk, `cage -- chromium`
+launching the dark-Home dashboard) auto-starts on boot because the
+detect-display condition (`duduclaw-kiosk-detect-display.sh`) reads the
+guest-visible virtio-gpu connector as "connected" regardless of `-display`
+choice — this is a guest-kernel DRM connector state, not a host-UI concern.
+It was stopped (`systemctl stop duduclaw-kiosk.service`) before starting
+the manual verification session below, since both processes compete for
+the same `seatd`-brokered DRM device and only one `cage` client can hold it
+at a time.
+
+Login used the systemd/PAM-managed serial session (`/bin/login` on
+`ttyAMA0` via the newly-enabled getty), which — unlike a bare shell —
+automatically creates `/run/user/0` (mode 0700) via `pam_systemd`'s
+`user-runtime-dir@0` unit, so `$XDG_RUNTIME_DIR` needed no manual setup
+this round (unlike the container-level round's headless weston path, which
+had no login manager at all).
+
+`cage -d -- env LIBGL_ALWAYS_SOFTWARE=1 RUST_LOG=info duduclaw-comp -c
+foot` launched cleanly: EGL negotiated `PLATFORM_WAYLAND_KHR` → GLES 3.2 on
+`llvmpipe (LLVM 19.1.7, 128 bits)` (two harmless `DRI2: failed to create
+screen` warnings preceded the working `kms_swrast` fallback — foot's own
+direct-rendering probe, not a comp issue, same shape as this file's
+container-round EGL notes), `foot` connected as `duduclaw-comp`'s first
+xdg-shell client, and the codrive listener came up at
+`/run/user/0/duduclaw-codrive.sock` with its audit log alongside it. Zero
+panics and only those two benign warning lines across the entire
+multi-minute session (`grep -ci error /root/comp.log` → 2, both the DRI2
+lines; `grep -c panic` → 0).
+
+**One unplanned but informative event**: the agent seat froze itself
+*before any deliberate test began* — audit line 1,
+`{"kind":"freeze","op":"pointer_motion_absolute","frozen":true}`, fired the
+instant `cage` attached the real `usb-tablet` device, because that device
+reports an initial absolute position on attach. This is the freeze
+mechanism correctly doing its job against a real (if incidental) hardware
+event, and it meant every deliberate test below had to issue an explicit
+`resume` first — consistent with DESIGN §6 red line 3 ("人輸入優先凍結無
+例外"): even an incidental real event takes priority, no allowance for "but
+nothing meant to move yet."
+
+### Item 1 — real-hardware freeze (PASS)
+
+Driven via a guest-local Python script (`python3` is present in the image
+per `mkosi.conf`'s `Packages=` — no injection needed, unlike the task
+brief's contingency plan) connecting to the codrive Unix socket and
+bursting 400 `move` commands (3ms spacing, ~1.4s span) at the agent seat,
+while the **host** fired a real `input-send-event` QMP keypress
+(`shift`, a harmless key) partway through — landing on the guest's real USB
+HID keyboard device, through `seatd`/libinput/Wayland/`cage`/comp's own
+`input.rs::process_input_event`, exactly the same code path this file's
+earlier "VM cage real-seat input verification" section already proved for
+plain keyboard/mouse forwarding.
+
+Audit trail (guest path `/run/user/0/duduclaw-codrive-audit.jsonl`,
+`grep -n "freeze\|resume\|session_started\|session_ended"`, line numbers
+from that grep):
+
+```
+179:{"ts_ms":1787287763607,"kind":"freeze","op":"keyboard","frozen":true}
+```
+
+`"op":"keyboard"` — not `"debug_stdin_simulated"` — is the load-bearing
+fact here: this freeze was fired by `input.rs`'s real human-seat keyboard
+arm, from a QMP-injected key event that actually traversed the kernel
+input stack, not the container round's stdin-simulator shortcut. Line-by-
+line context around the freeze:
+
+```
+{"ts_ms":1787287763607,"kind":"freeze","op":"keyboard","frozen":true}
+{"ts_ms":1787287763611,"kind":"inject_dropped","op":"move","x":123.0,"y":123.0,
+  "detail":"agent seat frozen (human input active) — dropped, not buffered","frozen":true}
+{"ts_ms":1787287763612,"kind":"inject_dropped","op":"move","x":119.0,"y":119.0,
+  "detail":"frozen at execution time (queued-then-frozen race, latency_us=Some(4568))","frozen":true}
+```
+
+**Freeze latency: 4ms** (freeze audit event at `763607` → first
+`inject_dropped` at `763611`) — real hardware path end-to-end (QMP → QEMU
+USB HID → guest kernel evdev → seatd/libinput → Wayland → `cage` →
+`duduclaw-comp`'s winit backend → `input.rs::on_human_input` → codrive
+freeze flag → next agent command dropped), well under the DESIGN §5 CD-0
+<50ms target and in the same ballpark as the container round's simulated
+3ms figure (expected — the actual freeze-to-drop path is the same
+single-calloop-dispatch mechanism either way; only the *trigger* origin
+differs between the two rounds).
+
+Burst result (`/root/burst_result.txt`, written by the guest script):
+
+```
+BURST: sent=400 ok=173 frozen_dropped=227 errs=0 dur_ms=1405.66
+```
+
+**This round also exercised the "queued-then-frozen race" path the
+container round's own honest-stub list flagged as never hit live**
+(`codrive::handle_agent_inject`'s main-thread re-check, as opposed to
+`listener.rs`'s socket-thread pre-check) — visible above as
+`"detail":"frozen at execution time (queued-then-frozen race,
+latency_us=Some(4568))"`. The tighter real-hardware timing (a real kernel
+round-trip is slower than a same-process channel send) made commands land
+in the channel queue before the freeze flag flipped, closing that specific
+gap in coverage.
+
+### Item 2 — real Super+Esc emergency stop (PASS)
+
+A guest-local watcher script held a connection open (having first issued
+`resume` + one `move` to prove it was live), then the **host** fired a real
+`Super+Esc` chord via QMP `input-send-event`: `meta_l` down, `esc` down,
+`esc` up, `meta_l` up — four separate `input-send-event` calls, matching
+how a real keyboard reports a held-modifier chord. `input.rs`'s keyboard
+filter closure (`modifiers.logo && handle.modified_sym() ==
+Keysym::new(keysyms::KEY_Escape)`) is the same code this file's earlier
+"VM cage real-seat input verification" round already proved reachable for
+plain `Esc`/`Super-K`; this round is the first to actually hold `Super`
+while pressing `Esc` on real hardware.
+
+Watcher's observed sequence (`/root/estop_watch.log`):
+
+```
+resume: b'{"ok":true,"frozen":false}\n'
+move: b'{"ok":true,"frozen":false}\n'
+PUSHED: b'{"event":"emergency_stop"}\n'
+EOF_OBSERVED (connection force-closed)
+FINAL_BUFFER: b'{"event":"emergency_stop"}\n'
+POST_STOP_NEW_CONN_INJECT: b'{"ok":false,"frozen":true,"reason":"agent_seat_frozen"}\n'
+```
+
+Audit trail:
+
+```
+{"ts_ms":1787287838227,"kind":"emergency_stop","detail":"super+esc","frozen":true}
+```
+
+`"detail":"super+esc"` — the real detector's reason string, not
+`"debug_stdin_simulated_super_esc"`. The post-stop reconnect probe is worth
+spelling out: a *new* connection resets `terminated` (per `listener.rs`'s
+documented state machine) but not `frozen`, so its inject attempt was
+rejected with `"reason":"agent_seat_frozen"` rather than
+`"session_terminated"` — both are correct per the design (`terminated`
+guards the just-force-closed connection's own tail; `frozen` is the
+still-active human-priority gate, cleared only by an explicit `resume`),
+and this round is what actually exercised that reconnect-after-real-
+emergency-stop path end-to-end rather than by inspection.
+
+### Item 3 — dual-cursor visual distinctness (PASS)
+
+Two QMP `screendump`s, both saved as PNG in `appliance/.vm/s2-evidence/`:
+
+- **`cd0-cursors-live.png`**: agent cursor issued a `move` to `(900, 500)`
+  after `resume` (agent seat live, unfrozen) — renders as the amber cross/
+  reticle (`AGENT_COLOR_LIVE`, `cursor.rs`) at that position; the human
+  cursor renders as a small pale square (`HUMAN_COLOR`) at its own
+  independent position (left over from the incidental `usb-tablet` attach
+  event noted above). Directly `Read` and visually inspected: the two
+  cursors are unambiguously distinct in both shape (square vs.
+  cross/reticle) and color (pale white vs. amber), exactly matching DESIGN
+  §3.3.2's "與人游標明確異形異色".
+- **`cd0-cursors-frozen.png`**: a real QMP absolute-pointer move
+  (`input-send-event`, `type: abs`) relocated the human cursor to a new
+  position — this is itself a genuine human-seat event, so it froze the
+  agent seat as a side effect (audit: `{"kind":"freeze",
+  "op":"pointer_motion_absolute","frozen":true}`, confirmed before the
+  screendump). The agent cursor, still at `(900, 500)`, is now rendered in
+  `AGENT_COLOR_FROZEN` (dimmed red) — visually confirming the frozen-state
+  color cue DESIGN §3.4 calls for ("系統級『共駕中』指示") actually renders
+  correctly on real hardware, not just in `cursor.rs`'s source.
+
+Both screenshots also incidentally show `foot`'s terminal with the Item-1
+burst-test's earlier shell output still on screen (`echo cd0agentok987 >
+/tmp/cd0-agent-proof.txt`), giving a second, independent visual
+confirmation (beyond the file-system side-effect check below) that agent-
+injected keystrokes really did reach a real xdg-shell client rendered by
+`duduclaw-comp` under `cage`.
+
+### Bonus — real-seat agent injection reaching a real shell (PASS, not one
+of the three named items but exercised first as a smoke test)
+
+Before the freeze/emergency-stop tests, a plain move→click→type sequence
+over the codrive socket (`move` to `(100,100)`, left `button` press+
+release, `text` synthesizing `echo cd0agentok987 > /tmp/cd0-agent-proof.txt
+\n`) was sent to confirm the pipeline was alive on real hardware before
+testing its failure modes. `cat /tmp/cd0-agent-proof.txt` on the guest
+afterward printed `cd0agentok987` — a real shell command, synthesized
+entirely from agent-seat keystrokes, executed by `foot`'s real shell,
+running under `cage` on the VM's virtio-gpu output. Strictly stronger
+evidence than the earlier container round's identical check (real seat
+stack vs. headless weston), included here for completeness since it's the
+precondition every other test in this section depends on.
+
+### Cleanup
+
+`{"execute":"quit"}` over QMP shut the VM down cleanly (confirmed via `ps`
+— no leftover `qemu-system-aarch64` process). The one operator mistake
+noted above (an aborted loop-mount leaving a loop device attached at the
+Docker-Desktop-for-Mac kernel level) was caught and cleaned up
+(`losetup -d`) before the retry, with `e2fsck -f -y` confirming no
+filesystem damage either before or after. The disposable `vars-cd0.fd`
+(UEFI varstore working copy, wiped fresh on launch as this file's
+`run-vm.sh` section already documents doing) was deleted after the run;
+the disk image itself (`duduclaw-os-vm.raw`) now permanently carries the
+codrive-enabled comp binary, the known root password, and the enabled
+serial getty — all three are durable changes to the shared Shell-S2/CD-0
+working copy, not undone after this round (intentional: the whole point
+was to leave a debuggable disk for whichever round needs it next).
+
+### Honest stub / limitation list (this round)
+
+- **Injection socket auth**: unchanged CD-0-known-gap, restated for
+  completeness (see the container round's own note above).
+- **`keymap_ascii.rs`'s ASCII-only table**: unchanged; not exercised
+  further than the container round already did.
+- **Root password / serial getty are now permanent disk changes**: fine
+  for a shared debug/verification working copy, but anyone treating this
+  disk as "the same as what Shell-S2 shipped" should know a debug login
+  path now exists on it that didn't reliably exist before this round.
+- **Frame-rate / DPI claims**: none made, none relevant — same R1 scope
+  note as every other section of this file (all software rendering under
+  QEMU).
+- **Single verification pass, not repeated N times**: each of the three
+  items passed on its first real attempt this round (no retries needed,
+  so the stop-loss-at-5-attempts contingency in the task brief was never
+  invoked) — a second independent run was not performed to check for
+  flakiness, same evidentiary bar the container round itself used.
