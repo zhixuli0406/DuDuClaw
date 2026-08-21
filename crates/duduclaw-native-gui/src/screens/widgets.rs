@@ -10,6 +10,12 @@
 // this WP's 2-page-scope pass (header buttons + card kebab menu render
 // decoratively — assembled, not wired, per the task brief).
 //
+// UPDATE (WP-S6b2-O, 2026-08-21): the 新增 button now navigates for real —
+// `active_page = "widgetComposer"` — reaching `screens/widget_composer.rs`
+// (a creation-only "新增 Widget" leaf, see that module's own doc comment).
+// HTML 自訂/匯入 stay exactly as decorative as this paragraph originally
+// described; only 新增 changed.
+//
 // ── RPC shape (read directly from `crates/duduclaw-gateway/src/handlers.
 // rs`, never guessed; open to any authenticated user — no `require_*!()`
 // gate on `widgets.custom.list`) ─────────────────────────────────────────
@@ -198,7 +204,23 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
         .gap_2()
         .child(button("widgets-new-html", i18n::t(locale, "native.widgets.newHtml"), ButtonVariant::Secondary, false, None, |_ev, _window, _app| {}))
         .child(button("widgets-import", i18n::t(locale, "native.widgets.import"), ButtonVariant::Secondary, false, None, |_ev, _window, _app| {}))
-        .child(button("widgets-new", i18n::t(locale, "native.widgets.new"), ButtonVariant::Primary, false, None, |_ev, _window, _app| {}));
+        .child(button(
+            "widgets-new",
+            i18n::t(locale, "native.widgets.new"),
+            ButtonVariant::Primary,
+            false,
+            None,
+            // WP-S6b2-O (2026-08-21): the one live navigation this page
+            // wires — every other header button (HTML 自訂/匯入) stays
+            // decorative, this one now actually reaches the new "新增
+            // Widget" composer (`screens/widget_composer.rs`), same
+            // "reaching page wires the row/button that gets you there"
+            // precedent `screens/mcp.rs`'s own 存取金鑰管理 row establishes.
+            cx.listener(|this, _ev, _window, cx| {
+                this.active_page = "widgetComposer";
+                cx.notify();
+            }),
+        ));
 
     div()
         .id("widgets-page")

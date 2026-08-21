@@ -48,6 +48,21 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
     let locale = state.locale;
     let active_id = state.active_page;
 
+    // WP-S6b2-M (S6b 第二波, 2026-08-21) — 資料搬家精靈 full-screen bypass.
+    // Skips the normal sidebar/content-list/content_shell three-column
+    // composition entirely for `active_page == "migrate"`, per the canvas's
+    // own "modal task flow, not a persistent page" note (`Migrate.dc.html`,
+    // B16) — a `shell.rs`-level root swap, same shape `main.rs`'s own
+    // `Screen::Language`/`Screen::Login`/`Screen::Shell` match already uses,
+    // deliberately NOT an absolutely-positioned overlay (see `screens::
+    // migrate`'s own module doc comment for the full rationale, including
+    // why an overlay was rejected). Must run before every other branch
+    // below since none of them apply once this page has taken over the
+    // whole window.
+    if active_id == "migrate" {
+        return crate::screens::migrate::render(state, cx);
+    }
+
     // ── Content-area placeholder heading ─────────────────────────────────
     let active_item = nav::find(active_id);
     let page_label = active_item.map(|i| i18n::t(locale, i.label_key)).unwrap_or_else(|| active_id.to_string().into());
@@ -113,6 +128,26 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // comment. Same "skip the generic placeholder heading entirely"
         // pattern as every other real (non-stub) page in this match.
         content_shell.child(crate::screens::agents::render(state, cx))
+    // ── WP-S6b2-N (S6b 第二波, 2026-08-21) — 編輯員工, a leaf of `agents`
+    // reached via `agents_detail.rs`'s own "編輯" button (no `nav.rs` entry
+    // of its own) — self-attached here per the "D 先掛好分支就直接可達，未
+    // 掛就自己掛" precedent every prior wave's own comments already
+    // establish (e.g. `governance`/`wikiTrust`/`security`'s block below). ──
+    } else if active_id == "editAgent" {
+        // WP-S6b2-N: 編輯員工 — see `screens/edit_agent.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::edit_agent::render(state, cx))
+    // ── WP-S6b2-N (S6b 第二波, 2026-08-21) — 新增員工, a leaf of `agents`
+    // reached via `agents_list.rs`'s own "新員工" button (no `nav.rs` entry
+    // of its own) — self-attached here per the same "D 先掛好分支就直接可達，
+    // 未掛就自己掛" precedent the `editAgent` block right above already
+    // re-establishes. ─────────────────────────────────────────────────────
+    } else if active_id == "createAgent" {
+        // WP-S6b2-N: 新增員工 — see `screens/create_agent.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::create_agent::render(state, cx))
     } else if active_id == "device" {
         // S5b1-A: 裝置 — see `screens/device.rs`'s module doc comment. Same
         // "skip the generic placeholder heading entirely" pattern as every
@@ -239,6 +274,30 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // Same "skip the generic placeholder heading entirely" pattern as
         // every other real (non-stub) page in this match.
         content_shell.child(crate::screens::skills::render(state, cx))
+    // ── WP-S6b2-M (S6b 第二波, 2026-08-21) — "新增技能" (`SkillNew.dc.html`,
+    // B16 in-page wizard), a `skills` drill-down. Sidebar retained (unlike
+    // `screens::migrate`'s full-bleed bypass above), so it stays inside the
+    // normal `content_shell` composition. No `nav.rs` entry yet — reached
+    // via `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=skillNew`, same "D 先掛好分支就直
+    // 接可達，未掛就自己掛" precedent every prior self-attached S5b/S6b page
+    // already establishes. ─────────────────────────────────────────────────
+    } else if active_id == "skillNew" {
+        // WP-S6b2-M: 新增技能 — see `screens/skill_new.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::skill_new::render(state, cx))
+    // ── WP-S6b2-N (S6b 第二波, 2026-08-21) — 自建技能詳情 (SkillCustomDetail
+    // .dc.html), another `skills` drill-down leaf. No `nav.rs` entry — reached
+    // only via `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=skillCustom` this round (no
+    // "我的技能" list row exists yet to click into it from), same "D 先掛好分
+    // 支就直接可達，未掛就自己掛" precedent `skillNew` right above already
+    // establishes. See `screens/skill_custom_detail.rs`'s own module doc
+    // comment for the full RPC/fidelity notes. ───────────────────────────────
+    } else if active_id == "skillCustom" {
+        // WP-S6b2-N: 自建技能詳情 — see `screens/skill_custom_detail.rs`'s
+        // module doc comment. Same "skip the generic placeholder heading
+        // entirely" pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::skill_custom_detail::render(state, cx))
     } else if active_id == "experts" {
         // WP-S5b2-E: AI 團隊 — see `screens/experts.rs`'s module doc
         // comment. Same "skip the generic placeholder heading entirely"
@@ -384,6 +443,23 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // comment. Same "skip the generic placeholder heading entirely"
         // pattern as every other real (non-stub) page in this match.
         content_shell.child(crate::screens::distributors::render(state, cx))
+    // ── WP-S6b2-O (S6b 第二波, 2026-08-21) — "新增 Widget"/"桌寵工作室"
+    // (`WidgetComposer.dc.html`/`PetStudio.dc.html`, B21). No `nav.rs` entry
+    // for either — `widgetComposer` is reached via `screens::widgets`'s own
+    // 新增 button (wired this pass), `petStudio` has no in-app entry point at
+    // all yet (see that module's own doc comment) — self-attached here per
+    // the same "D 先掛好分支就直接可達，未掛就自己掛" precedent every prior
+    // wave's own comments above already establish. ─────────────────────────
+    } else if active_id == "widgetComposer" {
+        // WP-S6b2-O: 新增 Widget — see `screens/widget_composer.rs`'s module
+        // doc comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::widget_composer::render(state, cx))
+    } else if active_id == "petStudio" {
+        // WP-S6b2-O: 桌寵工作室 — see `screens/pet_studio.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::pet_studio::render(state, cx))
     } else if active_id == "spike_t7" {
         // WP-gpui-spike-T7: debug-only Chromium-risk-page feasibility spike
         // (see `screens/spike_t7.rs`'s module doc comment). No `nav.rs`

@@ -103,18 +103,23 @@ fn header(count: usize, locale: i18n::Locale, cx: &mut Context<RootView>) -> gpu
                 ),
         )
         .child(
-            // "新員工" — honest stub this round (agent creation is a
-            // multi-step wizard on the web dashboard; not ported here yet).
-            // `disabled: true` renders a dimmed, non-interactive button with
-            // NO click handler attached at all (`mds_gpui::button`'s own
-            // documented `disabled` shape), never a fake-looking live CTA.
+            // "新員工" — WP-S6b2-N wires this real: navigates to the
+            // `createAgent` page (`screens/create_agent.rs`'s own module doc
+            // comment covers RPC shapes and the assembled-vs-wired boundary
+            // for that page's own submit button). Previously an honest
+            // `disabled: true` stub ("agent creation is a multi-step wizard
+            // on the web dashboard; not ported here yet") — that page now
+            // exists, so the stub is gone.
             button(
                 "agents-new",
                 i18n::t(locale, "native.agents.new"),
                 ButtonVariant::Primary,
-                true,
+                false,
                 None,
-                cx.listener(|_, _, _, _| {}),
+                cx.listener(|this, _ev, _window, cx| {
+                    this.active_page = "createAgent";
+                    cx.notify();
+                }),
             ),
         )
 }

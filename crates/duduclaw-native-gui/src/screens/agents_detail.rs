@@ -124,6 +124,7 @@ fn hero(locale: i18n::Locale, detail: &AgentDetailData, cx: &mut Context<RootVie
         }
     };
     let open_chat_id = detail.id.clone();
+    let edit_id = detail.id.clone();
 
     div()
         .flex()
@@ -150,9 +151,16 @@ fn hero(locale: i18n::Locale, detail: &AgentDetailData, cx: &mut Context<RootVie
             "agents-detail-edit",
             i18n::t(locale, "native.agents.action.edit"),
             ButtonVariant::Secondary,
-            true, // honest stub — full edit form is a follow-up pass
+            // WP-S6b2-N (2026-08-21): the follow-up pass this stub's own
+            // comment pointed at has landed — `screens::edit_agent` is a
+            // real page now. Real click handler below, no longer a stub.
+            false,
             None,
-            cx.listener(|_, _, _, _| {}),
+            cx.listener(move |this, _ev, _window, cx| {
+                cx.global_mut::<crate::screens::edit_agent::EditAgentState>().select_agent(edit_id.clone());
+                this.active_page = "editAgent";
+                cx.notify();
+            }),
         ))
         .child(button(
             "agents-detail-open-chat",

@@ -1756,9 +1756,19 @@ export interface PartnerCustomer {
  * it and serializing it would only invite copy-paste leaks.
  */
 export interface LicenseSnapshot {
-  /** Active tier — `opensource` when no license is installed. */
+  /**
+   * Active tier — `open_source` when no license is installed.
+   *
+   * Wire value comes from `LicenseTier`'s `#[serde(rename_all =
+   * "snake_case")]` derive (`crates/duduclaw-license/src/tier.rs`), NOT its
+   * unrelated `as_toml_key()` helper (which does produce `"opensource"`, no
+   * underscore, but only for `features.toml` section lookups) — the two were
+   * previously confused here and in `TIER_LABELS` (`license-labels.ts`),
+   * silently falling back to the raw wire string instead of the friendly
+   * label wherever the default tier renders.
+   */
   tier:
-    | 'opensource'
+    | 'open_source'
     | 'hobby'
     | 'solo'
     | 'studio'

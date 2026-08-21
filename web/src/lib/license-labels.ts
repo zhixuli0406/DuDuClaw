@@ -2,7 +2,7 @@ import type { LicenseSnapshot } from '@/lib/api';
 
 /** Human-readable label for each license tier. */
 export const TIER_LABELS: Record<LicenseSnapshot['tier'], string> = {
-  opensource: 'Open Source',
+  open_source: 'Open Source',
   hobby: 'Hobby (Trial)',
   solo: 'Solo',
   studio: 'Studio',
