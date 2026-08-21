@@ -113,3 +113,16 @@ pub fn t1(locale: Locale, key: &str, param: &str, value: &str) -> SharedString {
         .replace(&format!("{{{param}}}"), value)
         .into()
 }
+
+/// `t()` with N `{param}` substitutions — S4b's dashboard needs multi-value
+/// strings (e.g. `native.home.card.budget.detail`: "已用 {percent}%（NT$
+/// {spent} / {total}）", three params). Generalizes [`t1`] rather than
+/// duplicating it; applies substitutions in the order given and is a no-op
+/// for any pair whose placeholder isn't present in the catalog string.
+pub fn tn(locale: Locale, key: &str, pairs: &[(&str, &str)]) -> SharedString {
+    let mut s = t(locale, key).to_string();
+    for (param, value) in pairs {
+        s = s.replace(&format!("{{{param}}}"), value);
+    }
+    s.into()
+}

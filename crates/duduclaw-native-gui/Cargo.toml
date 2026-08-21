@@ -48,3 +48,19 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # own direct entry here. Pinned to the version Cargo.lock already resolved
 # for gpui's copy (1.13.3) so this doesn't pull in a second version.
 unicode-segmentation = "1.13"
+
+# S4b: RFC3339 parsing + local-timezone relative-time formatting for the
+# chat sidebar's date-grouped conversation list (`screens/chat/
+# conversations.rs`) — `last_active` timestamps arrive from the gateway as
+# `chrono::Utc::now().to_rfc3339()` output (`duduclaw-gateway/src/
+# session.rs`), so parsing them with the same library both matches the
+# producer's own format exactly and avoids hand-rolling calendar-day-diff
+# arithmetic (leap years, month lengths, DST) — precisely the class of code
+# this crate's own conventions single out as worth NOT reinventing. This
+# crate is detached from the workspace (see this file's header comment), so
+# it cannot use `{ workspace = true }` the way `duduclaw-gateway` does for
+# its own `chrono = { workspace = true }` — pinned directly instead, with
+# only the two features actually used (RFC3339 parsing, `Local` timezone
+# conversion), no `serde` feature (nothing here round-trips a `DateTime`
+# through JSON — only formats/parses plain strings).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

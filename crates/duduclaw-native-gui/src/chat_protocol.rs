@@ -28,9 +28,10 @@ pub enum OutFrame {
     UserMessage {
         content: String,
         session_id: Option<String>,
-        /// L1 per-agent routing — always `None` in S4 (this crate has no
-        /// agent picker yet; the server treats absent as "the main/default
-        /// agent", byte-compatible with the pre-L1 protocol).
+        /// L1 per-agent routing. S4b (`screens/chat/agents_picker.rs`) is
+        /// this client's first caller to ever pass `Some(id)` — `None`
+        /// stays byte-compatible with S4's pre-picker behavior (the server
+        /// treats absent as "the main/default agent").
         agent: Option<String>,
         /// Always empty — file attachments are an explicit S4 scope cut
         /// (see `chat_ws.rs`'s doc comment). `Vec<()>` would serialize as
@@ -50,12 +51,13 @@ pub fn build_auth(token: &str) -> String {
 pub fn build_user_message(
     content: &str,
     session_id: Option<String>,
+    agent: Option<String>,
     conv: Option<String>,
 ) -> String {
     encode(&OutFrame::UserMessage {
         content: content.to_string(),
         session_id,
-        agent: None,
+        agent,
         attachments: Vec::new(),
         conv,
     })
@@ -137,8 +139,8 @@ mod tests {
     }
 
     #[test]
-    fn build_user_message_omits_agent_and_attachments() {
-        let json = build_user_message("hi", Some("sess-1".to_string()), Some("conv-1".to_string()));
+    fn build_user_message_omits_agent_and_attachments_when_no_agent_selected() {
+        let json = build_user_message("hi", Some("sess-1".to_string()), None, Some("conv-1".to_string()));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "user_message");
         assert_eq!(v["content"], "hi");
@@ -148,9 +150,17 @@ mod tests {
         assert_eq!(v["attachments"], serde_json::json!([]));
     }
 
+    /// S4b: the agent picker's selection round-trips into the wire frame.
+    #[test]
+    fn build_user_message_carries_selected_agent() {
+        let json = build_user_message("hi", None, Some("finance".to_string()), None);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["agent"], "finance");
+    }
+
     #[test]
     fn build_user_message_null_session_and_conv_when_absent() {
-        let json = build_user_message("hi", None, None);
+        let json = build_user_message("hi", None, None, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v["session_id"].is_null());
         assert!(v["conv"].is_null());

@@ -58,7 +58,13 @@ pub enum Command {
     /// fail-fast-not-queue policy) — the caller (the chat screen) already
     /// disables the send control while `ConnState != Authenticated`, so
     /// this is a defence-in-depth no-op, not the primary guard.
-    Send { content: String, session_id: Option<String>, conv: Option<String> },
+    ///
+    /// `agent`: S4b's agent picker (`screens/chat/agents_picker.rs`) — `None`
+    /// is byte-compatible with S4's pre-picker behavior (the server treats
+    /// an absent `agent` as "the main/default agent"); `Some(id)` routes
+    /// this turn to that specific employee, per `chat_protocol.rs`'s
+    /// `OutFrame::UserMessage.agent` doc comment.
+    Send { content: String, session_id: Option<String>, agent: Option<String>, conv: Option<String> },
     Disconnect,
 }
 
@@ -132,8 +138,8 @@ async fn run(mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>, evt_tx: std_mps
                 let out_tx = out_tx.clone();
                 task = Some(tokio::spawn(session_loop(CHAT_WS_URL, jwt, evt_tx, out_tx)));
             }
-            Command::Send { content, session_id, conv } => {
-                let frame = chat_protocol::build_user_message(&content, session_id, conv);
+            Command::Send { content, session_id, agent, conv } => {
+                let frame = chat_protocol::build_user_message(&content, session_id, agent, conv);
                 let sender = out_tx.lock().await.clone();
                 if let Some(sender) = sender {
                     let _ = sender.send(Message::Text(frame));

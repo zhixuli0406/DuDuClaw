@@ -186,6 +186,15 @@ pub struct RootView {
     /// IME-capable composer entity, ...) — see `screens/chat.rs`'s doc
     /// comment for why this is one bundled field, not a dozen flat ones.
     chat: screens::chat::ChatState,
+    /// S4b: the dashboard page's own per-card fetch state — see
+    /// `screens/dashboard.rs`'s module doc comment.
+    dashboard: screens::dashboard::DashboardState,
+    /// The logged-in user's `display_name` (`api::AuthUser`), captured from
+    /// the local-session/login response for the dashboard greeting line.
+    /// `None` until a session actually resolves; the greeting falls back to
+    /// a generic name rather than showing nothing (see `screens::dashboard::
+    /// greeting_name`).
+    display_name: Option<String>,
 }
 
 impl RootView {
@@ -207,6 +216,9 @@ impl RootView {
                 self.refresh_token = Some(resp.refresh_token);
                 self.screen = Screen::Shell;
                 self.login_error = None;
+                // S4b: for the dashboard greeting line — see that field's
+                // own doc comment.
+                self.display_name = Some(resp.user.display_name.clone());
                 // S4: the chat socket authenticates eagerly right alongside
                 // the main `/ws`, same timing — by the time a user actually
                 // navigates to the chat page it's normally already
@@ -229,6 +241,7 @@ impl RootView {
                 self.screen = Screen::Shell;
                 self.login_loading = false;
                 self.login_error = None;
+                self.display_name = Some(resp.user.display_name.clone());
                 self.chat.connect(resp.access_token.clone());
                 let _ = self.session_tx.send(SessionCommand::ConnectWs {
                     jwt: resp.access_token,
@@ -435,6 +448,17 @@ fn main() {
                             |this: &mut RootView, _emitter, event: &ime_input::ChatInputEvent, cx| {
                                 let ime_input::ChatInputEvent::Submit(content) = event;
                                 this.chat.submit(content.clone());
+                                // S4b: this listener is global (one
+                                // subscription on the one shared composer
+                                // entity — `dashboard_cards.rs`'s prompt bar
+                                // reuses the SAME entity, see that module's
+                                // doc comment), so navigating to the chat
+                                // page here covers Enter-to-submit from
+                                // EITHER page: submitting from `home`
+                                // switches into `newChat` to show the
+                                // exchange landing; submitting from
+                                // `newChat` itself is a no-op reassignment.
+                                this.active_page = "newChat";
                                 cx.notify();
                             },
                         )
@@ -455,6 +479,8 @@ fn main() {
                             login_loading: false,
                             login_error: None,
                             chat: screens::chat::ChatState::new(chat_input, chat_tx_for_view),
+                            dashboard: screens::dashboard::DashboardState::new(),
+                            display_name: None,
                         }
                     })
                 },
@@ -503,6 +529,14 @@ fn main() {
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => chat_dead = true,
             }
+            // S4b: cheap no-op check (two field reads) on every tick — fires
+            // the dashboard's seven RPCs exactly once per "arrived on the
+            // home page" transition. See `screens/dashboard.rs::maybe_fetch`'s
+            // doc comment for why this lives in the poll loop rather than in
+            // `render` (which only ever gets `&RootView`, not `&mut`).
+            let _ = window.update(cx, |view, _window, cx| {
+                screens::dashboard::maybe_fetch(view, cx);
+            });
             if session_dead && chat_dead {
                 break;
             }

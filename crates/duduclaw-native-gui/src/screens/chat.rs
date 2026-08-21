@@ -1,4 +1,4 @@
-// S4 — Screen 4: the chat page ("新對話" in the daily nav rail).
+// S4 / S4b — Screen 4: the chat page ("新對話" in the daily nav rail).
 //
 // Data flow (protocol read directly from `crates/duduclaw-gateway/src/
 // webchat.rs`, mirrored in `chat_protocol.rs`/`chat_ws.rs` — see those
@@ -13,15 +13,28 @@
 // `main.rs` from re-growing the way it would if S4 just tacked ten more
 // `pub` fields onto `RootView` directly.
 //
-// Honest scope cuts (S4, documented per this crate's convention):
-//   - Plain text only — no markdown rendering (bold/code/links render as
-//     raw source characters). The web dashboard's markdown pipeline
-//     (`channel_format`-adjacent) is out of scope for this pass.
-//   - No file attachments, no agent picker, no conversation history list /
-//     resume — single live conversation only (see `chat_ws.rs`'s own
-//     "honest stubs" list, which this screen inherits).
-//   - `step`/`progress` frames collapse into ONE transient status line
-//     (`ChatState::status`), not a persistent collapsible tool-call tree.
+// ── S4b (this pass) ────────────────────────────────────────────────────
+// Closes the first three of S4's honest scope cuts:
+//   1. Markdown rendering for agent bubbles (`markdown.rs`).
+//   2. A real left-sidebar conversation list (`conversations.rs`) — this is
+//      also where the p06 decision lands ("/conversations 併入 chat 左欄，
+//      方案 A": see `commercial/design/duduclaw-s4a-pages/Conversations.
+//      dc.html`'s left half — no separate `/conversations` page exists or
+//      is planned).
+//   3. An agent picker for new conversations (`agents_picker.rs`).
+// Still out of scope (deferred, not forgotten): file attachments, a
+// clipboard, a `TodoWrite` progress board, voice/video calls.
+//
+// ── Why this pass never touches `main.rs`/`nav.rs` ────────────────────────
+// A concurrent pass owns `main.rs`'s wiring and `nav.rs`'s routing this
+// round. Every new piece of state this pass needs (the sidebar RPC
+// connection, the agents/conversations fetch triggers) is therefore
+// constructed *inside* this module's own `ChatState::new()`/`render()`
+// rather than threaded in from `main.rs` — see `sidebar_rpc.rs`'s module
+// doc comment for the concrete consequence (a second, simpler RPC
+// connection instead of reusing `ws_status.rs`'s dormant `Command::Call`)
+// and `maybe_boot_fetch`'s doc comment below for how the initial
+// conversations/agents fetch fires without `main.rs`'s poll loop.
 
 use gpui::{div, prelude::*, px, Context, Div, ScrollHandle, SharedString, Stateful};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -32,6 +45,12 @@ use crate::ime_input::ChatInputState;
 use crate::mds_gpui::{empty_state, skeleton};
 use crate::theme;
 use crate::RootView;
+
+mod agents_picker;
+mod conversation_row;
+mod conversations;
+mod markdown;
+mod sidebar_rpc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -66,6 +85,18 @@ pub struct ChatState {
     pub input: gpui::Entity<ChatInputState>,
     pub scroll_handle: ScrollHandle,
     tx: tokio_mpsc::UnboundedSender<chat_ws::Command>,
+    /// S4b: the left sidebar's conversation list (task item #2).
+    pub conversations: conversations::ConversationsState,
+    /// S4b: the agent picker for new conversations (task item #3).
+    pub agents: agents_picker::AgentsState,
+    /// `None` = the server's default/main agent (byte-compatible with the
+    /// pre-S4b protocol, which never sent an `agent` field at all) — see
+    /// `select_agent`'s doc comment.
+    pub selected_agent_id: Option<String>,
+    /// S4b: the sidebar's own dedicated RPC connection — see
+    /// `sidebar_rpc.rs`'s module doc comment for why this isn't
+    /// `ws_status.rs`'s already-open `/ws`.
+    rpc_tx: tokio_mpsc::UnboundedSender<sidebar_rpc::Command>,
 }
 
 impl ChatState {
@@ -83,21 +114,108 @@ impl ChatState {
             input,
             scroll_handle: ScrollHandle::new(),
             tx,
+            conversations: conversations::ConversationsState::new(),
+            agents: agents_picker::AgentsState::new(),
+            selected_agent_id: None,
+            rpc_tx: sidebar_rpc::spawn(),
         }
     }
 
     /// Kick off (or replace) the `/ws/chat` connection with a fresh JWT —
     /// called from `main.rs::handle_session_event` right alongside the main
-    /// `/ws`'s own `ConnectWs` dispatch, same eager-connect timing.
+    /// `/ws`'s own `ConnectWs` dispatch, same eager-connect timing. Also
+    /// hands the same JWT to the S4b sidebar RPC connection (see
+    /// `sidebar_rpc.rs`) — `main.rs` calls this one method for both, so no
+    /// `main.rs` edit was needed to wire the second connection in.
     pub fn connect(&self, jwt: String) {
-        let _ = self.tx.send(chat_ws::Command::Connect { jwt });
+        let _ = self.tx.send(chat_ws::Command::Connect { jwt: jwt.clone() });
+        let _ = self.rpc_tx.send(sidebar_rpc::Command::Connect { jwt });
     }
 
     /// Tear down the chat connection — called when the main `/ws` session
     /// itself terminates (e.g. `WsAuthFailed`), since a stale JWT there
-    /// means the chat socket's JWT is stale too.
+    /// means the chat socket's JWT is stale too (and the sidebar RPC
+    /// connection's JWT, forgotten here for the same reason).
     pub fn disconnect(&self) {
         let _ = self.tx.send(chat_ws::Command::Disconnect);
+        let _ = self.rpc_tx.send(sidebar_rpc::Command::Disconnect);
+    }
+
+    /// Clone of the sidebar RPC command sender — `conversations.rs`/
+    /// `agents_picker.rs` (this module's own children) need it to issue
+    /// their own calls; kept as a method rather than a `pub` field so
+    /// `ChatState` stays the single owner of the underlying channel.
+    fn rpc_tx(&self) -> tokio_mpsc::UnboundedSender<sidebar_rpc::Command> {
+        self.rpc_tx.clone()
+    }
+
+    /// Switch which AI staff member a NEW conversation talks to (task item
+    /// #3). Mirrors the web dashboard's `chat-store.ts::selectAgent` (read
+    /// directly, not guessed): switching partners starts a fresh thread —
+    /// each employee has an isolated server-side session, so keeping the
+    /// old messages/session id around would either bleed A's context into
+    /// B's view or make the next send read as an invalid cross-agent
+    /// resume. A no-op re-selection of the already-active agent does
+    /// nothing (matches the web store's own early-return).
+    pub fn select_agent(&mut self, agent_id: Option<String>) {
+        if agent_id == self.selected_agent_id {
+            return;
+        }
+        self.selected_agent_id = agent_id;
+        self.start_new_conversation();
+    }
+
+    /// The sidebar's "+" button (task item #2, per the design canvas) — a
+    /// blank conversation with whichever agent is currently selected.
+    pub fn start_new_conversation(&mut self) {
+        self.messages.clear();
+        self.session_id = None;
+        self.status = None;
+        self.streaming = false;
+        self.conv_id = mint_conv_id();
+    }
+
+    /// Load a past conversation's transcript into the view — called by
+    /// `conversations::fetch_history` once `chat.sessions.history` resolves.
+    /// Payload shape read directly from `handle_chat_sessions_history`
+    /// (`duduclaw-gateway/src/handlers.rs`, ~line 30996): `{ "session_id",
+    /// "agent_id", "messages": [ { "role", "content", "timestamp",
+    /// "tokens" } ] }`, oldest→newest. A malformed/missing field degrades to
+    /// an empty value per-message rather than dropping the whole load.
+    pub fn apply_history(&mut self, payload: &serde_json::Value) {
+        let session_id = payload.get("session_id").and_then(|v| v.as_str()).map(str::to_string);
+        let messages = payload
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|m| {
+                        let role = match m.get("role").and_then(|v| v.as_str()).unwrap_or("") {
+                            "user" => Role::User,
+                            "assistant" => Role::Assistant,
+                            _ => Role::System,
+                        };
+                        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let tokens = m.get("tokens").and_then(|v| v.as_u64()).map(|t| t as u32);
+                        UiMessage { role, content, tokens }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.session_id = session_id;
+        self.messages = messages;
+        self.status = None;
+        self.streaming = false;
+        self.scroll_handle.scroll_to_bottom();
+    }
+
+    /// Localized system-bubble error line — used by `conversations.rs`'s
+    /// fetch failure paths, which run inside a `cx.spawn` block that has a
+    /// `Locale` (from `RootView.locale`, `Copy`) but no direct route to call
+    /// `i18n::t` before reaching into `ChatState` itself.
+    pub fn push_system_error(&mut self, locale: Locale, i18n_key: &str) {
+        self.push_system(format!("⚠️ {}", i18n::t(locale, i18n_key)));
     }
 
     /// Apply one event from the background chat manager (`chat_ws.rs`).
@@ -177,6 +295,7 @@ impl ChatState {
         let _ = self.tx.send(chat_ws::Command::Send {
             content,
             session_id: self.session_id.clone(),
+            agent: self.selected_agent_id.clone(),
             conv: Some(self.conv_id.clone()),
         });
     }
@@ -211,8 +330,13 @@ fn conn_label(locale: Locale, state: ConnState) -> SharedString {
 fn message_bubble(locale: Locale, msg: &UiMessage) -> Div {
     let is_user = msg.role == Role::User;
     let is_system = msg.role == Role::System;
+    // S4b task item #1: markdown rendering, agent bubbles only — user/system
+    // text is shown verbatim (a user's own typed message has no markdown
+    // source to render, and system lines are this crate's own short status
+    // strings, not agent output).
+    let is_assistant = !is_user && !is_system;
 
-    let bubble = div()
+    let mut bubble = div()
         .max_w(px(560.))
         .px_3p5()
         .py_2p5()
@@ -224,11 +348,15 @@ fn message_bubble(locale: Locale, msg: &UiMessage) -> Div {
         .when(is_system, |el| {
             el.bg(theme::alpha(theme::WARNING, 0.12)).text_color(theme::alpha(theme::WARNING, 1.0))
         })
-        .when(!is_user && !is_system, |el| {
+        .when(is_assistant, |el| {
             el.bg(theme::alpha(theme::SURFACE_RAISED, 1.0)).text_color(theme::alpha(theme::FOREGROUND, 1.0))
-        })
-        .child(msg.content.clone())
-        .children(msg.tokens.map(|t| {
+        });
+    bubble = if is_assistant {
+        bubble.child(markdown::render_markdown(&msg.content))
+    } else {
+        bubble.child(msg.content.clone())
+    };
+    let bubble = bubble.children(msg.tokens.map(|t| {
             div()
                 .mt_1()
                 .text_size(px(theme::TEXT_XS))
@@ -242,7 +370,41 @@ fn message_bubble(locale: Locale, msg: &UiMessage) -> Div {
     div().w_full().flex().when(is_user, |el| el.justify_end()).when(!is_user, |el| el.justify_start()).child(bubble)
 }
 
+/// One-shot initial fetch for the sidebar's conversation list + agent chips
+/// — fired from the top of `render` (the only place in this module that has
+/// a live `cx: &mut Context<RootView>`; see this file's module doc comment
+/// on why `main.rs`'s poll loop isn't an option this pass). Gated by two
+/// `Cell<bool>` latches (`ConversationsState`/`AgentsState::should_boot_
+/// fetch`) so re-renders — which happen constantly while streaming — don't
+/// re-issue the fetch every frame; interior mutability is what lets those
+/// latches flip from a `&RootView` (render only reads state, see the
+/// existing S4 comment on `self` reborrowing below).
+///
+/// Gated on `chat.session_id.is_some()`: that field is only ever set once
+/// the `/ws/chat` handshake's `session_info` frame arrives, which happens
+/// at the same moment `ChatState::connect` already handed the sidebar RPC
+/// connection its JWT — using it as the trigger condition needs no new
+/// "have we connected" bookkeeping. Honest limitation: this latches once
+/// per app run, so a relogin after a `WsAuthFailed` kick-back will not
+/// automatically re-fetch — S4 has no logout button either, so this isn't a
+/// regression, just an acknowledged gap for whenever one is added.
+fn maybe_boot_fetch(state: &RootView, cx: &mut Context<RootView>) {
+    if state.chat.session_id.is_none() {
+        return;
+    }
+    if state.chat.conversations.should_boot_fetch() {
+        state.chat.conversations.mark_boot_kicked();
+        conversations::fetch(state.chat.rpc_tx(), cx);
+    }
+    if state.chat.agents.should_boot_fetch() {
+        state.chat.agents.mark_boot_kicked();
+        agents_picker::fetch(state.chat.rpc_tx(), cx);
+    }
+}
+
 pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
+    maybe_boot_fetch(state, cx);
+
     let locale = state.locale;
     let chat = &state.chat;
 
@@ -374,12 +536,26 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
                 .child(i18n::t(locale, "native.chat.send")),
         );
 
-    div()
-        .id("chat-page")
-        .size_full()
+    // S4b: the transcript/composer column (S4's original single-column page
+    // content, unchanged in substance) now sits to the RIGHT of the
+    // conversations sidebar instead of being the whole page — see
+    // `conversations::render_sidebar` and this file's module doc comment on
+    // the p06 "併入 chat 左欄" decision.
+    let main_column = div()
+        .id("chat-main-column")
+        .flex_1()
+        .min_w_0()
+        .h_full()
         .flex()
         .flex_col()
         .child(header)
         .child(message_list)
-        .child(composer)
+        .child(composer);
+
+    div()
+        .id("chat-page")
+        .size_full()
+        .flex()
+        .child(conversations::render_sidebar(state, cx))
+        .child(main_column)
 }
