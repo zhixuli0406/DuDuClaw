@@ -17,16 +17,15 @@
 //
 // ── Data flow (first real consumer of `ws_status::call`) ─────────────────
 // `ws_status.rs`'s S4 doc comment flagged its RPC layer as "no consumer
-// yet" — this page is that consumer. `maybe_fetch` is driven from
-// `main.rs`'s existing 100ms poll loop (not from `render`, which only ever
-// gets `&RootView`): the first tick where `active_page == "home"` AND the
-// main `/ws` is `Authenticated` fires seven RPCs in parallel (each a
-// `Context::spawn` async block awaiting the oneshot `ws_status::call`
-// returns, per that function's own doc comment on the intended calling
-// pattern) and flips `DashboardState.requested` so it never re-fires on its
-// own. A visible "重新整理" button is the manual-refresh path this task
-// brief asks for when no server-push event exists for these aggregates
-// (there isn't one for tasks/approvals/budget/channels/agents as a group).
+// yet" — this page is that consumer. `maybe_fetch` is driven from the top of
+// `render` (the first tick where `active_page == "home"` AND the main `/ws`
+// is `Authenticated` fires seven RPCs in parallel — each a `Context::spawn`
+// async block awaiting the oneshot `ws_status::call` returns, per that
+// function's own doc comment on the intended calling pattern — and flips
+// `DashboardState.requested` so it never re-fires on its own). A visible
+// "重新整理" button is the manual-refresh path this task brief asks for when
+// no server-push event exists for these aggregates (there isn't one for
+// tasks/approvals/budget/channels/agents as a group).
 //
 // Each of the 6 cards + the activity shelf tracks its OWN `Loadable<T>` —
 // loading skeleton / error text / ready content — rather than one page-wide
@@ -35,8 +34,22 @@
 // the agent-scoped calls (tasks/activity/agents) still succeeded. The one
 // page-level state that DOES gate everything is the WS connection itself —
 // see the `connection_error` block in `render` below.
+//
+// ── Why state lives in a `gpui::Global`, not a `RootView` field (WP-NG-
+// debt, 2026-08-21) ───────────────────────────────────────────────────────
+// `DashboardState` was originally a dedicated `RootView` field (this page
+// was the FIRST S4b page, landing before any other page needed the same
+// shape) — every S4b page after it (`goals.rs`, `agents.rs`, `console.rs`,
+// `inbox.rs`, `tasks.rs`, `about.rs`) converged on `gpui::Global` instead
+// (see `goals.rs`'s own module doc comment for the original "can't touch
+// `main.rs` this pass" reasoning that started the convention). This page's
+// residual `RootView` field was the one holdout; converging it here removes
+// the special case with zero behavior change — `maybe_fetch` moves from the
+// `main.rs` poll loop into the top of `render` (the same place every other
+// page's own `maybe_fetch*` already runs from), and every `state.dashboard.*`
+// read becomes a `cx.default_global::<DashboardState>()` read instead.
 
-use gpui::{div, prelude::*, px, Context, Div, SharedString, Stateful};
+use gpui::{div, prelude::*, px, Context, Div, Global, SharedString, Stateful};
 use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -116,6 +129,17 @@ pub struct DashboardState {
     pub activity: Loadable<Vec<ActivityItem>>,
 }
 
+/// `cx.default_global::<DashboardState>()` needs `Default` (it lazily
+/// installs one on first access) — see this file's module doc comment on
+/// why this page's state moved behind `gpui::Global`.
+impl Default for DashboardState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Global for DashboardState {}
+
 impl DashboardState {
     pub fn new() -> Self {
         Self {
@@ -156,11 +180,15 @@ impl DashboardState {
 
 // ── Fetch orchestration ───────────────────────────────────────────────
 
-/// Called every ~100ms from `main.rs`'s existing poll loop (see that file's
-/// `cx.spawn` timer loop). Cheap to call when it's a no-op: two field reads
-/// plus an enum compare.
-pub fn maybe_fetch(view: &mut RootView, cx: &mut Context<RootView>) {
-    if view.active_page != "home" || view.dashboard.requested {
+/// Called from the top of `render` on every pass (cheap to call when it's a
+/// no-op: two field reads plus an enum compare) — same placement as every
+/// other S4b page's own `maybe_fetch*` (see e.g. `agents.rs::
+/// maybe_fetch_list`). `render` only ever runs while `active_page == "home"`
+/// (`shell.rs` only calls `dashboard::render` for that nav id), so the
+/// `active_page` check below is a defensive no-op in practice, kept for
+/// parity with the pre-`Global` version rather than trimmed away.
+pub fn maybe_fetch(state: &RootView, cx: &mut Context<RootView>) {
+    if state.active_page != "home" || cx.default_global::<DashboardState>().requested {
         return;
     }
     // Wait for the main `/ws` to actually be authenticated — firing while
@@ -168,39 +196,39 @@ pub fn maybe_fetch(view: &mut RootView, cx: &mut Context<RootView>) {
     // `NotConnected` (`ws_status.rs`'s `call()` doc comment: calls made
     // while disconnected are never queued) and `requested` would latch
     // `true` on a page that then never gets real data until a manual
-    // refresh. Re-checked every tick until then, so the fetch still fires
+    // refresh. Re-checked every render until then, so the fetch still fires
     // the moment auth completes.
-    if view.ws_state != WsConnState::Authenticated {
+    if state.ws_state != WsConnState::Authenticated {
         return;
     }
-    view.dashboard.requested = true;
-    let tx = view.session_tx.clone();
+    cx.global_mut::<DashboardState>().requested = true;
+    let tx = state.session_tx.clone();
 
-    spawn_call(cx, tx.clone(), "approvals.list", json!({}), |view, result| {
-        view.dashboard.approvals = result.map(|v| {
+    spawn_call(cx, tx.clone(), "approvals.list", json!({}), |cx, result| {
+        cx.default_global::<DashboardState>().approvals = result.map(|v| {
             v.get("count").and_then(Value::as_u64).unwrap_or(0) as usize
         }).into();
     });
-    spawn_call(cx, tx.clone(), "tasks.list", json!({"goal_mode": true}), |view, result| {
-        view.dashboard.goal = result.map(|v| parse_goal_card(&v)).into();
+    spawn_call(cx, tx.clone(), "tasks.list", json!({"goal_mode": true}), |cx, result| {
+        cx.default_global::<DashboardState>().goal = result.map(|v| parse_goal_card(&v)).into();
     });
-    spawn_call(cx, tx.clone(), "tasks.list", json!({"goal_mode": false}), |view, result| {
-        view.dashboard.tasks = result.map(|v| parse_tasks_card(&v)).into();
+    spawn_call(cx, tx.clone(), "tasks.list", json!({"goal_mode": false}), |cx, result| {
+        cx.default_global::<DashboardState>().tasks = result.map(|v| parse_tasks_card(&v)).into();
     });
-    spawn_call(cx, tx.clone(), "accounts.budget_summary", json!({}), |view, result| {
-        view.dashboard.budget = result.map(|v| BudgetCard {
+    spawn_call(cx, tx.clone(), "accounts.budget_summary", json!({}), |cx, result| {
+        cx.default_global::<DashboardState>().budget = result.map(|v| BudgetCard {
             spent_cents: v.get("total_spent_cents").and_then(Value::as_i64).unwrap_or(0),
             total_cents: v.get("total_budget_cents").and_then(Value::as_i64).unwrap_or(0),
         }).into();
     });
-    spawn_call(cx, tx.clone(), "channels.status", json!({}), |view, result| {
-        view.dashboard.channels = result.map(|v| parse_channels_card(&v)).into();
+    spawn_call(cx, tx.clone(), "channels.status", json!({}), |cx, result| {
+        cx.default_global::<DashboardState>().channels = result.map(|v| parse_channels_card(&v)).into();
     });
-    spawn_call(cx, tx.clone(), "agents.list", json!({}), |view, result| {
-        view.dashboard.agents = result.map(|v| parse_agents_card(&v)).into();
+    spawn_call(cx, tx.clone(), "agents.list", json!({}), |cx, result| {
+        cx.default_global::<DashboardState>().agents = result.map(|v| parse_agents_card(&v)).into();
     });
-    spawn_call(cx, tx, "activity.list", json!({"limit": 8}), |view, result| {
-        view.dashboard.activity = result.map(|v| parse_activity(&v)).into();
+    spawn_call(cx, tx, "activity.list", json!({"limit": 8}), |cx, result| {
+        cx.default_global::<DashboardState>().activity = result.map(|v| parse_activity(&v)).into();
     });
 }
 
@@ -214,7 +242,11 @@ impl<T> From<Result<T, String>> for Loadable<T> {
 }
 
 /// One RPC round trip: dispatch `method`, await the response, hand the
-/// (payload | description) back to `apply` on the entity. Generic over
+/// (payload | description) back to `apply` against `Context<RootView>`
+/// (which is how a `Global`-backed `apply` reaches `cx.default_global::
+/// <DashboardState>()` — mirrors `goals.rs::spawn_goal_call`'s identical
+/// shape, kept as this page's own copy rather than a cross-module import so
+/// this pass's diff stays scoped to the dashboard page). Generic over
 /// `apply` (not boxed) — monomorphized per call site, matching this crate's
 /// existing style of avoiding `dyn` where a concrete closure works.
 fn spawn_call(
@@ -222,7 +254,7 @@ fn spawn_call(
     session_tx: tokio_mpsc::UnboundedSender<SessionCommand>,
     method: &'static str,
     params: Value,
-    apply: impl FnOnce(&mut RootView, Result<Value, String>) + 'static,
+    apply: impl FnOnce(&mut Context<RootView>, Result<Value, String>) + 'static,
 ) {
     cx.spawn(async move |weak, cx| {
         let rx = ws_status::call(&session_tx, method, params);
@@ -233,8 +265,8 @@ fn spawn_call(
             // only possible if the whole background manager thread died.
             Err(_) => Err("背景連線執行緒已結束".to_string()),
         };
-        let _ = weak.update(cx, |view, cx| {
-            apply(view, outcome);
+        let _ = weak.update(cx, |_view, cx| {
+            apply(cx, outcome);
             cx.notify();
         });
     })
@@ -425,6 +457,7 @@ fn greeting_name(display_name: Option<&str>, locale: Locale) -> SharedString {
 }
 
 pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
+    maybe_fetch(state, cx);
     let locale = state.locale;
 
     // Page-level error state: the main `/ws` has never authenticated. Every
@@ -455,7 +488,7 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
         "name",
         &greeting_name(state.display_name.as_deref(), locale),
     );
-    let subtitle = match state.dashboard.pending_decisions() {
+    let subtitle = match cx.default_global::<DashboardState>().pending_decisions() {
         None => i18n::t(locale, "native.home.greeting.subtitleLoading"),
         Some(0) => i18n::t(locale, "native.home.greeting.subtitleAllClear"),
         Some(n) => i18n::t1(locale, "native.home.greeting.subtitlePending", "count", &n.to_string()),
@@ -526,7 +559,7 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
         // ── ≤6 interactive cards ─────────────────────────────────────
         .child(div().w_full().max_w(px(920.)).grid().grid_cols(3).gap_3().children(card_rows))
         // ── Today's activity shelf ───────────────────────────────────
-        .child(cards::activity_shelf(state, locale))
+        .child(cards::activity_shelf(locale, cx))
 }
 
 /// Shared skeleton row for a card's value area while its `Loadable` is

@@ -1,7 +1,12 @@
 // S4b (second wave) — row-level rendering for `inbox.rs`. Split out purely
-// to keep `inbox.rs` (state + fetch orchestration + pure feed model + top
-// composition) under this crate's own <800-line file convention — same
-// reason `dashboard.rs`/`dashboard_cards.rs` are split. No behavior differs
+// to keep `inbox.rs` (state + fetch orchestration + top composition) under
+// this crate's own <800-line file convention — same reason
+// `dashboard.rs`/`dashboard_cards.rs` are split. The pure feed model
+// (`FeedItem` and friends) lives in the sibling `inbox_data.rs` module
+// (WP-NG-debt, 2026-08-21 — same "types + pure parsing" split
+// `goals_data.rs` established for `goals.rs`), imported directly from here
+// rather than re-exported through `inbox.rs`, mirroring
+// `goals_inspector.rs`'s own import of `goals_data`. No behavior differs
 // from an unsplit version.
 
 use chrono::{DateTime, Local, Utc};
@@ -10,7 +15,8 @@ use gpui::{div, prelude::*, px, Context, Div, SharedString, Stateful};
 use crate::i18n::{self, Locale};
 use crate::mds_gpui::{badge, button, skeleton, BadgeVariant, ButtonVariant};
 use crate::screens::dashboard::error_row;
-use crate::screens::inbox::{self, FeedBadge, FeedCategory, FeedItem, FilterKind, InboxState};
+use crate::screens::inbox::{self, InboxState};
+use crate::screens::inbox_data::{ApprovalExpand, FeedBadge, FeedCategory, FeedItem, FilterKind};
 use crate::theme;
 use crate::RootView;
 
@@ -259,7 +265,7 @@ fn collapsed_approval_row(item: &FeedItem, unread: bool, locale: Locale, cx: &mu
 fn expanded_approval_row(
     state: &RootView,
     item: &FeedItem,
-    exp: &inbox::ApprovalExpand,
+    exp: &ApprovalExpand,
     unread: bool,
     locale: Locale,
     cx: &mut Context<RootView>,

@@ -198,10 +198,15 @@ pub(super) fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<D
                 .bg(theme::alpha(theme::SIDEBAR_ACCENT, 1.0))
                 .text_size(px(theme::TEXT_XS))
                 .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
-                .child(format!(
-                    "{} Lv.1 v{}",
-                    i18n::t(locale, "native.shell.editionBadge"),
-                    env!("CARGO_PKG_VERSION"),
-                )),
+                .child(format!("{} Lv.1 v", i18n::t(locale, "native.shell.editionBadge")))
+                // WP-NG-debt: only the version NUMBER renders in the system
+                // monospace face (same `SF Mono` convention `about.rs`'s own
+                // version badge and `chat/markdown.rs::mono_font` already
+                // establish) — split into its own child so the edition
+                // label + "Lv.1 v" prefix keep the sidebar's normal UI font;
+                // a nested `div()` with no `text_size`/`text_color` of its
+                // own inherits both from this flex row, so only the font
+                // family differs, not the size/color of this badge.
+                .child(div().font_family("SF Mono").child(env!("CARGO_PKG_VERSION"))),
         )
 }

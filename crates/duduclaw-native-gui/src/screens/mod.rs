@@ -24,11 +24,24 @@ pub mod goals;
 mod goals_data;
 mod goals_inspector;
 pub mod inbox;
+mod inbox_data;
 mod inbox_rows;
 pub mod language_picker;
 pub mod login;
 pub mod prototypes;
 pub mod shell;
+// WP-gpui-spike-T7 (2026-08-21): debug-only Chromium-risk-page feasibility
+// spike, NOT a real product page — see `spike_t7.rs`'s own module doc
+// comment for the full rationale. Reachable only via
+// `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=spike_t7` (`main.rs`'s debug-page boot
+// override); no `nav.rs` entry, not part of any normal navigation flow.
+// `spike_t7_timeline`/`spike_t7_panzoom` are siblings holding two of the
+// spike's three primitive canvases, split out for the same file-size reason
+// `goals`/`goals_data`/`goals_inspector` are split (see `spike_t7.rs`'s own
+// doc comment).
+pub mod spike_t7;
+mod spike_t7_panzoom;
+mod spike_t7_timeline;
 // S4b third wave — the "任務" list page (p09) + its full detail page (p10).
 // `tasks_data` (types + pure parsing/filtering), `tasks_quickview` (list
 // page's right-column quick view), `tasks_detail` (the in-page full detail

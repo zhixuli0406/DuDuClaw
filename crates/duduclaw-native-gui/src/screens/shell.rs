@@ -125,6 +125,12 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // caption bar + preview (see `screens/prototypes/mod.rs`), same
         // "skip the generic placeholder heading" pattern.
         content_shell.child(crate::screens::prototypes::render(state, cx))
+    } else if active_id == "spike_t7" {
+        // WP-gpui-spike-T7: debug-only Chromium-risk-page feasibility spike
+        // (see `screens/spike_t7.rs`'s module doc comment). No `nav.rs`
+        // entry — only reachable via `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=
+        // spike_t7`, same "skip the generic placeholder heading" pattern.
+        content_shell.child(crate::screens::spike_t7::render(state, cx))
     } else {
         content_shell
             .child(

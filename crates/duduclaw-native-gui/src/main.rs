@@ -186,15 +186,19 @@ pub struct RootView {
     /// IME-capable composer entity, ...) — see `screens/chat.rs`'s doc
     /// comment for why this is one bundled field, not a dozen flat ones.
     chat: screens::chat::ChatState,
-    /// S4b: the dashboard page's own per-card fetch state — see
-    /// `screens/dashboard.rs`'s module doc comment.
-    dashboard: screens::dashboard::DashboardState,
     /// The logged-in user's `display_name` (`api::AuthUser`), captured from
     /// the local-session/login response for the dashboard greeting line.
     /// `None` until a session actually resolves; the greeting falls back to
     /// a generic name rather than showing nothing (see `screens::dashboard::
     /// greeting_name`).
     display_name: Option<String>,
+    /// WP-gpui-spike-T7 (2026-08-21): debug-only Chromium-risk-page
+    /// feasibility spike state (`screens::spike_t7`) — see that module's doc
+    /// comment. Always constructed (same "unconditional field, only
+    /// meaningful on one debug page" shape as `active_prototype` above), so
+    /// there's no `Option` to unwrap when `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=
+    /// spike_t7` lands on it.
+    spike_t7: screens::spike_t7::SpikeT7State,
 }
 
 impl RootView {
@@ -479,8 +483,8 @@ fn main() {
                             login_loading: false,
                             login_error: None,
                             chat: screens::chat::ChatState::new(chat_input, chat_tx_for_view),
-                            dashboard: screens::dashboard::DashboardState::new(),
                             display_name: None,
+                            spike_t7: screens::spike_t7::SpikeT7State::default(),
                         }
                     })
                 },
@@ -529,14 +533,13 @@ fn main() {
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => chat_dead = true,
             }
-            // S4b: cheap no-op check (two field reads) on every tick — fires
-            // the dashboard's seven RPCs exactly once per "arrived on the
-            // home page" transition. See `screens/dashboard.rs::maybe_fetch`'s
-            // doc comment for why this lives in the poll loop rather than in
-            // `render` (which only ever gets `&RootView`, not `&mut`).
-            let _ = window.update(cx, |view, _window, cx| {
-                screens::dashboard::maybe_fetch(view, cx);
-            });
+            // WP-NG-debt: the dashboard's `maybe_fetch` used to be driven from
+            // here (it needed a `&mut RootView` field this poll loop could
+            // reach, back before `DashboardState` became a `gpui::Global` —
+            // see that type's own doc comment). Now that its state lives
+            // behind `Global`, it's called from `dashboard::render` itself,
+            // same as every other S4b page's own `maybe_fetch*` — no `&mut
+            // RootView` needed, so no poll-loop entry needed either.
             if session_dead && chat_dead {
                 break;
             }
