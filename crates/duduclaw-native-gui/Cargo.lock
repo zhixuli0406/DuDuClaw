@@ -1345,8 +1345,9 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-native-gui"
-version = "0.1.0"
+version = "1.62.0"
 dependencies = [
+ "chrono",
  "futures-util",
  "gpui",
  "gpui_macros",

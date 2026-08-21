@@ -77,7 +77,43 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
     // back to. `gallery::render` draws its own title/subtitle internally
     // (see that file), so this branch skips the placeholder heading below
     // entirely rather than showing both.
-    let content = if active_id == "componentLibrary" {
+    let content = if active_id == "home" {
+        // S4b: the "總覽" dashboard — first real S4b page, see
+        // `screens/dashboard.rs`'s module doc comment. Same "skip the
+        // generic placeholder heading entirely" pattern as the two branches
+        // below (this page draws its own greeting/prompt-bar/cards).
+        content_shell.child(crate::screens::dashboard::render(state, cx))
+    } else if active_id == "inbox" {
+        // S4b (second wave): 收件匣 — see `screens/inbox.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::inbox::render(state, cx))
+    } else if active_id == "console" {
+        // S4b (second wave): 主控台 — see `screens/console.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::console::render(state, cx))
+    } else if active_id == "goals" {
+        // S4b (second wave): 目標 — see `screens/goals.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::goals::render(state, cx))
+    } else if active_id == "tasks" {
+        // S4b (third wave): 任務 — see `screens/tasks.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::tasks::render(state, cx))
+    } else if active_id == "about" {
+        // S4b (third wave): 關於 — see `screens/about.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::about::render(state, cx))
+    } else if active_id == "agents" {
+        // S4b (third wave): AI 員工 — see `screens/agents.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::agents::render(state, cx))
+    } else if active_id == "componentLibrary" {
         content_shell.child(crate::screens::gallery::render(state, cx))
     } else if active_id == "newChat" {
         // S4: the chat page draws its own header/messages/composer (see
