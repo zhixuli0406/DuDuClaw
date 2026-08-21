@@ -123,6 +123,50 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
         // comment. Same "skip the generic placeholder heading entirely"
         // pattern as every other real (non-stub) page in this match.
         content_shell.child(crate::screens::manage_advanced::render(state, cx))
+    // ── WP-S6b1-K (S6b 第一波, 2026-08-21) — 治理/安全 drill-down leaves of
+    // `manageAdvanced` (see `screens/governance.rs`'s module doc comment for
+    // the GovernanceShell tabs `governance`/`wikiTrust` share). Self-
+    // attached here per the "D 先掛好分支就直接可達，未掛就自己掛" precedent
+    // every prior wave's own comments already establish — the actual
+    // clickable row wiring inside `manage_advanced.rs` is a parallel WP's
+    // territory (that file is off this pass's edit list). ─────────────────
+    } else if active_id == "governance" {
+        // WP-S6b1-K: 治理規則 — see `screens/governance.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::governance::render(state, cx))
+    } else if active_id == "wikiTrust" {
+        // WP-S6b1-K: Wiki 信任層級 — see `screens/wiki_trust.rs`'s module
+        // doc comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::wiki_trust::render(state, cx))
+    } else if active_id == "security" {
+        // WP-S6b1-K: 安全 — see `screens/security.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::security::render(state, cx))
+    // ── WP-S6b1-J (S6b 第一波, 2026-08-21) — 帳務/授權 drill-down leaves of
+    // `manageAdvanced` (see `screens/manage_advanced_common.rs`'s module doc
+    // comment for the LicenseShell tabs `license`/`partnerPortal` share).
+    // Self-attached here per the same "D 先掛好分支就直接可達，未掛就自己掛"
+    // precedent WP-S6b1-K's block right above already re-establishes — the
+    // actual clickable row wiring inside `manage_advanced.rs` is a parallel
+    // WP's territory (that file is off this pass's edit list too). ────────
+    } else if active_id == "billing" {
+        // WP-S6b1-J: 帳務 — see `screens/billing.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::billing::render(state, cx))
+    } else if active_id == "license" {
+        // WP-S6b1-J: 授權 — see `screens/license.rs`'s module doc comment.
+        // Same "skip the generic placeholder heading entirely" pattern as
+        // every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::license::render(state, cx))
+    } else if active_id == "partnerPortal" {
+        // WP-S6b1-J: 經銷夥伴入口 — see `screens/partner_portal.rs`'s module
+        // doc comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::partner_portal::render(state, cx))
     } else if active_id == "systemUpdates" {
         // S5b1-A: 系統更新 — see `screens/system_updates.rs`'s module doc
         // comment. Same "skip the generic placeholder heading entirely"
@@ -324,6 +368,22 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Div {
     // the established "D 先掛好分支就直接可達，未掛就自己掛" precedent, so
     // none of the seven fall through to the generic placeholder below
     // anymore.
+    // ── WP-S6b1-L (S6b 第一波, 2026-08-21) — 成員/經銷 (`UsersPage.dc.html`/
+    // `DistributorsPage.dc.html`, B19). No `nav.rs` entry yet (reached via
+    // `screens::manage_advanced`'s own wired rows, same pass, or the
+    // debug-page override) — self-attached here per the "D 先掛好分支就直接
+    // 可達，未掛就自己掛" precedent this file's own comment blocks above
+    // already establish for every S5b3-wave page. ─────────────────────────
+    } else if active_id == "users" {
+        // WP-S6b1-L: 成員 — see `screens/users.rs`'s module doc comment. Same
+        // "skip the generic placeholder heading entirely" pattern as every
+        // other real (non-stub) page in this match.
+        content_shell.child(crate::screens::users::render(state, cx))
+    } else if active_id == "distributors" {
+        // WP-S6b1-L: 經銷 — see `screens/distributors.rs`'s module doc
+        // comment. Same "skip the generic placeholder heading entirely"
+        // pattern as every other real (non-stub) page in this match.
+        content_shell.child(crate::screens::distributors::render(state, cx))
     } else if active_id == "spike_t7" {
         // WP-gpui-spike-T7: debug-only Chromium-risk-page feasibility spike
         // (see `screens/spike_t7.rs`'s module doc comment). No `nav.rs`

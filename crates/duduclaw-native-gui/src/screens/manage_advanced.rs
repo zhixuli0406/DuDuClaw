@@ -17,16 +17,18 @@
 // an honest, flagged deviation, not a silent "fix" of the brief or a silent
 // drop of 2 real canvas rows to force the count to match.
 //
-// ── Every row is inert this round ────────────────────────────────────────
-// None of the 14 target pages exist in `nav.rs` yet — all 14 are S6-wave
-// scope per `commercial/docs/TODO-native-gui-page-migration-2026-08.md`'s
-// "S6 第三波" table (billing/license/distributors/security/secaudit/
-// governance/users/departments/logs/reliability/inference/local-models/
-// migrate/settings). Every row renders a trailing "即將推出" label instead
-// of a chevron, and carries NO `on_click` handler — same "an inert-looking
-// control is honest; a control that silently does nothing on click is a
-// worse lie" precedent `screens/agents_detail.rs`'s read-only capability
-// rows already establish for this crate.
+// ── Every row was inert at S5b1-A; 6 of 14 go live at S6b1-L ─────────────
+// None of the 14 target pages had a `nav.rs` entry when this file was
+// first built — all 14 are S6-wave scope per `commercial/docs/
+// TODO-native-gui-page-migration-2026-08.md`'s "S6 第三波" table (billing/
+// license/distributors/security/secaudit/governance/users/departments/
+// logs/reliability/inference/local-models/migrate/settings). Every row
+// still renders EITHER a trailing "即將推出" label (still-inert rows, no
+// `on_click` at all) OR a chevron + real `on_click` (the 6 rows this same
+// task's WP-S6b1-L pass wires below) — never a control that silently does
+// nothing on click, the "an inert-looking control is honest" precedent
+// `screens/agents_detail.rs`'s read-only capability rows already establish
+// for this crate.
 //
 // ── Icon glyphs, not hand-drawn stroke SVG ───────────────────────────────
 // The canvas draws a distinct hand-drawn stroke-SVG icon per row. This
@@ -39,6 +41,25 @@
 // No RPC calls on this page at all — it is a pure static navigation index,
 // same shape as `web/src/pages/ManageAdvancedPage.tsx` (functional
 // reference only, per this task's "版面禁抄 web" rule).
+//
+// ── WP-S6b1-L (S6b 第一波, 2026-08-21) — 6 of the 14 rows go live ─────────
+// This pass wires the 6 rows this wave's brief names (billing/license/
+// distributors/security/governance/users — the brief's own "成員/安全/治理"
+// wording maps to this file's existing `users`/`security`/`governance`
+// title keys) to real `active_page` navigation, via `AdvancedItem::target`.
+// The other 8 rows (secaudit/departments plus the entire 維運/其他 groups)
+// stay exactly as before — inert, "即將推出" trailing label, no click
+// handler — per this task's own "尚無真頁的項目保持惰性" instruction.
+//
+// A wired row's target id is safe to click even for a sibling workstream's
+// page that hasn't landed a `shell.rs` match arm yet (`billing`/`license`/
+// `security`/`governance` have no `nav.rs` entry and no `shell.rs` branch as
+// of this pass — only `users`/`distributors`, this same pass's own two
+// pages, do): `shell.rs`'s fallback branch renders ANY unmatched
+// `active_page` id as a generic placeholder heading, never panics — the
+// same "unwired id degrades to a placeholder, not a crash" property
+// `settings_common::breadcrumb`'s own doc comment already relies on for
+// exactly this kind of cross-workstream forward reference.
 
 use gpui::{div, prelude::*, px, Context, Div, Stateful};
 
@@ -50,10 +71,24 @@ struct AdvancedItem {
     glyph: char,
     title_key: &'static str,
     desc_key: &'static str,
+    /// `Some(active_page id)` when a real page exists to route to this
+    /// round; `None` keeps the row inert with a "即將推出" trailing label —
+    /// same "an inert-looking control is honest" precedent this file's own
+    /// header comment already establishes.
+    target: Option<&'static str>,
 }
 
 const fn advanced_item(glyph: char, title_key: &'static str, desc_key: &'static str) -> AdvancedItem {
-    AdvancedItem { glyph, title_key, desc_key }
+    AdvancedItem { glyph, title_key, desc_key, target: None }
+}
+
+const fn advanced_item_wired(
+    glyph: char,
+    title_key: &'static str,
+    desc_key: &'static str,
+    target: &'static str,
+) -> AdvancedItem {
+    AdvancedItem { glyph, title_key, desc_key, target: Some(target) }
 }
 
 struct AdvancedGroup {
@@ -62,16 +97,26 @@ struct AdvancedGroup {
 }
 
 const BILLING_GROUP_ITEMS: &[AdvancedItem] = &[
-    advanced_item('$', "manageAdvanced.item.billing.title", "manageAdvanced.item.billing.desc"),
-    advanced_item('K', "manageAdvanced.item.license.title", "manageAdvanced.item.license.desc"),
-    advanced_item('W', "manageAdvanced.item.distributors.title", "manageAdvanced.item.distributors.desc"),
+    advanced_item_wired('$', "manageAdvanced.item.billing.title", "manageAdvanced.item.billing.desc", "billing"),
+    advanced_item_wired('K', "manageAdvanced.item.license.title", "manageAdvanced.item.license.desc", "license"),
+    advanced_item_wired(
+        'W',
+        "manageAdvanced.item.distributors.title",
+        "manageAdvanced.item.distributors.desc",
+        "distributors",
+    ),
 ];
 
 const ACCESS_GROUP_ITEMS: &[AdvancedItem] = &[
-    advanced_item('S', "manageAdvanced.item.security.title", "manageAdvanced.item.security.desc"),
+    advanced_item_wired('S', "manageAdvanced.item.security.title", "manageAdvanced.item.security.desc", "security"),
     advanced_item('A', "manageAdvanced.item.secaudit.title", "manageAdvanced.item.secaudit.desc"),
-    advanced_item('G', "manageAdvanced.item.governance.title", "manageAdvanced.item.governance.desc"),
-    advanced_item('M', "manageAdvanced.item.users.title", "manageAdvanced.item.users.desc"),
+    advanced_item_wired(
+        'G',
+        "manageAdvanced.item.governance.title",
+        "manageAdvanced.item.governance.desc",
+        "governance",
+    ),
+    advanced_item_wired('M', "manageAdvanced.item.users.title", "manageAdvanced.item.users.desc", "users"),
     advanced_item('P', "manageAdvanced.item.departments.title", "manageAdvanced.item.departments.desc"),
 ];
 
@@ -110,8 +155,14 @@ fn item_glyph_badge(glyph: char) -> Div {
         .child(glyph.to_string())
 }
 
-fn item_row(locale: crate::i18n::Locale, item: &AdvancedItem, is_last: bool) -> Div {
-    let row = div()
+fn item_row(
+    locale: crate::i18n::Locale,
+    item: &AdvancedItem,
+    is_last: bool,
+    cx: &mut Context<RootView>,
+) -> Stateful<Div> {
+    let mut row = div()
+        .id(item.title_key)
         .flex()
         .items_center()
         .gap_3()
@@ -136,14 +187,32 @@ fn item_row(locale: crate::i18n::Locale, item: &AdvancedItem, is_last: bool) -> 
                         .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
                         .child(i18n::t(locale, item.desc_key)),
                 ),
-        )
-        .child(
+        );
+
+    row = match item.target {
+        Some(target) => row
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::alpha(theme::SURFACE_HOVER, 1.0)))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(theme::TEXT_XS))
+                    .text_color(theme::alpha(theme::MUTED_FOREGROUND, 0.6))
+                    .child(">"),
+            )
+            .on_click(cx.listener(move |this, _ev, _window, cx| {
+                this.active_page = target;
+                cx.notify();
+            })),
+        None => row.child(
             div()
                 .flex_shrink_0()
                 .text_size(px(theme::TEXT_XS))
                 .text_color(theme::alpha(theme::MUTED_FOREGROUND, 0.8))
                 .child(i18n::t(locale, "manageAdvanced.comingSoon")),
-        );
+        ),
+    };
+
     if is_last {
         row
     } else {
@@ -151,7 +220,7 @@ fn item_row(locale: crate::i18n::Locale, item: &AdvancedItem, is_last: bool) -> 
     }
 }
 
-fn group_box(locale: crate::i18n::Locale, group: &AdvancedGroup) -> Div {
+fn group_box(locale: crate::i18n::Locale, group: &AdvancedGroup, cx: &mut Context<RootView>) -> Div {
     let mut rows = div()
         .w_full()
         .flex()
@@ -163,7 +232,7 @@ fn group_box(locale: crate::i18n::Locale, group: &AdvancedGroup) -> Div {
         .border_color(theme::surface_border())
         .shadow(theme::surface_shadow());
     for (idx, item) in group.items.iter().enumerate() {
-        rows = rows.child(item_row(locale, item, idx == group.items.len() - 1));
+        rows = rows.child(item_row(locale, item, idx == group.items.len() - 1, cx));
     }
     div()
         .flex()
@@ -180,12 +249,12 @@ fn group_box(locale: crate::i18n::Locale, group: &AdvancedGroup) -> Div {
         .child(rows)
 }
 
-pub fn render(state: &RootView, _cx: &mut Context<RootView>) -> Stateful<Div> {
+pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
     let locale = state.locale;
 
     let mut group_rows = Vec::with_capacity(GROUPS.len());
     for group in GROUPS {
-        group_rows.push(group_box(locale, group));
+        group_rows.push(group_box(locale, group, cx));
     }
 
     let header = div()
@@ -241,6 +310,19 @@ mod tests {
         assert_eq!(ACCESS_GROUP_ITEMS.len(), 5);
         assert_eq!(OPS_GROUP_ITEMS.len(), 5);
         assert_eq!(OTHER_GROUP_ITEMS.len(), 1);
+    }
+
+    /// Trip-wire for this task's own wiring instruction: exactly 6 of the 14
+    /// rows carry a `target` this wave (billing/license/distributors/
+    /// security/governance/users) — everything else, including the two
+    /// group-1/2 siblings the brief deliberately left inert (secaudit/
+    /// departments), stays `None`. A future edit that silently wires or
+    /// un-wires a row updates this test too.
+    #[test]
+    fn exactly_six_rows_are_wired_this_wave() {
+        let mut wired: Vec<&str> = GROUPS.iter().flat_map(|g| g.items.iter()).filter_map(|i| i.target).collect();
+        wired.sort_unstable();
+        assert_eq!(wired, vec!["billing", "distributors", "governance", "license", "security", "users"]);
     }
 
     #[test]
