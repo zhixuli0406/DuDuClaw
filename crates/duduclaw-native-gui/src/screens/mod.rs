@@ -24,6 +24,11 @@ pub mod accounts;
 // shape `settings_common`/`agents_data`/`goals_data`/`tasks_data` already
 // establish.
 mod catalog_common;
+// WP-S5b3-I (2026-08-21) — 畫布 (`Canvas.dc.html`, B12). Single-file page —
+// see the module's own doc comment for RPC shapes and the HTML-rendering
+// honesty boundary (gpui has no browser/HTML-sandbox capability; see also
+// `panzoom` below, its pan/zoom-able content frame's shared primitive).
+pub mod canvas;
 // S5b (first wave) — 通道 (`Channels.dc.html`). Single-file page (no
 // split-out data/rows sibling needed at its current size, unlike
 // `goals`/`inbox`/`tasks`) — see the module's own doc comment for the RPC
@@ -51,6 +56,20 @@ pub mod experts;
 // one page in this crate whose data source is a REST route, not a WS RPC).
 pub mod files;
 mod files_data;
+// WP-S5b3-G (S5b 第三波, 2026-08-21) — "預測與驗證" (`Foresight.dc.html`,
+// B9). Single-file page — see the module's own doc comment for the
+// `forward.summary`/`forward.states`/`forward.recent`/`forward.calibration`
+// RPC shapes and the scope cut vs. `web/src/pages/ForesightPage.tsx` (no
+// belief tab, no chain drill-down, deterministic top-agent auto-pick for
+// calibration instead of a manual agent `<Select>`).
+pub mod foresight;
+// WP-S5b3-H (S5b 第三波, 2026-08-21) — "分支決戰" (`Forks.dc.html`, B13),
+// RFC-26 Live Run Forking. `forks_data` (types + pure parsing) is a sibling
+// of `forks`, split off for the same file-size reason `runs`/`runs_data` are
+// split — see `forks.rs`'s own module doc comment for the `fork.list`/
+// `fork.inspect` RPC shapes and the left-list title deviation.
+pub mod forks;
+mod forks_data;
 pub mod gallery;
 // WP-S5b1-C (2026-08-21) — "Google 工作區" (`GoogleIntegration.dc.html`), an
 // "整合" drill-down leaf reached via `RootView::active_page == "googleIntegration"`
@@ -59,11 +78,23 @@ pub mod gallery;
 // deviations; shares `settings_common`'s boxed-list/breadcrumb primitives
 // with its three sibling drill-down pages (`mcp`/`odoo`/`identity`).
 pub mod google_integration;
+// WP-S5b3-G (S5b 第三波, 2026-08-21) — "成長" (`Growth.dc.html`, B9). Single-
+// file page — see the module's own doc comment for the `growth.snapshot`/
+// `growth.daily_report` RPC shapes and the scope cut vs. `web/src/pages/
+// GrowthPage.tsx` (no 7-day archive picker — `growth.daily_report` is
+// called with no `date`, which reports yesterday only).
+pub mod growth;
 // WP-S5b1-C (2026-08-21) — "身分解析" (`Identity.dc.html`), an "整合"
 // drill-down leaf reached via `active_page == "identity"`. See the module's
 // own doc comment — the one page in this batch with a genuinely live
 // action (test-resolve).
 pub mod identity;
+// WP-S5b3-I (2026-08-21) — 信箱 (`Mail.dc.html`, B15, Agent Mail / P2-d).
+// Single-file page — see the module's own doc comment for the six `mail.*`
+// RPC shapes and why 確認寄出/不要寄/撰寫 are assembled but not wired (mail
+// leaving the building is an ApprovalBroker decision, per this WP's own
+// product-rule brief).
+pub mod mail;
 pub mod manage_advanced;
 // WP-S5b1-C (2026-08-21) — "工具伺服器（MCP）" (`Mcp.dc.html`), an "整合"
 // drill-down leaf reached via `active_page == "mcp"`. See the module's own
@@ -75,10 +106,39 @@ pub mod mcp;
 // for RPC shapes and why it carries its own local breadcrumb instead of
 // widening `settings_common::breadcrumb`.
 pub mod mcp_keys;
+// WP-S5b3-I (2026-08-21) — 記憶 (`Memory.dc.html`, B14). `memory_rows`
+// (category rail + list column) / `memory_detail` (right detail column) are
+// nested submodules declared inside `memory.rs` itself (files at
+// `screens/memory/*.rs`) — same page-private-sibling shape `plans.rs`/
+// `routines.rs` establish. See `memory.rs`'s own module doc comment for RPC
+// shapes and canvas fidelity notes (only the 記憶 tab is wired to real data;
+// the other three tabs render an honest stub).
+pub mod memory;
 // WP-S5b1-C (2026-08-21) — "Odoo ERP" (`Odoo.dc.html`), an "整合" drill-down
 // leaf reached via `active_page == "odoo"`. See the module's own doc
 // comment for RPC shapes and canvas deviations.
 pub mod odoo;
+// WP-S5b3-H (S5b 第三波, 2026-08-21) — "組織架構" (`OrgIndented.dc.html`,
+// 方案 A 縮排階層清單 — the user's own 2026-08-21 拍板; B/C alternatives not
+// built). `org_data` (types + `reports_to` tree flattening) is a sibling of
+// `org`, split off for the same file-size reason `runs`/`runs_data` are
+// split — see `org.rs`'s own module doc comment for the `agents.list` RPC
+// shape and why this page can't reuse `agents_data::AgentListItem`.
+pub mod org;
+mod org_data;
+// WP-S5b3-G (S5b 第三波, 2026-08-21) — "OS" (`Os.dc.html`, B9, KDE 兩層式).
+// Single-file page — see the module's own doc comment for the `agents.list`/
+// `os.status`/`os.gate.recent` RPC shapes and the scope cut vs. `web/src/
+// pages/OSPage.tsx` (no live event tail, no environment doctor, read-only).
+pub mod os;
+// WP-S5b3-I (2026-08-21) — shared pan/zoom primitive for `canvas.rs`/
+// `world.rs`'s content frames — see the module's own doc comment for why
+// this is re-layout zoom (plain `Div` sizes recomputed per render), not a
+// GPU transform (this crate's pinned gpui rev has no `Styled`-trait scale
+// method reachable from element-building code). Not `pub`: same "private
+// mod, `pub fn`/`pub struct` items reachable via `crate::screens::panzoom::…`"
+// shape `agents_data`/`goals_data`/`catalog_common` already establish.
+mod panzoom;
 // WP-S5b2-D (2026-08-21) — 共同計畫 (`Plans.dc.html`). `plans_rows`/
 // `plans_detail` are nested submodules declared inside `plans.rs` itself —
 // same page-private-sibling shape `routines.rs`/`routines_*.rs` use. See
@@ -89,6 +149,13 @@ pub mod plans;
 // — see the module's own doc comment for RPC shapes (`presets.list` +
 // per-agent `presets.status` fan-out) and canvas fidelity notes.
 pub mod presets;
+// WP-S5b3-G (S5b 第三波, 2026-08-21) — "分析報表" (`Reports.dc.html`, B9,
+// 總覽→深潛). Single-file page — see the module's own doc comment for the
+// `analytics.summary`/`analytics.conversations`/`analytics.cost_savings`/
+// `cost.summary`/`cost.agents` RPC shapes; the only page this wave whose
+// charts are gpui-canvas-drawn (line chart + bar chart) rather than
+// width-percentage divs, per this task's brief.
+pub mod reports;
 // WP-S5b1-C (2026-08-21) — shared boxed-list/breadcrumb/kv-row primitives
 // for the four "整合" drill-down pages above (`mcp`/`odoo`/
 // `google_integration`/`identity`) — see the module's own doc comment for
@@ -158,6 +225,14 @@ pub mod spike_t7;
 mod spike_t7_panzoom;
 mod spike_t7_timeline;
 pub mod system_updates;
+// WP-S5b3-H (S5b 第三波, 2026-08-21) — "工作時間軸" (`Timeline.dc.html`,
+// B10). `timeline_data` (types + lane-packing/kind-color layout) is a
+// sibling of `timeline`, split off for the same file-size reason
+// `runs`/`runs_data` are split — see `timeline.rs`'s own module doc comment
+// for the `timeline.list` RPC shape and the spike_t7_timeline.rs painting
+// recipe this page follows.
+pub mod timeline;
+mod timeline_data;
 // S4b third wave — the "任務" list page (p09) + its full detail page (p10).
 // `tasks_data` (types + pure parsing/filtering), `tasks_quickview` (list
 // page's right-column quick view), `tasks_detail` (the in-page full detail
@@ -176,6 +251,13 @@ mod tasks_quickview;
 // user_id` addition it needed for the 我的/團隊分享 split, and the
 // decorative-thumbnail deviation (no HTML-sandbox rendering in gpui).
 pub mod widgets;
+// WP-S5b3-I (2026-08-21) — 世界 (`World.dc.html`, a B12 variant). Single-file
+// page — see the module's own doc comment for why it reuses `agents.list`
+// (no dedicated "world state" RPC exists), the deterministic token-scatter
+// hash, and the canvas fidelity deviations (no fabricated speech-bubble
+// status text; scene switcher is real but client-local UI state, same as
+// the web `WorldStage`'s own `localStorage`-only scene choice).
+pub mod world;
 // Column 1/Column 2/shared-row internals of `shell.rs` — see that file's
 // header comment for why the three-column app shell is split across
 // multiple files (this crate's own <300-line-per-file convention). Not
