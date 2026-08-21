@@ -22,11 +22,18 @@ mod update;
 
 use gpui::{Context, Div};
 
-use super::widgets::AccountFields;
+use super::widgets::{AccountFields, NetworkFields};
 use super::{OobeFlow, OobeStep, OobeUiState};
 use crate::ShellView;
 
-pub(super) fn render(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, account_fields: &AccountFields, cx: &mut Context<ShellView>) -> Div {
+pub(super) fn render(
+    step: OobeStep,
+    flow: &OobeFlow,
+    ui: &OobeUiState,
+    account_fields: &AccountFields,
+    network_fields: &NetworkFields,
+    cx: &mut Context<ShellView>,
+) -> Div {
     match step {
         // `input_detection`/`update` now take the whole `&OobeFlow` (not
         // just `flow.locale()`, round 2's shape) — as of the `Theme` step
@@ -36,7 +43,7 @@ pub(super) fn render(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, account_
         // need, but take it FROM `flow`" shape every other arm already has.
         OobeStep::InputDetection => input_detection::render(flow),
         OobeStep::LanguageAccessibility => language::render(flow, ui, cx),
-        OobeStep::Network => network::render(flow, cx),
+        OobeStep::Network => network::render(flow, ui, network_fields, cx),
         OobeStep::Update => update::render(flow),
         OobeStep::AccountCreate => account::render(flow, ui, account_fields, cx),
         OobeStep::RuntimeAuth => runtime_auth::render(flow, cx),

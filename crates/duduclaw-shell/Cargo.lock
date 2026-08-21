@@ -1368,8 +1368,9 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "duduclaw-native-gui"
-version = "0.1.0"
+version = "1.62.0"
 dependencies = [
+ "chrono",
  "futures-util",
  "gpui",
  "gpui_macros",
@@ -1384,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-shell"
-version = "0.1.0"
+version = "1.62.0"
 dependencies = [
  "duduclaw-native-gui",
  "gpui",
@@ -1392,6 +1393,7 @@ dependencies = [
  "gpui_platform",
  "serde",
  "serde_json",
+ "zbus",
 ]
 
 [[package]]

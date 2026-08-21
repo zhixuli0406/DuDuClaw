@@ -204,6 +204,17 @@ impl OobeTextField {
         cx.new(|cx| Self { content: String::new(), placeholder: placeholder.into(), masked, focus_handle: cx.focus_handle() })
     }
 
+    /// Resets typed content back to empty — `steps::network`'s "取消"
+    /// (cancel) handler on the PSK prompt, so re-picking a secured network
+    /// after backing out never shows a stale password from a previous
+    /// attempt. `AccountFields`'s two fields have no equivalent call site
+    /// (see `NetworkFields`'s own doc comment for why): the `AccountCreate`
+    /// step has no "cancel and start over" affordance.
+    pub(crate) fn clear(&mut self, cx: &mut Context<Self>) {
+        self.content.clear();
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         // Let anything chorded with cmd/ctrl/function fall through — same
@@ -315,5 +326,29 @@ impl AccountFields {
             name: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_NAME, false),
             password: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true),
         }
+    }
+}
+
+/// The `Network` step's PSK entry field (Shell-S3, 2026-08-21) — same
+/// "bundle the one-per-step `Entity<OobeTextField>` so `main.rs` only needs
+/// one field on `ShellView`" shape `AccountFields` already establishes
+/// above, re-derived here rather than folded INTO `AccountFields` because
+/// the two steps' fields have unrelated lifecycles (this one is only ever
+/// read while `NetConnectState::AwaitingPsk` holds; `steps::network`'s
+/// cancel handler clears its typed content back to empty via
+/// `OobeTextField::clear`, something `AccountFields`'s two fields never
+/// need since the `AccountCreate` step has no "cancel and pick a different
+/// target" affordance).
+pub(crate) struct NetworkFields {
+    pub(crate) psk: Entity<OobeTextField>,
+}
+
+impl NetworkFields {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        // Same masked-dots placeholder `AccountFields`'s own password field
+        // uses — a generic "this field is masked" shape hint, not a
+        // localized string (see that field's own construction above for
+        // why `fake_data`'s constants stay unlocalized placeholders).
+        Self { psk: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true) }
     }
 }

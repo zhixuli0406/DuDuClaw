@@ -19,6 +19,17 @@
 // because the case for translating them is weak. Flagged here for whoever
 // wires Templates i18n for real in a later round.
 
+/// Shell-S3 (2026-08-21) update: this table is no longer read directly by
+/// `steps::network` — it now backs `network::FakeNetworkBackend::scan()`
+/// (`oobe/network/fake.rs`), reached through the `NetworkBackend` trait
+/// like the real NetworkManager backend is. The table itself is unchanged
+/// (still hand-authored example SSIDs, still not routed through
+/// `crate::i18n` — see this file's own header comment above), but "選取→假
+/// 連線成功" (Shell-S1's original, no-failure-path behavior) no longer
+/// applies verbatim: `FakeNetworkBackend::connect` now honors the same
+/// PSK-length precondition a secured network needs, so a click on one of
+/// the `secured: true` rows below CAN fail in the dev/demo build too — see
+/// that module's own header comment.
 pub(super) struct FakeWifiNetwork {
     pub(super) ssid: &'static str,
     /// 1..=4, purely decorative (rendered as filled bars, see

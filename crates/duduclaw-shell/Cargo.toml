@@ -64,3 +64,24 @@ duduclaw-native-gui = { path = "../duduclaw-native-gui" }
 # transitive deps of gpui's own tree, so this adds negligible build cost.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Shell-S3 (2026-08-21): real Wi-Fi backend (`oobe/network/nm.rs`) talks to
+# NetworkManager over D-Bus. `[target.'cfg(...)'.dependencies]`, same
+# per-platform gating shape `gpui_linux` already gets via `gpui_platform`'s
+# `wayland` feature above — Linux is DuDuClaw OS's actual ship target
+# (`BUILD-LINUX.md` calls it that explicitly), macOS is this crate's
+# dev-loop host only and has no D-Bus/NetworkManager to talk to, so
+# `zbus`'s entire dependency tree (async-io, futures-util, nix, …) never
+# enters this crate's macOS build graph at all — confirmed the same way the
+# `wayland` feature's inertness was confirmed (`BUILD-LINUX.md`'s "macOS
+# regression check": `cargo test` here stays green with zero new deps
+# actually compiled). Default features (`async-io` + `blocking-api`) are
+# exactly what's needed: `blocking-api` is what exposes `zbus::blocking::
+# {Connection,Proxy}` (the API `nm.rs` uses — see that module's own header
+# comment for why the generic `Proxy`, not the `#[zbus::proxy]` macro), and
+# `async-io` is `blocking-api`'s own required runtime underneath — a small,
+# self-contained executor, NOT `tokio`, so this stays consistent with
+# `oobe/claim.rs`'s "no tokio in this crate" reasoning even though `zbus`
+# itself is now a dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"

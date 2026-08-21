@@ -499,3 +499,79 @@ winit backend, so it needs a host compositor with a seat inside the VM
 One transient `connector Virtual-1: Atomic commit failed: Device or
 resource busy` appears in cage's log at kiosk→cage handover; harmless in
 this run (rendering proceeded), not chased.
+
+## Shell-S3 (2026-08-21): `zbus` dependency — verified dependency list unchanged
+
+The real Wi-Fi backend (`oobe/network/nm.rs`, NetworkManager over D-Bus)
+adds `zbus` as a `[target.'cfg(target_os = "linux")'.dependencies]` crate
+(`Cargo.toml` — see that entry's own comment). `zbus` is a pure-Rust D-Bus
+implementation (it does NOT link against `libdbus`/`libdbus-1-dev`), so the
+natural assumption going in was that it would need one anyway — checked the
+same way this file's own "Verified minimal dependency list" section already
+checks such assumptions: a full FRESH build (empty target dir, warm
+registry/git caches only) with `libdbus-1-dev` installed succeeded, then a
+SECOND full fresh build (separate empty target dir) with `libdbus-1-dev`
+deliberately omitted succeeded too, both `cargo build`/`cargo clippy
+--all-targets -- -D warnings`/`cargo test` clean. **Verified minimal
+dependency list from this file's B-① section is still exactly correct as
+of this round — `zbus` adds zero new system packages.** `cargo clippy`
+additionally needed `rustup component add clippy` in the `rust:bookworm`
+image (not present by default, unlike `rustc`/`cargo`).
+
+### Real NetworkManager activity check (verified 2026-08-21)
+
+`nm.rs` gained a live-fire `#[ignore]`d test
+(`oobe::network::nm::tests::live_probe_against_real_networkmanager`, same
+"never run by a bare `cargo test`" contract `oobe::claim`'s own live gateway
+test already establishes) and it was actually run against a REAL
+NetworkManager instance, not just compile-checked:
+
+```bash
+docker run --rm --privileged \
+  -v /Users/lizhixu/Project/DuDuClaw:/work \
+  -v duduclaw-shell-cargo:/usr/local/cargo/registry \
+  -v duduclaw-shell-cargo-git:/usr/local/cargo/git \
+  -v duduclaw-shell-target:/target \
+  -e CARGO_TARGET_DIR=/target \
+  -w /work/crates/duduclaw-shell \
+  rust:bookworm bash -c '
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends \
+      pkg-config libwayland-dev libxkbcommon-dev libfontconfig1-dev dbus network-manager
+    mkdir -p /run/dbus && dbus-daemon --system --fork && sleep 1
+    NetworkManager --no-daemon &
+    sleep 3
+    cargo test -- --ignored live_probe_against_real_networkmanager --nocapture
+  '
+```
+
+Result: `probe()` succeeded (real `Connection::system()` + a real
+`org.freedesktop.NetworkManager` `Devices` property read); `scan()` reached
+`wifi_device_path()`, enumerated all 11 `Devices` NetworkManager reported in
+that container, correctly found none of `DeviceType == 2` (no container has
+a real Wi-Fi radio), and returned the honest `Unavailable("no Wi-Fi adapter
+found")` — the CORRECT outcome, not a failure of the code; `status()`
+correctly returned `Disconnected`; `forget()` round-tripped its
+`ListConnections` + `GetSettings` calls against NetworkManager's real
+Settings service (deserializing the nested `a{sa{sv}}` reply into
+`HashMap<String, HashMap<String, OwnedValue>>` — this module's structurally
+most complex D-Bus type, and the one code path `scan()`'s early failure
+above never reaches) and correctly returned `NotFound` for a made-up SSID.
+
+**What this proves**: the `zbus::blocking::Proxy` wire-level calls
+(`Proxy::new`, `.get_property::<T>()`, `.call::<_, _, R>()`) are not just
+type-correct against the D-Bus signatures this module assumes — they
+round-trip against a REAL NetworkManager's real replies, for `Devices`/
+`DeviceType`/`ListConnections`/`GetSettings`.
+
+**What remains unverified** (no real Wi-Fi hardware reachable in any
+available environment — Docker container, this repo's other VM tooling, or
+this task's own sandbox): `RequestScan` + the `LastScan`-poll wait +
+`GetAccessPoints`'s `Ssid`/`Strength`/`Flags`/`WpaFlags`/`RsnFlags`
+properties (the actual scan RESULT path), `AddAndActivateConnection` +
+`poll_until_settled`'s `Device.State` polling (the actual join/connect
+path). Both are compile-verified (this file's B-① equivalent) and
+design-verified (read against the NetworkManager D-Bus API spec, see
+`nm.rs`'s own header/inline comments) but not activity-verified — left for
+the acceptance round, same honesty bar this file's own B-③ section applies
+to `duduclaw-comp`'s input forwarding.

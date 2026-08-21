@@ -23,12 +23,12 @@ use gpui::{div, prelude::*, px, Context, Stateful, Div};
 
 use duduclaw_native_gui::theme;
 
-use super::widgets::{self, AccountFields, StepButtonVariant};
+use super::widgets::{self, AccountFields, NetworkFields, StepButtonVariant};
 use super::{steps, OobeFlow, OobeStep, OobeUiState};
 use crate::i18n::{t, Key};
 use crate::ShellView;
 
-pub fn render(flow: &OobeFlow, ui: &OobeUiState, account_fields: &AccountFields, cx: &mut Context<ShellView>) -> Stateful<Div> {
+pub fn render(flow: &OobeFlow, ui: &OobeUiState, account_fields: &AccountFields, network_fields: &NetworkFields, cx: &mut Context<ShellView>) -> Stateful<Div> {
     let step = flow.current();
     let palette = flow.palette();
     // Ambient theme for `widgets::OobeTextField` (the ONE OOBE widget that
@@ -74,7 +74,7 @@ pub fn render(flow: &OobeFlow, ui: &OobeUiState, account_fields: &AccountFields,
                 // the approved design boards, where every card is the full
                 // 640 column. Title/subtitle centering is each step root's
                 // own `.items_center()`, not this wrapper's job.
-                .child(div().w(px(640.)).flex().flex_col().gap(px(20.)).child(steps::render(step, flow, ui, account_fields, cx))),
+                .child(div().w(px(640.)).flex().flex_col().gap(px(20.)).child(steps::render(step, flow, ui, account_fields, network_fields, cx))),
         )
         .child(button_row(step, flow, cx))
 }

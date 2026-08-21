@@ -151,6 +151,11 @@ pub struct ShellView {
     /// plain data with no gpui types) and why they're created once,
     /// unconditionally, at window-open time rather than lazily.
     pub(crate) oobe_account_fields: oobe::AccountFields,
+    /// The `Network` step's real PSK entry field (Shell-S3, 2026-08-21) —
+    /// same reasoning as `oobe_account_fields` just above (created once,
+    /// unconditionally, at window-open time — see `oobe::NetworkFields`'s
+    /// own doc comment for why it isn't folded into that same field).
+    pub(crate) oobe_network_fields: oobe::NetworkFields,
     /// Home/overlay's own theme choice — Shell-S1 (2026-08-20). Set
     /// once at window-open time from `oobe::boot_theme(&persisted_oobe_
     /// state)` (see that fn's own doc comment for why it's read independent
@@ -295,7 +300,7 @@ impl Render for ShellView {
         // overlay-render call further down.
         let home_palette = palette::ShellPalette::for_choice(self.theme);
         root = if let Some(flow) = &self.oobe {
-            root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, cx))
+            root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, &self.oobe_network_fields, cx))
         } else {
             root.child(home::render(home_palette, cx))
         };
@@ -355,6 +360,12 @@ impl Render for ShellView {
 //     original (pre-round-1) local-only click behavior, for headless smoke
 //     runs with no gateway reachable. Read in `oobe/steps/account.rs`'s
 //     click handler — see that file's own header comment.
+// One more as of Shell-S3 (2026-08-21, real Wi-Fi backend):
+//   - `DUDUCLAW_SHELL_FAKE_NET=1` — forces the `Network` step's demo Wi-Fi
+//     backend regardless of platform, same shape as
+//     `DUDUCLAW_SHELL_OOBE_LOCAL_ACCOUNT` above. Read in
+//     `oobe/network/mod.rs`'s `select_backend()` — see that fn's own doc
+//     comment.
 fn main() {
     eprintln!("[main] starting duduclaw-shell S0");
 
@@ -398,12 +409,14 @@ fn main() {
                     // `cx.new(|cx| ...)` call below shadows `cx` with
                     // `&mut Context<ShellView>`.
                     let oobe_account_fields = oobe::AccountFields::new(cx);
+                    let oobe_network_fields = oobe::NetworkFields::new(cx);
                     cx.new(|cx| ShellView {
                         surface: SurfaceState::default(),
                         overlay_ui: overlay::OverlayUiState::default(),
                         oobe: initial_oobe,
                         oobe_ui: oobe::OobeUiState::default(),
                         oobe_account_fields,
+                        oobe_network_fields,
                         theme: initial_theme,
                         focus_handle: cx.focus_handle(),
                         diag: std::env::var("DUDUCLAW_SHELL_DIAG").is_ok_and(|v| v == "1"),
