@@ -44,9 +44,12 @@
 //   監控 (monitor)     — home, reports. `home` (the old flat-rail dashboard)
 //                        and `reports` (old tail of `工作`) are both
 //                        "look, don't touch" surfaces — CHART_2 hue.
-//   管理 (manage)      — about only. See "Two settle-related decisions"
-//                        below for why `manage`/`componentLibrary` are NOT
-//                        here.
+//   管理 (manage)      — originally `about` only (Phase 1a placeholder,
+//                        since nothing else had an id yet); superseded by
+//                        the S5b1-A update below, which is now this area's
+//                        current, real membership. See "Two settle-related
+//                        decisions" for why `manage`/`componentLibrary` are
+//                        NOT here (footer-pinned instead).
 //
 // ── Two settle-related decisions worth stating explicitly ───────────────
 // 1. `manage` (nav.manage, "管理" — its own i18n desc is literally "整合、
@@ -55,21 +58,34 @@
 //    (macOS Cmd-,/Windows `IsSettingsVisible`) — this crate has no separate
 //    "Preferences" id to invent, and `manage` already covers exactly that
 //    ground. Reusing it avoids adding a synthetic id nothing else points at.
-// 2. That leaves the "管理" AREA (a distinct 6th top-level area, per the
-//    task brief's "channels/integrations/accounts/updates/advanced"
-//    grouping) with nothing but `about` to hold — this Phase-1a subset has
-//    no separate ids for those sub-pages yet (the full `web` app's
-//    `manageNav`/`manageAdvancedNav` — 15+ rows — isn't ported here; see the
-//    old file's header comment on "representative SUBSET" scope). `about`
-//    is the one id that doesn't fit any of the other 5 areas and isn't
-//    itself a settings-hub id, so it becomes this area's sole occupant.
-//    `about` is ALSO reachable from the macOS menu bar (App ▸ About
-//    DuDuClaw, see `main.rs`'s `ShowAbout` action) — belt-and-suspenders,
-//    not exclusive, so non-macOS builds (no menu bar this pass) don't lose
-//    the only way to reach it.
+// 2. `componentLibrary` is pinned to `FOOTER_ITEMS` per the task brief
+//    verbatim ("「設定」與「元件庫」釘在側欄 footer…不進分組").
 //
-// `componentLibrary` is pinned to `FOOTER_ITEMS` per the task brief
-// verbatim ("「設定」與「元件庫」釘在側欄 footer…不進分組").
+// ── S5b1-A update (2026-08-21): the "管理" AREA gained real occupants ────
+// The Phase-1a placeholder above ("管理" area holds only `about`, since
+// nothing else had an id yet) is now stale — WP-S5b1-A wires four of the
+// S5 settings pages (`device`/`manageAdvanced`/`systemUpdates`/`accounts`)
+// plus two placeholder rows this same wave predefines for a sibling package
+// to fill in (`channels`/`integrations`). `MANAGE_ITEMS` below is now the
+// literal 6-item membership the S5 canvas's own "統一側欄組成" panel spells
+// out (`commercial/design/duduclaw-s5-settings-pages/Main.dc.html`,
+// approved 2026-08-21): 通道／整合／帳戶與登入／系統更新／裝置／進階設定, in
+// that exact order.
+//
+// `about` is deliberately DROPPED from this area, not folded in as a 7th
+// item — the approved canvas's own sidebar mockup (all 10 artboards share
+// one literal sidebar HTML fragment) renders exactly those 6 rows, and the
+// cover sheet's "與 web 版面的刻意差異" §4 states the group "從 S4a 的 2 項
+// 擴充為 6 項（通道／整合／帳戶與登入／系統更新／裝置／進階設定）" — an
+// enumerated list that does not include `about`. `about` stays fully
+// reachable exactly as before via the macOS menu bar (App ▸ About DuDuClaw,
+// `main.rs`'s `ShowAbout` action sets `active_page = "about"` directly, with
+// no dependency on `nav::find`/`AREAS` membership) — this file's own
+// `screens/about.rs` doc comment already documented that path as
+// "belt-and-suspenders, not exclusive"; it is now the ONLY path on this
+// build. Non-macOS builds (no menu bar yet) lose sidebar reachability for
+// this one page until a future pass gives it one — an accepted, documented
+// gap, not a silent regression (tracked by this comment, not hidden).
 
 use crate::theme;
 
@@ -160,8 +176,22 @@ const MONITOR_ITEMS: &[NavItem] = &[
     item("reports", "nav.reports", "nav.reports.desc", 'A', theme::CHART_2),
 ];
 
-const MANAGE_ITEMS: &[NavItem] =
-    &[item("about", "nav.about", "nav.about.desc", 'I', theme::MUTED_FOREGROUND)];
+// S5b1-A (2026-08-21): the real 6-item "管理" membership — order matches
+// the approved S5 canvas's sidebar exactly (see this file's header comment
+// on the S5b1-A update). `channels`/`integrations` are placeholder rows
+// this wave predefines (their target screens are a sibling package's scope,
+// landing in a later commit); until then `shell.rs`'s generic fallback
+// branch renders their `label_key`/`desc_key` as an honest "here's what
+// this page is, not yet wired" placeholder heading — never a blank page or
+// a silent redirect.
+const MANAGE_ITEMS: &[NavItem] = &[
+    item("channels", "nav.channels", "nav.channels.desc", 'C', theme::MUTED_FOREGROUND),
+    item("integrations", "nav.integrations", "nav.integrations.desc", 'I', theme::MUTED_FOREGROUND),
+    item("accounts", "nav.accounts", "nav.accounts.desc", 'A', theme::MUTED_FOREGROUND),
+    item("systemUpdates", "nav.systemUpdates", "nav.systemUpdates.desc", 'U', theme::MUTED_FOREGROUND),
+    item("device", "nav.device", "nav.device.desc", 'D', theme::MUTED_FOREGROUND),
+    item("manageAdvanced", "nav.manageAdvanced", "nav.manageAdvanced.desc", 'S', theme::MUTED_FOREGROUND),
+];
 
 /// The 6 top-level areas, in the sidebar's rendered order — see this
 /// module's header comment for the full id→area mapping and rationale.
@@ -171,8 +201,10 @@ pub const AREAS: &[NavArea] = &[
     area("areaTasks", "navArea.tasks", 'T', theme::SUCCESS, TASKS_ITEMS),
     area("areaKnowledge", "navArea.knowledge", 'K', theme::INFO, KNOWLEDGE_ITEMS),
     area("areaMonitor", "navArea.monitor", 'M', theme::CHART_2, MONITOR_ITEMS),
-    // Badge deliberately mirrors `about`'s own (see header comment §2): this
-    // area is a single-item pass-through, not a real second-level grouping.
+    // Badge kept as the neutral `MUTED_FOREGROUND` "settings" hue — same
+    // "one hue per group" convention every other area follows, and the same
+    // tone `about`'s own former solo badge used before S5b1-A gave this
+    // area 6 real occupants.
     area("areaManage", "navArea.manage", 'I', theme::MUTED_FOREGROUND, MANAGE_ITEMS),
 ];
 
@@ -228,9 +260,16 @@ mod tests {
     /// 保留映射" requirement, enforced rather than just asserted in a
     /// comment. If a future edit drops an id from `AREAS`/`FOOTER_ITEMS`
     /// without updating this list too, this test is the trip-wire.
+    ///
+    /// `about` is deliberately NOT in this list as of S5b1-A (2026-08-21) —
+    /// see this file's header comment on the S5b1-A update for why the
+    /// approved S5 canvas drops it from the sidebar's "管理" area (it stays
+    /// reachable via the macOS menu bar only). Removing a legacy id from
+    /// this list is exactly the kind of change this test exists to catch if
+    /// done silently; this is the one documented, approved exception.
     const LEGACY_IDS: &[&str] = &[
         "newChat", "home", "console", "routines", "plans", "goals", "runs", "files", "tasks",
-        "reports", "skills", "memory", "agents", "world", "growth", "experts", "manage", "about",
+        "reports", "skills", "memory", "agents", "world", "growth", "experts", "manage",
         "componentLibrary",
     ];
 
@@ -239,6 +278,30 @@ mod tests {
         for id in LEGACY_IDS {
             assert!(find(id).is_some(), "legacy nav id {id:?} no longer resolves via find()");
         }
+    }
+
+    /// S5b1-A (2026-08-21): the "管理" area's 6-item membership, in the
+    /// exact order the approved S5 canvas's sidebar renders them — a trip-
+    /// wire against a future edit silently reordering or dropping one of
+    /// these without updating the canvas-derived comment above.
+    #[test]
+    fn manage_area_has_the_six_s5_canvas_items_in_order() {
+        let manage = AREAS.iter().find(|a| a.id == "areaManage").expect("areaManage must exist");
+        let ids: Vec<&str> = manage.items.iter().map(|i| i.id).collect();
+        assert_eq!(
+            ids,
+            vec!["channels", "integrations", "accounts", "systemUpdates", "device", "manageAdvanced"]
+        );
+    }
+
+    /// `about` is intentionally absent from every area and from the footer
+    /// as of S5b1-A — it is reachable only via the macOS menu bar now (see
+    /// `LEGACY_IDS`'s doc comment). This positive assertion makes that
+    /// absence a deliberate, tested fact rather than something a future
+    /// reader has to infer from a comment alone.
+    #[test]
+    fn about_is_no_longer_a_sidebar_nav_item() {
+        assert!(find("about").is_none());
     }
 
     #[test]
