@@ -14,6 +14,11 @@ mod agents_summary;
 // see the module's own doc comment for the RPC shapes and the B6/B8-hybrid
 // canvas fidelity notes.
 pub mod accounts;
+// WP-S6b1-J (2026-08-21) — "帳務" (`BillingPage.dc.html`, B17), a "進階設定"
+// drill-down leaf reached via `active_page == "billing"`. See the module's
+// own doc comment for the `billing.usage`/`accounts.budget_summary`/
+// `budget.incidents` RPC shapes and canvas deviations.
+pub mod billing;
 // WP-S5b2-E (2026-08-21) — shared page-header/breadcrumb/category-grouping/
 // catalog-card primitives for this wave's five "型錄卡牆" pages (`presets`/
 // `skills`/`experts`/`inspiration_gallery`/`widgets`, all below) — same "one
@@ -44,6 +49,11 @@ mod dashboard_cards;
 // own doc comment).
 pub mod device;
 mod device_backup;
+// WP-S6b1-L (S6b 第一波, 2026-08-21) — "經銷" (`DistributorsPage.dc.html`,
+// B19). Single-file page — see the module's own doc comment for the
+// `distributor.list` RPC shape, why `distributor.status` isn't ALSO called,
+// and the tier-badge/fingerprint-mask canvas deviations.
+pub mod distributors;
 // WP-S5b2-E (2026-08-21) — "AI 團隊" (`Experts.dc.html`). Single-file page —
 // see the module's own doc comment for RPC shapes and canvas deviations
 // (the catalog-card skill/wiki-count fabrication the canvas draws but the
@@ -78,6 +88,11 @@ pub mod gallery;
 // deviations; shares `settings_common`'s boxed-list/breadcrumb primitives
 // with its three sibling drill-down pages (`mcp`/`odoo`/`identity`).
 pub mod google_integration;
+// WP-S6b1-K (S6b 第一波, 2026-08-21) — "治理規則" (`GovernancePage.dc.html`,
+// B18) + the shared `GovernanceShell` tabs/breadcrumb/spawn_call primitives
+// `wiki_trust.rs` (below) also imports — see the module's own doc comment
+// for RPC shapes and canvas fidelity deviations.
+pub mod governance;
 // WP-S5b3-G (S5b 第三波, 2026-08-21) — "成長" (`Growth.dc.html`, B9). Single-
 // file page — see the module's own doc comment for the `growth.snapshot`/
 // `growth.daily_report` RPC shapes and the scope cut vs. `web/src/pages/
@@ -96,6 +111,12 @@ pub mod identity;
 // product-rule brief).
 pub mod mail;
 pub mod manage_advanced;
+// WP-S6b1-J (2026-08-21) — shared breadcrumb + LicenseShell tab-strip
+// primitives for this batch's 3 "進階設定" drill-down pages (`billing`/
+// `license`/`partner_portal`, all in this file). See the module's own doc
+// comment for why this is its own module rather than widening
+// `settings_common` (a different batch's "整合" breadcrumb root).
+mod manage_advanced_common;
 // WP-S5b1-C (2026-08-21) — "工具伺服器（MCP）" (`Mcp.dc.html`), an "整合"
 // drill-down leaf reached via `active_page == "mcp"`. See the module's own
 // doc comment for RPC shapes and canvas deviations.
@@ -139,6 +160,10 @@ pub mod os;
 // mod, `pub fn`/`pub struct` items reachable via `crate::screens::panzoom::…`"
 // shape `agents_data`/`goals_data`/`catalog_common` already establish.
 mod panzoom;
+// WP-S6b1-J (2026-08-21) — "經銷夥伴入口" (`PartnerPortalPage.dc.html`, B19),
+// the LicenseShell's second tab (see `screens::license`). See the module's
+// own doc comment for the `partner.*` RPC shapes and canvas deviations.
+pub mod partner_portal;
 // WP-S5b2-D (2026-08-21) — 共同計畫 (`Plans.dc.html`). `plans_rows`/
 // `plans_detail` are nested submodules declared inside `plans.rs` itself —
 // same page-private-sibling shape `routines.rs`/`routines_*.rs` use. See
@@ -188,6 +213,12 @@ pub mod inspiration_gallery;
 // navigation contract.
 pub mod integrations;
 pub mod language_picker;
+// WP-S6b1-J (2026-08-21) — "授權" (`LicensePage.dc.html`, B16+B18), a
+// "進階設定" drill-down leaf; also hosts the LicenseShell tab strip shared
+// with `screens::partner_portal`. See the module's own doc comment for the
+// `license.status` RPC shape, the verified tier-string wire values, and the
+// canvas deviations.
+pub mod license;
 pub mod login;
 pub mod prototypes;
 // WP-S5b2-D (2026-08-21) — 例行工作 (`Routines.dc.html`). `routines_rows`
@@ -206,6 +237,11 @@ pub mod routines;
 // own doc comment for the `runs.list`/`runs.get` RPC shapes.
 pub mod runs;
 mod runs_data;
+// WP-S6b1-K (S6b 第一波, 2026-08-21) — "安全" (`SecurityPage.dc.html`, B5+
+// B18 合併版). Single-file page — see the module's own doc comment for the
+// `security.status` RPC shape and canvas fidelity deviations (緊急控制 has
+// no backing RPC field at all; RBAC "最後變更" column has none either).
+pub mod security;
 pub mod shell;
 // WP-S5b2-E (2026-08-21) — "技能庫" (`Skills.dc.html`, "市場" tab only —
 // the other three tabs render as an honest stub per this WP's brief).
@@ -246,11 +282,21 @@ mod tasks_data;
 mod tasks_detail;
 mod tasks_detail_data;
 mod tasks_quickview;
+// WP-S6b1-L (S6b 第一波, 2026-08-21) — "成員" (`UsersPage.dc.html`, B19).
+// Single-file page — see the module's own doc comment for the `users.list`
+// RPC shape and the 通道身分-column/status-label canvas deviations.
+pub mod users;
 // WP-S5b2-E (2026-08-21) — "Widget 工坊" (`Widgets.dc.html`). Single-file
 // page — see the module's own doc comment for RPC shapes, the `RootView::
 // user_id` addition it needed for the 我的/團隊分享 split, and the
 // decorative-thumbnail deviation (no HTML-sandbox rendering in gpui).
 pub mod widgets;
+// WP-S6b1-K (S6b 第一波, 2026-08-21) — "Wiki 信任層級" (`WikiTrustPage.dc.
+// html`, B18) — the second tab of the `GovernanceShell` `governance.rs`
+// owns (see that module's own doc comment). Single-file page — see this
+// module's own doc comment for the `agents.list`/`wiki.trust_audit` RPC
+// shapes and canvas fidelity deviations.
+pub mod wiki_trust;
 // WP-S5b3-I (2026-08-21) — 世界 (`World.dc.html`, a B12 variant). Single-file
 // page — see the module's own doc comment for why it reuses `agents.list`
 // (no dedicated "world state" RPC exists), the deterministic token-scatter
