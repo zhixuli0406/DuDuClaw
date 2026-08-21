@@ -86,6 +86,33 @@
 // build. Non-macOS builds (no menu bar yet) lose sidebar reachability for
 // this one page until a future pass gives it one — an accepted, documented
 // gap, not a silent regression (tracked by this comment, not hidden).
+//
+// ── S5b2-D update (2026-08-21): four areas reshuffled per the work-pages
+// canvas ──────────────────────────────────────────────────────────────────
+// WP-S5b2-D ("S5b 第二波" — this crate's sole `nav.rs`/`shell.rs` editor for
+// the wave, per its own task brief) wires the S5a work-pages canvas
+// (`commercial/design/duduclaw-s5-work-pages/`, approved 2026-08-21) into
+// `AREAS`. Four constants change; see each constant's own comment above for
+// the full per-area reasoning. Summary of WHERE ids moved (every id keeps a
+// home — none dropped, same "既有頁 id 全部保留映射" rule §20 states):
+//   `files`:  KNOWLEDGE_ITEMS → TASKS_ITEMS   (work-with-your-files, not
+//             generic knowledge — matches the canvas's own §2 rationale)
+//   `skills`: KNOWLEDGE_ITEMS → AGENTS_ITEMS  (an agent capability, grouped
+//             with the AI-employee pages that configure agents)
+//   `runs`:   TASKS_ITEMS → MONITOR_ITEMS     (this wave's explicit "「監控」
+//             加 執行紀錄" instruction)
+//   `presets`/`gallery`/`widgets`: brand-new ids this wave, landing directly
+//             in AGENTS_ITEMS/AGENTS_ITEMS/KNOWLEDGE_ITEMS respectively.
+// Recolored to match each NEW area's established "one hue per GROUP"
+// convention (`files`→SUCCESS, `skills`→WARNING, `runs`→CHART_2) rather than
+// keeping their old area's hue — the whole point of that convention (§37-43
+// above) is that hue signals CURRENT group membership, so carrying a stale
+// hue across a move would misrepresent it. `presets`/`skills`/`experts`/
+// `gallery`'s pages are this wave's SIBLING packages' scope (E/B2), not this
+// pass's own two pages (`routines`/`plans`, B1) — `screens/shell.rs`'s
+// generic placeholder branch renders them honestly until each sibling lands
+// its own page, same pattern the S5b1-A update above already established for
+// `channels`/`integrations`.
 
 use crate::theme;
 
@@ -150,30 +177,73 @@ const CHAT_ITEMS: &[NavItem] = &[
     item("console", "nav.console", "nav.console.desc", 'C', theme::CHART_2),
 ];
 
+// S5b2-D (2026-08-21) update: this area is now the S5a work-pages canvas's
+// 5-item "AI 員工" membership — 員工總覽/職務組合/技能庫/AI團隊/靈感畫廊
+// (`agents`/`presets`/`skills`/`experts`/`gallery`, in that exact order —
+// `commercial/design/duduclaw-s5-work-pages/Main.dc.html`'s "與 web 版面的
+// 刻意差異" §1). `presets`/`gallery` are new ids this wave; `skills` MOVES IN
+// from the old `KNOWLEDGE_ITEMS` (a skill is an agent capability, not a
+// knowledge/memory artifact — see that constant's own note). `world`/
+// `growth` are DELIBERATELY KEPT here too (appended, unchanged position)
+// rather than dropped to hit the canvas's literal "5 項" count: the brief's
+// 5-item list has no destination for them, and this crate's own established
+// rule (`nav.rs`'s header comment, "既有頁 id 全部保留映射") is to never strand
+// an existing id without an assigned home. The canvas's own FULL unified
+// sidebar (embedded per-page, e.g. `Routines.dc.html`) in fact shows `world`/
+// `growth` still living in this exact area (with a not-yet-built `組織架構`
+// row between `gallery` and `world` — that page belongs to a LATER wave, not
+// this one) — so keeping them here is the closer reading of the two
+// documents, not just the safer one. A future wave that lands 組織架構 should
+// insert it between `gallery` and `world` to match the canvas exactly.
 const AGENTS_ITEMS: &[NavItem] = &[
     item("agents", "nav.agents", "nav.agents.desc", 'E', theme::WARNING),
+    item("presets", "nav.presets", "nav.presets.desc", 'P', theme::WARNING),
+    item("skills", "nav.skills", "nav.skills.desc", 'S', theme::WARNING),
     item("experts", "nav.experts", "nav.experts.desc", 'X', theme::WARNING),
+    item("gallery", "nav.gallery", "nav.gallery.desc", 'I', theme::WARNING),
     item("world", "nav.world", "nav.world.desc", 'W', theme::WARNING),
     item("growth", "nav.growth", "nav.growth.desc", 'G', theme::WARNING),
 ];
 
+// S5b2-D (2026-08-21) update: the S5a work-pages canvas's 5-item "任務與
+// 目標" membership — 目標/任務/例行工作/共同計畫/檔案 (`goals`/`tasks`/
+// `routines`/`plans`/`files`, in that exact order, matching both the task
+// brief's own parenthetical list AND the canvas's embedded sidebar). `runs`
+// MOVES OUT to `MONITOR_ITEMS` (this wave's "「監控」加 執行紀錄" instruction);
+// `files` MOVES IN from the old `KNOWLEDGE_ITEMS`. The canvas's full unified
+// sidebar shows a 6th row here, `分支決戰` (`forks`) — explicitly deferred to
+// a later wave per the task brief ("分支決戰留波三"), so it is NOT added yet.
 const TASKS_ITEMS: &[NavItem] = &[
+    item("goals", "nav.goals", "nav.goals.desc", 'G', theme::SUCCESS),
+    item("tasks", "nav.tasks", "nav.tasks.desc", 'T', theme::SUCCESS),
     item("routines", "nav.routines", "nav.routines.desc", 'R', theme::SUCCESS),
     item("plans", "nav.plans", "nav.plans.desc", 'P', theme::SUCCESS),
-    item("goals", "nav.goals", "nav.goals.desc", 'G', theme::SUCCESS),
-    item("runs", "nav.runs", "nav.runs.desc", 'L', theme::SUCCESS),
-    item("tasks", "nav.tasks", "nav.tasks.desc", 'T', theme::SUCCESS),
+    item("files", "nav.files", "nav.files.desc", 'F', theme::SUCCESS),
 ];
 
+// S5b2-D (2026-08-21) update: `files` and `skills` MOVE OUT (see
+// `TASKS_ITEMS`/`AGENTS_ITEMS`'s own notes above — a shared file/skill is
+// now grouped with the work it belongs to rather than staying in a generic
+// "knowledge" bucket); `widgets` is new (this wave's "「知識與記憶」加 Widget
+// 工坊" instruction). The canvas's full unified sidebar also shows a
+// `知識中樞` ("Knowledge Hub"/WikiGraph) row here with no id in this crate
+// yet — a later (viz-pages) wave's page, not this one's, so it is not added.
 const KNOWLEDGE_ITEMS: &[NavItem] = &[
-    item("files", "nav.files", "nav.files.desc", 'F', theme::INFO),
-    item("skills", "nav.skills", "nav.skills.desc", 'S', theme::INFO),
     item("memory", "nav.memory", "nav.memory.desc", 'M', theme::INFO),
+    item("widgets", "nav.widgets", "nav.widgets.desc", 'W', theme::INFO),
 ];
 
+// S5b2-D (2026-08-21) update: `runs` MOVES IN from `TASKS_ITEMS` (this
+// wave's "「監控」加 執行紀錄" instruction) — the canvas's full unified
+// "監控" group additionally has usage/foresight/OS/timeline/canvas rows (7
+// total, "監控 7 項不拆" per the 2026-08-21 status-map decision log) and
+// drops `home` to the "對話" group entirely; both of those are OUTSIDE this
+// wave's brief (only "加 執行紀錄" was asked for) and belong to a later
+// (viz-pages) wave, so `home`'s position is deliberately left untouched here.
 const MONITOR_ITEMS: &[NavItem] = &[
     item("home", "nav.home", "nav.home.desc", 'D', theme::CHART_2),
     item("reports", "nav.reports", "nav.reports.desc", 'A', theme::CHART_2),
+    item("runs", "nav.runs", "nav.runs.desc", 'L', theme::CHART_2),
 ];
 
 // S5b1-A (2026-08-21): the real 6-item "管理" membership — order matches
@@ -273,6 +343,20 @@ mod tests {
         "componentLibrary",
     ];
 
+    /// S5b2-D (2026-08-21): the three brand-new ids this wave introduces —
+    /// not "legacy" (nothing referenced them before), but resolvability is
+    /// exactly as load-bearing, so they get their own explicit trip-wire
+    /// rather than being folded into `LEGACY_IDS` (whose name and doc
+    /// comment are specifically about pre-existing ids).
+    const S5B2_D_NEW_IDS: &[&str] = &["presets", "gallery", "widgets"];
+
+    #[test]
+    fn every_s5b2_d_new_id_resolves() {
+        for id in S5B2_D_NEW_IDS {
+            assert!(find(id).is_some(), "new nav id {id:?} does not resolve via find()");
+        }
+    }
+
     #[test]
     fn every_legacy_id_still_resolves() {
         for id in LEGACY_IDS {
@@ -292,6 +376,47 @@ mod tests {
             ids,
             vec!["channels", "integrations", "accounts", "systemUpdates", "device", "manageAdvanced"]
         );
+    }
+
+    /// S5b2-D (2026-08-21): the "AI 員工" area's 7-item membership — the
+    /// canvas's own 5-item list (員工總覽/職務組合/技能庫/AI團隊/靈感畫廊) in
+    /// exact order, followed by the pre-existing `world`/`growth` (kept, per
+    /// this file's header comment on the S5b2-D update's reasoning).
+    #[test]
+    fn agents_area_has_the_s5b2_d_membership_in_order() {
+        let agents = AREAS.iter().find(|a| a.id == "areaAgents").expect("areaAgents must exist");
+        let ids: Vec<&str> = agents.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec!["agents", "presets", "skills", "experts", "gallery", "world", "growth"]);
+    }
+
+    /// S5b2-D (2026-08-21): the "任務與目標" area's 5-item membership, in the
+    /// exact order the task brief and the canvas's embedded sidebar both
+    /// give (目標/任務/例行工作/共同計畫/檔案).
+    #[test]
+    fn tasks_area_has_the_s5b2_d_membership_in_order() {
+        let tasks = AREAS.iter().find(|a| a.id == "areaTasks").expect("areaTasks must exist");
+        let ids: Vec<&str> = tasks.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec!["goals", "tasks", "routines", "plans", "files"]);
+    }
+
+    /// S5b2-D (2026-08-21): the "知識與記憶" area shrinks to `memory` +
+    /// `widgets` — `files`/`skills` moved out (see `TASKS_ITEMS`/
+    /// `AGENTS_ITEMS`'s own membership tests above).
+    #[test]
+    fn knowledge_area_has_the_s5b2_d_membership_in_order() {
+        let knowledge = AREAS.iter().find(|a| a.id == "areaKnowledge").expect("areaKnowledge must exist");
+        let ids: Vec<&str> = knowledge.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec!["memory", "widgets"]);
+    }
+
+    /// S5b2-D (2026-08-21): `runs` joins `home`/`reports` in "監控" — this
+    /// wave's only instructed change to this area ("home"'s position is
+    /// deliberately left untouched, see `MONITOR_ITEMS`'s own comment).
+    #[test]
+    fn monitor_area_has_the_s5b2_d_membership_in_order() {
+        let monitor = AREAS.iter().find(|a| a.id == "areaMonitor").expect("areaMonitor must exist");
+        let ids: Vec<&str> = monitor.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec!["home", "reports", "runs"]);
     }
 
     /// `about` is intentionally absent from every area and from the footer

@@ -190,6 +190,50 @@ pub async fn try_local_session_at(base_url: &str) -> Option<LoginResponse> {
     resp.json::<LoginResponse>().await.ok()
 }
 
+/// WP-S5b2-F — generic authenticated `GET` returning the parsed JSON body.
+/// The REST twin of `ws_status::Command::Call`'s WS-RPC primitive: this
+/// crate's dashboard-file-panel surface (`GET /api/files`, `screens::files`)
+/// has no WS-RPC equivalent server-side (`duduclaw-gateway/src/handlers.rs`'s
+/// dispatch match has no `files.*` arm — the listing only exists as a REST
+/// route in `server.rs`), so a page needing it cannot just reuse
+/// `Command::Call`. Generic over any future `/api/*` GET rather than a
+/// one-off `files_list` function, mirroring how `Command::Call` is generic
+/// over RPC method name rather than minting a variant per method.
+///
+/// Caller supplies `path_and_query` starting with `/` (e.g. `"/api/files?
+/// agent=duduclaw"`); `jwt` is sent as a Bearer token when present (omitted
+/// entirely — not an empty header — when `None`, matching how every other
+/// authenticated call site in this crate treats a missing token).
+pub async fn get_json(
+    base_url: &str,
+    path_and_query: &str,
+    jwt: Option<&str>,
+) -> Result<serde_json::Value, AuthError> {
+    let url = format!("{base_url}{path_and_query}");
+    let mut req = client().get(&url);
+    if let Some(jwt) = jwt {
+        req = req.bearer_auth(jwt);
+    }
+    let resp = req.send().await.map_err(classify_send_error)?;
+    let status = resp.status();
+    if status.is_success() {
+        return resp.json::<serde_json::Value>().await.map_err(|e| AuthError::Other {
+            status: Some(status.as_u16()),
+            detail: format!("malformed response body: {e}"),
+        });
+    }
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(AuthError::InvalidCredentials);
+    }
+    let body_text = resp.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<ErrorBody>(&body_text)
+        .ok()
+        .map(|b| b.error)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(body_text);
+    Err(AuthError::Other { status: Some(status.as_u16()), detail })
+}
+
 /// A `reqwest::Error` from `.send()` itself (never reached the server, or
 /// the whole request timed out) → [`AuthError::Unreachable`]; anything else
 /// reqwest could raise at this stage (body-encode failure, ...) is folded
@@ -304,6 +348,27 @@ mod tests {
         // completes and returns the expected type", exercising the same
         // code path `ws_status.rs`'s boot-time probe uses.
         let _ = try_local_session().await;
+    }
+
+    #[tokio::test]
+    async fn get_json_against_unreachable_host_is_unreachable() {
+        let result = get_json(UNREACHABLE_BASE_URL, "/api/files", None).await;
+        assert!(matches!(result, Err(AuthError::Unreachable)), "expected Unreachable, got {result:?}");
+    }
+
+    /// Live path: `/api/files` without a bearer token must fail closed
+    /// (401), never silently return a body — the same authenticated-REST
+    /// invariant `authorize_file_access` documents server-side.
+    #[tokio::test]
+    async fn get_json_without_token_against_live_gateway_is_invalid_credentials() {
+        let result = get_json(GATEWAY_BASE_URL, "/api/files", None).await;
+        match result {
+            Err(AuthError::InvalidCredentials) => {}
+            other => panic!(
+                "expected InvalidCredentials against the live local gateway, got {other:?} \
+                 — is a gateway actually running on 127.0.0.1:18789? (curl :18789/healthz)"
+            ),
+        }
     }
 
     #[test]

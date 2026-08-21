@@ -44,11 +44,14 @@
 //    `disabled: true` path omits the click handler entirely (see that
 //    module's own doc comment) rather than attaching a handler that would
 //    silently do nothing.
-// 4. "存取金鑰管理 →" is a plain, non-interactive row — the target page
-//    (`mcp_keys.*`, confirmed to exist server-side) is explicit batch-2
-//    scope per this task's brief ("目標頁屬批次二範圍未實作，佔位守護不
-//    panic"). No `active_page` id is minted for it here; an inert row can
-//    never navigate to a broken page.
+// 4. "存取金鑰管理 →" IS live (WP-S5b2-F, S5b 第二波) — the target page now
+//    exists (`screens::mcp_keys`, id `mcpKeys`). Clicking the row sets
+//    `active_page = "mcpKeys"`; the `shell.rs` match arm that actually
+//    routes that id is a sibling package's scope per WP-S5b2-F's own "側欄
+//    /nav/shell.rs 不歸你動" boundary — until it lands, `shell.rs`'s
+//    generic fallback renders an honest placeholder for `mcpKeys` (same
+//    "unmatched id degrades, never panics" property `settings_common::
+//    breadcrumb`'s own doc comment already relies on for `"integrations"`).
 
 use gpui::{div, prelude::*, px, Context, Div, Global, SharedString, Stateful};
 use serde_json::{json, Value};
@@ -398,7 +401,7 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
         div().flex().flex_col().child(section_label(i18n::t(locale, "native.mcp.oauthServices"))).child(body)
     };
 
-    // "存取金鑰管理 →" — inert, see header comment §4.
+    // "存取金鑰管理 →" — live, see header comment §4 (WP-S5b2-F).
     let keys_link_row = boxed_group(vec![kv_row(
         i18n::t(locale, "native.mcp.keysManagement"),
         div()
@@ -406,7 +409,14 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
             .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
             .child(i18n::t(locale, "native.mcp.keysManagementArrow")),
         true,
-    )]);
+    )])
+    .id("mcp-keys-link")
+    .cursor_pointer()
+    .hover(|s| s.bg(theme::alpha(theme::MUTED, 0.3)))
+    .on_click(cx.listener(|this, _ev, _window, cx| {
+        this.active_page = "mcpKeys";
+        cx.notify();
+    }));
 
     div()
         .id("mcp-page")

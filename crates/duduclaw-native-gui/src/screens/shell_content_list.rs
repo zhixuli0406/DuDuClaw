@@ -10,9 +10,10 @@ use crate::screens::shell_row::nav_row;
 use crate::theme;
 use crate::RootView;
 
-/// Column 2 width — same order of magnitude as Column 1; it lists at most 5
-/// short page names for any one area (`nav.rs::AREAS`' longest is `任務與
-/// 目標` with 5 items).
+/// Column 2 width — same order of magnitude as Column 1; it lists at most a
+/// handful of short page names for any one area (`nav.rs::AREAS`' longest is
+/// `AI 員工` with 7 items as of the S5b2-D update — see `nav.rs`'s own
+/// module doc comment).
 const CONTENT_LIST_WIDTH: f32 = 224.0;
 
 /// `None` when the current page's area holds only one page (nothing to

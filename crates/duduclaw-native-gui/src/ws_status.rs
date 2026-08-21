@@ -72,6 +72,18 @@ pub enum Command {
         params: serde_json::Value,
         respond_to: oneshot::Sender<Result<serde_json::Value, CallError>>,
     },
+    /// WP-S5b2-F: one authenticated `GET /api/*` round trip, dispatched on
+    /// this manager's own background tokio runtime (see [`api::get_json`]'s
+    /// doc comment for why — `screens::files` is the first page needing a
+    /// JSON REST read beyond login, and gpui's own executor is not a tokio
+    /// context). `jwt` is threaded through explicitly by the caller rather
+    /// than read from any state this manager tracks — this command is a
+    /// transport-only bridge, not an auth-aware one.
+    RestGet {
+        path_and_query: String,
+        jwt: Option<String>,
+        respond_to: oneshot::Sender<Result<serde_json::Value, String>>,
+    },
 }
 
 /// Issue one RPC call and return a receiver for its eventual result.
@@ -95,6 +107,20 @@ pub fn call(
 ) -> oneshot::Receiver<Result<serde_json::Value, CallError>> {
     let (respond_to, rx) = oneshot::channel();
     let _ = session_tx.send(Command::Call { method: method.into(), params, respond_to });
+    rx
+}
+
+/// Issue one authenticated `GET /api/*` and return a receiver for its
+/// eventual parsed-JSON result — the REST twin of [`call`]. Same
+/// never-blocks-never-fails-synchronously contract: if the manager thread is
+/// gone the send is a silent no-op and the receiver simply never resolves.
+pub fn rest_get(
+    session_tx: &tokio_mpsc::UnboundedSender<Command>,
+    path_and_query: impl Into<String>,
+    jwt: Option<String>,
+) -> oneshot::Receiver<Result<serde_json::Value, String>> {
+    let (respond_to, rx) = oneshot::channel();
+    let _ = session_tx.send(Command::RestGet { path_and_query: path_and_query.into(), jwt, respond_to });
     rx
 }
 
@@ -261,7 +287,29 @@ async fn run(mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>, evt_tx: std_mps
             Command::Call { method, params, respond_to } => {
                 dispatch_call(&pending, &active_writer, method, params, respond_to).await;
             }
+            Command::RestGet { path_and_query, jwt, respond_to } => {
+                tokio::spawn(async move {
+                    let result = api::get_json(api::GATEWAY_BASE_URL, &path_and_query, jwt.as_deref())
+                        .await
+                        .map_err(|e| describe_rest_auth_error(&e));
+                    let _ = respond_to.send(result);
+                });
+            }
         }
+    }
+}
+
+/// User-facing-ish (still diagnostic, not localized — callers own the
+/// `files.error`-style i18n key) description of a REST-layer [`AuthError`],
+/// mirroring `screens::mcp::describe_call_error`'s role for the WS-RPC side.
+fn describe_rest_auth_error(e: &AuthError) -> String {
+    match e {
+        AuthError::Unreachable => "無法連線到伺服器".to_string(),
+        AuthError::InvalidCredentials => "沒有存取權限或憑證已過期".to_string(),
+        AuthError::Other { status, detail } => match status {
+            Some(s) => format!("HTTP {s}: {detail}"),
+            None => detail.clone(),
+        },
     }
 }
 

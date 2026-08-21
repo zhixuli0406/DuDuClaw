@@ -165,8 +165,12 @@ pub struct RootView {
     /// Access token, in memory only. S2 scope stops here deliberately: no
     /// disk persistence, no refresh timer — see this crate's final S2
     /// report for the explicit S3+ "honest stub" callout on refresh-token
-    /// handling.
-    #[allow(dead_code)] // not yet read anywhere past the ConnectWs dispatch that consumes it
+    /// handling. Read by any page needing an authenticated REST call
+    /// alongside the WS session — `screens::device_backup`'s download-URL
+    /// builder was the first consumer (S5b1-A), `screens::files`'s
+    /// `Command::RestGet`/preview-download URLs (WP-S5b2-F) the second; the
+    /// `#[allow(dead_code)]` this field used to carry (accurate only up
+    /// through S2) is gone now that it has real readers.
     jwt: Option<String>,
     /// Refresh token, in memory only (task item 5: "本階段只存於記憶體、不做自動
     /// refresh timer"). S2 captures it so it exists when an S3+ refresh
@@ -192,6 +196,16 @@ pub struct RootView {
     /// a generic name rather than showing nothing (see `screens::dashboard::
     /// greeting_name`).
     display_name: Option<String>,
+    /// WP-S5b2-E (2026-08-21): the logged-in user's own id (`api::AuthUser::
+    /// id`), captured alongside `display_name` at the exact same two call
+    /// sites. Added for `screens::widgets`'s "我的" vs "團隊分享" tab split
+    /// (`created_by_user == this id`), which `web/src/pages/WidgetsPage.tsx`
+    /// does the same way via `useAuthStore`'s `user.id` — this crate has no
+    /// such store yet, so the id rides on `RootView` directly, same shape
+    /// `display_name` already established rather than inventing a second
+    /// mechanism. `None` until a session resolves, same honest-stub
+    /// semantics as `display_name`.
+    user_id: Option<String>,
     /// WP-gpui-spike-T7 (2026-08-21): debug-only Chromium-risk-page
     /// feasibility spike state (`screens::spike_t7`) — see that module's doc
     /// comment. Always constructed (same "unconditional field, only
@@ -223,6 +237,8 @@ impl RootView {
                 // S4b: for the dashboard greeting line — see that field's
                 // own doc comment.
                 self.display_name = Some(resp.user.display_name.clone());
+                // WP-S5b2-E: see `user_id`'s own doc comment.
+                self.user_id = Some(resp.user.id.clone());
                 // S4: the chat socket authenticates eagerly right alongside
                 // the main `/ws`, same timing — by the time a user actually
                 // navigates to the chat page it's normally already
@@ -246,6 +262,7 @@ impl RootView {
                 self.login_loading = false;
                 self.login_error = None;
                 self.display_name = Some(resp.user.display_name.clone());
+                self.user_id = Some(resp.user.id.clone());
                 self.chat.connect(resp.access_token.clone());
                 let _ = self.session_tx.send(SessionCommand::ConnectWs {
                     jwt: resp.access_token,
@@ -484,6 +501,7 @@ fn main() {
                             login_error: None,
                             chat: screens::chat::ChatState::new(chat_input, chat_tx_for_view),
                             display_name: None,
+                            user_id: None,
                             spike_t7: screens::spike_t7::SpikeT7State::default(),
                         }
                     })
