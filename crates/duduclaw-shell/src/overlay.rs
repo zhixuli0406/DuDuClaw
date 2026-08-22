@@ -193,6 +193,13 @@ pub fn render(
     // `main.rs`), threaded straight through to `controlcenter::render` the
     // same way `ui` already is. Launcher/Notifications ignore it.
     audio_ui: &crate::audio::AudioUiState,
+    // APP-1 (2026-08-22): the Launcher's 「應用程式」section renders the REAL
+    // installed-app list (`crate::apps::feed::InstalledAppsFeed`, threaded
+    // straight through the same way `audio_ui` already is). Notifications/
+    // ControlCenter ignore it. The feed's background scan is dispatched from
+    // Home's dock, which renders underneath every overlay — this surface
+    // deliberately does not schedule a second one.
+    installed_apps: &crate::apps::feed::InstalledAppsFeed,
     palette: ShellPalette,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &mut Context<ShellView>,
@@ -214,7 +221,7 @@ pub fn render(
         .on_click(on_close);
 
     let panel: Stateful<Div> = match overlay {
-        Overlay::Launcher => launcher::render(ui, palette, cx),
+        Overlay::Launcher => launcher::render(ui, installed_apps, palette, cx),
         Overlay::Notifications => notifications::render(ui, palette, cx),
         Overlay::ControlCenter => controlcenter::render(ui, audio_ui, palette, cx),
     };
@@ -273,11 +280,14 @@ mod tests {
     /// you sure" can never survive to be answered by accident later.
     #[test]
     fn closing_the_launcher_also_drops_a_pending_install_confirmation() {
-        let entry = crate::fake_data::DOCK_APPS.iter().find(|a| a.flatpak_id.is_some()).expect("one installable entry must exist");
+        // APP-1: the gate is armed from the installable CATALOG now, not
+        // from the (deleted) canned `fake_data::DOCK_APPS` array — see
+        // `crate::apps::catalog`'s own header comment.
+        let entry = crate::apps::catalog::INSTALL_CATALOG.first().expect("one installable catalog entry must exist");
         let mut ui = OverlayUiState::default();
         assert!(ui.install_gate.is_none(), "no install may be pending on a fresh state");
 
-        ui.install_gate = install_gate::InstallGate::open(entry, crate::apps::INSTALL_DESTINATION_LABEL.to_string());
+        ui.install_gate = Some(install_gate::InstallGate::open(entry, crate::apps::INSTALL_DESTINATION_LABEL.to_string()));
         assert!(ui.install_gate.is_some());
 
         ui.close_launcher_query();

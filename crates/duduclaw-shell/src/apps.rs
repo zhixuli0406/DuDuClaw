@@ -1,131 +1,202 @@
-// App registry search + launch — WP-A3 (2026-08-22, A-line S5 "殼整合"
-// round): the Launcher's typed-search "app" result category and the dock's
-// click-to-launch icon both go through this one module rather than each
-// re-deriving their own filter/spawn logic.
+// App registry: enumerate, search, launch, install.
 //
-// ── Data source boundary (read this before touching either list) ───────────
-// This crate's task brief for this round assumed a live "Flatpak app
-// registry" (`flatpak list`, portal-backed metadata) would already exist to
-// query. It does not: A2 (`research/native-os-2026-08/flatpak-portal-scope-
-// 2026-08.md`) was a container-level INVESTIGATION, not a shipped feature —
-// flatpak reached the appliance image only in the SAME wave as this file's
-// install support (A4-2/3, 2026-08-22 — `appliance/mkosi.extra/etc/flatpak/
-// installations.d/10-duduclaw-data.conf`), and there is still no live
-// package-manager query anywhere in this crate. So `search()` below filters
-// `fake_data::DOCK_APPS` — a small hand-authored catalog, honestly labeled
-// as such in that const's own doc comment — not a live package-manager
-// query. Only ONE entry (`browser`, Chromium) carries a real `flatpak_id`
-// with actual launch evidence behind it (A2 §3's container PASS); every
-// other entry is a conceptual dock icon lifted from the design board with
-// no real app behind it at all, and stays `flatpak_id: None`.
+// ── Data source boundary (read this before touching either list) ────────
+// APP-1 (2026-08-22) replaced this module's foundation. Until then,
+// `search()` filtered `fake_data::DOCK_APPS` — a hand-authored six-entry
+// array lifted from a design board, only ONE of which (`browser`/Chromium)
+// had a real app behind it. It was honestly labelled in its own doc
+// comment, but it was still what the Launcher and the dock actually
+// rendered, so on a real appliance the operator was reading a menu of
+// software that was not installed. A user testing the VM reported exactly
+// that.
 //
-// ── Why this is a plain fn module, not an `Entity` ──────────────────────────
-// Nothing here needs gpui state — `search` is a pure filter over `'static`
-// data (same "gpui-free, independently testable" discipline `surface.rs`
-// documents for itself) and `launch` is a fire-and-forget `Command::spawn()`
-// call with no result to track yet (no "launching…" UI state this round —
-// see `launch`'s own doc comment on the honest limitation that implies).
+// This module now has TWO lists, and they answer two different questions:
+//
+//   * **What is installed** — `apps::installed::scan()`, a real enumeration
+//     of `flatpak list --app` plus the XDG `.desktop` directories, merged
+//     and deduplicated (`apps/installed.rs`; `apps/flatpak_list.rs` and
+//     `apps/desktop_entry.rs` are its two parsers). Held in
+//     `apps::feed::InstalledAppsFeed`, scanned on a cadence off the render
+//     thread. `search()` below filters THAT. There is no fallback to canned
+//     data anywhere on this path: a machine with nothing installed renders
+//     an empty list with an honest message, and a failed enumeration says
+//     so rather than substituting a catalog.
+//   * **What could be installed** — `apps::catalog::INSTALL_CATALOG`, a
+//     curated list of apps this shell knows a real flatpak ref and remote
+//     for. That is not derivable from scanning a machine that does not have
+//     the app yet, which is why it is data; the bar every entry has to
+//     clear is spelled out in that module's own header comment, and the
+//     five design-board icons with no app behind them did not clear it and
+//     are deleted.
+//
+// `fake_data::DockApp`/`DOCK_APPS` are gone entirely. `fake_data.rs` still
+// holds this shell's genuinely-decorative content (goal cards, activity
+// shelf, menu strings) — the app list is no longer part of it.
+//
+// ── Why this is a plain fn module, not an `Entity` ──────────────────────
+// Nothing here needs gpui state. `search` is a pure filter, the scan lives
+// behind a plain struct with no gpui types (`apps/feed.rs`), and every
+// process call (`launch`, `probe_download_size`, `install`, and the scan
+// itself) is dispatched from a background thread by its caller — same
+// "gpui-free, independently testable" discipline `surface.rs` documents for
+// itself.
 
-use crate::fake_data::{self, DockApp};
+pub(crate) mod catalog;
+pub(crate) mod desktop_entry;
+pub(crate) mod feed;
+pub(crate) mod flatpak_list;
+pub(crate) mod installed;
 
-/// Case-insensitive substring search over `fake_data::DOCK_APPS`'
-/// `search_key`/`label` fields — backs the Launcher's "app" result category
-/// (D12 §0.8 point 3, `commercial/docs/DESIGN-native-gui-gpui-2026-08.md`:
-/// NL delegation is the first result class, app/file/system next). An empty
-/// query matches every entry — the Launcher's own pre-typing state, same
-/// "browse everything" default a fresh search box uses before narrowing.
-pub fn search(query: &str) -> Vec<&'static DockApp> {
-    let q = query.trim().to_lowercase();
-    fake_data::DOCK_APPS.iter().filter(|app| q.is_empty() || app.search_key.contains(&q) || app.label.to_lowercase().contains(&q)).collect()
+use installed::InstalledApp;
+
+/// The D8 "DuDuClaw Verified" four-tier compatibility rating
+/// (`commercial/docs/DESIGN-app-compat-layer-2026-08.md` §3), plus a fifth
+/// `Unrated` state this crate adds for "no rating evidence exists yet" —
+/// the design doc's own four tiers are all "has SOME evidence", so an entry
+/// with none needs a distinct state rather than being forced into the
+/// nearest tier (which would misrepresent a guess as a rating).
+///
+/// APP-1 moved this out of `fake_data.rs`: with a real app enumeration,
+/// most rows genuinely ARE `Unrated` (nobody has evaluated the average
+/// `.desktop` entry on this machine), which makes the tier a real, live
+/// piece of information rather than a per-row constant in a canned array.
+/// `catalog::verified_tier` is the lookup. `crate::palette::ShellPalette::
+/// verified_bg`/`verified_text`/`verified_accent_dot` resolve the per-theme
+/// colors; `overlay/launcher.rs`/`home/home_dock.rs` render them.
+// `Verified`/`Partial`/`Unsupported` are never CONSTRUCTED today (the
+// catalog's one rated entry is `Works`, and everything else resolves to
+// `Unrated`) — but every downstream consumer already matches all five
+// variants exhaustively, ready for the day a second app gets real rating
+// evidence. `#[allow(dead_code)]` is the honest choice over either
+// fabricating a fake entry to silence the lint or deleting three-fifths of
+// the D8 spec's own tier vocabulary because nothing uses it YET.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifiedTier {
+    /// "開箱即用零設定" — D8 §3 top tier.
+    Verified,
+    /// "需官方預置 workaround" — D8 §3 second tier.
+    Works,
+    /// "能用但明列缺什麼" — D8 §3 third tier.
+    Partial,
+    /// "不能用" — D8 §3 bottom tier.
+    Unsupported,
+    /// Not a D8 tier — this crate's own "no rating evidence exists" state,
+    /// see this enum's own header comment.
+    Unrated,
 }
 
-/// Launches a Flatpak-packaged app by application id (`flatpak run <id>`).
-/// Fire-and-forget: `Command::spawn()` returns as soon as the child process
-/// is forked — it does not wait for the app to actually start, so this never
-/// blocks gpui's render thread and needs no background thread hand-off
-/// (unlike `gateway_client`'s blocking HTTP calls, which DO need one — see
-/// that module's own header comment for why).
+/// Case-insensitive substring search over an already-scanned installed-app
+/// list — backs the Launcher's 「應用程式」result category. An empty query
+/// matches every entry (the Launcher's own pre-typing browse state).
 ///
-/// Callers only wire this behind a click handler when `entry.flatpak_id.
-/// is_some()` (`overlay/launcher.rs::app_result_row` / `home/home_dock.rs::
-/// dock_app`) — matching this crate's established "only wire what's
-/// actually real, leave the rest an honest static stub" convention (see
-/// `home/home_dock.rs`'s own header comment on Round 3's dock icons). This
-/// fn still no-ops safely (a diag line, never a panic) if handed an entry
-/// with no `flatpak_id`, so it's safe to call unconditionally too.
+/// `apps` is `feed::InstalledAppsFeed::apps()`, NOT a fresh scan: search
+/// runs on every keystroke and a scan forks subprocesses, so the two are
+/// deliberately decoupled (see `apps/feed.rs`'s header comment).
+/// `search_key` is built lower-cased at scan time from name + id + generic
+/// name + keywords, so this stays one substring test over normalised text.
 ///
-/// **Known limitation**: on a dev Mac window (no `flatpak` binary at all),
-/// or an appliance build predating A4-2/3, this spawn fails with "no such
-/// file or directory". That's an expected, logged outcome, not a bug in
-/// this fn; this crate has no toast/notification surface to report a launch
-/// failure to the user yet (tracked as debt in the WP-A3 report, not
-/// silently dropped).
+/// Substring matching is correct HERE specifically because this is a search
+/// box, not a routing or security decision — the crate convention that bans
+/// unanchored `contains` (coding convention 2) is about the latter, and
+/// every id/app_id comparison in this module is exact.
+pub(crate) fn search<'a>(apps: &'a [InstalledApp], query: &str) -> Vec<&'a InstalledApp> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return apps.iter().collect();
+    }
+    apps.iter().filter(|app| app.search_key.contains(&q) || app.name.to_lowercase().contains(&q)).collect()
+}
+
+/// Launches an installed app. Fire-and-forget: `Command::spawn()` returns
+/// as soon as the child process is forked — it does not wait for the app to
+/// actually start, so this never blocks gpui's render thread and needs no
+/// background thread hand-off (unlike `gateway_client`'s and
+/// `comp_client`'s blocking calls, which DO need one).
 ///
-/// **No `--installation=data` here, on purpose** — `flatpak run` resolves an
-/// app across every configured installation, so the flag would only narrow
-/// it and would break launching on any host without a `data` installation.
-/// The INSTALL path does carry it, and must: see this file's "Install"
-/// section header for what happens if it doesn't.
+/// Two launch paths, matching the two enumeration sources:
+///   * a flatpak app runs through `flatpak run <id>`;
+///   * a native `.desktop` app runs its own parsed `Exec=` argv (field
+///     codes already stripped at scan time — see `desktop_entry::
+///     exec_to_argv`).
 ///
-/// **Known argv gap, NOT fixed in this WP** (`appliance/README.md`, measured
-/// finding): Flathub's Chromium still selects the X11 ozone backend even
-/// with `WAYLAND_DISPLAY` exported, and needs an explicit
-/// `--ozone-platform=wayland` that no environment variable can express. The
-/// durable fix is a per-app-id argv policy in this fn; it is out of scope
-/// for WP-A4-4 (a CPU/retry-storm fix plus the install gate) and is left
-/// recorded here rather than silently half-done.
-pub fn launch(entry: &DockApp) {
-    let Some(app_id) = entry.flatpak_id else {
+/// **No `--installation=data` on `flatpak run`, on purpose** — `run`
+/// resolves an app across every configured installation, so the flag would
+/// only narrow it and would break launching on any host without a `data`
+/// installation. The INSTALL and ENUMERATION paths both carry it, and must:
+/// see this file's "Install" section and `apps/flatpak_list.rs`'s header.
+///
+/// **Known limitations, recorded rather than silently absorbed**:
+///   * this crate still has no toast/notification surface, so a launch that
+///     fails after the fork (a missing runtime, a crash on startup) is
+///     invisible to the operator — only the spawn error itself is logged;
+///   * an app declaring `Terminal=true` expects a terminal emulator to host
+///     it. This shell has none, so its window may never appear. It is still
+///     listed (it IS installed, and `NoDisplay`/`Hidden` are the spec's own
+///     hide signals — neither of which it set) and the launch is still
+///     attempted, with a diagnostic saying why nothing may show up;
+///   * Flathub's Chromium selects the X11 ozone backend even with
+///     `WAYLAND_DISPLAY` exported and needs an explicit
+///     `--ozone-platform=wayland` that no environment variable can express
+///     (`appliance/README.md`, measured). The durable fix is a per-app-id
+///     argv policy here; still out of scope, still recorded.
+pub(crate) fn launch(app: &InstalledApp) {
+    if app.terminal && crate::diag_enabled() {
+        eprintln!("[apps] '{}' declares Terminal=true and this shell has no terminal to host it — launching anyway, a window may not appear", app.id);
+    }
+    if let Some(flatpak_id) = app.flatpak_id.as_deref() {
+        spawn_and_log(std::process::Command::new("flatpak").arg("run").arg(flatpak_id), &format!("flatpak run {flatpak_id}"), &app.id);
+        return;
+    }
+    let Some(argv) = app.exec_argv.as_deref().filter(|argv| !argv.is_empty()) else {
         if crate::diag_enabled() {
-            eprintln!("[apps] launch requested for '{}' but it has no known flatpak_id (honest no-op)", entry.id);
+            eprintln!("[apps] launch requested for '{}' but it has no launch command (honest no-op)", app.id);
         }
         return;
     };
-    match std::process::Command::new("flatpak").arg("run").arg(app_id).spawn() {
+    spawn_and_log(std::process::Command::new(&argv[0]).args(&argv[1..]), &argv.join(" "), &app.id);
+}
+
+fn spawn_and_log(command: &mut std::process::Command, rendered: &str, app_id: &str) {
+    match command.spawn() {
         Ok(_child) => {
             if crate::diag_enabled() {
-                eprintln!("[apps] launched {app_id} (dock/launcher id={})", entry.id);
+                eprintln!("[apps] launched '{app_id}' via {rendered}");
             }
         }
         Err(e) => {
-            if crate::diag_enabled() {
-                eprintln!("[apps] launch failed for {app_id}: {e}");
-            }
+            // Always logged, not DIAG-gated: unlike a poll that fails
+            // identically forever, a launch failure happens exactly once
+            // per click and is the only trace the operator's click leaves.
+            eprintln!("[apps] launch failed for '{app_id}' ({rendered}): {e}");
         }
     }
 }
 
 // ── Install (WP-A4-4, 2026-08-22) ───────────────────────────────────────
 //
-// A3 shipped `launch` (`flatpak run`) and left INSTALL as an open debt.
 // Installing changes system state — it downloads and writes hundreds of
 // megabytes from a remote the operator may never have looked at — so it
 // must never happen silently off one click. The confirmation gate itself
 // lives in `overlay::install_gate` (pure state machine) + `overlay::
-// launcher` (the sheet); this half is the plumbing it drives.
+// launcher` (the sheet); this half is the plumbing it drives. What can be
+// installed comes from `apps::catalog` (see that module's header comment on
+// why an inventory cannot answer that question).
 //
 // ── `--installation=data` is MANDATORY, not a preference ────────────────
-// The appliance image (A4-2/3, same wave as this WP) ships
-// `/etc/flatpak/installations.d/10-duduclaw-data.conf`, which declares an
-// ADDITIONAL named installation `data` at `/data/flatpak`. It does NOT move
-// the default one. A bare `flatpak install <app>` therefore still writes to
-// `/var/lib/flatpak` — on the fixed 5 GB, read-only-by-design root
-// partition, which has well under 1.4 GB free, against a measured 2.4 GB
-// for Chromium plus the freedesktop runtime. Getting this wrong does not
-// degrade, it fills the system partition; and once a repository lands in
-// `/var/lib/flatpak`, moving it is surgery (`appliance/README.md`, "The app
-// repository lives on `/data`, never on root"). So every argv this module
-// builds carries `--installation=data`, the builders are pure functions,
-// and there is a test pinning the flag into each one.
-//
-// `launch` (`flatpak run`) deliberately does NOT carry it: `run` resolves
-// across all configured installations, so the flag would only narrow it,
-// and adding it would break launching on a dev box that has no `data`
-// installation at all. ENUMERATION would need it (`flatpak list` only sees
-// the default installation) — this crate has no enumeration path today
-// (`search` filters the hardcoded `fake_data::DOCK_APPS` registry, see this
-// file's header comment), so there is nothing else to fix here; whoever
-// adds a real `flatpak list` later must carry the flag.
+// The appliance image ships `/etc/flatpak/installations.d/
+// 10-duduclaw-data.conf`, which declares an ADDITIONAL named installation
+// `data` at `/data/flatpak`. It does NOT move the default one. A bare
+// `flatpak install <app>` therefore still writes to `/var/lib/flatpak` — on
+// the fixed 5 GB, read-only-by-design root partition, which has well under
+// 1.4 GB free, against a measured 2.4 GB for Chromium plus the freedesktop
+// runtime. Getting this wrong does not degrade, it fills the system
+// partition; and once a repository lands in `/var/lib/flatpak`, moving it
+// is surgery (`appliance/README.md`). So every argv this module builds
+// carries `--installation=data`, the builders are pure functions, and there
+// is a test pinning the flag into each one. APP-1 extended the same rule to
+// the ENUMERATION path (`apps/flatpak_list.rs`), which is what that file's
+// original comment predicted would be needed.
 //
 // **Honest limitation, same one `launch` already carries**: no `flatpak`
 // binary exists on the dev Mac, so neither `probe_download_size` nor
@@ -139,18 +210,18 @@ pub fn launch(entry: &DockApp) {
 /// Refuses an argument that would be read as a FLAG by `flatpak` rather
 /// than as a remote/app id. No shell is involved anywhere here
 /// (`Command::new` + `.arg`, never a shell string), so this is not an
-/// injection guard — it is a "don't let a malformed registry entry turn
-/// into an unintended flag" guard, which is the only way a bad value could
+/// injection guard — it is a "don't let a malformed catalog entry turn into
+/// an unintended flag" guard, which is the only way a bad value could
 /// actually change what runs.
 fn is_safe_cli_arg(value: &str) -> bool {
     !value.is_empty() && !value.starts_with('-')
 }
 
-/// The flatpak installation name every command below targets — see this
-/// section's header comment for why this is load-bearing rather than a
-/// preference. Must stay in sync with the appliance image's own
+/// The flatpak installation the install AND enumeration commands target —
+/// see this section's header comment for why this is load-bearing rather
+/// than a preference. Must stay in sync with the appliance image's own
 /// `mkosi.extra/etc/flatpak/installations.d/10-duduclaw-data.conf`.
-pub const FLATPAK_INSTALLATION: &str = "data";
+pub(crate) const FLATPAK_INSTALLATION: &str = "data";
 
 /// What the confirmation sheet shows in its "安裝位置" row. Deliberately the
 /// STORAGE the operator recognizes (`/data` — the appliance's own data
@@ -158,12 +229,12 @@ pub const FLATPAK_INSTALLATION: &str = "data";
 /// not the internal `--installation=data` flag or the `/data/flatpak`
 /// repository layout underneath it. Internal implementation details do not
 /// belong in user-facing copy (this project's own §7 communication rule).
-pub const INSTALL_DESTINATION_LABEL: &str = "/data";
+pub(crate) const INSTALL_DESTINATION_LABEL: &str = "/data";
 
 /// Pure argv builder for the size probe — split out so a test can pin the
 /// `--installation=data` flag without a flatpak binary. `None` when either
 /// value would be read as a flag (see `is_safe_cli_arg`).
-pub fn remote_info_argv(remote: &str, app_id: &str) -> Option<Vec<String>> {
+pub(crate) fn remote_info_argv(remote: &str, app_id: &str) -> Option<Vec<String>> {
     if !is_safe_cli_arg(remote) || !is_safe_cli_arg(app_id) {
         return None;
     }
@@ -179,7 +250,7 @@ pub fn remote_info_argv(remote: &str, app_id: &str) -> Option<Vec<String>> {
 /// Pure argv builder for the install itself — same reasoning as
 /// `remote_info_argv`. `--assumeyes` is safe here specifically BECAUSE this
 /// is only ever reached through the confirmation gate (see `install`).
-pub fn install_argv(remote: &str, app_id: &str) -> Option<Vec<String>> {
+pub(crate) fn install_argv(remote: &str, app_id: &str) -> Option<Vec<String>> {
     if !is_safe_cli_arg(remote) || !is_safe_cli_arg(app_id) {
         return None;
     }
@@ -205,7 +276,7 @@ const DOWNLOAD_SIZE_LABELS: &[&str] = &["download", "download size"];
 /// printed it (e.g. `"123.4 MB"`) — this module never reformats, rounds, or
 /// unit-converts a number it did not compute, so what the gate shows is
 /// exactly what the package manager said.
-pub fn parse_download_size(stdout: &str) -> Option<String> {
+pub(crate) fn parse_download_size(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
         let Some((label, value)) = line.split_once(':') else {
             continue;
@@ -226,7 +297,7 @@ pub fn parse_download_size(stdout: &str) -> Option<String> {
 /// result back with `mpsc` + `cx.spawn`, the same split `gateway_client`'s
 /// own header comment documents. `None` means "we could not find out",
 /// which the gate renders as an honest blank; it never means "zero".
-pub fn probe_download_size(remote: &str, app_id: &str) -> Option<String> {
+pub(crate) fn probe_download_size(remote: &str, app_id: &str) -> Option<String> {
     if !is_safe_cli_arg(remote) || !is_safe_cli_arg(app_id) {
         return None;
     }
@@ -246,13 +317,15 @@ pub fn probe_download_size(remote: &str, app_id: &str) -> Option<String> {
 /// `Command::spawn()` returns once the child is forked, so `Ok(())` means
 /// "the install STARTED", never "the app is installed" — the gate's own
 /// copy says exactly that rather than claiming a completion this fn cannot
-/// observe.
+/// observe. The installed-app feed picks the new app up on its next scan
+/// (`apps::feed::REFRESH_INTERVAL`), which is what makes the gate's "完成後
+/// 會出現在 app 清單" line true rather than aspirational.
 ///
 /// `--assumeyes` is safe here specifically BECAUSE this is only ever
 /// reached through the confirmation gate: the human prompt flatpak would
 /// otherwise print has already been asked, on screen, with the app name,
 /// remote, size and destination shown (`overlay::install_gate`).
-pub fn install(remote: &str, app_id: &str) -> Result<(), String> {
+pub(crate) fn install(remote: &str, app_id: &str) -> Result<(), String> {
     let Some(argv) = install_argv(remote, app_id) else {
         return Err(format!("refusing to run flatpak with remote={remote:?} app_id={app_id:?}"));
     };
@@ -269,52 +342,110 @@ pub fn install(remote: &str, app_id: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::installed::AppSource;
     use super::*;
-    use crate::fake_data::VerifiedTier;
+
+    fn app(id: &str, name: &str, keys: &str) -> InstalledApp {
+        InstalledApp {
+            id: id.to_string(),
+            name: name.to_string(),
+            source: AppSource::Desktop,
+            icon: None,
+            exec_argv: Some(vec!["/bin/true".to_string()]),
+            flatpak_id: None,
+            terminal: false,
+            search_key: keys.to_lowercase(),
+            origin: "test".to_string(),
+        }
+    }
+
+    fn sample() -> Vec<InstalledApp> {
+        vec![
+            app("org.chromium.Chromium", "Chromium", "chromium org.chromium.chromium web browser"),
+            app("org.gnome.TextEditor", "文字編輯器", "文字編輯器 org.gnome.texteditor text editor"),
+            app("foot", "foot", "foot terminal"),
+        ]
+    }
+
+    // ── search ──────────────────────────────────────────────────────────
 
     #[test]
-    fn empty_query_returns_every_registry_entry() {
-        assert_eq!(search("").len(), fake_data::DOCK_APPS.len());
+    fn an_empty_query_browses_the_whole_installed_list() {
+        let apps = sample();
+        assert_eq!(search(&apps, "").len(), apps.len());
+        assert_eq!(search(&apps, "   ").len(), apps.len(), "whitespace only behaves like empty");
     }
 
     #[test]
-    fn whitespace_only_query_behaves_like_empty() {
-        assert_eq!(search("   ").len(), fake_data::DOCK_APPS.len());
+    fn search_is_case_insensitive_over_the_scan_time_search_key() {
+        let apps = sample();
+        assert!(search(&apps, "CHROM").iter().any(|a| a.id == "org.chromium.Chromium"));
+        assert!(search(&apps, "browser").iter().any(|a| a.id == "org.chromium.Chromium"));
+        // The haystack is one space-joined string, so a multi-word query
+        // matches when those words are adjacent in it…
+        assert!(search(&apps, "TEXT editor").iter().any(|a| a.id == "org.gnome.TextEditor"));
+        // …and does not when they come from two different apps. Substring
+        // matching over a pre-normalised haystack is exactly as much as this
+        // search box claims to do — no token reordering, no fuzzy matching.
+        assert!(search(&apps, "browser 文字").is_empty());
     }
 
     #[test]
-    fn search_matches_the_ascii_search_key_case_insensitively() {
-        let results = search("CHROM");
-        assert!(results.iter().any(|a| a.id == "browser"), "expected 'CHROM' to find the browser entry");
+    fn search_matches_a_cjk_name_verbatim() {
+        let apps = sample();
+        assert!(search(&apps, "文字").iter().any(|a| a.id == "org.gnome.TextEditor"));
     }
 
     #[test]
-    fn search_also_matches_the_cjk_label() {
-        let results = search("信箱");
-        assert!(results.iter().any(|a| a.id == "mail"));
+    fn search_over_an_empty_machine_returns_nothing_rather_than_a_catalog() {
+        // The regression this whole work package exists for: with no apps
+        // installed, the app list is EMPTY. It must not quietly fall back
+        // to canned entries.
+        assert!(search(&[], "").is_empty());
+        assert!(search(&[], "browser").is_empty());
     }
 
     #[test]
-    fn search_with_no_match_returns_empty() {
-        assert!(search("zzz_no_such_app_in_the_registry").is_empty());
+    fn a_query_that_matches_nothing_returns_empty() {
+        assert!(search(&sample(), "zzz_no_such_app_anywhere").is_empty());
+    }
+
+    // ── launch ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn launching_an_entry_with_no_command_is_a_safe_noop() {
+        let mut broken = app("x", "X", "x");
+        broken.exec_argv = None;
+        launch(&broken); // must not panic — the only assertion this needs
     }
 
     #[test]
-    fn launch_on_an_entry_with_no_flatpak_id_is_a_safe_noop() {
-        let entry = fake_data::DOCK_APPS.iter().find(|a| a.flatpak_id.is_none()).expect("at least one honest display-only stub must exist");
-        launch(entry); // must not panic — the only assertion this test needs
+    fn launching_without_flatpak_installed_reports_an_error_instead_of_panicking() {
+        // Dev-machine reality: `flatpak` is very likely absent, and that
+        // MUST be a clean logged `Err` path, never a panic. This is real
+        // coverage of the failure branch, not a smoke test.
+        let mut flatpak_app = app("org.example.Nope", "Nope", "nope");
+        flatpak_app.exec_argv = None;
+        flatpak_app.flatpak_id = Some("org.example.DoesNotExist".to_string());
+        launch(&flatpak_app);
     }
 
     #[test]
-    fn launch_on_the_one_real_entry_does_not_panic_even_without_flatpak_installed() {
-        // Dev-machine reality per this module's own header comment: `flatpak`
-        // is very likely absent, and this MUST still be a clean `Err` path,
-        // never a panic — `Command::spawn()` returning `Err` is exactly what
-        // "flatpak not installed" looks like, so this is real coverage, not
-        // a smoke test with a fake precondition.
-        let entry = fake_data::DOCK_APPS.iter().find(|a| a.id == "browser").expect("browser entry must exist");
-        assert_eq!(entry.verified, VerifiedTier::Works);
-        launch(entry);
+    fn launching_a_native_entry_whose_binary_is_missing_does_not_panic() {
+        let mut missing = app("gone", "Gone", "gone");
+        missing.exec_argv = Some(vec!["/duduclaw-nonexistent-binary-for-tests".to_string(), "--flag".to_string()]);
+        launch(&missing);
+    }
+
+    #[test]
+    fn a_terminal_app_is_still_listed_and_still_attempted() {
+        // Recorded behaviour, not an accident: `Terminal=true` is not a
+        // freedesktop hide signal, so hiding it would be this shell
+        // inventing a policy. It launches (and logs why nothing may show).
+        let mut terminal = app("htop", "htop", "htop");
+        terminal.terminal = true;
+        assert!(terminal.launchable());
+        launch(&terminal);
     }
 
     // ── Install plumbing (WP-A4-4) ─────────────────────────────────────
@@ -335,8 +466,6 @@ mod tests {
 
     #[test]
     fn parse_download_size_returns_none_rather_than_guessing() {
-        // Output shape this module doesn't recognize -> honest blank, never
-        // an invented number (task brief: "拿不到就誠實留白，不要編數字").
         assert_eq!(parse_download_size(""), None);
         assert_eq!(parse_download_size("error: Remote \"flathub\" not found\n"), None);
         assert_eq!(parse_download_size("Download:\n"), None, "an empty value is not a size");

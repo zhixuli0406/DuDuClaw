@@ -41,26 +41,27 @@
 // button.rs`'s `.hover(move |style| style.bg(bg_hover))`) — `cursor_pointer()`
 // alone signals clickability but gives no on-hover feedback.
 //
-// Icon glyphs: no `gpui::svg()` usage exists anywhere in this codebase yet
-// (see `fake_data.rs`'s header comment), and the bundled font stack
-// (`theme::app_font()`'s `InterVariable.ttf` + `NotoSansTC-Variable.ttf`,
-// loaded by `duduclaw-native-gui`'s own `main.rs` — this crate does NOT
-// re-load fonts, see this file's own font note below) has no guaranteed
-// pictographic/emoji glyph coverage (bell, gear, arrow dingbats are NOT
-// part of either font's core Latin/CJK charset). Every icon-shaped slot
-// below is therefore either a single CJK character (guaranteed via Noto
-// Sans TC, same "letter + color" placeholder convention
-// `duduclaw-native-gui/src/nav.rs` already established) or plain ASCII, and
-// purely decorative glyphs with no safe equivalent (the menu bar's
-// notification-bell SVG) are dropped rather than risk a tofu box — an
-// honest stub, not silently faked.
+// Icon glyphs: REAL stroke icons since ICON-1 (2026-08-22). Every
+// icon-shaped slot below used to render a single CJK character (and the
+// menu bar's Wi-Fi arc, having no safe equivalent character, was dropped
+// entirely) on the reasoning that this codebase had no `gpui::svg()` usage
+// and no pictographic font coverage. That reasoning was right about the
+// cause and wrong about the conclusion: the icons had been drawn as real
+// inline SVG in the approved boards all along. `crate::icons` now embeds
+// them as assets and `icon_or_glyph` swaps each placeholder for the board's
+// own artwork, keeping the character as a fallback if an asset ever fails
+// to resolve. See that module's header comment for the asset provenance,
+// the alpha-mask/tinting constraint, and why the light and dark boards
+// share ONE asset set.
 //
-// Font note: unlike `duduclaw-native-gui`'s own `main.rs`, THIS crate's
-// `main.rs` does not call `cx.text_system().add_fonts(...)` — Shell-S0 has
-// no bundled font assets of its own yet, so text renders on gpui's system
-// font fallback. CJK glyphs still render correctly (the OS provides a CJK
-// system font), just not in the Inter/Noto Sans TC faces the design board
-// specifies. Tracked as a stub, not fixed this round.
+// Font note: this crate's `main.rs` registers the bundled stack itself as
+// of ICON-1 (`theme::bundled_font_bytes()` → `add_fonts`, plus
+// `.font(theme::app_font())` on the root element in `Render::render`).
+// Before that it registered nothing and asked for nothing, so every screen
+// rendered in the platform's default family — the earlier note here, which
+// claimed `duduclaw-native-gui`'s `main.rs` covered it, was wrong in the
+// one place it mattered most: on the appliance the kiosk unit launches
+// THIS binary directly and that crate's `main.rs` never runs at all.
 //
 // Split across two files, same convention `duduclaw-native-gui/src/
 // screens/shell.rs` + its `shell_sidebar.rs`/`shell_content_list.rs`/
@@ -81,6 +82,7 @@ use duduclaw_native_gui::theme;
 
 use crate::fake_data;
 use crate::i18n::{t, Key, Locale};
+use crate::icons;
 use crate::overlay::notifications_feed::{FeedStatus, NotificationsFeed};
 use crate::palette::ShellPalette;
 use crate::surface::Overlay;
@@ -145,10 +147,16 @@ pub(crate) fn png(bytes: &'static [u8]) -> Arc<Image> {
 /// for its running-indicator dots and reuses it to decide focus-vs-launch
 /// on click (see `home::running_windows::RunningWindowsFeed`'s own header
 /// comment).
+/// `installed_apps` (APP-1, 2026-08-22) is `&self.installed_apps` from the
+/// same caller — the dock renders the REAL apps on this machine from it,
+/// and `home_dock::dock` also dispatches the background scan that keeps it
+/// warm for the Launcher overlay too (see `crate::apps::feed::
+/// InstalledAppsFeed`'s own header comment).
 pub fn render(
     palette: ShellPalette,
     notifications: &NotificationsFeed,
     running_windows: &RunningWindowsFeed,
+    installed_apps: &crate::apps::feed::InstalledAppsFeed,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
     div()
@@ -188,7 +196,7 @@ pub fn render(
         .child(workspace(palette, cx))
         .child(home_dock::goal_cards_row(palette))
         .child(home_dock::activity_shelf(palette))
-        .child(home_dock::dock(palette, running_windows, cx))
+        .child(home_dock::dock(palette, running_windows, installed_apps, cx))
 }
 
 fn blob_top_left(top: f32, left: f32, size: f32, color: gpui::Rgba) -> Div {
@@ -350,8 +358,8 @@ fn ticker_text(feed: &NotificationsFeed) -> String {
 /// the Launcher (task brief: "「⌘K」膠囊點擊 → 開 Launcher"), the
 /// battery/clock status group opens Notifications (task brief: "右側狀態
 /// 區（agent 頭像/電量/時鐘一帶）點擊 → 開 Notifications" — this board has
-/// no agent-avatar glyph in the menu bar, see this file's header comment on
-/// dropped pictographic glyphs, so the group is battery + clock only).
+/// no agent avatar in the menu bar at all, so the group is the Wi-Fi
+/// indicator + battery + clock).
 fn menu_bar_right(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
     // `.open(...)`, not `.toggle_launcher()` — see `composer()`'s own doc
     // comment for why every mouse click target here opens rather than
@@ -389,12 +397,6 @@ fn menu_bar_right(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
                 .text_size(px(11.))
                 .text_color(theme::alpha(palette.muted_foreground, 1.0))
                 .hover(|style| style.bg(theme::alpha(palette.surface_selected, 1.0)))
-                // Main.dc.html shows a bell SVG to the left of this — see
-                // this file's header comment on why pictographic glyphs are
-                // dropped rather than risked; the ⌘K hint itself is kept
-                // (design-load-bearing), accepting the small risk that "⌘"
-                // alone renders as a tofu box on a font with no dedicated
-                // glyph for it.
                 .child("⌘K")
                 .on_click(cmdk_click),
         )
@@ -408,6 +410,18 @@ fn menu_bar_right(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
                 .rounded(px(6.))
                 .px(px(4.))
                 .hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0)))
+                // ICON-1: the Wi-Fi indicator between the ⌘K pill and the
+                // battery reading. Main.dc.html renders it at 14px with the
+                // menu bar's own foreground stroke (`#09090b` light /
+                // `#fafafa` dark) — `palette.foreground` matches BOTH board
+                // values exactly, no bespoke pair needed. It is inside the
+                // status group's click target because the board draws it
+                // there, grouped with battery/clock; it is not separately
+                // interactive. No text fallback exists for it (there is no
+                // safe single character for "Wi-Fi"), so a missing asset
+                // renders nothing here rather than a wrong character —
+                // which is why `icons`' registry tests exist.
+                .children(icons::icon_or_none(&[(icons::WIFI, palette.foreground)], 14.))
                 .child(div().text_size(px(12.)).child(fake_data::BATTERY_PCT))
                 .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(fake_data::CLOCK))
                 .on_click(status_click),
@@ -500,7 +514,13 @@ fn composer(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div>
                 .text_size(px(15.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::alpha(palette.muted_foreground, 1.0))
-                .child("+"),
+                // ICON-1: the board's leading icon here is an arrow-out-of-
+                // a-tray (upload/attach), 18px, `#71717b` light / `#9f9fa9`
+                // dark — exactly `palette.muted_foreground` in both. "+" is
+                // the pre-ICON-1 stand-in, kept as the fallback; the
+                // wrapper's own `text_size`/`text_color` above are what
+                // style it if it ever renders.
+                .child(icons::icon_or_glyph(&[(icons::UPLOAD, palette.muted_foreground)], 18., "+")),
         )
         .child(
             div()
@@ -525,7 +545,11 @@ fn composer(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div>
                         .text_size(px(13.))
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme::alpha(palette.brand_foreground, 1.0))
-                        .child("送"),
+                        // ICON-1: the board's send button is an up-arrow,
+                        // 14px, `#fafafa` on the brand fill in BOTH boards
+                        // — `palette.brand_foreground` exactly, which is
+                        // also what the "送" fallback already used.
+                        .child(icons::icon_or_glyph(&[(icons::ARROW_UP, palette.brand_foreground)], 14., "送")),
                 ),
         )
         .on_click(on_click)

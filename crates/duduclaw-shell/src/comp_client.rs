@@ -207,12 +207,33 @@ pub fn focus_window(query: &str) -> Result<FocusMatch, CompClientError> {
 mod tests {
     use super::*;
 
+    /// The three tests below all mutate the SAME process-wide environment
+    /// variable, and `cargo test` runs them on concurrent threads — so one
+    /// test's `remove_var` could land between another's `set_var` and its
+    /// assertion. That is not theoretical: measured at **14 failures in 40
+    /// runs** of `cargo test comp_client::` alone (2026-08-22, macOS), with
+    /// no other test in the binary involved. It went unnoticed until APP-1
+    /// added enough sibling tests to change the scheduling, which is exactly
+    /// how a latent race announces itself.
+    ///
+    /// Serializing them on one mutex is the fix rather than
+    /// `--test-threads=1` (which would slow the whole suite for three tests)
+    /// or `#[serial_test::serial]` (a new dependency, which this crate's
+    /// `Cargo.toml` header comment sets a deliberately high bar for). The
+    /// guard is taken for the WHOLE save/mutate/assert/restore span, so a
+    /// panicking assertion cannot leak a mutated environment either — a
+    /// poisoned mutex is recovered rather than cascading into a second
+    /// failure that hides the first.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn socket_path_none_when_xdg_runtime_dir_unset() {
-        // SAFETY: test-only env mutation, same best-effort caveat this
-        // codebase's other env-mutating tests already accept (e.g.
-        // `duduclaw-sysd::protocol::tests::resolve_socket_path_prefers_env_
-        // override`).
+        let _guard = env_guard();
+        // SAFETY: test-only env mutation, serialized by `env_guard` above so
+        // no sibling test can observe the intermediate state.
         let saved = std::env::var_os("XDG_RUNTIME_DIR");
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
@@ -227,6 +248,7 @@ mod tests {
 
     #[test]
     fn socket_path_joins_the_fixed_file_name_under_xdg_runtime_dir() {
+        let _guard = env_guard();
         let saved = std::env::var_os("XDG_RUNTIME_DIR");
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "/tmp/some-runtime-dir");
@@ -242,6 +264,7 @@ mod tests {
 
     #[test]
     fn list_windows_against_a_missing_socket_is_not_available_not_a_panic() {
+        let _guard = env_guard();
         let saved = std::env::var_os("XDG_RUNTIME_DIR");
         let dir = std::env::temp_dir().join(format!("duduclaw-shell-comp-client-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);

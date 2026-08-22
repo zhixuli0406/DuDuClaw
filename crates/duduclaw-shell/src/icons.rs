@@ -1,0 +1,574 @@
+// Vector icons for the shell — ICON-1 (2026-08-22).
+//
+// ── What this replaces ───────────────────────────────────────────────────
+// Every icon-shaped slot in this crate used to render a single CJK
+// character ("設" for the dock's settings gear, "勿" for Do-not-disturb,
+// "表" for a spreadsheet, …) or plain ASCII ("W"/"B" for Wi-Fi/Bluetooth),
+// and the purely decorative slots with no safe equivalent character (the
+// menu bar's Wi-Fi arc, the Launcher's magnifier) were dropped entirely.
+// The reasoning recorded at the time (`home.rs` / `fake_data.rs` /
+// `overlay/launcher.rs` header comments) was correct about the CAUSE —
+// no `gpui::svg()` usage existed anywhere in this codebase and the bundled
+// font stack has no pictographic coverage — but wrong about the
+// consequence: the icons were never missing. They were designed, drawn as
+// real inline SVG, and signed off by the operator on 2026-08-20, sitting
+// in the approved design boards this whole time
+// (`commercial/design/duduclaw-os-desktop/*.dc.html` +
+// `commercial/design/duduclaw-os-home-dark/*.dc.html`). This module is the
+// plumbing that finally connects them.
+//
+// ── Where the assets come from ───────────────────────────────────────────
+// `crates/duduclaw-shell/assets/icons/*.svg`, one file per icon, path data
+// transcribed VERBATIM from the boards (every `d`/`cx`/`cy`/`r`/`x`/`y`/
+// `width`/`height`/`rx` attribute copied character-for-character — nothing
+// was redrawn "close enough"). Two container-level attributes are the only
+// additions a standalone file needs and the boards' inline SVG did not
+// carry: `xmlns="http://www.w3.org/2000/svg"` (usvg refuses a document
+// without it) and nothing else.
+//
+// They deliberately live in THIS repo, not in `commercial/` — that tree is
+// a separate nested git repo AND gitignored here, so an `include_bytes!`
+// pointing into it would build on this machine and fail everywhere else.
+// Same reasoning `home.rs`'s `MARK_32`/`CAT_512` already record for the
+// branding PNGs (which resolve to `appliance/branding/png/`).
+//
+// Naming rule: one file per DEPICTED SHAPE, kebab-case, named for what the
+// icon draws rather than where it happens to be used (`folder.svg`, not
+// `dock-slot-6.svg`) — the same icon is reused at several call sites and a
+// role-based name would be a lie at all but one of them. Where one board
+// icon paints in more than one color, it is split into one file PER COLOR
+// LAYER with a shared prefix (`document-outline` / `document-lines` /
+// `document-pencil`), because of the rendering constraint below.
+//
+// ── The rendering constraint (read before adding a multi-color icon) ─────
+// Verified against the pinned gpui rev (`7a7c3e1`,
+// `crates/gpui/src/window.rs::paint_svg` + `svg_renderer.rs::
+// render_alpha_mask`): `gpui::svg()` rasterizes the document to an ALPHA
+// MASK and paints it as a `MonochromeSprite` tinted by the element's own
+// `text_color`. Two consequences, both load-bearing here:
+//
+//   1. The stroke/fill colors written INSIDE an asset file are inert. They
+//      are kept at the light board's own values purely so the file still
+//      renders correctly in a browser/editor when someone inspects it; the
+//      color that actually reaches the screen is whichever palette token
+//      the caller pairs with the key. This is what makes the light/dark
+//      boards collapse into ONE asset set: both boards' SVGs were compared
+//      attribute-by-attribute and their path data is IDENTICAL — only the
+//      stroke colors differ, and those are exactly what the palette now
+//      supplies (see `crate::palette::ShellPalette`'s `icon_*` methods).
+//   2. A single `svg()` element cannot paint two colors. The boards' two
+//      multi-color icons (the Files document with its amber pencil, the
+//      spreadsheet with white rules over a green body) are therefore
+//      composed as STACKED layers — see `icon_or_none`'s `layers`
+//      parameter.
+//
+// `gpui::img()` + `ImageFormat::Svg` WOULD render full color in one
+// element (it routes to `render_single_frame`, not the alpha mask), and
+// was rejected deliberately: it rasterizes at a fixed 2x the document's
+// own intrinsic size rather than at the element's real bounds, and — the
+// deciding reason — it would bake the light board's colors into a bitmap,
+// putting every icon permanently outside the theme system. Layering costs
+// two extra small files and buys per-theme correctness for free.
+//
+// ── Degradation ──────────────────────────────────────────────────────────
+// `paint_svg` draws NOTHING (silently, via `.log_err()`) when an asset
+// fails to resolve. A blank hole where an icon should be is the one
+// outcome worse than the CJK-character placeholder it replaced, so every
+// call site goes through `icon_or_glyph`, which resolves the bytes FIRST
+// and falls back to the original placeholder character when they are
+// missing, logging the miss once per key. Three independent tests make
+// that path unreachable in practice rather than merely survivable: every
+// key in `ICONS` resolves to non-empty bytes; every payload PARSES through
+// the same `usvg` the renderer uses; and every payload RASTERIZES to a
+// non-empty image. The last two matter because a file that resolves but
+// fails to parse (or parses to nothing) never reaches the fallback at all
+// — it reaches the silent blank hole, which the fallback cannot see.
+
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
+use gpui::{div, prelude::*, px, AnyElement, SharedString, Svg};
+
+use duduclaw_native_gui::theme;
+
+use crate::palette::ShellPalette;
+
+// ── Keys ─────────────────────────────────────────────────────────────────
+// The key IS the `AssetSource` path — `gpui::svg().path(k)` hands it
+// straight to `ShellAssets::load` below, and `paint_svg` also uses it as
+// the sprite-atlas cache key, so it must be stable across renders (it is:
+// these are `&'static str` consts, not formatted strings).
+
+pub(crate) const WIFI: &str = "icons/wifi.svg";
+pub(crate) const UPLOAD: &str = "icons/upload.svg";
+pub(crate) const ARROW_UP: &str = "icons/arrow-up.svg";
+pub(crate) const GLOBE: &str = "icons/globe.svg";
+pub(crate) const SETTINGS: &str = "icons/settings.svg";
+pub(crate) const WIFI_TILE: &str = "icons/wifi-tile.svg";
+pub(crate) const BLUETOOTH: &str = "icons/bluetooth.svg";
+pub(crate) const MOON: &str = "icons/moon.svg";
+pub(crate) const VOLUME: &str = "icons/volume.svg";
+pub(crate) const BRIGHTNESS: &str = "icons/brightness.svg";
+pub(crate) const SEARCH: &str = "icons/search.svg";
+pub(crate) const FOLDER_FILLED: &str = "icons/folder-filled.svg";
+pub(crate) const SPREADSHEET_BODY: &str = "icons/spreadsheet-body.svg";
+pub(crate) const SPREADSHEET_LINES: &str = "icons/spreadsheet-lines.svg";
+pub(crate) const DOWNLOAD: &str = "icons/download.svg";
+
+/// The board's five CONCEPTUAL app icons: extracted and embedded like every
+/// other icon, but with no call site today. They are `UNBOUND_APP_ICONS`
+/// below, and the reason is a change that landed alongside this work
+/// package rather than an oversight.
+///
+/// `Main.dc.html`'s dock draws six imaginary apps (mail, a document with an
+/// amber pencil, a globe, a music note, a chat bubble, a folder). APP-1
+/// deleted the canned `DockApp`/`DOCK_APPS` array those tiles were rendered
+/// from, because on a real appliance it advertised software that was not
+/// installed; the dock and the Launcher now enumerate the machine's actual
+/// inventory (`crate::apps::installed`). A real installed app has no board
+/// icon to lift — its icon is whatever its own `.desktop` `Icon=` names,
+/// resolved against the system icon theme, which `apps::installed` already
+/// parses and carries and which is explicitly a separate work package. So
+/// binding, say, `MAIL` to whichever mail client happens to be installed
+/// would be this module inventing an identity for someone else's app.
+///
+/// The globe is the one exception and IS bound: `apps::catalog`'s single
+/// entry is the same Chromium the board's browser tile always stood for, so
+/// `catalog_layers` uses it.
+///
+/// Kept rather than deleted because the `Icon=` work package needs exactly
+/// this set as its unresolvable-icon fallback family, and re-extracting
+/// verified board artwork later is pure waste. The test
+/// `unbound_app_icons_are_shipped_and_still_unbound` pins the list so it
+/// cannot quietly grow, and asserts the mapping really does not use them.
+pub(crate) const MAIL: &str = "icons/mail.svg";
+pub(crate) const DOCUMENT_OUTLINE: &str = "icons/document-outline.svg";
+pub(crate) const DOCUMENT_LINES: &str = "icons/document-lines.svg";
+pub(crate) const DOCUMENT_PENCIL: &str = "icons/document-pencil.svg";
+pub(crate) const MUSIC: &str = "icons/music.svg";
+pub(crate) const CHAT: &str = "icons/chat.svg";
+pub(crate) const FOLDER: &str = "icons/folder.svg";
+
+/// Every embedded asset, keyed by its `AssetSource` path.
+///
+/// `include_bytes!` rather than a runtime file read: the appliance boots
+/// with a READ-ONLY root and the shell's working directory is not
+/// guaranteed, so any path-relative asset lookup would be a latent
+/// production failure. Same convention `home.rs`'s branding PNGs already
+/// follow.
+const ICONS: &[(&str, &[u8])] = &[
+    (WIFI, include_bytes!("../assets/icons/wifi.svg")),
+    (UPLOAD, include_bytes!("../assets/icons/upload.svg")),
+    (ARROW_UP, include_bytes!("../assets/icons/arrow-up.svg")),
+    (MAIL, include_bytes!("../assets/icons/mail.svg")),
+    (DOCUMENT_OUTLINE, include_bytes!("../assets/icons/document-outline.svg")),
+    (DOCUMENT_LINES, include_bytes!("../assets/icons/document-lines.svg")),
+    (DOCUMENT_PENCIL, include_bytes!("../assets/icons/document-pencil.svg")),
+    (GLOBE, include_bytes!("../assets/icons/globe.svg")),
+    (MUSIC, include_bytes!("../assets/icons/music.svg")),
+    (CHAT, include_bytes!("../assets/icons/chat.svg")),
+    (FOLDER, include_bytes!("../assets/icons/folder.svg")),
+    (SETTINGS, include_bytes!("../assets/icons/settings.svg")),
+    (WIFI_TILE, include_bytes!("../assets/icons/wifi-tile.svg")),
+    (BLUETOOTH, include_bytes!("../assets/icons/bluetooth.svg")),
+    (MOON, include_bytes!("../assets/icons/moon.svg")),
+    (VOLUME, include_bytes!("../assets/icons/volume.svg")),
+    (BRIGHTNESS, include_bytes!("../assets/icons/brightness.svg")),
+    (SEARCH, include_bytes!("../assets/icons/search.svg")),
+    (FOLDER_FILLED, include_bytes!("../assets/icons/folder-filled.svg")),
+    (SPREADSHEET_BODY, include_bytes!("../assets/icons/spreadsheet-body.svg")),
+    (SPREADSHEET_LINES, include_bytes!("../assets/icons/spreadsheet-lines.svg")),
+    (DOWNLOAD, include_bytes!("../assets/icons/download.svg")),
+];
+
+/// The embedded bytes for `path`, or `None` when nothing is registered
+/// under that key. Pure, and the single lookup both the `AssetSource` impl
+/// and the render-side `icon()` guard go through — so "the renderer can
+/// find it" and "the guard says it exists" can never disagree.
+pub(crate) fn bytes(path: &str) -> Option<&'static [u8]> {
+    ICONS.iter().find(|(key, _)| *key == path).map(|(_, data)| *data)
+}
+
+// ── AssetSource ──────────────────────────────────────────────────────────
+
+/// This crate's `gpui::AssetSource`, registered ONCE in `main.rs` via
+/// `application().with_assets(ShellAssets)` — the only registration point
+/// that exists, because `Application::with_assets` (`gpui/src/app.rs:200`)
+/// consumes the pre-launch `Application` value and also rebuilds the
+/// `SvgRenderer` around the new source; there is no post-`run()` API to
+/// swap it. gpui's default is `impl AssetSource for ()`, which answers
+/// `Ok(None)` to everything — which is exactly why `svg()` could never have
+/// worked in this crate before, no matter what path it was handed.
+///
+/// Registered in the SHELL's own `main.rs`, not inherited from
+/// `duduclaw-native-gui`: the shell is a separate binary that the appliance's
+/// kiosk unit launches directly (`appliance/mkosi.extra/usr/local/sbin/
+/// duduclaw-kiosk-launch.sh`), so `duduclaw-native-gui`'s `main.rs` never
+/// runs on the appliance at all and nothing it configures reaches here.
+/// (That same fact is why this crate now loads its own fonts too — see
+/// `main.rs`'s `add_fonts` call site.)
+pub(crate) struct ShellAssets;
+
+impl gpui::AssetSource for ShellAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        Ok(bytes(path).map(std::borrow::Cow::Borrowed))
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(ICONS.iter().filter(|(key, _)| key.starts_with(path)).map(|(key, _)| SharedString::from(*key)).collect())
+    }
+}
+
+// ── Render helpers ───────────────────────────────────────────────────────
+
+/// One paint layer: an asset key plus the color it is tinted with. A
+/// single-color icon is one layer; the boards' two multi-color icons are
+/// several (see this module's header comment on why gpui cannot do it in
+/// one element).
+pub(crate) type Layer = (&'static str, u32);
+
+/// Renders `layers` stacked, `size`x`size` px, or `None` when ANY layer's
+/// asset is missing — never a partial stack, since a document drawn without
+/// its pencil would look like a deliberate design rather than a fault.
+/// Callers with a text placeholder to fall back on should use
+/// `icon_or_glyph`; this raw form is for the slots that never had one (the
+/// menu bar's Wi-Fi indicator, the Launcher's magnifier), where rendering
+/// nothing is the honest degradation and a substitute character would be an
+/// invention.
+///
+/// A one-layer call returns the bare `svg()` element (no wrapper `div`);
+/// multi-layer calls get a `relative()` box with each layer absolutely
+/// pinned to the same bounds, so the layers register exactly the way they
+/// do inside the board's single SVG document.
+pub(crate) fn icon_or_none(layers: &[Layer], size: f32) -> Option<AnyElement> {
+    for (key, _) in layers {
+        if bytes(key).is_none() {
+            warn_missing(key);
+            return None;
+        }
+    }
+    match layers {
+        [] => None,
+        [(key, hex)] => Some(layer_svg(key, *hex, size).into_any_element()),
+        many => {
+            let mut stack = div().relative().w(px(size)).h(px(size)).flex_none();
+            for (key, hex) in many {
+                stack = stack.child(layer_svg(key, *hex, size).absolute().top(px(0.)).left(px(0.)));
+            }
+            Some(stack.into_any_element())
+        }
+    }
+}
+
+fn layer_svg(key: &'static str, hex: u32, size: f32) -> Svg {
+    // `.text_color` is not cosmetic here: `paint_svg` is only reached when
+    // `style.text.color` is `Some` (`gpui/src/elements/svg.rs`'s `paint`),
+    // so an untinted `svg()` draws nothing at all. Always set it.
+    gpui::svg().path(key).w(px(size)).h(px(size)).flex_none().text_color(theme::alpha(hex, 1.0))
+}
+
+/// The one entry point every call site uses: the real icon when its assets
+/// are embedded, otherwise the placeholder character that slot used before
+/// ICON-1. The fallback inherits `text_size`/`font_weight`/`text_color`
+/// from its parent element exactly as the original placeholder did, so a
+/// degraded slot renders identically to the pre-ICON-1 build rather than
+/// half-styled.
+pub(crate) fn icon_or_glyph(layers: &[Layer], size: f32, glyph: &'static str) -> AnyElement {
+    icon_or_none(layers, size).unwrap_or_else(|| glyph.into_any_element())
+}
+
+/// Logged once per key, not once per frame: a missing asset would
+/// otherwise print on every repaint of the surface that references it.
+fn warn_missing(key: &str) {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut guard) = seen.lock() else {
+        return;
+    };
+    if guard.insert(key.to_string()) {
+        eprintln!("[icons] asset missing from the embedded registry: {key:?} — falling back to the text placeholder");
+    }
+}
+
+// ── Slot → icon mapping ──────────────────────────────────────────────────
+// Deliberately NOT an extra field on `apps::catalog::CatalogApp` /
+// `fake_data::QuickTile` / `fake_data::LauncherFileResult`: "which vector
+// icon draws this row" is a presentation concern with no business in data
+// tables this crate also unit-tests for content fidelity against the
+// boards, and those tables were being rewritten by a concurrent work
+// package while this one landed. Keeping the mapping here as a pure
+// `id -> layers` function leaves both files untouched and makes the mapping
+// itself directly testable — which is what `every_*_key_is_registered`
+// below actually tests.
+
+/// The icon for an `apps::catalog::CatalogApp` — the Launcher's 「可安裝」
+/// rows and the install-confirmation sheet, which key off the same
+/// `CatalogApp::id`. `None` means the boards contain no icon for that
+/// entry, and the caller keeps its text placeholder.
+///
+/// This is the ONE app-shaped slot that legitimately carries board artwork:
+/// the catalog is a fixed, hand-authored list this crate ships (not a scan
+/// of the machine), and its single entry is the same Chromium the board's
+/// browser tile always depicted. Installed apps deliberately have no
+/// mapping here — see `MAIL`'s doc comment.
+///
+/// Layers come back already paired with their palette tokens. Resolving the
+/// color HERE rather than at the call site is deliberate: which token tints
+/// which icon layer is knowledge read off the design boards, and keeping
+/// all of it in this one module is what lets the light and dark boards
+/// share a single asset set.
+pub(crate) fn catalog_layers(catalog_id: &str, palette: ShellPalette) -> Option<Vec<Layer>> {
+    match catalog_id {
+        "catalog-chromium" => Some(vec![(GLOBE, palette.icon_globe())]),
+        _ => None,
+    }
+}
+
+/// The icon for a `fake_data::QuickTile` (ControlCenter's Wi-Fi / Bluetooth
+/// / Do-not-disturb tiles). `active` picks the stroke the boards use for an
+/// ON tile (`#fafafa` on the brand fill) versus an OFF one — the same
+/// distinction `overlay/controlcenter.rs` already draws for the tile's own
+/// title and subtitle.
+pub(crate) fn quick_tile_layers(tile_id: &str, palette: ShellPalette, active: bool) -> Option<Vec<Layer>> {
+    let hex = if active { palette.brand_foreground } else { palette.icon_control() };
+    let key = match tile_id {
+        "tile-wifi" => WIFI_TILE,
+        "tile-bluetooth" => BLUETOOTH,
+        "tile-dnd" => MOON,
+        _ => return None,
+    };
+    Some(vec![(key, hex)])
+}
+
+/// The icon for a `fake_data::LauncherFileResult` row. The spreadsheet is
+/// two layers (green body, white rules); the folder is one filled shape.
+/// Both keep IDENTITY colors — a folder is blue and an xlsx is green in
+/// both boards — which is why `glyph_hex` is threaded in from the row
+/// itself rather than resolved from a theme token (the same convention
+/// `overlay/launcher.rs` already documents for that field).
+pub(crate) fn launcher_file_layers(file_id: &str, glyph_hex: u32, palette: ShellPalette) -> Option<Vec<Layer>> {
+    match file_id {
+        "launcher-file-folder" => Some(vec![(FOLDER_FILLED, glyph_hex)]),
+        "launcher-file-xlsx" => Some(vec![(SPREADSHEET_BODY, glyph_hex), (SPREADSHEET_LINES, palette.icon_on_colored_tile())]),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AssetSource as _;
+
+    /// The load-bearing one. A key referenced by a call site but absent
+    /// from `ICONS` is a hole in the UI, and the render-time fallback is
+    /// designed to HIDE that (it quietly draws the old placeholder) — so
+    /// the miss has to fail here instead.
+    #[test]
+    fn every_registered_key_resolves_to_non_empty_bytes() {
+        for (key, _) in ICONS {
+            let found = bytes(key).unwrap_or_else(|| panic!("{key} is registered but does not resolve"));
+            assert!(!found.is_empty(), "{key} resolved to zero bytes");
+        }
+    }
+
+    /// Resolving is not the same as being drawable: `paint_svg` swallows a
+    /// parse error and paints nothing, and the byte-level guard above
+    /// cannot see that. This runs the exact `usvg` configuration the
+    /// renderer uses (`gpui::SvgRenderer`, the type `Application::
+    /// with_assets` installs) over every payload.
+    #[test]
+    fn every_registered_asset_parses_as_svg() {
+        let renderer = gpui::SvgRenderer::new(std::sync::Arc::new(()));
+        for (key, data) in ICONS {
+            assert!(renderer.parse_svg(data).is_ok(), "{key} does not parse as SVG");
+        }
+    }
+
+    /// The alpha mask is built from what actually rasterizes, so a document
+    /// that parses but paints nothing (a typo'd path, a zero-size viewBox)
+    /// would still reach the screen as a blank hole.
+    #[test]
+    fn every_registered_asset_rasterizes_to_a_non_empty_image() {
+        let renderer = gpui::SvgRenderer::new(std::sync::Arc::new(()));
+        for (key, data) in ICONS {
+            let parsed = renderer.parse_svg(data).unwrap_or_else(|e| panic!("{key} failed to parse: {e}"));
+            let image = renderer
+                .render_parsed(&parsed, gpui::SvgSize::ExactSize(gpui::size(gpui::DevicePixels(48), gpui::DevicePixels(48))))
+                .unwrap_or_else(|e| panic!("{key} failed to rasterize: {e}"));
+            let size = image.size(0);
+            assert!(i32::from(size.width) > 0 && i32::from(size.height) > 0, "{key} rasterized to an empty image");
+        }
+    }
+
+    #[test]
+    fn keys_are_unique() {
+        let mut keys: Vec<&str> = ICONS.iter().map(|(k, _)| *k).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), ICONS.len(), "duplicate key in ICONS");
+    }
+
+    #[test]
+    fn every_key_lives_under_the_icons_prefix_and_ends_in_svg() {
+        for (key, _) in ICONS {
+            assert!(key.starts_with("icons/"), "{key} is outside the icons/ namespace");
+            assert!(key.ends_with(".svg"), "{key} is not a .svg path");
+        }
+    }
+
+    #[test]
+    fn unknown_paths_resolve_to_none() {
+        assert!(bytes("icons/does-not-exist.svg").is_none());
+        assert!(bytes("").is_none());
+        // Not a prefix match — a lookup must be the whole key, so a
+        // truncated or extended path can never silently resolve to a
+        // neighbour.
+        assert!(bytes("icons/mail").is_none());
+        assert!(bytes("icons/mail.svg.bak").is_none());
+    }
+
+    #[test]
+    fn asset_source_load_matches_the_registry() {
+        for (key, data) in ICONS {
+            let loaded = ShellAssets.load(key).expect("load must not error").expect("every registered key must load");
+            assert_eq!(loaded.as_ref(), *data, "{key} loaded different bytes than the registry holds");
+        }
+        assert!(ShellAssets.load("icons/nope.svg").expect("a miss is Ok(None), not an error").is_none());
+    }
+
+    #[test]
+    fn asset_source_list_enumerates_the_namespace() {
+        let listed = ShellAssets.list("icons/").expect("list must not error");
+        assert_eq!(listed.len(), ICONS.len());
+        assert!(ShellAssets.list("fonts/").expect("list must not error").is_empty());
+    }
+
+    // ── Slot mapping ─────────────────────────────────────────────────────
+
+    /// Every mapped slot must point at keys that actually exist — the
+    /// mapping is where a typo would otherwise land, and a typo'd key
+    /// degrades to the old text placeholder silently at runtime.
+    #[test]
+    fn every_catalog_entry_that_is_mapped_resolves_to_registered_keys() {
+        for palette in [ShellPalette::light(), ShellPalette::dark()] {
+            for entry in crate::apps::catalog::INSTALL_CATALOG {
+                let Some(layers) = catalog_layers(entry.id, palette) else {
+                    continue;
+                };
+                assert!(!layers.is_empty(), "{} maps to an empty layer list", entry.id);
+                for (key, _) in &layers {
+                    assert!(bytes(key).is_some(), "{} maps to unregistered key {key}", entry.id);
+                }
+            }
+        }
+    }
+
+    /// The catalog is small and hand-authored, so "every entry has an icon"
+    /// is a claim worth holding to — an entry added without one silently
+    /// falls back to a CJK character, which is the state this whole work
+    /// package exists to end.
+    #[test]
+    fn every_catalog_entry_has_an_icon() {
+        let palette = ShellPalette::light();
+        for entry in crate::apps::catalog::INSTALL_CATALOG {
+            assert!(catalog_layers(entry.id, palette).is_some(), "catalog entry {} has no icon mapping", entry.id);
+        }
+    }
+
+    #[test]
+    fn every_mapped_quick_tile_key_is_registered() {
+        for palette in [ShellPalette::light(), ShellPalette::dark()] {
+            for active in [false, true] {
+                for tile in crate::fake_data::QUICK_TILES {
+                    let layers = quick_tile_layers(tile.id, palette, active).unwrap_or_else(|| panic!("{} has no icon mapping", tile.id));
+                    for (key, _) in &layers {
+                        assert!(bytes(key).is_some(), "{} maps to unregistered key {key}", tile.id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_mapped_launcher_file_key_is_registered() {
+        for palette in [ShellPalette::light(), ShellPalette::dark()] {
+            for row in crate::fake_data::LAUNCHER_FILE_RESULTS {
+                let layers =
+                    launcher_file_layers(row.id, row.glyph_hex, palette).unwrap_or_else(|| panic!("{} has no icon mapping", row.id));
+                for (key, _) in &layers {
+                    assert!(bytes(key).is_some(), "{} maps to unregistered key {key}", row.id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_slot_ids_map_to_none() {
+        let palette = ShellPalette::light();
+        assert!(catalog_layers("catalog-nope", palette).is_none());
+        assert!(quick_tile_layers("tile-nope", palette, true).is_none());
+        assert!(launcher_file_layers("launcher-file-nope", 0x000000, palette).is_none());
+    }
+
+    /// The whole point of one asset set serving two themes: a mapped layer
+    /// must resolve to a DIFFERENT tint in light and dark wherever the
+    /// boards themselves differ, and to the SAME one where they do not
+    /// (identity colors: white on a colored tile, the amber pencil, a blue
+    /// folder). A regression here shows up on screen as an icon that
+    /// vanishes into its own background in one theme.
+    #[test]
+    fn icon_tints_follow_the_theme_where_the_boards_do() {
+        let globe_light = catalog_layers("catalog-chromium", ShellPalette::light()).expect("chromium is mapped");
+        let globe_dark = catalog_layers("catalog-chromium", ShellPalette::dark()).expect("chromium is mapped");
+        assert_ne!(globe_light[0].1, globe_dark[0].1, "the globe is themed");
+
+        // The spreadsheet's green body is identity in both themes; its
+        // white rules are the shared colored-tile white, also identity.
+        let sheet_light = launcher_file_layers("launcher-file-xlsx", 0x21a366, ShellPalette::light()).expect("mapped");
+        let sheet_dark = launcher_file_layers("launcher-file-xlsx", 0x21a366, ShellPalette::dark()).expect("mapped");
+        assert_eq!(sheet_light.len(), 2);
+        assert_eq!(sheet_light[0].1, sheet_dark[0].1);
+        assert_eq!(sheet_light[1].1, sheet_dark[1].1);
+    }
+
+    #[test]
+    fn quick_tile_active_and_inactive_tints_differ() {
+        for palette in [ShellPalette::light(), ShellPalette::dark()] {
+            let on = quick_tile_layers("tile-wifi", palette, true).expect("mapped");
+            let off = quick_tile_layers("tile-wifi", palette, false).expect("mapped");
+            assert_ne!(on[0].1, off[0].1);
+        }
+    }
+
+    /// See the block comment on `MAIL`. A test fixture rather than a
+    /// crate-level const precisely BECAUSE nothing in the shipping binary
+    /// consumes it — the whole claim being pinned is that these keys have
+    /// no call site.
+    const UNBOUND_APP_ICONS: &[&str] = &[MAIL, DOCUMENT_OUTLINE, DOCUMENT_LINES, DOCUMENT_PENCIL, MUSIC, CHAT, FOLDER];
+
+    /// Pins the boundary `MAIL`'s doc comment describes: the board's five
+    /// conceptual app icons ship but have no call site, because the dock
+    /// and the Launcher render a real inventory now and a real app's icon
+    /// comes from its own `Icon=`. If a future round binds one of these,
+    /// this list should shrink deliberately — and if someone adds a new
+    /// asset and forgets to wire it, it will not silently join them.
+    #[test]
+    fn unbound_app_icons_are_shipped_and_still_unbound() {
+        for key in UNBOUND_APP_ICONS {
+            assert!(bytes(key).is_some(), "{key} is listed as shipped-but-unbound yet does not resolve");
+        }
+        let palette = ShellPalette::light();
+        let bound: Vec<&str> = ICONS
+            .iter()
+            .map(|(k, _)| *k)
+            .filter(|k| {
+                crate::apps::catalog::INSTALL_CATALOG.iter().any(|e| {
+                    catalog_layers(e.id, palette).is_some_and(|layers| layers.iter().any(|(lk, _)| lk == k))
+                })
+            })
+            .collect();
+        for key in UNBOUND_APP_ICONS {
+            assert!(!bound.contains(key), "{key} is listed as unbound but the catalog mapping uses it");
+        }
+    }
+}

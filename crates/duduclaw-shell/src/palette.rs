@@ -94,8 +94,11 @@
 //     that the approved canvas's own annotation says DOES need a themed
 //     swap (`#2d2d31→#1e1e21` + a 14%-white border in dark) even though
 //     every OTHER dock/app-icon color is explicitly "identity, not
-//     themed" — see the header comment on `home.rs`'s `DOCK_APPS` for the
-//     full identity-color rule this is the one documented exception to.
+//     themed". APP-1 (2026-08-22) made this the ONLY app-tile treatment
+//     rather than an exception: the dock and the Launcher render REAL
+//     installed apps now (`crate::apps::installed`), and a real app has no
+//     design-board colour to lift, so every app tile uses this neutral pair
+//     with the app's own first character in it (`InstalledApp::glyph`).
 //   - `settings_gradient_top` / `settings_gradient_bottom`: the neutral GRAY
 //     "settings"/"system update" icon gradient reused verbatim by
 //     `home/home_dock.rs`'s dock settings icon AND `overlay/notifications.rs`'s
@@ -372,6 +375,68 @@ impl ShellPalette {
         vec![BoxShadow::new(px(0.), px(3.), rgb(base).opacity(opacity).into()).blur_radius(px(6.))]
     }
 
+    // ── Icon stroke tints (ICON-1, 2026-08-22) ───────────────────────────
+    // `gpui::svg()` paints an alpha mask tinted by the element's own text
+    // color (see `crate::icons`'s header comment), so these six methods ARE
+    // the icon color system — the hexes written inside the asset files
+    // never reach the screen. Every value below is read off the two
+    // approved boards' own `stroke=`/`fill=` attributes for that icon,
+    // light and dark side by side.
+    //
+    // Methods, not fields, for two reasons: three of the six resolve to the
+    // SAME value in both themes (identity colors, exactly the exception
+    // this module's header comment already documents for tile gradients),
+    // which the `light_and_dark_disagree_on_every_plain_color_field` test
+    // deliberately forbids for a plain field; and two of them are derived
+    // from an existing field (`text_secondary`, `brand_bright`) rather than
+    // being a new independent color, which a field would duplicate.
+
+    /// Icon stroke on a COLORED (identity-gradient) app tile — the dock's
+    /// mail/music/chat/folder squircles, and the white rules over the
+    /// Launcher's green spreadsheet icon. `#ffffff` in BOTH boards: a white
+    /// glyph on a saturated fill does not need to change per theme, since
+    /// the fill it sits on doesn't either.
+    pub(crate) fn icon_on_colored_tile(&self) -> u32 {
+        0xffffff
+    }
+
+    /// Icon stroke on the neutral GRAY gradient (`settings_gradient_top`/
+    /// `bottom`) — the dock's settings gear and Notifications' system-update
+    /// row. Light `#ffffff` / dark `#d4d4d8`, which is exactly
+    /// `text_secondary`'s dark value; both call sites already resolved this
+    /// pair inline before ICON-1, so this is the same behavior with one
+    /// owner instead of two copies.
+    pub(crate) fn icon_on_neutral_gradient(&self) -> u32 {
+        if self.dark {
+            self.text_secondary
+        } else {
+            0xffffff
+        }
+    }
+
+    /// Standalone control-surface icon stroke (ControlCenter's inactive
+    /// quick tiles, its volume/brightness rows) — light `#52525c` / dark
+    /// `#b0b0b8`. Both call sites already spelled this pair out inline
+    /// before ICON-1; the values are unchanged.
+    pub(crate) fn icon_control(&self) -> u32 {
+        if self.dark {
+            0xb0b0b8
+        } else {
+            0x52525c
+        }
+    }
+
+    /// The browser globe's stroke — light `#1f7ae0` (bespoke: NOT `brand`,
+    /// which is `#2171cc`) / dark `#59a6ff`, which IS `brand_bright`
+    /// exactly. Kept as one method so the asymmetry is stated once.
+    pub(crate) fn icon_globe(&self) -> u32 {
+        if self.dark {
+            self.brand_bright
+        } else {
+            0x1f7ae0
+        }
+    }
+
     /// The solid accent color for a badge's dot/ring (goal-card status
     /// rings, the dock agent status dot's "brand" case — NOT its "needs
     /// human" case, which uses `warning_dot` instead, see this module's
@@ -429,7 +494,7 @@ impl ShellPalette {
     }
 
     /// WP-A3 (2026-08-22): resolves the D8 "DuDuClaw Verified" four-tier
-    /// rating (`fake_data::VerifiedTier`) onto this palette's existing
+    /// rating (`crate::apps::VerifiedTier`) onto this palette's existing
     /// `BadgeKind`/`destructive` tokens — deliberately NOT a fourth/fifth
     /// `BadgeKind` variant (same "no board precedent, reuse the plain
     /// `destructive` field instead of growing the enum" call this module's
@@ -437,8 +502,8 @@ impl ShellPalette {
     /// `Unrated` (no rating evidence — see that variant's own doc comment)
     /// resolves through `text_faint` rather than any accent color, since it
     /// isn't a rating at all.
-    pub(crate) fn verified_bg(&self, tier: crate::fake_data::VerifiedTier) -> Rgba {
-        use crate::fake_data::VerifiedTier;
+    pub(crate) fn verified_bg(&self, tier: crate::apps::VerifiedTier) -> Rgba {
+        use crate::apps::VerifiedTier;
         match tier {
             VerifiedTier::Verified => self.badge_bg(BadgeKind::Success),
             VerifiedTier::Works => self.badge_bg(BadgeKind::Brand),
@@ -452,8 +517,8 @@ impl ShellPalette {
 
     /// Text color half of [`Self::verified_bg`] — see that fn's own doc
     /// comment.
-    pub(crate) fn verified_text(&self, tier: crate::fake_data::VerifiedTier) -> Rgba {
-        use crate::fake_data::VerifiedTier;
+    pub(crate) fn verified_text(&self, tier: crate::apps::VerifiedTier) -> Rgba {
+        use crate::apps::VerifiedTier;
         match tier {
             VerifiedTier::Verified => self.badge_text(BadgeKind::Success),
             VerifiedTier::Works => self.badge_text(BadgeKind::Brand),
@@ -469,8 +534,8 @@ impl ShellPalette {
     /// extra for the common "no rating evidence" case rather than a
     /// cluttered always-on dot; this is the "無資料誠實顯示" boundary
     /// applied to a context with no room for the word "未評級" itself.
-    pub(crate) fn verified_accent_dot(&self, tier: crate::fake_data::VerifiedTier) -> Option<u32> {
-        use crate::fake_data::VerifiedTier;
+    pub(crate) fn verified_accent_dot(&self, tier: crate::apps::VerifiedTier) -> Option<u32> {
+        use crate::apps::VerifiedTier;
         match tier {
             VerifiedTier::Verified => Some(self.success),
             VerifiedTier::Works => Some(self.brand),
@@ -625,6 +690,50 @@ mod tests {
         assert_ne!(light_shadow[0].color, dark_shadow[0].color);
     }
 
+    /// ICON-1: the three THEMED icon tints must actually change with the
+    /// theme (an icon that keeps its light stroke on a dark surface is the
+    /// exact failure mode `crate::icons`'s one-asset-set-for-two-boards
+    /// design has to avoid), and the three IDENTITY ones must not.
+    #[test]
+    fn icon_tints_split_cleanly_into_themed_and_identity() {
+        let light = ShellPalette::light();
+        let dark = ShellPalette::dark();
+
+        assert_ne!(light.icon_on_neutral_gradient(), dark.icon_on_neutral_gradient());
+        assert_ne!(light.icon_control(), dark.icon_control());
+        assert_ne!(light.icon_globe(), dark.icon_globe());
+
+        assert_eq!(light.icon_on_colored_tile(), dark.icon_on_colored_tile());
+    }
+
+    /// The two derived-from-an-existing-field cases, pinned so a future
+    /// edit to `text_secondary`/`brand_bright` can't silently desync the
+    /// icon color from the token this module's doc comment says it IS.
+    #[test]
+    fn derived_icon_tints_track_their_source_field() {
+        let dark = ShellPalette::dark();
+        assert_eq!(dark.icon_on_neutral_gradient(), dark.text_secondary);
+        assert_eq!(dark.icon_globe(), dark.brand_bright);
+    }
+
+    /// The board's own light/dark stroke pairs, transcribed. These are the
+    /// only literals in this module that a reader cannot check against a
+    /// token, so they get pinned directly against the boards' `stroke=`
+    /// values (`commercial/design/duduclaw-os-desktop/*.dc.html` and its
+    /// `duduclaw-os-home-dark` twin).
+    #[test]
+    fn icon_tints_match_the_boards_stroke_values() {
+        let light = ShellPalette::light();
+        let dark = ShellPalette::dark();
+        assert_eq!(light.icon_on_colored_tile(), 0xffffff);
+        assert_eq!(light.icon_on_neutral_gradient(), 0xffffff);
+        assert_eq!(dark.icon_on_neutral_gradient(), 0xd4d4d8);
+        assert_eq!(light.icon_control(), 0x52525c);
+        assert_eq!(dark.icon_control(), 0xb0b0b8);
+        assert_eq!(light.icon_globe(), 0x1f7ae0);
+        assert_eq!(dark.icon_globe(), 0x59a6ff);
+    }
+
     #[test]
     fn badge_accent_maps_each_kind_to_its_own_token() {
         for palette in [ShellPalette::light(), ShellPalette::dark()] {
@@ -661,7 +770,7 @@ mod tests {
 
     #[test]
     fn verified_bg_and_text_differ_between_light_and_dark_for_every_tier() {
-        use crate::fake_data::VerifiedTier;
+        use crate::apps::VerifiedTier;
         let light = ShellPalette::light();
         let dark = ShellPalette::dark();
         for tier in
@@ -677,7 +786,7 @@ mod tests {
         // A badge nobody can read is worse than no badge — every tier
         // (including `Unrated`, which has no accent color of its own) must
         // still resolve to a visible pill.
-        use crate::fake_data::VerifiedTier;
+        use crate::apps::VerifiedTier;
         for palette in [ShellPalette::light(), ShellPalette::dark()] {
             for tier in
                 [VerifiedTier::Verified, VerifiedTier::Works, VerifiedTier::Partial, VerifiedTier::Unsupported, VerifiedTier::Unrated]
@@ -690,7 +799,7 @@ mod tests {
 
     #[test]
     fn verified_accent_dot_is_none_only_for_unrated() {
-        use crate::fake_data::VerifiedTier;
+        use crate::apps::VerifiedTier;
         for palette in [ShellPalette::light(), ShellPalette::dark()] {
             assert_eq!(palette.verified_accent_dot(VerifiedTier::Unrated), None);
             for tier in [VerifiedTier::Verified, VerifiedTier::Works, VerifiedTier::Partial, VerifiedTier::Unsupported] {
@@ -705,7 +814,7 @@ mod tests {
         // color family" call this module's header comment already makes for
         // the Rejected approval outcome — pin it so a future refactor can't
         // silently reintroduce a fourth/fifth `BadgeKind` variant instead.
-        use crate::fake_data::VerifiedTier;
+        use crate::apps::VerifiedTier;
         for palette in [ShellPalette::light(), ShellPalette::dark()] {
             assert_eq!(palette.verified_accent_dot(VerifiedTier::Unsupported), Some(palette.destructive));
         }

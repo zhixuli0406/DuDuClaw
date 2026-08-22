@@ -293,10 +293,12 @@ fn unlock_hint() -> Div {
         .child(div().text_size(px(12.)).text_color(theme::alpha(0xfafafa, 0.55)).child(t(Locale::ZhTw, Key::LockUnlockHint)))
 }
 
-/// No `gpui::svg()` usage anywhere in this codebase yet (same gap `home.rs`'s
-/// own header comment documents) — a single CJK glyph ("鎖", lock) stands in
-/// for a real lock icon, same "letter/glyph + color, no icon font" stub
-/// convention this whole crate already follows.
+/// A single CJK glyph ("鎖", lock) stands in for a real lock icon. ICON-1
+/// (2026-08-22) gave this crate real vector icons (`crate::icons`) but did
+/// NOT change this slot: `LockScreen.dc.html` — the approved board for this
+/// very surface — contains no SVG at all, so there is no board artwork to
+/// draw here and inventing one would be this file deciding a design
+/// question. Left as the honest placeholder, listed as a gap.
 fn lock_glyph_circle() -> Div {
     div()
         .w(px(56.))

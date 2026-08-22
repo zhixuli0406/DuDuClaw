@@ -26,9 +26,10 @@
 //     variant that carries a made-up number, so a size can only ever be
 //     rendered from text `flatpak` itself printed (task brief: "拿得到就顯
 //     示，拿不到就誠實留白，不要編數字").
-//   * `open` returns `None` for an app with no `flatpak_id`/`flatpak_remote`
-//     — the gate cannot be opened for something this shell has no real way
-//     to install, rather than opening a sheet that would fail on confirm.
+//   * the gate can only be built from a catalog entry that already names a
+//     real flatpak ref AND a real remote — it is impossible to open one for
+//     something this shell has no way to install (APP-1 made that a
+//     property of `CatalogApp`'s type; see the note further down).
 //   * `confirm` is the ONLY way to obtain the `(remote, app_id)` pair the
 //     caller needs in order to run anything, and it hands it over exactly
 //     once, only from `Confirming`. Cancelling drops the whole gate, so
@@ -39,13 +40,26 @@
 //     something this shell can observe yet.
 //
 // ── Icon/emoji convention ───────────────────────────────────────────────
-// Nothing here introduces a glyph at all. The sheet reuses the app's own
-// existing `DockApp::glyph` (a single CJK character) — this crate has zero
-// emoji anywhere and no `gpui::svg()` usage to draw a stroke icon with (see
-// `home.rs`'s own header comment on that gap), so adding a NEW pictogram
-// here would mean either an emoji (forbidden) or a tofu box.
+// Nothing here introduces a pictogram of its own, before or after ICON-1.
+// The sheet renders whatever the catalog entry it was opened for already
+// shows in its result row — since ICON-1 (2026-08-22) that is the entry's
+// board stroke icon (`crate::icons::catalog_layers`, keyed off `app_id`),
+// with its `glyph` character as the fallback. Both come from the entry;
+// neither is invented here. This crate still has zero emoji anywhere.
+//
+// ── APP-1 (2026-08-22): source type changed, behaviour did not ──────────
+// `open` used to take a `fake_data::DockApp` — the canned six-entry array
+// that also backed the (fake) app list, whose `flatpak_id`/`flatpak_remote`
+// were `Option`s that were `None` for five of the six entries. That array
+// is gone: the app list is a real enumeration now, and the installable side
+// is `apps::catalog::CatalogApp`, where both fields are non-optional
+// because an entry that cannot name its ref and its remote is not a catalog
+// entry at all (see that module's header comment). `open` therefore no
+// longer HAS a "would fail on confirm" case to defend against — the
+// guarantee moved from a runtime check into the type. Every other honesty
+// rule above is unchanged.
 
-use crate::fake_data::DockApp;
+use crate::apps::catalog::CatalogApp;
 
 /// Download size for the pending install. See this file's header comment on
 /// why "unknown" is its own state rather than a zero or a blank string.
@@ -76,7 +90,7 @@ pub(crate) enum GateStage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InstallGate {
-    /// `DockApp::id` — the registry key, used for element ids and to make
+    /// `CatalogApp::id` — the catalog key, used for element ids and to make
     /// sure a late size-probe result is applied to the gate it belongs to
     /// (see `apply_size_probe`).
     pub app_id: &'static str,
@@ -97,23 +111,21 @@ pub(crate) struct InstallGate {
 }
 
 impl InstallGate {
-    /// Opens a gate for `app`, or `None` when this shell has no real way to
-    /// install it (no `flatpak_id`, or no `flatpak_remote` naming where it
-    /// would come from). `install_root` is injected rather than read here
+    /// Opens a gate for a catalog entry. Infallible by construction —
+    /// `CatalogApp` cannot exist without a ref and a remote (see this
+    /// file's APP-1 note). `install_root` is injected rather than read here
     /// so this module stays free of environment reads too.
-    pub(crate) fn open(app: &'static DockApp, install_root: String) -> Option<Self> {
-        let flatpak_id = app.flatpak_id?;
-        let remote = app.flatpak_remote?;
-        Some(Self {
+    pub(crate) fn open(app: &'static CatalogApp, install_root: String) -> Self {
+        Self {
             app_id: app.id,
             label: app.label,
             glyph: app.glyph,
-            flatpak_id,
-            remote,
+            flatpak_id: app.flatpak_id,
+            remote: app.flatpak_remote,
             install_root,
             size: SizeProbe::Probing,
             stage: GateStage::Confirming,
-        })
+        }
     }
 
     /// Applies a settled size probe. `app_id` guards against a slow probe
@@ -162,24 +174,29 @@ impl InstallGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_data;
+    use crate::apps::catalog;
 
-    fn browser() -> &'static DockApp {
-        fake_data::DOCK_APPS.iter().find(|a| a.id == "browser").expect("the one installable registry entry must exist")
+    fn browser() -> &'static CatalogApp {
+        catalog::INSTALL_CATALOG.iter().find(|a| a.flatpak_id == "org.chromium.Chromium").expect("the one installable catalog entry must exist")
     }
 
-    fn stub() -> &'static DockApp {
-        fake_data::DOCK_APPS.iter().find(|a| a.flatpak_id.is_none()).expect("at least one display-only stub must exist")
-    }
-
+    /// APP-1: there is no longer any way to construct a `CatalogApp`
+    /// without a ref and a remote, so the old "refuse an app this shell
+    /// cannot install" runtime check has nothing left to refuse — the
+    /// guarantee is the type's now. This pins that the catalog itself keeps
+    /// holding to it, which is what makes `open` infallible.
     #[test]
-    fn open_refuses_an_app_this_shell_cannot_actually_install() {
-        assert!(InstallGate::open(stub(), "/tmp/flatpak".to_string()).is_none(), "a gate that could only fail on confirm must not open at all");
+    fn every_catalog_entry_a_gate_could_open_names_a_real_ref_and_remote() {
+        for entry in catalog::INSTALL_CATALOG {
+            let gate = InstallGate::open(entry, "/data".to_string());
+            assert!(!gate.flatpak_id.is_empty());
+            assert!(!gate.remote.is_empty());
+        }
     }
 
     #[test]
     fn open_carries_every_field_the_sheet_has_to_show() {
-        let gate = InstallGate::open(browser(), crate::apps::INSTALL_DESTINATION_LABEL.to_string()).expect("browser is installable");
+        let gate = InstallGate::open(browser(), crate::apps::INSTALL_DESTINATION_LABEL.to_string());
         assert_eq!(gate.label, "瀏覽器");
         assert_eq!(gate.flatpak_id, "org.chromium.Chromium");
         assert_eq!(gate.remote, "flathub");
@@ -194,7 +211,7 @@ mod tests {
     /// confirm through some other command surface still trips this.
     #[test]
     fn the_confirmed_pair_produces_an_argv_that_targets_the_data_installation() {
-        let mut gate = InstallGate::open(browser(), crate::apps::INSTALL_DESTINATION_LABEL.to_string()).unwrap();
+        let mut gate = InstallGate::open(browser(), crate::apps::INSTALL_DESTINATION_LABEL.to_string());
         let (remote, app_id) = gate.confirm().expect("a Confirming gate must yield the pair");
         let argv = crate::apps::install_argv(remote, app_id).expect("both values are safe");
         assert!(
@@ -205,25 +222,25 @@ mod tests {
 
     #[test]
     fn a_size_that_could_not_be_determined_is_unavailable_not_a_number() {
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
-        gate.apply_size_probe("browser", None);
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
+        gate.apply_size_probe(gate.app_id, None);
         assert_eq!(gate.size, SizeProbe::Unavailable);
 
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
-        gate.apply_size_probe("browser", Some("   ".to_string()));
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
+        gate.apply_size_probe(gate.app_id, Some("   ".to_string()));
         assert_eq!(gate.size, SizeProbe::Unavailable, "whitespace is not a size");
     }
 
     #[test]
     fn a_known_size_is_kept_verbatim() {
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
-        gate.apply_size_probe("browser", Some("123.4 MB".to_string()));
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
+        gate.apply_size_probe(gate.app_id, Some("123.4 MB".to_string()));
         assert_eq!(gate.size, SizeProbe::Known("123.4 MB".to_string()));
     }
 
     #[test]
     fn a_size_probe_for_a_different_app_is_dropped_not_shown_against_this_one() {
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
         gate.apply_size_probe("some-other-app", Some("999 GB".to_string()));
         assert_eq!(gate.size, SizeProbe::Probing, "a stale probe must never label THIS app with another app's size");
     }
@@ -232,14 +249,14 @@ mod tests {
     /// install command without an explicit confirm.
     #[test]
     fn confirm_is_the_only_source_of_an_install_command() {
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
         assert_eq!(gate.confirm(), Some(("flathub", "org.chromium.Chromium")));
         assert_eq!(gate.stage, GateStage::Installing, "the buttons must be gone once it is running — `install_sheet` renders on this");
     }
 
     #[test]
     fn a_second_confirm_cannot_start_a_second_install() {
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
         assert!(gate.confirm().is_some());
         assert_eq!(gate.confirm(), None, "a double click must not fork flatpak twice");
         gate.apply_install_result(Ok(()));
@@ -252,7 +269,7 @@ mod tests {
     /// a command, so dropping it can not leave an install running.
     #[test]
     fn cancelling_before_confirm_means_nothing_was_ever_handed_out() {
-        let gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
+        let gate = InstallGate::open(browser(), "/x".to_string());
         assert_eq!(gate.stage, GateStage::Confirming);
         drop(gate); // what `install_gate = None` does
                     // Nothing to assert beyond the type: `confirm` is `&mut self` and
@@ -261,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_failed_spawn_is_reported_honestly_not_as_a_success() {
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
         gate.confirm();
         gate.apply_install_result(Err("No such file or directory (os error 2)".to_string()));
         assert_eq!(gate.stage, GateStage::Failed("No such file or directory (os error 2)".to_string()));
@@ -269,7 +286,7 @@ mod tests {
 
     #[test]
     fn a_successful_spawn_reports_started_which_is_not_the_same_as_installed() {
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
         gate.confirm();
         gate.apply_install_result(Ok(()));
         assert_eq!(gate.stage, GateStage::Started);
@@ -277,16 +294,16 @@ mod tests {
 
     #[test]
     fn an_install_result_arriving_out_of_order_is_ignored() {
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
         gate.apply_install_result(Ok(()));
         assert_eq!(gate.stage, GateStage::Confirming, "nothing was started, so nothing can have finished");
     }
 
     #[test]
     fn a_size_probe_landing_after_confirm_does_not_disturb_the_settled_sheet() {
-        let mut gate = InstallGate::open(browser(), "/x".to_string()).unwrap();
+        let mut gate = InstallGate::open(browser(), "/x".to_string());
         gate.confirm();
-        gate.apply_size_probe("browser", Some("123.4 MB".to_string()));
+        gate.apply_size_probe(gate.app_id, Some("123.4 MB".to_string()));
         assert_eq!(gate.size, SizeProbe::Probing);
         assert_eq!(gate.stage, GateStage::Installing);
     }

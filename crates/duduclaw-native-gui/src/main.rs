@@ -439,21 +439,22 @@ fn main() {
         // any text laid out before `add_fonts` returns would resolve
         // against gpui's `.SystemUIFont` default and never re-flow onto the
         // bundled faces (there's no reactive re-layout-on-font-load here).
-        // `Cow::Borrowed` avoids copying the `include_bytes!` static data;
-        // `add_fonts` takes ownership only of the `Vec`/`Cow` wrapper.
         //
         // Fail-open per this crate's established convention (`config::
         // load_locale`'s doc comment): a font-loading failure must not
         // block the window from opening at all — text simply falls back to
         // gpui's system-font default for this run, logged loudly to stderr
         // rather than silently swallowed or panicking.
-        let font_bytes: Vec<std::borrow::Cow<'static, [u8]>> = vec![
-            std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/InterVariable.ttf").as_slice()),
-            std::borrow::Cow::Borrowed(
-                include_bytes!("../assets/fonts/NotoSansTC-Variable.ttf").as_slice(),
-            ),
-        ];
-        match cx.text_system().add_fonts(font_bytes) {
+        //
+        // ICON-1 (2026-08-22): the two `include_bytes!` calls that used to
+        // sit inline here now live next to `theme::app_font()` (the
+        // function naming the very families these files provide) as
+        // `theme::bundled_font_bytes()`, so `duduclaw-shell` — a second
+        // gpui binary that the appliance launches directly, bypassing this
+        // `main.rs` entirely — can register the identical stack without a
+        // duplicated copy of a 12.8 MB TTF. Byte-for-byte the same faces in
+        // the same order as before; only the call site moved.
+        match cx.text_system().add_fonts(theme::bundled_font_bytes()) {
             Ok(()) => eprintln!("[main] add_fonts ok: InterVariable + NotoSansTC-Variable loaded"),
             Err(e) => eprintln!("[main] add_fonts FAILED (falling back to system font): {e}"),
         }

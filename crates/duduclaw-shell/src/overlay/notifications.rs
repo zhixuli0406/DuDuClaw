@@ -92,6 +92,7 @@ use super::notifications_feed::{ApprovalRow, FeedStatus, NotificationsFeed, RowD
 use super::OverlayUiState;
 use crate::gateway_client::{self, ApprovalItem};
 use crate::i18n::{t, Key, Locale};
+use crate::icons;
 use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::{fake_data, ShellView};
@@ -815,7 +816,11 @@ fn system_icon(palette: ShellPalette) -> Div {
     // `#ffffff` light (kept literal, byte-identical to the original) /
     // `text_secondary` (`#d4d4d8`) dark, matching the board's own dark
     // stroke exactly.
-    let glyph_color = if palette.is_dark() { palette.text_secondary } else { 0xffffff };
+    // ICON-1 (2026-08-22): `palette.icon_on_neutral_gradient()` resolves to
+    // the SAME pair this line used to spell out (`#ffffff` light /
+    // `text_secondary` dark) — it is the shared tint for icons sitting on
+    // this neutral gray gradient, which the dock's settings gear uses too.
+    let glyph_color = palette.icon_on_neutral_gradient();
     div()
         .w(px(26.))
         .h(px(26.))
@@ -829,10 +834,16 @@ fn system_icon(palette: ShellPalette) -> Div {
         .items_center()
         .justify_center()
         .shadow(palette.icon_shadow(0.14, 0.30))
-        // Update-available system row — the board's own icon is an SVG
-        // download arrow; dropped per this file's parent module's glyph
-        // convention, substituted with a plain CJK "更新" initial instead.
-        .child(div().text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(theme::alpha(glyph_color, 1.0)).child("更"))
+        // Update-available system row. ICON-1 (2026-08-22) restored the
+        // board's own download arrow here; the "更" initial that stood in
+        // for it is now only the fallback.
+        .child(
+            div()
+                .text_size(px(11.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::alpha(glyph_color, 1.0))
+                .child(icons::icon_or_glyph(&[(icons::DOWNLOAD, glyph_color)], 14., "更")),
+        )
 }
 
 fn activity_row(row: &fake_data::ActivityRow, palette: ShellPalette) -> Stateful<Div> {
