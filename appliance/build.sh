@@ -300,6 +300,31 @@ else
     echo "[build] (1d) DUDUCLAW_COMP_BIN_PATH unset — kiosk compositor stays on cage"
 fi
 
+# --- Step 1e: DuDuClaw brand cursor theme (CUR-2 wave) ---------------------
+# A prebuilt XCursor theme (crates/duduclaw-comp/assets/cursors/DuDuClaw —
+# built artifacts checked into the repo, because this image-build environment
+# has neither rsvg-convert nor xcursorgen; build-theme.sh in the same dir
+# regenerates them from the SVG masters). Installing it does NOT enable it:
+# the session default stays the system cursor (user decision, 2026-08-22);
+# the theme only takes effect when comp is switched to `brand` via the
+# shell-control op or DUDUCLAW_COMP_CURSOR_SOURCE. `cp -a` matters — the
+# theme's legacy-name entries (arrow → default, openhand → grab, …) are
+# symlinks, and flattening them would triple the payload and break nothing
+# visibly until a legacy-name lookup silently resolved to a stale copy.
+CURSOR_THEME_SRC="$REPO_ROOT/crates/duduclaw-comp/assets/cursors/DuDuClaw"
+STAGED_CURSOR_THEME=""
+if [[ -d "$CURSOR_THEME_SRC" ]]; then
+    STAGED_CURSOR_THEME="$APPLIANCE_DIR/.build/staged/cursor-theme"
+    rm -rf "$STAGED_CURSOR_THEME"
+    mkdir -p "$STAGED_CURSOR_THEME"
+    cp -a "$CURSOR_THEME_SRC" "$STAGED_CURSOR_THEME/DuDuClaw"
+    echo "[build] (1e) brand cursor theme staged → /usr/share/icons/DuDuClaw (installed, NOT default)"
+else
+    # In-repo asset, so this only happens on a mutilated checkout — warn
+    # rather than fail: the image is fully functional on the system cursor.
+    echo "[build] (1e) WARNING: $CURSOR_THEME_SRC not found — image will lack the brand cursor theme" >&2
+fi
+
 # --- Step 2: mkosi build ---------------------------------------------------
 mkdir -p "$OUTPUT_DIR"
 
@@ -335,6 +360,10 @@ if [[ "$HOST_OS" == "Linux" ]]; then
     if [[ -n "$STAGED_COMP_BIN" ]]; then
         NATIVE_COMP_TREE_ARG=("--extra-tree=${STAGED_COMP_BIN}:/usr/local/bin/duduclaw-comp")
     fi
+    NATIVE_CURSOR_TREE_ARG=()
+    if [[ -n "$STAGED_CURSOR_THEME" ]]; then
+        NATIVE_CURSOR_TREE_ARG=("--extra-tree=${STAGED_CURSOR_THEME}/DuDuClaw:/usr/share/icons/DuDuClaw")
+    fi
     # APPLIANCE_DEBUG=1 sets a root password so you can log in on the serial
     # console (`root` / the value of APPLIANCE_DEBUG_PASSWORD, default
     # "duduclaw") to inspect the running VM — journalctl, systemctl status,
@@ -353,6 +382,7 @@ if [[ "$HOST_OS" == "Linux" ]]; then
         "${NATIVE_CLI_TREE_ARG[@]}" \
         "${NATIVE_SHELL_TREE_ARG[@]}" \
         "${NATIVE_COMP_TREE_ARG[@]}" \
+        "${NATIVE_CURSOR_TREE_ARG[@]}" \
         "${DEBUG_ARGS[@]}" \
         build)
 else
@@ -440,6 +470,12 @@ else
     if [[ -n "$STAGED_COMP_BIN" ]]; then
         cp "$STAGED_COMP_BIN" "$BIN_TREE/usr/local/bin/duduclaw-comp"
         chmod 755 "$BIN_TREE/usr/local/bin/duduclaw-comp"
+    fi
+    # Step 1e: the brand cursor theme rides the same single extra-tree —
+    # cp -a preserves its legacy-name symlinks (see the staging block above).
+    if [[ -n "$STAGED_CURSOR_THEME" ]]; then
+        mkdir -p "$BIN_TREE/usr/share/icons"
+        cp -a "$STAGED_CURSOR_THEME/DuDuClaw" "$BIN_TREE/usr/share/icons/DuDuClaw"
     fi
     docker cp "$BIN_TREE" "$CID:/workspace/bin-tree"      # → /workspace/bin-tree/usr/local/bin/duduclaw
     rm -rf "$BIN_TREE"
