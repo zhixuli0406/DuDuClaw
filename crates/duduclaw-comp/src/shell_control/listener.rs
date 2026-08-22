@@ -43,8 +43,12 @@ use std::{
 
 use smithay::reexports::calloop;
 
-use super::protocol::{ShellControlRequest, ShellControlResponse, MAX_QUERY_BYTES, MAX_REQUEST_LINE_BYTES};
+use super::protocol::{
+    ShellControlRequest, ShellControlResponse, MAX_CURSOR_SOURCE_BYTES, MAX_QUERY_BYTES,
+    MAX_REQUEST_LINE_BYTES,
+};
 use super::{ShellControlMsg, ShellControlShared};
+use crate::cursor::source::CursorSource;
 
 /// Bounds how long `handle_connection` will block waiting for a request
 /// line from an already-accepted (and already peer-cred-authorized) peer.
@@ -258,6 +262,25 @@ pub(super) fn validate(req: &ShellControlRequest) -> Result<(), String> {
             }
             Ok(())
         }
+        ShellControlRequest::GetCursorSource => Ok(()),
+        ShellControlRequest::SetCursorSource { source } => {
+            // Length first, so a pathological string is refused before it is
+            // parsed at all — same ordering as `focus_window` above.
+            if source.len() > MAX_CURSOR_SOURCE_BYTES {
+                return Err(format!(
+                    "set_cursor_source source exceeds {MAX_CURSOR_SOURCE_BYTES} bytes"
+                ));
+            }
+            if CursorSource::parse_strict(source).is_none() {
+                // The error string is a fixed token, NOT the caller's own
+                // value echoed back: this line reaches a log and, through
+                // the shell, potentially a UI, and reflecting arbitrary
+                // caller-controlled text into either is a habit worth not
+                // having. `op_name()` already tells a reader which op failed.
+                return Err("invalid_cursor_source".into());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -298,6 +321,54 @@ mod tests {
     fn validate_accepts_reasonable_query() {
         let req = ShellControlRequest::FocusWindow { query: "foot-A".to_string() };
         assert!(validate(&req).is_ok());
+    }
+
+    // ── CUR-2 cursor ops ─────────────────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_get_cursor_source() {
+        assert!(validate(&ShellControlRequest::GetCursorSource).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_the_three_legal_cursor_sources() {
+        for v in ["system", "brand", "duduclaw", "  Brand  ", "SYSTEM"] {
+            let req = ShellControlRequest::SetCursorSource { source: v.to_string() };
+            assert!(validate(&req).is_ok(), "{v:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_unknown_cursor_source_instead_of_coercing_it() {
+        // The env var folds a typo into `system`; a control-channel op must
+        // not — see `CursorSource::parse_strict`'s doc comment.
+        for v in ["", "   ", "brnad", "claw", "1", "🐾"] {
+            let req = ShellControlRequest::SetCursorSource { source: v.to_string() };
+            assert_eq!(
+                validate(&req).unwrap_err(),
+                "invalid_cursor_source",
+                "{v:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_oversized_cursor_source() {
+        let req = ShellControlRequest::SetCursorSource {
+            source: "b".repeat(MAX_CURSOR_SOURCE_BYTES + 1),
+        };
+        let err = validate(&req).unwrap_err();
+        assert!(err.contains(&MAX_CURSOR_SOURCE_BYTES.to_string()), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_cursor_source_error_does_not_echo_the_callers_value() {
+        let req = ShellControlRequest::SetCursorSource {
+            source: "<script>alert(1)</script>".to_string(),
+        };
+        let err = validate(&req).unwrap_err();
+        assert_eq!(err, "invalid_cursor_source");
+        assert!(!err.contains("script"));
     }
 
     // ── Pure auth predicate — the "agent cannot reach this socket" proof ──

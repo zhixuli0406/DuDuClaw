@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!--
+    CUR-2 brand cursor: `grabbing` — the same paw, clenched.
+
+    Same five pads, same colours, same 1.6-unit dark halo as grab.svg. The
+    toes are pulled down and inward until only their tips clear the palm,
+    which is what a closed paw looks like and what distinguishes it from
+    grab.svg at a glance even at 24 px — the silhouette goes from a wide fan
+    to a compact rounded mass.
+
+    Hotspot is unit (12, 12) = size/2, identical to grab.svg: a drag must not
+    make the pointer jump when the button goes down.
+  -->
+  <defs>
+    <g id="paw">
+      <ellipse cx="7.0" cy="11.0" rx="1.8" ry="2.25" transform="rotate(-48 7 11)"/>
+      <ellipse cx="10.3" cy="8.8" rx="1.85" ry="2.3" transform="rotate(-18 10.3 8.8)"/>
+      <ellipse cx="14.1" cy="8.7" rx="1.85" ry="2.3" transform="rotate(18 14.1 8.7)"/>
+      <ellipse cx="17.4" cy="10.8" rx="1.8" ry="2.25" transform="rotate(46 17.4 10.8)"/>
+      <ellipse cx="12.2" cy="15.8" rx="5.3" ry="4.0"/>
+    </g>
+  </defs>
+  <use href="#paw" xlink:href="#paw" xmlns:xlink="http://www.w3.org/1999/xlink"
+       fill="#1C1917" stroke="#1C1917" stroke-width="2.4"
+       stroke-linejoin="round" stroke-linecap="round"/>
+  <use href="#paw" xlink:href="#paw" xmlns:xlink="http://www.w3.org/1999/xlink"
+       fill="#E85055"/>
+</svg>

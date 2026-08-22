@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!--
+    CUR-2 brand cursor: `grab` — the same paw, open.
+
+    Same anatomy as default.svg (one palm pad, four toe pads, same colours,
+    same 1.6-unit dark halo) with two deliberate differences:
+      * no extended claw — the leading toe is an ordinary round pad, because
+        "grab" means "you may pick this up", not "this is the tip";
+      * the four toes are splayed on a wide arc, which is what makes it read
+        as OPEN next to grabbing.svg's tucked cluster.
+
+    Hotspot is the paw's centre, unit (12, 12) = size/2 — whole numbers at
+    every output size. That matches the X11 convention for `openhand` /
+    `closedhand`, where the hotspot is the middle of the hand rather than a
+    tip: while dragging, the pointer is the thing being carried.
+  -->
+  <defs>
+    <g id="paw">
+      <ellipse cx="5.6" cy="12.0" rx="2.0" ry="2.6" transform="rotate(-42 5.6 12)"/>
+      <ellipse cx="9.7" cy="7.4" rx="2.05" ry="2.7" transform="rotate(-16 9.7 7.4)"/>
+      <ellipse cx="15.2" cy="7.2" rx="2.05" ry="2.7" transform="rotate(14 15.2 7.2)"/>
+      <ellipse cx="19.3" cy="11.6" rx="2.0" ry="2.6" transform="rotate(40 19.3 11.6)"/>
+      <ellipse cx="12.4" cy="16.4" rx="5.6" ry="4.5"/>
+    </g>
+  </defs>
+  <use href="#paw" xlink:href="#paw" xmlns:xlink="http://www.w3.org/1999/xlink"
+       fill="#1C1917" stroke="#1C1917" stroke-width="2.4"
+       stroke-linejoin="round" stroke-linecap="round"/>
+  <use href="#paw" xlink:href="#paw" xmlns:xlink="http://www.w3.org/1999/xlink"
+       fill="#E85055"/>
+</svg>

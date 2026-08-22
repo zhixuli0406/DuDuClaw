@@ -61,9 +61,24 @@ pub struct LoadedCursor {
 
 /// Loads and caches cursor images for one theme.
 pub struct CursorThemeStore {
+    /// What is actually in effect, after the brand→system fail-safe.
     source: CursorSource,
+    /// CUR-2: what was ASKED for. Differs from `source` exactly when the
+    /// brand theme was requested and is not installed. Both are reported to
+    /// `shell_control` callers: a settings UI must keep showing the user's
+    /// own choice (`requested`) while being able to say what is really being
+    /// drawn (`source`).
+    requested: CursorSource,
     theme_name: String,
     size: u32,
+    /// CUR-2: the env-derived inputs to `resolve_theme_name`, kept so a live
+    /// source switch can re-resolve without re-reading the environment. It
+    /// must not re-read: `std::env::var` in a running compositor would pick
+    /// up nothing new (a process's own environment does not change) while
+    /// making the function untestable, and re-reading would silently move
+    /// the "explicit override wins" rule from startup to switch time.
+    explicit_theme: Option<String>,
+    xcursor_theme: Option<String>,
     theme: xcursor::CursorTheme,
     /// Keyed by [`CursorIcon::name`] (a `&'static str`), so no allocation and
     /// no `Hash` requirement on `CursorIcon`. `None` means "we already looked
@@ -85,86 +100,57 @@ impl CursorThemeStore {
     /// degraded appliance is diagnosable from `journalctl` alone, which is
     /// requirement 3 of the CUR-1 brief ("降級要記一行 log 說明為什麼").
     pub fn from_env() -> Self {
-        let source = CursorSource::from_env();
+        // CUR-2: the source is no longer read from the env var alone — a
+        // stored user preference sits between the env var and the default.
+        // See `cursor/persist.rs` for the whole priority order and why the
+        // env var still wins.
+        let env_raw = std::env::var(source::CURSOR_SOURCE_ENV).ok();
+        let (requested, origin) =
+            source::resolve_startup_source(env_raw.as_deref(), super::persist::load());
         let explicit = std::env::var(source::CURSOR_THEME_ENV).ok();
         let xcursor_theme = std::env::var("XCURSOR_THEME").ok();
         let size = source::resolve_size(std::env::var("XCURSOR_SIZE").ok().as_deref());
 
-        let wanted = source::resolve_theme_name(source, explicit.as_deref(), xcursor_theme.as_deref());
-        Self::new(source, wanted, size)
-    }
-
-    /// Testable core of [`Self::from_env`] — takes the already-resolved
-    /// settings so no test has to touch process-global environment state.
-    pub fn new(source: CursorSource, wanted_theme: String, size: u32) -> Self {
-        let theme = xcursor::CursorTheme::load(&wanted_theme);
-        // Probing for the one icon every theme is required to have is the
-        // cheapest honest answer to "did we actually find a theme?" —
-        // `CursorTheme::load` itself succeeds even for a name that matches no
-        // directory on disk.
-        let usable = theme.load_icon(CursorIcon::Default.name()).is_some();
-
-        if usable {
-            tracing::info!(
-                source = source.as_str(),
-                theme = %wanted_theme,
-                size,
-                "cursor: XCursor theme loaded"
-            );
-            return Self::with_theme(source, wanted_theme, size, theme);
-        }
-
-        // Brand artwork is opt-in and does not exist yet (see
-        // `source.rs`'s module doc) — asking for it on a machine without the
-        // theme installed must land on normal system cursors, not on the
-        // asset-free fallback.
-        if source == CursorSource::Brand {
-            let system = source::resolve_theme_name(
-                CursorSource::System,
-                None,
-                std::env::var("XCURSOR_THEME").ok().as_deref(),
-            );
-            let system_theme = xcursor::CursorTheme::load(&system);
-            if system_theme.load_icon(CursorIcon::Default.name()).is_some() {
-                tracing::warn!(
-                    requested_theme = %wanted_theme,
-                    fell_back_to = %system,
-                    "cursor: brand cursor theme is not installed — falling back to the system \
-                     theme (set {}=system to silence this)",
-                    source::CURSOR_SOURCE_ENV
-                );
-                return Self::with_theme(CursorSource::System, system, size, system_theme);
-            }
-        }
-
-        tracing::warn!(
-            source = source.as_str(),
-            theme = %wanted_theme,
-            size,
-            "cursor: no XCursor theme found (looked for '{}' on XCURSOR_PATH / the default \
-             icon search path) — drawing the built-in outlined arrow instead. Install a cursor \
-             theme (e.g. the adwaita-icon-theme package) or set {} to a theme that exists.",
-            wanted_theme,
-            source::CURSOR_THEME_ENV
+        tracing::debug!(
+            requested = requested.as_str(),
+            origin = origin.as_str(),
+            "cursor: resolved the startup cursor source"
         );
-        Self::with_theme(source, wanted_theme, size, theme)
+        Self::with_env_inputs(requested, explicit, xcursor_theme, size)
     }
 
-    fn with_theme(
-        source: CursorSource,
-        theme_name: String,
+    /// Testable core of [`Self::from_env`] — takes the already-read
+    /// environment values so no test has to touch process-global state, and
+    /// keeps them so [`Self::set_source`] can re-resolve later.
+    pub fn with_env_inputs(
+        requested: CursorSource,
+        explicit_theme: Option<String>,
+        xcursor_theme: Option<String>,
         size: u32,
-        theme: xcursor::CursorTheme,
     ) -> Self {
+        let (source, theme_name, theme) =
+            load_theme(requested, explicit_theme.as_deref(), xcursor_theme.as_deref(), size);
         Self {
             source,
+            requested,
             theme_name,
             size,
+            explicit_theme,
+            xcursor_theme,
             theme,
             cache: HashMap::new(),
             fallback: None,
             degraded_logged: false,
         }
+    }
+
+    /// Convenience for callers (and tests) that have already resolved a theme
+    /// NAME and want it used verbatim. The name is stored as the explicit
+    /// override, which is exactly its semantics — an explicitly-named theme
+    /// keeps winning across a later [`Self::set_source`], same as
+    /// `DUDUCLAW_COMP_CURSOR_THEME` does across a restart.
+    pub fn new(source: CursorSource, wanted_theme: String, size: u32) -> Self {
+        Self::with_env_inputs(source, Some(wanted_theme), None, size)
     }
 
     /// Which source is actually in effect (already resolved through the
@@ -173,9 +159,60 @@ impl CursorThemeStore {
         self.source
     }
 
+    /// CUR-2: which source was ASKED for, before the brand→system fail-safe.
+    pub fn requested(&self) -> CursorSource {
+        self.requested
+    }
+
     /// The theme name actually in effect. Exposed for the startup log.
     pub fn theme_name(&self) -> &str {
         &self.theme_name
+    }
+
+    /// CUR-2: switch artwork source **without restarting the compositor**.
+    ///
+    /// Returns `true` when something actually changed (so the caller knows
+    /// whether a repaint is owed). Re-requesting the source already in effect
+    /// is a no-op — notably it does NOT re-probe the filesystem, so a
+    /// settings UI that writes the current value on every render costs
+    /// nothing.
+    ///
+    /// The three things a switch has to do, and why each is necessary:
+    ///
+    /// 1. **Re-resolve and reload the theme.** The theme NAME is a function
+    ///    of the source (`resolve_theme_name`), so the source alone is not
+    ///    enough state to change.
+    /// 2. **Drop the per-icon cache.** It is keyed by icon name only — it has
+    ///    no theme dimension — so a stale entry would keep the OLD theme's
+    ///    image on screen for every icon already drawn this session. This is
+    ///    the one line that would silently half-work if forgotten: the
+    ///    pointer would change only for shapes nothing had hovered yet.
+    /// 3. **Re-arm the degraded warning.** A switch INTO a missing theme has
+    ///    to log its own reason; the previous run's "already warned" flag
+    ///    must not suppress it.
+    ///
+    /// What it deliberately does NOT do is touch
+    /// [`super::CursorState::status`]. A client-provided cursor surface
+    /// (`CursorImageStatus::Surface`) is drawn by the client, not from any
+    /// theme, so it keeps its own image until that client next changes it —
+    /// there is nothing here that could honestly override it.
+    pub fn set_source(&mut self, requested: CursorSource) -> bool {
+        if self.requested == requested {
+            return false;
+        }
+        let (source, theme_name, theme) = load_theme(
+            requested,
+            self.explicit_theme.as_deref(),
+            self.xcursor_theme.as_deref(),
+            self.size,
+        );
+        self.requested = requested;
+        self.source = source;
+        self.theme_name = theme_name;
+        self.theme = theme;
+        self.cache.clear();
+        self.degraded_logged = false;
+        true
     }
 
     /// The cursor image for `icon`, loading and caching it on first use.
@@ -271,6 +308,70 @@ impl CursorThemeStore {
         }
         None
     }
+}
+
+/// Resolves a theme name from `(requested source, explicit override,
+/// XCURSOR_THEME)`, loads it, and applies the brand→system fail-safe.
+///
+/// Returns `(effective source, theme name in effect, loaded theme)`.
+///
+/// Split out of `CursorThemeStore::new` by CUR-2 so that startup and a live
+/// [`CursorThemeStore::set_source`] go through the SAME code — a switch that
+/// resolved theme names by a second, subtly different rule than boot did
+/// would be a bug factory (the brand fail-safe in particular).
+fn load_theme(
+    requested: CursorSource,
+    explicit_theme: Option<&str>,
+    xcursor_theme: Option<&str>,
+    size: u32,
+) -> (CursorSource, String, xcursor::CursorTheme) {
+    let wanted = source::resolve_theme_name(requested, explicit_theme, xcursor_theme);
+    let theme = xcursor::CursorTheme::load(&wanted);
+    // Probing for the one icon every theme is required to have is the
+    // cheapest honest answer to "did we actually find a theme?" —
+    // `CursorTheme::load` itself succeeds even for a name that matches no
+    // directory on disk.
+    let usable = theme.load_icon(CursorIcon::Default.name()).is_some();
+
+    if usable {
+        tracing::info!(
+            source = requested.as_str(),
+            theme = %wanted,
+            size,
+            "cursor: XCursor theme loaded"
+        );
+        return (requested, wanted, theme);
+    }
+
+    // Brand artwork is opt-in (see `source.rs`'s module doc) — asking for it
+    // on a machine where the theme package is not installed must land on
+    // normal system cursors, not on the asset-free fallback.
+    if requested == CursorSource::Brand {
+        let system = source::resolve_theme_name(CursorSource::System, None, xcursor_theme);
+        let system_theme = xcursor::CursorTheme::load(&system);
+        if system_theme.load_icon(CursorIcon::Default.name()).is_some() {
+            tracing::warn!(
+                requested_theme = %wanted,
+                fell_back_to = %system,
+                "cursor: brand cursor theme is not installed — falling back to the system \
+                 theme (set {}=system to silence this)",
+                source::CURSOR_SOURCE_ENV
+            );
+            return (CursorSource::System, system, system_theme);
+        }
+    }
+
+    tracing::warn!(
+        source = requested.as_str(),
+        theme = %wanted,
+        size,
+        "cursor: no XCursor theme found (looked for '{}' on XCURSOR_PATH / the default \
+         icon search path) — drawing the built-in outlined arrow instead. Install a cursor \
+         theme (e.g. the adwaita-icon-theme package) or set {} to a theme that exists.",
+        wanted,
+        source::CURSOR_THEME_ENV
+    );
+    (requested, wanted, theme)
 }
 
 /// Picks the best image out of a parsed XCursor file and wraps it.
@@ -414,5 +515,101 @@ mod tests {
         // Second call must hit the cached fallback, not rebuild it.
         let again = store.cursor_for(CursorIcon::Pointer);
         assert_eq!(again.hotspot, c.hotspot);
+    }
+
+    // ── CUR-2: live source switching ─────────────────────────────────────
+
+    #[test]
+    fn set_source_switches_the_theme_name_without_a_restart() {
+        // No explicit override and no XCURSOR_THEME, so the theme name is a
+        // pure function of the source: Adwaita for system, DuDuClaw for
+        // brand. Neither needs to exist on the test machine — this asserts
+        // the RESOLUTION, which is what a switch has to get right; whether
+        // artwork is then found is `load_theme`'s already-tested fail-safe.
+        let mut store =
+            CursorThemeStore::with_env_inputs(CursorSource::System, None, None, 24);
+        assert_eq!(store.requested(), CursorSource::System);
+        assert_eq!(store.theme_name(), source::DEFAULT_THEME_NAME);
+
+        assert!(store.set_source(CursorSource::Brand), "a real change reports true");
+        assert_eq!(store.requested(), CursorSource::Brand);
+        // `source()` may have fallen back to System (no brand theme in a bare
+        // container) but the REQUEST is what a settings UI shows.
+        assert!(
+            store.theme_name() == source::BRAND_THEME_NAME
+                || store.source() == CursorSource::System,
+            "either the brand theme loaded, or the documented fail-safe ran"
+        );
+
+        assert!(store.set_source(CursorSource::System));
+        assert_eq!(store.requested(), CursorSource::System);
+        assert_eq!(store.theme_name(), source::DEFAULT_THEME_NAME);
+    }
+
+    #[test]
+    fn set_source_to_the_current_source_is_a_no_op() {
+        let mut store =
+            CursorThemeStore::with_env_inputs(CursorSource::System, None, None, 24);
+        assert!(
+            !store.set_source(CursorSource::System),
+            "re-requesting the live source must not report a change (a settings UI \
+             re-asserting its own state must not cost a theme reload or a repaint)"
+        );
+    }
+
+    #[test]
+    fn set_source_drops_the_per_icon_cache() {
+        // The cache is keyed by icon name only — it carries no theme
+        // dimension — so a switch that forgot to clear it would keep drawing
+        // the OLD theme's image for every icon already touched this session,
+        // and only the untouched shapes would change. That failure mode is
+        // invisible in a screenshot of one cursor, so it is asserted here.
+        let mut store = CursorThemeStore::with_env_inputs(
+            CursorSource::System,
+            Some("duduclaw-no-such-theme-cur2-a".to_string()),
+            None,
+            24,
+        );
+        let _ = store.cursor_for(CursorIcon::Default);
+        let _ = store.cursor_for(CursorIcon::Grab);
+        assert_eq!(store.cache.len(), 2, "both lookups should have been cached");
+
+        assert!(store.set_source(CursorSource::Brand));
+        assert!(store.cache.is_empty(), "a source switch must invalidate every cached image");
+    }
+
+    #[test]
+    fn an_explicit_theme_override_keeps_winning_across_a_switch() {
+        // Same rule the env var has at startup (`resolve_theme_name`
+        // priority 1), applied at switch time: an operator who named a theme
+        // outright did not ask for the brand toggle to move it.
+        let mut store = CursorThemeStore::with_env_inputs(
+            CursorSource::System,
+            Some("Bibata".to_string()),
+            Some("Breeze".to_string()),
+            24,
+        );
+        assert_eq!(store.theme_name(), "Bibata");
+        assert!(store.set_source(CursorSource::Brand));
+        assert_eq!(
+            store.theme_name(),
+            "Bibata",
+            "an explicit theme override outranks the brand source"
+        );
+    }
+
+    #[test]
+    fn xcursor_theme_is_restored_when_switching_back_to_system() {
+        // The failure this guards against: re-resolving on switch by reading
+        // the environment again (which a running process cannot do
+        // meaningfully) or by remembering only the resolved NAME would leave
+        // the system side stuck on Adwaita instead of the operator's
+        // XCURSOR_THEME.
+        let mut store =
+            CursorThemeStore::with_env_inputs(CursorSource::System, None, Some("Breeze".into()), 24);
+        assert_eq!(store.theme_name(), "Breeze");
+        assert!(store.set_source(CursorSource::Brand));
+        assert!(store.set_source(CursorSource::System));
+        assert_eq!(store.theme_name(), "Breeze");
     }
 }
