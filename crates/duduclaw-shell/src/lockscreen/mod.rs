@@ -25,20 +25,43 @@
 // split `oobe/mod.rs` (state) / `oobe/render.rs` (rendering) already
 // establishes for OOBE.
 //
-// ── Why NO password on unlock (accepted trade-off, flagged for 拍板) ──────
-// Every OS precedent surveyed unlocks via a password/PIN/biometric — this
-// surface does NOT: any key or click wakes the screen straight back to Home,
-// no credential check. The task brief calls this out explicitly as the
-// intended v1 shape for a duty appliance: the screen lock is a PRIVACY/
-// glanceability boundary (don't leave duty-summary content lit on a shared
-// screen), not an ACCESS-control boundary — the machine itself already sits
-// behind whatever physical/network security protects the appliance, and the
-// gateway's own account system (OOBE's `AccountCreate` step) is a SEPARATE
-// concept guarding the dashboard/API, not this screen. This is a genuine
-// product decision, not an oversight: 是否要補密碼解鎖是本輪明確列的拍板
-// 項，尚未拍板前維持「任意鍵/點擊喚回」。See `render.rs`'s own header
-// comment for the corresponding "no interactive elements" design that falls
-// out of this choice.
+// ── Password unlock (WP-lock-pw, 2026-08-22 — REVERSES the S4-lock MVP) ──
+// Shell-S4-lock originally shipped with NO credential check at all (any key
+// or click woke the screen straight back to Home) — a deliberate v1 choice,
+// explicitly flagged in this file's own header as pending a 拍板 decision.
+// That decision landed 2026-08-22: **any-key-unlock is REVOKED**. The first
+// key/click after locking now only REVEALS a password field (clock/summary
+// card stay exactly where they were, per the original spec's own "read-only
+// surface" framing — see `render.rs`'s header comment); actually unlocking
+// requires the operator to type the `admin@local` password and press Enter,
+// verified against the real gateway's `POST /api/login`
+// (`gateway_client::verify_password` — see that module's own header
+// comment). The `LockPrivacy`/idle-lock machinery below is UNCHANGED by
+// this round; only the unlock PATH gained a credential gate.
+//
+// ── Offline fail-safe semantics (the load-bearing design decision here) ──
+// A password can only be VERIFIED by asking the gateway — if the gateway is
+// unreachable, there is no way to know whether a typed password is correct,
+// so this surface's only honest choice is to STAY LOCKED and say so
+// (`UnlockFailureKind::Unreachable` -> `Key::LockOfflineError`, "本機服務未
+// 回應"), never to fail open. This is a conscious trade-off, not an
+// oversight: a duty machine that unlocked itself the moment its own gateway
+// process happened to be down would defeat the entire point of a lock
+// screen. The escape hatch for a genuinely stuck machine (gateway crashed,
+// won't restart, operator physically needs in) is the SAME one every
+// server/appliance already has — a local serial/TTY console with its own
+// OS-level login, entirely outside this gpui surface's control — not
+// something this module needs to (or should) reimplement. Once the gateway
+// comes back, the very next Enter press against the SAME typed password
+// (still sitting in the field — see `UnlockFailureKind::Unreachable`'s own
+// handling in `render.rs`) verifies normally; no special recovery flow
+// exists because none is needed. `DUDUCLAW_SHELL_LOCK_NO_PASSWORD=1`
+// (`password_required_from_env` below) is the SEPARATE, explicit opt-out
+// for dev/headless/unattended-kiosk deployments where a password prompt
+// would strand an operator with no keyboard at all — it is not a substitute
+// for the offline fail-safe above (a machine that opted OUT of passwords
+// entirely still just unlocks on any key, offline or not, same as before
+// this round).
 
 use std::time::{Duration, Instant};
 
@@ -123,6 +146,84 @@ pub(crate) fn idle_after_from_env() -> Option<Duration> {
     }
 }
 
+/// `DUDUCLAW_SHELL_LOCK_NO_PASSWORD` — WP-lock-pw's dev/headless escape
+/// hatch (task brief: "開發/無人值守場景明確 opt-out，預設密碼開"). When
+/// set to exactly `"1"`, the lockscreen reproduces the ORIGINAL Shell-S4-lock
+/// behavior verbatim: any key or click unlocks immediately, no password
+/// prompt is ever revealed, no gateway round trip — for headless smoke runs
+/// and unattended-kiosk deployments where a password prompt would strand
+/// the operator with no keyboard (see this file's header comment on why
+/// this is a SEPARATE concern from the offline fail-safe). Read live (not
+/// cached at boot), same convention `privacy_from_env`/`idle_after_from_env`
+/// establish. Any other value — including unset, empty, or a typo — means
+/// "password required": the safe default, so a malformed value can never
+/// accidentally disable the credential gate.
+pub(crate) fn password_required_from_env() -> bool {
+    !std::env::var("DUDUCLAW_SHELL_LOCK_NO_PASSWORD").is_ok_and(|v| v.trim() == "1")
+}
+
+/// Consecutive failed verify attempts (since the lock started, or since the
+/// last one settled) before the client-side throttle kicks in — task
+/// brief: "3 次後 2 秒節流防爆破".
+const FAILS_BEFORE_THROTTLE: u32 = 3;
+/// How long a submit is refused once the throttle is active — task brief's
+/// own number. NOT a lockout: the very next Enter press after this window
+/// elapses is accepted normally, and the typed password is never cleared
+/// just because a submit was refused (see `UnlockPrompt`'s own doc comment).
+const THROTTLE_DURATION: Duration = Duration::from_secs(2);
+
+/// The password prompt's own sub-state (WP-lock-pw, 2026-08-22) — only ever
+/// meaningful while the parent `LockScreenState.locked` is `true`;
+/// `LockScreenState::unlock()` resets this to `default()` unconditionally,
+/// so no error/attempt-count/visibility ever survives past a successful
+/// unlock into the NEXT lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct UnlockPrompt {
+    /// Hidden until the first key/click after locking reveals it (task
+    /// brief: "按任意鍵/點擊 → 出現密碼輸入框") — see
+    /// `LockScreenState::reveal_prompt`.
+    visible: bool,
+    phase: UnlockPhase,
+    /// Consecutive failed verify attempts since this lock started (or since
+    /// the last successful unlock) — feeds `FAILS_BEFORE_THROTTLE` above.
+    /// Deliberately NOT reset by a `Failed` -> re-shown transition, only by
+    /// `unlock()` — "不鎖死" (task brief) means the operator can always
+    /// keep trying, not that the throttle forgets a run of recent failures.
+    fail_count: u32,
+    /// When the most recent attempt SETTLED as a FAILURE (a success instead
+    /// resets the whole struct via `unlock()`, so this field never needs to
+    /// distinguish "settled successfully") — the throttle clock
+    /// `LockScreenState::can_submit` reads against `THROTTLE_DURATION`.
+    last_attempt_at: Option<Instant>,
+}
+
+/// The password field's current activity — drives `render.rs`'s own
+/// verifying-spinner/error-line choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum UnlockPhase {
+    #[default]
+    Idle,
+    InFlight,
+    Failed(UnlockFailureKind),
+}
+
+/// Why the most recent verify attempt failed — `render.rs`'s own mapping to
+/// `Key::LockPasswordWrongError`/`Key::LockOfflineError` collapses
+/// `gateway_client::LoginError`'s finer-grained variants down to exactly
+/// these two honest UI states (see that module's own doc comment on why a
+/// rare 429 belongs in `Unreachable` rather than a third state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlockFailureKind {
+    /// A real password mismatch — the gateway is reachable and said so.
+    WrongPassword,
+    /// Every other failure — offline, timeout, unexpected HTTP status,
+    /// malformed response, the gateway's own rate limit — one honest
+    /// fail-safe message. See this file's header comment ("Offline
+    /// fail-safe semantics") for why this surface stays locked rather than
+    /// guessing.
+    Unreachable,
+}
+
 /// Runtime lock-screen state — lives on `ShellView` as `lockscreen` (see
 /// `main.rs`'s own field doc comment). Deliberately plain data (no gpui
 /// types) — see this file's header comment.
@@ -144,11 +245,14 @@ pub(crate) struct LockScreenState {
     /// instantly-idle again and could re-lock on the very next watchdog
     /// tick).
     last_input_at: Instant,
+    /// WP-lock-pw (2026-08-22) — the password prompt's own sub-state. See
+    /// `UnlockPrompt`'s own doc comment.
+    unlock_prompt: UnlockPrompt,
 }
 
 impl Default for LockScreenState {
     fn default() -> Self {
-        Self { locked: false, locked_at: None, last_input_at: Instant::now() }
+        Self { locked: false, locked_at: None, last_input_at: Instant::now(), unlock_prompt: UnlockPrompt::default() }
     }
 }
 
@@ -171,18 +275,106 @@ impl LockScreenState {
         }
         self.locked = true;
         self.locked_at = Some(Instant::now());
+        // Defensive reset — the only reachable path here is from an
+        // unlocked state, where `unlock_prompt` should already sit at its
+        // default (nothing else ever sets it while unlocked), but a fresh
+        // lock starting from a guaranteed-clean slate costs nothing and
+        // removes any need to trust that invariant.
+        self.unlock_prompt = UnlockPrompt::default();
     }
 
     /// See `last_input_at`'s own doc comment for why this also resets the
-    /// idle clock.
+    /// idle clock. Also resets `unlock_prompt` unconditionally — see that
+    /// type's own doc comment: no error/attempt-count/visibility from THIS
+    /// lock survives into the next one.
     pub(crate) fn unlock(&mut self) {
         self.locked = false;
         self.locked_at = None;
         self.last_input_at = Instant::now();
+        self.unlock_prompt = UnlockPrompt::default();
     }
 
     pub(crate) fn note_input(&mut self) {
         self.last_input_at = Instant::now();
+    }
+
+    pub(crate) fn prompt_visible(&self) -> bool {
+        self.unlock_prompt.visible
+    }
+
+    pub(crate) fn unlock_phase(&self) -> UnlockPhase {
+        self.unlock_prompt.phase
+    }
+
+    /// Reveals the password prompt — idempotent, same "a redundant call
+    /// costs nothing" discipline `lock()` establishes. Returns `true`
+    /// exactly on the Hidden -> visible EDGE (never on a call that finds it
+    /// already visible), so callers (`render::note_input_or_reveal`) know
+    /// precisely when to also move keyboard focus onto the freshly-rendered
+    /// field — focusing on every redundant call would steal focus back from
+    /// wherever the operator's cursor already is (e.g. mid-typing inside
+    /// the field itself, since every keystroke that isn't a bound action
+    /// also reaches this same catch-all — see `render.rs`'s own header
+    /// comment on that bubble order).
+    pub(crate) fn reveal_prompt(&mut self) -> bool {
+        if self.unlock_prompt.visible {
+            return false;
+        }
+        self.unlock_prompt.visible = true;
+        true
+    }
+
+    /// True once a submit is allowed: no request currently in flight, and
+    /// — once `fail_count` has crossed `FAILS_BEFORE_THROTTLE` — the
+    /// `THROTTLE_DURATION` cooldown since the last failure has elapsed.
+    /// Locked-status itself is NOT checked here (same division of concerns
+    /// `is_idle_past` establishes for the idle watchdog) — every real call
+    /// site only ever reaches this while already locked.
+    pub(crate) fn can_submit(&self, now: Instant) -> bool {
+        if self.unlock_prompt.phase == UnlockPhase::InFlight {
+            return false;
+        }
+        if self.unlock_prompt.fail_count < FAILS_BEFORE_THROTTLE {
+            return true;
+        }
+        match self.unlock_prompt.last_attempt_at {
+            Some(at) => now.saturating_duration_since(at) >= THROTTLE_DURATION,
+            None => true,
+        }
+    }
+
+    /// True while `fail_count` has crossed the throttle threshold AND the
+    /// cooldown since the last failure hasn't elapsed yet — purely a
+    /// RENDER-time signal (`render.rs`'s own `Key::LockThrottledLabel`
+    /// hint), distinct from `can_submit` above (which also returns `false`
+    /// while a request is simply `InFlight`, a different reason with its
+    /// own `Key::LockVerifyingLabel` message).
+    pub(crate) fn is_throttled(&self, now: Instant) -> bool {
+        self.unlock_prompt.fail_count >= FAILS_BEFORE_THROTTLE
+            && self.unlock_prompt.phase != UnlockPhase::InFlight
+            && self.unlock_prompt.last_attempt_at.is_some_and(|at| now.saturating_duration_since(at) < THROTTLE_DURATION)
+    }
+
+    /// Marks a verify request as dispatched — guarded by `can_submit`, so
+    /// this never overwrites an in-flight or still-throttled attempt; a
+    /// call site that skips the `can_submit` check first gets a defensive
+    /// no-op (returns `false`) instead of a double-dispatch.
+    pub(crate) fn begin_verify(&mut self, now: Instant) -> bool {
+        if !self.can_submit(now) {
+            return false;
+        }
+        self.unlock_prompt.phase = UnlockPhase::InFlight;
+        true
+    }
+
+    /// Records a settled failure — advances `fail_count` (feeding the
+    /// throttle) and stamps `last_attempt_at` (the throttle clock), same
+    /// timestamp used for both so a caller can't pass two different
+    /// "now"s that disagree.
+    pub(crate) fn record_failure(&mut self, kind: UnlockFailureKind, now: Instant) {
+        self.unlock_prompt.phase = UnlockPhase::Failed(kind);
+        self.unlock_prompt.fail_count += 1;
+        self.unlock_prompt.last_attempt_at = Some(now);
     }
 
     /// Pure predicate the idle watchdog (`render::maybe_auto_lock`) consults
@@ -363,5 +555,143 @@ mod tests {
     fn format_away_duration_reports_whole_hours_dropping_remainder_minutes() {
         assert_eq!(format_away_duration(Duration::from_secs(2 * 3600 + 45 * 60)), "2 小時");
         assert_eq!(format_away_duration(Duration::from_secs(3600)), "1 小時");
+    }
+
+    // ── WP-lock-pw (2026-08-22): password prompt sub-state ────────────────
+
+    #[test]
+    fn no_password_env_default_is_password_required_when_unset() {
+        with_env("DUDUCLAW_SHELL_LOCK_NO_PASSWORD", None, || {
+            assert!(password_required_from_env());
+        });
+    }
+
+    #[test]
+    fn no_password_env_exactly_one_disables_the_password_requirement() {
+        with_env("DUDUCLAW_SHELL_LOCK_NO_PASSWORD", Some("1"), || {
+            assert!(!password_required_from_env());
+        });
+    }
+
+    #[test]
+    fn no_password_env_any_other_value_still_requires_a_password() {
+        // A typo'd value must degrade to the SAFE default (password
+        // required), not silently disable the credential gate.
+        with_env("DUDUCLAW_SHELL_LOCK_NO_PASSWORD", Some("true"), || {
+            assert!(password_required_from_env());
+        });
+        with_env("DUDUCLAW_SHELL_LOCK_NO_PASSWORD", Some("0"), || {
+            assert!(password_required_from_env());
+        });
+    }
+
+    #[test]
+    fn prompt_starts_hidden_on_a_fresh_lock() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        assert!(!state.prompt_visible());
+        assert_eq!(state.unlock_phase(), UnlockPhase::Idle);
+    }
+
+    #[test]
+    fn reveal_prompt_returns_true_exactly_on_the_hidden_to_visible_edge() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        assert!(state.reveal_prompt(), "first reveal must report the edge");
+        assert!(state.prompt_visible());
+        assert!(!state.reveal_prompt(), "a redundant reveal while already visible must report no edge");
+        assert!(state.prompt_visible(), "still visible after the redundant call");
+    }
+
+    #[test]
+    fn unlock_resets_the_prompt_back_to_hidden_with_no_leftover_error() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        state.reveal_prompt();
+        state.record_failure(UnlockFailureKind::WrongPassword, Instant::now());
+        state.unlock();
+        assert!(!state.is_locked());
+        state.lock();
+        assert!(!state.prompt_visible(), "a fresh lock must not inherit the previous lock's revealed prompt");
+        assert_eq!(state.unlock_phase(), UnlockPhase::Idle, "a fresh lock must not inherit the previous lock's error");
+    }
+
+    #[test]
+    fn can_submit_is_true_before_any_attempt() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        assert!(state.can_submit(Instant::now()));
+    }
+
+    #[test]
+    fn begin_verify_sets_in_flight_and_blocks_a_second_concurrent_submit() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        let now = Instant::now();
+        assert!(state.begin_verify(now), "first begin_verify must succeed");
+        assert_eq!(state.unlock_phase(), UnlockPhase::InFlight);
+        assert!(!state.can_submit(now), "a request already in flight must block a second submit");
+        assert!(!state.begin_verify(now), "begin_verify itself must refuse while already in flight");
+    }
+
+    #[test]
+    fn fewer_than_three_failures_never_throttles() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        let now = Instant::now();
+        state.record_failure(UnlockFailureKind::WrongPassword, now);
+        assert!(state.can_submit(now), "1st failure must not throttle");
+        assert!(!state.is_throttled(now));
+        state.record_failure(UnlockFailureKind::WrongPassword, now);
+        assert!(state.can_submit(now), "2nd failure must not throttle");
+        assert!(!state.is_throttled(now));
+    }
+
+    #[test]
+    fn the_third_consecutive_failure_throttles_for_the_cooldown_window() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        let now = Instant::now();
+        state.record_failure(UnlockFailureKind::WrongPassword, now);
+        state.record_failure(UnlockFailureKind::WrongPassword, now);
+        state.record_failure(UnlockFailureKind::WrongPassword, now);
+        assert!(!state.can_submit(now), "3rd consecutive failure must throttle immediately");
+        assert!(state.is_throttled(now));
+        assert_eq!(state.unlock_phase(), UnlockPhase::Failed(UnlockFailureKind::WrongPassword));
+
+        let after_cooldown = now + THROTTLE_DURATION;
+        assert!(state.can_submit(after_cooldown), "submit must be allowed again once the cooldown elapses");
+        assert!(!state.is_throttled(after_cooldown));
+    }
+
+    #[test]
+    fn throttle_is_not_a_hard_lockout_repeated_failures_keep_allowing_retries_after_each_cooldown() {
+        // Task brief: "錯誤次數不鎖死但 3 次後 2 秒節流防爆破" — never a
+        // permanent block, just a forced pause between attempts once the
+        // threshold is crossed.
+        let mut state = LockScreenState::default();
+        state.lock();
+        let mut now = Instant::now();
+        for _ in 0..3 {
+            state.record_failure(UnlockFailureKind::WrongPassword, now);
+        }
+        assert!(!state.can_submit(now));
+        now += THROTTLE_DURATION;
+        assert!(state.can_submit(now), "must be submittable again after the cooldown");
+        state.record_failure(UnlockFailureKind::WrongPassword, now);
+        assert!(!state.can_submit(now), "a further failure re-arms the throttle");
+        now += THROTTLE_DURATION;
+        assert!(state.can_submit(now), "and it clears again after another cooldown — never a permanent lockout");
+    }
+
+    #[test]
+    fn record_failure_overwrites_an_in_flight_phase() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        let now = Instant::now();
+        state.begin_verify(now);
+        state.record_failure(UnlockFailureKind::Unreachable, now);
+        assert_eq!(state.unlock_phase(), UnlockPhase::Failed(UnlockFailureKind::Unreachable));
+        assert!(state.can_submit(now), "below the throttle threshold, settling out of InFlight must immediately allow a retry");
     }
 }

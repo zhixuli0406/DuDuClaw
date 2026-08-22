@@ -14,17 +14,25 @@
 // `crate::palette`'s own header comment establishes for its badge-color
 // gaps, just applied to an entire surface instead of one field.
 //
-// ── Read-only, by construction — no `.on_click`/`.on_mouse_down` anywhere
-// in this file ────────────────────────────────────────────────────────────
+// ── Read-only, EXCEPT for the password field itself (WP-lock-pw reversal) ─
 // Every OS precedent researched (§3.3) keeps the lock surface non-
-// interactive; this module has ZERO click targets of its own. Unlocking is
-// captured at the WINDOW ROOT instead (`main.rs`'s `Render::render` wires
-// unconditional `on_key_down`/`on_mouse_down` listeners that call `unlock`/
-// `note_input_or_unlock` below) — any key or click anywhere in the window
-// wakes the screen, without this surface needing to expose an affordance
-// that would contradict "read-only". See `crate::lockscreen`'s own header
-// comment for why there is no password/PIN check on that path (an accepted
-// v1 trade-off, flagged as a 拍板 item, not an oversight).
+// interactive outside of its own credential entry, and that is now the
+// shape here too: the clock/summary card/glow blobs still have ZERO click
+// targets of their own, but `unlock_prompt_panel` below renders one real
+// `OobeTextField` (the SAME reusable widget OOBE's `AccountCreate`/`Network`
+// steps use — see `crate::oobe::LockPasswordField`'s own doc comment for
+// why it's reached through that module rather than re-derived here) once
+// the prompt is revealed. Everything else about the wake-up path is
+// unchanged: `main.rs`'s `Render::render` still wires unconditional
+// `on_key_down`/`on_mouse_down` listeners at the WINDOW ROOT, but they now
+// call `note_input_or_reveal` (renamed from the old `note_input_or_unlock`)
+// — the first key/click after locking REVEALS the field and moves keyboard
+// focus onto it (see that fn's own doc comment for the exact focus-handoff
+// mechanics); it no longer unlocks anything by itself. Actually unlocking
+// only ever happens through `dispatch_unlock_attempt` below, gated on a
+// real `gateway_client::verify_password` round trip. See
+// `crate::lockscreen`'s own header comment for the full reversal writeup
+// and the offline fail-safe semantics that fall out of it.
 //
 // ── Data source: the SAME `NotificationsFeed` the Notifications overlay
 // panel reads ───────────────────────────────────────────────────────────
@@ -49,15 +57,16 @@
 // gap, not silently dropped scope. See the parent crate's report for the
 // tracked follow-up.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Timelike};
-use gpui::{div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, Context, Div, FontWeight, Stateful};
+use gpui::{div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, Context, Div, Focusable, FontWeight, Stateful, Window};
 
 use duduclaw_native_gui::theme;
 
-use super::{format_away_duration, LockPrivacy, LockScreenState};
+use super::{format_away_duration, LockPrivacy, LockScreenState, UnlockFailureKind, UnlockPhase};
 use crate::i18n::{t, t1, Key, Locale};
+use crate::oobe::LockPasswordField;
 use crate::overlay::notifications_feed::{FeedStatus, NotificationsFeed};
 use crate::ShellView;
 
@@ -83,7 +92,12 @@ const IDLE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
 /// (same "OOBE takes over the whole screen" precedent `oobe::render`
 /// establishes, see `main.rs`'s own header comment for why that shape was
 /// chosen over layering as another overlay).
-pub(crate) fn render(state: &LockScreenState, notifications: &NotificationsFeed, cx: &mut Context<ShellView>) -> Stateful<Div> {
+pub(crate) fn render(
+    state: &LockScreenState,
+    notifications: &NotificationsFeed,
+    password_field: &LockPasswordField,
+    cx: &mut Context<ShellView>,
+) -> Stateful<Div> {
     schedule_clock_tick(cx);
     schedule_stale_check(cx);
 
@@ -102,8 +116,12 @@ pub(crate) fn render(state: &LockScreenState, notifications: &NotificationsFeed,
         .child(glow_top_right())
         .child(glow_bottom_left())
         .child(cat_watermark())
-        .child(clock_block(&time_text, &date_text))
-        .child(unlock_hint());
+        .child(clock_block(&time_text, &date_text));
+
+    // WP-lock-pw: the hint ("按任意鍵或點擊以輸入密碼") only makes sense
+    // BEFORE the field exists — once revealed, `unlock_prompt_panel` takes
+    // over the same bottom-of-screen real estate.
+    root = if state.prompt_visible() { root.child(unlock_prompt_panel(state, password_field)) } else { root.child(unlock_hint()) };
 
     if privacy != LockPrivacy::None {
         root = root.child(summary_card(state, notifications, privacy));
@@ -285,6 +303,54 @@ fn lock_glyph_circle() -> Div {
         .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).text_color(theme::alpha(0xfafafa, 1.0)).child("鎖"))
 }
 
+/// WP-lock-pw (2026-08-22) — replaces `unlock_hint()` once the password
+/// prompt is revealed, at the same bottom-of-screen position (`unlock_hint`
+/// sits at `bottom(px(90.))`; this panel starts a little higher to leave
+/// room for the input box itself, still well clear of the summary card
+/// above it at `top(px(420.))`). Keeps the same lock glyph as a visual
+/// anchor so the transition from "hint" to "prompt" doesn't jump the whole
+/// layout around.
+fn unlock_prompt_panel(state: &LockScreenState, password_field: &LockPasswordField) -> Div {
+    let now = Instant::now();
+    let mut col = div().absolute().bottom(px(70.)).left(px(0.)).right(px(0.)).flex().flex_col().items_center().gap(px(10.));
+
+    col = col.child(lock_glyph_circle());
+    col = col.child(div().w(px(240.)).child(password_field.field.clone()));
+
+    match state.unlock_phase() {
+        UnlockPhase::Idle => {}
+        UnlockPhase::InFlight => col = col.child(prompt_hint_line(t(Locale::ZhTw, Key::LockVerifyingLabel))),
+        UnlockPhase::Failed(UnlockFailureKind::WrongPassword) => col = col.child(prompt_error_line(t(Locale::ZhTw, Key::LockPasswordWrongError))),
+        // See `crate::lockscreen`'s own header comment ("Offline fail-safe
+        // semantics") for why this is the SAME honest message regardless of
+        // which underlying `gateway_client::LoginError` variant it was —
+        // offline, timeout, unexpected status, or the gateway's own rate
+        // limit all read as "本機服務未回應" to the operator, who has no
+        // actionable way to tell those apart anyway.
+        UnlockPhase::Failed(UnlockFailureKind::Unreachable) => col = col.child(prompt_error_line(t(Locale::ZhTw, Key::LockOfflineError))),
+    }
+    if state.is_throttled(now) {
+        col = col.child(prompt_hint_line(t(Locale::ZhTw, Key::LockThrottledLabel)));
+    }
+    col
+}
+
+/// Small neutral-gray status line (verifying/throttled) — distinct from
+/// `prompt_error_line` below by color only, same "same shape, different
+/// color token" split `summary_line`'s own dot-color parameter establishes
+/// elsewhere in this file.
+fn prompt_hint_line(text: &str) -> Div {
+    div().text_size(px(12.)).text_color(theme::alpha(0xfafafa, 0.6)).child(text.to_string())
+}
+
+/// `theme::dark::DESTRUCTIVE` — this surface is always the fixed dark-navy
+/// look (see this file's header comment on why `ShellPalette` is never
+/// threaded through here), so the DARK variant is the only one that's ever
+/// correct, not a light/dark choice that got hardcoded by accident.
+fn prompt_error_line(text: &str) -> Div {
+    div().text_size(px(12.)).text_color(theme::alpha(theme::dark::DESTRUCTIVE, 1.0)).child(text.to_string())
+}
+
 // ── Trigger / unlock entry points (called from `main.rs`) ─────────────────
 
 /// Locks the screen, dismisses whatever Home overlay was open (a lock should
@@ -302,10 +368,12 @@ pub(crate) fn lock_and_refresh(view: &mut ShellView, cx: &mut Context<ShellView>
     cx.notify();
 }
 
-/// Any key or click while locked wakes the machine back up — task brief:
-/// "任意鍵/點擊喚回". No credential check — see `crate::lockscreen`'s own
-/// header comment for the accepted trade-off. A no-op (not a panic, not a
-/// redundant `cx.notify()`) when already unlocked.
+/// Settles a SUCCESSFUL verify — the only path that actually clears
+/// `LockScreenState.locked` (see `dispatch_unlock_attempt`/
+/// `apply_unlock_result` below for the credential-gated caller; the
+/// `DUDUCLAW_SHELL_LOCK_NO_PASSWORD=1` escape hatch also lands here
+/// directly). A no-op (not a panic, not a redundant `cx.notify()`) when
+/// already unlocked.
 pub(crate) fn unlock(view: &mut ShellView, cx: &mut Context<ShellView>) {
     if !view.lockscreen.is_locked() {
         return;
@@ -320,24 +388,172 @@ pub(crate) fn unlock(view: &mut ShellView, cx: &mut Context<ShellView>) {
 /// listeners are SEPARATE from its pre-existing diagnostic-only pair, gpui's
 /// `key_down_listeners`/`mouse_down_listeners` being `Vec`s that accumulate
 /// rather than overwrite, confirmed against the pinned gpui rev's own
-/// `elements/div.rs` before relying on it). While locked: unlocks. While
-/// unlocked: just refreshes the idle clock (`LockScreenState::note_input`) —
-/// this is NOT called for `cmd-k`/`escape`/`enter` specifically, since a
+/// `elements/div.rs` before relying on it).
+///
+/// WP-lock-pw (2026-08-22): renamed from `note_input_or_unlock` — while
+/// locked, this NO LONGER unlocks anything. It only reveals the password
+/// prompt (task brief: "任意鍵/點擊 → 出現密碼輸入框"), and — exactly on
+/// the Hidden -> visible edge (`LockScreenState::reveal_prompt`'s own `bool`
+/// return) — moves keyboard focus onto the freshly-rendered field via
+/// `Focusable::focus_handle`, so the very NEXT keystroke lands as typed
+/// content in the field instead of hitting this same catch-all again. Once
+/// already visible, this is a pure no-op: clicking/typing on the
+/// BACKGROUND (not on the field itself) neither re-focuses nor clears
+/// anything — the field's own `OobeTextField::on_mouse_down` handles
+/// click-to-focus if the operator clicks directly on it.
+///
+/// This is NOT called for `cmd-k`/`escape`/`enter` specifically, since a
 /// keystroke that matches a bound `KeyBinding` is fully consumed by gpui's
 /// action-dispatch path and never reaches a raw `on_key_down` listener on
-/// the same element at all (verified against `Window::dispatch_key_event`'s
+/// the SAME element at all (verified against `Window::dispatch_key_event`'s
 /// own control flow in the pinned gpui rev: a matched binding's action
 /// handler running with `cx.propagate_event` left `false` returns BEFORE
-/// `dispatch_key_down_up_event` — the raw key-listener pass — ever runs) —
-/// `main.rs`'s three action handlers (`on_toggle_launcher`/`on_close_overlay`
-/// /`on_oobe_next`) each carry their OWN identical lock-check at their own
-/// top for exactly that reason, not relying on this fn to cover those three
-/// keys.
-pub(crate) fn note_input_or_unlock(view: &mut ShellView, cx: &mut Context<ShellView>) {
+/// `dispatch_key_down_up_event` — the raw key-listener pass — ever runs).
+/// `main.rs`'s `on_toggle_launcher`/`on_close_overlay` each carry their OWN
+/// identical lock-check (calling THIS fn, same reveal-only behavior — cmd-k/
+/// escape have no other meaning while locked); `on_oobe_next` (`enter`)
+/// instead calls `submit_or_reveal` below, since Enter is this surface's
+/// SUBMIT trigger once the field is already visible and focused — a plain
+/// letter keystroke typed while the field has focus still ALSO reaches this
+/// catch-all after bubbling past the field's own (non-propagation-stopping)
+/// `OobeTextField::on_key_down`, but by then `reveal_prompt()` is a no-op
+/// (already visible), so it changes nothing.
+pub(crate) fn note_input_or_reveal(view: &mut ShellView, window: &mut Window, cx: &mut Context<ShellView>) {
     if view.lockscreen.is_locked() {
+        reveal_and_focus(view, window, cx);
+        return;
+    }
+    view.lockscreen.note_input();
+}
+
+/// The reveal-and-focus operation shared by `note_input_or_reveal` above and
+/// `submit_or_reveal` below (Enter, on a not-yet-revealed prompt, is "just
+/// another key" per the task brief — see that fn's own doc comment).
+fn reveal_and_focus(view: &mut ShellView, window: &mut Window, cx: &mut Context<ShellView>) {
+    if !view.lockscreen.reveal_prompt() {
+        return;
+    }
+    let handle = view.lockscreen_password_field.field.read(cx).focus_handle(cx);
+    window.focus(&handle, cx);
+    cx.notify();
+}
+
+/// `main.rs`'s `on_oobe_next` (bound to `enter`, `None` key-context — see
+/// that binding's own registration in `main.rs`) calls this while locked,
+/// REPLACING the old direct `unlock(view, cx)` call. Enter reaches the
+/// currently-focused element (the password field, once revealed) BEFORE
+/// bubbling up to this global binding — see `note_input_or_reveal`'s own
+/// doc comment for the exact bubble order this relies on — so by the time
+/// this fires, `view.lockscreen_password_field.field`'s `content` already
+/// holds whatever the operator just typed.
+pub(crate) fn submit_or_reveal(view: &mut ShellView, window: &mut Window, cx: &mut Context<ShellView>) {
+    if !view.lockscreen.prompt_visible() {
+        // First Enter press on a freshly-locked screen — same reveal-only
+        // behavior as any other key; nothing has been typed yet for there
+        // to be anything to submit.
+        reveal_and_focus(view, window, cx);
+        return;
+    }
+    dispatch_unlock_attempt(view, cx);
+}
+
+/// The credential-gated unlock attempt — reads the typed password, applies
+/// the throttle/in-flight guard, and (unless `DUDUCLAW_SHELL_LOCK_NO_
+/// PASSWORD=1` is set — see `lockscreen::password_required_from_env`'s own
+/// doc comment) dispatches a real `gateway_client::verify_password` round
+/// trip on a background thread, bridged back via `std::sync::mpsc` + a
+/// `cx.spawn` poll loop — the exact "thread + channel + poll" shape
+/// `oobe/steps/account.rs`'s own `create_click` handler already establishes
+/// for the OOBE claim flow (see that file's own header comment); re-derived
+/// here rather than shared for the same "small independent modules" reason
+/// `gateway_client/mod.rs`'s own header comment gives for its sibling
+/// clients.
+fn dispatch_unlock_attempt(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    if !super::password_required_from_env() {
+        // Dev/headless escape hatch — reproduces the ORIGINAL Shell-S4-lock
+        // behavior verbatim: unlocks immediately, no gateway round trip.
+        // Whatever (if anything) was typed is discarded unread, never sent
+        // anywhere.
+        view.lockscreen_password_field.field.update(cx, |f, cx| f.clear(cx));
         unlock(view, cx);
-    } else {
-        view.lockscreen.note_input();
+        return;
+    }
+
+    let now = Instant::now();
+    if !view.lockscreen.can_submit(now) {
+        // Throttled or already in flight — a no-op keypress, not an error:
+        // the field keeps whatever was typed so the operator doesn't have
+        // to retype during the cooldown (task brief: "不鎖死").
+        return;
+    }
+    let password = view.lockscreen_password_field.field.read(cx).content.clone();
+    if password.is_empty() {
+        // Enter on an empty field is a no-op, not a wasted round trip or a
+        // spurious "wrong password" flash.
+        return;
+    }
+    view.lockscreen.begin_verify(now);
+    // Clear the field's typed content IMMEDIATELY, before the round trip
+    // even starts — task brief: "密碼零落 log／不留明文於狀態". The
+    // password this attempt is verifying is already captured in `password`
+    // above (moved into the background thread below); there is no reason
+    // for the plaintext to keep sitting in the `OobeTextField`'s own
+    // `content` for however long the round trip takes.
+    view.lockscreen_password_field.field.update(cx, |f, cx| f.clear(cx));
+    cx.notify();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = crate::gateway_client::verify_password(&password);
+        // `password` is dropped right here at thread exit — nothing holds
+        // it past this call, and it is never written to a log (this thread
+        // has no logging of its own; `apply_unlock_result`'s own stderr
+        // diagnostic for a failure logs only the `LoginError` variant, never
+        // the password).
+        let _ = tx.send(result);
+    });
+
+    // Same one-shot poll shape as `oobe/steps/account.rs`'s own
+    // `create_click` handler — see that file's own comment on this exact
+    // `try_recv` + paced `background_executor().timer` loop.
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(result) => {
+                let _ = weak.update(cx, |view, cx| {
+                    apply_unlock_result(view, result, cx);
+                    cx.notify();
+                });
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(Duration::from_millis(50)).await;
+    })
+    .detach();
+}
+
+/// Applies a settled `gateway_client::verify_password` result — the
+/// weak-entity update body run from `dispatch_unlock_attempt`'s poll loop
+/// above. Only `InvalidCredentials` maps to `UnlockFailureKind::
+/// WrongPassword`; every other `LoginError` variant collapses to
+/// `UnlockFailureKind::Unreachable` (see that type's own doc comment and
+/// `crate::lockscreen`'s header comment "Offline fail-safe semantics" for
+/// why that collapse is the honest choice, not a laziness shortcut).
+fn apply_unlock_result(view: &mut ShellView, result: Result<(), crate::gateway_client::LoginError>, cx: &mut Context<ShellView>) {
+    match result {
+        Ok(()) => unlock(view, cx),
+        Err(crate::gateway_client::LoginError::InvalidCredentials) => {
+            view.lockscreen.record_failure(UnlockFailureKind::WrongPassword, Instant::now());
+        }
+        Err(other) => {
+            // Diagnostic detail (which of Unreachable/RateLimited/Http/
+            // Malformed/NonLoopback happened) goes to stderr only — the
+            // operator-facing message collapses all of these to one honest
+            // "本機服務未回應" (see this fn's own doc comment).
+            eprintln!("[lockscreen] unlock verify failed: {other:?}");
+            view.lockscreen.record_failure(UnlockFailureKind::Unreachable, Instant::now());
+        }
     }
 }
 
