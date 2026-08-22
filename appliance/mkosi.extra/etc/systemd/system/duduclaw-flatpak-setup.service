@@ -1,0 +1,30 @@
+# Prepares the /data-resident Flatpak installation (directory + global
+# sandbox env override + the flathub remote). See
+# /usr/local/sbin/duduclaw-flatpak-setup.sh for the full reasoning; the
+# short version is that the app repository must not live on the fixed-size
+# read-only root, and a remote can only be added at runtime because it is
+# stored inside an OSTree repo that lives on /data.
+#
+# Runs on EVERY boot, on purpose — the script is idempotent and stamps
+# itself once the (network-dependent) remote is in place, so a box that
+# first booted without an uplink picks it up later without operator
+# action. That is also why there is no RemainAfterExit=yes: the unit is
+# meant to be re-run next boot, not held "active" forever.
+#
+# No network-online.target dependency: this image deliberately MASKS
+# systemd-networkd-wait-online.service (it blocks ~120s and then fails
+# under QEMU virtio-net — see postinst.d/20-users-and-units.sh), so
+# waiting on "fully online" here would either hang boot or be a lie. The
+# script's own bounded retry loop is the honest substitute.
+[Unit]
+Description=DuDuClaw OS: Flatpak installation on /data + flathub remote
+After=data.mount network.target duduclaw-firstboot-provision.service
+Requires=data.mount
+ConditionPathExists=/etc/flatpak/installations.d/10-duduclaw-data.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/duduclaw-flatpak-setup.sh
+
+[Install]
+WantedBy=multi-user.target

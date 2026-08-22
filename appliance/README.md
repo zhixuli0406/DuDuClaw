@@ -27,6 +27,7 @@ appliance/
 ├── mkosi.skeleton/           files copied into the OS tree BEFORE packages install
 ├── mkosi.extra/               files copied into the OS tree AFTER packages install
 │   ├── etc/chromium/policies/managed/   kiosk Chromium enterprise policy (JSON)
+│   ├── etc/flatpak/installations.d/     app repository redirected onto /data
 │   ├── etc/systemd/system/     first-boot + gateway + kiosk systemd units
 │   ├── etc/sysupdate.d/        A/B update transfer definitions
 │   └── usr/local/sbin/         the scripts those units run
@@ -188,9 +189,12 @@ onboarding flow all need a real machine.
    `/sys/class/drm/*/status` for any `connected` output. No display
    attached (the common case) → clean skip, nothing else happens. Display
    attached → `seatd.service` (already running by this point) hands DRM
-   access to `cage`, which fullscreens Chromium at the loopback dashboard
-   URL. See "Kiosk display session" below for the full design and its
-   estimated cost.
+   access to the session compositor, which fullscreens the one and only
+   client. See "Kiosk display session" below for which compositor and
+   which client, and for the automatic fallback chain between them.
+7. `duduclaw-flatpak-setup.service`: creates `/data/flatpak` and adds the
+   flathub remote to it (retried on later boots if there's no uplink yet).
+   See "Flatpak app layer" below.
 
 ## Kiosk display session
 
@@ -198,8 +202,97 @@ Off in effect on every headless box, on automatically the moment a
 monitor is attached and the box (re)boots — no config flag either way, see
 `mkosi.extra/etc/systemd/system/duduclaw-kiosk.service` for the detection
 mechanism and the full device-access chain (`seatd` → `video`/`render`
-group membership → `cage` → Chromium), each link verified against
+group membership → compositor → client), each link verified against
 upstream/Debian source rather than assumed.
+
+### Which compositor, which client
+
+`duduclaw-kiosk-launch.sh` picks one of three session shapes and falls
+back automatically. Nothing here needs a rebuild to change:
+
+| Shape | Compositor | Client | Selected when |
+|---|---|---|---|
+| `comp` | `duduclaw-comp` (owns DRM/KMS via seatd) | `duduclaw-shell` | both binaries present and comp isn't failure-blacklisted — **the preferred shape, but see the pin below** |
+| `cage` | `cage` | `duduclaw-shell` | shell present, comp absent/blacklisted/failed |
+| `chromium` | `cage` | Chromium at `http://127.0.0.1:18789` | no shell in the image (the pre-shell behavior, unchanged) |
+
+Which binaries are in the image is a build-time choice:
+`DUDUCLAW_SHELL_BIN_PATH=` and `DUDUCLAW_COMP_BIN_PATH=` on `build.sh`
+(steps 1c/1d). Neither is built by this repo's build script — both come
+from detached workspaces (`crates/duduclaw-shell/BUILD-LINUX.md`,
+`crates/duduclaw-comp/BUILD.md`).
+
+**Automatic fallback.** `comp` is attempted, not assumed. The launcher
+starts it, waits for its Wayland socket, starts the shell against that
+socket, and requires *both* processes to survive a probe window before
+calling the session healthy (the socket alone is a weak signal — smithay
+creates the listener before the backend is up, so "socket exists" does not
+prove comp got the DRM device). Anything short of that → kill both, log
+the reason, wait a second for the DRM device to be released, and start the
+`cage` shape instead. The journal always says which shape actually ran and
+why. Three consecutive early failures write a breadcrumb
+(`/data/duduclaw-kiosk/.kiosk-comp-failures`) that makes auto-selection
+stop trying comp until it's removed; a healthy session clears it.
+
+**Live-verified (2026-08-22, A4 wave).** The `comp` shape was taken end to
+end on the appliance VM against real hardware: libseat session on `seat0`,
+`/dev/dri/card0`, connector `Virtual-1` + CRTC, a 1280x800 output, real
+pixels on screen, absolute-pointer input landing where it was sent, and
+**idle CPU measured at 0.00%** (against `cage`'s ~100% and the winit
+backend's 32%) — with `duduclaw-shell` running on it, load average was
+0.10 versus 5.6 for the old cage+shell stack. Two defects found in that
+round and fixed in the same wave, both of which would have shipped a
+box that boots to an unusable screen:
+
+- **comp did not flush Wayland clients unless it rendered.** `flush_clients()`
+  sat at the end of the render path, which is skipped whenever nothing is
+  dirty — so a client still doing its opening `wl_registry`/`wl_display.sync`
+  roundtrip never got the replies (nothing in that roundtrip damages an
+  output). The shell hung forever at 0% CPU. Fixed by flushing every event
+  loop iteration; idle cost is unchanged.
+- **`duduclaw-shell` received no keyboard or pointer events at all.** Root
+  cause is client-side: gpui's Wayland backend stores exactly one seat
+  (`gpui_linux/.../wayland/client.rs:309` is literally
+  `// TODO: Multi seat support`) and each new seat's capabilities event
+  *releases* the previous seat's keyboard/pointer — so the shell was left
+  holding the co-drive **agent** seat while focus lives on the human seat.
+  comp advertises two `wl_seat` globals on purpose (that separation is what
+  makes freeze/e-stop structurally agent-only), so the fix is
+  `seat_order.rs`: advertise the agent seat FIRST so gpui's last-wins lands
+  on the human seat. Zero change to the co-drive safety model. Override with
+  `DUDUCLAW_COMP_SEAT_ORDER=human-first` (which reproduces the broken state
+  exactly, useful as an A/B). Known cost: a gpui client can no longer be
+  agent-driven, since it releases the agent seat's resources; every other
+  client keeps both seats (`foot` re-verified under the new order).
+  The upstream gpui patch is written up in `crates/duduclaw-comp/BUILD.md`
+  for whenever a zed fork exists to carry it.
+
+**Escape hatches** (drop a file from a serial/debug session, then
+`systemctl restart duduclaw-kiosk.service` — no image rebuild):
+
+- `/etc/duduclaw/kiosk-app` — one word, forces the shape: `chromium`,
+  `comp`, or `cage` (`shell` is accepted as the historical spelling of
+  `cage`). Checked before everything else, including the blacklist.
+- `/etc/duduclaw/kiosk.env` — optional shell fragment, sourced with
+  `set -a`. Knobs: `DUDUCLAW_KIOSK_DBUS=0`,
+  `DUDUCLAW_KIOSK_COMP_MAX_FAILURES`,
+  `DUDUCLAW_KIOSK_COMP_SOCKET_WAIT_SECS`,
+  `DUDUCLAW_KIOSK_COMP_SHELL_PROBE_SECS`, `DUDUCLAW_COMP_BACKEND`.
+
+**Session D-Bus bus.** This unit is a plain system service, not a
+PAM/logind session, so nothing would otherwise create a session bus. The
+launcher re-execs itself under `dbus-run-session` so the whole session
+tree shares one, and pushes `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/
+`XDG_SESSION_TYPE` into the bus's activation environment once the
+compositor is up — without that, a D-Bus-activated `xdg-desktop-portal`
+would be spawned with no idea where the display is. Fail-open: if
+`dbus-run-session` isn't installed the session starts exactly as before
+and says so in the journal (Flatpak apps then have no portal support).
+
+**Don't set `LIBGL_ALWAYS_SOFTWARE` on the compositor.** Mesa refuses
+("Not allowed to force software rendering when API explicitly selects a
+hardware device") and the compositor segfaults. It was found this way with
+`cage`; the same rule now points at `duduclaw-comp`.
 
 **Estimated cost** (not measured on real hardware this round — flagged as
 an estimate per the task, not a benchmark result):
@@ -222,6 +315,68 @@ an estimate per the task, not a benchmark result):
   compositors are lightweight). Only paid when a display is attached and
   the unit actually starts; headless boxes pay nothing beyond the
   binaries already sitting unused on disk.
+
+## Flatpak app layer
+
+Third-party desktop apps run as Flatpaks. Three packages are installed
+(`flatpak`, `xdg-desktop-portal`, `xdg-desktop-portal-gtk`) and
+`xdg-desktop-portal-wlr` deliberately is not: Screenshot/ScreenCast
+backends forward frames captured through `wlr-screencopy`, and
+`duduclaw-comp` implements no screen-capture protocol, so that package
+would be dead weight rather than a partial win. Everything behind these
+choices — including a live container run of a real Flathub Chromium
+against `duduclaw-comp` with **zero** portal backends installed, which
+started and rendered fine — is written up in
+`research/native-os-2026-08/flatpak-portal-scope-2026-08.md`.
+
+**The app repository lives on `/data`, never on root.** A single Chromium
+plus the freedesktop runtime measures 2.4 GB on disk; the root partition
+is a fixed 5 GB with well under 1.4 GB free. `mkosi.extra/etc/flatpak/
+installations.d/10-duduclaw-data.conf` declares a named installation
+`data` at `/data/flatpak`, and it ships as static image content precisely
+because it has to be in place *before* the first `flatpak install` — the
+repository layout is created by that first install, and once it lands in
+`/var/lib/flatpak` moving it is surgery.
+
+**Every command needs `--installation=data`.** This adds an installation;
+it does not move the default one. A bare `flatpak install <app>` still
+targets `/var/lib/flatpak` on the root partition and will fill it.
+
+```bash
+flatpak --installation=data list
+flatpak remote-ls --installation=data flathub
+flatpak install --installation=data flathub org.libreoffice.LibreOffice
+```
+
+`duduclaw-flatpak-setup.service` runs on every boot and does three things,
+all idempotent: create `/data/flatpak` (refusing to proceed if `/data`
+isn't actually mounted), write a default sandbox environment
+(`XDG_SESSION_TYPE=wayland`), and add the flathub remote. Only the last
+needs the network, so it retries and is stamped once it succeeds — a box
+that first booted without an uplink picks it up on a later boot rather
+than needing operator action.
+
+Two measured findings worth keeping in view:
+
+- **`flatpak override` cannot target a named installation.** On flatpak
+  1.16.6, in both documented option positions, it exits 0, prints no
+  warning, reads the value straight back with `--show` — and writes to
+  `/var/lib/flatpak/overrides/global`, which no app under `/data` reads.
+  The setup script therefore writes `/data/flatpak/overrides/global`
+  itself, in flatpak's own file format.
+- **Wayland is not auto-selected by Chromium-family apps.** With
+  `WAYLAND_DISPLAY` already exported, Flathub's Chromium still picked the
+  X11 ozone backend and failed; it needs an explicit
+  `--ozone-platform=wayland`. That is argv, and no environment variable
+  expresses it, so the durable fix belongs to whatever launches the app
+  (a per-app-id argv policy in DuDuClaw's own launcher) — not to an edited
+  `.desktop` file inside the app, which the next `flatpak update` deletes.
+
+**Size**: the three packages cost **113.5 MB** installed *on top of this
+image's existing package set* (86 new packages, no recommends — measured
+by diffing the apt dependency closure with and without them, not
+estimated). The 2.4 GB figure above is app/runtime content and lands on
+`/data`.
 
 ## Known open points
 
@@ -308,6 +463,52 @@ real Linux build environment is available:
     (`policy_paths.cc`, `config_dir_policy_loader.cc`,
     `translate_url_fetcher.cc`'s own traffic-annotation example), but
     Chromium actually picking it up was not observed on a real boot.
+
+- **`duduclaw-comp` as the session compositor, on real hardware.** The
+  selection + fallback decision tree in `duduclaw-kiosk-launch.sh` is
+  verified — 31 assertions, in a Debian trixie container against stub
+  binaries covering comp-dies-instantly, the three-strike blacklist, all
+  three escape-hatch tokens, a junk token, a healthy comp handing a real
+  Unix socket to its client, a missing binary, and the no-shell path — but
+  a *stub* is not a compositor. Two things it therefore cannot prove:
+  - `duduclaw-comp`'s own DRM/udev backend. That is being implemented in
+    parallel (A4-1); this wiring assumes the contract "no `WAYLAND_DISPLAY`
+    in the environment ⇒ take the hardware", with `DUDUCLAW_COMP_BACKEND`
+    passed explicitly on top so the target is never implicit. A comp build
+    that ignores that variable still gets the same path from the unset
+    `WAYLAND_DISPLAY`; a comp build that wants a *different* variable name
+    needs one line changed in `run_comp_session`.
+  - Whether the compositor's socket appears where the launcher looks
+    (`$XDG_RUNTIME_DIR/wayland-*`, matched by "is a socket" rather than by
+    name, so a rename can't silently break it) once the winit backend is
+    no longer the one creating it.
+- **`dbus-run-session`'s package provenance.** The `dbus` package is
+  already installed and is expected to pull the binary in transitively,
+  but which Debian trixie binary package actually ships
+  `/usr/bin/dbus-run-session` was not confirmed. The launcher degrades
+  cleanly (no session bus, journal line, everything else unchanged) rather
+  than failing, so the first boot's journal answers this; if it is absent,
+  add `dbus-bin` to `mkosi.conf`'s `Packages=`.
+- **Input devices under `duduclaw-comp`.** The kiosk user is deliberately
+  *not* in the `input` group, because a libseat-based compositor never
+  opens `/dev/input/event*` itself — seatd does, exactly as it already
+  does for `cage` on this image. If a comp build reaches libinput without
+  going through libseat it will see zero keyboards and zero pointers; the
+  fix is `input` in the `useradd -G` list in
+  `postinst.d/20-users-and-units.sh`. Recorded so the first failing boot
+  is one step, not five.
+- **Root partition headroom is arithmetic, not a measurement.** The "~3.6 GB
+  used of 5 GB" baseline comes from `mkosi.repart/20-root-a.conf`'s own
+  comment, not from `df` on a built image. Against it, the A4 additions are
+  113.5 MB (flatpak trio, measured) plus the `duduclaw-comp` binary
+  (~146 MB as an unstripped debug build, materially less stripped or built
+  release) — so no partition resize, with roughly 1 GB still free. If a
+  build ever dies with "No space left on device while populating file
+  system", the levers in order are: `APPLIANCE_STRIP` (on by default —
+  check the build log actually reported a strip rather than a warning),
+  handing in a release build of the two binaries, then raising `SizeMinBytes=`
+  /`SizeMaxBytes=` in **both** `20-root-a.conf` and `21-root-b.conf`
+  together (A/B slots must stay identical for sysupdate).
 
 None of these are silently assumed solved; each is called out at its
 source in the relevant file's comments as well, so nothing here is a

@@ -25,6 +25,30 @@
 # it — precisely "there is only the dashboard", and vastly smaller than
 # pulling in an actual desktop session manager for one browser window.
 #
+# Since the A4 wave (2026-08-22) cage is the FALLBACK, not the only
+# option: when /usr/local/bin/duduclaw-comp is present, the launch script
+# runs DuDuClaw OS's own compositor as the session compositor instead and
+# only drops back to cage if comp fails to come up (see
+# duduclaw-kiosk-launch.sh for the full selection/fallback decision tree
+# and the /etc/duduclaw/kiosk-app + /etc/duduclaw/kiosk.env escape
+# hatches). Nothing in THIS unit had to change for that: duduclaw-comp
+# reaches the hardware through exactly the same chain documented below —
+# seatd brokers the DRM "card" device (comp uses smithay's libseat-backed
+# session, the same libseat protocol cage's wlroots uses), the `video`
+# group is what may connect to seatd's socket, and `render` is what allows
+# a direct open of /dev/dri/renderD*.
+#
+# KNOWN CONTINGENCY (not a defect observed here — recorded so the first
+# failing boot is diagnosed in one step instead of five): input devices.
+# /dev/input/event* is root:input 0660 on Debian and the kiosk user is
+# deliberately NOT in the `input` group, because a libseat-based
+# compositor never opens those nodes itself — seatd opens them as root and
+# passes the fds, which is exactly how cage works on this image today. If
+# a future duduclaw-comp build opens input devices directly (plain
+# libinput/udev without a libseat session), it will see zero keyboards and
+# zero pointers, and the fix is to add `input` to the `useradd -G` list in
+# postinst.d/20-users-and-units.sh — NOT to loosen anything here.
+#
 # Device access chain — every piece verified against upstream/Debian
 # source this round, not guessed (see postinst.d/20-users-and-units.sh
 # for the matching useradd rationale):
@@ -68,6 +92,17 @@ After=seatd.service systemd-udev-settle.service duduclaw-gateway.service getty@t
 Requires=seatd.service
 Wants=duduclaw-gateway.service
 Conflicts=getty@tty1.service
+# StartLimitIntervalSec=/StartLimitBurst= belong to [Unit], not [Service]
+# (systemd.unit(5) documents them there; systemd.service(5) does not list
+# them at all). They sat under [Service] until 2026-08-22, where at best
+# they were a deprecated compatibility alias and at worst silently ignored,
+# leaving systemd's built-in default rate limit in force. Moved here so the
+# values written actually are the values applied. If a field box ever gets
+# stuck "start request repeated too quickly", this is the knob — but note
+# that a failing compositor no longer causes a restart at all: the launch
+# script falls back to cage inside the same invocation.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -101,8 +136,6 @@ ExecCondition=/usr/local/sbin/duduclaw-kiosk-detect-display.sh
 ExecStart=/usr/local/sbin/duduclaw-kiosk-launch.sh
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 NoNewPrivileges=yes
 ProtectHome=yes

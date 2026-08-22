@@ -27,6 +27,19 @@
 #                                 Silicon host (no cross-arch QEMU emulation
 #                                 penalty) for local smoke testing only —
 #                                 see README.md for which path to use when.
+#   DUDUCLAW_SHELL_BIN_PATH=<p>   Prebuilt Linux duduclaw-shell binary (gpui
+#                                 shell). Unset -> kiosk shows the Chromium
+#                                 dashboard instead. See step 1c.
+#   DUDUCLAW_COMP_BIN_PATH=<p>    Prebuilt Linux duduclaw-comp binary (the
+#                                 self-built Wayland compositor). Unset ->
+#                                 the kiosk session keeps using cage. Only
+#                                 meaningful together with the shell. Step 1d.
+#   APPLIANCE_STRIP=0             Disable the default `strip --strip-debug`
+#                                 applied to the staged copies of the two
+#                                 binaries above (step 1b2). Off means a
+#                                 bigger root partition footprint; the
+#                                 caller's own files are never modified
+#                                 either way.
 #   CARGO_JOBS=<n>                Caps cargo's build parallelism inside
 #                                 step 1's rust-builder Docker stage
 #                                 (container/Dockerfile.server's
@@ -138,6 +151,97 @@ else
     echo "[build] (1b) SKIP_CLI_VENDOR set — image will lack the AI CLIs"
 fi
 
+# --- Step 1b2: staging + optional strip for caller-supplied binaries -------
+# The two big binaries this script does NOT build (duduclaw-shell, ~553MB;
+# duduclaw-comp, ~146MB as a debug build) are handed in by the caller as
+# prebuilt Linux ELFs. Both go on the fixed-size 5G read-only root, which
+# was already at ~3.6G before duduclaw-comp existed — so they are staged
+# through a copy under .build/staged/ and, by default, `strip --strip-debug`
+# is applied to that COPY.
+#
+#   - The caller's file is never modified. Ever. Staging is a copy first,
+#     strip second, and any strip failure restores the copy from the
+#     original — a build must not mutate an artifact someone else produced.
+#   - `--strip-debug`, NOT plain `strip`/`--strip-all`: it drops the
+#     .debug_* sections (the bulk of an unoptimized Rust binary) but keeps
+#     .symtab, so a panic backtrace still resolves FUNCTION NAMES. What is
+#     lost is file:line resolution in backtraces. That is the deliberate
+#     trade: an appliance image with no room for the compositor is a worse
+#     debugging position than a backtrace without line numbers.
+#   - APPLIANCE_STRIP=0 turns the whole thing off (staging still happens,
+#     so the rest of the script has one code path either way).
+#   - Fail-open by construction: no usable strip tool, no Docker, no
+#     network — every one of those prints a warning and ships the
+#     unstripped copy. Stripping is a size optimization, never a build gate.
+STAGE_DIR="$APPLIANCE_DIR/.build/staged"
+STRIP_IMAGE="duduclaw-appliance-strip:$APPLIANCE_ARCH"
+
+# True when $1 still starts with the ELF magic (7f 45 4c 46) and is
+# non-empty — the post-strip sanity check. `head -c` + `od` are used
+# because `file(1)` is not guaranteed on a stripped-down build host.
+elf_ok() {
+    [[ -s "$1" ]] || return 1
+    local magic
+    magic="$(head -c 4 "$1" | od -An -tx1 | tr -d ' \n')"
+    [[ "$magic" == "7f454c46" ]]
+}
+
+# Strip $1 in place, returning non-zero if nothing worked. Host binutils
+# first (the native-Linux build host case), then a tiny cached Docker image
+# built for $DOCKER_PLATFORM — GNU strip is built for one target, so the
+# container has to match the IMAGE's architecture, not the build host's.
+strip_elf() {
+    local f="$1" tool
+    for tool in llvm-strip strip; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            # macOS's /usr/bin/strip is the Mach-O one and simply errors out
+            # on an ELF; that's why this is a try-and-verify, not a
+            # try-and-assume (and why elf_ok runs after every attempt).
+            if "$tool" --strip-debug "$f" 2>/dev/null && elf_ok "$f"; then
+                return 0
+            fi
+        fi
+    done
+    command -v docker >/dev/null 2>&1 || return 1
+    if ! docker image inspect "$STRIP_IMAGE" >/dev/null 2>&1; then
+        printf 'FROM debian:trixie-slim\nRUN apt-get update && apt-get install -y --no-install-recommends binutils && rm -rf /var/lib/apt/lists/*\n' \
+            | docker build --platform "$DOCKER_PLATFORM" -t "$STRIP_IMAGE" - >/dev/null 2>&1 || return 1
+    fi
+    # Bind mount is fine HERE (unlike the mkosi runner below, which avoids
+    # them because Docker Desktop misreports permission bits on macOS):
+    # only the file CONTENT crosses the boundary, and every consumer below
+    # re-chmods explicitly.
+    docker run --rm --platform "$DOCKER_PLATFORM" \
+        -v "$STAGE_DIR:/stage" "$STRIP_IMAGE" \
+        strip --strip-debug "/stage/${f##*/}" >/dev/null 2>&1 || return 1
+    elf_ok "$f"
+}
+
+# stage_binary <source-path> <basename> — prints the staged path on stdout;
+# all human-facing output goes to stderr so the caller can capture it.
+stage_binary() {
+    local src="$1" name="$2" dest="$STAGE_DIR/$2" before after
+    mkdir -p "$STAGE_DIR"
+    cp "$src" "$dest"
+    chmod 755 "$dest"
+    if [[ "${APPLIANCE_STRIP:-1}" == "0" ]]; then
+        echo "[build]       $name: APPLIANCE_STRIP=0 — staged unstripped ($(wc -c < "$dest") bytes)" >&2
+        printf '%s' "$dest"
+        return 0
+    fi
+    before="$(wc -c < "$dest")"
+    if strip_elf "$dest"; then
+        after="$(wc -c < "$dest")"
+        chmod 755 "$dest"
+        echo "[build]       $name: stripped $before -> $after bytes (--strip-debug; symbol names kept)" >&2
+    else
+        cp "$src" "$dest"
+        chmod 755 "$dest"
+        echo "[build]       WARNING: $name could not be stripped (no usable strip tool / docker) — shipping $before bytes unstripped" >&2
+    fi
+    printf '%s' "$dest"
+}
+
 # --- Step 1c: DuDuClaw OS gpui shell (optional, Shell-S2 wave) -------------
 # The native shell is built from the detached `crates/duduclaw-shell`
 # workspace (gpui pulls the whole zed monorepo — deliberately NOT rebuilt
@@ -149,6 +253,7 @@ fi
 # mkosi.extra/usr/local/sbin/duduclaw-kiosk-launch.sh's selection order,
 # incl. the /etc/duduclaw/kiosk-app escape hatch). When unset, nothing
 # changes: Chromium kiosk, byte-identical to before this step existed.
+STAGED_SHELL_BIN=""
 if [[ -n "${DUDUCLAW_SHELL_BIN_PATH:-}" ]]; then
     if [[ ! -f "$DUDUCLAW_SHELL_BIN_PATH" ]]; then
         echo "[build] DUDUCLAW_SHELL_BIN_PATH=$DUDUCLAW_SHELL_BIN_PATH does not exist" >&2
@@ -156,8 +261,43 @@ if [[ -n "${DUDUCLAW_SHELL_BIN_PATH:-}" ]]; then
     fi
     echo "[build] (1c) shell binary: $DUDUCLAW_SHELL_BIN_PATH → /usr/local/bin/duduclaw-shell (kiosk runs the gpui shell)"
     echo "[build]       (caller-supplied — not verified to match APPLIANCE_ARCH=$APPLIANCE_ARCH)"
+    STAGED_SHELL_BIN="$(stage_binary "$DUDUCLAW_SHELL_BIN_PATH" duduclaw-shell)"
 else
     echo "[build] (1c) DUDUCLAW_SHELL_BIN_PATH unset — kiosk stays on the Chromium dashboard"
+fi
+
+# --- Step 1d: DuDuClaw OS compositor (optional, A4 wave) -------------------
+# duduclaw-comp is DuDuClaw OS's own Wayland compositor (smithay-based; see
+# crates/duduclaw-comp/BUILD.md). Like the shell it lives in a DETACHED
+# workspace and is deliberately NOT rebuilt here — hand in a prebuilt Linux
+# binary matching APPLIANCE_ARCH:
+#   DUDUCLAW_COMP_BIN_PATH=/path/to/duduclaw-comp appliance/build.sh
+# When set, the image ships it at /usr/local/bin/duduclaw-comp and the kiosk
+# session prefers it over cage as the session compositor, with an automatic
+# fallback to the cage path when it fails to come up (full decision tree +
+# escape hatches: mkosi.extra/usr/local/sbin/duduclaw-kiosk-launch.sh).
+# When unset, nothing changes: the binary is simply absent and the launch
+# script's selection lands on exactly the pre-A4 behavior.
+#
+# Note it is only ever USED together with the shell — comp with no client
+# would be a blank screen — but the two variables are kept independent so
+# an image can be built with the shell alone (the verified Shell-S2 shape)
+# without this step having an opinion about it.
+STAGED_COMP_BIN=""
+if [[ -n "${DUDUCLAW_COMP_BIN_PATH:-}" ]]; then
+    if [[ ! -f "$DUDUCLAW_COMP_BIN_PATH" ]]; then
+        echo "[build] DUDUCLAW_COMP_BIN_PATH=$DUDUCLAW_COMP_BIN_PATH does not exist" >&2
+        exit 1
+    fi
+    echo "[build] (1d) compositor binary: $DUDUCLAW_COMP_BIN_PATH → /usr/local/bin/duduclaw-comp (kiosk prefers duduclaw-comp over cage)"
+    echo "[build]       (caller-supplied — not verified to match APPLIANCE_ARCH=$APPLIANCE_ARCH)"
+    if [[ -z "${DUDUCLAW_SHELL_BIN_PATH:-}" ]]; then
+        echo "[build]       WARNING: DUDUCLAW_SHELL_BIN_PATH is unset — duduclaw-comp will be installed but never selected" >&2
+        echo "[build]                (the launch script only picks comp when the shell is present to be its client)" >&2
+    fi
+    STAGED_COMP_BIN="$(stage_binary "$DUDUCLAW_COMP_BIN_PATH" duduclaw-comp)"
+else
+    echo "[build] (1d) DUDUCLAW_COMP_BIN_PATH unset — kiosk compositor stays on cage"
 fi
 
 # --- Step 2: mkosi build ---------------------------------------------------
@@ -185,9 +325,15 @@ if [[ "$HOST_OS" == "Linux" ]]; then
     if [[ -d "$CLIS_TREE" ]]; then
         NATIVE_CLI_TREE_ARG=("--extra-tree=${CLIS_TREE}:/usr/local")
     fi
+    # Both of these point at the STAGED copies (step 1b2), never at the
+    # caller's own file — that's what makes the optional strip safe.
     NATIVE_SHELL_TREE_ARG=()
-    if [[ -n "${DUDUCLAW_SHELL_BIN_PATH:-}" ]]; then
-        NATIVE_SHELL_TREE_ARG=("--extra-tree=${DUDUCLAW_SHELL_BIN_PATH}:/usr/local/bin/duduclaw-shell")
+    if [[ -n "$STAGED_SHELL_BIN" ]]; then
+        NATIVE_SHELL_TREE_ARG=("--extra-tree=${STAGED_SHELL_BIN}:/usr/local/bin/duduclaw-shell")
+    fi
+    NATIVE_COMP_TREE_ARG=()
+    if [[ -n "$STAGED_COMP_BIN" ]]; then
+        NATIVE_COMP_TREE_ARG=("--extra-tree=${STAGED_COMP_BIN}:/usr/local/bin/duduclaw-comp")
     fi
     # APPLIANCE_DEBUG=1 sets a root password so you can log in on the serial
     # console (`root` / the value of APPLIANCE_DEBUG_PASSWORD, default
@@ -206,6 +352,7 @@ if [[ "$HOST_OS" == "Linux" ]]; then
         "--extra-tree=${DUDUCLAW_BIN_PATH}:/usr/local/bin/duduclaw" \
         "${NATIVE_CLI_TREE_ARG[@]}" \
         "${NATIVE_SHELL_TREE_ARG[@]}" \
+        "${NATIVE_COMP_TREE_ARG[@]}" \
         "${DEBUG_ARGS[@]}" \
         build)
 else
@@ -283,11 +430,16 @@ else
     if [[ -d "$CLIS_TREE" ]]; then
         cp -a "$CLIS_TREE/." "$BIN_TREE/usr/local/"
     fi
-    # Step 1c: the gpui shell binary, when supplied (see the validation
-    # block above step 2 — the kiosk launch script switches on its presence).
-    if [[ -n "${DUDUCLAW_SHELL_BIN_PATH:-}" ]]; then
-        cp "$DUDUCLAW_SHELL_BIN_PATH" "$BIN_TREE/usr/local/bin/duduclaw-shell"
+    # Steps 1c/1d: the gpui shell and the compositor, when supplied (see the
+    # validation blocks above step 2 — the kiosk launch script switches on
+    # their presence). Copied from the STAGED path, not the caller's file.
+    if [[ -n "$STAGED_SHELL_BIN" ]]; then
+        cp "$STAGED_SHELL_BIN" "$BIN_TREE/usr/local/bin/duduclaw-shell"
         chmod 755 "$BIN_TREE/usr/local/bin/duduclaw-shell"
+    fi
+    if [[ -n "$STAGED_COMP_BIN" ]]; then
+        cp "$STAGED_COMP_BIN" "$BIN_TREE/usr/local/bin/duduclaw-comp"
+        chmod 755 "$BIN_TREE/usr/local/bin/duduclaw-comp"
     fi
     docker cp "$BIN_TREE" "$CID:/workspace/bin-tree"      # → /workspace/bin-tree/usr/local/bin/duduclaw
     rm -rf "$BIN_TREE"

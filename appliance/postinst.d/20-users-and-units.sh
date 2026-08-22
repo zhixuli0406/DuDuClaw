@@ -91,7 +91,8 @@ systemctl enable \
     duduclaw-sysd.service \
     duduclaw-gateway.service \
     duduclaw-usb-install.service \
-    duduclaw-kiosk.service
+    duduclaw-kiosk.service \
+    duduclaw-flatpak-setup.service
 
 # Mask systemd-networkd-wait-online.service outright (2026-08-19). Removing it
 # from the enable list above is not enough: the Debian networkd package ships
