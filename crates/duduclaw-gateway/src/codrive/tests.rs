@@ -164,6 +164,7 @@ pub(super) fn plain_step(narration: &str, action: CodriveAction) -> CodriveStep 
         action,
         consequential: None,
         api_action: None,
+        locate: None,
     }
 }
 
@@ -182,6 +183,7 @@ pub(super) fn consequential_step(
             description: desc.to_string(),
         }),
         api_action: None,
+        locate: None,
     }
 }
 
@@ -202,6 +204,26 @@ pub(super) fn api_action_step(
         action: fallback_action,
         consequential: None,
         api_action: Some(api_action),
+        locate: None,
+    }
+}
+
+/// C-L3 (WP-CD4b) variant: an ordinary plain step that ALSO carries a
+/// `locate` request — `tests_atspi_locate.rs` uses this to exercise the
+/// locate checkpoint `step::run_one_step` inserts ahead of the ordinary
+/// coordinate dispatch, mirroring `api_action_step` one rung down.
+pub(super) fn locate_step(
+    narration: &str,
+    fallback_action: CodriveAction,
+    locate: super::script::LocateRequest,
+) -> CodriveStep {
+    CodriveStep {
+        narration: narration.to_string(),
+        highlight: None,
+        action: fallback_action,
+        consequential: None,
+        api_action: None,
+        locate: Some(locate),
     }
 }
 

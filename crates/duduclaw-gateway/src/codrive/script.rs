@@ -33,6 +33,14 @@ pub const MAX_TAKE_OVER_REASON_CHARS: usize = 200;
 /// short programmatic identifiers (`"open_url"`, `"state"`, ...), not
 /// free-form narration.
 pub const MAX_API_ACTION_NAME_CHARS: usize = 64;
+/// `locate.role`'s char cap (WP-CD4b, C-L3 AT-SPI2) — a short programmatic
+/// role token (`"button"`, `"entry"`, ...), matched against
+/// `atspi_locate::role_from_token`'s closed table, not free-form narration.
+pub const MAX_LOCATE_ROLE_CHARS: usize = 32;
+/// `locate.name`'s char cap — an accessible-object name/label query
+/// (`"儲存"`, `"Save"`), CJK-safe. Generous relative to typical UI labels but
+/// still bounded (coding convention: never trust an unbounded caller string).
+pub const MAX_LOCATE_NAME_CHARS: usize = 120;
 
 /// The full script one `codrive_run` call executes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +81,23 @@ pub struct CodriveStep {
     /// request.
     #[serde(default)]
     pub api_action: Option<ApiActionRequest>,
+    /// C-L3 (WP-CD4b, DESIGN §3.2 execution ladder rung 3): optional request
+    /// to resolve this step's coordinate `action` via the AT-SPI2
+    /// accessibility bus instead of the literal `x`/`y` the caller wrote
+    /// into `action`. `None` (the default — every script written before this
+    /// field existed) means: skip the locate step entirely, dispatch exactly
+    /// as before — zero behavior change. When set, the driver looks up the
+    /// control in `CodriveScript::target_app`'s accessible tree keyed by
+    /// `(role, name)` — see `atspi_locate::locate`; a locate MISS or FAILURE
+    /// both fall back to this step's own literal `action` coordinates,
+    /// unchanged — see `step::try_atspi_locate`. Only meaningful for
+    /// `Move`/`Click` actions (every other action kind's `locate`, if set,
+    /// is silently ignored — there is no coordinate to override); `action`
+    /// is still required and still what actually runs whenever C-L3 can't
+    /// resolve the request, same non-replacement relationship `api_action`
+    /// already has with `action` one rung up the ladder.
+    #[serde(default)]
+    pub locate: Option<LocateRequest>,
 }
 
 /// One C-L2 registry action request: the registered action's `name` plus
@@ -84,6 +109,21 @@ pub struct ApiActionRequest {
     pub action: String,
     #[serde(default)]
     pub params: serde_json::Value,
+}
+
+/// One C-L3 AT-SPI2 locate query: a role token (`atspi_locate::role_from_token`'s
+/// closed vocabulary — `"button"`, `"entry"`, `"password"`, ...) plus a
+/// name/label substring to match within `target_app`'s accessible tree.
+/// Both fields are free text from the caller and are truncated CJK-safe by
+/// `CodriveScript::sanitize` (`MAX_LOCATE_ROLE_CHARS`/`MAX_LOCATE_NAME_CHARS`)
+/// — an unrecognized `role` token is not a structural error here, it degrades
+/// to an honest `LocateOutcome::Failed` at dispatch time (see
+/// `atspi_locate::locate`), same "never reject the whole script, just fall
+/// back" spirit as every other soft-validated field in this schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocateRequest {
+    pub role: String,
+    pub name: String,
 }
 
 /// Target highlight box (a pre-click predisplay frame, design §3.3.2(b)) —
@@ -201,6 +241,10 @@ impl CodriveScript {
             if let Some(api) = &mut step.api_action {
                 api.action = duduclaw_core::truncate_chars(api.action.trim(), MAX_API_ACTION_NAME_CHARS);
             }
+            if let Some(loc) = &mut step.locate {
+                loc.role = duduclaw_core::truncate_chars(loc.role.trim(), MAX_LOCATE_ROLE_CHARS);
+                loc.name = duduclaw_core::truncate_chars(loc.name.trim(), MAX_LOCATE_NAME_CHARS);
+            }
         }
         Ok(self)
     }
@@ -221,6 +265,7 @@ mod tests {
                     action: CodriveAction::Move { x: 0.0, y: 0.0 },
                     consequential: None,
                     api_action: None,
+                    locate: None,
                 })
                 .collect(),
             watch_mode: false,
@@ -274,6 +319,33 @@ mod tests {
             s.steps[0].api_action.as_ref().unwrap().action.chars().count(),
             MAX_API_ACTION_NAME_CHARS
         );
+    }
+
+    #[test]
+    fn locate_role_and_name_truncated_cjk_safe() {
+        let mut s = one_step_script(1);
+        s.steps[0].locate = Some(LocateRequest {
+            role: "動".repeat(MAX_LOCATE_ROLE_CHARS + 10),
+            name: "儲".repeat(MAX_LOCATE_NAME_CHARS + 10),
+        });
+        let s = s.sanitize().unwrap();
+        let loc = s.steps[0].locate.as_ref().unwrap();
+        assert_eq!(loc.role.chars().count(), MAX_LOCATE_ROLE_CHARS);
+        assert_eq!(loc.name.chars().count(), MAX_LOCATE_NAME_CHARS);
+    }
+
+    #[test]
+    fn locate_defaults_to_none_for_existing_scripts() {
+        // A script literal built the way every pre-C-L3 caller already
+        // writes them (no `locate` field set in JSON) must deserialize with
+        // `locate: None` — zero behavior change.
+        let json = serde_json::json!({
+            "target_app": "foot",
+            "task_summary": "test",
+            "steps": [{"narration": "move", "action": {"kind": "move", "x": 0.0, "y": 0.0}}],
+        });
+        let s: CodriveScript = serde_json::from_value(json).unwrap();
+        assert!(s.steps[0].locate.is_none());
     }
 
     #[test]

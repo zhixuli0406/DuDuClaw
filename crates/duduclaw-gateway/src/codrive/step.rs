@@ -14,11 +14,15 @@ use serde_json::json;
 
 use crate::approval::{ApprovalBroker, ApprovalStatus, SimulationNarrative};
 
+use super::atspi_locate::{self, LocateOutcome};
 use super::client::{CodriveButtonState, CodriveClient, CodriveClientError, CodriveCmd};
 use super::config::CodriveConfig;
 use super::driver::ticker;
 use super::registry::{self, DispatchOutcome};
-use super::script::{ApiActionRequest, CodriveAction, CodriveConsequential, CodriveStep, ConsequentialClass};
+use super::script::{
+    ApiActionRequest, CodriveAction, CodriveConsequential, CodriveHighlight, CodriveStep, ConsequentialClass,
+    LocateRequest,
+};
 
 /// The tool name stamped on every audit row this module writes — matches
 /// the MCP tool name (`codrive_run`) so `tool_calls.jsonl` correlates.
@@ -115,9 +119,22 @@ pub(super) async fn run_one_step(
         }
     }
 
+    // WP-CD4b (C-L3 AT-SPI2 checkpoint, DESIGN §3.2 execution ladder rung
+    // 3): if this step declares a `locate` query, try to resolve on-screen
+    // coordinates via the accessibility bus and, on a hit, override THIS
+    // COPY of the step's action before it ever reaches `send_step_actions`
+    // — the original `step.action` (and therefore any future retry of this
+    // same script run) is never mutated. A MISS/FAILED locate leaves
+    // `effective_action` identical to `step.action`, i.e. the step's own
+    // literal C-L1 coordinates keep going exactly as before.
+    let mut effective_action = step.action.clone();
+    if let Some(req) = &step.locate {
+        try_atspi_locate(home_dir, agent_id, target_app, req, &mut effective_action).await;
+    }
+
     let mut reapplied = false;
     loop {
-        match send_step_actions(client, step).await {
+        match send_step_actions(client, &step.highlight, &effective_action).await {
             Ok(()) => return Ok(StepSuccess { approval_id, reapplied, taken_over: false, via_api_action: false }),
             Err(CodriveClientError::Frozen) => {
                 ticker(home_dir, agent_id, "codrive_step", session_id, "已被人類輸入凍結，等待交還（Super+Enter）").await;
@@ -361,15 +378,83 @@ async fn try_registry_action(home_dir: &Path, agent_id: &str, target_app: &str, 
     matches!(outcome, DispatchOutcome::Executed { .. })
 }
 
+/// WP-CD4b: try this step's `locate` query against `atspi_locate::locate`.
+/// On a `Located` hit, overwrites `action`'s x/y in place — `Move`/`Click`
+/// only, every other action kind is left untouched since there is no
+/// coordinate to override. On `Miss`/`Failed`, `action` is left exactly as
+/// the caller passed it in, so the step's own literal C-L1 coordinates keep
+/// going unchanged — the whole "查無/失敗→原樣落回既有座標" contract lives in
+/// that untouched `action`, not in any special-cased error handling here,
+/// mirroring `try_registry_action`'s C-L2 shape one rung up. Every one of
+/// the three outcomes is audited (`locate_outcome`: `located` /
+/// `locate_miss_fallback` / `locate_failed_fallback`).
+async fn try_atspi_locate(
+    home_dir: &Path,
+    agent_id: &str,
+    target_app: &str,
+    req: &LocateRequest,
+    action: &mut CodriveAction,
+) {
+    let outcome = atspi_locate::locate(target_app, req).await;
+    let (locate_outcome, success, detail, resolved) = match &outcome {
+        LocateOutcome::Located { x, y, detail } => ("located", true, detail.clone(), Some((*x, *y))),
+        LocateOutcome::Miss => (
+            "locate_miss_fallback",
+            false,
+            format!(
+                "no AT-SPI match for app={target_app:?} role={:?} name={:?} — falling back to C-L1",
+                req.role, req.name
+            ),
+            None,
+        ),
+        LocateOutcome::Failed { detail } => ("locate_failed_fallback", false, detail.clone(), None),
+    };
+    if let Some((x, y)) = resolved {
+        match action {
+            CodriveAction::Move { x: ax, y: ay } | CodriveAction::Click { x: ax, y: ay, .. } => {
+                *ax = x;
+                *ay = y;
+            }
+            CodriveAction::Text { .. } | CodriveAction::KeyName { .. } | CodriveAction::Wait { .. } | CodriveAction::TakeOver { .. } => {}
+        }
+    }
+    let params_summary = format!(
+        "locate {locate_outcome}: app={target_app} role={} name={} — {}",
+        req.role,
+        req.name,
+        duduclaw_core::truncate_chars(&detail, 200)
+    );
+    duduclaw_security::audit::append_tool_call_with_extras(
+        home_dir,
+        agent_id,
+        TOOL_NAME,
+        &params_summary,
+        success,
+        &[
+            ("locate_outcome", json!(locate_outcome)),
+            ("app_id", json!(target_app)),
+            ("role", json!(&req.role)),
+            ("name", json!(&req.name)),
+        ],
+    );
+}
+
 /// Send one step's wire ops: optional highlight + 200ms predisplay, then
 /// the action itself. `click` = move + button press + release; `key_name`
-/// = press + release tap; `wait` never touches the socket.
-async fn send_step_actions(client: &mut CodriveClient, step: &CodriveStep) -> Result<(), CodriveClientError> {
-    if let Some(h) = &step.highlight {
+/// = press + release tap; `wait` never touches the socket. `action` is the
+/// step's *effective* action — WP-CD4b's C-L3 locate checkpoint
+/// (`run_one_step`) may have already overridden its x/y before this is
+/// called, so this function itself has no locate-awareness at all.
+async fn send_step_actions(
+    client: &mut CodriveClient,
+    highlight: &Option<CodriveHighlight>,
+    action: &CodriveAction,
+) -> Result<(), CodriveClientError> {
+    if let Some(h) = highlight {
         client.send(&CodriveCmd::Highlight { x: h.x, y: h.y, w: h.w, h: h.h, ms: HIGHLIGHT_DISPLAY_MS }).await?;
         tokio::time::sleep(PRE_CLICK_HIGHLIGHT_DELAY).await;
     }
-    match &step.action {
+    match action {
         CodriveAction::Move { x, y } => {
             client.send(&CodriveCmd::Move { x: *x, y: *y }).await?;
         }
