@@ -134,17 +134,49 @@ pub fn app_font() -> gpui::Font {
 /// `Cow::Borrowed` avoids copying the static data; `add_fonts` takes
 /// ownership only of the `Vec`/`Cow` wrappers.
 pub fn bundled_font_bytes() -> Vec<std::borrow::Cow<'static, [u8]>> {
-    vec![std::borrow::Cow::Borrowed(INTER_VARIABLE), std::borrow::Cow::Borrowed(NOTO_SANS_TC_VARIABLE)]
+    BUNDLED_FONTS.iter().map(|(_, bytes)| std::borrow::Cow::Borrowed(*bytes)).collect()
 }
 
-/// Inter Variable — the Latin/digit face `app_font()` asks for by family
-/// name ("Inter Variable", NOT "Inter"). OFL, license text alongside the
-/// file at `assets/fonts/OFL-Inter.txt`.
-pub const INTER_VARIABLE: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
+/// Every bundled face, as (usWeightClass, bytes) — four STATIC weight
+/// instances per family, NOT the variable originals.
+///
+/// Why static instances (user bug report, appliance VM, 2026-08-22: "字體的
+/// 部分會因為中英文而粗細不同"): the text system registers a variable font
+/// under its fvar DEFAULT instance's properties, and the two variable
+/// originals disagree about what that default is —
+/// `NotoSansTC-Variable.ttf` defaults to wght=100 (**Thin**; its name ID 1
+/// is literally "Noto Sans TC Thin") while `InterVariable.ttf` defaults to
+/// wght=400. Every weight request then nearest-matches onto that one
+/// registered face, so ALL CJK rendered Thin while Latin rendered Regular —
+/// and JP-only glyphs (択/変, absent from the TC charset) fell through to
+/// the system Noto Sans CJK JP at Regular, producing mixed weights inside a
+/// single line. Shipping one static file per weight the UI actually uses
+/// (NORMAL/MEDIUM/SEMIBOLD/BOLD — the full set both binaries request) makes
+/// weight selection a plain file match with no axis handling anywhere.
+///
+/// The statics are derived from the variable originals kept next to them —
+/// see `assets/fonts/static/regenerate.sh`. Family names carried by the
+/// statics (name ID 16, verified at instancing time and pinned by the test
+/// below): "Inter Variable" and "Noto Sans TC" — the exact names
+/// `app_font()` asks for, unchanged from the variable era. OFL both;
+/// license texts alongside the files.
+pub const BUNDLED_FONTS: &[(u16, &[u8])] = &[
+    (400, include_bytes!("../assets/fonts/static/Inter-400.ttf")),
+    (500, include_bytes!("../assets/fonts/static/Inter-500.ttf")),
+    (600, include_bytes!("../assets/fonts/static/Inter-600.ttf")),
+    (700, include_bytes!("../assets/fonts/static/Inter-700.ttf")),
+    (400, include_bytes!("../assets/fonts/static/NotoSansTC-400.ttf")),
+    (500, include_bytes!("../assets/fonts/static/NotoSansTC-500.ttf")),
+    (600, include_bytes!("../assets/fonts/static/NotoSansTC-600.ttf")),
+    (700, include_bytes!("../assets/fonts/static/NotoSansTC-700.ttf")),
+];
 
-/// Noto Sans TC Variable — the zh-TW face registered as `app_font()`'s
-/// per-glyph fallback. OFL, `assets/fonts/OFL-NotoSansTC.txt`.
-pub const NOTO_SANS_TC_VARIABLE: &[u8] = include_bytes!("../assets/fonts/NotoSansTC-Variable.ttf");
+/// The Regular Latin face — kept as a named handle because the name-table
+/// test below reads family names off real payloads.
+pub const INTER_VARIABLE: &[u8] = BUNDLED_FONTS[0].1;
+
+/// The Regular CJK face — same role as [`INTER_VARIABLE`] above.
+pub const NOTO_SANS_TC_VARIABLE: &[u8] = BUNDLED_FONTS[4].1;
 // Not every token here is consumed by Phase 1a's 3 screens (`SECONDARY`,
 // `MUTED`, `POPOVER`, `SIDEBAR_PRIMARY`, `CHART_1`/`CHART_3`, the various
 // `*_FOREGROUND` pairing constants, …) — this is the full MDS token catalog
@@ -395,7 +427,7 @@ mod tests {
     #[test]
     fn bundled_font_bytes_are_two_real_truetype_payloads() {
         let fonts = bundled_font_bytes();
-        assert_eq!(fonts.len(), 2, "the stack is Inter Variable + Noto Sans TC");
+        assert_eq!(fonts.len(), 8, "four static weights per family, two families");
         for bytes in &fonts {
             assert!(!bytes.is_empty());
             // sfnt version: `0x00010000` for TrueType outlines, or one of
@@ -407,7 +439,48 @@ mod tests {
             assert!(ok, "not an sfnt payload: {magic:?}");
         }
         assert_eq!(fonts[0].as_ref(), INTER_VARIABLE);
-        assert_eq!(fonts[1].as_ref(), NOTO_SANS_TC_VARIABLE);
+        assert_eq!(fonts[4].as_ref(), NOTO_SANS_TC_VARIABLE);
+    }
+
+    /// The regression the statics exist to prevent: every bundled face must
+    /// carry the usWeightClass its filename claims (OS/2 offset 4), and both
+    /// families must cover the exact four weights the two binaries request
+    /// (NORMAL/MEDIUM/SEMIBOLD/BOLD). A wrong-weight file would silently
+    /// re-create the all-CJK-renders-Thin bug this table replaced.
+    #[test]
+    fn bundled_statics_cover_the_four_requested_weights_per_family() {
+        let mut inter = vec![];
+        let mut noto = vec![];
+        for (expect_weight, bytes) in BUNDLED_FONTS {
+            let weight = sfnt_us_weight_class(bytes).expect("every face has an OS/2 table");
+            assert_eq!(weight, *expect_weight, "a face's OS/2 weight does not match its table entry");
+            match sfnt_family_name(bytes).expect("every face declares a family").as_str() {
+                "Inter Variable" => inter.push(weight),
+                "Noto Sans TC" => noto.push(weight),
+                other => panic!("unexpected family in the bundle: {other}"),
+            }
+        }
+        assert_eq!(inter, [400, 500, 600, 700]);
+        assert_eq!(noto, [400, 500, 600, 700]);
+    }
+
+    /// OS/2 usWeightClass — same minimal-reader approach as
+    /// `sfnt_family_name` below, same "not a dependency for one assertion"
+    /// reasoning.
+    fn sfnt_us_weight_class(bytes: &[u8]) -> Option<u16> {
+        let u16_at = |o: usize| -> Option<u16> { Some(u16::from_be_bytes([*bytes.get(o)?, *bytes.get(o + 1)?])) };
+        let u32_at = |o: usize| -> Option<u32> {
+            Some(u32::from_be_bytes([*bytes.get(o)?, *bytes.get(o + 1)?, *bytes.get(o + 2)?, *bytes.get(o + 3)?]))
+        };
+        let table_count = u16_at(4)? as usize;
+        for i in 0..table_count {
+            let rec = 12 + i * 16;
+            if bytes.get(rec..rec + 4)? == b"OS/2" {
+                let off = u32_at(rec + 8)? as usize;
+                return u16_at(off + 4);
+            }
+        }
+        None
     }
 
     /// The half that actually bites. `add_fonts` succeeding proves nothing
