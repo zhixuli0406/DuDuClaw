@@ -24,7 +24,7 @@ use smithay::{
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
-    utils::{Rectangle, Transform},
+    utils::{Point, Rectangle, Transform},
 };
 
 // A4-1: `CodriveElement` moved to `crate::render` so the udev backend can
@@ -143,28 +143,37 @@ pub fn init_winit(
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
 
-                // CD-0 codrive spike (DESIGN §3.3.2): both cursors are
-                // compositor-internal render elements, not client
-                // surfaces — queried fresh every frame directly from each
-                // seat's pointer handle rather than tracked as duplicate
-                // state on `DuduclawComp`. `custom_elements`'s element type
-                // `C` is independent of the space's own element type (see
-                // `render_output`'s signature — `C: RenderElement<R>` has
-                // no relation to `E: SpaceElement`), so this doesn't need a
-                // combined enum: `SolidColorRenderElement` implements
-                // `RenderElement<R>` for any `R`.
-                let human_pos = state.seat.get_pointer().unwrap().current_location();
+                // CD-0 codrive spike (DESIGN §3.3.2): the agent cursor is a
+                // compositor-internal render element, not a client surface —
+                // queried fresh every frame directly from the seat's pointer
+                // handle rather than tracked as duplicate state on
+                // `DuduclawComp`. `custom_elements`'s element type `C` is
+                // independent of the space's own element type (see
+                // `render_output`'s signature — `C: RenderElement<R>` has no
+                // relation to `E: SpaceElement`).
+                //
+                // CUR-1: the HUMAN cursor is built first (so it sorts above
+                // everything else in the slice — `render_output` treats
+                // earlier elements as nearer the viewer) and needs the
+                // renderer, since it is either a themed image uploaded from
+                // memory or a client-provided surface tree. Scoped like the
+                // PiP block below so `backend`'s borrow ends before
+                // `backend.bind()`.
                 let agent_pos = state.agent_seat.get_pointer().unwrap().current_location();
                 let agent_frozen = state.codrive.is_frozen();
+                let mut cursor_elements: Vec<CodriveElement> = {
+                    let renderer = backend.renderer();
+                    state.build_human_cursor_elements(renderer, Point::from((0.0, 0.0)))
+                };
                 // CD-2: cursor/highlight elements now go through the
-                // combined `CodriveElement` enum (see this file's top-level
+                // combined `CodriveElement` enum (see `render.rs`'s
                 // `render_elements!` invocation) so the PiP texture element
                 // below can share the same `custom_elements` slice.
-                let mut cursor_elements: Vec<CodriveElement> =
-                    crate::codrive::build_cursor_elements(human_pos, agent_pos, agent_frozen)
+                cursor_elements.extend(
+                    crate::codrive::build_agent_cursor_elements(agent_pos, agent_frozen)
                         .into_iter()
-                        .map(CodriveElement::Solid)
-                        .collect();
+                        .map(CodriveElement::Solid),
+                );
                 // CD-1 (DESIGN §3.3.2(b) target highlight box): appended
                 // into the same custom-elements slice as the cursors —
                 // `codrive_highlight_elements` takes `&mut self` since it
@@ -228,14 +237,16 @@ pub fn init_winit(
                 }
                 backend.submit(Some(&[damage])).unwrap();
 
+                let elapsed = state.start_time.elapsed();
                 state.space.elements().for_each(|window| {
-                    window.send_frame(
-                        &output,
-                        state.start_time.elapsed(),
-                        Some(Duration::ZERO),
-                        |_, _| Some(output.clone()),
-                    )
+                    window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+                        Some(output.clone())
+                    })
                 });
+                // CUR-1: a client-provided cursor surface is not in `space`,
+                // so it needs its own frame callback or a client that
+                // double-buffers its cursor stalls after one commit.
+                state.send_cursor_frames(&output, elapsed);
 
                 state.space.refresh();
                 state.popups.cleanup();

@@ -75,10 +75,11 @@
 
 /// Which `wl_seat` global `DuduclawComp::new` creates — and therefore
 /// advertises — first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SeatAdvertiseOrder {
     /// Agent seat global first, human seat global second. **Default.**
     /// Makes a last-seat-wins client (gpui) settle on the human seat.
+    #[default]
     AgentFirst,
     /// Human seat global first, agent seat second — the order this
     /// compositor used before A4-5, and the conventional one ("the first
@@ -126,12 +127,6 @@ impl SeatAdvertiseOrder {
     /// True when the agent seat's global is created first.
     pub fn agent_first(self) -> bool {
         matches!(self, Self::AgentFirst)
-    }
-}
-
-impl Default for SeatAdvertiseOrder {
-    fn default() -> Self {
-        Self::AgentFirst
     }
 }
 

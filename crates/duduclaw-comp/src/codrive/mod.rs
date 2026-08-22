@@ -115,7 +115,7 @@ mod window_geometry;
 // section) — no logic moved or duplicated, only visibility.
 pub(crate) mod window_target;
 
-pub use cursor::build_cursor_elements;
+pub use cursor::build_agent_cursor_elements;
 pub use debug_sim::maybe_init_stdin_simulator;
 pub use protocol::InjectCmd;
 pub use shadow::{create_shadow_output, SHADOW_ORIGIN};
