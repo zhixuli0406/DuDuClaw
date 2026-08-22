@@ -28,16 +28,19 @@ use smithay::reexports::calloop::{generic::Generic, EventLoop, Interest, Mode, P
 
 use crate::CalloopData;
 
-/// Registers a stdin-reading calloop source that turns three magic lines
+/// Registers a stdin-reading calloop source that turns four magic lines
 /// into synthetic human-seat events, iff `DUDUCLAW_CODRIVE_DEBUG_STDIN=1` is
 /// set. Lines recognized: `simulate_human` (calls `on_human_input`, the
 /// same entry point `input.rs` calls for a real event), `simulate_super_esc`
 /// (calls `emergency_stop` directly — the real Super+Esc detector lives in
-/// `input.rs` and is not reachable from here), and `simulate_super_enter`
+/// `input.rs` and is not reachable from here), `simulate_super_enter`
 /// (CD-1: calls `human_resume` directly — the real Super+Enter detector
-/// likewise lives in `input.rs` and is not reachable from here). All three
-/// match "this only drives the state machine, not the hardware detection
-/// path" above.
+/// likewise lives in `input.rs` and is not reachable from here), and
+/// `simulate_super_tab` (WP-A1 multi-window round: calls `cycle_focus`
+/// directly — same reasoning, the real Super+Tab keysym detector lives in
+/// `input.rs`'s keyboard filter closure and needs a real keyboard device to
+/// reach). All four match "this only drives the state machine, not the
+/// hardware detection path" above.
 pub fn maybe_init_stdin_simulator(event_loop: &mut EventLoop<CalloopData>) {
     if std::env::var_os("DUDUCLAW_CODRIVE_DEBUG_STDIN").is_none() {
         return;
@@ -45,10 +48,10 @@ pub fn maybe_init_stdin_simulator(event_loop: &mut EventLoop<CalloopData>) {
 
     tracing::warn!(
         "codrive: DEBUG_STDIN human-input simulator ENABLED — reading lines from stdin \
-         (\"simulate_human\" / \"simulate_super_esc\" / \"simulate_super_enter\"). This \
-         exists only for headless-container verification where no real input device can \
-         originate the events (see codrive/debug_sim.rs module doc) — never set this env \
-         var in a real deployment."
+         (\"simulate_human\" / \"simulate_super_esc\" / \"simulate_super_enter\" / \
+         \"simulate_super_tab\"). This exists only for headless-container verification \
+         where no real input device can originate the events (see codrive/debug_sim.rs \
+         module doc) — never set this env var in a real deployment."
     );
 
     let stdin = std::io::stdin();
@@ -88,6 +91,10 @@ pub fn maybe_init_stdin_simulator(event_loop: &mut EventLoop<CalloopData>) {
                 "simulate_super_enter" => {
                     tracing::info!("codrive: debug stdin — simulating Super+Enter human resume");
                     data.state.human_resume();
+                }
+                "simulate_super_tab" => {
+                    tracing::info!("codrive: debug stdin — simulating Super+Tab window cycling");
+                    data.state.cycle_focus();
                 }
                 "" => {}
                 other => {

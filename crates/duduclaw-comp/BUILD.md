@@ -131,9 +131,10 @@ worth it for a "prove we can build one" spike. What actually changed:
 
 What's **not implemented at all** (matches upstream smallvil — not a
 regression introduced here, just scope this example never had):
-popup grabs (`fn grab` is a documented no-op, same as upstream), XWayland,
-layer-shell, DRM/libinput/udev backends, screen-copy/damage-tracking
-protocols beyond what `desktop::space` provides for free.
+popup grabs (`fn grab` is a documented no-op, same as upstream) — **now
+implemented, see "A1 multi-window round" below** —, XWayland, layer-shell,
+DRM/libinput/udev backends, screen-copy/damage-tracking protocols beyond
+what `desktop::space` provides for free.
 
 ## Original next-round run plan (superseded — see "Nested headless live-run" below)
 
@@ -366,7 +367,10 @@ debug spam.
   repos — `weston-terminal` was installed alongside it as a fallback but
   never needed). Multi-window stacking, move/resize grabs, and popup
   handling (`grab()` is still a documented no-op, unchanged from upstream —
-  see the earlier "Honest stub" list) are unexercised.
+  see the earlier "Honest stub" list) are unexercised. **Closed by the "A1
+  multi-window round" below** (3 concurrent real clients, move/resize grabs
+  exercised against 2 of them, popup grabs implemented and exercised
+  against a real GTK context menu).
 - **`weston`'s headless backend, not a "real" host session.** It's a
   legitimate stand-in (it implements the real Wayland host-compositor
   protocols, just backed by an off-screen buffer instead of DRM/KMS), but
@@ -422,10 +426,14 @@ dir — observed twice). Inside cage, comp negotiated
 `PLATFORM_WAYLAND_KHR` EGL → GLES 3.2 on `llvmpipe (LLVM 19.1.7)` and
 created its `wayland-1` socket exactly as in the headless run.
 
-**Still unverified:** window-management grabs (move/resize drags — the
-smallvil-inherited `grabs/` module beyond plain focus-click), multi-client,
-popup grabs (still no-op upstream), and everything R1 (all software
-rendering; no frame-rate claims).
+**Still unverified (at the time of this round):** window-management grabs
+(move/resize drags — the smallvil-inherited `grabs/` module beyond plain
+focus-click), multi-client, popup grabs (still no-op upstream), and
+everything R1 (all software rendering; no frame-rate claims). **The first
+three are closed by the "A1 multi-window round" below** — move/resize
+drags, ≥3 concurrent real clients, and a real popup grab are all now
+container-verified; R1 (software rendering, no frame-rate claims) remains
+open, out of this round's scope.
 
 ## CD-0 codrive spike verification (2026-08-21)
 
@@ -2288,3 +2296,501 @@ the threshold, not late).
   note reserves the vocabulary for CD-4's perception upgrade (C-L2/C-L3)
   to fill in honestly once a real mechanism exists — this is not deferred
   work silently dropped, it's a documented non-applicability at this stage.
+
+## A1 multi-window round (2026-08-22)
+
+WP-A1: the "duduclaw-comp multi-window formal pass" this crate needed
+before an S5 Flatpak host could sit on top of it — labwc was judged dead
+for that role, everything builds on this self-built smithay compositor
+instead. Four deliverables, all container-verified against **real**
+clients, not synthetic test harnesses: popup grabs, ≥3 concurrent real
+clients, focus/Z-order correctness (including a real bug fix), and this
+file's own "Still unverified" debt.
+
+### 1. Popup grab implementation
+
+`XdgShellHandler::grab()` (`src/handlers/xdg_shell.rs`) was a documented
+no-op inherited from smallvil (smallvil never implements it either — see
+this file's earlier "Honest stub" list). It now:
+
+- Resolves the popup's root surface via the same `find_popup_root_surface`
+  lookup `unconstrain_popup` (just below it in the same file) already used,
+  and requires that root to be a currently-mapped toplevel — this crate has
+  no layer-shell, so unlike anvil's version there is no `layer_map_for_
+  output` fallback branch to carry.
+- Calls `PopupManager::grab_popup` (smithay library code, `smithay::
+  desktop`) to obtain a `PopupGrab`, then wires it to the requesting seat
+  via `PopupKeyboardGrab::new`/`PopupPointerGrab::new` (also smithay
+  library types) through the same `keyboard.set_grab`/`pointer.set_grab`
+  calls `move_request`/`resize_request` above already use for move/resize.
+  The actual mechanics — outside-click dismissal, nested-popup topmost-only
+  enforcement, keyboard-event forwarding while grabbed — are **smithay's
+  own library implementation**, not reimplemented here; this function's job
+  is only to construct the right types in the right order and hand them to
+  the seat.
+- Denies (with a `tracing::debug!` line, not a panic) on every failure path
+  `PopupManager::grab_popup`/anvil's own version already handles: dead root
+  surface, `PopupGrabError` (already-mapped popup, parent dismissed, not
+  the topmost popup), or an unrelated grab already holding the keyboard/
+  pointer.
+
+**Reference source declaration (task brief's licensing rule):** the
+*structure* of `grab()` — which library calls, in what order — is adapted
+from smithay's `anvil` example (`anvil/src/shell/xdg.rs`'s own `grab()`),
+checked 2026-08-22 against the `v0.7.0` tag specifically (the version this
+crate is pinned to, per this file's own "smithay version choice" section
+above): `anvil/` lives inside the same `Smithay/smithay` repository as
+`smallvil/`, under the repo-root `LICENSE.txt` (MIT, no separate license
+file inside `anvil/` — confirmed by listing the tagged tree via GitHub's
+API and fetching the root license text directly, not assumed from
+memory). This is within the task brief's stated allowance ("MIT 授權的
+smithay 本體（含其 anvil 範例）— 可參考"). No GPL project (niri, labwc, or
+any other GPL-licensed compositor) was read, referenced, or consulted for
+this work. The types actually doing the grab work — `PopupManager::
+grab_popup`, `PopupKeyboardGrab`, `PopupPointerGrab`, `PopupUngrabStrategy`
+— are smithay **library** code this crate already depends on via
+`Cargo.toml`, not anvil application code; anvil's contribution here is the
+*usage pattern* (which calls, what order, what to check), simplified for
+this crate's plainer `SeatHandler::KeyboardFocus = WlSurface` model (no
+`KeyboardFocusTarget` wrapper enum needed — anvil's version threads one
+because it also supports layer-shell, this crate doesn't).
+
+**Live evidence** (see "Multi-client live-run" below for the full session):
+3 separate popup grabs established against a real `gtk3-widget-factory`
+context menu (`xdg_shell: popup grab established`, zero denials), including
+one **re-grab after a prior grab was cleanly dismissed** — proving the
+compositor returns to a fully re-grabbable state, not a stuck one — and one
+confirmed **outside-click dismissal**: right-clicking `gtk3-widget-factory`
+opened its context menu (popup grab established), then clicking on an
+unrelated `foot` window elsewhere correctly dismissed the popup (the click
+went through the normal, non-grabbed `focus_window` path immediately
+afterward — `focus: activation set target_surface_id=<the foot window>` —
+which could only happen if smithay's `PopupPointerGrab::button` had already
+ungrabbed) **and** delivered a real keystroke to the newly-focused window
+(a `echo … > file` proof file appeared). Nested popups were not
+independently exercised this round (gtk3-widget-factory's menu didn't have
+a reachable submenu without pixel-perfect coordinates this headless
+container can't provide) — the nested-popup-safe behavior
+(`PopupGrabError::NotTheTopmostPopup`, appending to the same seat-scoped
+`PopupGrabInner` instead of starting a second independent grab) is entirely
+smithay library logic, unmodified by this round, so this is a real but
+low-risk gap, not an unverified custom code path.
+
+### 2. Multi-client live-run
+
+Extends this file's "Nested headless live-run" three-layer stack (weston
+headless → duduclaw-comp → client) to **three simultaneous real clients**
+on layer 3, all connecting to `duduclaw-comp`'s own socket: `foot -a
+foot-A`, `foot -a foot-B`, and `gtk3-widget-factory` (Debian's
+`gtk-3-examples` package — a real, full-featured GTK3 demo app with a
+header bar and right-click context menus, chosen specifically because
+`foot`/`weston-terminal` have no menu to exercise popup grabs against).
+All three connected and mapped cleanly (`xdg client connected` ×3, `new
+toplevel created` ×3 — 4 total toplevels across the whole session counting
+one relaunch after a deliberate close).
+
+Since `new_toplevel` maps every window at literal `(0, 0)` (smallvil's own
+placement policy — no cascading/tiling logic exists), all three windows
+initially overlap exactly. Verification used the compositor's own
+click-to-focus + move-grab machinery to pull them apart one at a time via
+the codrive injection socket (a real Python client authenticating with the
+run's actual token, same protocol shape as this file's earlier CD-round
+scripts) — each step's result is directly checkable against the
+compositor's own tracing output, not inferred:
+
+- **Move, independence, exact tracking**: dragging the topmost window's
+  title-bar band (found empirically — no screenshot access in this
+  container, so a handful of candidate points were probed and the *new*
+  `move_request`/`resize_request` log lines this round added confirm
+  exactly which one fired) moved `gtk3-widget-factory` in a sequence of
+  five drags with **exact delta tracking** at every step (`(0,0) → (30,3) →
+  (60,6) → (90,9) → (120,12) → (870,542)` in one run) — the CSD's own
+  drag-to-move logic on a real GTK client, driving this crate's
+  `grabs/move_grab.rs` end-to-end, not a synthetic call. A second `foot`
+  window was independently dragged in the same session; neither move
+  affected the other windows' positions (confirmed structurally: a
+  window's title bar only becomes clickable again at its old screen
+  position once the window that was covering it has actually moved away —
+  if the move had wrongly dragged multiple windows together, clicking the
+  vacated spot would have hit nothing).
+- **Resize, independence**: probing near a window's declared right edge
+  (found via the *new* `geometry`/`location` fields this round added to
+  the `toplevel commit (already configured)` debug log — previously the
+  only way to locate a resize hotspot blindly) triggered `resize_request`
+  on `foot`'s CSD resize border, distinct from `move_request` triggered a
+  few pixels away on the same window — confirmed via the button-code
+  distinction alone with no ambiguity. A full drag then grew the window
+  from `704×500` to `949×500` (delta matches the drag distance exactly),
+  while `gtk3-widget-factory`'s independently-tracked geometry
+  (`1356×732` at `(800,535)`) was unchanged in the very next commit log —
+  direct proof the resize didn't leak into the other client.
+- **Independent keyboard routing**: after separating the windows, each was
+  click-focused in turn and sent a *distinct* `echo <marker> > <file>\n`
+  text injection; each marker landed in exactly the window that was
+  focused at the time (verified via the resulting file's content, not
+  just "no error") — proving `input.rs`/`codrive/mod.rs`'s per-seat
+  keyboard-focus routing doesn't bleed between clients even with three
+  live connections.
+- **Closing one doesn't disturb the others**: `kill -TERM` against one
+  `foot` process cleanly triggered `toplevel_destroyed` → unmap → (see
+  §3 below); the remaining two windows' own state (position, mapped
+  status) was unaffected — confirmed by continuing to interact with them
+  normally afterward in the same session (further moves/resizes/focus
+  changes on the survivors all succeeded).
+
+### 3. Focus/Z-order completion
+
+Three sub-fixes, all in `src/state.rs`'s new `DuduclawComp::focus_window` /
+`reassign_focus_on_window_removed` / `cycle_focus` methods (`src/input.rs`
+and `src/codrive/mod.rs` now call the shared `focus_window` instead of each
+hand-rolling its own raise+focus loop):
+
+- **Real bug fixed: `set_activated(true)` was never called.** Both
+  `input.rs`'s human click-to-focus arm and `codrive/mod.rs`'s agent
+  click-to-focus arm only ever called `Window::set_activated(false)` on
+  the click-on-empty-space path — the window actually being selected never
+  had its xdg-shell `activated` state (and any client-side active/inactive
+  titlebar styling keyed off it) set. `focus_window` fixes this: every call
+  iterates every mapped window and sets `activated` to `true` for exactly
+  the target, `false` for everything else. **Live evidence**: a new
+  `focus: activation set` debug log (`target_surface_id`, `activated_count`,
+  `total_windows`) was added specifically so this could be checked directly
+  rather than inferred — every one of the dozens of focus changes in this
+  round's live session shows `activated_count=1` matching the correct
+  `target_surface_id`, across 1, 2, and 3 mapped windows.
+- **Window-close focus handoff, to the next-highest Z-order window.**
+  `XdgShellHandler::toplevel_destroyed` (a smithay callback with a no-op
+  default that nothing in this crate had implemented before this round) now
+  eagerly unmaps the destroyed window from `self.space` (not waiting for
+  the next frame's `space.refresh()`) and calls `reassign_focus_on_window_
+  removed`, which — **per seat, independently** — hands focus to
+  `self.space.elements().next_back()` (the new topmost survivor) **only
+  if** that seat's keyboard focus was the just-destroyed surface; a seat
+  focused elsewhere is left untouched (closing a background window must
+  never steal focus from whatever's actually being used). **Live evidence**
+  (a clean, isolated repro, avoiding an earlier same-round test run that
+  entangled this with a still-open popup grab — see the honest-stub note
+  below): click-focus `foot-A` → confirmed via the activation log → `kill
+  -TERM` → `xdg_shell: toplevel destroyed, unmapping and reassigning
+  focus` → `focus: closed window held focus — reassigning to the new
+  topmost window next_surface_id=<gtk3-widget-factory>` →
+  `focus: activation set target_surface_id=<gtk3-widget-factory>
+  activated_count=1 total_windows=1`. Exactly the designed behavior, no
+  gaps in the log chain.
+- **Super+Tab window cycling.** Added to `input.rs`'s human keyboard filter
+  closure, alongside the existing Super+Esc/Super+Enter bindings (same
+  closure, same structural agent-cannot-reach-this guarantee those two
+  already have — see `codrive/mod.rs`'s module doc). No MRU list is
+  tracked; `DuduclawComp::cycle_focus` (`state.rs`) instead raises the
+  CURRENT BOTTOM of the z-order stack to the top on every press. This is a
+  genuine full rotation, not a two-window oscillation — worked out by hand
+  before writing the implementation (an earlier candidate design, "raise
+  whichever window is one position below the current top," was checked by
+  hand-simulating a 3-window stack and found to only ever swap the top two
+  elements, never reaching a third window; documented as a rejected
+  alternative directly in `cycle_focus`'s doc comment so a future reader
+  doesn't have to rediscover the same mistake). **Live evidence**: since
+  headless nested weston has no keyboard device at all (the same
+  established constraint `codrive/debug_sim.rs`'s module doc already
+  documents for Super+Esc/Super+Enter), a fourth debug-stdin command —
+  `simulate_super_tab`, calling `cycle_focus()` directly — was added
+  following the exact same pattern (opt-in via
+  `DUDUCLAW_CODRIVE_DEBUG_STDIN=1`, true no-op otherwise). With 2 mapped
+  windows, four consecutive simulated presses correctly alternated
+  `gtk3-widget-factory ↔ foot-C` every time (the expected degenerate case
+  of a full rotation at N=2), each followed by an `activated_count=1`
+  activation-set log matching the newly-topmost window. **Not verified
+  this round**: an actual keystroke landing in the cycled-to window from
+  Super+Tab specifically — `cycle_focus` operates on the **human** seat
+  (`self.seat`), and this round's text-delivery proofs all went through
+  the **agent** seat (the codrive injection socket); the two are
+  independent by design (see `codrive/mod.rs`'s module doc on why human
+  and agent inputs are structurally separated), so agent-seat text
+  injection cannot exercise human-seat focus. `focus_window` itself —
+  the exact function `cycle_focus` calls, parametrized only by which
+  `Seat` handle is passed — is the same function proven to deliver real
+  keystrokes correctly on the agent seat throughout this round's other
+  tests; `keyboard.set_focus()` has no seat-specific branching inside it.
+  Real Super+Tab keystroke delivery on the human seat is real-hardware
+  territory, same category (and same VM/`cage` closure path) as this
+  file's existing Super+Esc/Super+Enter real-hardware gaps.
+
+### Reproducible command (this round)
+
+Same one-shot shape as the CD-0 round's command above (weston headless +
+comp + `DUDUCLAW_CODRIVE_DEBUG_STDIN=1` via a FIFO), with `gtk-3-examples`
+added to the `apt-get install` line and three clients (`foot -a foot-A`,
+`foot -a foot-B`, `gtk3-widget-factory`) launched on layer 3 instead of
+one. The actual verification run used a long-lived `docker exec` dev
+container (same zombie-reaping caveat this file's CD-0 section already
+documents) plus a small reusable Python client
+(`auth`/`move`/`button`/`click`/`drag`/`text`/`status` helpers over the
+codrive socket) to drive move/resize/focus/popup interactions iteratively
+against the live compositor — not reproduced verbatim as one shell block
+here since the exact pixel coordinates for each client's title bar/resize
+border were found empirically this round (see §2 above) and are recorded
+directly in this section's evidence rather than hard-coded into a
+throwaway script.
+
+### Build/clippy/test (this round)
+
+```
+cargo build                              -> Finished, zero warnings
+cargo clippy --all-targets -- -D warnings -> Finished, zero warnings
+cargo test                               -> 70 passed; 0 failed
+```
+
+70 is unchanged from the CD-3 round's count: this round's new logic
+(`focus_window`, `reassign_focus_on_window_removed`, `cycle_focus`,
+`grab()`, `toplevel_destroyed`) all touch live `Seat`/`Space`/`Window`
+state that cannot be constructed in a unit test without a real Wayland
+display (confirmed by checking: none of the existing 70 tests construct
+real smithay `Window`/`Space`/`Seat` objects either — every one of them
+tests pure protocol-parsing/decision logic, e.g. `is_system_gesture_tail`,
+`freeze_bypass_decision_*`, `check_token`). This round's live-run container
+evidence above is this crate's established substitute for that category of
+logic, not a gap introduced this round.
+
+### File-size housekeeping paid down this round
+
+`codrive/mod.rs` was sitting at exactly 800 lines (the project's hard
+per-file cap) before this round touched it — the task brief required
+paying that down before adding content. `CodriveShared` (struct + its
+`disabled()`/`disabled_keep_audit()`/new `new()` constructor/`record()`/
+`is_frozen()`/`check_token()`/`push_event()`/test-only builders) moved to
+a new `codrive/shared.rs` (274 lines); `mod.rs` dropped to 591 lines before
+this round's own additions, leaving headroom. Field/method visibility for
+the handful of items the parent module and sibling submodules (`rotation.
+rs`, `listener.rs`) still reach directly (`active_conn`, `auth_token`,
+`token_path`, plus the moved constructors) went from module-private to
+`pub(super)` — the minimum bump that restores *exactly* the same
+reachability those call sites had before the split, verified by grepping
+every direct field access across the whole `codrive/` tree before deciding
+which fields needed it (only 3 of 8 fields did; `audit` stays fully
+private, touched only inside `shared.rs` itself). All 70 pre-existing
+tests (including the 3 `check_token` tests, moved to live alongside the
+code they test in `shared.rs`) passed unchanged after the split, before
+any of this round's new logic was added on top — confirming the extraction
+was behavior-preserving on its own.
+
+### Honest debt / limitations (this round)
+
+- **No visual/screenshot verification** — this headless container has no
+  `screendump`/QMP framebuffer access (see this file's R1 notes above);
+  every claim in §2/§3 is evidence from the compositor's own tracing
+  output and real client-visible side effects (files written by injected
+  keystrokes, exact geometry deltas matching drag distances), not pixel
+  comparison. Visual confirmation (does the activated window's CSD
+  actually look different, are both cursors distinct on screen) remains
+  VM/QMP acceptance-side work, same category this file has flagged since
+  the base spike's "VM cage real-seat input verification" section.
+- **Super+Tab's real-hardware keystroke delivery is unverified** — see §3's
+  own paragraph above for the full reasoning (human-vs-agent seat
+  separation, `focus_window` code-path reuse as indirect evidence).
+- **Nested popups were not independently exercised** — see §1's own
+  paragraph above (smithay library logic, not custom code, so a real but
+  low-risk gap).
+- **One test-session sequencing mistake, corrected, worth recording**: the
+  first attempt at the window-close-focus-transfer test entangled a
+  still-open popup grab (opened by an earlier test step and never
+  explicitly dismissed) with the close event — the destroyed window
+  wasn't the popup-grab-holding seat's actual focus target, so no
+  reassignment fired, which is *correct* behavior but looked surprising
+  until traced back to the un-dismissed popup. Re-run cleanly (dismiss
+  first, confirm focus via the activation log, then close) for the
+  evidence quoted in §3. Kept here rather than silently redone, per this
+  crate's own "honest stub" convention — the compositor behaved correctly
+  both times; the first attempt's test design didn't isolate the variable
+  it meant to.
+- **CSD title-bar/resize-hotspot coordinates were found empirically, not
+  computed** — this container has no screenshot access, so candidate
+  points were probed and confirmed via the new `move_request`/
+  `resize_request`/geometry-in-commit log lines this round added
+  specifically to make that possible. This is now a repeatable technique
+  (documented here) for any future round needing the same, not a one-off
+  hack.
+- **Window placement is still literal `(0,0)` for every new toplevel** —
+  unchanged smallvil behavior, not addressed this round (out of scope: the
+  task brief's four deliverables didn't include cascading/tiling
+  placement). All of this round's multi-window separation was done via the
+  existing move-grab machinery, which is itself part of what was being
+  verified.
+
+## WP-CD4a-COMP: `activate_window` (2026-08-22)
+
+B-line CD-4a, multi-window targeting: a wire op that raises/focuses a
+mapped toplevel by xdg-shell app_id (exact match, priority) or a
+title-prefix fallback, reusing the WP-A1 `DuduclawComp::focus_window`
+helper unchanged — this round adds a lookup layer on top, not new
+focus/activation mechanics.
+
+### What changed
+
+- **`src/codrive/protocol.rs`**: new `InjectCmd::ActivateWindow { app_id:
+  String }` variant + `describe()` arm + `MAX_ACTIVATE_WINDOW_QUERY_BYTES`
+  (255 bytes, same "reject not truncate" reasoning as
+  `MAX_TAKE_OVER_REASON_BYTES`).
+- **`src/codrive/window_target.rs`** (new file, ~260 lines): the matching
+  policy is split into a pure function (`match_window_query`, no
+  `Window`/`Space`, unit-testable) and a thin real-state wrapper
+  (`find_target_window`) — same "pure logic unit-tested, live Seat/Space
+  state live-run-tested" split `shadow.rs`'s `freeze_bypass_decision` /
+  `is_freeze_bypass_eligible` pair already established. `window_identity`
+  reads `XdgToplevelSurfaceData.{app_id,title}` via the same
+  `with_states`/`data_map` pattern `handlers/xdg_shell.rs::handle_commit`
+  already uses. `DuduclawComp::codrive_activate_window` is the main-thread
+  entry point: on a hit, calls `focus_window` and records an `activate_
+  window` audit line (`detail` carries the query and whichever criterion
+  matched — `matched_app_id` or `matched_via=title_prefix matched_title`);
+  on a miss, records `activate_window_failed` (`detail` carries the query)
+  — never a silent no-op. A `tracing::debug!` line logs every currently-
+  known `(app_id, title)` pair on every call, specifically so a live
+  session can discover what a real client actually registered instead of
+  guessing (same motive as this file's own "CSD title-bar/resize-hotspot
+  coordinates were found empirically" note above).
+- **`src/codrive/shadow.rs`**: `freeze_bypass_decision` gained an explicit
+  `InjectCmd::ActivateWindow { .. } => false` arm (task brief: "凍結/
+  takeover 中拒絕（照既有 op 閘）" — reuse the standard gate, no new bypass
+  carve-out; unlike `Move`/`Button`/`Highlight` this op carries no target
+  coordinate to confirm against `SHADOW_ORIGIN`'s bounds at all) + one new
+  unit test.
+- **`src/codrive/listener.rs`**: `validate()` gained an `ActivateWindow`
+  arm (rejects empty or oversized `app_id`, same shape as `TakeOver`'s
+  reason-length check). This pushed the file to 812 lines, over the
+  project's 800-line cap, so its entire `#[cfg(test)] mod tests` block
+  (all pre-existing tests, unchanged) moved to a new **`src/codrive/
+  tests_listener.rs`** — same "new/split scenarios get their own
+  `tests_<topic>.rs`" pattern `tests_takeover.rs` already established for
+  CD-3. `listener.rs` dropped to 474 lines; five new
+  `activate_window`-specific tests were added to `tests_listener.rs`
+  alongside the moved ones.
+- **`src/codrive/mod.rs`**: `mod window_target;` + `#[cfg(test)] mod
+  tests_listener;` declared; `handle_agent_inject`'s match gained a thin
+  `InjectCmd::ActivateWindow { app_id } => self.codrive_activate_window(app_id),`
+  arm (all real logic lives in `window_target.rs`); module doc updated
+  with an item (11) entry.
+
+### Wire protocol addition
+
+```
+{"op":"activate_window","app_id":"foot-A"}
+  -> {"ok":true,"frozen":false}    (forwarded to the main thread; success/
+                                     failure is decided there and only
+                                     visible via the audit trail/logs, same
+                                     as every other seat/space-touching op)
+  -> {"ok":false,"frozen":true,"reason":"agent_seat_frozen"}   (denied
+                                     outright while frozen — never
+                                     shadow-bypass-eligible)
+```
+
+Audit `kind`s: `activate_window` (hit — `detail` has `matched_app_id` or
+`matched_via=title_prefix matched_title`) / `activate_window_failed` (miss
+— `detail` has the query) / the generic `inject_dropped` (denied while
+frozen, at the socket-thread pre-check) that every other op already
+produces.
+
+### Build/clippy/test (this round)
+
+```
+cargo build                              -> Finished, zero warnings
+cargo clippy --all-targets -- -D warnings -> Finished, zero warnings
+cargo test                               -> 82 passed; 0 failed
+```
+
+82 = 70 (A1 baseline) + 12 new (6 in `window_target.rs`'s pure
+`match_window_query` tests covering 命中/查無/title-prefix-fallback/
+priority-ordering/anchored-not-substring/z-order-tie-break; 1 in
+`shadow.rs` proving `ActivateWindow` never bypasses a freeze; 5 in
+`tests_listener.rs` covering wire validation and the socket-thread
+frozen-denial + not-frozen-forwarding pair).
+
+### Live verification (this round, nested headless weston, `DUDUCLAW_CODRIVE_DEBUG_STDIN=1`)
+
+Same three-layer stack as the A1 round's multi-client live-run (weston
+headless → duduclaw-comp → real clients), with `foot -a foot-A` and
+`gtk3-widget-factory` (Debian's `gtk-3-examples` package) as the two
+concurrent app_id-distinct clients, driven over the real codrive socket
+with a Python client authenticating with the run's actual token.
+
+**Ground truth discovered live** (via this round's new diagnostic debug
+line — neither app_id was known ahead of time): `foot -a foot-A` registers
+app_id `"foot-A"` / title `"foot"`; `gtk3-widget-factory` registers BOTH
+app_id and title as the literal string `"gtk3-widget-factory"`.
+
+**命中 (hit via exact app_id)** — two distinct queries against the two live
+clients each raised/focused the correct, distinct surface:
+
+```
+query=foot-A               -> focus: activation set target_surface_id=...wl_surface@3[0]...  activated_count=1
+  audit: {"kind":"activate_window","detail":"query=\"foot-A\" matched_app_id=\"foot-A\"","frozen":false}
+
+query=gtk3-widget-factory   -> focus: activation set target_surface_id=...wl_surface@26[1]...  activated_count=1
+  audit: {"kind":"activate_window","detail":"query=\"gtk3-widget-factory\" matched_app_id=\"gtk3-widget-factory\"","frozen":false}
+```
+
+Re-issuing `foot-A` after the gtk3 query flipped `activated_count=1` back
+to the foot-A surface — proving each call independently retargets, not a
+one-shot/sticky effect.
+
+**title 前綴回退 (title-prefix fallback)** — query `"gtk3"` is NOT an exact
+app_id match (`"gtk3-widget-factory" != "gtk3"`) but IS a genuine prefix of
+that window's title, isolating priority 2 from priority 1:
+
+```
+query=gtk3   -> focus: activation set target_surface_id=...wl_surface@26[1]...  activated_count=1
+  audit: {"kind":"activate_window","detail":"query=\"gtk3\" matched_via=title_prefix matched_title=\"gtk3-widget-factory\"","frozen":false}
+```
+
+**查無 (not found)** — `"GTK"` (case-sensitive miss) and
+`"does-not-exist-xyz"` both produced an honest failure, zero focus change:
+
+```
+query=GTK                  -> WARN codrive: activate_window — no toplevel matched by app_id or title prefix
+  audit: {"kind":"activate_window_failed","detail":"query=\"GTK\" — no toplevel matched by app_id (exact) or title (prefix)","frozen":false}
+query=does-not-exist-xyz   -> (same shape)
+```
+
+No `focus: activation set` line appears for either — confirmed by grepping
+the full log window between the two audit lines.
+
+**凍結中拒 (denied while frozen)** — `simulate_human` (debug stdin) froze
+the seat, then `activate_window` was denied at the SOCKET-THREAD
+pre-check — never even reaching `window_target.rs` (no
+`codrive::window_target` log line appears between the freeze and the
+denial):
+
+```
+{"op":"activate_window","app_id":"gtk3-widget-factory"} -> {"ok":false,"frozen":true,"reason":"agent_seat_frozen"}
+audit: {"kind":"inject_dropped","op":"activate_window","detail":"agent seat frozen (human input active) — dropped, not buffered","frozen":true}
+```
+
+`simulate_super_enter` (Super+Enter resume) then cleared the freeze
+(`{"kind":"resume","op":"human_super_enter","frozen":false}`), and the very
+next `activate_window` call against the same query succeeded normally —
+proving the denial was freeze-scoped, not a permanent failure.
+
+### Honest stub / limitation list (this round)
+
+- **No visual/screenshot verification** — same category of limitation this
+  file has flagged since the base spike; every claim above is evidence
+  from the compositor's own tracing output and audit trail, not pixel
+  comparison.
+- **Takeover-specific denial has no separate live test** — logically
+  redundant, not skipped: `freeze_bypass_decision`'s `ActivateWindow` arm
+  is unconditionally `false` regardless of `shadow_active`/
+  `takeover_active`, and `handle_agent_inject`'s gate is `frozen &&
+  !bypass` — since bypass is always `false` for this op, the takeover case
+  is a strict subset of the plain-frozen case already proven live above
+  (an active takeover always implies `frozen == true`). The `shadow.rs`
+  unit test (`freeze_bypass_decision_activate_window_never_bypasses`)
+  covers the `shadow_active=true` half of this claim directly.
+- **Z-order tie-break (two windows sharing the same app_id) is unit-tested
+  only, not live-run-proven** — this round's live session only ever had
+  one window per app_id at a time; `match_window_query_ties_resolve_to_
+  the_lowest_z_order_index` is the pure-function proof.
+- **Case sensitivity is exact, by design, not separately flagged as a
+  limitation** — `"GTK"` missing `"gtk3-widget-factory"` above is the
+  expected, tested behavior (`match_window_query_title_prefix_is_anchored_
+  not_substring`'s sibling concern), not a bug found live.
+- **Not committed** — per this task's instructions, same as every prior
+  round in this file.

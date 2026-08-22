@@ -4,7 +4,10 @@
 
 use smithay::{
     delegate_xdg_shell,
-    desktop::{find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window},
+    desktop::{
+        find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind, PopupManager,
+        PopupPointerGrab, PopupUngrabStrategy, Space, Window,
+    },
     input::{
         pointer::{Focus, GrabStartData as PointerGrabStartData},
         Seat,
@@ -105,6 +108,12 @@ impl XdgShellHandler for DuduclawComp {
                 initial_window_location,
             };
 
+            // WP-A1 multi-window round: greppable evidence that a client's
+            // own CSD drag handling actually reached the compositor and a
+            // move grab was armed — this handler previously had no log
+            // line at all, so the only prior evidence `grabs/move_grab.rs`
+            // had was "it compiles" (BUILD.md's "Still unverified" list).
+            tracing::info!(surface_id = ?wl_surface.id(), ?initial_window_location, "xdg_shell: move_request — move grab armed");
             pointer.set_grab(self, grab, serial, Focus::Clear);
         }
     }
@@ -145,13 +154,146 @@ impl XdgShellHandler for DuduclawComp {
                 Rectangle::new(initial_window_location, initial_window_size),
             );
 
+            // WP-A1 multi-window round: same "previously silent" gap as
+            // `move_request` above.
+            tracing::info!(surface_id = ?wl_surface.id(), ?initial_window_location, ?initial_window_size, "xdg_shell: resize_request — resize grab armed");
             pointer.set_grab(self, grab, serial, Focus::Clear);
         }
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        // TODO popup grabs — out of scope for this spike (matches upstream
-        // smallvil, which also leaves this unimplemented).
+    /// WP-A1 multi-window round: popup grabs (right-click/dropdown menus
+    /// getting exclusive input until dismissed). smallvil (this crate's
+    /// original template — see `main.rs`'s attribution note) never
+    /// implemented this; the *structure* here (which library types to
+    /// call, in what order) is adapted from smithay's `anvil` example
+    /// (`anvil/src/shell/xdg.rs`'s own `grab()`, same upstream repo, same
+    /// MIT license — verified 2026-08-22 against the `v0.7.0` tag: repo-
+    /// root `LICENSE.txt` covers `anvil/` too, no separate license file
+    /// inside that directory) — per this round's task brief, the only
+    /// permitted reference besides the Wayland protocol spec text itself.
+    /// simplified for this crate's plainer surface model: anvil threads a
+    /// `KeyboardFocusTarget` enum (Window | LayerSurface | Popup) through
+    /// `Seat<AnvilState>::KeyboardFocus` because it also has layer-shell;
+    /// this crate's `SeatHandler::KeyboardFocus = WlSurface` (see
+    /// `handlers/mod.rs`) already matches what `PopupManager::grab_popup`
+    /// wants directly, so there is no focus-target wrapper type to build,
+    /// and the layer-shell fallback branch anvil's version has doesn't
+    /// apply here (this crate has no layer-shell — see `main.rs`'s "what
+    /// this spike deliberately does not carry over" list) — a popup's
+    /// root here must be an already-mapped toplevel window, checked with
+    /// the exact same `self.space.elements().find(...)` lookup
+    /// `unconstrain_popup` below already uses. Also no touch-grab branch:
+    /// this crate's seats never call `add_touch` (`state.rs`/`codrive/
+    /// mod.rs` only ever add keyboard+pointer), so `seat.get_touch()`
+    /// would always be `None` here.
+    ///
+    /// The actual grab mechanics — outside-click dismissal, nested-popup
+    /// topmost-only enforcement, keyboard-event forwarding while grabbed —
+    /// are NOT reimplemented here at all: `PopupManager::grab_popup` plus
+    /// `PopupKeyboardGrab`/`PopupPointerGrab` are smithay LIBRARY types
+    /// (`smithay::desktop`, the same crate this file already depends on
+    /// via `Cargo.toml`, not application code), so this function's job is
+    /// only to construct them correctly and hand them to the seat via the
+    /// same `pointer.set_grab`/`keyboard.set_grab` calls `move_request`/
+    /// `resize_request` above already use for the move/resize grabs. See
+    /// `PopupPointerGrab::button`'s own doc comment (upstream, in
+    /// smithay's `src/desktop/wayland/popup/grab.rs`) for exactly how the
+    /// "click outside dismisses" behavior works: it compares the pointer's
+    /// current focus's client against the grabbed popup's client on every
+    /// press and ungrabs-all on a mismatch — this crate's existing
+    /// `input.rs`/`codrive/mod.rs` pointer-motion/-button code already
+    /// feeds `pointer.motion`/`pointer.button` unconditionally every
+    /// event, which is all `PointerHandle` needs to route through whatever
+    /// grab (move/resize/popup/none) is currently active — no changes
+    /// were needed there for this to work.
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        let seat: Seat<DuduclawComp> = Seat::from_resource(&seat).unwrap();
+        let kind = PopupKind::Xdg(surface);
+
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            tracing::debug!("xdg_shell: grab request for a popup with no resolvable root surface — ignoring");
+            return;
+        };
+        if !self
+            .space
+            .elements()
+            .any(|w| w.toplevel().unwrap().wl_surface() == &root)
+        {
+            // Root isn't a currently-mapped toplevel (already closed, or —
+            // this crate has no layer-shell — some other kind of surface
+            // entirely). Nothing to grab against.
+            tracing::debug!("xdg_shell: grab request whose root isn't a mapped toplevel — ignoring");
+            return;
+        }
+
+        let mut grab = match self.popups.grab_popup(root, kind, &seat, serial) {
+            Ok(grab) => grab,
+            Err(e) => {
+                tracing::debug!(error = %e, "xdg_shell: popup grab denied by PopupManager");
+                return;
+            }
+        };
+
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial) || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                tracing::debug!("xdg_shell: popup grab denied — keyboard already held by an unrelated grab");
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+            {
+                tracing::debug!("xdg_shell: popup grab denied — pointer already held by an unrelated grab");
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
+
+        tracing::info!("xdg_shell: popup grab established");
+    }
+
+    /// WP-A1 multi-window round (task brief req 3, "視窗關閉焦點轉移規則"):
+    /// smithay calls this automatically (default no-op upstream — see
+    /// `XdgShellHandler::toplevel_destroyed`'s doc in `smithay::wayland::
+    /// shell::xdg`) whenever a client destroys an `xdg_toplevel`. Before
+    /// this round nothing implemented it at all, so a closed window's
+    /// `Window` lingered in `self.space` until the next frame's
+    /// `state.space.refresh()` (`winit_backend.rs`'s redraw loop) happened
+    /// to reap it — and even then, nothing ever reassigned keyboard focus
+    /// away from the now-dead surface, so a client closing its focused
+    /// window left both seats' keyboard focus pointing at a dead object
+    /// until the next click. Two fixes here: unmap eagerly (don't wait for
+    /// the next redraw) so `reassign_focus_on_window_removed`'s z-order
+    /// lookup already reflects the removal, then hand focus to whatever's
+    /// now on top — see that method's doc (`state.rs`) for why it's
+    /// per-seat and conditional rather than unconditional.
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface().clone();
+        tracing::info!(surface_id = ?wl_surface.id(), "xdg_shell: toplevel destroyed, unmapping and reassigning focus");
+
+        // Bound to a `let` first (not `if let self.space.elements()....`
+        // directly) so the borrow of `self.space` inside `elements()` ends
+        // at this statement's `;` — `if let`'s scrutinee temporaries are
+        // otherwise kept alive for the whole `if let` block, which would
+        // conflict with the `&mut self.space` `unmap_elem` call below.
+        let window_to_remove = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().unwrap().wl_surface() == &wl_surface)
+            .cloned();
+        if let Some(window) = window_to_remove {
+            self.space.unmap_elem(&window);
+        }
+
+        self.reassign_focus_on_window_removed(&wl_surface);
     }
 }
 
@@ -210,7 +352,17 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
             // already-mapped surface; the *first* commit after the initial
             // configure (the `else` branch on the very next call) is the
             // "client actually has a buffer up" moment we want in evidence.
-            tracing::debug!(surface_id = ?surface.id(), "xdg_shell: toplevel commit (already configured)");
+            // WP-A1 multi-window round: geometry added at debug level —
+            // previously the only way to find a window's negotiated size
+            // (needed to target a CSD resize hotspot for a live multi-
+            // client resize-grab test) was to guess blindly with no
+            // screenshot available in this headless container.
+            tracing::debug!(
+                surface_id = ?surface.id(),
+                geometry = ?window.geometry(),
+                location = ?space.element_location(&window),
+                "xdg_shell: toplevel commit (already configured)"
+            );
         }
     }
 
