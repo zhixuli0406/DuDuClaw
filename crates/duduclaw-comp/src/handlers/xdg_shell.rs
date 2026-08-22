@@ -352,8 +352,49 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
         });
 
         if !initial_configure_sent {
+            // Tell the client HOW BIG to be. `send_configure()` on its own
+            // sends a 0x0 size, which in xdg-shell means "you pick" — and a
+            // client that picks freely picks something that has nothing to do
+            // with this screen. Found live on the appliance (2026-08-22, first
+            // cold boot with comp as the session compositor): `duduclaw-shell`
+            // chose a window ~1280x957 against a 1280x800 output, so the OOBE
+            // footer — Back / Skip / 下一步, i.e. the only way forward — was
+            // simply below the bottom edge. It looked like a missing button,
+            // not an oversized window. `cage` never showed this because a
+            // kiosk compositor forces its single client to the output size;
+            // that is exactly the behaviour comp has to keep now that it is
+            // the one running the session.
+            //
+            // Scope, deliberately: EVERY toplevel gets the full output, which
+            // matches what comp actually is today — windows are mapped at
+            // (0,0) with no decorations and cycled with Super+Tab, one visible
+            // at a time. When A5's multi-window desktop lands it owns the
+            // layout policy and this becomes its call to make, not a rule
+            // baked in here. Not marking the surface Maximized/Fullscreen on
+            // purpose: the size alone is what fixes the clipping, and those
+            // states also change CSD (shadows, rounded corners, client-side
+            // resize edges) for every GTK/Qt app we host — a visual change
+            // that has not been designed or reviewed.
+            //
+            // The primary output is the one at the origin; the CD-2 shadow
+            // output lives far away at `codrive::SHADOW_ORIGIN` and must never
+            // be the size source (a window sized to it would be off-screen
+            // geometry for a window that is about to map on the real screen).
+            // No output yet → leave the 0x0 behaviour untouched rather than
+            // guess a size.
+            let output_size = space
+                .outputs()
+                .filter_map(|o| space.output_geometry(o))
+                .find(|geo| geo.loc.x == 0 && geo.loc.y == 0)
+                .map(|geo| geo.size);
+            if let Some(size) = output_size {
+                window.toplevel().unwrap().with_pending_state(|state| {
+                    state.size = Some(size);
+                });
+            }
             tracing::info!(
                 surface_id = ?surface.id(),
+                configured_size = ?output_size,
                 "xdg_shell: sending initial configure to toplevel"
             );
             window.toplevel().unwrap().send_configure();
