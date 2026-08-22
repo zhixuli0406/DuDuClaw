@@ -2794,3 +2794,284 @@ proving the denial was freeze-scoped, not a permanent failure.
   not_substring`'s sibling concern), not a bug found live.
 - **Not committed** — per this task's instructions, same as every prior
   round in this file.
+
+## WP-comp-shell-ipc: shell↔comp window query/control socket (2026-08-22)
+
+A3's dock integration needed comp to answer "what windows are running" and
+"switch to this one" — but `codrive`'s injection socket is the AGENT's
+private, token-authenticated channel (every command through it is
+attributed to the agent seat and lands in `codrive`'s own audit trail as an
+agent action). Routing a human's dock click through it would misattribute
+a human action as an agent action. This round adds a SECOND, entirely
+separate Unix socket, wire protocol, and audit trail:
+`$XDG_RUNTIME_DIR/duduclaw-shell.sock` — see `src/shell_control/mod.rs`'s
+module doc for the full design rationale (reproduced in summary below).
+
+### Trust boundary — same-uid `SO_PEERCRED`, not a bearer token
+
+`codrive`'s token exists because an agent CLI subprocess and this
+compositor are not the same trust domain in general. `duduclaw-shell` and
+`duduclaw-comp`, by contrast, ARE: on the appliance both run under the same
+kiosk-session user (`duduclaw-kiosk`,
+`appliance/mkosi.extra/etc/systemd/system/duduclaw-kiosk.service`), while
+agent CLI subprocesses run under a DIFFERENT user (`duduclaw`,
+`duduclaw-gateway.service` — see `appliance/postinst.d/
+20-users-and-units.sh`'s own useradd comments). That is a real,
+kernel-enforced boundary a same-uid `SO_PEERCRED` check can use directly —
+the exact pattern `duduclaw-sysd` already established for its own root
+daemon (`duduclaw-sysd/src/server.rs::handle_connection`), simplified from
+"an externally configured allowed uid" to "my own uid" since this process
+and its legitimate caller are always the same user by construction.
+
+`std::os::unix::net::UnixStream::peer_cred()` looked like the obvious API
+but is gated behind the unstable `peer_credentials_unix_socket` feature on
+this crate's pinned toolchain (`rustc 1.97.1` — confirmed by trying it
+first and reading the resulting `E0658`, not assumed); `duduclaw-sysd` gets
+away with a similarly-named method because that's TOKIO's own `peer_cred()`
+(tokio implements `SO_PEERCRED` itself), not std's. `src/shell_control/
+listener.rs::peer_uid` hand-rolls the raw `getsockopt(SOL_SOCKET,
+SO_PEERCRED)` call instead — exactly what tokio's own implementation does
+under the hood — using `libc` (already a dependency, per `Cargo.toml`'s
+existing CD-2 comment).
+
+**No freeze gate.** A dock click is human input by definition (this socket
+cannot be reached by anything that isn't already authenticated as the same
+uid as the kiosk session), so it is never gated behind `codrive.frozen`/
+`terminated`/`takeover_active` — a human can always operate their own
+desktop. This is also not a red-line-3 backdoor for the agent to bypass its
+own freeze: the same-uid auth means an agent CLI subprocess structurally
+cannot open this socket in the first place.
+
+**One-shot RPC, not a persistent session.** Unlike `codrive`'s long-lived,
+single-connection-at-a-time session, this socket is a plain connect → one
+request line → one response line → close round trip per call — the natural
+shape for a dock polling `list_windows` on an interval and firing
+`focus_window` on a click.
+
+### What changed (comp side)
+
+- **`src/codrive/window_target.rs`** / **`src/codrive/mod.rs`**: `find_
+  target_window`/`window_identity`/`WindowMatch` widened from module-private
+  to `pub(crate)` (`window_target` mod likewise) so `shell_control` can
+  reuse the EXACT SAME matching policy `activate_window` already proved
+  live (WP-CD4a-COMP) — no logic duplicated, only visibility.
+- **`src/shell_control/`** (new directory, 4 files):
+  - `protocol.rs` (~215 lines) — `ShellControlRequest` (`ListWindows` /
+    `FocusWindow { query }`), ADJACENTLY tagged (`tag = "op", content =
+    "params"`, `deny_unknown_fields`) — unlike `codrive::protocol::
+    InjectCmd`'s internal tagging, found empirically (not assumed) that
+    `deny_unknown_fields` does not reliably reject a stray key next to an
+    internally-tagged unit variant; adjacent tagging (mirroring
+    `duduclaw-sysd::protocol::SysdRequest`'s own shape) sidesteps that.
+    `ShellControlResponse` is one flat envelope struct with `Option`
+    fields, same shape convention as `SysdResponse`.
+  - `audit.rs` (~95 lines) — `ShellControlAuditLog`, a SEPARATE struct/file
+    from `codrive::audit::AuditLog` (no `frozen` column — this channel has
+    no freeze concept), writing `duduclaw-shell-control-audit.jsonl`. Only
+    `focus_window`/`focus_window_failed`/`auth_denied` are audited —
+    `list_windows` is read-only and realistically polled every few
+    seconds, so auditing it would be noise, matching the "queries aren't
+    audited, actions are" precedent `codrive::listener`'s own `status`
+    handling already set.
+  - `listener.rs` (~330 lines) — one dedicated thread accepts connections
+    SEQUENTIALLY (each is a fast one-shot round trip, so no per-connection
+    thread is warranted); `peer_uid()` hand-rolled `SO_PEERCRED` read (see
+    above); `is_authorized_peer` is a pure predicate; a request is bridged
+    to the calloop main thread via a `std::sync::mpsc` ONESHOT reply
+    channel wrapped in `ShellControlMsg` (unlike `codrive`'s fire-and-forget
+    `InjectCmd` channel, this caller genuinely needs the real computed
+    answer) — `recv_timeout(3s)` bounds the wait so a stalled main loop
+    degrades this one connection to a timeout instead of hanging the
+    listener thread (which would starve every later caller, since
+    connections are handled sequentially).
+  - `mod.rs` (~215 lines) — `ShellControlShared` (just the audit log — no
+    frozen/token state), `init()` (mirrors `codrive::init`'s call shape,
+    computes `own_uid` via `libc::getuid()`, no `SeatState`/`DisplayHandle`
+    needed since no new `wl_seat` is created), and `DuduclawComp::
+    handle_shell_control_request`/`shell_control_list_windows`/
+    `shell_control_focus_window` — the latter reuses `codrive::window_
+    target::find_target_window` then calls the SAME shared `focus_window`
+    helper (WP-A1) `codrive`'s own `activate_window` uses, but against
+    `self.seat` (the HUMAN seat), never `self.agent_seat`.
+- **`src/state.rs`**: new `pub shell_control: Arc<shell_control::
+  ShellControlShared>` field, `shell_control::init(event_loop)` called
+  right after `codrive::init` in `DuduclawComp::new`.
+- **`src/main.rs`**: `mod shell_control;`.
+
+### Op definitions / wire protocol
+
+```
+{"op":"list_windows"}
+  -> {"ok":true,"windows":[{"app_id":"foot-A","title":"foot","focused":true}, ...]}
+
+{"op":"focus_window","params":{"query":"foot-A"}}
+  -> {"ok":true,"matched_app_id":"foot-A"}                      (exact app_id hit)
+  -> {"ok":true,"matched_title_prefix":"Bar — Editor"}          (title-prefix fallback hit)
+  -> {"ok":false,"error":"not_found"}                           (honest miss, never a silent no-op)
+
+(unauthorized peer)          -> {"ok":false,"error":"unauthorized"}
+(malformed/oversized/unknown) -> {"ok":false,"error":"parse_error"|"line_too_long"|...}
+```
+
+Audit `kind`s (own file, `duduclaw-shell-control-audit.jsonl`): `focus_window`
+(hit — `detail` carries the query and matched criterion, same shape
+`codrive`'s own `activate_window` detail uses) / `focus_window_failed`
+(miss) / `auth_denied` (peer uid mismatch, logged with both uids).
+
+### Build/clippy/test (this round)
+
+```
+cargo build                              -> Finished, zero warnings
+cargo clippy --all-targets -- -D warnings -> Finished, zero warnings
+cargo test                               -> 104 passed; 0 failed
+```
+
+104 = 82 (WP-CD4a-COMP baseline) + 22 new in `shell_control/` (9 in
+`protocol.rs`: wire round-trips, `unknown_op`/`unknown_field`/malformed
+JSON rejection, `op_name` stability, response-shape omission checks; 2 in
+`audit.rs`: one JSONL line per `record()` call with `kind`/`detail`, 0600
+file mode; 11 in `listener.rs`: 4 pure `validate()` cases, 3 pure
+`is_authorized_peer` cases (matching uid / different uid / unreadable
+credentials — the "agent cannot reach this socket" proof, see below), and
+4 real-socket round trips using a fake "main thread" stand-in that counts
+how many `ShellControlMsg`s it actually received).
+
+**The "agent 拿不到殼 socket" test**: `shell_control::listener::tests::
+mismatched_configured_uid_denies_connection_before_it_ever_reaches_the_main_thread`
+— configures the listener's OWN uid to `current_uid() + 1` (same strategy
+`duduclaw-sysd::server::tests::mismatched_uid_is_rejected` already
+established as this codebase's accepted way to test this property without
+root: the CONFIGURED side, not the real peer, is varied), connects as the
+real test-process uid, and asserts BOTH that the wire response is
+`{"ok":false,"error":"unauthorized"}` AND that the fake main-thread
+stand-in's received-message counter stayed at 0 — proving an unauthorized
+peer's request never reaches `self.space`/`self.seat` at all, not just
+that its response looks like a rejection. `shell_control::listener::tests::
+is_authorized_peer_rejects_a_different_uid`/`::is_authorized_peer_rejects_
+unreadable_peer_credentials` cover the pure predicate directly.
+
+### Live verification (this round, nested headless weston)
+
+Same three-layer stack (`weston --backend=headless-backend.so` → `duduclaw-
+comp` → real xdg-shell clients) as prior rounds, driving the shell-control
+socket over Python (`socket.AF_UNIX`) against two REAL `foot -a foot-A`/
+`foot -a foot-B` clients:
+
+```
+list_windows (before focus)  -> {'ok': True, 'windows': [
+    {'app_id': 'foot-A', 'title': 'foot', 'focused': False},
+    {'app_id': 'foot-B', 'title': 'foot', 'focused': False}]}
+focus_window foot-A          -> {'ok': True, 'matched_app_id': 'foot-A'}
+list_windows (after)         -> foot-A now focused:true, foot-B focused:false
+focus_window foot-B          -> {'ok': True, 'matched_app_id': 'foot-B'}
+list_windows (after)         -> foot-B now focused:true, foot-A focused:false
+focus_window does-not-exist-xyz -> {'ok': False, 'error': 'not_found'}
+```
+
+`duduclaw-comp.log` confirms the SAME `focus: activation set` line
+`state.rs::focus_window` already logs for the human/agent paths, now fired
+by `shell_control`; the shell-control audit file contains exactly the 3
+`focus_window`/`focus_window_failed` lines with correct `query`/`matched_*`
+detail — `list_windows` produced ZERO audit lines (by design). Socket +
+audit file both confirmed `srw-------`/`-rw-------` (0600).
+
+**Cross-user proof the agent boundary is real, not just unit-tested**: the
+container runs as root, so a genuinely different-uid user (`useradd -u
+1500 testagent`, standing in for the appliance's `duduclaw` gateway/agent
+user vs. `duduclaw-kiosk`'s comp/shell user) was actually created and used
+to probe the running comp instance:
+
+```
+root (own uid, authorized)  -> list_windows succeeds: {"ok":true,"windows":[]}
+testagent (uid 1500) connect() -> PermissionError: [Errno 13] Permission denied
+  (refused at the OS/filesystem layer — 0600, owned by root — before this
+   thread's peer-uid check even runs)
+testagent cat duduclaw-codrive.token        -> Permission denied
+testagent cat duduclaw-shell-control-audit.jsonl -> Permission denied
+```
+
+Two independent layers (filesystem 0600 perms AND the in-process
+`SO_PEERCRED` check) both deny a real different-uid caller; the unit tests
+above additionally prove the in-process check alone (varying the
+CONFIGURED side, since a real different-uid *listener* isn't constructible
+without root either) — together, live cross-user proof of the outer layer
+plus a direct proof of the inner layer's logic.
+
+### Live verification (this round, comp hosting `duduclaw-shell` as its own client)
+
+Combined round: `weston` (headless, layer 1) → `duduclaw-comp` (layer 2,
+now ALSO the HOST providing a real `wl_seat` — unlike weston's headless
+backend, which advertises none, see `duduclaw-shell/BUILD-LINUX.md`'s own
+"`wl_seat` finding") → `foot -a foot-A` (layer 3a) + `duduclaw-shell`
+(layer 3b, `WAYLAND_DISPLAY=wayland-1`, `DUDUCLAW_SHELL_SKIP_OOBE=1`,
+`DUDUCLAW_SHELL_DIAG=1`) as TWO concurrent clients of comp. `duduclaw-shell`
+ran the full 15s under `timeout` with **zero panics** — comp's own `wl_seat`
+(keyboard+pointer, `state.rs::new`) is sufficient for gpui, confirming the
+`wl_seat.unwrap()` panic `BUILD-LINUX.md` found is specific to weston's
+headless backend, not a gpui limitation in general.
+
+`duduclaw-shell`'s own passive dock poll (`home/home_dock.rs::schedule_
+running_windows_poll`) fired for real and logged:
+
+```
+[dock] list_windows ok: 2 window(s): [
+  CompWindow { app_id: Some("foot-A"), title: Some("foot"), focused: false },
+  CompWindow { app_id: None, title: None, focused: false }]
+```
+
+(the second, app_id-less entry is `duduclaw-shell`'s own mapped window —
+gpui does not set an xdg-shell app_id, an honest finding, not a bug).
+Concurrently, a SEPARATE process ran `duduclaw-shell`'s real `comp_client`
+Rust code (not Python this time) via its `#[ignore]`d live tests:
+
+```
+cargo test -- --ignored live_list_windows_against_real_comp live_focus_window_against_real_comp --nocapture
+[live] focus_window("foot-A") matched: AppId("foot-A")
+[live] 2 window(s): [...]
+[live] focus_window on a bogus query correctly returned Comp("not_found")
+test result: ok. 2 passed; 0 failed
+```
+
+`duduclaw-comp.log` shows the resulting `focus: activation set` +
+`shell_control: focus_window — window focused` lines, and the audit file
+gained the matching `focus_window`/`focus_window_failed` rows — proving
+comp correctly serves TWO concurrent one-shot callers (the live-running
+`duduclaw-shell` process's own background poll, and the separate test
+process) without interference, since `listener.rs` handles connections
+sequentially but each is fast enough that this never queued visibly.
+
+### Honest stub / limitation list (this round)
+
+- **Dock click-to-focus was not exercised via real input** — this round's
+  containers have no real seat/pointer (same category of gap `BUILD-LINUX.
+  md`'s own "Input devices remain unverified" section already flags for
+  this crate, and this file's own "VM cage real-seat input verification"
+  section already flags for `codrive`'s human path). What WAS verified:
+  the exact function (`comp_client::focus_window`) `home_dock.rs`'s click
+  handler calls really works end-to-end against a real comp instance —
+  only the mouse-click-delivers-the-call step is unverified, deferred to a
+  VM/`cage` round same as every other real-input gap in this project.
+  clicking-a-running-icon vs. clicking-a-not-yet-running-icon is unit-
+  tested at the `is_app_running`/`RunningWindowsFeed` logic layer
+  (`home/running_windows.rs`'s own test module), just not through a real
+  mouse event.
+- **`flatpak_id`-as-xdg-app_id-query is an assumption, not cross-checked
+  against a real flatpak app** — `home/running_windows.rs`'s own module
+  doc flags this: flatpak isn't provisioned into the dev/appliance images
+  yet (A4 pending, same gap `apps.rs`'s own header comment already
+  documents), so whether a real flatpak-packaged GUI app's xdg-shell
+  app_id actually equals its flatpak application id in practice is
+  untested end-to-end; only `foot`'s hand-set `-a` app_id was available to
+  test against this round.
+- **No visual/screenshot verification** — same category of limitation this
+  file and `BUILD-LINUX.md` have flagged since their base spikes; every
+  claim above is log/audit-trail evidence, not pixel comparison.
+- **Concurrent-connection stress is not load-tested** — this round's two
+  simultaneous one-shot callers never actually collided in the kernel
+  backlog (both completed well within `listener.rs`'s sequential handling),
+  so contention under many concurrent dock+debug-tool callers is unproven,
+  same "no connection-limiting beyond the OS backlog" honesty
+  `duduclaw-sysd/src/server.rs`'s own module doc already accepts for its
+  analogous design.
+- **Not committed** — per this task's instructions, same as every prior
+  round in this file.

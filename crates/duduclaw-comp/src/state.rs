@@ -26,7 +26,7 @@ use smithay::{
     },
 };
 
-use crate::{codrive, CalloopData};
+use crate::{codrive, shell_control, CalloopData};
 
 /// Top-level compositor state. One instance per compositor process — this
 /// is the `D` type parameter smithay's `delegate_*!` macros generate
@@ -129,6 +129,12 @@ pub struct DuduclawComp {
     /// set_at` which only updates on the not-frozen→frozen transition).
     /// `codrive_check_watch_idle` compares `Instant::now()` against this.
     pub codrive_last_human_activity: std::time::Instant,
+    /// WP-comp-shell-ipc (2026-08-22): cross-thread state shared with the
+    /// shell-control socket thread (`shell_control::init`) — a SEPARATE
+    /// channel/trust-boundary from `codrive` above, see that module's own
+    /// doc comment for why. Just the audit log today (no freeze/token
+    /// state — this channel has neither).
+    pub shell_control: std::sync::Arc<shell_control::ShellControlShared>,
 }
 
 impl DuduclawComp {
@@ -158,6 +164,13 @@ impl DuduclawComp {
         // it moves into `Self` below) and while `event_loop` is available
         // to register the injection channel's calloop source.
         let (agent_seat, codrive) = codrive::init(&mut seat_state, &dh, event_loop);
+
+        // WP-comp-shell-ipc (2026-08-22): needs no `SeatState`/
+        // `DisplayHandle` (no new `wl_seat` — every op acts on the human
+        // `seat` created above), so it can init any time after `event_loop`
+        // is available; grouped here, right after `codrive::init`, since
+        // both are "the compositor's IPC surfaces" set up in one place.
+        let shell_control = shell_control::init(event_loop);
 
         let mut space = Space::default();
 
@@ -202,6 +215,7 @@ impl DuduclawComp {
             codrive_watch_active: false,
             codrive_watch_paused: false,
             codrive_last_human_activity: start_time,
+            shell_control,
         }
     }
 

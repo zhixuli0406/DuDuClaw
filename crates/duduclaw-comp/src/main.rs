@@ -29,6 +29,7 @@ mod handlers;
 mod codrive;
 mod grabs;
 mod input;
+mod shell_control;
 mod state;
 mod winit_backend;
 
