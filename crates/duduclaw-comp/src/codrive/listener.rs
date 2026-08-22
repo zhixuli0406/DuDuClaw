@@ -288,6 +288,33 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
                 let _ = writeln!(writer, r#"{{"ok":false,"error":"resume_is_human_only"}}"#);
                 continue;
             }
+            InjectCmd::WindowGeometry { ref app_id, pid } => {
+                // WP-CD4b-fix (B3). Grouped with `status`/`resume`/
+                // `rotate_token` — before the `terminated`/`frozen` gates —
+                // because it is a READ-ONLY query, not an action: it moves
+                // no window, touches no seat, changes no pixel. Denying it
+                // under freeze would make the gateway MORE likely to click
+                // the wrong place, not less: a failed locate falls back to
+                // the step's literal C-L1 coordinate, while the click that
+                // follows stays gated by these same checks exactly as
+                // before. See `window_geometry.rs`'s "Not an action"
+                // section.
+                //
+                // Unlike its three neighbours, this one cannot be answered
+                // from `CodriveShared` alone — it needs `self.space`, which
+                // only the calloop main thread may touch — so it round
+                // trips over the oneshot bridge (bounded by
+                // `QUERY_REPLY_TIMEOUT`; a stalled main loop degrades this
+                // one query, it does not wedge this thread).
+                let reply = shared.query_window_geometry(super::window_geometry::WindowGeometryRequest {
+                    pid,
+                    app_id: app_id.clone(),
+                });
+                let line = serde_json::to_string(&reply)
+                    .unwrap_or_else(|_| r#"{"ok":false,"error":"internal_serialize_error"}"#.to_string());
+                let _ = writeln!(writer, "{line}");
+                continue;
+            }
             InjectCmd::RotateToken => {
                 // CD-2 (task brief item 1): control-plane, like Status/
                 // Resume above — never touches the seat, so it's handled
@@ -450,6 +477,33 @@ pub(super) fn validate(cmd: &InjectCmd) -> Result<(), String> {
                     "activate_window app_id exceeds {} bytes",
                     super::protocol::MAX_ACTIVATE_WINDOW_QUERY_BYTES
                 ));
+            }
+            Ok(())
+        }
+        // WP-CD4b-fix (B3): an identity-less query must be refused here, not
+        // "helpfully" matched against whatever single window happens to be
+        // mapped — see `window_geometry::resolve_window`'s fail-closed
+        // policy. Field caps reuse `activate_window`'s query cap (same
+        // vocabulary, same reject-don't-truncate reasoning).
+        InjectCmd::WindowGeometry { app_id, pid } => {
+            if app_id.is_none() && pid.is_none() {
+                return Err("window_geometry requires at least one of app_id/pid".into());
+            }
+            if let Some(app_id) = app_id {
+                if app_id.is_empty() {
+                    return Err("window_geometry app_id must not be empty".into());
+                }
+                if app_id.len() > super::protocol::MAX_ACTIVATE_WINDOW_QUERY_BYTES {
+                    return Err(format!(
+                        "window_geometry app_id exceeds {} bytes",
+                        super::protocol::MAX_ACTIVATE_WINDOW_QUERY_BYTES
+                    ));
+                }
+            }
+            // pid 0 is the kernel's swapper/idle task — never a Wayland
+            // client, so a caller sending it is confused, not unlucky.
+            if *pid == Some(0) {
+                return Err("window_geometry pid must be > 0".into());
             }
             Ok(())
         }

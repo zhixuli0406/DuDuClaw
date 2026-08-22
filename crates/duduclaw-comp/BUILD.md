@@ -15,6 +15,15 @@ libinput, no real hardware ownership), basic move/resize window management,
 keyboard+pointer input forwarding. See the "what this deliberately does not
 carry over" list in `src/main.rs`'s module doc.
 
+> **Superseded in part by A4-1 (2026-08-22).** There are now **two** backends
+> in the one binary, selected at runtime: the original `winit`-nested one
+> (development/CI, everything below) and a real-hardware `udev`/DRM/KMS +
+> libseat + libinput one. "no DRM/KMS, no libinput, no real hardware
+> ownership" is still an accurate description of the **winit** backend only.
+> See **"A4-1: udev/DRM backend"** at the bottom of this file for the new
+> backend, the extra system build dependencies it needs, its damage-driven
+> repaint scheduling, and exactly what is and is not verified.
+
 ## Why Docker, not `cargo build` on this Mac
 
 smithay is **Linux-only**: it depends on `wayland-server`/`wayland-client`
@@ -133,8 +142,8 @@ What's **not implemented at all** (matches upstream smallvil — not a
 regression introduced here, just scope this example never had):
 popup grabs (`fn grab` is a documented no-op, same as upstream) — **now
 implemented, see "A1 multi-window round" below** —, XWayland, layer-shell,
-DRM/libinput/udev backends, screen-copy/damage-tracking protocols beyond
-what `desktop::space` provides for free.
+DRM/libinput/udev backends — **now implemented, see "A4-1: udev/DRM backend"
+below** —, screen-copy protocols.
 
 ## Original next-round run plan (superseded — see "Nested headless live-run" below)
 
@@ -3075,3 +3084,620 @@ sequentially but each is fast enough that this never queued visibly.
   analogous design.
 - **Not committed** — per this task's instructions, same as every prior
   round in this file.
+
+## A4-1: udev/DRM backend — owning real hardware (2026-08-22)
+
+### What changed and why
+
+Until this round, on the appliance image `duduclaw-comp` was **not** the
+thing that owned the display. The stack was three layers deep:
+
+```
+cage (wlroots kiosk compositor: DRM/KMS + seatd + libinput)
+  └─ duduclaw-comp (winit backend — cage's single fullscreen client)
+       └─ third-party client (foot, …)
+```
+
+`cage` existed purely because this crate had no hardware backend. That cost
+a whole extra compositor's worth of CPU (measured on the appliance VM: `cage`
+alone at ~100% of a core, load average 5.6 on 4 vCPU with the nested comp on
+top) and put an uncontrollable component between DuDuClaw and the seat.
+
+A4-1 removes that layer. The target stack is now two:
+
+```
+duduclaw-comp (udev backend: libseat + DRM/KMS + GBM/EGL + libinput)
+  └─ third-party client (foot, …)
+```
+
+### New files / changed files
+
+| File | What |
+|---|---|
+| `src/udev_backend.rs` | **New.** The whole hardware backend: libseat session, udev GPU discovery, DRM/KMS connector→CRTC→surface setup, GBM allocator + EGL/GLES renderer, libinput seat, vblank-driven + damage-driven repaint. |
+| `src/backend_choice.rs` | **New.** Pure runtime backend-selection rule + 10 unit tests. |
+| `src/render.rs` | **New.** `CodriveElement` (the `render_elements!` enum) moved here out of `winit_backend.rs` so both backends can share it. Definition unchanged. |
+| `src/main.rs` | `CalloopData` gains `udev: Option<UdevBackendState>`; backend chosen at startup; the calloop post-dispatch callback drives `udev_backend::dispatch_render`. |
+| `src/state.rs` | `pending_redraw` field + `queue_redraw()` + `primary_output()`. |
+| `src/input.rs` | `InputEvent::PointerMotion` (relative) implemented; `PointerMotionAbsolute` output-selection bug fixed; `clamp_pointer`/`clamp_to` added. |
+| `src/winit_backend.rs` | Imports `CodriveElement` from `render.rs`; clears `pending_redraw`; carries the A4-1 note on why it stays unconditional-redraw. |
+| `src/handlers/compositor.rs`, `src/handlers/xdg_shell.rs`, `src/codrive/mod.rs`, `src/codrive/highlight.rs` | `queue_redraw()` damage sources; `codrive_highlight_elements_at(now, offset)` added (the zero-offset wrapper keeps the old behaviour byte-identical). |
+| `Cargo.toml` | smithay features `backend_drm` / `backend_gbm` / `backend_egl` / `backend_libinput` / `backend_udev` / `backend_session_libseat` / `renderer_gl` added to the existing `backend_winit` set. |
+
+No new **crate** dependencies: `drm`, `gbm`, `input` (libinput), `udev` and
+`rustix` all come through `smithay::reexports`, which is deliberate — those
+re-exports are the exact versions smithay itself was built against, and
+mixing versions there produces handle types that don't unify.
+
+### Extra system build dependencies
+
+The original three (`pkg-config`, `libwayland-dev`, `libxkbcommon-dev`) are
+no longer enough. The full list is now:
+
+```
+pkg-config libwayland-dev libxkbcommon-dev \
+libinput-dev libudev-dev libseat-dev libgbm-dev libdrm-dev
+```
+
+(Versions present in `rust:bookworm` at the time of writing: libinput 1.22.1,
+libseat 0.7.0, gbm 22.3.6, libdrm 2.4.114, libudev 252 — all satisfied by
+Debian bookworm's own packages, no backports.)
+
+Runtime deps on the appliance are unchanged from what the image already
+carries for `cage`: `seatd` (already installed and enabled — Debian runs it
+as `seatd -g video`), plus mesa's GBM/EGL/GLES userspace.
+
+### Runtime backend selection
+
+`src/backend_choice.rs`, unit-tested, no compile-time split:
+
+| `DUDUCLAW_COMP_BACKEND` | `WAYLAND_DISPLAY` / `DISPLAY` | backend |
+|---|---|---|
+| unset/empty | either set and non-empty | `winit` (nested) |
+| unset/empty | both unset/empty | `udev` (real hardware) |
+| `winit` / `nested` | anything | `winit` |
+| `udev` / `drm` / `kms` | anything | `udev` |
+| anything else | anything | **hard error**, process exits |
+
+A typo'd override is refused rather than silently falling back — a wrong
+backend that "sounds like it worked" is the failure mode this avoids.
+
+There is deliberately **no winit fallback** when udev init fails: on a bare
+TTY there is nothing to nest inside, so a fallback would just be a second,
+more confusing error. The real reason is reported and the process exits
+non-zero.
+
+Other environment variables:
+
+- `DUDUCLAW_COMP_DRM_DEVICE=/dev/dri/card0` — overrides udev's idea of the
+  primary GPU (mirrors anvil's `ANVIL_DRM_DEVICE`).
+- `DUDUCLAW_COMP_SEAT_ORDER=human-first` — restores the pre-A4-5 `wl_seat`
+  advertisement order (human seat first). Default is `agent-first`; see
+  "A4-5: `wl_seat` advertisement order" at the bottom of this file for why
+  the default flipped and what it costs.
+- All the pre-existing ones (`DUDUCLAW_CODRIVE_*`) are unchanged.
+
+### Repaint scheduling (the CPU requirement)
+
+The winit backend calls `window.request_redraw()` at the end of every frame:
+an unconditional full composite whether or not anything changed. The udev
+backend never does that. Instead:
+
+1. Anything that can change a pixel calls `DuduclawComp::queue_redraw()`.
+   The complete list of damage sources is in that method's doc comment:
+   client commits (`handlers/compositor.rs::commit`), toplevel/popup
+   create+destroy (`handlers/xdg_shell.rs`), every human input event
+   (`input.rs::process_input_event`), every applied agent injection
+   (`codrive/mod.rs::handle_agent_inject`), every focus/activation change
+   (`state.rs::focus_window`, which every focus path funnels through), and
+   the udev backend's own housekeeping tick for codrive highlight expiry and
+   watch-mode freeze transitions.
+2. `dispatch_render` runs after every calloop dispatch and composites only
+   outputs that are dirty and not already awaiting a page flip
+   (`udev_backend::should_render`, unit-tested).
+3. `render_output` returns `damage: None` for a frame identical to the last
+   one. In that case **no page flip is queued at all** — the scanout keeps
+   the buffer it already has.
+4. `event_loop.run(None, …)` blocks in `epoll`. With nothing to draw, nothing
+   wakes the process except the 1 Hz housekeeping tick.
+5. The one path with no hardware pacing is "dirty, but the frame came out
+   identical" (e.g. a client that commits a frame-callback request with no
+   buffer damage in response to the frame callback we just sent). That is
+   held to one composite per refresh period by `min_render_gap`, and a
+   one-shot calloop timer re-tries when the window closes so a genuinely
+   late frame can't sit stale until the next 1 Hz tick.
+
+### CPU accounting — what was actually measured
+
+Measured **in the container** (Docker Desktop LinuxKit VM, `rust:bookworm`,
+`LIBGL_ALWAYS_SOFTWARE=1`, `weston --backend=headless-backend.so` at
+1280×800 as the host), by sampling `utime+stime` from
+`/proc/<pid>/stat` over a 6-second window:
+
+| stack | idle, no client | one `foot` client |
+|---|---|---|
+| `duduclaw-comp` **winit** backend (unchanged behaviour) | **32.5%** | **53.8%** |
+
+That is the "before" number and the reason A4-1 exists: the winit backend
+composites unconditionally, so it burns a third of a core showing a static
+picture, and the appliance pays that **on top of** `cage` doing the same
+thing underneath it.
+
+**The udev backend's own idle CPU is NOT measured in this round.** It cannot
+be: the container has no `/dev/dri` (verified — `ls /dev/dri` → No such file;
+`/sys/class/drm` contains only `version`) and the LinuxKit kernel ships no
+`vkms` module (`modprobe vkms` → "module not found in modules.dep"), so
+there is no DRM device to drive. Claiming a number here would be fabricated.
+What *is* established in-container is the mechanism: `should_render` and
+`min_render_gap` are unit-tested, and the "no screen change ⇒ no composite"
+rule is a test (`nothing_dirty_means_no_work_at_all`), not a comment. The
+real number has to come off the VM — steps below.
+
+A winit-side "on-demand" switch was built as a way to measure the same
+mechanism in-container, then **removed after measuring it**: winit re-fires
+`RedrawRequested` immediately after `request_redraw()`, so skipping the
+composite and re-arming is a hot spin — measured at **100% CPU with ~780 000
+skipped frames per 5 s**, strictly worse than compositing. Making winit
+on-demand properly needs `WinitGraphicsBackend` hoisted out of the event
+source into `CalloopData` (the shape the udev backend uses), which would
+rewrite the one code path every previous round's live verification covers,
+for a backend that only ever runs nested in development. Not done; see the
+note above `init_winit` in `src/winit_backend.rs`.
+
+### Container verification (verified 2026-08-22)
+
+Warm-cache container (`comp-a41`), volumes `duduclaw-comp-cargo`,
+`duduclaw-comp-cargo-git`, `duduclaw-comp-target`.
+
+```bash
+docker volume create duduclaw-comp-cargo >/dev/null
+docker volume create duduclaw-comp-cargo-git >/dev/null
+docker volume create duduclaw-comp-target >/dev/null
+
+docker run --rm \
+  -v /Users/lizhixu/Project/DuDuClaw:/work \
+  -v duduclaw-comp-cargo:/usr/local/cargo/registry \
+  -v duduclaw-comp-cargo-git:/usr/local/cargo/git \
+  -v duduclaw-comp-target:/target \
+  -e CARGO_TARGET_DIR=/target \
+  -w /work/crates/duduclaw-comp \
+  rust:bookworm bash -c '
+set -uo pipefail
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends \
+  pkg-config libwayland-dev libxkbcommon-dev \
+  libinput-dev libudev-dev libseat-dev libgbm-dev libdrm-dev \
+  libegl1 libgl1-mesa-dri libgles2 weston foot python3 procps >/dev/null
+
+cargo build || exit 1
+rustup component add clippy >/dev/null 2>&1
+cargo clippy --all-targets -- -D warnings || exit 1
+cargo test || exit 1
+'
+```
+
+Results:
+
+```
+cargo build   -> Finished `dev` profile ... in 15.63s
+cargo clippy --all-targets -- -D warnings -> Finished (no warnings)
+cargo test    -> test result: ok. 129 passed; 0 failed; 0 ignored
+```
+
+**129 = the 104 pre-existing tests (all still green) + 25 new**: 10 in
+`backend_choice`, 10 in `udev_backend` (`min_render_gap` × 4, `next_tick` × 2,
+`should_render` × 4), 5 in `input` (`clamp_to`).
+
+Live rounds in the same container:
+
+1. **Backend selection matrix.**
+   ```
+   auto-tty     -> backend="udev"  wayland_display=None display=None
+                   udev: libseat session acquired seat=seat0
+                   Error: NoGpu("udev reports no DRM device on seat \"seat0\" ...")
+   force-winit  -> backend="winit" (then winit's own honest
+                   "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET nor DISPLAY is set")
+   typo (udv)   -> Error: "DUDUCLAW_COMP_BACKEND=\"udv\" is not a known backend ..."
+   ```
+   Note what this *does* prove beyond selection: **libseat really acquired a
+   session** (`seat=seat0`) inside the container — libseat's builtin backend
+   works as root without `seatd` — and udev enumeration really ran and
+   correctly reported zero DRM devices. The session and discovery layers are
+   exercised; DRM/GBM/EGL/libinput are not (there is no device).
+
+2. **Nested winit regression (no capability lost).** weston headless →
+   `duduclaw-comp` (auto-selected `winit`) → two `foot` clients:
+   ```
+   selected display backend backend="winit" wayland_display=Some("wayland-host")
+   xdg client connected client_id=InnerClientId { id: 0, serial: 1 }
+   xdg_shell: new toplevel created, mapping into space  surface_id=...@3[0]
+   xdg_shell: sending initial configure to toplevel      surface_id=...@3[0]
+   xdg client connected client_id=InnerClientId { id: 1, serial: 2 }
+   xdg_shell: new toplevel created, mapping into space  surface_id=...@3[1]
+   xdg_shell: sending initial configure to toplevel      surface_id=...@3[1]
+   xdg_shell: toplevel destroyed, unmapping and reassigning focus (×2)
+   ```
+   `duduclaw-shell.sock` round trip over SO_PEERCRED, same uid:
+   ```
+   {"op":"list_windows"} ->
+   {"ok":true,"windows":[{"app_id":"foot","title":"foot","focused":false},
+                         {"app_id":"foot","title":"foot","focused":false}]}
+   ```
+
+3. **codrive injection regression** (the path that now also calls
+   `queue_redraw`). Authenticated over `duduclaw-codrive.sock` with the
+   token file, 9 seat/space-touching ops:
+   ```
+   auth      -> {"ok":true,"authenticated":true}
+   status    -> {"ok":true,"frozen":false,"terminated":false,"takeover":false}
+   move / highlight / button×2 / text / watch / shadow×2 / watch-off -> all {"ok":true,...}
+   audit log: 9 × inject_applied (move, highlight, button, button, text,
+                                  watch, shadow, shadow, watch)
+   comp log:  focus: activation set target_surface_id=Some(...) activated_count=1 total_windows=1
+   ```
+   i.e. the agent seat still moves, clicks (with click-to-focus), types,
+   highlights, and toggles shadow/watch exactly as before.
+
+### VM verification — how to actually test the hardware backend
+
+**Not run in this round** (per the task split: the VM belongs to the main
+session). Steps, with expected output and where to look when it fails.
+
+The appliance VM is QEMU aarch64 with `virtio-gpu-pci`. `cage` already runs
+there, which is what makes this worth trying: DRM/KMS + GLES on
+`virtio_gpu` is known-good in that environment.
+
+**Step 0 — get the new binary onto the VM.** Build it in the container (the
+command above) and copy `/target/debug/duduclaw-comp` (or a `--release`
+build) into the image / onto the running VM, replacing whatever the kiosk
+unit launches.
+
+**Step 1 — stop the current kiosk stack.** The `cage` layer must not hold
+DRM master:
+
+```bash
+systemctl stop duduclaw-kiosk.service
+# confirm nothing else holds the card:
+sudo fuser -v /dev/dri/card0      # expect: no output
+```
+
+**Step 2 — check the preconditions the backend needs.**
+
+```bash
+systemctl is-active seatd                       # expect: active
+ls -l /dev/dri/                                 # expect: card0 (+ renderD128)
+id duduclaw-kiosk                               # expect groups to include video, render
+echo $XDG_RUNTIME_DIR                           # must be set, 0700, owned by the user
+```
+
+**Step 3 — run it by hand as the kiosk user, on a bare TTY (no
+`WAYLAND_DISPLAY`).**
+
+```bash
+sudo -u duduclaw-kiosk env \
+  XDG_RUNTIME_DIR=/run/duduclaw-kiosk \
+  RUST_LOG=info,duduclaw_comp=debug \
+  /usr/bin/duduclaw-comp
+```
+
+Expected on stdout, in this order:
+
+```
+duduclaw-comp: selected display backend backend="udev" wayland_display=None display=None
+udev: libseat session acquired seat=seat0
+udev: using DRM device /dev/dri/card0
+udev: output created connector="Virtual-1" crtc=... mode=(1280, 800) refresh_mhz=60000 location=(0, 0)
+udev: backend up — duduclaw-comp now owns the display directly (no cage layer) outputs=1 connectors=["Virtual-1"]
+duduclaw-comp: udev backend ready seat=seat0
+duduclaw-comp listening; socket_name=Some("wayland-1")
+```
+
+The screen should go to the dark grey clear colour (`0.1, 0.1, 0.1`) — the
+same background the nested winit runs use.
+
+**Failure triage, by which line is the last one printed:**
+
+| Last line seen | Meaning | Where to look |
+|---|---|---|
+| `selected display backend backend="winit"` | `WAYLAND_DISPLAY`/`DISPLAY` leaked into the environment | `env` and look for either var; force with `DUDUCLAW_COMP_BACKEND=udev` |
+| `Error: udev backend init failed (session): …` | libseat could not open a session | `systemctl status seatd`; user in `video`; on a non-logind system libseat needs `seatd` running and `SEATD_SOCK` reachable (default `/run/seatd.sock`) |
+| `Error: udev backend init failed (no-gpu): …no DRM device…` | udev sees no card on this seat | `ls /dev/dri`; `udevadm info /dev/dri/card0` (check `ID_SEAT`); override with `DUDUCLAW_COMP_DRM_DEVICE=/dev/dri/card0` |
+| `Error: udev backend init failed (open-device): …` | libseat refused the fd | usually `cage`/another compositor still holds DRM master — recheck step 1 |
+| `Error: udev backend init failed (egl): …` | mesa can't make a GLES context on gbm | `LIBGL_ALWAYS_SOFTWARE=1` as a diagnostic (note the CD-0 round's finding: put it on the comp process, never on a parent kiosk process); check `libgl1-mesa-dri`/`libgbm1` are installed |
+| `Error: udev backend init failed (no-output): …` | connectors exist but none connected, or no free CRTC | the `udev: connector not connected, skipping` / `no free CRTC` warn lines just above name each one |
+| `udev: create_surface failed` / `GbmBufferedSurface::new failed` | mode/format negotiation | the error text names the connector; try forcing 8-bit only (already the default here) or a different mode |
+
+**Step 4 — a real client.** From a second shell:
+
+```bash
+sudo -u duduclaw-kiosk env XDG_RUNTIME_DIR=/run/duduclaw-kiosk \
+  WAYLAND_DISPLAY=wayland-1 foot
+```
+
+Expect `xdg client connected` + `xdg_shell: new toplevel created` in the comp
+log, and the terminal visible on the physical/virtual screen.
+
+**Step 5 — real input.** Move the mouse and type into `foot`.
+
+- Pointer movement must move the pale cursor square. This is the arm that was
+  **empty before this round** (`InputEvent::PointerMotion` — winit never
+  emits it, libinput always does), so it is the single highest-risk new code
+  path. If the pointer does not move, that arm is the first suspect.
+- Click on a window: expect `focus: activation set … activated_count=1`.
+- `Super+Tab`: expect `focus: Super+Tab cycling`.
+- `Super+Esc`: expect the codrive emergency stop (`emergency_stop` audit
+  event, agent cursor turning dimmed red).
+- `Super+Enter`: expect `human_resume`. The CD-2 chord-tail fix
+  (`is_system_gesture_tail`) matters here and has only ever been verified
+  through `cage`, never through this backend's own libinput path.
+
+**Step 6 — idle CPU (the number this work package owes).**
+
+```bash
+# with the compositor up and one idle foot window, from another shell:
+pidstat -p $(pgrep -x duduclaw-comp) 1 10
+# or, without sysstat:
+P=$(pgrep -x duduclaw-comp)
+A=$(awk '{print $14+$15}' /proc/$P/stat); sleep 10
+B=$(awk '{print $14+$15}' /proc/$P/stat)
+echo "cpu% = $(awk -v a=$A -v b=$B -v c=$(getconf CLK_TCK) 'BEGIN{printf "%.2f",(b-a)/c/10*100}')"
+```
+
+Expected: **near 0%** with a static screen (the design target is "one 1 Hz
+timer wake-up and nothing else"). Compare against the 32.5% the winit backend
+burns doing the same nothing, and against `cage`'s own ~100%. If it is *not*
+near zero, the diagnostic is `RUST_LOG=…,duduclaw_comp::udev_backend=trace`:
+`udev: no damage — skipping page flip` should be the dominant message, and a
+flood of composites without that line means some `queue_redraw` call site is
+firing continuously (the frame-callback loop described in point 5 of
+"Repaint scheduling" is the likely culprit).
+
+**Step 7 — session pause/activate (VT switch driven externally).**
+
+```bash
+sudo chvt 2   # expect: "udev: session paused (VT switched away) — dropping DRM master"
+sudo chvt 1   # expect: "udev: session activated — reacquiring DRM master", screen restored
+```
+
+(There is **no** `Ctrl+Alt+F<n>` binding inside the compositor — see "not
+implemented" below.)
+
+**Step 8 — put it back.** `systemctl start duduclaw-kiosk.service`, or edit
+the unit to drop the `cage` wrapper if the round succeeded.
+
+### Deliberately not implemented (do not read the code as if these work)
+
+- **Multi-GPU.** One GPU node is opened; a second GPU's connectors are
+  ignored. anvil's `GpuManager`/`MultiRenderer` copy-between-GPUs path is not
+  vendored.
+- **Hotplug.** The udev event source is registered and logs every
+  Added/Changed/Removed, but nothing rescans. Plugging a monitor in after
+  startup will not create an output; unplugging leaves a dead surface until
+  restart. A correct version needs `smithay-drm-extras`' `DrmScanner`.
+- **DMA-BUF / linux-dmabuf-v1 / `wl_drm`.** Clients go through `wl_shm`
+  exactly as on the winit backend; `bind_wl_display` is not called and no
+  `DmabufState` global is advertised. GPU clients fall back to software
+  buffers.
+- **Hardware cursor / overlay planes / direct scanout.** Everything
+  composites into the primary plane. The codrive cursors stay ordinary
+  `SolidColorRenderElement`s.
+- **VT switching from inside the compositor.** No `Ctrl+Alt+F<n>` binding.
+  Two reasons: the kiosk unit is deliberately not a PAM/logind session
+  (`appliance/postinst.d/20-users-and-units.sh`), so there is nothing to
+  switch to; and adding a global chord means touching the human keyboard
+  filter closure in `input.rs`, which carries the Super+Esc / Super+Enter
+  codrive semantics this work package was told not to change. Session
+  pause/activate *is* handled, so `chvt` from outside works.
+- **VRR, 10-bit colour, explicit in-fences on the plane.** `ARGB8888` /
+  `XRGB8888` only.
+- **libinput device configuration** (tap-to-click, natural scroll, pointer
+  acceleration profile). Defaults only.
+
+### Bugs found and fixed while doing this
+
+1. **`InputEvent::PointerMotion` was an empty arm.** Harmless under winit
+   (which only emits `PointerMotionAbsolute`), fatal under libinput (which
+   emits relative motion for every mouse/trackpad) — the pointer would never
+   have moved on real hardware. Implemented as accumulate-delta-then-clamp.
+2. **`PointerMotionAbsolute` was mapping through the *shadow* output.**
+   `self.space.outputs().next()` returns insertion order, and the CD-2 shadow
+   output is mapped first (in `DuduclawComp::new`, before any backend exists)
+   at `codrive::SHADOW_ORIGIN` = `(0, 100_000)`. Every absolute pointer
+   position was therefore being placed 100 000 px below every real window.
+   This affected the **winit** path too, i.e. it is a pre-existing live bug,
+   not something A4-1 introduced. Fixed via `DuduclawComp::primary_output()`,
+   which skips the shadow output.
+
+### Not verified (honest list)
+
+- **Everything downstream of "no DRM device" is unverified in this round.**
+  Container coverage stops at: backend selection ✓, libseat session
+  acquisition ✓, udev GPU enumeration ✓ (correctly finding none). **Not**
+  exercised anywhere yet: `DrmDevice::new`, connector/CRTC selection,
+  `create_surface`, `GbmBufferedSurface`, EGL/GLES context creation on gbm,
+  the vblank event loop, libinput event delivery, session pause/activate, and
+  every line of `render_surface`. These compile and are modelled on anvil's
+  own sequence, but nothing has run them.
+- **The udev backend's idle CPU is unmeasured** — see "CPU accounting". The
+  scheduling *rule* is unit-tested; the *number* is not measured.
+- **Multi-output layout is untested even in principle** — the left-to-right
+  `next_x` layout and the per-output codrive-overlay offset
+  (`codrive_highlight_elements_at`) are written and compile, but no
+  two-connector setup has been run.
+- **No visual/screenshot verification** — same standing limitation as every
+  previous round in this file. All claims above are log/audit evidence.
+- **`wl_seat` is still named `"winit"`** on the hardware backend
+  (`state.rs`'s `new_wl_seat(&dh, "winit")`). Cosmetic but wire-visible;
+  left alone deliberately because the seat name is protocol surface and
+  renaming it has non-zero regression risk for zero functional gain.
+- **Not committed** — per this task's instructions, same as every prior round
+  in this file.
+
+---
+
+## A4-5: `wl_seat` advertisement order — why `duduclaw-shell` had no keyboard (2026-08-22)
+
+### The symptom
+
+On the appliance VM, with `duduclaw-comp` on the udev/DRM backend owning the
+hardware directly (no `cage`), `duduclaw-shell` received **no keyboard input
+at all**: typing did nothing in the task box, `Super` did not open the
+launcher. Everything around it looked healthy:
+
+| Observation | Verdict |
+|---|---|
+| Pointer moves and clicking focuses windows | comp's `focus_window` runs; `shell_control`'s `list_windows` reports `focused: true` for the shell |
+| `Super+Esc` triggers `codrive: EMERGENCY STOP — reason="super+esc"` | comp's own key path (`input.rs:38` filter closure) is alive |
+| `foot -- sh -c 'cat > /tmp/keys.txt'` on the same comp receives `q`/`w`/`e` | comp really does deliver keys to clients |
+| Shell with `WAYLAND_DEBUG=1`: zero `wl_keyboard.enter`, zero `wl_keyboard.key` | the shell is the odd one out |
+
+### The root cause — it is a client-side (gpui) bug, not a comp bug
+
+The decisive evidence is the shell's own protocol trace:
+
+```
+wl_seat#3.capabilities(3)
+wl_seat#4.capabilities(3)
+ -> wl_seat#3.get_keyboard(new id wl_keyboard#74)
+ -> wl_seat#4.get_keyboard(new id wl_keyboard#76)
+wl_keyboard#76.keymap(1, fd 23, 64754)
+```
+
+`duduclaw-comp` deliberately advertises **two** `wl_seat` globals — the human
+seat (`"winit"`, `state.rs`) and the agent seat (`"duduclaw-agent"`,
+`codrive/mod.rs:230`). That is legal Wayland and multi-seat-aware clients
+cope (`foot`, above, is the proof).
+
+gpui does not. Reading the pinned zed rev
+(`7a7c3e1d2f03195c5fa19bc890da330ad7f3abef`),
+`crates/gpui_linux/src/linux/wayland/client.rs`:
+
+| Line | Code | Consequence |
+|---|---|---|
+| 309 | `wl_seat: wl_seat::WlSeat, // TODO: Multi seat support` | the client state has room for exactly one seat |
+| ~717-725 | `"wl_seat" => { seat = Some(globals.registry().bind::<wl_seat::WlSeat,_,_>(…)); }` inside `globals.contents().with_list` | every seat is bound, but the local binding keeps only the **last** |
+| 1651 / 1654 | `if let Some(wl_keyboard) = &state.wl_keyboard { wl_keyboard.release(); }` then `state.wl_keyboard = Some(keyboard);` | the second seat's `Capabilities` event **destroys** the first seat's keyboard |
+| 1676 / 1679 | same shape for `wl_pointer` | ditto for the pointer |
+| 1325 / 1328 / 1331 | a runtime `wl_registry.global` for `wl_seat` releases both devices and rebinds `state.wl_seat` | a seat appearing later also steals the slot |
+
+So with the human seat advertised first and the agent seat second, the shell
+ends up holding **only the agent seat's** keyboard and pointer. The human
+seat's keyboard focus — which is what `focus_window` sets — has no client
+resource left to deliver to, hence zero `enter`, zero `key`.
+
+This also explains the anomaly in the trace that first pointed away from a
+client bug: **`wl_keyboard#74` never receives a `keymap`.** It is not that
+comp failed to initialise the human seat's keyboard — smithay sends the
+keymap from `KeyboardHandle`'s `bind` path like it does for any seat. It is
+that gpui *released* `#74` at line ~1652 moments after creating it, so the
+object was already dead client-side. The surviving `#76` is the agent seat's.
+
+Corollary worth knowing: **the shell's pointer input is broken the same way**.
+The "mouse works" evidence above is all compositor-side (comp draws the
+cursor and runs `focus_window` itself) — it does not show that the shell
+received a single `wl_pointer.motion`. Expect in-shell clicking to have been
+dead too, and to come back with this fix.
+
+### Where the fix went, and why not the other side
+
+The *correct* fix is upstream in gpui — make the seat state per-seat instead
+of a single clobbered slot. That is not reachable from this repo cheaply:
+
+- `gpui_linux` is consumed as a **git dependency** at a pinned rev, shared
+  with `duduclaw-native-gui` (both crates must stay on the identical rev or
+  the `gpui` types stop unifying — see `duduclaw-shell/Cargo.toml`'s header).
+- Vendoring it as a `[patch]` **path** crate does not work: its manifest is
+  workspace-inherited (31 `… .workspace = true` entries plus
+  `edition`/`lints`), so a standalone copy would have to have every
+  dependency edge re-pinned by hand against zed's workspace — 15k LOC and a
+  re-vendor on every rev bump, to change three lines.
+- The realistic upstream route is a **git fork of zed** plus a `[patch]`
+  block; that needs a fork repo to exist, which is an operator decision (and
+  a push), not something this work package can do. The exact patch is
+  recorded below so the fork is a five-minute job when wanted.
+
+Merging agent input back into the human seat is **not** an option — freeze,
+emergency stop and the audit trail are all built on the agent's input
+travelling through a structurally separate seat.
+
+That leaves advertisement order, which is what changed:
+
+| File | Change |
+|---|---|
+| `src/seat_order.rs` | **New.** `SeatAdvertiseOrder` + `from_env_value` (pure, unit-tested) + the full root-cause writeup as a module doc. |
+| `src/state.rs` | `DuduclawComp::new` now creates the agent seat **before** the human seat by default; the human-seat constructor was lifted into a local closure so both orders share one body. |
+| `src/main.rs` | `mod seat_order;`. |
+
+Because gpui keeps the last seat it sees, advertising the agent seat first
+lands it on the human seat. **Nothing about the codrive model changes**: two
+separate seats either way, each with its own keyboard and pointer, freeze /
+emergency stop / audit untouched.
+
+### The tradeoff, stated plainly
+
+This is a coin flip, not a cure, and it should be reverted the day gpui
+learns multi-seat:
+
+- A client that naively keeps the **first** seat (rather than the last) is
+  now pushed onto the *agent* seat — the same bug mirrored. We accept it
+  because every client that actually runs on the appliance except the shell
+  is multi-seat-aware (`foot`, GTK/Qt, Chromium/Firefox), so that hazard is
+  theoretical here while the last-seat-wins breakage is observed.
+- The known cost: **a gpui client can no longer be driven by the agent**, because
+  it releases the agent seat's keyboard/pointer. Human input to the shell is
+  non-negotiable; agent-driving the shell's own UI is not a current
+  requirement, and every other codrive target keeps both seats working.
+- `DUDUCLAW_COMP_SEAT_ORDER=human-first` restores the old order in one step.
+
+### The upstream patch (for when a zed fork exists)
+
+Against `crates/gpui_linux/src/linux/wayland/client.rs` at rev `7a7c3e1d`.
+Minimal, surgical — "first seat wins, ignore the rest", which is what
+GTK/Qt/SDL do when they do not implement multi-seat, rather than a full
+per-seat refactor:
+
+```rust
+// 1) in WaylandClient::new's registry walk (~line 717): keep the FIRST seat
+//    and do not bind any other, so no second Capabilities event can arrive.
+"wl_seat" => {
+    if seat.is_none() {
+        seat = Some(globals.registry().bind::<wl_seat::WlSeat, _, _>(
+            global.name,
+            wl_seat_version(global.version),
+            &qh,
+            (),
+        ));
+    }
+}
+
+// 2) in Dispatch<wl_seat::WlSeat> (~line 1629): ignore seats that are not
+//    the adopted one, instead of clobbering the adopted seat's devices.
+if seat != &state.wl_seat {
+    return;
+}
+
+// 3) in Dispatch<wl_registry::WlRegistry> (~line 1323): a seat appearing at
+//    runtime must not steal the slot from the seat already in use.
+"wl_seat" => { /* already have one; ignore */ }
+```
+
+With that upstream, comp's order becomes irrelevant and
+`DUDUCLAW_COMP_SEAT_ORDER` can be deleted.
+
+### Verification
+
+- Container build + `cargo test`: **156 passed, 0 failed** (`rust:bookworm`,
+  the A4-1 system-dependency list). The five new tests are
+  `seat_order::tests::*`.
+- `duduclaw-shell` on macOS: **317 passed, 0 failed, 5 ignored** — unchanged,
+  no shell file was touched by this work package. (Note: run it with rustup's
+  `~/.cargo/bin/cargo`; the Homebrew `rustc` first on `PATH` is an
+  x86_64 build that ignores `rust-toolchain.toml` and dies in `media`'s
+  bindgen build script for want of an x86_64 `libclang`.)
+- **Not verified on real hardware** — the VM is the operator's. See the
+  live-check recipe in the handover notes: with `WAYLAND_DEBUG=1` on the
+  shell, a fixed run must show `wl_keyboard#N.enter(...)` when the shell is
+  focused and `wl_keyboard#N.key(...)` per keystroke, where `#N` is the
+  keyboard obtained from the **second** `wl_seat` in the trace.
+- **Not committed** — per this task's instructions, same as every prior round
+  in this file.

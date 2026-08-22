@@ -37,11 +37,23 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        mpsc, Mutex,
     },
+    time::Duration,
 };
 
+use smithay::reexports::calloop;
+
 use super::audit::AuditLog;
+use super::window_geometry::{CodriveQuery, WindowGeometryReply, WindowGeometryRequest};
+
+/// Bounds how long the socket thread will block waiting for the calloop
+/// main thread to answer a `window_geometry` query. Same reasoning (and
+/// same value) as `shell_control::listener::MAIN_THREAD_REPLY_TIMEOUT`: a
+/// stalled/overloaded main loop must degrade this ONE query to an honest
+/// timeout error, never wedge the single injection-socket thread — which
+/// would starve every later command on the same connection.
+const QUERY_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct CodriveShared {
     /// True while the agent seat is frozen (human input observed). Set on
@@ -65,6 +77,22 @@ pub struct CodriveShared {
     /// can force-close it and so state-transition events (`frozen`/
     /// `resumed`) can be pushed to it — both from the main thread.
     pub(super) active_conn: Mutex<Option<UnixStream>>,
+    /// WP-CD4b-fix (B3): the socket thread's end of the READ-ONLY
+    /// `window_geometry` query bridge to the calloop main thread. `None`
+    /// until `codrive::init` installs it (and permanently `None` in the
+    /// `disabled*`/`for_test*` constructors), in which case
+    /// [`Self::query_window_geometry`] answers `compositor_unavailable`
+    /// rather than pretending — a query that cannot be answered must never
+    /// yield a made-up coordinate (see `window_geometry.rs`'s module doc).
+    ///
+    /// A `Mutex<Option<…>>` rather than a constructor parameter for one
+    /// concrete reason: the sender only exists after `init` has built the
+    /// calloop source, which is after `CodriveShared` is already wrapped in
+    /// its `Arc` — and threading a 4th parameter through `listener::spawn`
+    /// would have churned 14 existing test call sites for no behavioral
+    /// gain. The lock is only ever held long enough to *clone* the sender
+    /// out (never across the blocking `recv_timeout`).
+    pub(super) query_tx: Mutex<Option<calloop::channel::Sender<super::window_geometry::CodriveQuery>>>,
     audit: Option<AuditLog>,
     /// This run's hex-encoded 32-byte socket-auth token (CD-1, DESIGN
     /// §3.3.1 "EIS 界線"). `None` means token generation/write failed at
@@ -101,6 +129,7 @@ impl CodriveShared {
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
+            query_tx: Mutex::new(None),
             audit,
             auth_token: Mutex::new(Some(auth_token)),
             token_path: Some(token_path),
@@ -114,6 +143,7 @@ impl CodriveShared {
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
+            query_tx: Mutex::new(None),
             audit: None,
             auth_token: Mutex::new(None),
             token_path: None,
@@ -132,6 +162,7 @@ impl CodriveShared {
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
+            query_tx: Mutex::new(None),
             audit,
             auth_token: Mutex::new(None),
             token_path: None,
@@ -186,6 +217,49 @@ impl CodriveShared {
         diff == 0
     }
 
+    /// WP-CD4b-fix (B3): installs the main-thread query bridge. Called once
+    /// from `codrive::init`, before `listener::spawn`, so no connection can
+    /// ever observe a half-built bridge.
+    pub(super) fn set_query_channel(&self, tx: calloop::channel::Sender<CodriveQuery>) {
+        if let Ok(mut guard) = self.query_tx.lock() {
+            *guard = Some(tx);
+        }
+    }
+
+    /// WP-CD4b-fix (B3): run one READ-ONLY `window_geometry` query on the
+    /// calloop main thread and return its answer. Called from the socket
+    /// thread (`listener.rs`), never from the main thread.
+    ///
+    /// Every failure mode resolves to an explicit `ok:false` reply — no
+    /// bridge installed, the event loop gone, or the main thread not
+    /// answering within [`QUERY_REPLY_TIMEOUT`]. Nothing here can produce a
+    /// *plausible-looking* coordinate out of a failure, which is the whole
+    /// safety property this op exists to preserve.
+    pub(super) fn query_window_geometry(&self, req: WindowGeometryRequest) -> WindowGeometryReply {
+        // Clone the sender out and drop the lock immediately — the blocking
+        // `recv_timeout` below must never run while holding it.
+        let tx = match self.query_tx.lock() {
+            Ok(guard) => (*guard).clone(),
+            Err(poisoned) => (*poisoned.into_inner()).clone(),
+        };
+        let Some(tx) = tx else {
+            return WindowGeometryReply::err("compositor_unavailable");
+        };
+
+        let (reply_tx, reply_rx) = mpsc::channel::<WindowGeometryReply>();
+        if tx.send(CodriveQuery { req, reply_tx }).is_err() {
+            tracing::error!("codrive: window_geometry query channel closed — compositor event loop gone");
+            return WindowGeometryReply::err("compositor_unavailable");
+        }
+        match reply_rx.recv_timeout(QUERY_REPLY_TIMEOUT) {
+            Ok(reply) => reply,
+            Err(_) => {
+                tracing::warn!("codrive: window_geometry — main thread did not answer within the timeout");
+                WindowGeometryReply::err("timeout")
+            }
+        }
+    }
+
     // `rotate_token` (CD-2 task item 1) lives in a SECOND `impl
     // CodriveShared` block in the `rotation` submodule, not here — see that
     // module's doc comment.
@@ -220,6 +294,7 @@ impl CodriveShared {
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
+            query_tx: Mutex::new(None),
             audit: None,
             auth_token: Mutex::new(auth_token),
             token_path: None,
@@ -239,6 +314,7 @@ impl CodriveShared {
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
+            query_tx: Mutex::new(None),
             audit: None,
             auth_token: Mutex::new(auth_token),
             token_path: Some(token_path),

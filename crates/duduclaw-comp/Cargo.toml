@@ -48,11 +48,39 @@ libc = "0.2"
 # needed for this spike (winit backend + xdg-shell + single output). A git
 # pin is the documented fallback if a future run of this crate needs an API
 # only present post-0.7.0 — none was needed to get `cargo build` green.
+# A4-1 (2026-08-22) added the real-hardware backend feature set on top of
+# the original winit-only list. Both backends are compiled into the one
+# binary and chosen at RUNTIME (`src/backend_choice.rs`), never by a cargo
+# feature — a compile-time split would mean shipping two binaries and would
+# make `BUILD.md`'s nested container verification stop covering the code
+# that actually runs on the appliance.
+#
+# Feature names are smithay 0.7.0's own (verified against the published
+# crate's `[features]` table, not from memory):
+#   backend_drm             -> DrmDevice/DrmSurface/vblank event source
+#   backend_gbm             -> GbmDevice/GbmAllocator (pulls backend_drm)
+#   backend_egl             -> EGLDisplay/EGLContext (already implied by
+#                              backend_winit, listed explicitly for clarity)
+#   backend_libinput        -> LibinputInputBackend + the `input` reexport
+#   backend_udev            -> UdevBackend/primary_gpu/all_gpus
+#   backend_session_libseat -> LibSeatSession (seatd/logind via libseat)
+#   renderer_gl             -> GlesRenderer (already implied by backend_winit)
+#
+# System build dependencies this adds beyond the original
+# pkg-config/libwayland-dev/libxkbcommon-dev trio: libinput-dev, libudev-dev,
+# libseat-dev, libgbm-dev, libdrm-dev. See BUILD.md.
 [dependencies.smithay]
 version = "0.7.0"
 default-features = false
 features = [
     "backend_winit",
+    "backend_drm",
+    "backend_gbm",
+    "backend_egl",
+    "backend_libinput",
+    "backend_udev",
+    "backend_session_libseat",
+    "renderer_gl",
     "wayland_frontend",
     "desktop",
 ]

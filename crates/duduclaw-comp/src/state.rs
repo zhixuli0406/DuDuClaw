@@ -26,7 +26,7 @@ use smithay::{
     },
 };
 
-use crate::{codrive, shell_control, CalloopData};
+use crate::{codrive, seat_order::SeatAdvertiseOrder, shell_control, CalloopData};
 
 /// Top-level compositor state. One instance per compositor process — this
 /// is the `D` type parameter smithay's `delegate_*!` macros generate
@@ -135,6 +135,15 @@ pub struct DuduclawComp {
     /// doc comment for why. Just the audit log today (no freeze/token
     /// state — this channel has neither).
     pub shell_control: std::sync::Arc<shell_control::ShellControlShared>,
+    /// A4-1 (udev/DRM backend): "something that can change a pixel happened
+    /// since the last composite". Set by [`DuduclawComp::queue_redraw`],
+    /// consumed (and cleared) by `udev_backend::dispatch_render`.
+    ///
+    /// The winit backend ignores this field entirely — it drives itself with
+    /// `Window::request_redraw()` and always has, so wiring damage sources
+    /// up cannot regress the already-verified nested path. Starts `true` so
+    /// the very first frame is drawn without waiting for an event.
+    pub pending_redraw: bool,
 }
 
 impl DuduclawComp {
@@ -151,19 +160,52 @@ impl DuduclawComp {
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let popups = PopupManager::default();
 
+        // A4-5: the ORDER these two `wl_seat` globals are created in is the
+        // order clients see them advertised in, and that order decides
+        // whether `duduclaw-shell` can receive keyboard input at all — gpui's
+        // Wayland backend keeps only the LAST `wl_seat` it sees and releases
+        // every other seat's keyboard/pointer. Read `seat_order`'s module doc
+        // for the full root cause, the upstream line numbers, and the
+        // tradeoff. Default is `AgentFirst` (agent seat advertised first, so
+        // gpui's last-one-wins lands on the human seat);
+        // `DUDUCLAW_COMP_SEAT_ORDER=human-first` restores the pre-A4-5 order.
+        //
+        // Neither branch changes the codrive safety model: two structurally
+        // separate seats either way, agent input never merged into the human
+        // seat, freeze / emergency stop / audit untouched.
+        let seat_order = SeatAdvertiseOrder::from_env();
+        tracing::info!(
+            order = ?seat_order,
+            "comp: wl_seat advertisement order (A4-5; override with {})",
+            crate::seat_order::SEAT_ORDER_ENV
+        );
+
         // A seat is a group of keyboard/pointer/touch devices. This spike
         // assumes a single always-present keyboard+pointer (real hotplug
         // tracking is out of scope for a winit-nested spike — there's no
         // real hardware to plug into).
-        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "winit");
-        seat.add_keyboard(Default::default(), 200, 25).unwrap();
-        seat.add_pointer();
+        //
+        // `codrive::init` is the agent seat's constructor (CD-0 codrive
+        // spike: agent seat + injection socket + audit log). It must happen
+        // while we still hold `&mut seat_state` locally (before it moves into
+        // `Self` below) and while `event_loop` is available to register the
+        // injection channel's calloop source — both hold in either branch.
+        let make_human_seat = |seat_state: &mut SeatState<Self>| -> Seat<Self> {
+            let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "winit");
+            seat.add_keyboard(Default::default(), 200, 25).unwrap();
+            seat.add_pointer();
+            seat
+        };
 
-        // CD-0 codrive spike: agent seat + injection socket + audit log.
-        // Must happen while we still hold `&mut seat_state` locally (before
-        // it moves into `Self` below) and while `event_loop` is available
-        // to register the injection channel's calloop source.
-        let (agent_seat, codrive) = codrive::init(&mut seat_state, &dh, event_loop);
+        let (seat, agent_seat, codrive) = if seat_order.agent_first() {
+            let (agent_seat, codrive) = codrive::init(&mut seat_state, &dh, event_loop);
+            let seat = make_human_seat(&mut seat_state);
+            (seat, agent_seat, codrive)
+        } else {
+            let seat = make_human_seat(&mut seat_state);
+            let (agent_seat, codrive) = codrive::init(&mut seat_state, &dh, event_loop);
+            (seat, agent_seat, codrive)
+        };
 
         // WP-comp-shell-ipc (2026-08-22): needs no `SeatState`/
         // `DisplayHandle` (no new `wl_seat` — every op acts on the human
@@ -216,7 +258,51 @@ impl DuduclawComp {
             codrive_watch_paused: false,
             codrive_last_human_activity: start_time,
             shell_control,
+            pending_redraw: true,
         }
+    }
+
+    /// A4-1: mark the compositor as visually dirty.
+    ///
+    /// Every call site is a place where the next composited frame could
+    /// legitimately differ from the last one:
+    /// - `handlers/compositor.rs::commit` — any client surface content,
+    ///   window map/unmap, popup, or resize.
+    /// - `handlers/xdg_shell.rs` — toplevel/popup creation and destruction.
+    /// - `input.rs` — every human input event (the human cursor overlay
+    ///   moves, focus may change, a grab may drag a window).
+    /// - `codrive/mod.rs::handle_agent_inject` — agent cursor, click,
+    ///   highlight box, shadow-workspace toggle.
+    /// - `focus_window` (below) — activation state changes, which every
+    ///   focus path in the crate funnels through, so click-to-focus,
+    ///   Super+Tab, close-time reassignment, `shell_control` focus, and
+    ///   codrive `activate_window` are all covered by that one call.
+    /// - `udev_backend.rs`'s housekeeping tick — codrive highlight expiry.
+    ///
+    /// Being conservative here is cheap: a spurious `queue_redraw` costs one
+    /// composite whose damage comes back empty, which then does NOT page
+    /// flip (see `udev_backend`'s "Repaint scheduling"). Missing one costs a
+    /// visibly stale screen, so when in doubt this is called.
+    pub fn queue_redraw(&mut self) {
+        self.pending_redraw = true;
+    }
+
+    /// The first REAL output, i.e. skipping the CD-2 shadow workspace's
+    /// headless output.
+    ///
+    /// `Space::outputs()` yields insertion order and the shadow output is
+    /// mapped first (in `new` above, before any backend has produced a real
+    /// one), so a bare `space.outputs().next()` returns the shadow output —
+    /// which sits at `codrive::SHADOW_ORIGIN` `(0, 100_000)`. Any caller
+    /// that used it to map an absolute pointer position was placing the
+    /// cursor 100 000 px below every real window. Found while wiring the
+    /// udev backend's input path (A4-1); `input.rs`'s
+    /// `PointerMotionAbsolute` arm was the one affected caller.
+    pub fn primary_output(&self) -> Option<&Output> {
+        self.space
+            .outputs()
+            .find(|o| *o != &self.shadow_output)
+            .or_else(|| self.space.outputs().next())
     }
 
     fn init_wayland_listener(
@@ -291,6 +377,13 @@ impl DuduclawComp {
     /// `self.seat`/`self.agent_seat` — that's what lets this take `&mut
     /// self` without a borrow-checker conflict at every call site.
     pub fn focus_window(&mut self, seat: &Seat<Self>, window: Option<&Window>, serial: Serial) {
+        // A4-1: raising and (de)activating windows changes what is on screen
+        // and, on clients that style their titlebar off xdg-shell
+        // `activated`, what those windows draw. Every focus path in the
+        // crate goes through here, so this one call covers click-to-focus
+        // (human + agent), Super+Tab, close-time reassignment,
+        // `shell_control` focus_window, and codrive `activate_window`.
+        self.queue_redraw();
         if let Some(w) = window {
             self.space.raise_element(w, true);
         }

@@ -426,7 +426,18 @@ mod tests {
 
         let conn = UnixStream::connect(&sock_path).expect("client failed to connect");
         let mut writer = conn.try_clone().unwrap();
-        writeln!(writer, r#"{{"op":"list_windows"}}"#).unwrap();
+        // Deliberately NOT `.unwrap()`: this is the REJECTION path, so the
+        // listener is racing us to close the connection the moment it reads
+        // the peer's credentials — it owes an unauthorized caller nothing and
+        // does not wait for the request line. When it wins that race our write
+        // lands on a closed socket and returns EPIPE, which made this test
+        // flake at roughly 1-in-15 (measured over a 15-run loop, 2026-08-22).
+        // Whether the write itself succeeds is not what is under test; the
+        // assertions below are, and both hold either way — the listener still
+        // answers `ok:false`/`unauthorized` and still never reaches the main
+        // thread. Swallowing the error here removes the flake without weakening
+        // a single assertion.
+        let _ = writeln!(writer, r#"{{"op":"list_windows"}}"#);
 
         let mut reply = String::new();
         BufReader::new(&conn).read_line(&mut reply).expect("no response from listener");

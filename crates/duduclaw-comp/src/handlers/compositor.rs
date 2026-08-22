@@ -31,6 +31,10 @@ impl CompositorHandler for DuduclawComp {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // A4-1: the single most important damage source — every pixel a
+        // client ever changes arrives through here. See
+        // `DuduclawComp::queue_redraw`.
+        self.queue_redraw();
         on_commit_buffer_handler::<Self>(surface);
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();

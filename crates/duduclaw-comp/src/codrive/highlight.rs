@@ -40,6 +40,24 @@ impl DuduclawComp {
     /// 5) so a stale highlight can't reappear on some later check before
     /// the next `highlight` op arrives.
     pub fn codrive_highlight_elements(&mut self, now: Instant) -> Vec<SolidColorRenderElement> {
+        self.codrive_highlight_elements_at(now, Point::from((0.0, 0.0)))
+    }
+
+    /// A4-1: same as [`Self::codrive_highlight_elements`] but shifted by
+    /// `offset` first.
+    ///
+    /// `codrive_highlight` is stored in the GLOBAL logical space of `Space`,
+    /// while `render_output`'s `custom_elements` are interpreted in the
+    /// rendered output's OWN space. Those coincide for an output at the
+    /// origin — the winit backend's single output, and the single-monitor
+    /// hardware case — so the zero-offset wrapper above is byte-identical to
+    /// the pre-A4-1 behaviour. The udev backend passes `-output.loc` so a
+    /// highlight box lands in the right place on a second monitor too.
+    pub fn codrive_highlight_elements_at(
+        &mut self,
+        now: Instant,
+        offset: Point<f64, Logical>,
+    ) -> Vec<SolidColorRenderElement> {
         let Some((rect, deadline)) = self.codrive_highlight else {
             return Vec::new();
         };
@@ -47,7 +65,7 @@ impl DuduclawComp {
             self.codrive_highlight = None;
             return Vec::new();
         }
-        build_border(rect)
+        build_border(Rectangle::new(rect.loc + offset, rect.size))
     }
 }
 
