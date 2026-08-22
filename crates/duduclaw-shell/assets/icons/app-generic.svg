@@ -1,0 +1,32 @@
+<!--
+  Generic application icon — ICON-2 (2026-08-22).
+
+  Drawn for the "this app's Icon= could not be resolved" fallback. Semantics
+  deliberately match freedesktop's `application-x-executable`, which is the
+  name GNOME Shell's own `shell-app.c` falls back to
+  (`g_themed_icon_new ("application-x-executable")`); the 2026-08 research
+  sweep found the same generic-icon answer at KDE, elementary, Windows and
+  Android, and found the first-letter tile this replaces at none of them.
+
+  SHAPE SOURCE: Lucide's `app-window` icon, path data taken verbatim.
+  Lucide is ISC licensed (https://github.com/lucide-icons/lucide, parts
+  inherited from Feather, MIT) — both permit closed-source commercial use
+  with the copyright notice retained, which is what this comment does.
+
+    Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022
+    as part of Feather (MIT). All other copyright (c) for Lucide are held
+    by Lucide Contributors 2022. Licensed under the ISC License.
+
+  Lucide's published geometry rules (24x24 canvas, >=1px padding,
+  stroke-width 2, round caps, round joins, centred stroke) are the same
+  rules this shell's own design boards already follow — verified attribute
+  by attribute in the research doc's §3.3 comparison table — so this file
+  needs no restyling to sit next to the hand-drawn assets in this directory.
+
+  The stroke colour written here is INERT at runtime: `gpui::svg()`
+  rasterizes to an alpha mask and tints it with the element's own
+  `text_color` (see `src/icons.rs`'s header comment). It is kept at the
+  light board's icon-on-neutral-tile value so the file still looks right
+  when someone opens it in a browser.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#52525c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/></svg>

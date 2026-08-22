@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 
 use super::desktop_entry::{self, XdgEnv};
 use super::flatpak_list;
+use super::icon_resolve::{self, AppIcon, IconMiss};
 
 /// Which enumeration an entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,7 +62,9 @@ pub(crate) enum SourceStatus {
 }
 
 /// One real, installed application.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` without `Eq` since ICON-2 — see `icon_resolve::AppIcon`.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InstalledApp {
     /// Stable identity: the flatpak application id, or the desktop-file id
     /// (`apps/desktop_entry.rs::desktop_file_id`). Also the dedup key
@@ -70,19 +73,29 @@ pub(crate) struct InstalledApp {
     /// What the operator sees. Locale-resolved for desktop entries.
     pub name: String,
     pub source: AppSource,
-    /// The `.desktop` `Icon=` value. **Parsed and carried, not rendered.**
-    /// ICON-1 (2026-08-22) gave this crate real vector icons and the
-    /// `AssetSource`/`gpui::svg()` plumbing behind them (`crate::icons`),
-    /// but only for slots the approved design boards actually draw. A real
-    /// installed app is not one of those: its icon is whatever THIS field
-    /// names, resolved against the system icon theme, which stays a
-    /// separate work package — so an installed app's slot is still the
-    /// honest single-character placeholder `glyph()` returns. Carrying the
-    /// value now keeps that round a pure rendering change with nothing left
-    /// to re-scan. `None` for a flatpak app that has no exported `.desktop`
-    /// file reachable from any applications directory — `flatpak list` has
-    /// no icon column, and inventing one from the app id would be a guess.
+    /// The `.desktop` `Icon=` value, verbatim. `None` for a flatpak app
+    /// that has no exported `.desktop` file reachable from any applications
+    /// directory — `flatpak list` has no icon column, and inventing one
+    /// from the app id would be a guess.
+    ///
+    /// ICON-2 (2026-08-22) turned this from a carried-but-unrendered value
+    /// into the input of `resolved_icon` below. It is still kept in its raw
+    /// form: it is what the log line names when resolution fails, and it is
+    /// the only honest record of what the app actually asked for.
     pub icon: Option<String>,
+    /// The real, drawable icon for this app — one ready-to-draw file per
+    /// rung of the shell's tile ladder, resolved against the system icon
+    /// themes at SCAN time (`apps/icon_resolve.rs`) so that rendering never
+    /// touches the filesystem.
+    ///
+    /// `None` means this app draws the generic application icon, which is
+    /// what every desktop OS does in the same situation (research §2.3) —
+    /// never a blank tile, and never the app name's first letter, which
+    /// APP-1's `glyph()` used to return and which ICON-2 retired: the
+    /// research found the monogram tile at no desktop OS at all (it is a
+    /// CONTACT-avatar convention). The dock's agent avatars keep their
+    /// initials, because those really are people.
+    pub resolved_icon: Option<AppIcon>,
     /// Ready-to-spawn argv from a desktop entry's `Exec=`, field codes
     /// already stripped. `None` for a flatpak-sourced app (which launches
     /// through `flatpak run <id>` instead).
@@ -107,20 +120,6 @@ pub(crate) struct InstalledApp {
 }
 
 impl InstalledApp {
-    /// The single-character placeholder this shell draws in an icon slot —
-    /// the same "a letter plus a color, real iconography deferred"
-    /// convention `duduclaw-native-gui/src/nav.rs` established and
-    /// `fake_data::DockApp::glyph` inherited. Uppercased for ASCII so
-    /// `chromium` reads as `C`; CJK and every other script is left exactly
-    /// as the app named itself.
-    pub fn glyph(&self) -> String {
-        let source = if self.name.trim().is_empty() { self.id.as_str() } else { self.name.trim() };
-        match source.chars().next() {
-            Some(c) => c.to_uppercase().collect(),
-            None => "?".to_string(),
-        }
-    }
-
     /// The xdg-shell `app_id` this app's windows are expected to carry, for
     /// matching against `home::running_windows::RunningWindowsFeed`. Both
     /// sources converge on the same freedesktop convention: a flatpak app's
@@ -142,7 +141,7 @@ impl InstalledApp {
 }
 
 /// Everything one `scan()` learned, including how each source went.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ScanOutcome {
     pub apps: Vec<InstalledApp>,
     pub flatpak: SourceStatus,
@@ -164,13 +163,59 @@ pub(crate) fn scan() -> ScanOutcome {
     let env = xdg_env_from_process();
     let (flatpak_apps, flatpak) = scan_flatpak();
     let (desktop_apps, desktop) = scan_desktop(&env);
-    ScanOutcome { apps: merge(flatpak_apps, desktop_apps), flatpak, desktop }
+    let mut apps = merge(flatpak_apps, desktop_apps);
+    resolve_icons(&mut apps, &env);
+    ScanOutcome { apps, flatpak, desktop }
+}
+
+/// ICON-2 (2026-08-22). Turns every merged app's `Icon=` into a drawable
+/// file, AFTER the merge — a flatpak row only learns its `Icon=` from the
+/// exported desktop entry that `merge` folds into it, so resolving earlier
+/// would resolve nothing for exactly the apps that need it most.
+///
+/// The theme chain is built ONCE for the whole list (`index.theme` files
+/// are tens of kilobytes and there are dozens of apps), then shared.
+///
+/// Every miss is logged with its own distinguishable reason, once per app
+/// per process (`icons::warn_once`) — a scan runs every 60 seconds forever,
+/// and an app that will never have an icon must not produce a log line
+/// every minute for the machine's whole uptime. Nothing here can fail the
+/// scan: a miss simply leaves `resolved_icon` as `None`, which renders the
+/// generic application icon.
+fn resolve_icons(apps: &mut [InstalledApp], env: &XdgEnv) {
+    if apps.is_empty() {
+        return;
+    }
+    let roots = icon_resolve::icon_roots(env);
+    let theme_override = std::env::var(icon_resolve::THEME_ENV).ok();
+    let chain = icon_resolve::theme_chain_for(env, &roots, theme_override.as_deref());
+    for app in apps.iter_mut() {
+        match icon_resolve::resolve(app.icon.as_deref(), &roots, &chain) {
+            Ok(icon) => app.resolved_icon = Some(icon),
+            Err(miss) => {
+                app.resolved_icon = None;
+                let message = match miss {
+                    IconMiss::NoIconKey => format!(
+                        "[app-icon] {}: no Icon= to resolve (a flatpak app with no reachable exported .desktop file, or an entry that declares none) — drawing the generic application icon",
+                        app.id
+                    ),
+                    IconMiss::Unresolved => format!(
+                        "[app-icon] {}: Icon={:?} matched no file in any icon theme on this machine — drawing the generic application icon",
+                        app.id,
+                        app.icon.as_deref().unwrap_or("")
+                    ),
+                };
+                crate::icons::warn_once(&format!("resolve:{}", app.id), &message);
+            }
+        }
+    }
 }
 
 /// Reads the XDG-relevant environment once. The only `std::env` reader in
-/// the app-enumeration path — everything downstream takes this snapshot as
+/// the app-enumeration path (together with `resolve_icons`'s one read of
+/// the icon-theme override) — everything downstream takes this snapshot as
 /// a parameter so it stays testable.
-fn xdg_env_from_process() -> XdgEnv {
+pub(crate) fn xdg_env_from_process() -> XdgEnv {
     XdgEnv {
         home: std::env::var("HOME").ok(),
         data_home: std::env::var("XDG_DATA_HOME").ok(),
@@ -250,6 +295,9 @@ fn from_flatpak_row(row: flatpak_list::FlatpakApp) -> InstalledApp {
         // flatpak's own exports directory) fills this in with the real
         // `Icon=`; without one it stays honestly unknown.
         icon: None,
+        // Resolved after the merge, for the whole list at once — see
+        // `resolve_icons`.
+        resolved_icon: None,
         exec_argv: None,
         flatpak_id: Some(row.app_id),
         terminal: false,
@@ -356,6 +404,7 @@ fn from_desktop_entry(id: String, entry: desktop_entry::DesktopEntry, exec_argv:
         id,
         source: AppSource::Desktop,
         icon: entry.icon,
+        resolved_icon: None,
         exec_argv: Some(exec_argv),
         flatpak_id: None,
         terminal: entry.terminal,
@@ -554,16 +603,20 @@ mod tests {
         assert_eq!(app.xdg_app_id(), "chromium");
     }
 
+    /// ICON-2 retired `InstalledApp::glyph()` — the app name's first
+    /// character, drawn in the icon slot. The 2026-08 research sweep
+    /// (`research/native-os-2026-08/icon-and-cursor-system-2026-08.md`
+    /// §2.3) checked GNOME, KDE, elementary, Windows and Android and found
+    /// the monogram tile at NONE of them; all five fall back to a generic
+    /// application icon. This test pins the boundary that replaced it: a
+    /// freshly-constructed row carries no resolved icon, and the renderer
+    /// (`crate::icons::app_icon_element`) turns that into the generic icon
+    /// rather than into a letter.
     #[test]
-    fn the_glyph_placeholder_is_the_apps_own_first_character() {
-        assert_eq!(flatpak_app("org.x.Y", "chromium").glyph(), "C");
-        assert_eq!(flatpak_app("org.x.Y", "文字編輯器").glyph(), "文");
-        assert_eq!(flatpak_app("org.x.Y", "  spaced").glyph(), "S");
-        // A row with no name at all falls back to the id rather than
-        // rendering an empty tile.
-        let mut nameless = flatpak_app("org.x.Y", "");
-        nameless.name = String::new();
-        assert_eq!(nameless.glyph(), "O");
+    fn a_row_starts_with_no_resolved_icon_and_no_letter_placeholder() {
+        let app = flatpak_app("org.x.Y", "chromium");
+        assert_eq!(app.resolved_icon, None);
+        assert_eq!(app.icon, None, "the raw Icon= value and the resolved file are separate facts");
     }
 
     #[test]
@@ -729,12 +782,12 @@ mod tests {
         eprintln!("[live] {} app(s) after merge:", outcome.apps.len());
         for app in &outcome.apps {
             eprintln!(
-                "[live]   {:?} id={} name={:?} glyph={:?} icon={:?} xdg_app_id={} exec={:?} terminal={} origin={}",
+                "[live]   {:?} id={} name={:?} icon={:?} resolved_icon={:?} xdg_app_id={} exec={:?} terminal={} origin={}",
                 app.source,
                 app.id,
                 app.name,
-                app.glyph(),
                 app.icon,
+                app.resolved_icon,
                 app.xdg_app_id(),
                 app.exec_argv,
                 app.terminal,
@@ -748,6 +801,56 @@ mod tests {
         if let SourceStatus::Ok(n) = outcome.desktop {
             assert!(n <= outcome.apps.len() + 64, "desktop count {n} is wildly out of line with the merged list");
         }
+    }
+
+    /// ICON-2's wiring, end to end on a real directory tree: a `.desktop`
+    /// entry whose `Icon=` really is in a real icon theme comes out of
+    /// `resolve_icons` with a drawable file for every rung of the ladder,
+    /// and one whose `Icon=` answers to nothing comes out honestly empty.
+    #[test]
+    fn resolve_icons_fills_in_what_the_themes_actually_have() {
+        use crate::apps::icon_theme;
+
+        let root = std::env::temp_dir().join(format!("duduclaw-shell-resolve-icons-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let theme_dir = root.join("usr/share/icons/hicolor/48x48/apps");
+        std::fs::create_dir_all(&theme_dir).expect("temp dirs");
+        std::fs::write(
+            root.join("usr/share/icons/hicolor/index.theme"),
+            "[Icon Theme]\nDirectories=48x48/apps\n\n[48x48/apps]\nSize=48\nContext=Applications\nType=Fixed\n",
+        )
+        .unwrap();
+        // Header-only PNG: `read_png_header` never decodes pixels.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&48u32.to_be_bytes());
+        png.extend_from_slice(&48u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(theme_dir.join("known.png"), &png).unwrap();
+
+        let mut apps = vec![
+            desktop_app("known", "[Desktop Entry]\nType=Application\nName=Known\nExec=/bin/true\nIcon=known\n"),
+            desktop_app("unknown", "[Desktop Entry]\nType=Application\nName=Unknown\nExec=/bin/true\nIcon=nothing-answers-to-this\n"),
+            desktop_app("naked", "[Desktop Entry]\nType=Application\nName=Naked\nExec=/bin/true\n"),
+        ];
+        let env = XdgEnv {
+            home: Some(root.join("home").display().to_string()),
+            data_home: Some(root.join("home/.local/share").display().to_string()),
+            data_dirs: Some(root.join("usr/share").display().to_string()),
+            ..Default::default()
+        };
+        resolve_icons(&mut apps, &env);
+
+        let known = apps.iter().find(|a| a.id == "known").expect("present");
+        let resolved = known.resolved_icon.as_ref().expect("a real theme icon resolves");
+        for container in icon_theme::RENDER_CONTAINERS {
+            assert!(resolved.for_container(container).is_some(), "every rung of the ladder must have a file to draw");
+        }
+        assert_eq!(apps.iter().find(|a| a.id == "unknown").unwrap().resolved_icon, None, "an Icon= nothing answers to must not invent a file");
+        assert_eq!(apps.iter().find(|a| a.id == "naked").unwrap().resolved_icon, None, "no Icon= at all is a different miss, same honest result");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

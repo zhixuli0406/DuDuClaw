@@ -95,6 +95,7 @@ use super::install_gate::{GateStage, InstallGate, SizeProbe};
 use super::OverlayUiState;
 use crate::apps::catalog::{self, CatalogApp};
 use crate::apps::feed::{AppsEmptyState, InstalledAppsFeed};
+use crate::apps::icon_theme;
 use crate::apps::installed::InstalledApp;
 use crate::apps::VerifiedTier;
 use crate::fake_data;
@@ -355,7 +356,7 @@ fn app_result_row(item: &InstalledApp, palette: ShellPalette, cx: &mut Context<S
         .rounded(px(10.))
         .px(px(10.))
         .py(px(8.))
-        .child(app_tile(&item.glyph(), &[], palette))
+        .child(installed_app_tile(item, palette))
         .child(div().flex_1().text_size(px(13.5)).child(item.name.clone()))
         .child(verified_badge(catalog::verified_tier(item.xdg_app_id()), palette));
 
@@ -368,36 +369,38 @@ fn app_result_row(item: &InstalledApp, palette: ShellPalette, cx: &mut Context<S
     row.cursor_pointer().hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0))).on_click(on_click)
 }
 
-/// The 30px neutral app tile every result row uses. Reproduces the design
-/// board's own white/outline tile treatment (the one it uses for Files and
-/// Browser) in both themes — a real installed app has no board colour to
-/// lift, and inventing a per-app palette would be decoration masquerading
-/// as identity.
+/// The result row's tile corner radius (`Launcher.dc.html`). Named for the
+/// same reason `home/home_dock.rs::DOCK_TILE_RADIUS_PX` is: ICON-2 needs it
+/// twice, once on the tile and once on the clip a full-bleed square raster
+/// is drawn into.
+const ROW_TILE_RADIUS_PX: f32 = 8.;
+
+/// The 30px neutral app tile every result row uses, without its child.
+/// Reproduces the design board's own white/outline tile treatment (the one
+/// it uses for Files and Browser) in both themes — a real installed app has
+/// no board colour to lift, and inventing a per-app palette would be
+/// decoration masquerading as identity.
 ///
-/// ICON-1 (2026-08-22): `layers` is the board's own stroke icon for this
-/// tile when one exists (today: the catalog's Chromium globe), and empty
-/// for an installed app, which falls back to `glyph` — its own first
-/// character — exactly as before. Empty is the normal case, not a failure:
-/// see this file's header comment on why a real app's icon has to come
-/// from its `Icon=` rather than from the board.
-fn app_tile(glyph: &str, layers: &[icons::Layer], palette: ShellPalette) -> Div {
+/// Split out by ICON-2 so the CONTAINER is written once and the two things
+/// that go inside it stay separate: the catalog's board artwork
+/// (`app_tile`, `gpui::svg()`) and an installed app's real icon
+/// (`installed_app_tile`, `gpui::img()`). See
+/// `crate::icons::app_icon_element` for why those cannot be one path.
+fn app_tile_shell(palette: ShellPalette) -> Div {
     let dark = palette.is_dark();
     let (gradient_top, gradient_bottom) =
         if dark { (palette.neutral_tile_top, palette.neutral_tile_bottom) } else { (0xffffff, 0xedeff4) };
     let border_color = if dark { palette.neutral_tile_border } else { theme::alpha(theme::light::SURFACE_BORDER, 1.0) };
-    let text_color = if dark { theme::alpha(0xb0b0b8, 1.0) } else { theme::alpha(palette.foreground, 0.55) };
     div()
-        .w(px(30.))
-        .h(px(30.))
-        .rounded(px(8.))
+        .w(px(icon_theme::TILE_ROW_PX))
+        .h(px(icon_theme::TILE_ROW_PX))
+        .rounded(px(ROW_TILE_RADIUS_PX))
         .bg(linear_gradient(180.0, linear_color_stop(rgb(gradient_top), 0.0), linear_color_stop(rgb(gradient_bottom), 1.0)))
         .border_1()
         .border_color(border_color)
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(13.))
-        .font_weight(FontWeight::MEDIUM)
         // The pre-existing light-only `0.14` already approximates the
         // board's own two distinct per-icon values (`.12` neutral / `.16`
         // colored, averaging to `.14`) as one flat number — kept exactly
@@ -405,11 +408,48 @@ fn app_tile(glyph: &str, layers: &[icons::Layer], palette: ShellPalette) -> Div 
         // averaging strategy over ITS OWN two board values (`.30`/`.35`
         // -> `.32`).
         .shadow(palette.icon_shadow(0.14, 0.32))
-        .text_color(text_color)
+}
+
+/// The stroke/text color a tile's contents use when this shell is drawing
+/// them: light `SURFACE_FOREGROUND` at 0.55 alpha, dark `#b0b0b8`. Same
+/// pair `home/home_dock.rs::dock_app` resolves for its own tile, unchanged
+/// by ICON-2 — it now tints the generic application icon where it used to
+/// tint a letter.
+fn app_tile_content_color(palette: ShellPalette) -> gpui::Rgba {
+    if palette.is_dark() {
+        theme::alpha(0xb0b0b8, 1.0)
+    } else {
+        theme::alpha(palette.foreground, 0.55)
+    }
+}
+
+/// The CATALOG tile: this shell's own board artwork (today the Chromium
+/// globe), with the entry's text glyph as the fallback. `gpui::svg()`
+/// path — the assets are `include_bytes!`-embedded and tinted from the
+/// palette.
+fn app_tile(glyph: &str, layers: &[icons::Layer], palette: ShellPalette) -> Div {
+    app_tile_shell(palette)
+        .text_size(px(13.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(app_tile_content_color(palette))
         .child(match icons::icon_or_none(layers, 17.) {
             Some(icon) => icon,
             None => glyph.to_string().into_any_element(),
         })
+}
+
+/// The INSTALLED-APP tile: the app's own icon, resolved from its `.desktop`
+/// `Icon=` at scan time (`crate::apps::icon_resolve`) and drawn full colour
+/// through `gpui::img()`, uncropped, at 80% of this container. ICON-2
+/// (2026-08-22) — before it, this slot drew the app name's first character,
+/// a convention the research sweep found at no desktop OS at all.
+fn installed_app_tile(app: &InstalledApp, palette: ShellPalette) -> Div {
+    app_tile_shell(palette).child(icons::app_icon_element(
+        app.resolved_icon.as_ref().and_then(|icon| icon.for_container(icon_theme::TILE_ROW_PX)),
+        icon_theme::TILE_ROW_PX,
+        ROW_TILE_RADIUS_PX,
+        app_tile_content_color(palette).into(),
+    ))
 }
 
 /// The 「可安裝」section — apps this shell knows how to fetch that are NOT

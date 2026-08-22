@@ -87,7 +87,7 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-use gpui::{div, prelude::*, px, AnyElement, SharedString, Svg};
+use gpui::{div, prelude::*, px, AnyElement, Hsla, SharedString, Svg};
 
 use duduclaw_native_gui::theme;
 
@@ -141,6 +141,17 @@ pub(crate) const DOWNLOAD: &str = "icons/download.svg";
 /// verified board artwork later is pure waste. The test
 /// `unbound_app_icons_are_shipped_and_still_unbound` pins the list so it
 /// cannot quietly grow, and asserts the mapping really does not use them.
+/// ICON-2 (2026-08-22) settled what these seven are NOT for. This module's
+/// original note above imagined them as the "could not resolve an app's
+/// icon" fallback family; the research sweep
+/// (`research/native-os-2026-08/icon-and-cursor-system-2026-08.md` §2.3)
+/// found that no desktop OS guesses an app's icon from its category, and
+/// the operator's own ruling for this round was ONE generic application
+/// icon (`APP_GENERIC`), not a family. Picking `MAIL` for whichever mail
+/// client happens to be installed would be the same "inventing an identity
+/// for someone else's app" this note already refuses. They stay shipped and
+/// unbound — the boards' artwork, kept verbatim, for a future round that
+/// legitimately draws a mail/music/chat/folder concept.
 pub(crate) const MAIL: &str = "icons/mail.svg";
 pub(crate) const DOCUMENT_OUTLINE: &str = "icons/document-outline.svg";
 pub(crate) const DOCUMENT_LINES: &str = "icons/document-lines.svg";
@@ -148,6 +159,15 @@ pub(crate) const DOCUMENT_PENCIL: &str = "icons/document-pencil.svg";
 pub(crate) const MUSIC: &str = "icons/music.svg";
 pub(crate) const CHAT: &str = "icons/chat.svg";
 pub(crate) const FOLDER: &str = "icons/folder.svg";
+
+/// The generic application icon — ICON-2 (2026-08-22). Drawn for the one
+/// slot that genuinely needs a stand-in: an installed app whose `Icon=`
+/// this shell could not turn into a file. Semantics match freedesktop's
+/// `application-x-executable`, which is what GNOME Shell itself falls back
+/// to; see the asset file's own header comment for the shape's source and
+/// licence. Unlike the seven above, this one IS bound — by
+/// `app_icon_element`, the only call site.
+pub(crate) const APP_GENERIC: &str = "icons/app-generic.svg";
 
 /// Every embedded asset, keyed by its `AssetSource` path.
 ///
@@ -179,6 +199,7 @@ const ICONS: &[(&str, &[u8])] = &[
     (SPREADSHEET_BODY, include_bytes!("../assets/icons/spreadsheet-body.svg")),
     (SPREADSHEET_LINES, include_bytes!("../assets/icons/spreadsheet-lines.svg")),
     (DOWNLOAD, include_bytes!("../assets/icons/download.svg")),
+    (APP_GENERIC, include_bytes!("../assets/icons/app-generic.svg")),
 ];
 
 /// The embedded bytes for `path`, or `None` when nothing is registered
@@ -261,10 +282,20 @@ pub(crate) fn icon_or_none(layers: &[Layer], size: f32) -> Option<AnyElement> {
 }
 
 fn layer_svg(key: &'static str, hex: u32, size: f32) -> Svg {
-    // `.text_color` is not cosmetic here: `paint_svg` is only reached when
-    // `style.text.color` is `Some` (`gpui/src/elements/svg.rs`'s `paint`),
-    // so an untinted `svg()` draws nothing at all. Always set it.
-    gpui::svg().path(key).w(px(size)).h(px(size)).flex_none().text_color(theme::alpha(hex, 1.0))
+    tinted_svg(key, theme::alpha(hex, 1.0).into(), size)
+}
+
+/// The one place `gpui::svg()` is constructed. `.text_color` is not
+/// cosmetic here: `paint_svg` is only reached when `style.text.color` is
+/// `Some` (`gpui/src/elements/svg.rs`'s `paint`), so an untinted `svg()`
+/// draws nothing at all. Always set it.
+///
+/// Takes an `Hsla` rather than a `u32` because ICON-2's generic fallback
+/// has to reproduce the exact color its text placeholder had, and one of
+/// those (the neutral tile in LIGHT) is `foreground` at 0.55 alpha — which
+/// a hex cannot express.
+fn tinted_svg(key: &'static str, color: Hsla, size: f32) -> Svg {
+    gpui::svg().path(key).w(px(size)).h(px(size)).flex_none().text_color(color)
 }
 
 /// The one entry point every call site uses: the real icon when its assets
@@ -280,14 +311,130 @@ pub(crate) fn icon_or_glyph(layers: &[Layer], size: f32, glyph: &'static str) ->
 /// Logged once per key, not once per frame: a missing asset would
 /// otherwise print on every repaint of the surface that references it.
 fn warn_missing(key: &str) {
+    warn_once(&format!("registry:{key}"), &format!("[icons] asset missing from the embedded registry: {key:?} — falling back to the text placeholder"));
+}
+
+/// Prints `message` the FIRST time `key` is seen in this process, and never
+/// again. Shared by every icon-side diagnostic (the embedded-registry miss
+/// above, and ICON-2's three third-party degradation paths) because they
+/// all sit on a render path that repaints many times a second — a log line
+/// per frame would bury the journal it is supposed to help.
+pub(crate) fn warn_once(key: &str, message: &str) {
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     let Ok(mut guard) = seen.lock() else {
         return;
     };
     if guard.insert(key.to_string()) {
-        eprintln!("[icons] asset missing from the embedded registry: {key:?} — falling back to the text placeholder");
+        eprintln!("{message}");
     }
+}
+
+// ── Third-party app artwork: the OTHER rendering path ───────────────────
+// ICON-2 (2026-08-22). Everything above this line draws the SHELL'S OWN
+// monochrome assets through `gpui::svg()`. Everything below draws SOMEBODY
+// ELSE'S artwork — an installed app's real icon, resolved from its
+// `.desktop` `Icon=` against the system icon theme
+// (`crate::apps::icon_resolve`). The two are deliberately different code
+// paths and must not be merged:
+//
+//   | | shell assets (`icon_or_none`) | app artwork (`app_icon_element`) |
+//   |-|-------------------------------|----------------------------------|
+//   | element | `gpui::svg()` | `gpui::img()` |
+//   | pixels | alpha mask, tinted by `text_color` | full colour, as authored |
+//   | source | `include_bytes!` via `ShellAssets` | an absolute path on this machine |
+//   | theming | one asset set serves light AND dark | never recoloured |
+//   | multi-colour | needs one file per layer | one file, any number of colours |
+//
+// `svg()` CANNOT draw a third-party icon: it throws every colour away and
+// keeps only coverage, so Chromium's four-colour disc would arrive as a
+// flat silhouette. `img()` CANNOT replace the shell's own icons either: it
+// bakes the file's authored colours into a bitmap, which is exactly why
+// ICON-1 rejected it for the board artwork (one asset set could then no
+// longer serve both themes).
+//
+// The theming rule follows from that, and is the research's
+// (§2.4) as well: a third party's full-colour icon is **never recoloured**
+// — changing it breaks their brand. Only the CONTAINER around it responds
+// to the theme. The one exception is the generic fallback below, which is
+// this shell's OWN asset and therefore goes back down the `svg()` path.
+
+/// Draws one installed app's icon inside its tile — the "soft mask" the
+/// research prescribes (§2.4): a shared rounded container that gives the
+/// dock its visual rhythm, WITHOUT cropping the artwork inside it.
+///
+/// * `variant` is the already-resolved file for THIS container size
+///   (`AppIcon::for_container`); `None` means the app has no drawable icon
+///   and the generic application icon is drawn instead.
+/// * `container_px` / `radius_px` are the tile's own size and corner
+///   radius, passed in from the call site so this never invents a second
+///   set of geometry — the dock's 44px/10px and the Launcher row's
+///   30px/8px are unchanged from before ICON-2.
+/// * `fallback_color` is the tint for the generic icon: each call site
+///   passes the exact color its text placeholder used, so a degraded tile
+///   is the same weight and hue it always was.
+///
+/// Three things this deliberately does NOT do: it never scales artwork up
+/// (`icon_theme::draw_px` already capped `draw_px` at the file's own pixel
+/// size), it never recolours it, and it never crops it unless
+/// `variant.full_bleed` proved the file is a square opaque raster — see
+/// `icon_theme::is_full_bleed_square` for why that proof is deliberately
+/// hard to satisfy.
+pub(crate) fn app_icon_element(
+    variant: Option<&crate::apps::icon_resolve::AppIconVariant>,
+    container_px: f32,
+    radius_px: f32,
+    fallback_color: Hsla,
+) -> AnyElement {
+    let Some(variant) = variant else {
+        return generic_app_icon(crate::apps::icon_theme::content_px(container_px), fallback_color);
+    };
+
+    let path = variant.path.clone();
+    let miss_key = format!("load:{}", path.display());
+    // `img()`'s own fallback: the load happens asynchronously inside gpui
+    // and can still fail after resolution succeeded (the file was deleted
+    // between the scan and this frame, a PNG is corrupt, a decoder rejects
+    // it). Degrading to the same generic icon — rather than to nothing —
+    // is what keeps "the tile is always drawn" true on every path.
+    let image = gpui::img(path).with_fallback(move || {
+        warn_once(&miss_key, &format!("[app-icon] {miss_key} — the resolved icon file failed to load; drawing the generic application icon"));
+        generic_app_icon(crate::apps::icon_theme::content_px(container_px), fallback_color)
+    });
+
+    if variant.full_bleed {
+        // A provably square, provably opaque raster IS the tile: drawn edge
+        // to edge and clipped to the container's own radius (the Apple/
+        // Android "hard mask" behaviour, applied only where it cannot
+        // damage anything). The clip lives on a dedicated wrapper rather
+        // than on the tile itself because the tile's other children — the
+        // verified-tier dot, the running-window dot — sit deliberately at
+        // and beyond its edge and must NOT be clipped away.
+        return div()
+            .w(px(container_px))
+            .h(px(container_px))
+            .rounded(px(radius_px))
+            .overflow_hidden()
+            .flex_none()
+            .child(image.w(px(container_px)).h(px(container_px)))
+            .into_any_element();
+    }
+
+    // The normal case: free-form artwork, centred at its resolved size
+    // inside the container, uncropped.
+    image.w(px(variant.draw_px)).h(px(variant.draw_px)).flex_none().into_any_element()
+}
+
+/// This shell's own generic application icon, on the `svg()` path (it is a
+/// shell asset, not third-party artwork). Falls back to nothing drawable
+/// only if the embedded asset itself went missing, which
+/// `every_registered_key_resolves_to_non_empty_bytes` makes impossible.
+pub(crate) fn generic_app_icon(size: f32, color: Hsla) -> AnyElement {
+    if bytes(APP_GENERIC).is_none() {
+        warn_missing(APP_GENERIC);
+        return div().into_any_element();
+    }
+    tinted_svg(APP_GENERIC, color, size).into_any_element()
 }
 
 // ── Slot → icon mapping ──────────────────────────────────────────────────

@@ -40,6 +40,7 @@ use duduclaw_native_gui::theme;
 
 use crate::apps::catalog;
 use crate::apps::feed::InstalledAppsFeed;
+use crate::apps::icon_theme;
 use crate::apps::installed::InstalledApp;
 use crate::comp_client;
 use crate::fake_data::{self, AgentDockStatus, GoalDot};
@@ -55,6 +56,15 @@ use crate::ShellView;
 /// apps before the divider (six app tiles plus headroom) without the row
 /// running into the agent avatars.
 const DOCK_MAX_APPS: usize = 8;
+
+/// The dock app tile's corner radius (`Main.dc.html`, unchanged since the
+/// board landed). Named rather than inlined only because ICON-2 needs the
+/// same number twice: once on the tile itself, once on the clip a
+/// full-bleed square raster is drawn into (`crate::icons::
+/// app_icon_element`). The tile's SIZE lives in `apps::icon_theme` with the
+/// rest of the ladder, since that is what decides which icon file gets
+/// resolved for it.
+const DOCK_TILE_RADIUS_PX: f32 = 10.;
 
 // ── Goal cards row ─────────────────────────────────────────────────────
 
@@ -285,14 +295,19 @@ fn dock_app(app: &InstalledApp, palette: ShellPalette, running_windows: &Running
     // APP-1: a real installed app has no design-board colour to lift, so
     // every dock tile renders in the neutral treatment the board already
     // uses for its own white/outline tiles (Files/Browser). Inventing a
-    // per-app gradient would be decoration masquerading as identity;
-    // resolving the real `Icon=` this crate already parses and carries
-    // (`InstalledApp::icon`) is a SEPARATE work package going through the
-    // design flow.
+    // per-app gradient would be decoration masquerading as identity.
+    //
+    // ICON-2 (2026-08-22): this tile is now the "soft mask" the research
+    // prescribes (§2.4) — the container below is unchanged (same 44px, same
+    // 10px radius, same `icon_shadow(0.20, 0.35)`, deliberately NOT a new
+    // visual), and the app's REAL icon is drawn inside it, uncropped, at
+    // 80% of the container. `crate::icons::app_icon_element` is a different
+    // rendering path from every other icon in this file — see its own doc
+    // comment for the `svg()` / `img()` split and why they must not merge.
     let dark = palette.is_dark();
     let (gradient_top, gradient_bottom) = if dark { (palette.neutral_tile_top, palette.neutral_tile_bottom) } else { (0xffffff, 0xedeff4) };
 
-    // Icon glyph color: light is `SURFACE_FOREGROUND` at 0.55 alpha —
+    // Fallback icon color: light is `SURFACE_FOREGROUND` at 0.55 alpha —
     // `SURFACE_FOREGROUND` and `FOREGROUND` share the identical value in
     // both themes (`theme.rs`'s own token table), so `palette.foreground`
     // reproduces it exactly. Dark swaps to a solid literal (`#b0b0b8`, the
@@ -300,6 +315,12 @@ fn dock_app(app: &InstalledApp, palette: ShellPalette, running_windows: &Running
     // translucent foreground tint — the translucency was only ever standing
     // in for "a lighter gray", which dark expresses with a genuinely
     // different (not just alpha-reduced) hex.
+    //
+    // ICON-2 keeps this pair EXACTLY as it was, now tinting the generic
+    // application icon instead of the retired first-letter glyph, so a tile
+    // that falls back reads at the same weight it always did. A resolved
+    // third-party icon is never tinted at all — recolouring somebody's
+    // brand is the one thing the research is unambiguous about.
     // Shadow: the pre-existing light-only code collapsed the board's own
     // per-family opacities to one flat `0.20` for every dock icon; kept
     // exactly (light must stay byte-identical). Dark mirrors the SAME
@@ -311,20 +332,26 @@ fn dock_app(app: &InstalledApp, palette: ShellPalette, running_windows: &Running
     let mut el = div()
         .id(format!("dock-app-{}", app.id))
         .relative()
-        .w(px(44.))
-        .h(px(44.))
-        .rounded(px(10.))
+        .w(px(icon_theme::TILE_DOCK_PX))
+        .h(px(icon_theme::TILE_DOCK_PX))
+        .rounded(px(DOCK_TILE_RADIUS_PX))
         .bg(linear_gradient(180.0, linear_color_stop(rgb(gradient_top), 0.0), linear_color_stop(rgb(gradient_bottom), 1.0)))
         .border_1()
         .border_color(border_color)
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(15.))
-        .font_weight(FontWeight::MEDIUM)
         .shadow(icon_shadow)
-        .text_color(text_color)
-        .child(app.glyph());
+        // ICON-2: `text_size`/`font_weight`/`text_color` are gone from this
+        // tile — nothing textual renders in it any more. The colour is
+        // passed straight to the icon helper instead, which is the only
+        // thing that ever consumed it.
+        .child(crate::icons::app_icon_element(
+            app.resolved_icon.as_ref().and_then(|icon| icon.for_container(icon_theme::TILE_DOCK_PX)),
+            icon_theme::TILE_DOCK_PX,
+            DOCK_TILE_RADIUS_PX,
+            text_color.into(),
+        ));
 
     // WP-A3: a small corner "Verified tier" indicator. APP-1 turned this
     // into a real lookup (`apps::catalog::verified_tier`) instead of a
