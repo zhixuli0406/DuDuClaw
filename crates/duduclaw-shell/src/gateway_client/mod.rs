@@ -1,5 +1,5 @@
 // Gateway client — Shell-S4 (2026-08-22, WP-S4-notif): real gateway RPC for
-// the Notifications overlay's approval cards. Three submodules, each a
+// the Notifications overlay's approval cards. Four submodules, each a
 // separate concern (this crate's established "many small files, low
 // coupling" convention — see e.g. `Cargo.toml`'s own `serde`/`zbus`
 // comments for the same reasoning applied elsewhere):
@@ -9,6 +9,10 @@
 //                  header comment for why no `reqwest`; this is a SEPARATE
 //                  small client, not a shared one, deliberately — see
 //                  `session.rs`'s own header comment).
+//   `login`     — `POST /api/login` (WP-lock-pw, 2026-08-22): the
+//                  lockscreen's password-verify call — see `login.rs`'s own
+//                  header comment for why it doesn't share code with
+//                  `session`/`claim`'s similarly-shaped clients either.
 //   `ws_rpc`    — one-shot round trip over `/ws` (the gateway has NO REST
 //                  surface for `approvals.list`/`approvals.decide` — see
 //                  that module's header comment for the dependency-tree
@@ -26,10 +30,12 @@
 // so it's usable — and tested — without a live window.
 
 pub mod approvals;
+mod login;
 pub mod session;
 mod ws_rpc;
 
 pub use approvals::{decide_approval, list_approvals, ApprovalItem};
+pub(crate) use login::{verify_password, LoginError};
 pub use session::{bootstrap_local_session, SessionError};
 pub use ws_rpc::RpcError;
 

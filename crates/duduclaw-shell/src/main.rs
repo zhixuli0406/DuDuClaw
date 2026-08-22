@@ -161,6 +161,15 @@ pub struct ShellView {
     /// `oobe` (see this file's own `Render::render` for how the two
     /// combine).
     pub(crate) lockscreen: lockscreen::LockScreenState,
+    /// WP-lock-pw (2026-08-22) — the lockscreen's real password-entry
+    /// `Entity<OobeTextField>`, same "created once, unconditionally, at
+    /// window-open time" precedent `oobe_account_fields`/`oobe_network_fields`
+    /// below already establish (see either field's own doc comment). Reached
+    /// through `oobe::LockPasswordField` (re-exported from `oobe::widgets`,
+    /// see that type's own doc comment) purely because the underlying
+    /// `OobeTextField::new` constructor is private to that module — this
+    /// field has nothing conceptually to do with OOBE.
+    pub(crate) lockscreen_password_field: oobe::LockPasswordField,
     /// `Some` while the system-level first-run flow (OOBE) owns the whole
     /// screen — see this file's header comment and `oobe/mod.rs`'s own for
     /// the design. `None` (the boot-resolved normal case once OOBE has
@@ -222,19 +231,22 @@ impl ShellView {
     /// this lives on the root element (`.on_action(cx.listener(...))` in
     /// `Render::render`) rather than as an App-global `cx.on_action`
     /// closure in `main()` like round 2 had it.
-    fn on_toggle_launcher(&mut self, _action: &ToggleLauncher, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_toggle_launcher(&mut self, _action: &ToggleLauncher, window: &mut Window, cx: &mut Context<Self>) {
         if diag_enabled() {
             eprintln!("[action] ToggleLauncher fired");
         }
         // Shell-S4-lock: `cmd-k` is a BOUND key, so a keystroke matching it
         // never reaches the root's raw `on_key_down` catch-all at all (gpui
         // consumes it entirely via action dispatch — see `lockscreen::
-        // render::note_input_or_unlock`'s own doc comment for why that
+        // render::note_input_or_reveal`'s own doc comment for why that
         // catch-all can't cover this key) — this handler carries its own
         // identical lock-check for that reason, not relying on the
-        // catch-all to unlock on cmd-k.
+        // catch-all to reveal the password prompt on cmd-k. WP-lock-pw:
+        // cmd-k has no meaning while locked beyond that same reveal — it
+        // does NOT unlock (see `lockscreen::render::note_input_or_reveal`'s
+        // own doc comment for the reversal).
         if self.lockscreen.is_locked() {
-            lockscreen::render::unlock(self, cx);
+            lockscreen::render::note_input_or_reveal(self, window, cx);
             return;
         }
         self.lockscreen.note_input();
@@ -256,12 +268,15 @@ impl ShellView {
     /// currently open (a no-op when none is). Shell-S4-lock: same
     /// self-contained lock-check as `on_toggle_launcher` above — `escape`
     /// is also a bound key, same reasoning applies.
-    fn on_close_overlay(&mut self, _action: &CloseOverlay, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_close_overlay(&mut self, _action: &CloseOverlay, window: &mut Window, cx: &mut Context<Self>) {
         if diag_enabled() {
             eprintln!("[action] CloseOverlay fired");
         }
+        // WP-lock-pw: same reveal-only behavior as `on_toggle_launcher`
+        // above — Escape has no other meaning while locked, it does NOT
+        // unlock.
         if self.lockscreen.is_locked() {
-            lockscreen::render::unlock(self, cx);
+            lockscreen::render::note_input_or_reveal(self, window, cx);
             return;
         }
         self.lockscreen.note_input();
@@ -277,15 +292,20 @@ impl ShellView {
 
     /// `enter`'s action handler — OOBE's keyboard "continue" binding (task
     /// brief: "Enter=繼續"). A no-op outside OOBE (Home has no Enter
-    /// binding of its own this round). Shell-S4-lock: same self-contained
-    /// lock-check as `on_toggle_launcher`/`on_close_overlay` above — `enter`
-    /// is also a bound key.
-    fn on_oobe_next(&mut self, _action: &OobeNext, _window: &mut Window, cx: &mut Context<Self>) {
+    /// binding of its own this round). WP-lock-pw (2026-08-22): while
+    /// locked, Enter is now this surface's SUBMIT trigger instead of an
+    /// instant unlock — `lockscreen::render::submit_or_reveal` reveals the
+    /// prompt on a first press (same as any other key) or, once the
+    /// password field is already visible and focused, dispatches a real
+    /// verify attempt against whatever the operator just typed into it (see
+    /// that fn's own doc comment for why Enter reliably reaches the
+    /// currently-focused field BEFORE bubbling up to this global binding).
+    fn on_oobe_next(&mut self, _action: &OobeNext, window: &mut Window, cx: &mut Context<Self>) {
         if diag_enabled() {
             eprintln!("[action] OobeNext fired");
         }
         if self.lockscreen.is_locked() {
-            lockscreen::render::unlock(self, cx);
+            lockscreen::render::submit_or_reveal(self, window, cx);
             return;
         }
         self.lockscreen.note_input();
@@ -366,21 +386,23 @@ impl Render for ShellView {
             // move_listeners` are `Vec`s that accumulate rather than
             // overwrite, confirmed against the pinned gpui rev's own
             // `elements/div.rs` before relying on this, so adding these
-            // does not disturb the diagnostic pair below). Any key or click
-            // wakes the screen back up while locked; while unlocked, they
-            // just refresh the idle-auto-lock clock. See `lockscreen::
-            // render::note_input_or_unlock`'s own doc comment for why
-            // `cmd-k`/`escape`/`enter` are NOT covered by this catch-all
-            // (those three go through `on_toggle_launcher`/`on_close_
-            // overlay`/`on_oobe_next`'s own lock-checks instead — a bound
-            // key never reaches a raw key listener on the same element).
-            .on_key_down(cx.listener(|view, _ev, _window, cx| {
-                lockscreen::render::note_input_or_unlock(view, cx);
+            // does not disturb the diagnostic pair below). WP-lock-pw
+            // (2026-08-22): any key or click REVEALS the password prompt
+            // while locked — it no longer unlocks by itself (reversed from
+            // the original Shell-S4-lock MVP); while unlocked, they just
+            // refresh the idle-auto-lock clock. See `lockscreen::render::
+            // note_input_or_reveal`'s own doc comment for why `cmd-k`/
+            // `escape`/`enter` are NOT covered by this catch-all (those
+            // three go through `on_toggle_launcher`/`on_close_overlay`/
+            // `on_oobe_next`'s own lock-checks instead — a bound key never
+            // reaches a raw key listener on the same element).
+            .on_key_down(cx.listener(|view, _ev, window, cx| {
+                lockscreen::render::note_input_or_reveal(view, window, cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, _ev, _window, cx| {
-                    lockscreen::render::note_input_or_unlock(view, cx);
+                cx.listener(|view, _ev, window, cx| {
+                    lockscreen::render::note_input_or_reveal(view, window, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|view, _ev, _window, _cx| {
@@ -410,7 +432,7 @@ impl Render for ShellView {
             // isn't rendered at all while locked, so there is nothing for a
             // Home overlay to sit on top of (mirrors the `self.oobe.is_
             // none()` guard on the overlay-render block further down).
-            root.child(lockscreen::render::render(&self.lockscreen, &self.overlay_ui.notifications, cx))
+            root.child(lockscreen::render::render(&self.lockscreen, &self.overlay_ui.notifications, &self.lockscreen_password_field, cx))
         } else {
             root.child(home::render(home_palette, &self.overlay_ui.notifications, cx))
         };
@@ -492,6 +514,14 @@ impl Render for ShellView {
 //   - `DUDUCLAW_SHELL_LOCK_IDLE_MINS=<N>` — idle-to-auto-lock threshold in
 //     minutes, `0` disables auto-lock entirely (default `10`). Read live in
 //     `lockscreen::idle_after_from_env()`.
+// One more as of WP-lock-pw (2026-08-22, lockscreen PASSWORD unlock —
+// reverses the any-key-unlock MVP above, see `lockscreen/mod.rs`'s own
+// header comment for the full writeup):
+//   - `DUDUCLAW_SHELL_LOCK_NO_PASSWORD=1` — dev/headless escape hatch:
+//     reproduces the ORIGINAL any-key-unlock behavior verbatim, no password
+//     prompt, no gateway round trip. Any other value (including unset)
+//     means "password required" — the safe default. Read live in
+//     `lockscreen::password_required_from_env()`.
 fn main() {
     eprintln!("[main] starting duduclaw-shell S0");
 
@@ -536,11 +566,16 @@ fn main() {
                     // `&mut Context<ShellView>`.
                     let oobe_account_fields = oobe::AccountFields::new(cx);
                     let oobe_network_fields = oobe::NetworkFields::new(cx);
+                    // WP-lock-pw: same "create once, unconditionally, at
+                    // window-open time" call site as the two `AccountFields`/
+                    // `NetworkFields` entities just above.
+                    let lockscreen_password_field = oobe::LockPasswordField::new(cx);
                     cx.new(|cx| ShellView {
                         surface: SurfaceState::default(),
                         overlay_ui: overlay::OverlayUiState::default(),
                         audio_ui: audio::AudioUiState::default(),
                         lockscreen: lockscreen::LockScreenState::default(),
+                        lockscreen_password_field,
                         oobe: initial_oobe,
                         oobe_ui: oobe::OobeUiState::default(),
                         oobe_account_fields,

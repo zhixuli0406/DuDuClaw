@@ -352,3 +352,34 @@ impl NetworkFields {
         Self { psk: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true) }
     }
 }
+
+/// The lockscreen surface's password entry field (WP-lock-pw, 2026-08-22) —
+/// same "bundle the one-per-surface `Entity<OobeTextField>` so `main.rs`
+/// only needs one field on `ShellView`" shape `AccountFields`/`NetworkFields`
+/// establish above. Defined HERE (not in `crate::lockscreen`) purely because
+/// `OobeTextField::new` is private to this module and `crate::lockscreen` is
+/// a crate-root SIBLING of `oobe`, not a descendant of it, so it cannot
+/// reach a private `fn` inside `oobe::widgets` directly — re-exported as
+/// `oobe::LockPasswordField` (`oobe/mod.rs`'s own `pub(crate) use` list,
+/// same shape as `AccountFields`/`NetworkFields`) so `crate::lockscreen`/
+/// `main.rs` never need to know the type physically lives under `oobe` at
+/// all; this is pure code reuse of an already-proven text-input widget, not
+/// a sign the lockscreen is somehow part of the OOBE flow.
+///
+/// Placeholder text is a literal zh-TW string, not routed through
+/// `crate::i18n` at construction time — `cx: &mut App` at window-open (this
+/// fn's own call site in `main.rs`) has no OOBE `Locale` selection yet to
+/// read (same reason `AccountFields`/`NetworkFields` above hardcode their
+/// own placeholders instead), and the lockscreen surface as a whole already
+/// hardcodes `Locale::ZhTw` throughout its own rendering (see
+/// `lockscreen/render.rs`'s header comment) — not a new limitation this
+/// field introduces.
+pub(crate) struct LockPasswordField {
+    pub(crate) field: Entity<OobeTextField>,
+}
+
+impl LockPasswordField {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        Self { field: OobeTextField::new(cx, crate::i18n::t(crate::i18n::Locale::ZhTw, crate::i18n::Key::LockPasswordPlaceholder), true) }
+    }
+}

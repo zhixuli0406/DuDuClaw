@@ -94,6 +94,10 @@ pub(crate) use widgets::AccountFields;
 /// `Network` step's PSK entry (Shell-S3) is the second, and so far only
 /// other, OOBE screen with a real typed field.
 pub(crate) use widgets::NetworkFields;
+/// `crate::lockscreen` needs `LockPasswordField` for the same reason
+/// `main.rs` needs `AccountFields`/`NetworkFields` above — see that type's
+/// own doc comment in `widgets.rs` (WP-lock-pw, 2026-08-22).
+pub(crate) use widgets::LockPasswordField;
 /// `NetScanState`/`NetConnectState`/`NetConnectFailureKind` live in their
 /// own file (`network_ui.rs` — see that file's own header comment for why)
 /// but are re-exported here so every call site keeps addressing them as
