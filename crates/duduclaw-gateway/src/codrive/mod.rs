@@ -26,6 +26,9 @@
 //!   emergency stop, and the activity-feed ticker.
 //! - [`identity`] — CD-2: resolves + authorizes the `agent`-parameter
 //!   identity override for `codrive_run` ([`identity::resolve_run_identity`]).
+//! - [`registry`] — CD-4/WP-CD4a: the C-L2 third-party app API/CLI/D-Bus
+//!   action registry ([`registry::dispatch`]), tried by `step.rs` ahead of
+//!   the ordinary C-L1 coordinate dispatch.
 //!
 //! `tests.rs`/`driver.rs` are both already near this project's per-file size
 //! convention (200-400 lines typical, 800 max) — new codrive test scenarios
@@ -38,6 +41,7 @@ pub mod client;
 pub mod config;
 pub mod driver;
 pub mod identity;
+pub mod registry;
 pub mod script;
 mod step;
 
@@ -49,6 +53,9 @@ mod tests_identity;
 
 #[cfg(all(test, unix))]
 mod tests_takeover;
+
+#[cfg(all(test, unix))]
+mod tests_registry;
 
 /// Permanent `#[ignore]` live-bridge harness against the real comp
 /// container stack — see its module doc for the playbook.
@@ -62,7 +69,8 @@ pub use client::{
 pub use config::CodriveConfig;
 pub use driver::{CodriveRunReport, CodriveStepReport, run_script};
 pub use identity::{resolve_run_identity, RunIdentityError};
+pub use registry::{dispatch as registry_dispatch, DispatchOutcome as RegistryDispatchOutcome};
 pub use script::{
-    CodriveAction, CodriveConsequential, CodriveHighlight, CodriveScript, CodriveStep,
-    ConsequentialClass,
+    ApiActionRequest, CodriveAction, CodriveConsequential, CodriveHighlight, CodriveScript,
+    CodriveStep, ConsequentialClass,
 };

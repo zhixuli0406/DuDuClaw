@@ -29,6 +29,10 @@ pub const MAX_WAIT_MS: u32 = 10_000;
 /// CJK-safe char count instead of a byte count (this crate, unlike comp,
 /// has `duduclaw_core::truncate_chars` available).
 pub const MAX_TAKE_OVER_REASON_CHARS: usize = 200;
+/// `api_action.action`'s name char cap (WP-CD4a, C-L2 registry) — these are
+/// short programmatic identifiers (`"open_url"`, `"state"`, ...), not
+/// free-form narration.
+pub const MAX_API_ACTION_NAME_CHARS: usize = 64;
 
 /// The full script one `codrive_run` call executes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +57,33 @@ pub struct CodriveStep {
     pub action: CodriveAction,
     #[serde(default)]
     pub consequential: Option<CodriveConsequential>,
+    /// C-L2 (WP-CD4a, DESIGN §3.2 execution ladder rung 2): optional request
+    /// to serve this step via a registered third-party app's native API/
+    /// CLI/D-Bus action instead of clicking through the GUI. `None` (the
+    /// default — every script written before this field existed) means:
+    /// skip the registry entirely, dispatch exactly as before — zero
+    /// behavior change. When set, the driver looks it up in
+    /// `registry::APP_REGISTRY` keyed by `(CodriveScript::target_app,
+    /// action)`; a registry MISS or an exec FAILURE both fall back to this
+    /// step's own coordinate `action` above, unchanged — see
+    /// `step::try_registry_action`. `api_action` is a best-effort
+    /// accelerant layered on top of the existing C-L1 path, never a
+    /// replacement for it: this step's `action` field is still required and
+    /// still the thing that actually runs whenever C-L2 can't serve the
+    /// request.
+    #[serde(default)]
+    pub api_action: Option<ApiActionRequest>,
+}
+
+/// One C-L2 registry action request: the registered action's `name` plus
+/// its call params (validated against the action's own `params_schema` at
+/// dispatch time — see `registry.rs`). `params` defaults to `Null` for
+/// zero-param actions (e.g. NetworkManager's read-only queries).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiActionRequest {
+    pub action: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
 }
 
 /// Target highlight box (a pre-click predisplay frame, design §3.3.2(b)) —
@@ -167,6 +198,9 @@ impl CodriveScript {
                     MAX_CONSEQUENTIAL_DESC_CHARS,
                 );
             }
+            if let Some(api) = &mut step.api_action {
+                api.action = duduclaw_core::truncate_chars(api.action.trim(), MAX_API_ACTION_NAME_CHARS);
+            }
         }
         Ok(self)
     }
@@ -186,6 +220,7 @@ mod tests {
                     highlight: None,
                     action: CodriveAction::Move { x: 0.0, y: 0.0 },
                     consequential: None,
+                    api_action: None,
                 })
                 .collect(),
             watch_mode: false,
@@ -225,6 +260,34 @@ mod tests {
         s.steps[0].action = CodriveAction::Wait { ms: 999_999 };
         let s = s.sanitize().unwrap();
         assert_eq!(s.steps[0].action_wait_ms(), Some(MAX_WAIT_MS));
+    }
+
+    #[test]
+    fn api_action_name_truncated_cjk_safe() {
+        let mut s = one_step_script(1);
+        s.steps[0].api_action = Some(ApiActionRequest {
+            action: "動".repeat(MAX_API_ACTION_NAME_CHARS + 10),
+            params: serde_json::Value::Null,
+        });
+        let s = s.sanitize().unwrap();
+        assert_eq!(
+            s.steps[0].api_action.as_ref().unwrap().action.chars().count(),
+            MAX_API_ACTION_NAME_CHARS
+        );
+    }
+
+    #[test]
+    fn api_action_defaults_to_none_for_existing_scripts() {
+        // A script literal built the way every pre-C-L2 caller already
+        // writes them (no `api_action` field set in JSON) must deserialize
+        // with `api_action: None` — zero behavior change.
+        let json = serde_json::json!({
+            "target_app": "foot",
+            "task_summary": "test",
+            "steps": [{"narration": "move", "action": {"kind": "move", "x": 0.0, "y": 0.0}}],
+        });
+        let s: CodriveScript = serde_json::from_value(json).unwrap();
+        assert!(s.steps[0].api_action.is_none());
     }
 
     #[test]
