@@ -183,6 +183,7 @@ mod tests {
             name: id.to_string(),
             source: AppSource::Desktop,
             icon: None,
+            resolved_icon: None,
             exec_argv: Some(vec!["/bin/true".to_string()]),
             flatpak_id: None,
             terminal: false,

@@ -45,6 +45,8 @@ pub(crate) mod catalog;
 pub(crate) mod desktop_entry;
 pub(crate) mod feed;
 pub(crate) mod flatpak_list;
+pub(crate) mod icon_resolve;
+pub(crate) mod icon_theme;
 pub(crate) mod installed;
 
 use installed::InstalledApp;
@@ -351,6 +353,7 @@ mod tests {
             name: name.to_string(),
             source: AppSource::Desktop,
             icon: None,
+            resolved_icon: None,
             exec_argv: Some(vec!["/bin/true".to_string()]),
             flatpak_id: None,
             terminal: false,
