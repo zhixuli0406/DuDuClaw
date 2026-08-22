@@ -12,48 +12,61 @@
 //
 // ── Interaction scope, WP-A3 (2026-08-22, A-line S5 "殼整合") ──────────────
 // Round 2's "static predisplay" is gone for the query row and the app
-// section: `render()` now takes a live `query: &str` (owned by `ShellView.
+// section: `render()` takes a live `query: &str` (owned by `ShellView.
 // overlay_ui.launcher_query`, typed via `main.rs`'s root `on_key_down`
 // listener — the exact same "plain `on_key_down`, printable `key_char`
 // appends, `backspace` pops, no IME composition" pattern `duduclaw-native-
 // gui/src/text_field.rs`'s own header comment already documents and
-// accepts as an honest gap, not this file's own invention) and
-// `apps_section` filters `crate::apps::search(query)` — real substring
-// search over `fake_data::DOCK_APPS` (now doubling as this crate's whole
-// app registry, see that const's own doc comment), not two hardcoded
-// canned rows tied to one fixed demo scenario (the old `LauncherAppResult`/
-// `LAUNCHER_APP_RESULTS`, removed). A result row with a known `flatpak_id`
-// is a REAL click-to-launch button (`crate::apps::launch`, `flatpak run
-// <id>`) — today that's exactly one entry (`browser`/Chromium, see
-// `fake_data::DOCK_APPS`'s own header comment for why); every other row
-// stays a non-interactive, honestly-labeled stub, same "only wire what's
-// actually real" convention `home/home_dock.rs`'s Round 3 established for
-// the dock. The delegate card and the files section stay untouched static
-// DEMO content (task brief: "既有交辦框並存、交辦優先序不變") — see
-// `render()`'s own comment below for why they only show in the EMPTY-query
-// state rather than trying to (dishonestly) react to arbitrary typed text
-// with no real NL-delegation/file-search backend behind them yet.
+// accepts as an honest gap, not this file's own invention). The delegate
+// card and the files section stay untouched static DEMO content (task
+// brief: "既有交辦框並存、交辦優先序不變") — see `render()`'s own comment
+// below for why they only show in the EMPTY-query state rather than trying
+// to (dishonestly) react to arbitrary typed text with no real
+// NL-delegation/file-search backend behind them yet.
+//
+// ── Two app sections, two different claims (APP-1, 2026-08-22) ────────────
+// A3's app section searched `fake_data::DOCK_APPS` — six canned entries,
+// five of which had no app behind them. A user testing the real appliance
+// reported exactly what that looks like from the outside: a menu of
+// software that is not there. Both halves changed:
+//
+//   * 「應用程式」is now the REAL inventory of this machine —
+//     `crate::apps::search` over `crate::apps::feed::InstalledAppsFeed`,
+//     itself a live enumeration of `flatpak list` plus the XDG `.desktop`
+//     directories (`crate::apps::installed`). Every row is a real launch
+//     button (`crate::apps::launch`). When it is empty it SAYS why, in one
+//     of three distinct honest states (`empty_apps_line` below) — it never
+//     falls back to canned rows.
+//   * 「可安裝」is a separate, clearly-labelled section for apps this shell
+//     knows how to FETCH but that are not installed here
+//     (`crate::apps::catalog`). "Installed" and "installable" are different
+//     claims, so they are different sections and never mixed.
 //
 // ── Install confirmation gate, WP-A4-4 (2026-08-22) ───────────────────────
-// A3 left INSTALL as stated debt: a result row could LAUNCH an app it
-// already had, and that was all. A row whose registry entry names both a
-// `flatpak_id` and a `flatpak_remote` now also carries a small secondary
-// "安裝" chip. It does not install anything — it arms a confirmation sheet
-// (`overlay::install_gate`, a pure state machine with its own tests) that
-// REPLACES this panel's result list until the operator answers, naming the
-// app, the remote, the download size (or an honest "無法取得"), and where it
-// lands. Cancel drops the gate and nothing ever ran. See that module's
-// header comment for the honesty rules the type itself enforces, and
-// `crate::apps`'s "Install" section for why every install argv must carry
-// `--installation=data`.
+// A row in the 「可安裝」section carries a small "安裝" chip. It does not
+// install anything — it arms a confirmation sheet (`overlay::install_gate`,
+// a pure state machine with its own tests) that REPLACES this panel's
+// result list until the operator answers, naming the app, the remote, the
+// download size (or an honest "無法取得"), and where it lands. Cancel drops
+// the gate and nothing ever ran. See that module's header comment for the
+// honesty rules the type itself enforces, and `crate::apps`'s "Install"
+// section for why every install argv must carry `--installation=data`.
 //
-// Icon glyphs: same "single CJK character, no `gpui::svg()`" convention
-// `home.rs`'s header comment establishes (this codebase has no
-// `gpui::svg()` usage anywhere, and the bundled font stack has no
-// guaranteed pictographic glyph coverage) — the board's own search-icon SVG
-// is dropped rather than risk a tofu box, same as `home.rs`'s menu-bar bell.
-// App-result rows reuse `fake_data::DOCK_APPS`' own glyph+gradient choices
-// verbatim since the design board's Files/Mail rows use the identical icons.
+// Icon glyphs: real stroke icons since ICON-1 (2026-08-22) wherever the
+// approved boards actually draw one — the search magnifier in the query
+// row, the folder and spreadsheet in the 檔案 rows, and the globe on the
+// 可安裝 catalog row (that entry is the same Chromium the board's browser
+// tile always stood for). See `crate::icons` for the asset provenance and
+// the alpha-mask tinting constraint.
+//
+// INSTALLED app rows are the deliberate exception and still render the
+// app's own first character on the board's neutral white/outline tile: a
+// real installed app has no board colour or board icon to lift, and its
+// real icon is whatever its `.desktop` `Icon=` names, resolved against the
+// system icon theme. `apps::installed` already parses and carries that
+// value; rendering it is a SEPARATE work package going through the design
+// flow, deliberately not started here — but ICON-1's `AssetSource` and
+// `gpui::svg()` plumbing is the foundation it was blocked on.
 //
 // ── Dark theme (Shell-S1) ─────────────────────────────────────────
 // Every color below now resolves through `palette: ShellPalette` — see
@@ -80,8 +93,13 @@ use duduclaw_native_gui::theme;
 
 use super::install_gate::{GateStage, InstallGate, SizeProbe};
 use super::OverlayUiState;
-use crate::fake_data::{self, DockApp, VerifiedTier};
+use crate::apps::catalog::{self, CatalogApp};
+use crate::apps::feed::{AppsEmptyState, InstalledAppsFeed};
+use crate::apps::installed::InstalledApp;
+use crate::apps::VerifiedTier;
+use crate::fake_data;
 use crate::i18n::{t, Key, Locale};
+use crate::icons;
 use crate::palette::ShellPalette;
 use crate::ShellView;
 
@@ -95,7 +113,7 @@ const PANEL_WIDTH: f32 = 660.;
 const PANEL_LEFT: f32 = (1440. - PANEL_WIDTH) / 2.; // 390 — see header comment
 const PANEL_TOP: f32 = 170.;
 
-pub(super) fn render(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+pub(super) fn render(ui: &OverlayUiState, installed: &InstalledAppsFeed, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     let query = ui.launcher_query.as_str();
     // Launcher.dc.html: bg `rgba(255,255,255,0.97)` light / `rgba(30,30,33,
     // 0.97)` dark — `surface_raised` in both (see `home.rs`'s
@@ -155,9 +173,16 @@ pub(super) fn render(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Contex
     // still being the visually FIRST thing a fresh Launcher open shows, not
     // by forcing it to survive every possible typed query.
     if query.trim().is_empty() {
-        panel = panel.child(delegate_section(palette)).child(apps_section(query, palette, cx)).child(files_section(palette));
+        panel = panel.child(delegate_section(palette)).child(apps_section(query, installed, palette, cx));
+        if let Some(section) = maybe_catalog_section(query, installed, palette, cx) {
+            panel = panel.child(section);
+        }
+        panel = panel.child(files_section(palette));
     } else {
-        panel = panel.child(apps_section(query, palette, cx));
+        panel = panel.child(apps_section(query, installed, palette, cx));
+        if let Some(section) = maybe_catalog_section(query, installed, palette, cx) {
+            panel = panel.child(section);
+        }
     }
     panel.child(footer(palette))
 }
@@ -184,6 +209,13 @@ fn query_row(query: &str, palette: ShellPalette) -> Div {
         .py(px(18.))
         .border_b_1()
         .border_color(border_color)
+        // ICON-1: the board's leading magnifier, 19px, `#71717b` light /
+        // `#9f9fa9` dark — exactly `palette.muted_foreground` in both. This
+        // slot had NO placeholder before (there is no safe single character
+        // for a magnifier, so the original round dropped it), which is why
+        // it uses `icon_or_none`: a missing asset renders nothing rather
+        // than an invented substitute.
+        .children(icons::icon_or_none(&[(icons::SEARCH, palette.muted_foreground)], 19.))
         .child(div().text_size(px(17.)).font_weight(FontWeight::MEDIUM).text_color(text_color).child(display))
         // The blinking text cursor — static bar, no actual blink animation
         // this round (unchanged limitation from before WP-A3; only the text
@@ -269,23 +301,18 @@ fn delegate_section(palette: ShellPalette) -> Div {
     )
 }
 
-/// The Launcher's "app" result category — WP-A3: real `crate::apps::search`
-/// over `fake_data::DOCK_APPS`, not a fixed two-row demo (see this file's
-/// header comment). `cx: &mut Context<ShellView>` threaded through via a
-/// plain `for` loop, not `.iter().map(...)` — `&mut Context<V>` isn't
+/// The Launcher's 「應用程式」category — the REAL inventory of this machine
+/// (`crate::apps::search` over the live `InstalledAppsFeed`), see this
+/// file's header comment. `cx: &mut Context<ShellView>` threaded through via
+/// a plain `for` loop, not `.iter().map(...)` — `&mut Context<V>` isn't
 /// `Copy`, same wall `overlay/notifications.rs`'s own header comment
 /// documents and works around identically for its approval cards.
-fn apps_section(query: &str, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
-    let results = crate::apps::search(query);
+fn apps_section(query: &str, installed: &InstalledAppsFeed, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let results = crate::apps::search(installed.apps(), query);
     let mut section = div().pt(px(6.)).pb(px(4.)).flex().flex_col().child(section_label(fake_data::LAUNCHER_SECTION_APPS, palette));
     if results.is_empty() {
         section = section.child(
-            div()
-                .px(px(22.))
-                .py(px(8.))
-                .text_size(px(12.5))
-                .text_color(theme::alpha(palette.text_faint, 1.0))
-                .child(t(Locale::ZhTw, Key::LauncherNoAppResults)),
+            div().px(px(22.)).py(px(8.)).text_size(px(12.5)).text_color(theme::alpha(palette.text_faint, 1.0)).child(empty_apps_line(query, installed)),
         );
         return section;
     }
@@ -296,20 +323,76 @@ fn apps_section(query: &str, palette: ShellPalette, cx: &mut Context<ShellView>)
     section.child(rows)
 }
 
-fn app_result_row(item: &'static DockApp, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
-    // Same "white/near-white bordered tile -> dark gradient" exception
-    // `home/home_dock.rs::dock_app` applies — see `crate::palette`'s own
-    // header comment. Non-bordered (colored) icons keep their identity
-    // gradient in both themes.
-    let neutral_dark = item.bordered && palette.is_dark();
-    let (gradient_top, gradient_bottom) =
-        if neutral_dark { (palette.neutral_tile_top, palette.neutral_tile_bottom) } else { (item.gradient_top, item.gradient_bottom) };
+/// Which honest sentence an empty 「應用程式」list gets. Four distinct
+/// situations, four distinct answers — the point of this work package is
+/// that the shell stops pretending, so "we have not looked yet", "we
+/// looked and this machine has nothing", "we could not read the list" and
+/// "your search matched nothing" must not collapse into one message.
+fn empty_apps_line(query: &str, installed: &InstalledAppsFeed) -> &'static str {
+    if !installed.apps().is_empty() {
+        // There ARE apps; the query just matched none of them.
+        return t(Locale::ZhTw, Key::LauncherNoAppResults);
+    }
+    let _ = query;
+    match installed.empty_state() {
+        AppsEmptyState::Scanning => t(Locale::ZhTw, Key::LauncherAppsScanning),
+        AppsEmptyState::NoneInstalled => t(Locale::ZhTw, Key::LauncherAppsNoneInstalled),
+        AppsEmptyState::ReadFailed => t(Locale::ZhTw, Key::LauncherAppsReadFailed),
+    }
+}
 
-    let mut icon = div()
+/// One installed-app row. `item` is borrowed from the feed (not `'static`
+/// like the old canned array), so the click handler captures an owned clone
+/// — a handful of small structs per render pass, which is what it costs to
+/// have a list that is actually real.
+fn app_result_row(item: &InstalledApp, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    let launch_target = item.clone();
+    let row = div()
+        .id(format!("launcher-app-{}", item.id))
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .rounded(px(10.))
+        .px(px(10.))
+        .py(px(8.))
+        .child(app_tile(&item.glyph(), &[], palette))
+        .child(div().flex_1().text_size(px(13.5)).child(item.name.clone()))
+        .child(verified_badge(catalog::verified_tier(item.xdg_app_id()), palette));
+
+    let on_click = cx.listener(move |_view, _ev, _window, _cx| {
+        if crate::diag_enabled() {
+            eprintln!("[hit] launcher app row '{}' -> launch", launch_target.id);
+        }
+        crate::apps::launch(&launch_target);
+    });
+    row.cursor_pointer().hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0))).on_click(on_click)
+}
+
+/// The 30px neutral app tile every result row uses. Reproduces the design
+/// board's own white/outline tile treatment (the one it uses for Files and
+/// Browser) in both themes — a real installed app has no board colour to
+/// lift, and inventing a per-app palette would be decoration masquerading
+/// as identity.
+///
+/// ICON-1 (2026-08-22): `layers` is the board's own stroke icon for this
+/// tile when one exists (today: the catalog's Chromium globe), and empty
+/// for an installed app, which falls back to `glyph` — its own first
+/// character — exactly as before. Empty is the normal case, not a failure:
+/// see this file's header comment on why a real app's icon has to come
+/// from its `Icon=` rather than from the board.
+fn app_tile(glyph: &str, layers: &[icons::Layer], palette: ShellPalette) -> Div {
+    let dark = palette.is_dark();
+    let (gradient_top, gradient_bottom) =
+        if dark { (palette.neutral_tile_top, palette.neutral_tile_bottom) } else { (0xffffff, 0xedeff4) };
+    let border_color = if dark { palette.neutral_tile_border } else { theme::alpha(theme::light::SURFACE_BORDER, 1.0) };
+    let text_color = if dark { theme::alpha(0xb0b0b8, 1.0) } else { theme::alpha(palette.foreground, 0.55) };
+    div()
         .w(px(30.))
         .h(px(30.))
         .rounded(px(8.))
         .bg(linear_gradient(180.0, linear_color_stop(rgb(gradient_top), 0.0), linear_color_stop(rgb(gradient_bottom), 1.0)))
+        .border_1()
+        .border_color(border_color)
         .flex()
         .items_center()
         .justify_center()
@@ -320,68 +403,68 @@ fn app_result_row(item: &'static DockApp, palette: ShellPalette, cx: &mut Contex
         // colored, averaging to `.14`) as one flat number — kept exactly
         // (light must stay byte-identical). Dark mirrors the same
         // averaging strategy over ITS OWN two board values (`.30`/`.35`
-        // -> `.32`), rather than discriminating by `item.bordered` (which
-        // light's own code never did either).
+        // -> `.32`).
         .shadow(palette.icon_shadow(0.14, 0.32))
-        .child(item.glyph);
-    icon = if neutral_dark {
-        icon.text_color(theme::alpha(0xb0b0b8, 1.0))
-    } else {
-        icon.text_color(theme::alpha(palette.foreground, if item.bordered { 0.55 } else { 1.0 }))
-    };
-    if item.bordered {
-        let border_color = if palette.is_dark() { palette.neutral_tile_border } else { theme::alpha(theme::light::SURFACE_BORDER, 1.0) };
-        icon = icon.border_1().border_color(border_color);
-    }
+        .text_color(text_color)
+        .child(match icons::icon_or_none(layers, 17.) {
+            Some(icon) => icon,
+            None => glyph.to_string().into_any_element(),
+        })
+}
 
-    let mut row = div()
-        .id(item.id)
+/// The 「可安裝」section — apps this shell knows how to fetch that are NOT
+/// already on this machine (`crate::apps::catalog`). Rendered as its own
+/// labelled section, never mixed into the inventory above it: "installed"
+/// and "installable" are different claims. Renders NOTHING at all when
+/// every catalog entry matching the query is already installed, rather than
+/// an empty heading.
+fn maybe_catalog_section(query: &str, installed: &InstalledAppsFeed, palette: ShellPalette, cx: &mut Context<ShellView>) -> Option<Div> {
+    let candidates: Vec<&'static CatalogApp> = catalog::search(query).into_iter().filter(|entry| !installed.contains_id(entry.flatpak_id)).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut rows = div().flex().flex_col().px(px(12.));
+    for entry in candidates {
+        rows = rows.child(catalog_result_row(entry, palette, cx));
+    }
+    Some(
+        div()
+            .pt(px(6.))
+            .pb(px(4.))
+            .flex()
+            .flex_col()
+            .child(section_label(t(Locale::ZhTw, Key::LauncherSectionInstallable), palette))
+            .child(rows),
+    )
+}
+
+/// One installable-catalog row. Deliberately NOT clickable as a whole: the
+/// row means "this could be fetched", and the only action it offers is the
+/// explicit 安裝 chip, which arms the confirmation sheet. An installed-app
+/// row's click means launch; conflating the two would make a single click
+/// ambiguous about whether it downloads 2.4 GB.
+fn catalog_result_row(entry: &'static CatalogApp, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    div()
+        .id(entry.id)
         .flex()
         .items_center()
         .gap(px(12.))
         .rounded(px(10.))
         .px(px(10.))
         .py(px(8.))
-        .child(icon)
-        .child(div().flex_1().text_size(px(13.5)).child(item.label));
-
-    // WP-A4-4: a row this shell could actually INSTALL gets a secondary
-    // button next to its Verified badge. It is deliberately a separate,
-    // explicitly-labelled control rather than a second meaning for the row
-    // click — installing and launching are not interchangeable, and the row
-    // click has meant "launch" since A3. The button only ARMS the
-    // confirmation sheet; nothing is downloaded or written until the sheet
-    // itself is confirmed (`overlay::install_gate`).
-    if item.flatpak_id.is_some() && item.flatpak_remote.is_some() {
-        row = row.child(install_button(item, palette, cx));
-    }
-    row = row.child(verified_badge(item.verified, palette));
-
-    // Only a row with a real launch command is a real button — every other
-    // entry stays an honest, non-interactive stub (see this file's header
-    // comment). `item` is `&'static DockApp` (a reference into `fake_data::
-    // DOCK_APPS`), `Copy`, so it captures into `move` with no lifetime/clone
-    // ceremony.
-    if item.flatpak_id.is_some() {
-        let on_click = cx.listener(move |_view, _ev, _window, _cx| {
-            if crate::diag_enabled() {
-                eprintln!("[hit] launcher app row '{}' -> launch", item.id);
-            }
-            crate::apps::launch(item);
-        });
-        row = row.cursor_pointer().hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0))).on_click(on_click);
-    }
-    row
+        .child(app_tile(entry.glyph, &icons::catalog_layers(entry.id, palette).unwrap_or_default(), palette))
+        .child(div().flex_1().text_size(px(13.5)).child(entry.label))
+        .child(install_button(entry, palette, cx))
+        .child(verified_badge(entry.verified, palette))
 }
 
 // ── Install confirmation gate (WP-A4-4, 2026-08-22) ─────────────────────
 
-/// The secondary "安裝" control on an installable result row. Arms the
+/// The secondary "安裝" control on an installable-catalog row. Arms the
 /// confirmation sheet and kicks off the size probe — it does NOT install
 /// anything. Styled as a quiet outlined chip (same neutral treatment
-/// `overlay/notifications.rs`'s own secondary buttons use) so it never
-/// competes visually with the row itself, which still means "launch".
-fn install_button(item: &'static DockApp, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+/// `overlay/notifications.rs`'s own secondary buttons use).
+fn install_button(item: &'static CatalogApp, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     let bg = if palette.is_dark() { palette.surface_hover } else { palette.surface_raised };
     let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.14).into() } else { palette.border() };
     let on_click = cx.listener(move |view, _ev, _window, cx| {
@@ -406,13 +489,11 @@ fn install_button(item: &'static DockApp, palette: ShellPalette, cx: &mut Contex
 }
 
 /// Arms the gate and dispatches the (blocking) size probe on a background
-/// thread. A `DockApp` with no `flatpak_id`/`flatpak_remote` produces no
-/// gate at all (`InstallGate::open` returns `None`) — the button is only
-/// rendered for entries that have both, so this is belt-and-suspenders.
-fn open_install_gate(item: &'static DockApp, view: &mut ShellView, cx: &mut Context<ShellView>) {
-    let Some(gate) = InstallGate::open(item, crate::apps::INSTALL_DESTINATION_LABEL.to_string()) else {
-        return;
-    };
+/// thread. Infallible since APP-1: a `CatalogApp` cannot exist without a
+/// real ref and remote, so there is no "could not open a gate" case left
+/// (see `overlay::install_gate`'s own APP-1 note).
+fn open_install_gate(item: &'static CatalogApp, view: &mut ShellView, cx: &mut Context<ShellView>) {
+    let gate = InstallGate::open(item, crate::apps::INSTALL_DESTINATION_LABEL.to_string());
     let (remote, flatpak_id, app_id) = (gate.remote, gate.flatpak_id, gate.app_id);
     view.overlay_ui.install_gate = Some(gate);
     cx.notify();
@@ -462,11 +543,18 @@ fn install_sheet(gate: &InstallGate, palette: ShellPalette, cx: &mut Context<She
                 .flex()
                 .items_center()
                 .gap(px(12.))
-                // The app's OWN existing glyph — no new pictogram is
-                // introduced here; this crate has zero emoji and no
-                // `gpui::svg()` usage to draw a stroke icon with (see
-                // `home.rs`'s header comment on that gap).
-                .child(div().text_size(px(20.)).text_color(theme::alpha(palette.text_secondary, 1.0)).child(gate.glyph))
+                // ICON-1: the catalog entry's own board icon (the same one
+                // its result row shows, so the sheet is visibly about the
+                // app just clicked), falling back to that entry's `glyph`
+                // character. No NEW pictogram is introduced here either
+                // way — this sheet still never invents an icon of its own.
+                .child(
+                    div().text_size(px(20.)).text_color(theme::alpha(palette.text_secondary, 1.0)).child(icons::icon_or_glyph(
+                        &icons::catalog_layers(gate.app_id, palette).unwrap_or_default(),
+                        20.,
+                        gate.glyph,
+                    )),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -719,7 +807,18 @@ fn file_result_row(item: &fake_data::LauncherFileResult, palette: ShellPalette) 
                 // documents for dock/app-tile colors (a folder is blue, an
                 // xlsx is green, regardless of theme).
                 .text_color(theme::alpha(item.glyph_hex, 1.0))
-                .child(item.glyph),
+                // ICON-1: the board's own file-type icons — a filled blue
+                // folder, and a green spreadsheet with white rules over it
+                // (two stacked layers, since gpui paints one SVG in one
+                // color; see `crate::icons`' header comment). Both keep the
+                // row's IDENTITY `glyph_hex` rather than a theme token, per
+                // the note just above. Falls back to the "夾"/"表"
+                // placeholder if an asset goes missing.
+                .child(icons::icon_or_glyph(
+                    &icons::launcher_file_layers(item.id, item.glyph_hex, palette).unwrap_or_default(),
+                    20.,
+                    item.glyph,
+                )),
         )
         .child(div().flex_1().text_size(px(13.5)).child(item.label))
         .child(div().text_size(px(11.)).text_color(theme::alpha(palette.text_faint, 1.0)).child(item.meta))

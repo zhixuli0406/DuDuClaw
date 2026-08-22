@@ -88,6 +88,7 @@ mod fake_data;
 mod gateway_client;
 mod home;
 mod i18n;
+mod icons;
 mod lockscreen;
 mod oobe;
 mod overlay;
@@ -99,6 +100,8 @@ use gpui::{
     MouseDownEvent, Render, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
+
+use duduclaw_native_gui::theme;
 
 use surface::{Overlay, SurfaceState};
 
@@ -170,6 +173,17 @@ pub struct ShellView {
     /// establishes for approvals — see `home::running_windows::
     /// RunningWindowsFeed`'s own header comment.
     pub(crate) running_windows: home::running_windows::RunningWindowsFeed,
+    /// APP-1 (2026-08-22) — the REAL list of applications installed on this
+    /// machine (`flatpak list` + the XDG `.desktop` directories, merged),
+    /// scanned on a cadence off the render thread. Read by BOTH the dock
+    /// (`home::home_dock::dock`) and the Launcher's app-search section
+    /// (`overlay::launcher`), same "one model, read by whatever surfaces
+    /// need it" shape `running_windows`/`overlay_ui.notifications` already
+    /// establish — see `apps::feed::InstalledAppsFeed`'s own header comment.
+    /// Replaces `fake_data::DOCK_APPS`, the canned six-entry array both
+    /// surfaces used to render (five of whose entries had no app behind
+    /// them at all).
+    pub(crate) installed_apps: apps::feed::InstalledAppsFeed,
     /// WP-lock-pw (2026-08-22) — the lockscreen's real password-entry
     /// `Entity<OobeTextField>`, same "created once, unconditionally, at
     /// window-open time" precedent `oobe_account_fields`/`oobe_network_fields`
@@ -390,6 +404,20 @@ impl Render for ShellView {
         }
         let mut root = div()
             .id("shell-root")
+            // ICON-1 (2026-08-22): the other half of the font fix. Loading
+            // the faces into the text system (see `main`'s `add_fonts`
+            // call) only makes them AVAILABLE — gpui still lays every glyph
+            // out in its platform default family until something asks for
+            // one, and until this round nothing in this crate ever did (no
+            // `.font(...)`/`.font_family(...)` call existed anywhere in
+            // `src/`). Set once on the root, where it cascades to OOBE, the
+            // lockscreen, Home and every overlay alike — the same single
+            // call site `duduclaw-native-gui/src/main.rs:392` uses for its
+            // own root. `theme::app_font()` resolves to the "Inter
+            // Variable" family with "Noto Sans TC" as its per-glyph
+            // fallback (see that function's own doc comment for how the
+            // family names were verified against the TTFs' name tables).
+            .font(theme::app_font())
             .track_focus(&self.focus_handle)
             .key_context("Shell")
             .on_action(cx.listener(Self::on_toggle_launcher))
@@ -429,9 +457,12 @@ impl Render for ShellView {
             // `backspace` pops, no IME composition" pattern `duduclaw-
             // native-gui/src/text_field.rs`'s own header comment documents
             // and accepts as an honest gap — composing CJK text into this
-            // box will not work correctly, only ASCII search terms (which
-            // is exactly what `fake_data::DockApp::search_key` is for, see
-            // that field's own doc comment).
+            // box will not work correctly, only ASCII search terms. APP-1
+            // (2026-08-22) softened that: `apps::installed::InstalledApp::
+            // search_key` folds each app's id, generic name and `Keywords=`
+            // into the haystack alongside its (possibly CJK) display name,
+            // so a zh-TW-named app is still reachable by typing its ASCII
+            // id or an English keyword — see that field's own doc comment.
             .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _window, cx| {
                 if view.oobe.is_some() || view.lockscreen.is_locked() {
                     return;
@@ -502,7 +533,7 @@ impl Render for ShellView {
             // above — an immutable borrow of one `self` field alongside
             // `cx` (a separate parameter, not a second borrow of `self`),
             // same shape, no conflict.
-            root.child(home::render(home_palette, &self.overlay_ui.notifications, &self.running_windows, cx))
+            root.child(home::render(home_palette, &self.overlay_ui.notifications, &self.running_windows, &self.installed_apps, cx))
         };
         if self.diag {
             root = root
@@ -545,7 +576,7 @@ impl Render for ShellView {
                     view.overlay_ui.close_launcher_query();
                     cx.notify();
                 });
-                root = root.child(overlay::render(active, &self.overlay_ui, &self.audio_ui, home_palette, on_close, cx));
+                root = root.child(overlay::render(active, &self.overlay_ui, &self.audio_ui, &self.installed_apps, home_palette, on_close, cx));
             }
         }
         root
@@ -594,7 +625,53 @@ impl Render for ShellView {
 fn main() {
     eprintln!("[main] starting duduclaw-shell S0");
 
-    application().run(move |cx: &mut App| {
+    // ICON-1 (2026-08-22): the shell's embedded SVG asset source. This is
+    // the ONLY point where it can be installed — `Application::with_assets`
+    // (`gpui/src/app.rs:200`) consumes the pre-launch `Application` value
+    // and rebuilds the `SvgRenderer` around the new source; there is no
+    // post-`run()` equivalent. Without it gpui's default `impl AssetSource
+    // for ()` answers `Ok(None)` to every path, which is why `gpui::svg()`
+    // could never have drawn anything in this crate before now.
+    application().with_assets(icons::ShellAssets).run(move |cx: &mut App| {
+        // ICON-1 (2026-08-22): the bundled font stack. Two facts made this
+        // necessary and neither was true of the comment it replaces
+        // (`home.rs` used to record "duduclaw-native-gui's main.rs loads
+        // these"):
+        //   1. On the appliance the kiosk unit launches THIS binary
+        //      directly (`appliance/mkosi.extra/usr/local/sbin/
+        //      duduclaw-kiosk-launch.sh`); `duduclaw-native-gui`'s `main.rs`
+        //      never runs there, so nothing it registers reaches the shell.
+        //   2. The appliance image ships neither face — `fc-match
+        //      sans-serif` there resolves to DejaVu Sans, and its CJK
+        //      coverage is Noto Sans CJK TC, not the Noto Sans TC the
+        //      boards specify. Every screen the operator has seen so far
+        //      rendered in those substitutes.
+        //
+        // Placed FIRST inside `run`, ahead of `open_window` — the same
+        // ordering (and the same reason) `duduclaw-native-gui/src/main.rs`
+        // documents at its own `add_fonts` call: text laid out before
+        // `add_fonts` returns resolves against gpui's system-font default
+        // and never re-flows onto the bundled faces afterwards.
+        //
+        // The bytes come from `duduclaw-native-gui`'s lib rather than a
+        // second copy checked in here: they are the SAME two faces
+        // `theme::app_font()` names, that function already lives in that
+        // module, and a duplicated 12.8 MB TTF in a second `assets/` tree
+        // is exactly the kind of divergence `duduclaw-native-gui/src/lib.rs`
+        // was created to prevent ("not a bin-local copy plus a lib-local
+        // copy silently diverging"). Loading them is only half the fix —
+        // `Render::render` also has to ASK for the family, see the
+        // `.font(theme::app_font())` call on the root element there.
+        //
+        // Fail-open, same shape as that crate's own call site: a font
+        // failure degrades this run to the system fallback (exactly today's
+        // behavior) and is logged loudly; it must never stop the window
+        // from opening.
+        match cx.text_system().add_fonts(theme::bundled_font_bytes()) {
+            Ok(()) => eprintln!("[main] add_fonts ok: InterVariable + NotoSansTC-Variable loaded"),
+            Err(e) => eprintln!("[main] add_fonts FAILED (falling back to system font): {e}"),
+        }
+
         let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
 
         // OOBE boot-entry resolution — see `oobe::resolve_boot_flow`'s own
@@ -645,6 +722,7 @@ fn main() {
                         audio_ui: audio::AudioUiState::default(),
                         lockscreen: lockscreen::LockScreenState::default(),
                         running_windows: home::running_windows::RunningWindowsFeed::default(),
+                        installed_apps: apps::feed::InstalledAppsFeed::default(),
                         lockscreen_password_field,
                         oobe: initial_oobe,
                         oobe_ui: oobe::OobeUiState::default(),
@@ -746,4 +824,40 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// ICON-1 (2026-08-22) — the second half of the font fix, guarded.
+    ///
+    /// Registering the bundled faces with `add_fonts` and ASKING for them
+    /// with `.font(...)` are independent, and getting only the first right
+    /// is silent: `add_fonts` logs "ok", every screen still renders in the
+    /// platform default, and nothing anywhere reports a problem. That was
+    /// literally this crate's state until this round — `grep -r 'font_family\|\.font('
+    /// src/` returned nothing at all.
+    ///
+    /// A source-text assertion is a crude instrument and is not pretending
+    /// otherwise: it cannot prove the element reaches the screen (that is
+    /// what the live visual check is for). What it CAN do is fail loudly if
+    /// the one call this crate depends on is deleted or renamed, which is
+    /// the specific regression that would otherwise be invisible. gpui has
+    /// no way to interrogate a rendered element tree's resolved font from a
+    /// plain unit test, and standing up a `TestAppContext` to open a window
+    /// for one assertion buys no more certainty than the visual check
+    /// already gives.
+    #[test]
+    fn the_root_element_applies_the_bundled_font() {
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains(".font(theme::app_font())"),
+            "the shell root no longer applies theme::app_font() — every screen would silently \
+             fall back to the platform default family (see this test's own doc comment)"
+        );
+        assert!(
+            source.contains("add_fonts(theme::bundled_font_bytes())"),
+            "the shell no longer registers the bundled faces — .font(app_font()) would then \
+             resolve to nothing and fall back to the platform default"
+        );
+    }
 }

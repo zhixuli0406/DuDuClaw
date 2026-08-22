@@ -1,8 +1,10 @@
 // Fake data for the Home surface — Shell-S0 prototype convention (see
 // `duduclaw-native-gui/src/nav.rs`'s "placeholder icon: an uppercase letter
-// + a fixed accent color, real iconography deferred" precedent, and this
-// crate's own `home.rs` doc comment for why real vector icons aren't drawn
-// this round either). Content is lifted verbatim (zh-TW copy, hex colors,
+// + a fixed accent color, real iconography deferred" precedent). The
+// `glyph` fields below are no longer what actually draws in most of those
+// slots: ICON-1 (2026-08-22) wired the approved boards' own stroke icons in
+// via `crate::icons`, and each `glyph` is now the FALLBACK for its slot.
+// Content is lifted verbatim (zh-TW copy, hex colors,
 // counts) from the visual spec
 // (`commercial/design/duduclaw-os-desktop/Main.dc.html`) — nothing here is
 // wired to a live gateway/agent yet, matching the task brief's "假資料
@@ -13,196 +15,31 @@
 // `screens::prototypes` module keeps between its static page data and
 // rendering.
 
-/// One dock "app" launcher icon (not an agent — see `DockAgent` below for
-/// those). `glyph` is a short zh-TW placeholder LABEL, not a real vector
-/// icon: this codebase has no `gpui::svg()` usage anywhere yet to redraw
-/// the design board's literal icon paths (mail envelope / folder / globe /
-/// music / chat bubble / calendar), and inventing a one-off icon set for a
-/// six-item dock is out of scope for an S0 skeleton — same "letter + color"
-/// stand-in convention `duduclaw-native-gui/src/nav.rs` already
-/// established for its own sidebar rows, reused here rather than a new one.
-///
-/// WP-A3 (2026-08-22, A-line S5 shell integration): this doubles as the
-/// shell's whole "app registry" now — `crate::apps::search` filters this
-/// SAME array for the Launcher's live app-search results (the old separate
-/// `LauncherAppResult`/`LAUNCHER_APP_RESULTS` — two canned rows tied to one
-/// fixed demo query — were removed rather than kept as a second, divergent
-/// catalog; see `overlay/launcher.rs`'s header comment). `label`/
-/// `search_key` are new for that: `label` is what a result row displays,
-/// `search_key` is a lowercase ASCII alias list a typed query matches
-/// against (this crate's Launcher has no CJK IME composition yet — see
-/// `overlay/launcher.rs`'s own header comment — so an ASCII alias is the
-/// only honest way to make a CJK-labeled entry actually findable by typing).
-/// `flatpak_id`/`verified` are the other two additions: `flatpak_id` is
-/// `Some(<app id>)` only for an entry this crate can ACTUALLY launch
-/// (`crate::apps::launch`, `flatpak run <id>`) and has real evidence for —
-/// today that's exactly one entry (`browser`/Chromium, A2's finding, see
-/// that field's own inline comment below) — every other entry is an
-/// honest `None` display-only stub, not a fake launch button. `verified` is
-/// this shell's first UI surface for the D8 "DuDuClaw Verified" four-tier
-/// rating (`commercial/docs/DESIGN-app-compat-layer-2026-08.md` §3) — a
-/// data field + badge render, not a real automated eval pipeline (that's
-/// application-layer S8 scope); an entry with no rating evidence is
-/// `VerifiedTier::Unrated`, never a guessed tier.
-pub struct DockApp {
-    pub id: &'static str,
-    pub glyph: &'static str,
-    /// Squircle gradient, top → bottom (`linear-gradient(180deg, top,
-    /// bottom)` in the design board — `home.rs` reproduces this with
-    /// `gpui::linear_gradient(180.0, ...)`, same angle convention CSS uses).
-    pub gradient_top: u32,
-    pub gradient_bottom: u32,
-    /// White/light-outline apps (Files, Browser in the design board) need a
-    /// visible 1px border since their gradient is near-white-on-white;
-    /// colored apps don't have one in the design.
-    pub bordered: bool,
-    /// Display name for a Launcher search-result row (dock icons never show
-    /// this — they stay glyph-only, unchanged from before WP-A3).
-    pub label: &'static str,
-    /// Lowercase ASCII search alias(es), space-separated — see this
-    /// struct's own header comment for why an ASCII key exists alongside a
-    /// CJK `label`.
-    pub search_key: &'static str,
-    /// `Some(<flatpak application id>)` when `crate::apps::launch` can
-    /// actually spawn this app; `None` is an honest "no known launch
-    /// command yet" stub, not a disabled button — see this struct's own
-    /// header comment.
-    pub flatpak_id: Option<&'static str>,
-    /// Which flatpak REMOTE this app would be installed from — WP-A4-4
-    /// (2026-08-22), needed by the install confirmation gate
-    /// (`overlay::install_gate`), which has to name a real source rather
-    /// than assume one. `None` wherever `flatpak_id` is `None` (nothing to
-    /// install), and deliberately a per-entry value rather than a
-    /// crate-wide "flathub" default: "which remote does this come from" is
-    /// registry DATA, and defaulting it would be inventing a fact about
-    /// every future entry.
-    pub flatpak_remote: Option<&'static str>,
-    pub verified: VerifiedTier,
-}
-
-/// WP-A3 (2026-08-22): the D8 "DuDuClaw Verified" four-tier compatibility
-/// rating (`commercial/docs/DESIGN-app-compat-layer-2026-08.md` §3), plus a
-/// fifth `Unrated` state this crate adds for "no rating evidence exists
-/// yet" — the design doc's own four tiers are all "has SOME evidence", so
-/// an entry with none needs a distinct state rather than being forced into
-/// the nearest tier (which would misrepresent a guess as a rating).
-/// `Copy`/`PartialEq`/`Eq`, same "plain, gpui-free data" discipline this
-/// file's other enums (`BadgeKind`, `AgentDockStatus`) already hold to —
-/// `crate::palette::ShellPalette::verified_bg`/`verified_text`/
-/// `verified_accent_dot` resolve the actual per-theme colors,
-/// `overlay/launcher.rs`/`home/home_dock.rs` render them.
-// `Verified`/`Partial`/`Unsupported` are never CONSTRUCTED by any current
-// `DockApp` entry (only `Works`/`Unrated` are, see `DOCK_APPS`'s own doc
-// comment on the honest "exactly one real entry" boundary) — but every
-// downstream consumer (`crate::palette::ShellPalette::verified_bg`/
-// `verified_text`/`verified_accent_dot`, `overlay/launcher.rs::
-// verified_badge`) already matches on all five variants exhaustively, ready
-// for the day a second app gets real rating evidence. `#[allow(dead_code)]`
-// here is the honest choice over either (a) fabricating a fake `Verified`/
-// `Partial`/`Unsupported` registry entry just to silence the lint, or (b)
-// deleting three-fifths of the D8 spec's own tier vocabulary because
-// nothing uses it YET.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifiedTier {
-    /// "開箱即用零設定" — D8 §3 top tier.
-    Verified,
-    /// "需官方預置 workaround" — D8 §3 second tier.
-    Works,
-    /// "能用但明列缺什麼" — D8 §3 third tier.
-    Partial,
-    /// "不能用" — D8 §3 bottom tier.
-    Unsupported,
-    /// Not a D8 tier — this crate's own "no rating evidence exists" state,
-    /// see this enum's own header comment.
-    Unrated,
-}
-
-pub const DOCK_APPS: &[DockApp] = &[
-    DockApp {
-        id: "mail",
-        glyph: "信",
-        gradient_top: 0x4facf7,
-        gradient_bottom: 0x1868df,
-        bordered: false,
-        label: "信箱",
-        search_key: "mail email 信箱",
-        // Conceptual dock icon lifted from the design board — no real Mail
-        // app exists behind it yet, so honestly `None` rather than a fake
-        // launch button. Same for photos/chat/calendar below.
-        flatpak_id: None,
-        flatpak_remote: None,
-        verified: VerifiedTier::Unrated,
-    },
-    DockApp {
-        id: "files",
-        glyph: "夾",
-        gradient_top: 0xffffff,
-        gradient_bottom: 0xedeff4,
-        bordered: true,
-        label: "文件",
-        search_key: "files folder docs 文件 檔案",
-        flatpak_id: None,
-        flatpak_remote: None,
-        verified: VerifiedTier::Unrated,
-    },
-    DockApp {
-        id: "browser",
-        glyph: "網",
-        gradient_top: 0xffffff,
-        gradient_bottom: 0xedeff4,
-        bordered: true,
-        label: "瀏覽器",
-        search_key: "browser chromium chrome web 瀏覽器",
-        // A2 investigation (`research/native-os-2026-08/flatpak-portal-
-        // scope-2026-08.md` §3, `org.chromium.Chromium`): real container-
-        // level PASS — zero portal backend, the window still mapped into
-        // duduclaw-comp's space and closed cleanly. The ONLY entry in this
-        // array with real launch evidence behind it.
-        flatpak_id: Some("org.chromium.Chromium"),
-        // Flathub is where A2's own container PASS pulled this exact ref
-        // from (`research/native-os-2026-08/flatpak-portal-scope-2026-08.md`
-        // §3) — recorded, not assumed.
-        flatpak_remote: Some("flathub"),
-        verified: VerifiedTier::Works,
-    },
-    DockApp {
-        id: "photos",
-        glyph: "圖",
-        gradient_top: 0xff6b81,
-        gradient_bottom: 0xe0335a,
-        bordered: false,
-        label: "圖片",
-        search_key: "photos gallery image 圖片",
-        flatpak_id: None,
-        flatpak_remote: None,
-        verified: VerifiedTier::Unrated,
-    },
-    DockApp {
-        id: "chat",
-        glyph: "訊",
-        gradient_top: 0x8b5cf6,
-        gradient_bottom: 0x5b34d6,
-        bordered: false,
-        label: "訊息",
-        search_key: "chat message 訊息",
-        flatpak_id: None,
-        flatpak_remote: None,
-        verified: VerifiedTier::Unrated,
-    },
-    DockApp {
-        id: "calendar",
-        glyph: "曆",
-        gradient_top: 0x43b6f8,
-        gradient_bottom: 0x0d84d8,
-        bordered: false,
-        label: "行事曆",
-        search_key: "calendar schedule 行事曆",
-        flatpak_id: None,
-        flatpak_remote: None,
-        verified: VerifiedTier::Unrated,
-    },
-];
+// ── `DockApp` / `DOCK_APPS` were REMOVED in APP-1 (2026-08-22) ──────────
+// They used to be this crate's whole "app registry": six hand-authored
+// entries lifted from the design board (信箱/文件/瀏覽器/圖片/訊息/行事曆),
+// five of which had no real app behind them. Both the dock and the
+// Launcher's app-search rendered them, so on a real appliance the operator
+// was reading a menu of software that was not installed — reported from the
+// VM, and the reason this work package exists.
+//
+// What replaced them:
+//   * the real inventory — `crate::apps::installed` (flatpak + XDG
+//     `.desktop` enumeration), held in `crate::apps::feed::
+//     InstalledAppsFeed`, rendered by `home/home_dock.rs` and
+//     `overlay/launcher.rs`. Nothing falls back to canned entries when it
+//     is empty or fails.
+//   * the one non-fictional thing that array carried — a real flatpak ref
+//     plus its remote, which an inventory cannot express for an app that is
+//     not installed yet — now `crate::apps::catalog::INSTALL_CATALOG`, the
+//     installable catalog behind the Launcher's separate 「可安裝」section.
+//   * `VerifiedTier` moved to `crate::apps` (it is now a live lookup over
+//     real apps, `crate::apps::catalog::verified_tier`, not a per-row
+//     constant in a canned array).
+//
+// This file keeps only genuinely decorative board content — goal cards, the
+// activity shelf, menu strings, the ControlCenter tiles. The app list is no
+// longer part of it.
 
 /// A pinned agent avatar in the dock (right of the app icons, after the
 /// divider) — the design board's "杜"/"財" circles. The small corner status
@@ -483,11 +320,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dock_apps_has_six_entries_matching_the_design_board() {
-        assert_eq!(DOCK_APPS.len(), 6);
-    }
-
-    #[test]
     fn dock_agents_has_two_entries_matching_the_design_board() {
         assert_eq!(DOCK_AGENTS.len(), 2);
     }
@@ -514,12 +346,6 @@ mod tests {
 
     #[test]
     fn no_field_is_empty() {
-        for app in DOCK_APPS {
-            assert!(!app.id.is_empty());
-            assert!(!app.glyph.is_empty());
-            assert!(!app.label.is_empty());
-            assert!(!app.search_key.is_empty());
-        }
         for agent in DOCK_AGENTS {
             assert!(!agent.id.is_empty());
             assert!(!agent.initial.is_empty());
@@ -544,14 +370,6 @@ mod tests {
         assert!(!BATTERY_PCT.is_empty());
         assert!(!CLOCK.is_empty());
         assert!(!MENU_BRAND.is_empty());
-    }
-
-    #[test]
-    fn dock_app_ids_are_unique() {
-        let mut ids: Vec<&str> = DOCK_APPS.iter().map(|a| a.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), DOCK_APPS.len());
     }
 
     #[test]
@@ -581,25 +399,6 @@ mod tests {
         // variant fails loudly here rather than silently in the renderer.
         assert_eq!(format!("{:?}", AgentDockStatus::Running), "Running");
         assert_eq!(format!("{:?}", AgentDockStatus::NeedsHuman), "NeedsHuman");
-    }
-
-    // ── App registry / Verified tier (WP-A3) ────────────────────────────────
-
-    #[test]
-    fn exactly_one_entry_has_real_launch_evidence() {
-        // Pins the honest current boundary this file's `DockApp` header
-        // comment documents: only `browser` (A2's Chromium finding) has a
-        // real `flatpak_id` + a non-`Unrated` tier. A future round adding a
-        // second verified app should update this assertion deliberately,
-        // not silently drift past it.
-        let launchable: Vec<&DockApp> = DOCK_APPS.iter().filter(|a| a.flatpak_id.is_some()).collect();
-        assert_eq!(launchable.len(), 1);
-        assert_eq!(launchable[0].id, "browser");
-        assert_eq!(launchable[0].verified, VerifiedTier::Works);
-        for app in DOCK_APPS.iter().filter(|a| a.id != "browser") {
-            assert_eq!(app.flatpak_id, None, "{} should have no launch evidence", app.id);
-            assert_eq!(app.verified, VerifiedTier::Unrated, "{} should be unrated", app.id);
-        }
     }
 
     // ── Launcher ─────────────────────────────────────────────────────────

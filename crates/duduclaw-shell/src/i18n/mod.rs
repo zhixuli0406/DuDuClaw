@@ -254,6 +254,22 @@ pub enum Key {
     /// Verified badge).
     LauncherSearchPlaceholder,
     LauncherNoAppResults,
+    /// APP-1 (2026-08-22): the app list stopped being a canned array and
+    /// became a real enumeration of this machine, which introduces three
+    /// genuinely new honest states an empty list can be in — and they are
+    /// three different facts, so they get three different sentences rather
+    /// than one shrug (see `apps::feed::AppsEmptyState`). Same "honest-state
+    /// messaging is process chrome, not per-item design CONTENT" boundary
+    /// the `Notif*`/`Launcher*` keys above already draw. None of them leaks
+    /// an internal detail (no `flatpak`, no `--installation=data`, no XDG
+    /// path) — the operator is told what is true, in their own vocabulary.
+    LauncherAppsScanning,
+    LauncherAppsNoneInstalled,
+    LauncherAppsReadFailed,
+    /// Section heading for the Launcher's installable-catalog rows
+    /// (`apps::catalog`) — new chrome with no design-board precedent (the
+    /// boards only ever showed 交辦/應用程式/檔案).
+    LauncherSectionInstallable,
     /// WP-A4-4 (2026-08-22): the flatpak install confirmation gate
     /// (`overlay::install_gate`). All new chrome with no design-board
     /// precedent — the boards never show an install flow — so it routes
@@ -434,6 +450,10 @@ fn zh_tw(key: Key) -> &'static str {
 
         Key::LauncherSearchPlaceholder => "輸入以搜尋…",
         Key::LauncherNoAppResults => "沒有符合的 app",
+        Key::LauncherAppsScanning => "正在尋找這台機器上的應用程式…",
+        Key::LauncherAppsNoneInstalled => "這台機器上還沒有可以開啟的應用程式",
+        Key::LauncherAppsReadFailed => "讀不到這台機器上的應用程式清單",
+        Key::LauncherSectionInstallable => "可安裝",
         Key::LauncherInstallButton => "安裝",
         Key::InstallGateTitle => "要安裝這個 app 嗎？",
         Key::InstallGateNotice => "安裝會下載檔案並改變這台機器的內容。確定前不會執行任何動作。",
@@ -582,6 +602,10 @@ fn en(key: Key) -> &'static str {
 
         Key::LauncherSearchPlaceholder => "Type to search…",
         Key::LauncherNoAppResults => "No matching apps",
+        Key::LauncherAppsScanning => "Looking for the apps on this machine\u{2026}",
+        Key::LauncherAppsNoneInstalled => "There are no apps on this machine yet",
+        Key::LauncherAppsReadFailed => "Couldn't read the list of apps on this machine",
+        Key::LauncherSectionInstallable => "Available to install",
         Key::LauncherInstallButton => "Install",
         Key::InstallGateTitle => "Install this app?",
         Key::InstallGateNotice => "Installing downloads files and changes what is on this machine. Nothing runs until you confirm.",
@@ -730,6 +754,10 @@ fn ja_jp(key: Key) -> &'static str {
 
         Key::LauncherSearchPlaceholder => "入力して検索…",
         Key::LauncherNoAppResults => "該当するアプリがありません",
+        Key::LauncherAppsScanning => "この端末のアプリを探しています…",
+        Key::LauncherAppsNoneInstalled => "この端末にはまだ開けるアプリがありません",
+        Key::LauncherAppsReadFailed => "この端末のアプリ一覧を読み取れませんでした",
+        Key::LauncherSectionInstallable => "インストール可能",
         Key::LauncherInstallButton => "インストール",
         Key::InstallGateTitle => "このアプリをインストールしますか？",
         Key::InstallGateNotice => "インストールはファイルをダウンロードし、この端末の内容を変更します。確定するまで何も実行されません。",

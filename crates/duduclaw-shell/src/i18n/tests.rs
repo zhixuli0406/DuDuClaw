@@ -136,6 +136,10 @@ const ALL_KEYS: &[Key] = &[
     Key::LockThrottledLabel,
     Key::LauncherSearchPlaceholder,
     Key::LauncherNoAppResults,
+    Key::LauncherAppsScanning,
+    Key::LauncherAppsNoneInstalled,
+    Key::LauncherAppsReadFailed,
+    Key::LauncherSectionInstallable,
     Key::LauncherInstallButton,
     Key::InstallGateTitle,
     Key::InstallGateNotice,
@@ -164,7 +168,7 @@ fn all_keys_has_the_expected_count_and_no_duplicates() {
     // `ALL_KEYS` silently drifting out of sync with a newly added `Key`
     // variant (the compiler won't catch THAT half; only the per-locale
     // match arms are compiler-enforced).
-    assert_eq!(ALL_KEYS.len(), 129);
+    assert_eq!(ALL_KEYS.len(), 133);
     let mut seen = std::collections::HashSet::new();
     for key in ALL_KEYS {
         assert!(seen.insert(key), "duplicate key in ALL_KEYS: {key:?}");

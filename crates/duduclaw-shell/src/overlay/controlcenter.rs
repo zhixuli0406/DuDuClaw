@@ -78,6 +78,7 @@ use duduclaw_native_gui::theme;
 
 use super::OverlayUiState;
 use crate::audio::{self, AudioBackendKind};
+use crate::icons;
 use crate::palette::ShellPalette;
 use crate::{fake_data, ShellView};
 
@@ -150,13 +151,13 @@ fn quick_tile(tile: &fake_data::QuickTile, palette: ShellPalette) -> Stateful<Di
     // no clean token); subtitle is the ONE literal that does NOT invert —
     // see this file's header comment.
     let (bg_hex, title_hex) = if tile.active { (palette.brand, 0xfafafa) } else { (palette.surface_hover, palette.foreground) };
-    let glyph_hex = if tile.active {
-        0xfafafa
-    } else if palette.is_dark() {
-        0xb0b0b8
-    } else {
-        0x52525c
-    };
+    // ICON-1 (2026-08-22): the two inline literals this used to spell out
+    // are now `palette.brand_foreground` (`#fafafa`, the active tile's
+    // white-on-brand stroke) and `palette.icon_control()` (`#52525c` light
+    // / `#b0b0b8` dark) — the SAME values, resolved through the methods
+    // that also tint the real stroke icons below, so the icon and its text
+    // fallback can never drift apart.
+    let glyph_hex = if tile.active { palette.brand_foreground } else { palette.icon_control() };
     // Main.dc.html/ControlCenter.dc.html: `#9f9fa9`, unchanged across
     // themes — see this file's header comment.
     let (sub_hex, sub_alpha) = if tile.active { (0xfafafa, 0.75) } else { (0x9f9fa9, 1.0) };
@@ -170,7 +171,15 @@ fn quick_tile(tile: &fake_data::QuickTile, palette: ShellPalette) -> Stateful<Di
         .flex()
         .flex_col()
         .gap(px(8.))
-        .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).text_color(theme::alpha(glyph_hex, 1.0)).child(tile.glyph))
+        .child(
+            div().text_size(px(15.)).font_weight(FontWeight::BOLD).text_color(theme::alpha(glyph_hex, 1.0)).child(
+                // ICON-1: the board's own 17px stroke icon for this tile
+                // (Wi-Fi arcs / Bluetooth rune / crescent moon), falling
+                // back to the "W"/"B"/"勿" placeholder if its asset is
+                // missing.
+                icons::icon_or_glyph(&icons::quick_tile_layers(tile.id, palette, tile.active).unwrap_or_default(), 17., tile.glyph),
+            ),
+        )
         .child(
             div()
                 .flex()
@@ -230,13 +239,22 @@ fn slider_row(row: &fake_data::SliderRow, palette: ShellPalette) -> Div {
     // this slider; the pre-existing (light-only) implementation never drew
     // one (track + fill only) — that gap is unchanged by this round (dark
     // theming only, not new elements), so no handle is added here either.
-    let glyph_hex = if palette.is_dark() { 0xb0b0b8 } else { 0x52525c };
+    let glyph_hex = palette.icon_control();
 
     div()
         .flex()
         .items_center()
         .gap(px(10.))
-        .child(div().text_size(px(13.)).text_color(theme::alpha(glyph_hex, 1.0)).child(row.glyph))
+        // ICON-1: the board's 15px brightness icon (a sun with eight rays)
+        // replaces the "光" placeholder. This row is the BRIGHTNESS one —
+        // `volume_slider_row` below draws the volume speaker separately
+        // because only that one is interactive.
+        .child(
+            div()
+                .text_size(px(13.))
+                .text_color(theme::alpha(glyph_hex, 1.0))
+                .child(icons::icon_or_glyph(&[(icons::BRIGHTNESS, glyph_hex)], 15., row.glyph)),
+        )
         .child(
             div().flex_1().relative().h(px(5.)).rounded(px(5.)).bg(theme::alpha(track_off_hex(palette), 1.0)).child(
                 div().absolute().left(px(0.)).top(px(0.)).bottom(px(0.)).w(relative(pct)).rounded(px(5.)).bg(theme::alpha(palette.brand, 1.0)),
@@ -268,7 +286,11 @@ fn volume_slider_row(audio_ui: &audio::AudioUiState, palette: ShellPalette, cx: 
         .cursor_pointer()
         .text_size(px(13.))
         .text_color(theme::alpha(icon_hex, 1.0))
-        .child(fake_data::SLIDER_ROWS[0].glyph)
+        // ICON-1: the board's 15px speaker icon replaces "音". `icon_hex`
+        // (not `glyph_hex`) is passed through deliberately — this icon is
+        // the mute toggle and already tints red while muted, and the real
+        // icon has to keep that feedback rather than lose it.
+        .child(icons::icon_or_glyph(&[(icons::VOLUME, icon_hex)], 15., fake_data::SLIDER_ROWS[0].glyph))
         .on_click(mute_click);
 
     // Captures the track's laid-out bounds every paint pass — `on_mouse_

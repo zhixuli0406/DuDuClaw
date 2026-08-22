@@ -251,9 +251,10 @@ fn wifi_row(ap: &network::AccessPoint, index: usize, flow: &OobeFlow, ui: &OobeU
 }
 
 /// Signal-strength indicator — four bars of increasing height, filled up to
-/// `strength`. Plain colored `div()`s, not a glyph — same "no `gpui::
-/// svg()` usage yet, no guaranteed pictographic glyph coverage" constraint
-/// `home.rs`'s header comment documents for this whole crate.
+/// `strength`. Plain colored `div()`s, which is what the approved OOBE
+/// board itself draws: those boards contain no SVG at all (unlike the
+/// Home/overlay boards, whose icons ICON-1 wired up through
+/// `crate::icons`), so there is no vector artwork to render here.
 fn signal_bars(strength: u8, palette: ShellPalette) -> Div {
     let mut row = div().flex().items_end().gap(px(2.));
     for bar in 1..=4u8 {

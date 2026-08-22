@@ -92,18 +92,59 @@ pub const TEXT_2XL: f32 = 24.0; // detail hero (sm:) breakpoint, unused on deskt
 /// FontFallbacks>` (`crates/gpui/src/text_system/font_fallbacks.rs`) is a
 /// real ordered family-name list consulted for per-glyph fallback — this is
 /// NOT the "only one family, no fallback order" limitation the task brief
-/// flagged as a possible finding. What's unverified (no automated way to
-/// screenshot-diff CJK glyph shapes from here) is byte-for-byte confirmation
-/// that "Noto Sans TC" is the exact family name gpui's font-kit backend
-/// resolves from `NotoSansTC-Variable.ttf`'s `name` table — see this crate's
-/// S3 report for how that was checked at runtime (stderr `add_fonts` log +
-/// a live zh-TW screen visual check, not just "should work").
+/// flagged as a possible finding.
+///
+/// ICON-1 (2026-08-22) closed what S3 recorded here as unverified — whether
+/// "Noto Sans TC" is really the family name resolved from
+/// `NotoSansTC-Variable.ttf`'s `name` table. It is, but only via the
+/// TYPOGRAPHIC family (name ID 16); that file's LEGACY family (name ID 1) is
+/// "Noto Sans TC Thin", the variable font's default instance. The Linux text
+/// system resolves through `fontdb`, which prefers name ID 16 and only falls
+/// back to name ID 1 when there is none (`fontdb::parse_names`), so the name
+/// asked for here is the one that matches — and
+/// `app_font_family_names_match_what_the_bundled_files_declare` below now
+/// asserts exactly that against the shipped bytes, so a font-file swap that
+/// renamed either family fails the test rather than silently degrading to
+/// the system font. macOS resolves through CoreText instead and was not
+/// re-derived from source; the appliance is Linux.
 pub fn app_font() -> gpui::Font {
     gpui::Font {
         fallbacks: Some(gpui::FontFallbacks::from_fonts(vec!["Noto Sans TC".to_string()])),
         ..gpui::font("Inter Variable")
     }
 }
+
+/// The raw bytes of the two faces `app_font()` names, ready to hand to
+/// `cx.text_system().add_fonts(...)`.
+///
+/// ICON-1 (2026-08-22): promoted here from a private `include_bytes!` pair
+/// inside this crate's own `main.rs`, because `duduclaw-shell` is a SECOND
+/// gpui binary that needs the identical stack and had been running without
+/// it — on the appliance the kiosk unit launches that binary directly, so
+/// this crate's `main.rs` (and everything it registers) never runs at all
+/// there, and every shell screen was rendering in whatever the OS offered
+/// as a fallback. Keeping the bytes beside `app_font()` — the function that
+/// names the very families these files provide — means the "which faces"
+/// and the "which family names" answers can never drift apart, and there is
+/// exactly ONE checked-in copy of a 12.8 MB TTF rather than a duplicate in
+/// a second crate's `assets/` tree. Same "one compiled copy, not a
+/// bin-local plus a lib-local copy silently diverging" reasoning this
+/// crate's `lib.rs` gives for `theme`/`mds_gpui` themselves.
+///
+/// `Cow::Borrowed` avoids copying the static data; `add_fonts` takes
+/// ownership only of the `Vec`/`Cow` wrappers.
+pub fn bundled_font_bytes() -> Vec<std::borrow::Cow<'static, [u8]>> {
+    vec![std::borrow::Cow::Borrowed(INTER_VARIABLE), std::borrow::Cow::Borrowed(NOTO_SANS_TC_VARIABLE)]
+}
+
+/// Inter Variable — the Latin/digit face `app_font()` asks for by family
+/// name ("Inter Variable", NOT "Inter"). OFL, license text alongside the
+/// file at `assets/fonts/OFL-Inter.txt`.
+pub const INTER_VARIABLE: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
+
+/// Noto Sans TC Variable — the zh-TW face registered as `app_font()`'s
+/// per-glyph fallback. OFL, `assets/fonts/OFL-NotoSansTC.txt`.
+pub const NOTO_SANS_TC_VARIABLE: &[u8] = include_bytes!("../assets/fonts/NotoSansTC-Variable.ttf");
 // Not every token here is consumed by Phase 1a's 3 screens (`SECONDARY`,
 // `MUTED`, `POPOVER`, `SIDEBAR_PRIMARY`, `CHART_1`/`CHART_3`, the various
 // `*_FOREGROUND` pairing constants, …) — this is the full MDS token catalog
@@ -340,3 +381,106 @@ pub mod light {
 // Phase 1a is dark-only: re-export `dark`'s tokens at the module root so
 // call sites read as `theme::SURFACE`, `theme::brand()`, `theme::alpha(...)`.
 pub use dark::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bundled faces have to actually be there. ICON-1 promoted these
+    /// out of a binary's `main.rs` into this library so a SECOND binary
+    /// (`duduclaw-shell`) could load the same two files; an empty or
+    /// truncated payload would degrade every screen in both binaries to the
+    /// platform's default family, silently, with only a stderr line to show
+    /// for it.
+    #[test]
+    fn bundled_font_bytes_are_two_real_truetype_payloads() {
+        let fonts = bundled_font_bytes();
+        assert_eq!(fonts.len(), 2, "the stack is Inter Variable + Noto Sans TC");
+        for bytes in &fonts {
+            assert!(!bytes.is_empty());
+            // sfnt version: `0x00010000` for TrueType outlines, or one of
+            // the three ASCII tags OpenType/Apple use. Anything else is not
+            // a font file at all (an LFS pointer, an HTML error page, a
+            // truncated download).
+            let magic = &bytes[..4];
+            let ok = magic == [0x00, 0x01, 0x00, 0x00] || magic == b"true" || magic == b"OTTO" || magic == b"ttcf";
+            assert!(ok, "not an sfnt payload: {magic:?}");
+        }
+        assert_eq!(fonts[0].as_ref(), INTER_VARIABLE);
+        assert_eq!(fonts[1].as_ref(), NOTO_SANS_TC_VARIABLE);
+    }
+
+    /// The half that actually bites. `add_fonts` succeeding proves nothing
+    /// about whether `app_font()`'s family NAMES match what those bytes
+    /// declare — a mismatch resolves to the system font with no error
+    /// anywhere, which is exactly the failure ICON-1 found on the appliance
+    /// (in that case because nothing asked for a family at all).
+    ///
+    /// The names are read with the SAME rule the Linux text system's font
+    /// database applies (`fontdb::parse_names`: prefer the TYPOGRAPHIC
+    /// family, name ID 16, and fall back to the legacy FAMILY, name ID 1,
+    /// only when there is no typographic one). That distinction is
+    /// load-bearing here rather than pedantic: `NotoSansTC-Variable.ttf`'s
+    /// name ID 1 is "Noto Sans TC Thin" (the variable font's default
+    /// instance), and only its name ID 16 is the plain "Noto Sans TC" this
+    /// module asks for.
+    #[test]
+    fn app_font_family_names_match_what_the_bundled_files_declare() {
+        let inter = sfnt_family_name(INTER_VARIABLE).expect("Inter has a family name");
+        let noto = sfnt_family_name(NOTO_SANS_TC_VARIABLE).expect("Noto Sans TC has a family name");
+
+        let font = app_font();
+        assert_eq!(font.family.as_ref(), inter, "app_font() asks for a family Inter does not declare");
+        let fallbacks = font.fallbacks.expect("the CJK fallback is not optional");
+        assert_eq!(fallbacks.fallback_list(), &[noto], "app_font()'s fallback is not the family Noto Sans TC declares");
+    }
+
+    /// Minimal `name`-table reader — deliberately not a new dependency for
+    /// one assertion. Returns the typographic family (name ID 16) when the
+    /// file has one, else the legacy family (name ID 1), matching the
+    /// preference order documented on the test above. Windows/Unicode
+    /// platform records only (UTF-16BE), which is what both bundled files
+    /// carry.
+    fn sfnt_family_name(bytes: &[u8]) -> Option<String> {
+        let u16_at = |o: usize| -> Option<u16> { Some(u16::from_be_bytes([*bytes.get(o)?, *bytes.get(o + 1)?])) };
+        let u32_at = |o: usize| -> Option<u32> {
+            Some(u32::from_be_bytes([*bytes.get(o)?, *bytes.get(o + 1)?, *bytes.get(o + 2)?, *bytes.get(o + 3)?]))
+        };
+
+        let table_count = u16_at(4)? as usize;
+        let mut name_table = None;
+        for i in 0..table_count {
+            let rec = 12 + i * 16;
+            if bytes.get(rec..rec + 4)? == b"name" {
+                name_table = Some(u32_at(rec + 8)? as usize);
+                break;
+            }
+        }
+        let name = name_table?;
+
+        let count = u16_at(name + 2)? as usize;
+        let storage = name + u16_at(name + 4)? as usize;
+        let mut typographic = None;
+        let mut legacy = None;
+        for i in 0..count {
+            let rec = name + 6 + i * 12;
+            let platform = u16_at(rec)?;
+            let name_id = u16_at(rec + 6)?;
+            if platform != 3 || (name_id != 1 && name_id != 16) {
+                continue;
+            }
+            let len = u16_at(rec + 8)? as usize;
+            let offset = u16_at(rec + 10)? as usize;
+            let raw = bytes.get(storage + offset..storage + offset + len)?;
+            let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+            let text = String::from_utf16_lossy(&units);
+            if name_id == 16 {
+                typographic.get_or_insert(text);
+            } else {
+                legacy.get_or_insert(text);
+            }
+        }
+        typographic.or(legacy)
+    }
+
+}

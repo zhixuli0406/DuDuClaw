@@ -20,6 +20,16 @@
 // for the gateway) — see that fn's own doc comment for why it checks
 // staleness immediately on every render pass rather than waiting out one
 // interval first, unlike that module's own `schedule_stale_check`.
+//
+// APP-1 (2026-08-22): the dock's icons are the REAL apps on this machine.
+// They used to be `fake_data::DOCK_APPS` — six design-board icons, five of
+// which had no app behind them at all, so on a real appliance the dock was
+// a row of buttons that could not open anything. `dock()` now renders
+// `crate::apps::feed::InstalledAppsFeed`'s first `DOCK_MAX_APPS` entries
+// (deterministically ordered by `apps::installed::merge`, so the row does
+// not reshuffle between refreshes) and dispatches that feed's own poll
+// alongside the running-windows one. A machine with nothing installed gets
+// a dock with no app tiles — honest, and never a fallback to canned icons.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -28,12 +38,23 @@ use gpui::{div, linear_color_stop, linear_gradient, prelude::*, px, rgb, BoxShad
 
 use duduclaw_native_gui::theme;
 
+use crate::apps::catalog;
+use crate::apps::feed::InstalledAppsFeed;
+use crate::apps::installed::InstalledApp;
 use crate::comp_client;
 use crate::fake_data::{self, AgentDockStatus, GoalDot};
 use crate::home::running_windows::RunningWindowsFeed;
 use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::ShellView;
+
+/// How many real apps the dock shows. The dock is a fixed-width row across
+/// the bottom of a 1440px window, so it cannot grow with the machine's app
+/// count — the Launcher (`cmd-k`) is the complete list, and this is the
+/// quick row. Eight matches what the design board's own dock allotted to
+/// apps before the divider (six app tiles plus headroom) without the row
+/// running into the agent avatars.
+const DOCK_MAX_APPS: usize = 8;
 
 // ── Goal cards row ─────────────────────────────────────────────────────
 
@@ -186,11 +207,21 @@ pub(super) fn activity_shelf(palette: ShellPalette) -> Div {
 
 // ── Dock ─────────────────────────────────────────────────────────────────
 
-pub(super) fn dock(palette: ShellPalette, running_windows: &RunningWindowsFeed, cx: &mut Context<ShellView>) -> Div {
+pub(super) fn dock(
+    palette: ShellPalette,
+    running_windows: &RunningWindowsFeed,
+    installed: &InstalledAppsFeed,
+    cx: &mut Context<ShellView>,
+) -> Div {
     // WP-comp-shell-ipc: keeps `running_windows` warm for as long as Home
     // keeps rendering (which is continuously, unlike the Notifications
     // overlay's open/closed panel — see this file's own header comment).
     schedule_running_windows_poll(cx);
+    // APP-1: the same one-shot-per-render-pass shape for the app scan. Home
+    // renders continuously from window-open and the Launcher renders on top
+    // of Home, so this ONE dispatch keeps the feed warm for both surfaces —
+    // the Launcher deliberately does not schedule its own.
+    schedule_installed_apps_poll(cx);
 
     // Main.dc.html: bg `rgba(255,255,255,0.78)` light / `rgba(30,30,33,
     // 0.78)` dark — `surface_raised` (matches `composer`'s own reasoning in
@@ -217,14 +248,12 @@ pub(super) fn dock(palette: ShellPalette, running_windows: &RunningWindowsFeed, 
         .py(px(10.))
         .shadow(shadow);
 
-    // Only "設" (settings) was interactive as of Round 3 — every other icon
-    // stayed an honest static stub, per that round's task brief ("其他 dock
-    // icon 維持靜態"). WP-A3 (2026-08-22) adds exactly ONE more: `browser`
-    // (Chromium) now has a real `flatpak_id` (`fake_data::DOCK_APPS`'s own
-    // doc comment) — `dock_app` below wires a click only for entries with
-    // one, so this loop stays a straight extension of the same convention,
-    // not a departure from it.
-    for app in fake_data::DOCK_APPS {
+    // APP-1: every tile here is a real, installed, launchable app. An empty
+    // machine (or a scan that has not settled yet) simply contributes no
+    // tiles — the divider, the agent avatars and the settings tile still
+    // render, so the dock never looks broken, it just has nothing to launch
+    // yet. That is the honest state, not a reason to draw canned icons.
+    for app in installed.apps().iter().take(DOCK_MAX_APPS) {
         row = row.child(dock_app(app, palette, running_windows, cx));
     }
     row = row.child(dock_divider(palette));
@@ -244,73 +273,67 @@ fn dock_divider(palette: ShellPalette) -> Div {
     div().w(px(1.)).h(px(34.)).bg(color)
 }
 
-fn dock_app(app: &'static fake_data::DockApp, palette: ShellPalette, running_windows: &RunningWindowsFeed, cx: &mut Context<ShellView>) -> Stateful<Div> {
-    // WP-comp-shell-ipc: `flatpak_id` doubles as the xdg-shell app_id query
-    // — see `running_windows.rs`'s own module doc for why that's a
-    // reasonable-but-unverified assumption, and why every entry besides
-    // `browser` (which has `flatpak_id: None`) never matches anything here.
-    let is_running = app.flatpak_id.is_some_and(|id| running_windows.is_app_running(id));
-    // The "white/near-white bordered" app tiles (Files/Browser) are the one
-    // documented exception to "identity colors stay hardcoded" — see
-    // `crate::palette`'s own header comment. Every OTHER (colored,
-    // non-bordered) app tile's gradient is identity and stays exactly as
-    // `app.gradient_top`/`gradient_bottom` already store it, in both themes.
-    let neutral_dark = app.bordered && palette.is_dark();
-    let (gradient_top, gradient_bottom) =
-        if neutral_dark { (palette.neutral_tile_top, palette.neutral_tile_bottom) } else { (app.gradient_top, app.gradient_bottom) };
+fn dock_app(app: &InstalledApp, palette: ShellPalette, running_windows: &RunningWindowsFeed, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    // WP-comp-shell-ipc: the app's xdg-shell app_id is what's matched
+    // against the live window list — `InstalledApp::xdg_app_id` (the
+    // flatpak application id, or the desktop-file id) — see that fn's own
+    // doc comment and `running_windows.rs`'s module doc for why this is a
+    // reasonable freedesktop convention rather than a guarantee. An app
+    // that sets some other app_id simply never shows a running dot; it
+    // never shows a WRONG one.
+    let is_running = running_windows.is_app_running(app.xdg_app_id());
+    // APP-1: a real installed app has no design-board colour to lift, so
+    // every dock tile renders in the neutral treatment the board already
+    // uses for its own white/outline tiles (Files/Browser). Inventing a
+    // per-app gradient would be decoration masquerading as identity;
+    // resolving the real `Icon=` this crate already parses and carries
+    // (`InstalledApp::icon`) is a SEPARATE work package going through the
+    // design flow.
+    let dark = palette.is_dark();
+    let (gradient_top, gradient_bottom) = if dark { (palette.neutral_tile_top, palette.neutral_tile_bottom) } else { (0xffffff, 0xedeff4) };
 
-    // Icon glyph color: light is `SURFACE_FOREGROUND` at 0.55 (bordered) /
-    // 1.0 (colored) alpha — `SURFACE_FOREGROUND` and `FOREGROUND` share the
-    // identical value in both themes (`theme.rs`'s own token table), so
-    // `palette.foreground` reproduces it exactly. Dark's bordered case
-    // swaps to a solid literal (`#b0b0b8`, the approved canvas's own
-    // primary icon-stroke color) instead of a translucent foreground tint —
-    // the translucency was only ever standing in for "a lighter gray than
-    // the glyph's colored-tile counterpart", which dark expresses with a
-    // genuinely different (not just alpha-reduced) hex.
-    // Shadow: the approved canvas actually varies opacity per icon FAMILY
-    // (colored `.20`/`.35`, neutral-bordered `.14`/`.30`) — but the
-    // PRE-EXISTING light-only code already collapsed that distinction to
-    // one flat `0.20` for every dock icon regardless of `bordered` (see the
-    // original code, unchanged here: light must stay byte-identical, so
-    // this does NOT start discriminating by `bordered` now). Dark mirrors
-    // the SAME flat-approximation strategy in the SAME direction light
-    // already picked (extend the colored-icon family's own value to every
-    // icon) — `0.35`, not the neutral family's `0.30`.
+    // Icon glyph color: light is `SURFACE_FOREGROUND` at 0.55 alpha —
+    // `SURFACE_FOREGROUND` and `FOREGROUND` share the identical value in
+    // both themes (`theme.rs`'s own token table), so `palette.foreground`
+    // reproduces it exactly. Dark swaps to a solid literal (`#b0b0b8`, the
+    // approved canvas's own primary icon-stroke color) instead of a
+    // translucent foreground tint — the translucency was only ever standing
+    // in for "a lighter gray", which dark expresses with a genuinely
+    // different (not just alpha-reduced) hex.
+    // Shadow: the pre-existing light-only code collapsed the board's own
+    // per-family opacities to one flat `0.20` for every dock icon; kept
+    // exactly (light must stay byte-identical). Dark mirrors the SAME
+    // flat-approximation in the SAME direction light already picked.
     let icon_shadow = palette.icon_shadow(0.20, 0.35);
+    let border_color = if dark { palette.neutral_tile_border } else { theme::alpha(theme::light::SURFACE_BORDER, 1.0) };
+    let text_color = if dark { theme::alpha(0xb0b0b8, 1.0) } else { theme::alpha(palette.foreground, 0.55) };
 
     let mut el = div()
-        .id(app.id)
+        .id(format!("dock-app-{}", app.id))
         .relative()
         .w(px(44.))
         .h(px(44.))
         .rounded(px(10.))
         .bg(linear_gradient(180.0, linear_color_stop(rgb(gradient_top), 0.0), linear_color_stop(rgb(gradient_bottom), 1.0)))
+        .border_1()
+        .border_color(border_color)
         .flex()
         .items_center()
         .justify_center()
         .text_size(px(15.))
         .font_weight(FontWeight::MEDIUM)
         .shadow(icon_shadow)
-        .child(app.glyph);
+        .text_color(text_color)
+        .child(app.glyph());
 
-    el = if neutral_dark {
-        el.text_color(theme::alpha(0xb0b0b8, 1.0))
-    } else {
-        el.text_color(theme::alpha(palette.foreground, if app.bordered { 0.55 } else { 1.0 }))
-    };
-
-    if app.bordered {
-        let border_color = if palette.is_dark() { palette.neutral_tile_border } else { theme::alpha(theme::light::SURFACE_BORDER, 1.0) };
-        el = el.border_1().border_color(border_color);
-    }
-
-    // WP-A3: a small corner "Verified tier" indicator — see `crate::
-    // palette::ShellPalette::verified_accent_dot`'s own doc comment for why
-    // this stays hidden entirely for `Unrated` (the dock has no room for
-    // the word "未評級" the way a Launcher row does) rather than always
-    // rendering an empty/neutral dot.
-    if let Some(hex) = palette.verified_accent_dot(app.verified) {
+    // WP-A3: a small corner "Verified tier" indicator. APP-1 turned this
+    // into a real lookup (`apps::catalog::verified_tier`) instead of a
+    // per-row constant: an app this crate has rating evidence for gets its
+    // dot, and everything else resolves to `Unrated`, which renders NO dot
+    // at all — see `crate::palette::ShellPalette::verified_accent_dot`'s own
+    // doc comment for why that beats drawing an empty/neutral one (the dock
+    // has no room for the word "未評級" the way a Launcher row does).
+    if let Some(hex) = palette.verified_accent_dot(catalog::verified_tier(app.xdg_app_id())) {
         el = el.child(
             div()
                 .absolute()
@@ -328,10 +351,7 @@ fn dock_app(app: &'static fake_data::DockApp, palette: ShellPalette, running_win
     // WP-comp-shell-ipc: macOS-dock-style "running" indicator — a small
     // dot centered BELOW the 44px icon (bottom-center, `left = (44-6)/2`),
     // deliberately not sharing a corner with the verified-tier dot above
-    // (bottom-right) so the two never visually collide. Only ever appears
-    // for `browser` today (the one entry with a real `flatpak_id` — see
-    // `fake_data::DOCK_APPS`'s own doc comment), matching this file's
-    // established "only wire what's actually real" convention.
+    // (bottom-right) so the two never visually collide.
     if is_running {
         el = el.child(
             div()
@@ -345,46 +365,49 @@ fn dock_app(app: &'static fake_data::DockApp, palette: ShellPalette, running_win
         );
     }
 
-    // Only a real launch command makes this a real button — every other
-    // icon stays the honest static stub Round 3 established (see this fn's
-    // call site in `dock` above). WP-comp-shell-ipc: a click on an
-    // ALREADY-RUNNING entry now switches to it (`comp_client::
-    // focus_window`) instead of blindly launching a second instance —
-    // `is_running` is a snapshot from THIS render pass (same "capture the
-    // feed's current read at render time" convention `menu_bar_ticker`'s
-    // own `has_pending` already uses), freshened at most `running_windows::
-    // POLL_INTERVAL` behind reality.
-    if let Some(flatpak_id) = app.flatpak_id {
-        let on_click = cx.listener(move |_view, _ev, _window, _cx| {
-            if is_running {
-                if crate::diag_enabled() {
-                    eprintln!("[hit] dock icon '{}' -> focus_window({flatpak_id:?})", app.id);
-                }
-                // `comp_client::focus_window` is a blocking socket call
-                // (this file's own header comment / `comp_client`'s own
-                // module doc) — dispatched off a background thread so it
-                // never blocks gpui's render thread, same "fire-and-forget
-                // from a click handler" shape `crate::apps::launch` already
-                // uses for the spawn path, just wrapped in a thread here
-                // because THIS call, unlike `Command::spawn()`, actually
-                // waits on a reply.
-                std::thread::spawn(move || {
-                    if let Err(e) = comp_client::focus_window(flatpak_id) {
-                        if crate::diag_enabled() {
-                            eprintln!("[dock] focus_window({flatpak_id:?}) failed: {e}");
-                        }
-                    }
-                });
-            } else {
-                if crate::diag_enabled() {
-                    eprintln!("[hit] dock icon '{}' -> launch", app.id);
-                }
-                crate::apps::launch(app);
+    // WP-comp-shell-ipc: a click on an ALREADY-RUNNING entry switches to it
+    // (`comp_client::focus_window`) instead of blindly launching a second
+    // instance — `is_running` is a snapshot from THIS render pass (same
+    // "capture the feed's current read at render time" convention
+    // `menu_bar_ticker`'s own `has_pending` already uses), freshened at most
+    // `running_windows::POLL_INTERVAL` behind reality.
+    //
+    // APP-1: every dock tile is a real installed app, so every tile is a
+    // real button — the "honest static stub" branch Round 3 needed is gone
+    // along with the canned entries that made it necessary. `app` is
+    // borrowed from the feed rather than `'static`, so the handler captures
+    // owned clones.
+    let launch_target = app.clone();
+    let focus_query = app.xdg_app_id().to_string();
+    let click_label = app.id.clone();
+    let on_click = cx.listener(move |_view, _ev, _window, _cx| {
+        if is_running {
+            if crate::diag_enabled() {
+                eprintln!("[hit] dock icon '{click_label}' -> focus_window({focus_query:?})");
             }
-        });
-        el = el.cursor_pointer().hover(|style| style.opacity(0.85)).on_click(on_click);
-    }
-    el
+            // `comp_client::focus_window` is a blocking socket call (this
+            // file's own header comment / `comp_client`'s own module doc) —
+            // dispatched off a background thread so it never blocks gpui's
+            // render thread, same "fire-and-forget from a click handler"
+            // shape `crate::apps::launch` already uses for the spawn path,
+            // just wrapped in a thread here because THIS call, unlike
+            // `Command::spawn()`, actually waits on a reply.
+            let query = focus_query.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = comp_client::focus_window(&query) {
+                    if crate::diag_enabled() {
+                        eprintln!("[dock] focus_window({query:?}) failed: {e}");
+                    }
+                }
+            });
+        } else {
+            if crate::diag_enabled() {
+                eprintln!("[hit] dock icon '{click_label}' -> launch");
+            }
+            crate::apps::launch(&launch_target);
+        }
+    });
+    el.cursor_pointer().hover(|style| style.opacity(0.85)).on_click(on_click)
 }
 
 // ── Running-windows poll (WP-comp-shell-ipc, 2026-08-22) ────────────────
@@ -480,6 +503,87 @@ fn trigger_running_windows_refresh_if_stale(view: &mut ShellView, cx: &mut Conte
     .detach();
 }
 
+// ── Installed-app scan poll (APP-1, 2026-08-22) ─────────────────────────
+
+/// Called from `dock()` on every render pass, same shape as
+/// `schedule_running_windows_poll` above and for the same reason: Home
+/// renders continuously from window-open and has no "just opened" event to
+/// pair a fast first fetch against, so the render-pass-gated immediate
+/// check IS the fast-first-scan path.
+///
+/// **One-shot, never a self-re-arming timer.** This spawns a future that
+/// does one staleness check and ends; it does NOT schedule the next one.
+/// `trigger_installed_apps_refresh_if_stale` no-ops instantly whenever the
+/// feed is fresh or a scan is already in flight, so calling it on every
+/// render costs one comparison — while an `async loop { timer().await }`
+/// per render pass would accumulate one live timer per repaint, which is
+/// exactly the CPU-burn incident WP-A4-4 fixed in this crate. The same
+/// discipline applies to the notify side: the settle below calls
+/// `cx.notify()` only when `apply_scan` reports something visible actually
+/// moved (see `apps::feed::InstalledAppsFeed::apply_scan`).
+fn schedule_installed_apps_poll(cx: &mut Context<ShellView>) {
+    cx.spawn(async move |weak, cx| {
+        let _ = weak.update(cx, |view, cx| {
+            trigger_installed_apps_refresh_if_stale(view, cx);
+        });
+    })
+    .detach();
+}
+
+fn trigger_installed_apps_refresh_if_stale(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    if !view.installed_apps.is_stale() {
+        return;
+    }
+    if !view.installed_apps.begin_refresh() {
+        // Already scanning — the next render pass's check catches it once
+        // this one settles.
+        return;
+    }
+    // No `cx.notify()` here: starting a scan changes nothing that is drawn.
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // BLOCKING: two `flatpak list` subprocesses plus a directory walk.
+        // This is precisely why it does not happen on the render thread.
+        let _ = tx.send(crate::apps::installed::scan());
+    });
+
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(outcome) => {
+                let _ = weak.update(cx, |view, cx| {
+                    let (before_flatpak, before_desktop) = {
+                        let (f, d) = view.installed_apps.source_statuses();
+                        (f.cloned(), d.cloned())
+                    };
+                    let applied = view.installed_apps.apply_scan(outcome);
+                    if applied.status_changed {
+                        // Logged on CHANGE only, never every 60 seconds
+                        // forever: a source that has been failing since boot
+                        // is one log line, not one per refresh. Not
+                        // DIAG-gated — a source that IS present and stops
+                        // enumerating is something whoever reads this
+                        // machine's journal needs to see.
+                        let (after_flatpak, after_desktop) = view.installed_apps.source_statuses();
+                        eprintln!(
+                            "[apps] scan sources changed: flatpak {before_flatpak:?} -> {after_flatpak:?}, desktop {before_desktop:?} -> {after_desktop:?} ({} app(s))",
+                            view.installed_apps.apps().len()
+                        );
+                    }
+                    if applied.repaint {
+                        cx.notify();
+                    }
+                });
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(BRIDGE_POLL_INTERVAL).await;
+    })
+    .detach();
+}
+
 fn dock_agent(agent: &fake_data::DockAgent, palette: ShellPalette) -> Stateful<Div> {
     // Status dot: `Running` uses the brand hue (matches its own avatar),
     // `NeedsHuman` uses `warning_dot` — NOT `badge_accent(Warning)`, see
@@ -534,11 +638,15 @@ fn dock_settings(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful
         cx.notify();
     });
 
-    // Glyph text: light stays `brand_foreground` (byte-identical to before —
-    // this crate's CJK-glyph "設" placeholder was already an approximation
-    // of the board's own white gear-icon stroke, `#ffffff`, and that
-    // approximation is preserved as-is). Dark: `text_secondary` (`#d4d4d8`)
-    // matches the board's own dark gear-icon stroke exactly.
+    // ICON-1 (2026-08-22): the board's real gear icon replaces the "設"
+    // placeholder. Its stroke is `#ffffff` light / `#d4d4d8` dark — that
+    // is `palette.icon_on_neutral_gradient()`, the shared tint for icons
+    // sitting on this neutral gray gradient (the Notifications
+    // system-update row uses the same pair on the same gradient). The
+    // fallback text keeps its ORIGINAL color pair (`brand_foreground` /
+    // `text_secondary`), which was an approximation of the same board
+    // values, so a degraded render is byte-identical to the pre-ICON-1
+    // build rather than subtly restyled.
     let glyph_color = if palette.is_dark() { palette.text_secondary } else { palette.brand_foreground };
 
     div()
@@ -560,6 +668,6 @@ fn dock_settings(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful
         .text_color(theme::alpha(glyph_color, 1.0))
         .shadow(palette.icon_shadow(0.18, 0.30))
         .hover(|style| style.opacity(0.85))
-        .child("設")
+        .child(crate::icons::icon_or_glyph(&[(crate::icons::SETTINGS, palette.icon_on_neutral_gradient())], 22., "設"))
         .on_click(on_click)
 }

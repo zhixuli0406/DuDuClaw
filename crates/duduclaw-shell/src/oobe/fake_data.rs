@@ -33,9 +33,10 @@
 pub(super) struct FakeWifiNetwork {
     pub(super) ssid: &'static str,
     /// 1..=4, purely decorative (rendered as filled bars, see
-    /// `steps::network::signal_bars` — no icon font glyph involved, same
-    /// "no `gpui::svg()` usage in this codebase yet" constraint `home.rs`'s
-    /// header comment documents).
+    /// `steps::network::signal_bars` — plain `div()`s, no glyph and no icon
+    /// asset: the approved OOBE boards contain no SVG at all, so there is
+    /// nothing here to wire up the way ICON-1 wired the Home/overlay
+    /// boards' own icons).
     pub(super) signal_bars: u8,
     pub(super) secured: bool,
 }

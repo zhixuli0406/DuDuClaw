@@ -17,19 +17,20 @@
 // struct only ever receives already-settled results through
 // `apply_list_ok`/`apply_list_err`, never performs I/O itself.
 //
-// ── Matching key: `flatpak_id`, not a new field ─────────────────────────
-// `fake_data::DockApp` has no xdg-shell-app_id field of its own — `apps.rs`'s
-// own header comment already documents that `flatpak_id` is the only REAL
-// identity a dock icon carries (every other entry is a display-only stub
-// with `flatpak_id: None`). A flatpak-packaged GUI app conventionally
-// registers its xdg-shell app_id as its flatpak application id (the
-// desktop-file basename convention flatpak's own window/taskbar
-// integration relies on) — a REASONABLE assumption, not a cross-checked
-// one (`apps.rs`'s own header comment records where flatpak actually is:
-// on the appliance since A4-2/3, absent on a dev Mac), so `is_app_running`
-// is an honest "assume the ids line up" helper. Every entry besides
-// `browser` has `flatpak_id: None` and therefore never matches anything
-// here regardless of what's actually running.
+// ── Matching key (APP-1, 2026-08-22) ────────────────────────────────────
+// The query is `apps::installed::InstalledApp::xdg_app_id()` — the flatpak
+// application id for a flatpak app, the desktop-file id for a native one.
+// Both rest on the SAME freedesktop convention (a well-behaved app sets its
+// xdg-shell app_id to its desktop-file basename, and flatpak's own window
+// integration relies on that basename being the application id), and it is
+// a convention, NOT a guarantee: an app that sets something else simply
+// never matches, which shows up as a missing running-indicator dot and a
+// click that launches a second instance — never as a dot on the wrong app.
+//
+// Before APP-1 this read `fake_data::DockApp::flatpak_id` — an `Option` on
+// a canned six-entry array where exactly one entry was non-`None`, so in
+// practice only Chromium could ever match. That array is gone; every dock
+// tile is now a real installed app carrying a real id.
 
 use std::time::{Duration, Instant};
 
