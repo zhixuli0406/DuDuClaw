@@ -70,6 +70,24 @@
 //! denied outright while frozen/under takeover like `Shadow`/`Watch`. A
 //! query matching nothing is answered honestly (`activate_window_failed`
 //! audit line), never a silent no-op.
+//!
+//! ## Relationship to `crate::shell_control` (WP-comp-shell-ipc, 2026-08-22)
+//! `crate::shell_control` is a SEPARATE Unix socket, wire protocol, and
+//! audit trail — not a 12th item in the state machine above. It exists so
+//! `duduclaw-shell` (a human clicking the dock) can list/switch windows
+//! without going anywhere near this module's agent-injection channel: the
+//! socket here is token-authenticated and every command through it is
+//! attributed to the AGENT (codrive audit `kind`s, agent-seat focus) —
+//! reusing it for a human dock click would misattribute human action as
+//! agent action in the audit trail and, worse, would mean anything that
+//! can read the codrive token file (see `write_token_file` below) could
+//! drive the agent seat by pretending to be the shell. `shell_control`'s
+//! own module doc has the full design (same-uid `SO_PEERCRED` auth instead
+//! of a bearer token, no freeze gate — a human can always operate their
+//! own desktop, independent audit log). The only code shared between the
+//! two is the pure window-matching/focus logic in `window_target.rs`
+//! (widened to `pub(crate)` this round for exactly that reuse) — no shared
+//! socket, no shared auth, no shared audit trail.
 
 mod audit;
 mod cursor;
@@ -87,7 +105,11 @@ mod tests_listener;
 #[cfg(test)]
 mod tests_takeover;
 mod watch;
-mod window_target;
+// WP-comp-shell-ipc (2026-08-22): widened module-private -> `pub(crate)` so
+// `crate::shell_control` can reuse `find_target_window`/`window_identity`
+// (see `window_target.rs`'s own module doc "WP-comp-shell-ipc reuse"
+// section) — no logic moved or duplicated, only visibility.
+pub(crate) mod window_target;
 
 pub use cursor::build_cursor_elements;
 pub use debug_sim::maybe_init_stdin_simulator;

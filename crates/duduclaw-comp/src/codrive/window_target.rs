@@ -50,6 +50,17 @@
 //! query is resolved to a window only INSIDE this file's own logic, which
 //! never runs while frozen in the first place (`handle_agent_inject`'s
 //! frozen gate short-circuits before this file's functions are called).
+//!
+//! ## WP-comp-shell-ipc reuse (2026-08-22)
+//! `find_target_window`/`window_identity`/[`WindowMatch`] widened from
+//! module-private to `pub(crate)` this round — `crate::shell_control`
+//! (the human-operated dock↔comp IPC, a SEPARATE socket/trust-boundary
+//! from this agent-injection channel — see that module's doc comment)
+//! reuses this exact same lookup+matching policy for its own
+//! `focus_window` op instead of re-deriving a second copy. No logic
+//! changed here; only visibility. `codrive::mod`'s `pub(crate) mod
+//! window_target;` (was module-private `mod window_target;`) is the other
+//! half of this same widening.
 
 use smithay::{
     desktop::{Space, Window},
@@ -64,7 +75,7 @@ use crate::state::DuduclawComp;
 /// tell an exact app_id hit apart from a title-prefix fallback, not just
 /// that "something" matched.
 #[derive(Debug, PartialEq, Eq)]
-enum WindowMatch {
+pub(crate) enum WindowMatch {
     AppId(String),
     TitlePrefix(String),
 }
@@ -107,7 +118,7 @@ fn match_window_query<'a>(
 /// are always present; this crate has no X11 window support to make either
 /// `None`, same assumption every other `w.toplevel().unwrap()` call site in
 /// this codebase already relies on).
-fn window_identity(window: &Window) -> (Option<String>, Option<String>) {
+pub(crate) fn window_identity(window: &Window) -> (Option<String>, Option<String>) {
     let toplevel = window.toplevel().unwrap();
     with_states(toplevel.wl_surface(), |states| {
         let attrs = states
@@ -122,9 +133,11 @@ fn window_identity(window: &Window) -> (Option<String>, Option<String>) {
 
 /// Thin wrapper (this file's module doc): extracts live identity facts from
 /// every window currently in `space` and defers to [`match_window_query`]
-/// for the actual decision. Module-private — its one real caller,
-/// `codrive_activate_window`, lives in this same file.
-fn find_target_window(space: &Space<Window>, query: &str) -> Option<(Window, WindowMatch)> {
+/// for the actual decision. `pub(crate)` (was module-private) — this
+/// file's own `codrive_activate_window` is still one caller;
+/// `crate::shell_control`'s `focus_window` op is the other (WP-comp-
+/// shell-ipc, see this file's module doc).
+pub(crate) fn find_target_window(space: &Space<Window>, query: &str) -> Option<(Window, WindowMatch)> {
     let windows: Vec<Window> = space.elements().cloned().collect();
     let identities: Vec<(Option<String>, Option<String>)> = windows.iter().map(window_identity).collect();
     let candidates = identities
