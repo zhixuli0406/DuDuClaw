@@ -61,6 +61,50 @@ pub enum CodriveCmd {
     /// CD-3: toggles idle-based auto-pause supervision for the rest of this
     /// session (comp's `codrive/watch.rs`).
     Watch { enable: bool },
+    /// WP-CD4b-fix (B3): READ-ONLY query for where a client's *visible*
+    /// window sits in comp's global logical coordinate space — the missing
+    /// half of AT-SPI's `CoordType::Window` offsets (see
+    /// [`super::atspi_locate`]'s module doc for why `CoordType::Screen` is
+    /// unusable on GTK4). Answered by comp outside the frozen gate (it is a
+    /// query, not an action); at least one of `app_id`/`pid` must be set or
+    /// comp rejects the line. Both fields are omitted from the wire when
+    /// `None` so an unused key never reaches comp's parser.
+    WindowGeometry {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        app_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pid: Option<u32>,
+    },
+}
+
+/// The `window` object comp returns on a successful `window_geometry`
+/// query (comp's `codrive/window_geometry.rs::WindowGeometryInfo`).
+///
+/// `origin_*`/`width`/`height` are REQUIRED (no `#[serde(default)]`): a
+/// half-populated reply must fail to parse into a
+/// [`CodriveClientError::Decode`] rather than silently deserializing to
+/// zeros — zeros here are exactly the bug class this whole round exists to
+/// kill. `shadow_*`/`matched_via` are diagnostics and may be absent.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CodriveWindowGeometry {
+    /// Top-left of the VISIBLE window (CSD shadow excluded) in comp global
+    /// logical coordinates — the origin AT-SPI `CoordType::Window` offsets
+    /// are relative to.
+    pub origin_x: i32,
+    pub origin_y: i32,
+    /// The visible window's size, used to bound-check a converted point.
+    pub width: i32,
+    pub height: i32,
+    /// The client-side-decoration shadow inset, diagnostics only.
+    /// Legitimately `0` when maximized/fullscreen.
+    #[serde(default)]
+    pub shadow_dx: i32,
+    #[serde(default)]
+    pub shadow_dy: i32,
+    /// Which criterion comp used to resolve the query (`pid`,
+    /// `pid+app_id`, `title_prefix`, …).
+    #[serde(default)]
+    pub matched_via: Option<String>,
 }
 
 /// Every ack shape the protocol can return, deserialized permissively
@@ -88,6 +132,17 @@ pub struct CodriveAck {
     pub error: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// WP-CD4b-fix (B3): present only on a successful `window_geometry`
+    /// ack. Absent on every other op (and on a comp too old to know the op
+    /// at all, which answers a plain `{"ok":true,"frozen":false}` — hence
+    /// `None` here MUST be treated as "unsupported / unusable", never as
+    /// "origin (0,0)"; see [`super::atspi_locate::frame_from_ack`]).
+    #[serde(default)]
+    pub window: Option<CodriveWindowGeometry>,
+    /// WP-CD4b-fix (B3): how many toplevels an `ambiguous_window` refusal
+    /// matched — diagnostics for the audit trail.
+    #[serde(default)]
+    pub candidates: Option<usize>,
 }
 
 /// An unsolicited `{"event": "..."}` line, interleaved with acks in the
@@ -419,6 +474,75 @@ mod tests {
         let terminated: CodriveAck =
             serde_json::from_value(serde_json::json!({"ok": false, "error": "session_terminated"})).unwrap();
         assert_eq!(terminated.error.as_deref(), Some("session_terminated"));
+    }
+
+    // ── WP-CD4b-fix (B3): window_geometry query ─────────────────────────
+
+    #[test]
+    fn wire_shape_window_geometry_omits_absent_fields() {
+        let pid_only = CodriveCmd::WindowGeometry { app_id: None, pid: Some(1234) };
+        assert_eq!(
+            serde_json::to_value(&pid_only).unwrap(),
+            serde_json::json!({"op": "window_geometry", "pid": 1234}),
+            "an absent app_id must not be serialized as an explicit null"
+        );
+
+        let both = CodriveCmd::WindowGeometry { app_id: Some("foot-A".into()), pid: Some(7) };
+        assert_eq!(
+            serde_json::to_value(&both).unwrap(),
+            serde_json::json!({"op": "window_geometry", "app_id": "foot-A", "pid": 7})
+        );
+    }
+
+    #[test]
+    fn ack_window_geometry_success_parses() {
+        let ack: CodriveAck = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "window": {
+                "origin_x": 10, "origin_y": 20,
+                "width": 800, "height": 600,
+                "shadow_dx": 26, "shadow_dy": 23,
+                "matched_via": "pid"
+            }
+        }))
+        .unwrap();
+        let w = ack.window.expect("window object must parse");
+        assert_eq!((w.origin_x, w.origin_y, w.width, w.height), (10, 20, 800, 600));
+        assert_eq!(w.matched_via.as_deref(), Some("pid"));
+    }
+
+    #[test]
+    fn ack_window_geometry_refusals_parse() {
+        let not_found: CodriveAck =
+            serde_json::from_value(serde_json::json!({"ok": false, "error": "window_not_found"})).unwrap();
+        assert!(not_found.window.is_none());
+        assert_eq!(not_found.error.as_deref(), Some("window_not_found"));
+
+        let ambiguous: CodriveAck =
+            serde_json::from_value(serde_json::json!({"ok": false, "error": "ambiguous_window", "candidates": 3}))
+                .unwrap();
+        assert_eq!(ambiguous.candidates, Some(3));
+    }
+
+    /// A comp that predates this op answers a plain injection ack. That must
+    /// parse cleanly and leave `window` as `None` — the caller then refuses
+    /// (see `atspi_locate::frame_from_ack`), rather than reading zeros.
+    #[test]
+    fn ack_from_a_comp_without_the_op_leaves_window_none() {
+        let ack: CodriveAck = serde_json::from_value(serde_json::json!({"ok": true, "frozen": false})).unwrap();
+        assert!(ack.window.is_none());
+        assert!(ack.ok);
+    }
+
+    /// A half-populated `window` object is a DECODE failure, not a
+    /// silently-zeroed geometry.
+    #[test]
+    fn ack_window_geometry_missing_required_field_fails_to_parse() {
+        let res: Result<CodriveAck, _> = serde_json::from_value(serde_json::json!({
+            "ok": true,
+            "window": {"origin_x": 10, "origin_y": 20, "width": 800}
+        }));
+        assert!(res.is_err(), "a window object missing `height` must not deserialize");
     }
 
     #[test]

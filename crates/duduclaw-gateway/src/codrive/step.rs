@@ -127,9 +127,19 @@ pub(super) async fn run_one_step(
     // same script run) is never mutated. A MISS/FAILED locate leaves
     // `effective_action` identical to `step.action`, i.e. the step's own
     // literal C-L1 coordinates keep going exactly as before.
+    //
+    // WP-CD4b-fix (B3): the locate now ALSO needs `client` — resolving a
+    // control's position takes two halves, "where is it inside its window"
+    // (AT-SPI `CoordType::Window`) and "where is that window on screen"
+    // (a read-only `window_geometry` query to comp over this same
+    // connection). See `atspi_locate`'s module doc for why the old
+    // `CoordType::Screen` half was structurally unusable on GTK4. Reusing
+    // the already-authenticated session connection (rather than opening a
+    // second one) matters: a reconnect looks like a brand-new co-drive
+    // session to comp — the exact bug CD-0 §9 fixed.
     let mut effective_action = step.action.clone();
     if let Some(req) = &step.locate {
-        try_atspi_locate(home_dir, agent_id, target_app, req, &mut effective_action).await;
+        try_atspi_locate(client, home_dir, agent_id, target_app, req, &mut effective_action).await;
     }
 
     let mut reapplied = false;
@@ -388,14 +398,22 @@ async fn try_registry_action(home_dir: &Path, agent_id: &str, target_app: &str, 
 /// mirroring `try_registry_action`'s C-L2 shape one rung up. Every one of
 /// the three outcomes is audited (`locate_outcome`: `located` /
 /// `locate_miss_fallback` / `locate_failed_fallback`).
+///
+/// WP-CD4b-fix (B3): `Failed` is now a much broader (and much more useful)
+/// category than "the bus was unreachable" — it also covers "more than one
+/// accessible matched", "comp could not uniquely identify the window", and
+/// "the converted point fell outside that window". Every one of those is a
+/// deliberate refusal to click on an untrustworthy coordinate, and every
+/// one lands in `tool_calls.jsonl` with its reason in `params_summary`.
 async fn try_atspi_locate(
+    client: &mut CodriveClient,
     home_dir: &Path,
     agent_id: &str,
     target_app: &str,
     req: &LocateRequest,
     action: &mut CodriveAction,
 ) {
-    let outcome = atspi_locate::locate(target_app, req).await;
+    let outcome = atspi_locate::locate(client, target_app, req).await;
     let (locate_outcome, success, detail, resolved) = match &outcome {
         LocateOutcome::Located { x, y, detail } => ("located", true, detail.clone(), Some((*x, *y))),
         LocateOutcome::Miss => (
