@@ -70,6 +70,7 @@
 // needs its internals) owns the goal-cards/activity-shelf/dock bottom half.
 
 mod home_dock;
+pub(crate) mod running_windows;
 
 use std::sync::Arc;
 
@@ -83,6 +84,7 @@ use crate::overlay::notifications_feed::{FeedStatus, NotificationsFeed};
 use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::ShellView;
+use running_windows::RunningWindowsFeed;
 
 /// Branding PNGs, repo-relative to `appliance/branding/png/` (this crate's
 /// task brief: "commercial/ 是 gitignored，資產一律用 appliance/branding 的
@@ -115,7 +117,17 @@ pub(crate) fn png(bytes: &'static [u8]) -> Arc<Image> {
 /// it's the SAME real feed the Notifications overlay panel itself renders
 /// (see `overlay::notifications_feed`'s own header comment on why the two
 /// surfaces share one model rather than each polling independently).
-pub fn render(palette: ShellPalette, notifications: &NotificationsFeed, cx: &mut Context<ShellView>) -> Stateful<Div> {
+/// `running_windows` (WP-comp-shell-ipc, 2026-08-22) is `&self.running_
+/// windows` from the same caller — the dock (`home_dock::dock`) reads it
+/// for its running-indicator dots and reuses it to decide focus-vs-launch
+/// on click (see `home::running_windows::RunningWindowsFeed`'s own header
+/// comment).
+pub fn render(
+    palette: ShellPalette,
+    notifications: &NotificationsFeed,
+    running_windows: &RunningWindowsFeed,
+    cx: &mut Context<ShellView>,
+) -> Stateful<Div> {
     div()
         .id("shell-home")
         .relative()
@@ -153,7 +165,7 @@ pub fn render(palette: ShellPalette, notifications: &NotificationsFeed, cx: &mut
         .child(workspace(palette, cx))
         .child(home_dock::goal_cards_row(palette))
         .child(home_dock::activity_shelf(palette))
-        .child(home_dock::dock(palette, cx))
+        .child(home_dock::dock(palette, running_windows, cx))
 }
 
 fn blob_top_left(top: f32, left: f32, size: f32, color: gpui::Rgba) -> Div {
