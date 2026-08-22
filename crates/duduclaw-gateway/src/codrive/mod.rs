@@ -33,7 +33,12 @@
 //!   locator ([`atspi_locate::locate`]), tried by `step.rs` one rung below
 //!   `registry` — resolves a step's `locate` role/name query into screen
 //!   coordinates that override the step's own literal `action` x/y before
-//!   the unchanged C-L1 coordinate dispatch runs.
+//!   the unchanged C-L1 coordinate dispatch runs. WP-CD4b-fix (B3): it
+//!   takes the session's [`client::CodriveClient`] because a real screen
+//!   coordinate needs BOTH halves — AT-SPI's window-relative offset and
+//!   comp's answer to "where is that window", asked over the new read-only
+//!   `window_geometry` op. See that module's doc for the GTK4
+//!   `CoordType::Screen`-returns-zeros defect this closes.
 //!
 //! `tests.rs`/`driver.rs` are both already near this project's per-file size
 //! convention (200-400 lines typical, 800 max) — new codrive test scenarios

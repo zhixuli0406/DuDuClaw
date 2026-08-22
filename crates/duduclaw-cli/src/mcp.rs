@@ -281,25 +281,33 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "in_reply_to", description: "Optional mail_id from your inbox that this replies to", required: false },
         ],
     },
-    // ── Human-machine co-drive (CD-1/CD-2/CD-3) ──────────────────────────
+    // ── Human-machine co-drive (CD-1/CD-2/CD-3/CD-4a/CD-4b) ───────────────
     // GUI-level mouse/keyboard injection into a shared desktop, human
-    // supervised throughout: every step is narrated to an activity-feed
-    // ticker, consequential steps (send/submit/delete/purchase/other) stop
-    // and wait for ApprovalBroker approval before the action is sent, a
-    // refuse-list hit (banking pages, CAPTCHA bypass, ...) is refused
-    // outright before any connection is even attempted, and human input on
-    // the shared desktop always freezes the agent immediately. CD-3: a
-    // login/password/payment step (explicit `take_over` action, or a
-    // `credential`-class consequential marker) hands the desktop to the
-    // human instead of being refused — the script continues once they hand
-    // it back; `watch_mode:true` asks for idle-based human-presence
-    // supervision for the rest of the run. Requires `[capabilities] codrive
-    // = true` on this agent (deny-by-default) in addition to Admin scope.
+    // supervised throughout, dispatched per-step through a three-rung
+    // execution ladder (DESIGN §3.2): C-L2 `api_action` (registered native
+    // API/CLI/D-Bus, `registry.rs`) → C-L3 `locate` (AT-SPI2 accessibility
+    // tree (role,name) lookup, `atspi_locate.rs`) → C-L1 the step's own
+    // literal coordinates. Both C-L2 and C-L3 are best-effort accelerants
+    // layered on C-L1, never a replacement for it: a registry MISS/FAILURE
+    // or a locate MISS/FAILURE both fall straight through to the next rung
+    // down, unchanged — see `step.rs::run_step`. Every step is narrated to
+    // an activity-feed ticker, consequential steps (send/submit/delete/
+    // purchase/other) stop and wait for ApprovalBroker approval before ANY
+    // rung dispatches the action, a refuse-list hit (banking pages, CAPTCHA
+    // bypass, ...) is refused outright before any connection is even
+    // attempted, and human input on the shared desktop always freezes the
+    // agent immediately. CD-3: a login/password/payment step (explicit
+    // `take_over` action, or a `credential`-class consequential marker)
+    // hands the desktop to the human instead of being refused — the script
+    // continues once they hand it back; `watch_mode:true` asks for
+    // idle-based human-presence supervision for the rest of the run.
+    // Requires `[capabilities] codrive = true` on this agent (deny-by-
+    // default) in addition to Admin scope.
     ToolDef {
         name: "codrive_run",
-        description: "Run a scripted human-machine co-drive session: move the mouse, click, type, and press keys in a shared, human-visible desktop, narrating each step to the activity feed. Every consequential step (send/submit/delete/purchase/other) pauses for human approval before the action is dispatched; a refuse-list hit (banking pages, CAPTCHA bypass, ...) is rejected outright, before any connection is even attempted. A login/password/payment step (action kind 'take_over', or a consequential class of 'credential') hands the shared desktop to a human instead — you never send the credential text yourself; the script resumes once they hand control back. Any human input on the shared desktop immediately freezes your seat — the dropped step is automatically retried once a person hands control back. Set watch_mode:true on the script for idle-based supervision (auto-pauses if no human input is seen for a while, for the rest of the run). Requires the codrive capability to be explicitly enabled on this agent.",
+        description: "Run a scripted human-machine co-drive session in a shared, human-visible desktop, narrating each step to the activity feed. Each step is dispatched through a three-rung execution ladder, tried in this order — prefer the highest rung that applies: C-L2 (this step's api_action, if set) runs a registered third-party app's native API/CLI/D-Bus action for target_app FIRST, before touching the GUI at all — always prefer this over clicking through the interface when the app+action you need is registered. C-L3 (this step's locate, if set, tried only when api_action is absent or missed/failed) resolves this step's move/click coordinates by (role, name) lookup in target_app's AT-SPI2 accessibility tree instead of trusting hand-guessed pixel coordinates — prefer this whenever the control you're driving has an accessible name/label, it is far more robust to layout/resolution/theme changes than literal x/y. C-L1 (this step's own literal action x/y) is the fallback used when api_action/locate are absent, or when either one misses or fails at runtime — action is therefore always required even when api_action or locate is also set. Every consequential step (send/submit/delete/purchase/other) pauses for human approval before ANY rung dispatches it; a refuse-list hit (banking pages, CAPTCHA bypass, ...) is rejected outright, before any connection is even attempted. A login/password/payment step (action kind 'take_over', or a consequential class of 'credential') hands the shared desktop to a human instead — you never send the credential text yourself through any rung; the script resumes once they hand control back. Any human input on the shared desktop immediately freezes your seat — the dropped step is automatically retried once a person hands control back. Set watch_mode:true on the script for idle-based supervision (auto-pauses if no human input is seen for a while, for the rest of the run). target_app is a SINGLE script-level field, not per-step — the whole script drives one app's registry/accessibility tree; to drive a second app, issue a second codrive_run call. Requires the codrive capability to be explicitly enabled on this agent.",
         params: &[
-            ParamDef { name: "script", description: "JSON object: {target_app, task_summary, watch_mode?:bool, steps:[{narration, highlight?:{x,y,w,h}, action:{kind:'move'|'click'|'text'|'key_name'|'wait'|'take_over', ...}, consequential?:{class:'send'|'submit'|'delete'|'purchase'|'credential'|'other', description}}]}. A 'take_over' action needs {kind:'take_over', reason}. Max 50 steps.", required: true },
+            ParamDef { name: "script", description: "JSON object: {target_app, task_summary, watch_mode?:bool, steps:[{narration, highlight?:{x,y,w,h}, action:{kind:'move'|'click'|'text'|'key_name'|'wait'|'take_over', ...}, consequential?:{class:'send'|'submit'|'delete'|'purchase'|'credential'|'other', description}, api_action?:{action, params?}, locate?:{role, name}}]}. target_app is a SINGLE script-level field (not per-step) — every step in one script targets the same app; split into multiple codrive_run calls to drive a second app. api_action is C-L2, tried before locate/coordinates: action is a short registered identifier for target_app (e.g. chromium's 'open_url', networkmanager's 'state' — see the app registry for the current list), params is that action's call payload (omit/null for zero-param actions, validated against the action's own schema at dispatch time); a registry MISS or exec FAILURE silently falls through to this step's action field, so action is still required even when api_action is set. locate is C-L3, tried after api_action (only meaningful for 'move'/'click' actions — ignored for text/key_name/wait/take_over): role is a short accessibility-role token (e.g. 'button', 'entry', 'password', 'menu_item', 'checkbox', 'link', ...), name is the control's accessible label/text to match within target_app's tree; a MISS/FAILURE falls back to action's own literal x,y, unchanged. A 'take_over' action needs {kind:'take_over', reason}. Max 50 steps.", required: true },
             ParamDef { name: "agent", description: "Optional: run (and capability-check) as a different agent id instead of the caller's own identity. Omit to use your own identity.", required: false },
         ],
     },
@@ -23150,6 +23158,51 @@ mod wiki_namespace_tests {
                 "skill_synthesis_run inputSchema must have property '{}'; schema: {}",
                 param,
                 tool["inputSchema"]
+            );
+        }
+    }
+
+    // ── B2: codrive_run must surface C-L2/C-L3, not just C-L1 coordinates ──
+    // Regression for the gap where `codrive_run`'s description/schema never
+    // mentioned `api_action` (C-L2 registry) or `locate` (C-L3 AT-SPI2) even
+    // though `CodriveStep` has supported both fields since CD-4a/CD-4b — an
+    // LLM caller reading only this tool's advertised shape could never
+    // produce a script that uses either rung.
+    #[test]
+    fn codrive_run_schema_surfaces_api_action_and_locate() {
+        use serde_json::json;
+        let id = json!(1);
+
+        let response = super::handle_tools_list(&id, &super::test_principal(false), tmp_home_for_tools_list().path());
+        let tools = response["result"]["tools"].as_array().expect("tools must be array");
+
+        let tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("codrive_run"))
+            .expect("codrive_run must be present in internal tools list");
+
+        let desc = tool["description"].as_str().unwrap_or("");
+        assert!(!desc.is_empty(), "codrive_run must have a non-empty description");
+        for keyword in ["api_action", "locate", "C-L2", "C-L3", "target_app"] {
+            assert!(
+                desc.contains(keyword),
+                "codrive_run description must mention '{keyword}'; description: {desc}"
+            );
+        }
+
+        // The `script` param's description is where this tool's whole
+        // schema convention lives (see `build_tool_schema` — every param is
+        // typed as a bare JSON-Schema string, so the actual object shape is
+        // carried in the description text). It must spell out both fields'
+        // shapes, not just name-drop them.
+        let script_desc = tool["inputSchema"]["properties"]["script"]["description"]
+            .as_str()
+            .unwrap_or("");
+        assert!(!script_desc.is_empty(), "codrive_run script param must have a non-empty description");
+        for keyword in ["api_action?:{action, params?}", "locate?:{role, name}"] {
+            assert!(
+                script_desc.contains(keyword),
+                "codrive_run script description must spell out '{keyword}'; description: {script_desc}"
             );
         }
     }
