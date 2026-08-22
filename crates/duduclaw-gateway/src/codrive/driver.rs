@@ -43,7 +43,9 @@ pub struct CodriveStepReport {
     pub index: usize,
     pub narration: String,
     /// One of: `applied` / `refused` / `denied` / `dropped_frozen_reapplied`
-    /// / `taken_over` (CD-3) / `aborted`.
+    /// / `taken_over` (CD-3) / `api_action` (WP-CD4a, C-L2 registry hit —
+    /// served by a native CLI/D-Bus action, never touched the comp socket)
+    /// / `aborted`.
     pub outcome: &'static str,
     pub detail: Option<String>,
     pub approval_id: Option<String>,
@@ -238,7 +240,9 @@ pub async fn run_script(
         .await
         {
             Ok(s) => {
-                let outcome = if s.taken_over {
+                let outcome = if s.via_api_action {
+                    "api_action"
+                } else if s.taken_over {
                     "taken_over"
                 } else if s.reapplied {
                     "dropped_frozen_reapplied"

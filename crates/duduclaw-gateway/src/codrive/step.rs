@@ -17,7 +17,8 @@ use crate::approval::{ApprovalBroker, ApprovalStatus, SimulationNarrative};
 use super::client::{CodriveButtonState, CodriveClient, CodriveClientError, CodriveCmd};
 use super::config::CodriveConfig;
 use super::driver::ticker;
-use super::script::{CodriveAction, CodriveConsequential, CodriveStep, ConsequentialClass};
+use super::registry::{self, DispatchOutcome};
+use super::script::{ApiActionRequest, CodriveAction, CodriveConsequential, CodriveStep, ConsequentialClass};
 
 /// The tool name stamped on every audit row this module writes — matches
 /// the MCP tool name (`codrive_run`) so `tool_calls.jsonl` correlates.
@@ -42,6 +43,13 @@ pub(super) struct StepSuccess {
     /// classed step auto-converted to one) rather than a normal action send
     /// — `driver.rs` maps this to the step outcome `"taken_over"`.
     pub(super) taken_over: bool,
+    /// WP-CD4a (C-L2): true iff this step was served by a registry-backed
+    /// native API/CLI/D-Bus action (`registry::dispatch` hit + succeeded)
+    /// instead of its ordinary coordinate `action` — `driver.rs` maps this
+    /// to the step outcome `"api_action"`. Mutually exclusive with
+    /// `taken_over`/`reapplied`: a C-L2 hit returns immediately from
+    /// `run_one_step`, before either of those other paths can be reached.
+    pub(super) via_api_action: bool,
 }
 
 /// Whole-script-aborting per-step failure.
@@ -93,10 +101,24 @@ pub(super) async fn run_one_step(
         },
     };
 
+    // WP-CD4a (C-L2 registry checkpoint, DESIGN §3.2 execution ladder rung
+    // 2): if this step declares an `api_action`, try the registry BEFORE
+    // the ordinary coordinate dispatch loop below — a hit that actually
+    // executes skips that loop (and therefore `client`/comp) entirely; a
+    // MISS or an exec FAILURE both fall straight through to the unchanged
+    // loop, exactly as if `api_action` had never been set. The approval
+    // gate above already ran either way — a consequential step is gated
+    // the same regardless of which mechanism ends up carrying it out.
+    if let Some(req) = &step.api_action {
+        if try_registry_action(home_dir, agent_id, target_app, req).await {
+            return Ok(StepSuccess { approval_id, reapplied: false, taken_over: false, via_api_action: true });
+        }
+    }
+
     let mut reapplied = false;
     loop {
         match send_step_actions(client, step).await {
-            Ok(()) => return Ok(StepSuccess { approval_id, reapplied, taken_over: false }),
+            Ok(()) => return Ok(StepSuccess { approval_id, reapplied, taken_over: false, via_api_action: false }),
             Err(CodriveClientError::Frozen) => {
                 ticker(home_dir, agent_id, "codrive_step", session_id, "已被人類輸入凍結，等待交還（Super+Enter）").await;
                 match wait_for_resume(client, started, deadline).await {
@@ -206,7 +228,7 @@ async fn run_take_over_step(
     match wait_for_resume(client, started, deadline).await {
         Ok(()) => {
             ticker(home_dir, agent_id, "codrive_step", session_id, "已交還，繼續執行下一步").await;
-            Ok(StepSuccess { approval_id: None, reapplied: false, taken_over: true })
+            Ok(StepSuccess { approval_id: None, reapplied: false, taken_over: true, via_api_action: false })
         }
         Err(WaitAbort::Timeout) => Err(StepAbort {
             step_outcome: "aborted",
@@ -294,6 +316,49 @@ async fn gate_consequential(
             Err(StepAbort { step_outcome: "denied", final_state: "aborted_approval_denied", detail, approval_id })
         }
     }
+}
+
+/// WP-CD4a: try this step's `api_action` against `registry::dispatch`.
+/// Returns `true` only on an actual `Executed` hit (the caller then skips
+/// the coordinate dispatch loop entirely); a `Miss` or a `Failed` both
+/// return `false` so the caller falls through to that loop unchanged — the
+/// whole "查無/呼叫失敗→原樣落回既有 C-L1 座標路徑" contract lives in that
+/// single boolean, not in any special-cased error handling here. Every one
+/// of the three outcomes is audited (`registry_outcome`: `executed` /
+/// `registry_miss_fallback` / `exec_failed_fallback`) — this is the "三者
+/// 各自入稽核" line the WP brief asks for, one row per attempt, disambiguated
+/// by that field rather than three separate audit calls, so a reader
+/// scanning `tool_calls.jsonl` for one `codrive_run` step sees exactly one
+/// C-L2 row instead of reconstructing it from a sequence.
+async fn try_registry_action(home_dir: &Path, agent_id: &str, target_app: &str, req: &ApiActionRequest) -> bool {
+    let outcome = registry::dispatch(target_app, req).await;
+    let (registry_outcome, success, detail) = match &outcome {
+        DispatchOutcome::Executed { detail } => ("executed", true, detail.clone()),
+        DispatchOutcome::Miss => (
+            "registry_miss_fallback",
+            false,
+            format!("no C-L2 registry entry for app={target_app:?} action={:?} — falling back to C-L1", req.action),
+        ),
+        DispatchOutcome::Failed { detail } => ("exec_failed_fallback", false, detail.clone()),
+    };
+    let params_summary = format!(
+        "api_action {registry_outcome}: app={target_app} action={} — {}",
+        req.action,
+        duduclaw_core::truncate_chars(&detail, 200)
+    );
+    duduclaw_security::audit::append_tool_call_with_extras(
+        home_dir,
+        agent_id,
+        TOOL_NAME,
+        &params_summary,
+        success,
+        &[
+            ("registry_outcome", json!(registry_outcome)),
+            ("app_id", json!(target_app)),
+            ("action", json!(req.action)),
+        ],
+    );
+    matches!(outcome, DispatchOutcome::Executed { .. })
 }
 
 /// Send one step's wire ops: optional highlight + 200ms predisplay, then

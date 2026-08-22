@@ -163,6 +163,7 @@ pub(super) fn plain_step(narration: &str, action: CodriveAction) -> CodriveStep 
         highlight: None,
         action,
         consequential: None,
+        api_action: None,
     }
 }
 
@@ -180,6 +181,27 @@ pub(super) fn consequential_step(
             class,
             description: desc.to_string(),
         }),
+        api_action: None,
+    }
+}
+
+/// C-L2 (WP-CD4a) variant: an ordinary plain step (same fallback `action`
+/// `plain_step` would build) that ALSO carries an `api_action` request —
+/// `tests_registry.rs` uses this to exercise the registry-check checkpoint
+/// `step::run_one_step` inserts ahead of the ordinary coordinate dispatch.
+/// `pub(super)` for the same reason the rest of this harness is: reused
+/// from a sibling `tests_<topic>.rs` file, not duplicated.
+pub(super) fn api_action_step(
+    narration: &str,
+    fallback_action: CodriveAction,
+    api_action: super::script::ApiActionRequest,
+) -> CodriveStep {
+    CodriveStep {
+        narration: narration.to_string(),
+        highlight: None,
+        action: fallback_action,
+        consequential: None,
+        api_action: Some(api_action),
     }
 }
 

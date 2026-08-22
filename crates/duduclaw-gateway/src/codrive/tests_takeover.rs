@@ -171,5 +171,6 @@ fn take_over_step(reason: &str) -> super::script::CodriveStep {
         highlight: None,
         action: CodriveAction::TakeOver { reason: reason.to_string() },
         consequential: None,
+        api_action: None,
     }
 }
