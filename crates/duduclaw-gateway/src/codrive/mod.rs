@@ -29,6 +29,11 @@
 //! - [`registry`] — CD-4/WP-CD4a: the C-L2 third-party app API/CLI/D-Bus
 //!   action registry ([`registry::dispatch`]), tried by `step.rs` ahead of
 //!   the ordinary C-L1 coordinate dispatch.
+//! - [`atspi_locate`] — CD-4/WP-CD4b: the C-L3 AT-SPI2 semantic-layer
+//!   locator ([`atspi_locate::locate`]), tried by `step.rs` one rung below
+//!   `registry` — resolves a step's `locate` role/name query into screen
+//!   coordinates that override the step's own literal `action` x/y before
+//!   the unchanged C-L1 coordinate dispatch runs.
 //!
 //! `tests.rs`/`driver.rs` are both already near this project's per-file size
 //! convention (200-400 lines typical, 800 max) — new codrive test scenarios
@@ -37,6 +42,7 @@
 //! doesn't fit `step.rs`'s existing split should get its own module the same
 //! way `identity.rs` did, not be appended to `driver.rs`.
 
+pub mod atspi_locate;
 pub mod client;
 pub mod config;
 pub mod driver;
@@ -57,11 +63,15 @@ mod tests_takeover;
 #[cfg(all(test, unix))]
 mod tests_registry;
 
+#[cfg(all(test, unix))]
+mod tests_atspi_locate;
+
 /// Permanent `#[ignore]` live-bridge harness against the real comp
 /// container stack — see its module doc for the playbook.
 #[cfg(all(test, unix))]
 mod live_tests;
 
+pub use atspi_locate::{locate as atspi_locate_dispatch, LocateOutcome as AtspiLocateOutcome};
 pub use client::{
     CodriveAck, CodriveButton, CodriveButtonState, CodriveClient, CodriveClientError, CodriveCmd,
     CodriveEvent,
@@ -72,5 +82,5 @@ pub use identity::{resolve_run_identity, RunIdentityError};
 pub use registry::{dispatch as registry_dispatch, DispatchOutcome as RegistryDispatchOutcome};
 pub use script::{
     ApiActionRequest, CodriveAction, CodriveConsequential, CodriveHighlight, CodriveScript,
-    CodriveStep, ConsequentialClass,
+    CodriveStep, ConsequentialClass, LocateRequest,
 };

@@ -99,7 +99,7 @@ fn live_home(label: &str, sock: &std::path::Path, token: &std::path::Path) -> Pa
 }
 
 fn step(narration: &str, action: CodriveAction) -> CodriveStep {
-    CodriveStep { narration: narration.to_string(), highlight: None, action, consequential: None, api_action: None }
+    CodriveStep { narration: narration.to_string(), highlight: None, action, consequential: None, api_action: None, locate: None }
 }
 
 /// One sequential test (not two) on purpose: comp accepts a single
@@ -124,6 +124,7 @@ async fn live_bridge_approve_then_deny_round() {
                 action: CodriveAction::Click { x: 200.0, y: 150.0, btn: super::client::CodriveButton::Left },
                 consequential: None,
                 api_action: None,
+                locate: None,
             },
             step("輸入建檔指令", CodriveAction::Text { s: "echo cd1live > /tmp/cd1-live.txt".to_string() }),
             CodriveStep {
@@ -135,6 +136,7 @@ async fn live_bridge_approve_then_deny_round() {
                     description: "在共享桌面的終端機執行已輸入的指令".to_string(),
                 }),
                 api_action: None,
+                locate: None,
             },
             step("等待畫面更新", CodriveAction::Wait { ms: 500 }),
         ],
@@ -166,6 +168,7 @@ async fn live_bridge_approve_then_deny_round() {
                     description: "在共享桌面的終端機執行已輸入的指令".to_string(),
                 }),
                 api_action: None,
+                locate: None,
             },
         ],
         watch_mode: false,
@@ -218,6 +221,7 @@ async fn live_bridge_real_human_freeze_and_resume() {
                 action: CodriveAction::Click { x: 200.0, y: 150.0, btn: super::client::CodriveButton::Left },
                 consequential: None,
                 api_action: None,
+                locate: None,
             },
             step(
                 "等待外部注入真人輸入（QMP 真鍵盤事件，非 debug stdin）",

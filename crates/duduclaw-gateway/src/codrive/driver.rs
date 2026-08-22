@@ -45,7 +45,12 @@ pub struct CodriveStepReport {
     /// One of: `applied` / `refused` / `denied` / `dropped_frozen_reapplied`
     /// / `taken_over` (CD-3) / `api_action` (WP-CD4a, C-L2 registry hit —
     /// served by a native CLI/D-Bus action, never touched the comp socket)
-    /// / `aborted`.
+    /// / `aborted`. WP-CD4b's C-L3 AT-SPI2 locate does NOT add a new tag
+    /// here — a locate hit still dispatches over the comp socket exactly
+    /// like a literal-coordinate step (just with resolved x/y), so it
+    /// reports `applied`/`reapplied` same as always; see `tool_calls.jsonl`'s
+    /// `locate_outcome` audit field (`step::try_atspi_locate`) for whether a
+    /// given step was actually served by a locate.
     pub outcome: &'static str,
     pub detail: Option<String>,
     pub approval_id: Option<String>,
