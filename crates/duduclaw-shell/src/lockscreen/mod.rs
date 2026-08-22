@@ -248,17 +248,48 @@ pub(crate) struct LockScreenState {
     /// WP-lock-pw (2026-08-22) — the password prompt's own sub-state. See
     /// `UnlockPrompt`'s own doc comment.
     unlock_prompt: UnlockPrompt,
+    /// WP-A4-4 (2026-08-22) — single-arm guard for `render::
+    /// schedule_clock_tick`. That timer used to be armed once per render
+    /// pass while ALSO being the thing that causes the next render (it
+    /// exists purely to `cx.notify()` so the clock advances), so every
+    /// repaint from any other source permanently added one more repeating
+    /// tick to the pile. On the appliance VM that ran for 5h48m, ending at
+    /// ~100% CPU on a static screen. Exactly the same fix, and the same
+    /// reasoning, as `overlay::notifications_feed::NotificationsFeed::
+    /// stale_timer_armed` — see that field's own doc comment.
+    clock_timer_armed: bool,
 }
 
 impl Default for LockScreenState {
     fn default() -> Self {
-        Self { locked: false, locked_at: None, last_input_at: Instant::now(), unlock_prompt: UnlockPrompt::default() }
+        Self { locked: false, locked_at: None, last_input_at: Instant::now(), unlock_prompt: UnlockPrompt::default(), clock_timer_armed: false }
     }
 }
 
 impl LockScreenState {
     pub(crate) fn is_locked(&self) -> bool {
         self.locked
+    }
+
+    /// Claims the single clock-tick timer slot — `true` means the caller
+    /// owns it and must arm exactly one repeating tick that calls
+    /// [`Self::disarm_clock_timer`] when it stops. `false` means one is
+    /// already running and this caller must do nothing.
+    pub(crate) fn try_arm_clock_timer(&mut self) -> bool {
+        if self.clock_timer_armed {
+            return false;
+        }
+        self.clock_timer_armed = true;
+        true
+    }
+
+    pub(crate) fn disarm_clock_timer(&mut self) {
+        self.clock_timer_armed = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock_timer_armed(&self) -> bool {
+        self.clock_timer_armed
     }
 
     pub(crate) fn locked_at(&self) -> Option<Instant> {
@@ -413,6 +444,42 @@ pub(crate) fn format_away_duration(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WP-A4-4 regression: `render::schedule_clock_tick` used to arm a
+    /// fresh repeating tick on EVERY render pass, while itself being the
+    /// thing that triggers the next render — so the pending-tick count only
+    /// ever grew, and the appliance VM ended at ~100% CPU on a static
+    /// screen. The slot below is what makes calling the scheduler from a
+    /// render body safe.
+    #[test]
+    fn the_clock_tick_slot_admits_exactly_one_holder() {
+        let mut state = LockScreenState::default();
+        assert!(!state.clock_timer_armed(), "a fresh state must own no timer");
+        assert!(state.try_arm_clock_timer(), "the first claimant wins");
+        assert!(state.clock_timer_armed());
+        for _ in 0..1_000 {
+            assert!(!state.try_arm_clock_timer(), "every later render pass must be refused, not stack another tick");
+        }
+        state.disarm_clock_timer();
+        assert!(!state.clock_timer_armed());
+        assert!(state.try_arm_clock_timer(), "a released slot must be re-claimable (lock -> unlock -> lock)");
+    }
+
+    /// The slot is orthogonal to lock state: the running tick releases it
+    /// itself on the first tick after an unlock (see `render::
+    /// schedule_clock_tick`), so `lock`/`unlock` must NOT stomp it — doing
+    /// so from `lock()` would let a re-lock arm a SECOND tick while the
+    /// first is still alive, which is the exact bug being fixed.
+    #[test]
+    fn locking_and_unlocking_never_silently_release_the_clock_slot() {
+        let mut state = LockScreenState::default();
+        assert!(state.try_arm_clock_timer());
+        state.lock();
+        assert!(state.clock_timer_armed());
+        state.unlock();
+        assert!(state.clock_timer_armed(), "only the tick itself may release the slot");
+        assert!(!state.try_arm_clock_timer());
+    }
 
     // Same `ENV_LOCK`-guarded discipline `audio::mod`/`oobe::network::mod`
     // already establish for their own process-global env var tests.

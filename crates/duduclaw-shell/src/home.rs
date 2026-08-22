@@ -72,7 +72,8 @@
 mod home_dock;
 pub(crate) mod running_windows;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use gpui::{div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, BoxShadow, Context, Div, FontWeight, Image, ImageFormat, Stateful};
 
@@ -100,8 +101,30 @@ use running_windows::RunningWindowsFeed;
 pub(crate) const MARK_32: &[u8] = include_bytes!("../../../appliance/branding/png/mark-32.png");
 pub(crate) const CAT_512: &[u8] = include_bytes!("../../../appliance/branding/png/cat-512.png");
 
+/// WP-A4-4 (2026-08-22): memoized per asset. This is called from RENDER
+/// bodies (Home's mascot + menu-bar mark, the lockscreen's watermark +
+/// mark, OOBE's finish mark), so the previous `bytes.to_vec()` copied and
+/// re-hashed the whole PNG on every single repaint — 14.5 KB for
+/// `CAT_512` — purely to hand gpui a value it already had.
+///
+/// Correctness was never at risk (checked against the pinned gpui rev's own
+/// `Image::from_bytes`, `crates/gpui/src/platform.rs`: `id: hash(&bytes)`
+/// is CONTENT-derived, so a fresh `Arc` of identical bytes hits the same
+/// image-cache entry and never triggers a re-decode). This is purely about
+/// not doing the copy-and-hash again on a machine that is repainting
+/// often — which the appliance VM demonstrably was.
 pub(crate) fn png(bytes: &'static [u8]) -> Arc<Image> {
-    Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec()))
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<Image>>>> = OnceLock::new();
+    // Keyed by the `&'static` slice's own address: every caller passes one
+    // of this crate's `include_bytes!` consts, so the address IS the asset
+    // identity and no hashing of the contents is needed to look it up.
+    let key = bytes.as_ptr() as usize;
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // A poisoned mutex here would mean a panic while cloning an `Arc` —
+    // recovering the guard is strictly better than turning that into a
+    // second panic on a UI thread.
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(guard.entry(key).or_insert_with(|| Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec()))))
 }
 
 /// The whole Home surface: wallpaper, menu bar, AI workspace, goal cards,
@@ -533,4 +556,28 @@ fn suggestion_chips(palette: ShellPalette) -> Div {
             .text_color(theme::alpha(palette.text_secondary, 1.0))
             .child(*label)
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WP-A4-4: `png` is called from render bodies, so a machine that
+    /// repaints often must not pay for a fresh `Vec` copy plus a content
+    /// hash of the whole PNG on every frame. Pointer equality of the
+    /// returned `Arc` is the direct evidence the memo actually hit.
+    #[test]
+    fn png_returns_the_same_cached_image_for_a_repeated_asset() {
+        let a = png(CAT_512);
+        let b = png(CAT_512);
+        assert!(Arc::ptr_eq(&a, &b), "a repeat render must reuse the decoded asset, not rebuild it");
+    }
+
+    #[test]
+    fn png_keeps_distinct_assets_distinct() {
+        let cat = png(CAT_512);
+        let mark = png(MARK_32);
+        assert!(!Arc::ptr_eq(&cat, &mark));
+        assert_ne!(cat.id(), mark.id(), "two different assets must not collapse onto one cache entry");
+    }
 }

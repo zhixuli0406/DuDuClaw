@@ -25,8 +25,8 @@
 // registers its xdg-shell app_id as its flatpak application id (the
 // desktop-file basename convention flatpak's own window/taskbar
 // integration relies on) — a REASONABLE assumption, not a cross-checked
-// one (this crate's own `apps.rs` already flags flatpak as absent from the
-// dev/appliance images this round — A4 still pending), so `is_app_running`
+// one (`apps.rs`'s own header comment records where flatpak actually is:
+// on the appliance since A4-2/3, absent on a dev Mac), so `is_app_running`
 // is an honest "assume the ids line up" helper. Every entry besides
 // `browser` has `flatpak_id: None` and therefore never matches anything
 // here regardless of what's actually running.
@@ -88,11 +88,27 @@ impl RunningWindowsFeed {
         true
     }
 
-    pub(crate) fn apply_list_ok(&mut self, windows: Vec<CompWindow>) {
+    /// Returns whether anything the DOCK actually draws changed. The dock's
+    /// only reader of this feed is `is_app_running` (a running-indicator
+    /// dot per icon), so the answer is exactly "did the window list move" —
+    /// `status`/`busy` have no on-screen representation here at all
+    /// (`status()` is `#[cfg(test)]`).
+    ///
+    /// WP-A4-4 (2026-08-22): before this returned anything, `home_dock.rs`
+    /// notified unconditionally on every settle, so a machine whose
+    /// `duduclaw-comp` is not running at all — which is exactly the
+    /// appliance's `cage` fallback session, where this shell is cage's only
+    /// client and there is no comp to ask — repainted the whole window
+    /// twice every 3 seconds forever to redraw an unchanged dock. See
+    /// `overlay/notifications_backoff.rs`'s header comment for the wider
+    /// post-mortem this belongs to.
+    pub(crate) fn apply_list_ok(&mut self, windows: Vec<CompWindow>) -> bool {
+        let changed = windows != self.windows;
         self.windows = windows;
         self.status = FeedStatus::Ready;
         self.busy = false;
         self.last_refreshed_at = Some(Instant::now());
+        changed
     }
 
     /// Deliberately does NOT clear `windows`/downgrade to an empty list on
@@ -152,6 +168,24 @@ mod tests {
         assert_eq!(feed.status(), FeedStatus::Loading);
         // Already busy — a second concurrent caller must not start another.
         assert!(!feed.begin_refresh());
+    }
+
+    /// WP-A4-4: the dock must not repaint the whole window for a poll that
+    /// found exactly what the previous poll found — which, on a session
+    /// with no `duduclaw-comp` running, is every poll forever.
+    #[test]
+    fn an_unchanged_window_list_reports_no_repaint_needed() {
+        let mut feed = RunningWindowsFeed::default();
+        feed.begin_refresh();
+        assert!(feed.apply_list_ok(vec![window("foot-A")]), "first result is a real change");
+        feed.begin_refresh();
+        assert!(!feed.apply_list_ok(vec![window("foot-A")]), "an identical poll result must cost nothing");
+        feed.begin_refresh();
+        assert!(feed.apply_list_ok(vec![window("foot-A"), window("foot-B")]), "a genuinely new window must still repaint");
+        feed.begin_refresh();
+        assert!(feed.apply_list_ok(vec![]), "and so must one going away");
+        feed.begin_refresh();
+        assert!(!feed.apply_list_ok(vec![]), "empty -> empty is the no-comp appliance case: zero repaints");
     }
 
     #[test]

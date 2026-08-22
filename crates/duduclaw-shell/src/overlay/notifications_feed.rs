@@ -40,6 +40,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::notifications_backoff::{sample_jitter, FailureKind, LogVerdict, RefreshBackoff};
 use crate::gateway_client::ApprovalItem;
 
 /// Bounds how many just-decided rows stay visible in `decided` — an
@@ -153,6 +154,27 @@ pub enum FeedStatus {
     Offline,
 }
 
+/// What `apply_list_ok` tells its caller — WP-A4-4. Two separate signals
+/// that used to be neither computed nor available: whether a repaint is
+/// warranted at all, and whether this success ended a failure streak worth
+/// one recovery log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FetchOkOutcome {
+    pub changed: bool,
+    pub recovered: Option<u32>,
+}
+
+/// What `apply_list_err`/`apply_session_err` tell their caller — WP-A4-4.
+/// `log` is the denoise verdict (see `notifications_backoff::LogVerdict`);
+/// `failures` is the streak length so far, so an emitted line can say how
+/// deep the outage is instead of looking like a first occurrence every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FetchErrOutcome {
+    pub changed: bool,
+    pub log: LogVerdict,
+    pub failures: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NotificationsFeed {
     pub status: FeedStatus,
@@ -171,11 +193,39 @@ pub struct NotificationsFeed {
     /// Most-recently-decided first, capped at `MAX_DECIDED_HISTORY` — see
     /// this file's header comment.
     decided: Vec<ApprovalRow>,
+    /// WP-A4-4 (2026-08-22): retry spacing after a failed fetch. Before
+    /// this existed, `apply_list_err`/`apply_session_err` left
+    /// `last_refreshed_at` untouched, so `is_stale()` answered `true`
+    /// forever after the first failure and every stale check that found no
+    /// fetch in flight immediately started another one — the appliance VM's
+    /// 429 storm. See `notifications_backoff`'s own header comment for the
+    /// full post-mortem.
+    backoff: RefreshBackoff,
+    /// Single-arm guard for the periodic stale-check TIMER (the second half
+    /// of that same post-mortem). `overlay::notifications::render` and
+    /// `lockscreen::render::render` each used to arm a fresh 30s timer on
+    /// EVERY render pass with nothing stopping the pending-timer count from
+    /// growing without bound; both now claim this one slot first and give
+    /// up if another timer already holds it. Lives on the feed, not on
+    /// either surface, precisely because both surfaces drive the SAME
+    /// refresh (see this file's header comment on why there is one model)
+    /// — two slots would let the two surfaces re-create the pile-up
+    /// between them.
+    stale_timer_armed: bool,
 }
 
 impl Default for NotificationsFeed {
     fn default() -> Self {
-        Self { status: FeedStatus::Idle, session_jwt: None, busy: false, last_refreshed_at: None, rows: Vec::new(), decided: Vec::new() }
+        Self {
+            status: FeedStatus::Idle,
+            session_jwt: None,
+            busy: false,
+            last_refreshed_at: None,
+            rows: Vec::new(),
+            decided: Vec::new(),
+            backoff: RefreshBackoff::default(),
+            stale_timer_armed: false,
+        }
     }
 }
 
@@ -229,11 +279,78 @@ impl NotificationsFeed {
     /// the last successful refresh is older than [`REFRESH_STALE_AFTER`].
     /// Does NOT itself check `is_busy()` — callers already guard on that
     /// separately (same split `begin_refresh`'s own doc comment describes).
+    ///
+    /// WP-A4-4: an OPEN backoff window (see `backoff`'s own doc comment)
+    /// answers `false` regardless of staleness. This is the load-bearing
+    /// half of the 429 fix — every caller, including the panel-open fast
+    /// path, goes through here, so there is no route that can bypass the
+    /// retry spacing.
     pub fn is_stale(&self) -> bool {
+        self.is_stale_at(Instant::now())
+    }
+
+    /// `is_stale` with the clock injected — the testable primitive (this
+    /// module's own "no wall-clock reads buried inside logic" discipline,
+    /// same shape `notifications_backoff` uses throughout).
+    pub(crate) fn is_stale_at(&self, now: Instant) -> bool {
+        if self.backoff.is_open(now) {
+            return false;
+        }
         match self.last_refreshed_at {
             None => true,
-            Some(t) => t.elapsed() >= REFRESH_STALE_AFTER,
+            Some(t) => now.saturating_duration_since(t) >= REFRESH_STALE_AFTER,
         }
+    }
+
+    /// How long the periodic stale-check loop should sleep before its next
+    /// `is_stale()` test: the plain [`REFRESH_STALE_AFTER`] cadence
+    /// normally, or exactly the remaining backoff window when one is open
+    /// (so a 2s backoff isn't rounded up to a 30s outage, and a 60s one
+    /// isn't woken at 30s only to be refused). Floored at one second — a
+    /// nearly-expired window must never produce a zero-delay timer, which
+    /// is how a "timer" quietly becomes a spin loop.
+    pub(crate) fn next_check_delay(&self) -> Duration {
+        self.next_check_delay_at(Instant::now())
+    }
+
+    pub(crate) fn next_check_delay_at(&self, now: Instant) -> Duration {
+        const MIN_CHECK_DELAY: Duration = Duration::from_secs(1);
+        match self.backoff.remaining(now) {
+            Some(remaining) => remaining.max(MIN_CHECK_DELAY),
+            None => REFRESH_STALE_AFTER,
+        }
+    }
+
+    /// Claims the single stale-check timer slot — `true` means the caller
+    /// now OWNS the slot and must arm exactly one timer that calls
+    /// [`Self::disarm_stale_timer`] when it fires. `false` means another
+    /// timer already holds it and this caller must do nothing at all.
+    /// See `stale_timer_armed`'s own doc comment for the bug this closes.
+    pub(crate) fn try_arm_stale_timer(&mut self) -> bool {
+        if self.stale_timer_armed {
+            return false;
+        }
+        self.stale_timer_armed = true;
+        true
+    }
+
+    pub(crate) fn disarm_stale_timer(&mut self) {
+        self.stale_timer_armed = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stale_timer_armed(&self) -> bool {
+        self.stale_timer_armed
+    }
+
+    /// Test-only mirror of the backoff's own streak counter — production
+    /// code reads it through `FetchErrOutcome::failures` (which the log
+    /// line needs anyway), so exposing it unconditionally would be dead
+    /// code, and this crate's convention is to say so rather than carry an
+    /// `#[allow(dead_code)]`.
+    #[cfg(test)]
+    pub(crate) fn consecutive_failures(&self) -> u32 {
+        self.backoff.consecutive_failures()
     }
 
     // ── Session bootstrap ────────────────────────────────────────────────
@@ -265,10 +382,14 @@ impl NotificationsFeed {
     /// regardless of which specific reason (`Refused`/`Unreachable`/
     /// `Http`/`Malformed`/`NonLoopback`) it was; see `gateway_client::
     /// GatewayError`'s own doc comment for why the UI layer doesn't
-    /// distinguish these.
-    pub fn apply_session_err(&mut self) {
+    /// distinguish these. `kind` is the RETRY-policy distinction only (429
+    /// vs everything else), which is a different axis from the UI's own
+    /// collapse — see `notifications_backoff::FailureKind`.
+    pub fn apply_session_err(&mut self, kind: FailureKind) -> FetchErrOutcome {
         self.busy = false;
+        let changed = self.status != FeedStatus::Offline;
         self.status = FeedStatus::Offline;
+        FetchErrOutcome { changed, log: self.backoff.record_failure(kind, Instant::now(), sample_jitter()), failures: self.backoff.consecutive_failures() }
     }
 
     // ── List refresh ─────────────────────────────────────────────────────
@@ -295,21 +416,43 @@ impl NotificationsFeed {
     /// comment): nothing can be `Confirming`/`InFlight` in the OLD `rows`
     /// while a refresh is in flight, since starting a decide would have
     /// required `begin_decide`, which itself requires `!busy`.
-    pub fn apply_list_ok(&mut self, items: Vec<ApprovalItem>) {
-        self.rows = items.into_iter().map(ApprovalRow::from_item).collect();
+    /// Returns whether anything a SURFACE actually draws changed (the row
+    /// list or the status banner) — WP-A4-4's "無變化不 notify" half. The
+    /// `busy` flag deliberately does NOT count as a change here: it is
+    /// drawn by exactly one surface (the open Notifications panel's header
+    /// dot), so its caller adds that condition itself rather than making
+    /// every background poll repaint Home and the lockscreen for a dot
+    /// neither of them shows. Returns `Some(streak)` in `recovered` when
+    /// this success ended a failure streak, so the caller can print one
+    /// recovery line.
+    pub fn apply_list_ok(&mut self, items: Vec<ApprovalItem>) -> FetchOkOutcome {
+        let rows: Vec<ApprovalRow> = items.into_iter().map(ApprovalRow::from_item).collect();
+        let changed = rows != self.rows || self.status != FeedStatus::Ready;
+        self.rows = rows;
         self.busy = false;
         self.status = FeedStatus::Ready;
         self.last_refreshed_at = Some(Instant::now());
+        FetchOkOutcome { changed, recovered: self.backoff.record_success() }
     }
 
-    pub fn apply_list_err(&mut self) {
+    pub fn apply_list_err(&mut self, kind: FailureKind) -> FetchErrOutcome {
         self.busy = false;
+        let changed = self.status != FeedStatus::Offline;
         self.status = FeedStatus::Offline;
         // `rows`/`decided` are deliberately left untouched — a transient
         // refresh failure while the panel is already showing real data
         // should not blank it out; the offline banner layers ON TOP (see
         // `overlay/notifications.rs`'s render logic), it doesn't replace
         // the list.
+        //
+        // `last_refreshed_at` is STILL not advanced here (unlike
+        // `home::running_windows::RunningWindowsFeed::apply_list_err`,
+        // which does advance its own) — it means "when did we last hold
+        // real data", and a failure did not produce any. Retry spacing is
+        // the backoff's job instead, which is the whole reason it exists;
+        // conflating the two is what made the pre-WP-A4-4 code look like it
+        // had a cadence when it had none.
+        FetchErrOutcome { changed, log: self.backoff.record_failure(kind, Instant::now(), sample_jitter()), failures: self.backoff.consecutive_failures() }
     }
 
     // ── Per-row confirm / decide ─────────────────────────────────────────
@@ -390,6 +533,13 @@ impl NotificationsFeed {
     /// Leaves the row in `rows` with `Failed { approve }` so the panel can
     /// offer to retry, rather than silently reverting to `Pending` and
     /// losing which button they'd clicked.
+    ///
+    /// WP-A4-4 deliberately does NOT feed this into `backoff`: a decide is
+    /// one operator click, not a loop, so it cannot produce a storm, and
+    /// making a failed click extend the poll's retry window would punish
+    /// the panel for the operator having tried. The retry affordance the
+    /// `Failed` state offers is a human pressing a button again, which is
+    /// its own rate limit.
     pub fn apply_decide_err(&mut self, id: &str, approve: bool) {
         self.busy = false;
         if let Some(row) = self.rows.iter_mut().find(|r| r.id == id) {
@@ -448,7 +598,7 @@ mod tests {
     fn apply_session_err_goes_offline() {
         let mut feed = NotificationsFeed::default();
         feed.begin_bootstrap();
-        feed.apply_session_err();
+        feed.apply_session_err(FailureKind::Other);
         assert_eq!(feed.status, FeedStatus::Offline);
         assert!(!feed.is_busy());
         assert!(!feed.has_session());
@@ -495,7 +645,7 @@ mod tests {
         feed.begin_refresh();
         feed.apply_list_ok(vec![item("a1", "finance", "q")]);
         feed.begin_refresh();
-        feed.apply_list_err();
+        feed.apply_list_err(FailureKind::Other);
         assert_eq!(feed.status, FeedStatus::Offline);
         assert_eq!(feed.pending_count(), 1, "a transient refresh failure must not blank out already-shown data");
     }
@@ -624,6 +774,179 @@ mod tests {
         feed.apply_decide_ok("no-such-id", true);
         feed.apply_decide_err("no-such-id", true);
         assert_eq!(feed.pending_count(), 0);
+    }
+
+    // ── WP-A4-4: the appliance VM's 429 storm ──────────────────────────
+    // Each of these locks one half of the live post-mortem in
+    // `overlay/notifications_backoff.rs`'s header comment.
+    //
+    // ── Why every assertion below is a LOWER bound taken BEFORE the call ─
+    // The `apply_*` methods read `Instant::now()` internally (production
+    // code should not have to be handed a clock just to record a failure),
+    // so any test assertion here is really about an instant the test never
+    // sees. A first attempt at these tests sampled the clock AFTER the call
+    // and allowed a fixed slack; that is a bet on the test runner not being
+    // descheduled, and the bet lost — twice, on a machine that happened to
+    // be running a Docker build at the same time. An intermittently red
+    // suite is worse than no suite.
+    //
+    // The rule these settled on: sample `before` immediately BEFORE the
+    // call and assert only lower bounds against it. Because `before <=
+    // recorded_at` holds unconditionally, `next_check_delay_at(before)`
+    // (which is `retry_not_before - before`) is an exact lower bound on the
+    // delay that was recorded, and a stall of ANY length only makes it
+    // larger — it can never break the assertion.
+    //
+    // UPPER bounds are deliberately NOT asserted here. They would need an
+    // instant sampled after the call, and once a stall exceeds the delay
+    // itself the window has already closed, at which point
+    // `next_check_delay_at` honestly reports the ordinary 30s cadence
+    // instead — indistinguishable from a bug at this layer. The upper half
+    // of the curve (exact doubling, exact jitter ceiling, exact 60s cap) is
+    // covered where it can be asserted exactly: `notifications_backoff`'s
+    // own tests against the pure, clock-free `delay_for`.
+
+    /// THE regression: before this round, a failed fetch left
+    /// `last_refreshed_at` untouched, so the very next staleness check
+    /// answered `true` and fired another request immediately — no spacing
+    /// at all between retries.
+    #[test]
+    fn a_failed_fetch_is_not_immediately_retryable() {
+        let mut feed = NotificationsFeed::default();
+        feed.begin_bootstrap();
+        feed.apply_session_ok("jwt-1".to_string());
+        feed.begin_refresh();
+
+        let before = Instant::now();
+        feed.apply_list_err(FailureKind::Other);
+
+        assert!(!feed.is_stale_at(before), "a fetch that just failed must NOT be instantly retryable");
+        // `before + next_check_delay_at(before)` IS the exact instant the
+        // window closes (that fn returns `retry_not_before - now`), so
+        // these two probes bracket the boundary with no guesswork at all.
+        let window = feed.next_check_delay_at(before);
+        assert!(window >= crate::overlay::notifications_backoff::BASE_DELAY, "a generic failure must wait at least the base delay, got {window:?}");
+        assert!(!feed.is_stale_at(before + window - Duration::from_nanos(1)), "still inside the window");
+        assert!(feed.is_stale_at(before + window), "but the window must close on its own");
+    }
+
+    #[test]
+    fn a_429_backs_off_far_longer_than_a_generic_failure() {
+        use crate::overlay::notifications_backoff::{BASE_DELAY, JITTER_CEILING_MULTIPLIER, RATE_LIMITED_BASE_DELAY};
+
+        let mut rate_limited = NotificationsFeed::default();
+        rate_limited.begin_bootstrap();
+        let rl_before = Instant::now();
+        rate_limited.apply_session_err(FailureKind::RateLimited);
+        let rl_wait = rate_limited.next_check_delay_at(rl_before);
+
+        let mut other = NotificationsFeed::default();
+        other.begin_bootstrap();
+        let other_before = Instant::now();
+        other.apply_session_err(FailureKind::Other);
+
+        // A generic failure DOES back off (this is the same feed method, so
+        // the `kind` really is being threaded through rather than ignored)…
+        assert!(!other.is_stale_at(other_before), "even a generic failure must not be instantly retryable");
+        // …and the LARGEST a generic first failure can ever be is a
+        // constant, so comparing the 429's lower bound against it is exact
+        // — no second clock reading, nothing for a stall to perturb.
+        let generic_ceiling = BASE_DELAY.mul_f64(JITTER_CEILING_MULTIPLIER);
+        assert!(rl_wait >= RATE_LIMITED_BASE_DELAY, "a 429 must wait at least the rate-limited base delay, got {rl_wait:?}");
+        assert!(
+            rl_wait > generic_ceiling,
+            "429 ({rl_wait:?}) must back off harder than ANY generic first failure could ({generic_ceiling:?}) — retrying fast is what caused it"
+        );
+    }
+
+    #[test]
+    fn consecutive_failures_grow_the_wait_and_stop_at_the_ceiling() {
+        use crate::overlay::notifications_backoff::{BASE_DELAY, MAX_DELAY};
+
+        let mut feed = NotificationsFeed::default();
+        let mut last_floor = Duration::ZERO;
+        for n in 1u32..=8 {
+            feed.begin_bootstrap();
+            let before = Instant::now();
+            feed.apply_session_err(FailureKind::Other);
+
+            let lower = feed.next_check_delay_at(before);
+            let curve = BASE_DELAY.saturating_mul(1 << (n - 1).min(16)).min(MAX_DELAY);
+
+            assert!(lower >= curve, "failure #{n}: {lower:?} is below the {curve:?} the backoff curve promises");
+            assert!(curve >= last_floor, "failure #{n}: the curve must never shrink while failing");
+            assert_eq!(feed.consecutive_failures(), n);
+            last_floor = curve;
+        }
+        assert_eq!(last_floor, MAX_DELAY, "eight consecutive failures must have driven the wait to the ceiling");
+    }
+
+    #[test]
+    fn one_success_clears_the_whole_backoff() {
+        let mut feed = NotificationsFeed::default();
+        for _ in 0..4 {
+            feed.begin_bootstrap();
+            feed.apply_session_err(FailureKind::RateLimited);
+        }
+        assert_eq!(feed.consecutive_failures(), 4);
+        assert!(!feed.is_stale_at(Instant::now()));
+
+        feed.begin_bootstrap();
+        feed.apply_session_ok("jwt-1".to_string());
+        feed.begin_refresh();
+        let ok = feed.apply_list_ok(vec![item("a1", "finance", "q")]);
+
+        assert_eq!(ok.recovered, Some(4), "a recovery must report the streak it ended, exactly once");
+        assert_eq!(feed.consecutive_failures(), 0);
+        assert_eq!(feed.next_check_delay(), REFRESH_STALE_AFTER, "back to the normal cadence, not a lingering penalty");
+        assert!(feed.is_stale_at(Instant::now() + REFRESH_STALE_AFTER));
+    }
+
+    #[test]
+    fn a_successful_refresh_that_changed_nothing_reports_no_repaint_needed() {
+        let mut feed = NotificationsFeed::default();
+        feed.begin_bootstrap();
+        feed.apply_session_ok("jwt-1".to_string());
+        feed.begin_refresh();
+        let first = feed.apply_list_ok(vec![item("a1", "finance", "q")]);
+        assert!(first.changed, "Idle -> Ready with a new row is a real change");
+        assert_eq!(first.recovered, None, "nothing to recover from — this must stay silent");
+
+        feed.begin_refresh();
+        let second = feed.apply_list_ok(vec![item("a1", "finance", "q")]);
+        assert!(!second.changed, "an identical poll result must not cost a repaint");
+
+        feed.begin_refresh();
+        let third = feed.apply_list_ok(vec![item("a1", "finance", "q"), item("a2", "ops", "q2")]);
+        assert!(third.changed, "a genuinely new row must still repaint");
+    }
+
+    #[test]
+    fn a_repeat_failure_while_already_offline_reports_no_repaint_needed() {
+        let mut feed = NotificationsFeed::default();
+        feed.begin_bootstrap();
+        let first = feed.apply_session_err(FailureKind::Other);
+        assert!(first.changed, "the first drop to Offline flips the banner on");
+
+        feed.begin_bootstrap();
+        let second = feed.apply_session_err(FailureKind::Other);
+        assert!(!second.changed, "still Offline, still the same banner — nothing to redraw");
+    }
+
+    #[test]
+    fn the_stale_check_timer_slot_admits_exactly_one_holder() {
+        let mut feed = NotificationsFeed::default();
+        assert!(!feed.stale_timer_armed());
+        assert!(feed.try_arm_stale_timer(), "the first claimant wins");
+        assert!(feed.stale_timer_armed());
+        // Every subsequent render pass (panel AND lockscreen, both of which
+        // call the same scheduler) must be refused — this is the guard that
+        // stops the pending-timer pile-up.
+        for _ in 0..1_000 {
+            assert!(!feed.try_arm_stale_timer());
+        }
+        feed.disarm_stale_timer();
+        assert!(feed.try_arm_stale_timer(), "released slots must be re-claimable");
     }
 
     #[test]

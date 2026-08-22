@@ -60,11 +60,20 @@ use crate::surface::Overlay;
 use crate::ShellView;
 
 mod controlcenter;
+/// WP-A4-4 (2026-08-22): the Launcher's flatpak install confirmation gate —
+/// a pure state machine, see its own header comment.
+pub(crate) mod install_gate;
 mod launcher;
 // `pub(crate)`, not private: `home.rs` (a sibling module of this one, not a
 // descendant) calls `notifications::open_and_refresh` directly from its two
 // "open Notifications" click sites — see that fn's own doc comment.
 pub(crate) mod notifications;
+/// WP-A4-4 (2026-08-22): retry spacing + log denoise for the feed's gateway
+/// poll. Its own module rather than more methods on `notifications_feed`
+/// because it is a self-contained, clock-injected policy with a test suite
+/// of its own — same "many small files, low coupling" convention this
+/// crate's `Cargo.toml`/`gateway_client` comments already state.
+mod notifications_backoff;
 pub mod notifications_feed;
 
 /// Runtime-mutable state backing the two overlays that have actual
@@ -94,6 +103,12 @@ pub struct OverlayUiState {
     /// open overlay), cleared by `close_launcher_query` below whenever the
     /// overlay closes so a fresh open never shows a stale search.
     pub(crate) launcher_query: String,
+    /// WP-A4-4 (2026-08-22): `Some` while the Launcher is showing the
+    /// flatpak install confirmation sheet. `None` — including after a
+    /// cancel — means no install is pending or running; see
+    /// `install_gate::InstallGate`'s own header comment for why "cancel ＝
+    /// drop the gate" is enough to guarantee nothing runs.
+    pub(crate) install_gate: Option<install_gate::InstallGate>,
 }
 
 impl Default for OverlayUiState {
@@ -108,6 +123,7 @@ impl Default for OverlayUiState {
             proactive_on: true,
             pause_all_on: false,
             launcher_query: String::new(),
+            install_gate: None,
         }
     }
 }
@@ -148,6 +164,16 @@ impl OverlayUiState {
     /// `String::clear()`).
     pub(crate) fn close_launcher_query(&mut self) {
         self.launcher_query.clear();
+        // WP-A4-4: closing the Launcher also dismisses any pending install
+        // confirmation. Dropping the gate is exactly what "取消" does — an
+        // unconfirmed gate never handed out an install command (see
+        // `install_gate::InstallGate`'s own doc comments), so this can not
+        // abandon a running install; it only discards a question that was
+        // never answered. A gate that IS already installing is likewise
+        // dropped from view, because the child process is flatpak's now,
+        // not this shell's — pretending the sheet still controls it would
+        // be the dishonest option.
+        self.install_gate = None;
     }
 }
 
@@ -188,7 +214,7 @@ pub fn render(
         .on_click(on_close);
 
     let panel: Stateful<Div> = match overlay {
-        Overlay::Launcher => launcher::render(&ui.launcher_query, palette, cx),
+        Overlay::Launcher => launcher::render(ui, palette, cx),
         Overlay::Notifications => notifications::render(ui, palette, cx),
         Overlay::ControlCenter => controlcenter::render(ui, audio_ui, palette, cx),
     };
@@ -239,6 +265,23 @@ mod tests {
         assert!(ui.launcher_query.is_empty());
         ui.close_launcher_query();
         assert!(ui.launcher_query.is_empty());
+    }
+
+    /// WP-A4-4: closing the Launcher by ANY route (Escape, cmd-k, a
+    /// backdrop click — all three go through `close_launcher_query`) must
+    /// also dismiss a pending install confirmation, so an unanswered "are
+    /// you sure" can never survive to be answered by accident later.
+    #[test]
+    fn closing_the_launcher_also_drops_a_pending_install_confirmation() {
+        let entry = crate::fake_data::DOCK_APPS.iter().find(|a| a.flatpak_id.is_some()).expect("one installable entry must exist");
+        let mut ui = OverlayUiState::default();
+        assert!(ui.install_gate.is_none(), "no install may be pending on a fresh state");
+
+        ui.install_gate = install_gate::InstallGate::open(entry, crate::apps::INSTALL_DESTINATION_LABEL.to_string());
+        assert!(ui.install_gate.is_some());
+
+        ui.close_launcher_query();
+        assert!(ui.install_gate.is_none(), "the question must not outlive the panel that asked it");
     }
 
     #[test]

@@ -56,6 +56,19 @@ const MAX_FRAMES_BEFORE_GIVING_UP: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcError {
     Unreachable(String),
+    /// The gateway's own token-bucket rate limiter (`OpType::HttpRequest`,
+    /// 60 req/min) refused the WS *upgrade* with HTTP 429 — the handshake
+    /// never became a WebSocket at all. A separate variant, not an
+    /// `Unreachable("HTTP error: 429 ...")` string, for the same reason
+    /// this crate's coding conventions forbid unanchored `contains` on
+    /// security/routing decisions: the caller
+    /// (`overlay::notifications_backoff`) has to *branch* on "you are
+    /// calling too fast" to pick a longer retry delay, and branching on a
+    /// `Display` string that upstream owns is exactly the kind of check
+    /// that silently stops matching after a dependency bump. Classified at
+    /// the point of construction from `tungstenite::Error::Http`'s own
+    /// typed status code (see `classify_connect_error`).
+    RateLimited,
     /// The `connect{jwt}` handshake itself was rejected — the JWT is
     /// invalid or expired. The caller's cue to bootstrap a fresh session
     /// (`gateway_client::bootstrap_local_session`) rather than retry the
@@ -94,6 +107,25 @@ fn ws_url() -> String {
     }
 }
 
+/// HTTP status the gateway's shared token-bucket limiter answers an
+/// over-quota upgrade with. Named rather than inlined so the one place this
+/// number lives is greppable against `duduclaw-gateway`'s own limiter.
+const HTTP_TOO_MANY_REQUESTS: u16 = 429;
+
+/// Maps a failed WS *upgrade* onto this module's error vocabulary. The only
+/// case that gets its own variant is HTTP 429 (see `RpcError::RateLimited`'s
+/// own doc comment); every other transport/handshake failure keeps the
+/// existing `Unreachable(<display text>)` shape byte-for-byte, so nothing
+/// downstream of this fn changes for the non-429 paths.
+fn classify_connect_error(e: &tokio_tungstenite::tungstenite::Error) -> RpcError {
+    if let tokio_tungstenite::tungstenite::Error::Http(response) = e {
+        if response.status().as_u16() == HTTP_TOO_MANY_REQUESTS {
+            return RpcError::RateLimited;
+        }
+    }
+    RpcError::Unreachable(e.to_string())
+}
+
 /// Synchronous entry point — spins up a throwaway current-thread tokio
 /// runtime for exactly this one round trip and tears it down on return. See
 /// this file's header comment for why a fresh runtime per call, not a
@@ -116,7 +148,7 @@ async fn call_once_async(url: &str, jwt: &str, method: &str, params: Value) -> R
     let connect_fut = tokio_tungstenite::connect_async(url);
     let (ws_stream, _response) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_fut).await {
         Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return Err(RpcError::Unreachable(e.to_string())),
+        Ok(Err(e)) => return Err(classify_connect_error(&e)),
         Err(_) => return Err(RpcError::Timeout),
     };
     let (mut write, mut read) = ws_stream.split();
@@ -316,6 +348,39 @@ mod tests {
 
         let result = call_once_at(&url, "jwt-abc", "approvals.list", serde_json::json!({}));
         assert!(matches!(result, Err(RpcError::Malformed(_))), "{result:?}");
+    }
+
+    /// The exact production failure the appliance VM's journal recorded
+    /// (`[notifications] approvals RPC failed: Unreachable("HTTP error: 429
+    /// Too Many Requests")`) — the gateway's token bucket refuses the
+    /// UPGRADE, so tungstenite hands back `Error::Http(429)` and never
+    /// produces a WebSocket. Built here from the typed `http::Response` the
+    /// real path also carries, not from a hand-written string, so this test
+    /// fails if the classification ever regresses back to string sniffing.
+    #[test]
+    fn a_429_upgrade_rejection_classifies_as_rate_limited_not_unreachable() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(429)
+            .body(None::<Vec<u8>>)
+            .expect("build a 429 handshake response");
+        let err = tokio_tungstenite::tungstenite::Error::Http(response);
+        assert_eq!(classify_connect_error(&err), RpcError::RateLimited);
+    }
+
+    #[test]
+    fn a_non_429_http_rejection_still_classifies_as_unreachable() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(503)
+            .body(None::<Vec<u8>>)
+            .expect("build a 503 handshake response");
+        let err = tokio_tungstenite::tungstenite::Error::Http(response);
+        assert!(matches!(classify_connect_error(&err), RpcError::Unreachable(_)));
+    }
+
+    #[test]
+    fn a_plain_transport_error_keeps_its_display_text_in_unreachable() {
+        let err = tokio_tungstenite::tungstenite::Error::ConnectionClosed;
+        assert_eq!(classify_connect_error(&err), RpcError::Unreachable(err.to_string()));
     }
 
     // `set_var`/`remove_var` are process-global and `unsafe` on this

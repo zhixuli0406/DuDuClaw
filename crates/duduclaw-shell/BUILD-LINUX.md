@@ -628,7 +628,7 @@ covers only the shell-side client + dock wiring and its verification.
   same parameter-passing shape `notifications: &NotificationsFeed` already
   uses.
 
-### Build/clippy/test (this round)
+### Build/clippy/test (WP-comp-shell-ipc round)
 
 macOS (native):
 ```
@@ -648,6 +648,40 @@ cargo test                               -> 281 passed; 0 failed; 5 ignored
 = "linux")]`-gated D-Bus tests, unrelated to this round; both runs include
 this round's 13 new tests: 7 in `comp_client.rs` + 6 in `home/running_
 windows.rs`, plus the 2 new `#[ignore]`d live tests below.)
+
+### Build/clippy/test (WP-A4-4, 2026-08-22 — current)
+
+The numbers above are that round's snapshot and are kept as-is; these are
+the current ones. WP-A4-4 (the appliance VM's 429-storm / CPU fixes plus the
+flatpak install confirmation gate) added 51 tests on macOS.
+
+macOS (native):
+```
+cargo build                              -> Finished, zero warnings (besides the pre-existing block v0.1.6 future-incompat notice)
+cargo clippy --all-targets -- -D warnings -> Finished, zero warnings
+cargo test                               -> 317 passed; 0 failed; 5 ignored
+```
+
+Linux container (same volumes/command shape as B-①, plus
+`rustup component add clippy` — the `rust:bookworm` image does not ship it):
+```
+cargo build                              -> Finished in 1m 40s (warm target volume), zero warnings
+cargo clippy --all-targets -- -D warnings -> Finished, zero warnings
+cargo test  (x3)                         -> 332 passed; 0 failed; 6 ignored  (all three runs)
+```
+
+(The macOS/Linux gap is still `nm.rs`'s `#[cfg(target_os = "linux")]` D-Bus
+tests, unchanged by this round.)
+
+**Run the suite more than once.** WP-A4-4's backoff tests were initially
+written against a clock sampled AFTER the call under test plus a fixed
+slack, which went red roughly one run in three whenever a Docker build was
+running on the same machine. They are now written as exact lower bounds
+against an instant sampled BEFORE the call (see `overlay/
+notifications_feed.rs`'s own test-section comment); the fix was verified by
+12 consecutive macOS runs with all 12 cores saturated by busy loops, plus
+the three container runs above. A single green run is not evidence that a
+timing-sensitive test is stable.
 
 ### Live verification (this round, combined with comp's own container run)
 

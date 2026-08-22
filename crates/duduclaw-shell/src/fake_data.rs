@@ -68,6 +68,15 @@ pub struct DockApp {
     /// command yet" stub, not a disabled button — see this struct's own
     /// header comment.
     pub flatpak_id: Option<&'static str>,
+    /// Which flatpak REMOTE this app would be installed from — WP-A4-4
+    /// (2026-08-22), needed by the install confirmation gate
+    /// (`overlay::install_gate`), which has to name a real source rather
+    /// than assume one. `None` wherever `flatpak_id` is `None` (nothing to
+    /// install), and deliberately a per-entry value rather than a
+    /// crate-wide "flathub" default: "which remote does this come from" is
+    /// registry DATA, and defaulting it would be inventing a fact about
+    /// every future entry.
+    pub flatpak_remote: Option<&'static str>,
     pub verified: VerifiedTier,
 }
 
@@ -122,6 +131,7 @@ pub const DOCK_APPS: &[DockApp] = &[
         // app exists behind it yet, so honestly `None` rather than a fake
         // launch button. Same for photos/chat/calendar below.
         flatpak_id: None,
+        flatpak_remote: None,
         verified: VerifiedTier::Unrated,
     },
     DockApp {
@@ -133,6 +143,7 @@ pub const DOCK_APPS: &[DockApp] = &[
         label: "文件",
         search_key: "files folder docs 文件 檔案",
         flatpak_id: None,
+        flatpak_remote: None,
         verified: VerifiedTier::Unrated,
     },
     DockApp {
@@ -149,6 +160,10 @@ pub const DOCK_APPS: &[DockApp] = &[
         // duduclaw-comp's space and closed cleanly. The ONLY entry in this
         // array with real launch evidence behind it.
         flatpak_id: Some("org.chromium.Chromium"),
+        // Flathub is where A2's own container PASS pulled this exact ref
+        // from (`research/native-os-2026-08/flatpak-portal-scope-2026-08.md`
+        // §3) — recorded, not assumed.
+        flatpak_remote: Some("flathub"),
         verified: VerifiedTier::Works,
     },
     DockApp {
@@ -160,6 +175,7 @@ pub const DOCK_APPS: &[DockApp] = &[
         label: "圖片",
         search_key: "photos gallery image 圖片",
         flatpak_id: None,
+        flatpak_remote: None,
         verified: VerifiedTier::Unrated,
     },
     DockApp {
@@ -171,6 +187,7 @@ pub const DOCK_APPS: &[DockApp] = &[
         label: "訊息",
         search_key: "chat message 訊息",
         flatpak_id: None,
+        flatpak_remote: None,
         verified: VerifiedTier::Unrated,
     },
     DockApp {
@@ -182,6 +199,7 @@ pub const DOCK_APPS: &[DockApp] = &[
         label: "行事曆",
         search_key: "calendar schedule 行事曆",
         flatpak_id: None,
+        flatpak_remote: None,
         verified: VerifiedTier::Unrated,
     },
 ];

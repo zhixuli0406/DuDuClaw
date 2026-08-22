@@ -428,7 +428,14 @@ fn trigger_running_windows_refresh_if_stale(view: &mut ShellView, cx: &mut Conte
         // this one settles.
         return;
     }
-    cx.notify();
+    // WP-A4-4 (2026-08-22): NO `cx.notify()` here. Starting a poll changes
+    // nothing the dock draws — `RunningWindowsFeed`'s only rendered output
+    // is `is_app_running`, and that cannot have moved yet. The settle side
+    // below now notifies only when the window list ACTUALLY changed, which
+    // takes the appliance's `cage` session (no `duduclaw-comp` at all, so
+    // every poll fails identically forever) from two full-window repaints
+    // every three seconds down to zero. See `running_windows::
+    // apply_list_ok`'s own doc comment.
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -440,21 +447,28 @@ fn trigger_running_windows_refresh_if_stale(view: &mut ShellView, cx: &mut Conte
         match rx.try_recv() {
             Ok(outcome) => {
                 let _ = weak.update(cx, |view, cx| {
-                    match outcome {
+                    let changed = match outcome {
                         Ok(windows) => {
                             if crate::diag_enabled() {
                                 eprintln!("[dock] list_windows ok: {} window(s): {windows:?}", windows.len());
                             }
-                            view.running_windows.apply_list_ok(windows);
+                            view.running_windows.apply_list_ok(windows)
                         }
                         Err(e) => {
                             if crate::diag_enabled() {
                                 eprintln!("[dock] list_windows failed: {e}");
                             }
+                            // A failed poll leaves the last known window
+                            // list in place on purpose (see `apply_list_err`
+                            // there), so by definition nothing the dock
+                            // draws moved — never a repaint.
                             view.running_windows.apply_list_err();
+                            false
                         }
+                    };
+                    if changed {
+                        cx.notify();
                     }
-                    cx.notify();
                 });
                 break;
             }
