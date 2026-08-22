@@ -64,3 +64,22 @@ unicode-segmentation = "1.13"
 # conversion), no `serde` feature (nothing here round-trips a `DateTime`
 # through JSON — only formats/parses plain strings).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# WP-C-M3: self-update client for the DuDuClaw.app bundle itself (distinct
+# from `duduclaw-gateway/src/updater.rs`'s CLI-binary self-update, which
+# `screens/about.rs`'s existing `system.check_update` line already surfaces
+# for the gateway SIDECAR process — this crate has no such mechanism for its
+# OWN `.app`, since gpui has no webview to host the Tauri updater plugin the
+# `src-tauri` shell relies on). Same crate + version the gateway/CLI already
+# depend on for the identical purpose (verified: `crates/duduclaw-gateway/
+# Cargo.toml` / `crates/duduclaw-cli/Cargo.toml`), not a second dependency
+# choice — `minisign-verify` is a small, pure-Rust, verify-only crate (no
+# signing capability, so it can never accidentally end up holding secret key
+# material), `sha2`/`tar`/`flate2` are the same trio the gateway's own
+# `extract_from_tar_gz` already uses. `updater/verify.rs`'s doc comment has
+# the exact key-reuse rationale (same `MINISIGN_SECRET_KEY` keypair as the
+# CLI release channel, per the WP-C-plan decision — not a new keypair).
+minisign-verify = "0.2"
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"

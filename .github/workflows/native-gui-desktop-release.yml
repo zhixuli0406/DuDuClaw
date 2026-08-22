@@ -6,14 +6,35 @@
 # signs + notarizes it via the shared scripts/desktop/sign-notarize-macos.sh
 # (passing this crate's own trimmed entitlements file).
 #
+# WP-C-M3 (2026-08-22) additionally packages a `.tar.gz` of the notarized
+# `.app` bundle — a SEPARATE artifact from the installer `.dmg` above,
+# consumed by `crates/duduclaw-native-gui/src/updater/` (this crate's own
+# self-update client; gpui has no bundled webview to run the Tauri shell's
+# `tauri-plugin-updater`, so it can't reuse that mechanism the way
+# `desktop-release.yml` does — see that module's header comment) — and
+# republishes a `native-gui-latest.json` manifest to the SAME fixed
+# `desktop-updater` release tag `desktop-release.yml` already uses for the
+# Tauri shell's `latest.json`, under a DIFFERENT filename so the two shells'
+# release assets never collide on that one release object.
+#
 # Windows and Linux are placeholder legs only (`if: false`) — the native-gui
 # crate is gpui-based and macOS-only today (see crate Cargo.toml comments on
 # the zed-industries/zed git dependency); flip them on once gpui ports land.
+# The updater manifest only ever gets `darwin-arm64`/`darwin-x64` platform
+# entries as a result — `updater/manifest.rs::platform_key()` returns `None`
+# on any other target, and `screens/about.rs`'s update card shows an honest
+# "此平台尚未支援自動更新" stub instead of a button there.
 #
-# Required repo secrets (Settings → Secrets → Actions) — same names as
-# desktop-release.yml, reused rather than duplicated:
+# Required repo secrets (Settings → Secrets → Actions):
 #   APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
 #   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD   (Developer ID .p12, base64)
+#     — same names as desktop-release.yml, reused rather than duplicated.
+#   MINISIGN_SECRET_KEY   the SAME key `release.yml` already uses to sign
+#     the CLI channel's release assets (secret half of `crates/duduclaw-
+#     gateway/src/updater.rs`'s pinned `UPDATE_PUBKEY`, maintainer copy at
+#     `~/.minisign/duduclaw-release.key`) — a deliberate reuse, not a new
+#     keypair; see `updater/verify.rs`'s header comment for the full
+#     reasoning ("沿用同一套 desktop-updater GH tag ＋同一組 minisign 金鑰對").
 #
 # This file is written but deliberately NOT wired to auto-fire on every push
 # — pushing a native-gui-v* tag is a human decision (see `on:` below).
@@ -115,14 +136,137 @@ jobs:
             -ov -format UDZO \
             "dist/release/DuDuClaw-native-gui-${{ github.ref_name }}-${{ matrix.target }}.dmg"
 
+      # WP-C-M3: a SECOND artifact, specifically for the in-app updater
+      # (`updater/install.rs::extract_app_bundle` — expects a plain tar.gz
+      # whose only top-level entry is `DuDuClaw.app/...`, not a mounted disk
+      # image). `-C dist/native-gui-macos DuDuClaw.app` keeps the archive's
+      # paths relative to that one directory, so the extracted top-level
+      # entry is exactly `DuDuClaw.app`, matching what the client expects.
+      - name: Package update archive (tar.gz) for the in-app updater
+        if: matrix.placeholder != true && matrix.os == 'macos-latest'
+        shell: bash
+        # `COPYFILE_DISABLE=1` is REQUIRED, not cosmetic (verified live,
+        # 2026-08-22): without it, macOS's system `tar` writes a `._<name>`
+        # AppleDouble sidecar entry for every file/dir carrying extended
+        # attributes — which a notarized/code-signed `.app` always does —
+        # INCLUDING a top-level `._DuDuClaw.app` entry that the client's own
+        # extractor (`updater/install.rs::extract_app_bundle`) used to treat
+        # as a second, different `.app` bundle and refuse outright. The
+        # client now also filters `._*` entries defensively
+        # (`is_apple_double_entry`), but fixing it at the source avoids
+        # shipping the clutter at all.
+        env:
+          COPYFILE_DISABLE: "1"
+        run: |
+          ARCHIVE="dist/release/DuDuClaw-native-gui-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar czf "$ARCHIVE" -C dist/native-gui-macos DuDuClaw.app
+          shasum -a 256 "$ARCHIVE" | awk '{print $1}' > "$ARCHIVE.sha256"
+          echo "  ${ARCHIVE}.sha256"; cat "$ARCHIVE.sha256"
+
+      # Same minisign keypair the CLI release channel already uses (see this
+      # file's header comment) — signs the update archive so `updater/
+      # verify.rs::verify_minisign` (pinned to the matching public key,
+      # `NATIVE_GUI_UPDATE_PUBKEY`) can refuse anything not signed by it.
+      - name: Sign update archive with minisign
+        if: matrix.placeholder != true && matrix.os == 'macos-latest'
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set — the update archive must be signed for the in-app updater to work"
+            exit 1
+          fi
+          brew install minisign
+          ARCHIVE="dist/release/DuDuClaw-native-gui-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          KEY_FILE="$(mktemp)"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$KEY_FILE"
+          minisign -S -s "$KEY_FILE" -m "$ARCHIVE" \
+            -t "duduclaw-native-gui ${{ github.ref_name }} ${{ matrix.target }}" \
+            -x "$ARCHIVE.minisig"
+          rm -f "$KEY_FILE"
+
       - name: Upload release asset
         if: matrix.placeholder != true
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: dist/release/*.dmg
+          files: |
+            dist/release/*.dmg
+            dist/release/*.tar.gz
+            dist/release/*.tar.gz.sha256
+            dist/release/*.tar.gz.minisig
           draft: false
           prerelease: false
+          # A `native-gui-v*` release publishes independently of (and often
+          # AFTER) the paired core `v*`/`desktop-v*` releases — without this
+          # it would silently steal the repo's "Latest" marker from the CLI
+          # release the exact same way `desktop-v*` tags used to (2026-07-29
+          # field report, fixed for that channel in `desktop-release.yml`'s
+          # `updater-manifest` job via a steal-then-restore dance). Setting
+          # `make_latest: false` here prevents the theft outright instead —
+          # simpler than restoring after the fact, and this release was
+          # never supposed to be "Latest" in the first place.
+          make_latest: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # WP-C-M3: republish a `native-gui-latest.json` manifest to the fixed
+  # `desktop-updater` tag — same "fixed pointer, never `releases/latest`"
+  # reasoning `desktop-release.yml`'s own `updater-manifest` job documents
+  # (core `v*` releases ship far more often and would 404 the check). A
+  # DIFFERENT filename from that job's `latest.json` (Tauri's own manifest)
+  # so both coexist as separate assets on the same `desktop-updater` release
+  # object without clobbering each other.
+  updater-manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build and publish native-gui-latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+          VERSION="$(awk -F'"' '/^version = /{print $2; exit}' crates/duduclaw-native-gui/Cargo.toml)"
+          NOTES="$(gh release view "$TAG" --repo "$REPO" --json body -q .body 2>/dev/null || echo '')"
+          PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          arm64_url="https://github.com/${REPO}/releases/download/${TAG}/DuDuClaw-native-gui-${TAG}-aarch64-apple-darwin.tar.gz"
+          x64_url="https://github.com/${REPO}/releases/download/${TAG}/DuDuClaw-native-gui-${TAG}-x86_64-apple-darwin.tar.gz"
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$NOTES" \
+            --arg pub_date "$PUB_DATE" \
+            --arg arm64_url "$arm64_url" \
+            --arg x64_url "$x64_url" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-arm64": { url: $arm64_url },
+                "darwin-x64": { url: $x64_url }
+              }
+            }' > native-gui-latest.json
+
+          echo "==> native-gui-latest.json"
+          cat native-gui-latest.json
+
+          if ! gh release view desktop-updater --repo "$REPO" >/dev/null 2>&1; then
+            # Same fixed-pointer release `desktop-release.yml` creates if it
+            # doesn't already exist — prerelease so it never claims the
+            # repo's "Latest" marker.
+            gh release create desktop-updater --repo "$REPO" \
+              --prerelease --title "Desktop updater manifest" \
+              --notes "Moving pointer for the desktop auto-updaters (Tauri shell's latest.json + native-gui's native-gui-latest.json). Installers live on the desktop-v*/native-gui-v* releases."
+          fi
+          gh release upload desktop-updater native-gui-latest.json --repo "$REPO" --clobber

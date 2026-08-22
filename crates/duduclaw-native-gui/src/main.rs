@@ -109,6 +109,7 @@ mod screens;
 mod sidecar;
 mod sidecar_target;
 mod text_field;
+mod updater;
 mod ws_status;
 
 // Shell-S0: `theme`/`mds_gpui` moved to this crate's own `lib.rs` so the new
@@ -239,6 +240,14 @@ pub struct RootView {
     /// after a failed connect attempt (health-check failure, or a locally-
     /// rejected malformed URL). `None` when nothing has failed yet.
     gateway_connect_error: Option<SharedString>,
+    /// WP-C-M3: this launch's self-update manager for the `DuDuClaw.app`
+    /// bundle itself — see `updater/mod.rs`'s module doc comment for why
+    /// this is a THIRD, independent thing from `sidecar` (which manages the
+    /// gateway subprocess) and from `screens::about`'s existing
+    /// `system.check_update` line (which checks the gateway's OWN CLI-binary
+    /// update channel). Always constructed, same "cheap to always have,
+    /// only meaningful on one page" shape `sidecar`/`spike_t7` already use.
+    app_updater: Arc<updater::UpdaterManager>,
 }
 
 impl RootView {
@@ -576,6 +585,7 @@ fn main() {
                             gateway_manual_field,
                             gateway_connecting: false,
                             gateway_connect_error: None,
+                            app_updater: updater::UpdaterManager::new(),
                         }
                     })
                 },
@@ -644,6 +654,15 @@ fn main() {
             // avoid needless re-render churn on every other page.
             let _ = window.update(cx, |view, _window, cx| {
                 if view.active_page == "gatewayPicker" {
+                    cx.notify();
+                }
+                // WP-C-M3: same reasoning as the `gatewayPicker` case just
+                // above — `app_updater`'s status transitions (Checking ->
+                // Available -> Downloading -> Installing -> ReadyToRestart)
+                // happen on a background thread with no event channel back
+                // into this loop, so the About page needs its own periodic
+                // nudge to actually see them while it's the visible page.
+                if view.active_page == "about" {
                     cx.notify();
                 }
             });
