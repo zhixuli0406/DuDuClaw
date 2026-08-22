@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!--
+    CUR-2 brand cursor: `default` — the pouncing paw.
+
+    Anatomy shared by all three shapes in this set: one palm pad plus four
+    toe pads. Here the leading toe is drawn as an extended CLAW, pointing
+    up-left, so the cursor has an unambiguous tip (the research brief's hard
+    requirement: "爪形必須設計出一個無歧義的尖端").
+
+    Geometry contract — DO NOT change without updating build-theme.sh:
+      * viewBox is 24 units; every output size is a whole multiple/fraction
+        of it, so a unit maps to size/24 pixels.
+      * The claw's fill apex sits at (4.1, 4.1). The dark outline is a
+        1.6-unit-wide halo drawn *under* the fill, and at a ~90° apex with a
+        round linejoin it extends 1.6 units along the outward bisector, i.e.
+        to (2.97, 2.97). So the visible tip lands on unit (3, 3), and the
+        hotspot is size * 3/24 = size/8 — a whole number at 24/32/48/64
+        (3/4/6/8). That is why 3 units, and not "as close to the corner as
+        possible": a fractional hotspot would have to be rounded per size and
+        the tip would drift.
+
+    Two-pass rendering (`<use>` twice) rather than `paint-order`: the first
+    <use> paints every pad expanded by the 1.6-unit stroke in stone-900, the
+    second paints the same pads in brand crimson with no stroke. That gives a
+    solid dark outline AND dark separation lines wherever two pads come close,
+    with no dependency on `paint-order` support in the rasteriser.
+
+    Colours (see build-theme.sh for the contrast reasoning):
+      outline #1C1917  stone-900  (CLAUDE.md palette "surface dark")
+      fill    #E85055  brand crimson (appliance/branding/duduclaw-cat.svg
+                                      torso gradient mid-tone)
+  -->
+  <defs>
+    <g id="paw">
+      <!-- leading claw: a lens pointed at (4.1,4.1), tapering back into the
+           toe cluster. Control points are the midpoint offset ±4.8/2 along
+           the axis normal, which makes the widest half-width 2.4 units. -->
+      <path d="M 3.85 3.85 Q 9.74 3.51 9.4 9.4 Q 3.51 9.74 3.85 3.85 Z"/>
+      <!-- two toes flanking the claw, symmetric about the 45° axis, plus a
+           third further along it — the paw is seen leaning up-left, so the
+           whole print is laid out on the canvas DIAGONAL (33.9 units) rather
+           than across its 24-unit side. That is what buys each pad enough
+           room to still read as a separate pad at 24 px. -->
+      <ellipse cx="13.6" cy="6.4" rx="1.85" ry="2.35" transform="rotate(30 13.6 6.4)"/>
+      <ellipse cx="5.6" cy="12.8" rx="1.85" ry="2.35" transform="rotate(-60 5.6 12.8)"/>
+      <ellipse cx="18.6" cy="9.0" rx="1.7" ry="2.15" transform="rotate(55 18.6 9)"/>
+      <!-- palm pad -->
+      <ellipse cx="14.0" cy="15.8" rx="5.0" ry="4.2" transform="rotate(45 14 15.8)"/>
+    </g>
+  </defs>
+  <use href="#paw" xlink:href="#paw" xmlns:xlink="http://www.w3.org/1999/xlink"
+       fill="#1C1917" stroke="#1C1917" stroke-width="2.4"
+       stroke-linejoin="round" stroke-linecap="round"/>
+  <use href="#paw" xlink:href="#paw" xmlns:xlink="http://www.w3.org/1999/xlink"
+       fill="#E85055"/>
+</svg>

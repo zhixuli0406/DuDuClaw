@@ -62,6 +62,17 @@
 //! cache and `queue_redraw()`. That op is **deliberately not implemented
 //! here** — it is a live-reconfiguration feature with its own auth/audit
 //! surface, and CUR-1 is a cursor-rendering work package.
+//!
+//! # CUR-2 (2026-08-22): that op now exists
+//!
+//! `shell_control`'s `get_cursor_source` / `set_cursor_source` ops do exactly
+//! what the paragraph above predicted, and the durable half lives in
+//! [`super::persist`] rather than in comp's spawn environment. The env var is
+//! unchanged and still WINS — see [`resolve_startup_source`] for the full
+//! priority order and [`super::persist`]'s module doc for why an operator's
+//! explicit environment must outrank a stored user preference.
+
+use std::fmt;
 
 /// Where the human pointer's artwork comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -128,6 +139,32 @@ impl CursorSource {
         Self::from_env_value(std::env::var(CURSOR_SOURCE_ENV).ok().as_deref())
     }
 
+    /// CUR-2: strict parse for values arriving over the `shell_control`
+    /// socket and from the stored preference file.
+    ///
+    /// Deliberately NOT [`Self::from_env_value`]'s behaviour. That one folds
+    /// anything unrecognised into `System`, which is right for an env var (a
+    /// typo must not cost the operator a usable pointer at boot). It is
+    /// wrong for a control-channel op: a caller that sends `"brnad"` has a
+    /// bug, and silently doing something *else* than what it asked is how a
+    /// settings UI ends up showing a state the compositor is not in. So this
+    /// returns `None` and the caller answers with an error — repo convention
+    /// #4, security gates and control surfaces fail closed.
+    ///
+    /// `system` is accepted as an explicit value here (unlike in the env
+    /// path, where it is merely the fallback), because "put it back to the
+    /// system cursor" is a real, distinct request.
+    pub fn parse_strict(raw: &str) -> Option<Self> {
+        let v = raw.trim();
+        if v.eq_ignore_ascii_case("system") {
+            Some(Self::System)
+        } else if v.eq_ignore_ascii_case("brand") || v.eq_ignore_ascii_case("duduclaw") {
+            Some(Self::Brand)
+        } else {
+            None
+        }
+    }
+
     /// Stable short name for tracing fields.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -135,6 +172,83 @@ impl CursorSource {
             Self::Brand => "brand",
         }
     }
+}
+
+impl fmt::Display for CursorSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where the compositor's live cursor source came from. Reported over
+/// `shell_control` so a settings UI can explain *why* the radio button shows
+/// what it shows — in particular, that an operator-pinned env var is the
+/// reason a stored preference is not in effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceOrigin {
+    /// [`CURSOR_SOURCE_ENV`] was set in comp's spawn environment.
+    Env,
+    /// Read from the stored preference file ([`super::persist`]).
+    Persisted,
+    /// Neither — [`CursorSource::default`].
+    Default,
+    /// Set at runtime by a `set_cursor_source` op since this process started.
+    Runtime,
+}
+
+impl SourceOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Persisted => "persisted",
+            Self::Default => "default",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+
+impl fmt::Display for SourceOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Startup priority, highest first:
+///
+/// 1. [`CURSOR_SOURCE_ENV`] — an operator's explicit, machine-level
+///    statement. Present-but-garbage still counts as "the operator spoke"
+///    and lands on `System` via [`CursorSource::from_env_value`]'s existing
+///    lenient rule; it does NOT silently fall through to a stored preference,
+///    because "your typo quietly activated somebody else's saved setting" is
+///    a worse outcome than "your typo got you the default".
+/// 2. The stored user preference ([`super::persist::load`]).
+/// 3. [`CursorSource::default`] — `System`.
+///
+/// Pure: both inputs are already-read values, same testability reasoning as
+/// [`CursorSource::from_env_value`].
+pub fn resolve_startup_source(
+    env_raw: Option<&str>,
+    persisted: Option<CursorSource>,
+) -> (CursorSource, SourceOrigin) {
+    // Blank/whitespace-only is treated as UNSET, not as "the operator spoke"
+    // — an empty env var is what `FOO=` or an unset shell variable expanding
+    // to nothing looks like, and neither is an intentional choice.
+    if let Some(raw) = env_raw.filter(|v| !v.trim().is_empty()) {
+        return (CursorSource::from_env_value(Some(raw)), SourceOrigin::Env);
+    }
+    match persisted {
+        Some(s) => (s, SourceOrigin::Persisted),
+        None => (CursorSource::default(), SourceOrigin::Default),
+    }
+}
+
+/// True iff [`CURSOR_SOURCE_ENV`] is set to a non-blank value in this
+/// process's environment — i.e. iff a stored preference will be ignored at
+/// the next start. Surfaced to callers as `env_pinned`.
+pub fn env_pins_source() -> bool {
+    std::env::var(CURSOR_SOURCE_ENV)
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
 }
 
 /// Resolves the XCursor theme name to load.
@@ -268,5 +382,81 @@ mod tests {
     fn source_as_str_is_stable() {
         assert_eq!(CursorSource::System.as_str(), "system");
         assert_eq!(CursorSource::Brand.as_str(), "brand");
+        assert_eq!(CursorSource::Brand.to_string(), "brand");
+    }
+
+    // ── CUR-2 ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_strict_accepts_exactly_the_documented_spellings() {
+        for raw in ["system", "SYSTEM", "  System  "] {
+            assert_eq!(CursorSource::parse_strict(raw), Some(CursorSource::System), "{raw:?}");
+        }
+        for raw in ["brand", "BRAND", " Brand ", "duduclaw", "DuDuClaw"] {
+            assert_eq!(CursorSource::parse_strict(raw), Some(CursorSource::Brand), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn parse_strict_rejects_what_from_env_value_would_have_swallowed() {
+        // This is the whole reason the two parsers are separate: over a
+        // control socket, "brnad" must be an error the caller can show, not
+        // a silent downgrade to the system cursor.
+        for raw in ["", "   ", "brnad", "1", "yes", "claw", "🐾", "systembrand"] {
+            assert_eq!(CursorSource::parse_strict(raw), None, "{raw:?} must be refused");
+            // …while the env parser keeps its lenient, boot-safe behaviour.
+            assert_eq!(CursorSource::from_env_value(Some(raw)), CursorSource::System);
+        }
+    }
+
+    #[test]
+    fn startup_priority_env_beats_persisted_beats_default() {
+        assert_eq!(
+            resolve_startup_source(Some("brand"), Some(CursorSource::System)),
+            (CursorSource::Brand, SourceOrigin::Env)
+        );
+        assert_eq!(
+            resolve_startup_source(Some("system"), Some(CursorSource::Brand)),
+            (CursorSource::System, SourceOrigin::Env)
+        );
+        assert_eq!(
+            resolve_startup_source(None, Some(CursorSource::Brand)),
+            (CursorSource::Brand, SourceOrigin::Persisted)
+        );
+        assert_eq!(
+            resolve_startup_source(None, None),
+            (CursorSource::System, SourceOrigin::Default)
+        );
+    }
+
+    #[test]
+    fn a_blank_env_var_counts_as_unset_so_the_preference_still_applies() {
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                resolve_startup_source(Some(blank), Some(CursorSource::Brand)),
+                (CursorSource::Brand, SourceOrigin::Persisted),
+                "{blank:?} should not count as an operator override"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typo_in_the_env_var_does_not_fall_through_to_the_stored_preference() {
+        // Documented deliberately (see `resolve_startup_source`): the
+        // operator DID speak, they just misspelled it, so they get the
+        // default rather than somebody's saved brand preference.
+        assert_eq!(
+            resolve_startup_source(Some("brnad"), Some(CursorSource::Brand)),
+            (CursorSource::System, SourceOrigin::Env)
+        );
+    }
+
+    #[test]
+    fn origin_names_are_stable() {
+        assert_eq!(SourceOrigin::Env.as_str(), "env");
+        assert_eq!(SourceOrigin::Persisted.as_str(), "persisted");
+        assert_eq!(SourceOrigin::Default.as_str(), "default");
+        assert_eq!(SourceOrigin::Runtime.as_str(), "runtime");
+        assert_eq!(SourceOrigin::Runtime.to_string(), "runtime");
     }
 }

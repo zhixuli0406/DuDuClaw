@@ -49,6 +49,7 @@
 //! `cursor-shape-v1` global; see `handlers/mod.rs` for why both matter.
 
 pub mod fallback;
+pub mod persist;
 pub mod source;
 pub mod theme;
 
@@ -85,22 +86,64 @@ pub struct CursorState {
     pub status: CursorImageStatus,
     /// Theme + cache + fallback. See [`theme::CursorThemeStore`].
     pub theme: theme::CursorThemeStore,
+    /// CUR-2: where the live source came from. Starts as whatever
+    /// [`source::resolve_startup_source`] decided and becomes
+    /// [`source::SourceOrigin::Runtime`] the first time a `shell_control`
+    /// `set_cursor_source` op changes it. Reported to callers so a settings
+    /// page can explain an operator-pinned env var instead of silently
+    /// showing a value the user did not choose.
+    pub origin: source::SourceOrigin,
     /// One-shot guard so a renderer that refuses to import the cursor image
     /// logs once instead of once per frame.
     import_error_logged: bool,
 }
 
 impl CursorState {
-    /// Reads the cursor configuration from the environment and loads the
-    /// theme. Called once from `DuduclawComp::new`.
+    /// Reads the cursor configuration from the environment and the stored
+    /// preference, then loads the theme. Called once from
+    /// `DuduclawComp::new`.
     pub fn from_env() -> Self {
+        let env_raw = std::env::var(source::CURSOR_SOURCE_ENV).ok();
+        let (_, origin) = source::resolve_startup_source(env_raw.as_deref(), persist::load());
         let theme = theme::CursorThemeStore::from_env();
         Self {
             status: CursorImageStatus::default_named(),
             theme,
+            origin,
             import_error_logged: false,
         }
     }
+}
+
+/// CUR-2: everything a `shell_control` caller is told about the live cursor
+/// configuration. Assembled by [`DuduclawComp::cursor_source_info`].
+///
+/// Deliberately reports BOTH `requested` and `source`: they differ exactly
+/// when the brand theme was asked for and is not installed, and a settings UI
+/// that only saw one of them would either lose the user's choice or claim a
+/// paw is on screen when an Adwaita arrow is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CursorSourceInfo {
+    /// The source actually in effect, after the brand→system fail-safe.
+    pub source: String,
+    /// The source that was asked for.
+    pub requested: String,
+    /// The XCursor theme name actually loaded.
+    pub theme: String,
+    /// `env` / `persisted` / `default` / `runtime`.
+    pub origin: String,
+    /// True iff `DUDUCLAW_COMP_CURSOR_SOURCE` is set in this compositor's
+    /// environment — i.e. iff a stored preference will NOT be honoured at the
+    /// next start, no matter what a `set_cursor_source` op writes.
+    pub env_pinned: bool,
+    /// Only meaningful on a `set_cursor_source` reply: whether the new value
+    /// reached the preference file. `false` here with `ok: true` means "the
+    /// switch is live but will not survive a restart" — see `persist_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted: Option<bool>,
+    /// Why persistence failed, when it did. Never present on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
 }
 
 impl DuduclawComp {
@@ -125,6 +168,53 @@ impl DuduclawComp {
         );
         self.cursor.status = image;
         self.queue_redraw();
+    }
+
+    /// CUR-2: the live cursor configuration, for `shell_control`'s
+    /// `get_cursor_source` / `set_cursor_source` replies.
+    pub(crate) fn cursor_source_info(&self) -> CursorSourceInfo {
+        CursorSourceInfo {
+            source: self.cursor.theme.source().as_str().to_string(),
+            requested: self.cursor.theme.requested().as_str().to_string(),
+            theme: self.cursor.theme.theme_name().to_string(),
+            origin: self.cursor.origin.as_str().to_string(),
+            env_pinned: source::env_pins_source(),
+            persisted: None,
+            persist_error: None,
+        }
+    }
+
+    /// CUR-2: switch the human pointer's artwork source **live**.
+    ///
+    /// This is the whole claim of the work package, and it is three lines
+    /// because CUR-1 shaped it that way: set the field (inside
+    /// [`theme::CursorThemeStore::set_source`], which also reloads the theme
+    /// and drops the per-icon cache) and mark the frame dirty. There is no
+    /// restart, no reconnect, and no client involvement — the next composite
+    /// draws the new artwork, and a `CursorImageStatus::Named` status
+    /// (everything a `cursor-shape-v1` client ever sets) resolves through the
+    /// new theme automatically.
+    ///
+    /// `queue_redraw` is not optional here: on the udev backend nothing else
+    /// would schedule a frame until some unrelated damage happened, so a
+    /// switch made while the pointer sits still would appear to do nothing
+    /// until the user moved the mouse. Same reasoning as
+    /// [`Self::set_human_cursor_image`].
+    ///
+    /// Returns `true` when the live artwork actually changed.
+    pub(crate) fn set_cursor_source(&mut self, requested: source::CursorSource) -> bool {
+        if !self.cursor.theme.set_source(requested) {
+            return false;
+        }
+        self.cursor.origin = source::SourceOrigin::Runtime;
+        tracing::info!(
+            requested = requested.as_str(),
+            effective = self.cursor.theme.source().as_str(),
+            theme = %self.cursor.theme.theme_name(),
+            "cursor: source switched live (no restart)"
+        );
+        self.queue_redraw();
+        true
     }
 
     /// This frame's render elements for the human pointer.

@@ -25,7 +25,7 @@
 use std::io::BufRead;
 
 use smithay::{
-    input::pointer::MotionEvent,
+    input::pointer::{CursorImageStatus, MotionEvent},
     reexports::calloop::{generic::Generic, EventLoop, Interest, Mode, PostAction},
     utils::{Logical, Point, SERIAL_COUNTER},
 };
@@ -57,7 +57,8 @@ pub fn maybe_init_stdin_simulator(event_loop: &mut EventLoop<CalloopData>) {
     tracing::warn!(
         "codrive: DEBUG_STDIN human-input simulator ENABLED — reading lines from stdin \
          (\"simulate_human\" / \"simulate_super_esc\" / \"simulate_super_enter\" / \
-         \"simulate_super_tab\" / \"simulate_pointer <x> <y>\"). This exists only for \
+         \"simulate_super_tab\" / \"simulate_pointer <x> <y>\" / \
+         \"simulate_cursor_shape <name>\"). This exists only for \
          headless-container verification \
          where no real input device can originate the events (see codrive/debug_sim.rs \
          module doc) — never set this env var in a real deployment."
@@ -125,6 +126,34 @@ pub fn maybe_init_stdin_simulator(event_loop: &mut EventLoop<CalloopData>) {
                         }
                     }
                 }
+                // CUR-2 (2026-08-22): sets the HUMAN seat's named cursor
+                // directly, the same way `SeatHandler::cursor_image` does
+                // when a `cursor-shape-v1` client asks for a shape.
+                //
+                // It exists for the same reason `simulate_pointer` does: a
+                // headless container has no input devices AND no client that
+                // will spontaneously ask for `grab`/`grabbing`, so without it
+                // there is no way to put those two shapes on screen for a
+                // pixel-level check. It proves the LOADING+DRAWING half of
+                // the chain; the client→compositor half was already
+                // live-proven in CUR-1 with a real `cursor-shape-v1` client
+                // (BUILD.md's CUR-1 evidence 2). Same opt-in gate as every
+                // other command here.
+                other if other.starts_with("simulate_cursor_shape") => {
+                    match parse_cursor_shape_args(other) {
+                        Some(icon) => {
+                            tracing::info!(icon = icon.name(), "codrive: debug stdin — simulating a named cursor shape");
+                            data.state.set_human_cursor_image(CursorImageStatus::Named(icon));
+                        }
+                        None => {
+                            tracing::warn!(
+                                line = other,
+                                "codrive: debug stdin — simulate_cursor_shape needs one CSS \
+                                 cursor name, e.g. \"simulate_cursor_shape grabbing\""
+                            );
+                        }
+                    }
+                }
                 "" => {}
                 other => {
                     tracing::warn!(line = other, "codrive: debug stdin — unrecognized command, ignoring");
@@ -153,6 +182,28 @@ fn parse_pointer_args(line: &str) -> Option<(f64, f64)> {
         return None;
     }
     Some((x, y))
+}
+
+/// Parses `simulate_cursor_shape <name>` into a [`CursorIcon`].
+///
+/// `<name>` is a CSS / freedesktop cursor name exactly as `CursorIcon::name`
+/// spells it (`default`, `text`, `grab`, `grabbing`, `ns-resize`, …) — the
+/// same vocabulary `wp_cursor_shape_device_v1` uses on the wire, so a shape
+/// simulated here is byte-for-byte the shape a real client could have asked
+/// for. Parsing is `cursor_icon`'s own `FromStr`, so this cannot drift from
+/// the protocol's name list.
+///
+/// Pure and unit-tested, same reasoning as [`parse_pointer_args`].
+fn parse_cursor_shape_args(line: &str) -> Option<smithay::input::pointer::CursorIcon> {
+    let mut it = line.split_whitespace();
+    if it.next()? != "simulate_cursor_shape" {
+        return None;
+    }
+    let name = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+    name.parse().ok()
 }
 
 /// Moves the HUMAN seat's pointer to a logical position, exactly the way
@@ -186,7 +237,32 @@ fn simulate_human_pointer(state: &mut DuduclawComp, x: f64, y: f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pointer_args;
+    use super::{parse_cursor_shape_args, parse_pointer_args};
+    use smithay::input::pointer::CursorIcon;
+
+    #[test]
+    fn parses_the_three_brand_shape_names() {
+        assert_eq!(parse_cursor_shape_args("simulate_cursor_shape default"), Some(CursorIcon::Default));
+        assert_eq!(parse_cursor_shape_args("simulate_cursor_shape grab"), Some(CursorIcon::Grab));
+        assert_eq!(parse_cursor_shape_args("simulate_cursor_shape grabbing"), Some(CursorIcon::Grabbing));
+        // Any other CSS cursor name works too — the parser is `cursor_icon`'s
+        // own, so it cannot drift from what cursor-shape-v1 accepts.
+        assert_eq!(parse_cursor_shape_args("  simulate_cursor_shape   text "), Some(CursorIcon::Text));
+    }
+
+    #[test]
+    fn rejects_unknown_shape_names_and_wrong_arity() {
+        for line in [
+            "simulate_cursor_shape",
+            "simulate_cursor_shape grab grabbing",
+            "simulate_cursor_shape paw",
+            "simulate_cursor_shape Grab", // FromStr is case-SENSITIVE kebab-case
+            "simulate_cursor_shapes grab",
+            "",
+        ] {
+            assert!(parse_cursor_shape_args(line).is_none(), "{line:?} should not parse");
+        }
+    }
 
     #[test]
     fn parses_two_numbers() {

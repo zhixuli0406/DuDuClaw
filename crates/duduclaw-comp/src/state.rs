@@ -252,8 +252,16 @@ impl DuduclawComp {
         let cursor = cursor::CursorState::from_env();
         tracing::info!(
             source = cursor.theme.source().as_str(),
+            requested = cursor.theme.requested().as_str(),
+            // CUR-2: `origin` is what makes a support question answerable in
+            // one line — "brand isn't sticking" is a completely different bug
+            // depending on whether the live value came from `env` (an
+            // operator pinned it), `persisted` (the stored preference loaded)
+            // or `default` (nothing was found at all).
+            origin = cursor.origin.as_str(),
             theme = %cursor.theme.theme_name(),
-            "comp: human cursor configured (override with {}=system|brand, {}=<theme>)",
+            "comp: human cursor configured (override with {}=system|brand, {}=<theme>; \
+             switch live via the shell_control set_cursor_source op)",
             cursor::source::CURSOR_SOURCE_ENV,
             cursor::source::CURSOR_THEME_ENV
         );

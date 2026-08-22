@@ -68,13 +68,50 @@
 //! `audit.rs` writes its own JSONL file (`duduclaw-shell-control-audit.
 //! jsonl`), never `codrive`'s — a reader who needs to tell "a human
 //! switched windows" apart from "the agent did" can do so by WHICH FILE a
-//! line is in, not a field inside a shared, disputable file. Only
-//! `focus_window` (an action with a real effect) is audited, mirroring the
-//! established "queries aren't audited, actions are" precedent
-//! `codrive::listener`'s own `status`/`resume` handling already set —
-//! `list_windows` is read-only and, realistically, polled every few
-//! seconds by a live dock, so auditing it would mostly be noise, not
+//! line is in, not a field inside a shared, disputable file. Only the
+//! ACTIONS — `focus_window` and CUR-2's `set_cursor_source` — are audited,
+//! mirroring the established "queries aren't audited, actions are"
+//! precedent `codrive::listener`'s own `status`/`resume` handling already
+//! set — `list_windows` and `get_cursor_source` are read-only and,
+//! realistically, polled every few seconds by a live dock / re-read every
+//! time a settings page opens, so auditing them would mostly be noise, not
 //! evidence.
+//!
+//! ## CUR-2 (2026-08-22): this socket also carries appearance preferences
+//! `get_cursor_source` / `set_cursor_source` let the shell switch the human
+//! pointer between the machine's system cursors and the DuDuClaw brand paw
+//! **without restarting the compositor**. They live here rather than on
+//! `codrive`'s socket for exactly the reason `focus_window` does: choosing
+//! how your own pointer looks is a HUMAN act, and attributing it to the
+//! agent in the codrive trail would be the audit poisoning this module
+//! exists to prevent. The same-uid `SO_PEERCRED` boundary is also precisely
+//! the right authority for it — only a process running as this kiosk
+//! session's own user may change how that session looks, and an agent CLI
+//! subprocess (a DIFFERENT system user) structurally cannot reach the
+//! socket at all.
+//!
+//! ### How the shell calls them
+//! ```text
+//! -> {"op":"get_cursor_source"}
+//! <- {"ok":true,"cursor":{"source":"system","requested":"system",
+//!                         "theme":"Adwaita","origin":"default",
+//!                         "env_pinned":false}}
+//!
+//! -> {"op":"set_cursor_source","params":{"source":"brand"}}
+//! <- {"ok":true,"cursor":{"source":"brand","requested":"brand",
+//!                         "theme":"DuDuClaw","origin":"runtime",
+//!                         "env_pinned":false,"persisted":true}}
+//!
+//! -> {"op":"set_cursor_source","params":{"source":"brnad"}}
+//! <- {"ok":false,"error":"invalid_cursor_source"}
+//! ```
+//! A settings page drives its radio state from `requested` (the user's own
+//! choice) and can warn from two honest signals: `source != requested`
+//! means the brand theme package is not installed and system cursors are
+//! being drawn instead; `env_pinned: true` means an operator pinned
+//! `DUDUCLAW_COMP_CURSOR_SOURCE` in comp's spawn environment, so the stored
+//! preference will not apply at the next start. Building that page is
+//! deliberately NOT part of CUR-2 — the op shape is.
 
 mod audit;
 mod listener;
@@ -213,7 +250,78 @@ impl DuduclawComp {
         match req {
             ShellControlRequest::ListWindows => ShellControlResponse::windows(self.shell_control_list_windows()),
             ShellControlRequest::FocusWindow { query } => self.shell_control_focus_window(query),
+            ShellControlRequest::GetCursorSource => ShellControlResponse::cursor(self.cursor_source_info()),
+            ShellControlRequest::SetCursorSource { source } => self.shell_control_set_cursor_source(&source),
         }
+    }
+
+    /// CUR-2: switch the human pointer's artwork source live, then persist
+    /// the choice.
+    ///
+    /// Ordering matters and is deliberate: **apply first, persist second.**
+    /// The switch is what the caller asked for and it cannot fail; writing
+    /// the preference file can (read-only home, full disk, a service account
+    /// with no `$HOME`). Persisting first would mean a failed write blocked a
+    /// switch that would otherwise have worked. Doing it this way, a write
+    /// failure degrades to "live now, gone after a restart" — reported
+    /// honestly as `persisted: false` + `persist_error`, never swallowed.
+    ///
+    /// `source` has already been through `listener::validate`, so
+    /// `parse_strict` here cannot fail; it is re-parsed rather than passed as
+    /// an enum because the wire type is a string and the parse is the
+    /// boundary. The `unreachable`-style fallback is written as a real error
+    /// response, not a panic — a validation gap must not take the compositor
+    /// down.
+    fn shell_control_set_cursor_source(&mut self, source: &str) -> ShellControlResponse {
+        let Some(requested) = crate::cursor::source::CursorSource::parse_strict(source) else {
+            tracing::error!(
+                "shell_control: set_cursor_source reached the main thread with a value \
+                 listener::validate should have refused — refusing here too"
+            );
+            self.shell_control.record("set_cursor_source_failed", Some("invalid_cursor_source".to_string()));
+            return ShellControlResponse::err("invalid_cursor_source");
+        };
+
+        let changed = self.set_cursor_source(requested);
+
+        let (persisted, persist_error) = match crate::cursor::persist::store(requested) {
+            Ok(path) => {
+                tracing::debug!(path = %path.display(), "cursor: preference stored");
+                (true, None)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cursor: the source switch is live but could not be persisted — it will \
+                     revert at the next compositor start"
+                );
+                (false, Some(e))
+            }
+        };
+
+        let mut info = self.cursor_source_info();
+        info.persisted = Some(persisted);
+        info.persist_error = persist_error.clone();
+
+        // Audited: this is an ACTION with a real, user-visible effect, unlike
+        // `list_windows`/`get_cursor_source`. The detail records the outcome
+        // (including the fail-safe's effective value and a persistence
+        // failure), not just the request — "what did the machine actually do"
+        // is what an audit line is for.
+        self.shell_control.record(
+            "set_cursor_source",
+            Some(format!(
+                "requested={requested} effective={} theme={:?} changed={changed} persisted={persisted}{}",
+                info.source,
+                info.theme,
+                match &persist_error {
+                    Some(e) => format!(" persist_error={e:?}"),
+                    None => String::new(),
+                }
+            )),
+        );
+
+        ShellControlResponse::cursor(info)
     }
 
     /// Read-only — never audited, see this module's own doc comment.
