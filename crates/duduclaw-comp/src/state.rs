@@ -12,10 +12,10 @@ use smithay::{
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
-            Display, DisplayHandle,
+            Display, DisplayHandle, Resource,
         },
     },
-    utils::{Logical, Point, Rectangle},
+    utils::{Logical, Point, Rectangle, Serial, SERIAL_COUNTER},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         output::OutputManagerState,
@@ -249,6 +249,133 @@ impl DuduclawComp {
                 .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p + location).to_f64()))
         })
+    }
+
+    /// WP-A1 multi-window round: raises `window` (if given) to the top of
+    /// the stack and gives it exclusive keyboard focus/activation on
+    /// `seat`, deactivating every other mapped window and telling every
+    /// client via a fresh configure. `window = None` clears keyboard focus
+    /// and deactivates everything (a click on empty space).
+    ///
+    /// Shared by every call site that needs the same "one active window,
+    /// matching keyboard focus, clients told" invariant: the human
+    /// click-to-focus arm (`input.rs`'s `PointerButton` handling), the
+    /// agent click-to-focus arm (`codrive/mod.rs`'s `InjectCmd::Button`
+    /// handling), close-time focus handoff
+    /// (`reassign_focus_on_window_removed` below), and Super+Tab cycling
+    /// (`cycle_focus` below). Before this round the first two each
+    /// open-coded their own copy of this loop — and neither one actually
+    /// called `Window::set_activated(true)` on the window it was
+    /// focusing, only `set_activated(false)` on the deselect-to-empty-
+    /// space path, so a newly selected window's own xdg-shell `activated`
+    /// state (and any client-side active/inactive titlebar styling keyed
+    /// off it) never lit up. See BUILD.md's "A1 multi-window round"
+    /// section for the live-run evidence this was fixed and stayed fixed.
+    ///
+    /// `seat` is a caller-owned clone (`Seat<D>` is a cheap `Arc`-backed
+    /// handle, see smithay's own `impl Clone for Seat`), never a borrow of
+    /// `self.seat`/`self.agent_seat` — that's what lets this take `&mut
+    /// self` without a borrow-checker conflict at every call site.
+    pub fn focus_window(&mut self, seat: &Seat<Self>, window: Option<&Window>, serial: Serial) {
+        if let Some(w) = window {
+            self.space.raise_element(w, true);
+        }
+        let mut activated_count = 0u32;
+        for element in self.space.elements() {
+            let activate = window == Some(element);
+            if activate {
+                activated_count += 1;
+            }
+            element.set_activated(activate);
+        }
+        // Debug-level, not info: this runs on every click, not just
+        // notable transitions (unlike the info!-level logs in
+        // `cycle_focus`/`reassign_focus_on_window_removed` above, which
+        // fire far less often). Exists so a live run can directly confirm
+        // "exactly one window activated, matching the focus target" —
+        // the specific invariant the WP-A1 fix restored — without needing
+        // pixel/screenshot access to a headless container.
+        tracing::debug!(
+            target_surface_id = ?window.map(|w| w.toplevel().unwrap().wl_surface().id()),
+            activated_count,
+            total_windows = self.space.elements().len(),
+            "focus: activation set"
+        );
+        if let Some(keyboard) = seat.get_keyboard() {
+            let target = window.map(|w| w.toplevel().unwrap().wl_surface().clone());
+            keyboard.set_focus(self, target, serial);
+        }
+        self.space.elements().for_each(|w| {
+            w.toplevel().unwrap().send_pending_configure();
+        });
+    }
+
+    /// WP-A1 multi-window round (task brief req 3, "視窗關閉焦點轉移規則
+    /// （轉給 Z 序次高者）"): called from `XdgShellHandler::
+    /// toplevel_destroyed` (`handlers/xdg_shell.rs`) right after the
+    /// destroyed window has been unmapped from `self.space`. For EACH
+    /// seat independently, only if that seat's keyboard focus WAS the
+    /// just-destroyed surface, hands focus to the new topmost remaining
+    /// window (or clears it if none remain). Deliberately does nothing to
+    /// a seat whose focus was already somewhere else — closing a
+    /// background window must never steal focus from whatever the human
+    /// (or the agent) was actually interacting with on the other seat.
+    pub fn reassign_focus_on_window_removed(&mut self, destroyed: &WlSurface) {
+        for seat in [self.seat.clone(), self.agent_seat.clone()] {
+            let Some(keyboard) = seat.get_keyboard() else {
+                continue;
+            };
+            if keyboard.current_focus().as_ref() != Some(destroyed) {
+                continue;
+            }
+            // `elements()` is bottom-to-top (see `focus_window`'s own
+            // raise-to-end reasoning) — `next_back()` is therefore the new
+            // topmost survivor, exactly "Z 序次高者".
+            let next = self.space.elements().next_back().cloned();
+            tracing::info!(
+                next_surface_id = ?next.as_ref().map(|w| w.toplevel().unwrap().wl_surface().id()),
+                "focus: closed window held focus — reassigning to the new topmost window"
+            );
+            let serial = SERIAL_COUNTER.next_serial();
+            self.focus_window(&seat, next.as_ref(), serial);
+        }
+    }
+
+    /// WP-A1 multi-window round (task brief req 3, "Super+Tab 視窗循環切
+    /// 換"): called from `input.rs`'s human keyboard filter closure,
+    /// alongside the existing Super+Esc/Super+Enter global bindings. No
+    /// MRU list is tracked — instead every press promotes the CURRENT
+    /// BOTTOM of the z-order stack to the top via `focus_window` (which
+    /// raises it, per `Space::raise_element`'s remove-then-push-to-end
+    /// behavior). That is a genuine full rotation through every mapped
+    /// window, not a two-window oscillation: with a 3-window stack
+    /// (bottom→top) `[A, B, C]`, press 1 raises the bottom (`A`) to
+    /// `[B, C, A]`; press 2 raises the new bottom (`B`) to `[C, A, B]`;
+    /// press 3 raises `C` to `[A, B, C]` — back to the start, having
+    /// visited A, B, and C exactly once each. (An earlier, rejected design
+    /// — "raise whichever window is one position below the current top" —
+    /// only ever swaps the top two elements and can never reach a window
+    /// three or more presses down; verified wrong by hand before writing
+    /// this version, not assumed.) No new persistent state is needed
+    /// beyond the space's own z-order, which every click-to-focus call
+    /// already maintains. No-op with zero or one mapped windows (nothing
+    /// meaningful to cycle to).
+    pub fn cycle_focus(&mut self) {
+        if self.space.elements().len() < 2 {
+            // Nothing to rotate with 0 or 1 mapped windows.
+            return;
+        }
+        let Some(next) = self.space.elements().next().cloned() else {
+            return;
+        };
+        tracing::info!(
+            surface_id = ?next.toplevel().unwrap().wl_surface().id(),
+            window_count = self.space.elements().len(),
+            "focus: Super+Tab cycling"
+        );
+        let seat = self.seat.clone();
+        let serial = SERIAL_COUNTER.next_serial();
+        self.focus_window(&seat, Some(&next), serial);
     }
 }
 

@@ -454,6 +454,16 @@ pub(super) fn freeze_bypass_decision(
         // (`!self.codrive_takeover_active` gates the call into this
         // function at all), not this match's.
         InjectCmd::TakeOver { .. } | InjectCmd::Watch { .. } => false,
+        // WP-CD4a-COMP: `activate_window` is denied outright while frozen,
+        // same fail-closed reasoning as `Shadow`/`TakeOver`/`Watch` above —
+        // it's a focus-changing control action over the whole `space`, not
+        // something "confined to the shadow output" naturally applies to
+        // (unlike `Move`/`Button`/`Highlight`, it carries no target
+        // coordinate to confirm against `SHADOW_ORIGIN`'s bounds at all).
+        // The task brief for this op is explicit: "凍結/takeover 中拒絕
+        // （照既有 op 閘）" — reuse the standard frozen gate, no new bypass
+        // carve-out.
+        InjectCmd::ActivateWindow { .. } => false,
     }
 }
 
@@ -645,5 +655,17 @@ mod tests {
         let watch = InjectCmd::Watch { enable: true };
         assert!(!freeze_bypass_decision(true, &take_over, Some(inside_shadow()), true));
         assert!(!freeze_bypass_decision(true, &watch, Some(inside_shadow()), true));
+    }
+
+    /// WP-CD4a-COMP: `activate_window` must never bypass a freeze, even with
+    /// a shadow session active — this is the pure half of the "凍結中拒" test
+    /// requirement; `codrive/tests_listener.rs`'s
+    /// `frozen_denies_activate_window_before_reaching_channel` covers the
+    /// socket-thread end-to-end half.
+    #[test]
+    fn freeze_bypass_decision_activate_window_never_bypasses() {
+        let cmd = InjectCmd::ActivateWindow { app_id: "foot-A".to_string() };
+        assert!(!freeze_bypass_decision(true, &cmd, Some(inside_shadow()), true));
+        assert!(!freeze_bypass_decision(false, &cmd, Some(inside_shadow()), true));
     }
 }

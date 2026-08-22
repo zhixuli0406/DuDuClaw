@@ -14,7 +14,6 @@ use smithay::{
         keyboard::{keysyms, FilterResult, Keysym},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::SERIAL_COUNTER,
 };
 
@@ -76,6 +75,23 @@ impl DuduclawComp {
                             // `simulate_super_enter` line for the
                             // container-level state-machine coverage.
                             data.human_resume();
+                        } else if key_state == KeyState::Pressed
+                            && modifiers.logo
+                            && handle.modified_sym() == Keysym::new(keysyms::KEY_Tab)
+                        {
+                            // WP-A1 multi-window round (task brief req 3):
+                            // window cycling, same human-only keyboard
+                            // filter closure as Super+Esc/Super+Enter above
+                            // — structurally unreachable from agent-
+                            // injected key events for the identical reason
+                            // those two are. `is_system_gesture_tail`
+                            // below already exempts ANY key while Logo is
+                            // (or was just) held from re-freezing the
+                            // seat, so Tab's chord tail needed no changes
+                            // there. See `DuduclawComp::cycle_focus`'s doc
+                            // comment (`state.rs`) for the rotation
+                            // strategy.
+                            data.cycle_focus();
                         }
                         FilterResult::Forward
                     },
@@ -134,36 +150,33 @@ impl DuduclawComp {
                 self.on_human_input("pointer_button");
 
                 let pointer = self.seat.get_pointer().unwrap();
-                let keyboard = self.seat.get_keyboard().unwrap();
 
                 let serial = SERIAL_COUNTER.next_serial();
                 let button = event.button_code();
                 let button_state = event.state();
 
+                // WP-A1 multi-window round: routed through
+                // `DuduclawComp::focus_window` (`state.rs`) instead of the
+                // hand-rolled raise+focus this arm used to carry. Same
+                // raise/keyboard-focus *behavior* as before (this is the
+                // path BUILD.md's "VM cage real-seat input verification"
+                // already exercised on real hardware) — the fix is that
+                // the old code never called `Window::set_activated(true)`
+                // on the window it just focused, only `set_activated(false)`
+                // on the click-on-empty-space path, so a selected window's
+                // xdg-shell `activated` state (and client-side active/
+                // inactive titlebar styling keyed off it) never lit up.
+                // `focus_window` sets it for every window on every call.
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
-                    if let Some((window, _loc)) = self
+                    let window = self
                         .space
                         .element_under(pointer.current_location())
-                        .map(|(w, l)| (w.clone(), l))
-                    {
-                        self.space.raise_element(&window, true);
-                        keyboard.set_focus(
-                            self,
-                            Some(window.toplevel().unwrap().wl_surface().clone()),
-                            serial,
-                        );
-                        self.space.elements().for_each(|window| {
-                            window.toplevel().unwrap().send_pending_configure();
-                        });
-                    } else {
-                        self.space.elements().for_each(|window| {
-                            window.set_activated(false);
-                            window.toplevel().unwrap().send_pending_configure();
-                        });
-                        keyboard.set_focus(self, Option::<WlSurface>::None, serial);
-                    }
-                };
+                        .map(|(w, _)| w.clone());
+                    let seat = self.seat.clone();
+                    self.focus_window(&seat, window.as_ref(), serial);
+                }
 
+                let pointer = self.seat.get_pointer().unwrap();
                 pointer.button(
                     self,
                     &ButtonEvent {

@@ -23,6 +23,10 @@
 // `take_over` (agent-initiated hand-off to the human, e.g. a login step) and
 // `watch` (toggles idle-based auto-pause supervision for the rest of this
 // session's trajectory).
+//
+// WP-CD4a-COMP addition (B-line CD-4a, multi-window targeting): `activate_
+// window` — raises/focuses a toplevel by xdg-shell app_id (or a title-prefix
+// fallback). Full behavior lives in `codrive/window_target.rs`.
 
 use serde::Deserialize;
 
@@ -33,6 +37,14 @@ use serde::Deserialize;
 /// by `listener.rs::MAX_LINE_BYTES` anyway; this is a tighter, more honest
 /// limit specific to one human-readable field.
 pub const MAX_TAKE_OVER_REASON_BYTES: usize = 500;
+
+/// Hard cap on `activate_window`'s `app_id` field, bytes (WP-CD4a-COMP).
+/// Real xdg-shell app_ids are short reverse-DNS-style strings and titles
+/// rarely run long either — this is a generous-but-bounded query length,
+/// same "reject, don't truncate" reasoning as [`MAX_TAKE_OVER_REASON_BYTES`]
+/// (this crate has no CJK-safe byte-truncation helper to reach for; see
+/// that constant's own doc for why).
+pub const MAX_ACTIVATE_WINDOW_QUERY_BYTES: usize = 255;
 
 /// One line of the injection protocol, `{"op": "...", ...}`.
 ///
@@ -89,6 +101,21 @@ pub const MAX_TAKE_OVER_REASON_BYTES: usize = 500;
 ///   supervision (DESIGN §3.4 "watch mode…人離開即自動暫停") for the rest of
 ///   this session. Reaches the main thread (`DuduclawComp::codrive_set_watch`,
 ///   `codrive/watch.rs`).
+/// - `{"op":"activate_window","app_id":"..."}` — WP-CD4a-COMP (B-line CD-4a,
+///   multi-window targeting): raises and focuses (via the same shared
+///   `DuduclawComp::focus_window` helper the human click-to-focus / agent
+///   click-to-focus / Super+Tab paths already use — see `state.rs`, WP-A1)
+///   the toplevel whose xdg-shell app_id matches `app_id` exactly, or —
+///   fallback, when no exact app_id match exists — whose title starts with
+///   `app_id` (some real clients don't expose the app_id a caller might
+///   expect; a title-prefix fallback gives a usable path instead of a hard
+///   failure). Reaches the main thread (`codrive::handle_agent_inject` →
+///   `DuduclawComp::codrive_activate_window`, `codrive/window_target.rs`) —
+///   subject to the same frozen/terminated gates as `move`/`button`/… and,
+///   like `Shadow`/`TakeOver`/`Watch`, never shadow-bypass-eligible (see
+///   `shadow.rs`'s `freeze_bypass_decision`). No match found is answered
+///   honestly with an `activate_window_failed` audit line, never a silent
+///   no-op.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum InjectCmd {
@@ -104,6 +131,7 @@ pub enum InjectCmd {
     Shadow { enable: bool },
     TakeOver { reason: String },
     Watch { enable: bool },
+    ActivateWindow { app_id: String },
 }
 
 impl InjectCmd {
@@ -124,6 +152,7 @@ impl InjectCmd {
             InjectCmd::Shadow { .. } => ("shadow", None, None),
             InjectCmd::TakeOver { .. } => ("take_over", None, None),
             InjectCmd::Watch { .. } => ("watch", None, None),
+            InjectCmd::ActivateWindow { .. } => ("activate_window", None, None),
         }
     }
 }

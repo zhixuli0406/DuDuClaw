@@ -61,6 +61,15 @@
 //! bypass exception (`takeover_active`) — zero exceptions for a credential
 //! window. (10) `watch` — idle-based auto-pause; `on_human_input` auto-lifts
 //! it with no explicit resume, since the input itself IS "still watching".
+//!
+//! WP-CD4a-COMP (B-line CD-4a, multi-window targeting; full detail in
+//! `codrive/window_target.rs`): (11) `activate_window` — raises/focuses a
+//! toplevel by xdg-shell app_id (exact match, priority) or a title-prefix
+//! fallback, reusing the WP-A1 `DuduclawComp::focus_window` helper. Never
+//! shadow-bypass-eligible (`shadow::freeze_bypass_decision`), so it's
+//! denied outright while frozen/under takeover like `Shadow`/`Watch`. A
+//! query matching nothing is answered honestly (`activate_window_failed`
+//! audit line), never a silent no-op.
 
 mod audit;
 mod cursor;
@@ -71,24 +80,30 @@ mod listener;
 mod protocol;
 mod rotation;
 mod shadow;
+mod shared;
 mod takeover;
+#[cfg(test)]
+mod tests_listener;
 #[cfg(test)]
 mod tests_takeover;
 mod watch;
+mod window_target;
 
 pub use cursor::build_cursor_elements;
 pub use debug_sim::maybe_init_stdin_simulator;
 pub use protocol::InjectCmd;
 pub use shadow::{create_shadow_output, SHADOW_ORIGIN};
+// WP-A1 multi-window round: `CodriveShared` itself moved to `shared.rs`
+// (see that file's module doc for why — `mod.rs` was at the crate's
+// 800-line file-size cap). Re-exported here so every existing external
+// reference (`codrive::CodriveShared` from `state.rs`, `super::
+// CodriveShared` from sibling submodules) keeps working unchanged.
+pub use shared::CodriveShared;
 
 use std::{
     io::Write,
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{atomic::Ordering, Arc},
 };
 
 use smithay::{
@@ -100,7 +115,7 @@ use smithay::{
     },
     reexports::{
         calloop::{self, EventLoop},
-        wayland_server::{protocol::wl_surface::WlSurface, DisplayHandle},
+        wayland_server::DisplayHandle,
     },
     utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
 };
@@ -111,196 +126,6 @@ use audit::AuditLog;
 use highlight::clamp_highlight_ms;
 use keymap_ascii::{ascii_to_xkb, key_name_to_xkb, SHIFT_XKB_KEYCODE};
 use protocol::{parse_button_code, parse_press_state};
-
-/// Cross-thread state shared between the calloop main thread and the
-/// injection-socket thread (`listener.rs`). See that module's doc comment
-/// for the "why a plain `Mutex`, not `duduclaw_core::with_file_lock`" note.
-pub struct CodriveShared {
-    /// True while the agent seat is frozen (human input observed). Set on
-    /// any human-seat event; cleared ONLY by human-side resume
-    /// (`DuduclawComp::human_resume`, Super+Enter) — never by connection
-    /// lifecycle and never by a socket `resume` op (CD-1: DESIGN-codrive-
-    /// desktop §6 red line 3 + §3.1 "交還是明確動作"). Gate checked
-    /// authoritatively in `DuduclawComp::handle_agent_inject`.
-    pub frozen: AtomicBool,
-    /// True after a Super+Esc emergency stop, until a *new* connection is
-    /// accepted (see `listener.rs::handle_conn`).
-    pub terminated: AtomicBool,
-    /// WP-CD2-freeze-scope: mirror of `DuduclawComp::codrive_shadow_active`,
-    /// kept ONLY for `listener.rs`'s optimistic pre-check (no `self.space`
-    /// access there). Never authoritative — see `shadow::
-    /// is_freeze_bypass_eligible`. Written in lockstep by `shadow.rs`.
-    pub shadow_active: AtomicBool,
-    /// CD-3 mirror of `codrive_takeover_active` — see `takeover.rs`.
-    pub takeover_active: AtomicBool,
-    /// The currently-connected agent's stream, kept so `emergency_stop`
-    /// can force-close it and so state-transition events (`frozen`/
-    /// `resumed`) can be pushed to it — both from the main thread.
-    active_conn: Mutex<Option<UnixStream>>,
-    audit: Option<AuditLog>,
-    /// This run's hex-encoded 32-byte socket-auth token (CD-1, DESIGN
-    /// §3.3.1 "EIS 界線"). `None` means token generation/write failed at
-    /// startup — see `init` — in which case `check_token` always returns
-    /// `false` (fail-closed: no listener is even spawned in that case, but
-    /// the field stays `None` rather than some sentinel value so there's
-    /// no "empty token" to accidentally match against).
-    ///
-    /// A `Mutex` (CD-2, was a plain `Option<String>` at CD-1) so
-    /// `rotate_token` can swap it while the process keeps running — see
-    /// that method's doc. Read once per connection, inside
-    /// `authenticate()`'s `check_token` call, never anywhere else, so this
-    /// lock is never held across a blocking or long-running operation.
-    auth_token: Mutex<Option<String>>,
-    /// Where `auth_token`'s value lives on disk (CD-1:
-    /// `$XDG_RUNTIME_DIR/duduclaw-codrive.token`). `None` in lockstep with
-    /// `auth_token` being permanently unusable — mirrors it rather than
-    /// being derived from it so `rotate_token` can fail fast with a clear
-    /// reason instead of re-deriving "do we even have a token" from the
-    /// mutex's contents.
-    token_path: Option<PathBuf>,
-}
-
-impl CodriveShared {
-    fn disabled() -> Self {
-        Self {
-            frozen: AtomicBool::new(false),
-            terminated: AtomicBool::new(false),
-            shadow_active: AtomicBool::new(false),
-            takeover_active: AtomicBool::new(false),
-            active_conn: Mutex::new(None),
-            audit: None,
-            auth_token: Mutex::new(None),
-            token_path: None,
-        }
-    }
-
-    /// Same "no listener will ever run" shape as `disabled()`, but keeps an
-    /// audit log that was already successfully opened before the failure
-    /// forcing this fallback (token generation/write failure) — so
-    /// freeze/emergency-stop events from human input alone (which need no
-    /// socket at all) still get audited.
-    fn disabled_keep_audit(audit: Option<AuditLog>) -> Self {
-        Self {
-            frozen: AtomicBool::new(false),
-            terminated: AtomicBool::new(false),
-            shadow_active: AtomicBool::new(false),
-            takeover_active: AtomicBool::new(false),
-            active_conn: Mutex::new(None),
-            audit,
-            auth_token: Mutex::new(None),
-            token_path: None,
-        }
-    }
-
-    /// No-ops (besides a log line, on first use) when the audit log failed
-    /// to open — a broken audit trail must never become a reason to block
-    /// or crash the injection path (fail-open on *logging*, fail-closed on
-    /// *authorization*, per repo security convention #4 — those are two
-    /// different gates).
-    pub fn record(&self, kind: &'static str, op: Option<&'static str>, x: Option<f64>, y: Option<f64>, detail: Option<String>) {
-        if let Some(audit) = &self.audit {
-            audit.record(kind, op, x, y, detail, self.frozen.load(Ordering::SeqCst));
-        }
-    }
-
-    /// Convenience read of the freeze flag for callers outside this module
-    /// (e.g. `winit_backend.rs`'s redraw path, which needs it to pick the
-    /// agent cursor's frozen-vs-live color — see `cursor.rs`).
-    pub fn is_frozen(&self) -> bool {
-        self.frozen.load(Ordering::SeqCst)
-    }
-
-    /// Best-effort constant-time-*ish* comparison against this run's
-    /// socket-auth token (CD-1, DESIGN §3.3.1 "EIS 界線"). Folds every byte
-    /// position of both operands with XOR rather than returning as soon as
-    /// a mismatch is found, so a naive `==`'s "how many leading bytes
-    /// matched" timing signal isn't there to lean on. Not a
-    /// cryptographic-grade constant-time primitive (no SIMD/compiler-
-    /// barrier guarantees, and `.get(i)` bounds checks branch on length) —
-    /// sized to this channel's actual threat model (a same-host Unix
-    /// socket, not a network timing-attack surface), not claimed to be
-    /// more than that. `None` (token generation/write failed at startup)
-    /// always fails: with no token durably shared with a legitimate
-    /// caller, nothing should ever authenticate.
-    pub(crate) fn check_token(&self, presented: &str) -> bool {
-        let guard = match self.auth_token.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let Some(expected) = guard.as_deref() else {
-            return false;
-        };
-        let a = expected.as_bytes();
-        let b = presented.as_bytes();
-        let max_len = a.len().max(b.len());
-        let mut diff: u8 = (a.len() != b.len()) as u8;
-        for i in 0..max_len {
-            diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
-        }
-        diff == 0
-    }
-
-    // `rotate_token` (CD-2 task brief item 1) lives in a SECOND `impl
-    // CodriveShared` block in the `rotation` submodule, not here — see that
-    // module's doc comment. Rust allows an inherent type's methods to be
-    // split across multiple `impl` blocks in different files within the
-    // same crate; this one was moved out for the same file-size reason
-    // `driver.rs`'s CD-2 note documents on the gateway side (this module
-    // was already near this project's per-file convention — 200-400 lines
-    // typical, 800 max — before CD-2 added it).
-
-    /// Best-effort push of a one-line JSON event to the currently connected
-    /// agent client (task brief req 3; mirrors `emergency_stop`'s existing
-    /// push of `{"event":"emergency_stop"}`). Silently does nothing if
-    /// there's no active connection or the write fails — this is a
-    /// courtesy notification, not a reliable channel; the client can
-    /// always poll via `{"op":"status"}`. Clones the stream (rather than
-    /// writing through the `&UnixStream` borrow directly) to reuse the
-    /// exact write pattern `emergency_stop` already had proven to work,
-    /// without introducing a second borrow-through-Mutex shape.
-    fn push_event(&self, event_line: &str) {
-        if let Ok(guard) = self.active_conn.lock() {
-            if let Some(stream) = guard.as_ref() {
-                if let Ok(clone) = stream.try_clone() {
-                    let _ = writeln!(&clone, "{event_line}");
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(auth_token: Option<String>) -> Self {
-        Self {
-            frozen: AtomicBool::new(false),
-            terminated: AtomicBool::new(false),
-            shadow_active: AtomicBool::new(false),
-            takeover_active: AtomicBool::new(false),
-            active_conn: Mutex::new(None),
-            audit: None,
-            auth_token: Mutex::new(auth_token),
-            token_path: None,
-        }
-    }
-
-    /// Same as [`Self::for_test`], but with a real `token_path` set — for
-    /// `rotate_token` tests, which need somewhere on disk to actually write
-    /// the rotated token (mirrors `init`'s real construction; plain
-    /// `for_test` deliberately has no path, matching the "listener never
-    /// started" `rotate_token` failure mode).
-    #[cfg(test)]
-    pub(crate) fn for_test_with_token_path(auth_token: Option<String>, token_path: PathBuf) -> Self {
-        Self {
-            frozen: AtomicBool::new(false),
-            terminated: AtomicBool::new(false),
-            shadow_active: AtomicBool::new(false),
-            takeover_active: AtomicBool::new(false),
-            active_conn: Mutex::new(None),
-            audit: None,
-            auth_token: Mutex::new(auth_token),
-            token_path: Some(token_path),
-        }
-    }
-}
 
 /// Reads exactly 32 bytes from `/dev/urandom` for this run's socket-auth
 /// token (CD-1, DESIGN §3.3.1's "EIS 界線" — the injection socket now
@@ -420,16 +245,7 @@ pub fn init(
         return (agent_seat, Arc::new(CodriveShared::disabled_keep_audit(audit)));
     }
 
-    let shared = Arc::new(CodriveShared {
-        frozen: AtomicBool::new(false),
-        terminated: AtomicBool::new(false),
-        shadow_active: AtomicBool::new(false),
-        takeover_active: AtomicBool::new(false),
-        active_conn: Mutex::new(None),
-        audit,
-        auth_token: Mutex::new(Some(auth_token)),
-        token_path: Some(token_path),
-    });
+    let shared = Arc::new(CodriveShared::new(audit, auth_token, token_path));
 
     let (tx, rx) = calloop::channel::channel::<InjectCmd>();
 
@@ -607,29 +423,33 @@ impl DuduclawComp {
                 let pointer = self.agent_seat.get_pointer().expect("agent seat always has a pointer");
 
                 // Click-to-focus on PRESS: mirrors what `input.rs`'s human
-                // PointerButton arm already does for the human seat (raise
-                // + set keyboard focus to the window under the pointer) —
-                // deliberately duplicated here rather than extracted into a
-                // shared helper, so the already-VM-verified human path in
-                // `input.rs` (see BUILD.md "VM cage real-seat input
-                // verification") stays byte-for-byte untouched. Without
+                // PointerButton arm does for the human seat (raise + give
+                // keyboard focus to the window under the pointer). Without
                 // this, `InjectCmd::Text`/`InjectCmd::Key` would have
                 // nowhere to route: each `wl_seat`'s keyboard focus is
                 // independent (wl_seat spec), and nothing else ever sets
                 // the agent seat's.
+                //
+                // WP-A1 multi-window round: now routed through
+                // `DuduclawComp::focus_window` (`state.rs`) instead of the
+                // hand-rolled raise+focus this arm used to carry — the
+                // hand-rolled version (like `input.rs`'s own, see that
+                // file's fix in the same round) never called
+                // `Window::set_activated(true)` on the newly-focused
+                // window, only `set_activated(false)` on the deselect path
+                // (there wasn't one here at all — every window kept
+                // whatever activation state it last had). `focus_window`
+                // is a small shared helper, not a refactor of the
+                // already-VM-verified human click-to-focus semantics in
+                // `input.rs`: the raise/pointer/keyboard-focus *behavior*
+                // is unchanged for either seat, only the "which windows are
+                // marked active" bookkeeping that both call sites need
+                // identically is now centralized.
                 if pressed && !pointer.is_grabbed() {
                     let pos = pointer.current_location();
-                    if let Some((window, _loc)) = self.space.element_under(pos).map(|(w, l)| (w.clone(), l)) {
-                        self.space.raise_element(&window, true);
-                        if let Some(keyboard) = self.agent_seat.get_keyboard() {
-                            keyboard.set_focus(self, Some(window.toplevel().unwrap().wl_surface().clone()), serial);
-                        }
-                        self.space.elements().for_each(|w| {
-                            w.toplevel().unwrap().send_pending_configure();
-                        });
-                    } else if let Some(keyboard) = self.agent_seat.get_keyboard() {
-                        keyboard.set_focus(self, Option::<WlSurface>::None, serial);
-                    }
+                    let window = self.space.element_under(pos).map(|(w, _)| w.clone());
+                    let agent_seat = self.agent_seat.clone();
+                    self.focus_window(&agent_seat, window.as_ref(), serial);
                 }
 
                 let pointer = self.agent_seat.get_pointer().expect("agent seat always has a pointer");
@@ -724,6 +544,11 @@ impl DuduclawComp {
             // "falls through to the generic record below" shape as Shadow.
             InjectCmd::TakeOver { reason } => self.codrive_take_over(reason),
             InjectCmd::Watch { enable } => self.codrive_set_watch(enable),
+            // WP-CD4a-COMP: full logic (matching + focus + its own
+            // success/failure audit lines) lives in `window_target.rs` —
+            // same "falls through to the generic record below" shape as
+            // every other seat/space-touching op above.
+            InjectCmd::ActivateWindow { app_id } => self.codrive_activate_window(app_id),
         }
 
         // WP-CD2-freeze-scope: tag shadow-bypassed applies for the audit
@@ -755,27 +580,10 @@ impl DuduclawComp {
 mod tests {
     use super::*;
 
-    #[test]
-    fn check_token_accepts_matching_token() {
-        let shared = CodriveShared::for_test(Some("abc123".to_string()));
-        assert!(shared.check_token("abc123"));
-    }
-
-    #[test]
-    fn check_token_rejects_wrong_or_partial_token() {
-        let shared = CodriveShared::for_test(Some("abc123".to_string()));
-        assert!(!shared.check_token("abc124"));
-        assert!(!shared.check_token("abc12"));
-        assert!(!shared.check_token("abc1234"));
-        assert!(!shared.check_token(""));
-    }
-
-    #[test]
-    fn check_token_rejects_everything_when_none() {
-        let shared = CodriveShared::for_test(None);
-        assert!(!shared.check_token(""));
-        assert!(!shared.check_token("anything"));
-    }
+    // `check_token`'s own tests moved to `shared.rs`'s test block alongside
+    // `CodriveShared` itself (WP-A1 multi-window round's file-size split —
+    // see that file's module doc). Only free-function tests for code that
+    // stayed in this file remain here.
 
     #[test]
     fn generate_token_bytes_returns_32_fresh_random_bytes() {
