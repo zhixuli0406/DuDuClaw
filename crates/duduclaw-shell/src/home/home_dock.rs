@@ -8,12 +8,29 @@
 // `palette: ShellPalette` parameter — see `home.rs`'s own header comment
 // (unchanged reasoning, just extended to this sibling file) and `crate::
 // palette`'s header comment for the Home/overlay light/dark token mapping.
+//
+// WP-comp-shell-ipc (2026-08-22): `dock()` and `dock_app()` now take a
+// `running_windows: &RunningWindowsFeed` parameter — the real "執行中視窗"
+// list this round wires in, replacing the "其他 dock icon 維持靜態" gap
+// Round 3/WP-A3 left (a dock icon with a real `flatpak_id` used to only
+// ever LAUNCH a fresh instance, with no concept of "is one already
+// running"). `dock()` also dispatches the background poll that keeps that
+// feed warm (`schedule_running_windows_poll`, same `std::thread::spawn` +
+// `mpsc` + `cx.spawn` bridge `overlay/notifications.rs` already established
+// for the gateway) — see that fn's own doc comment for why it checks
+// staleness immediately on every render pass rather than waiting out one
+// interval first, unlike that module's own `schedule_stale_check`.
+
+use std::sync::mpsc;
+use std::time::Duration;
 
 use gpui::{div, linear_color_stop, linear_gradient, prelude::*, px, rgb, BoxShadow, Context, Div, FontWeight, Stateful};
 
 use duduclaw_native_gui::theme;
 
+use crate::comp_client;
 use crate::fake_data::{self, AgentDockStatus, GoalDot};
+use crate::home::running_windows::RunningWindowsFeed;
 use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::ShellView;
@@ -169,7 +186,12 @@ pub(super) fn activity_shelf(palette: ShellPalette) -> Div {
 
 // ── Dock ─────────────────────────────────────────────────────────────────
 
-pub(super) fn dock(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+pub(super) fn dock(palette: ShellPalette, running_windows: &RunningWindowsFeed, cx: &mut Context<ShellView>) -> Div {
+    // WP-comp-shell-ipc: keeps `running_windows` warm for as long as Home
+    // keeps rendering (which is continuously, unlike the Notifications
+    // overlay's open/closed panel — see this file's own header comment).
+    schedule_running_windows_poll(cx);
+
     // Main.dc.html: bg `rgba(255,255,255,0.78)` light / `rgba(30,30,33,
     // 0.78)` dark — `surface_raised` (matches `composer`'s own reasoning in
     // `home.rs`). Border: light `SURFACE_BORDER` at `0.9` / dark `rgba(255,
@@ -203,7 +225,7 @@ pub(super) fn dock(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
     // one, so this loop stays a straight extension of the same convention,
     // not a departure from it.
     for app in fake_data::DOCK_APPS {
-        row = row.child(dock_app(app, palette, cx));
+        row = row.child(dock_app(app, palette, running_windows, cx));
     }
     row = row.child(dock_divider(palette));
     for agent in fake_data::DOCK_AGENTS {
@@ -222,7 +244,12 @@ fn dock_divider(palette: ShellPalette) -> Div {
     div().w(px(1.)).h(px(34.)).bg(color)
 }
 
-fn dock_app(app: &'static fake_data::DockApp, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+fn dock_app(app: &'static fake_data::DockApp, palette: ShellPalette, running_windows: &RunningWindowsFeed, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    // WP-comp-shell-ipc: `flatpak_id` doubles as the xdg-shell app_id query
+    // — see `running_windows.rs`'s own module doc for why that's a
+    // reasonable-but-unverified assumption, and why every entry besides
+    // `browser` (which has `flatpak_id: None`) never matches anything here.
+    let is_running = app.flatpak_id.is_some_and(|id| running_windows.is_app_running(id));
     // The "white/near-white bordered" app tiles (Files/Browser) are the one
     // documented exception to "identity colors stay hardcoded" — see
     // `crate::palette`'s own header comment. Every OTHER (colored,
@@ -298,19 +325,145 @@ fn dock_app(app: &'static fake_data::DockApp, palette: ShellPalette, cx: &mut Co
         );
     }
 
+    // WP-comp-shell-ipc: macOS-dock-style "running" indicator — a small
+    // dot centered BELOW the 44px icon (bottom-center, `left = (44-6)/2`),
+    // deliberately not sharing a corner with the verified-tier dot above
+    // (bottom-right) so the two never visually collide. Only ever appears
+    // for `browser` today (the one entry with a real `flatpak_id` — see
+    // `fake_data::DOCK_APPS`'s own doc comment), matching this file's
+    // established "only wire what's actually real" convention.
+    if is_running {
+        el = el.child(
+            div()
+                .absolute()
+                .bottom(px(-4.))
+                .left(px(19.))
+                .w(px(6.))
+                .h(px(6.))
+                .rounded(px(6.))
+                .bg(theme::alpha(palette.brand, 1.0)),
+        );
+    }
+
     // Only a real launch command makes this a real button — every other
     // icon stays the honest static stub Round 3 established (see this fn's
-    // call site in `dock` above).
-    if app.flatpak_id.is_some() {
+    // call site in `dock` above). WP-comp-shell-ipc: a click on an
+    // ALREADY-RUNNING entry now switches to it (`comp_client::
+    // focus_window`) instead of blindly launching a second instance —
+    // `is_running` is a snapshot from THIS render pass (same "capture the
+    // feed's current read at render time" convention `menu_bar_ticker`'s
+    // own `has_pending` already uses), freshened at most `running_windows::
+    // POLL_INTERVAL` behind reality.
+    if let Some(flatpak_id) = app.flatpak_id {
         let on_click = cx.listener(move |_view, _ev, _window, _cx| {
-            if crate::diag_enabled() {
-                eprintln!("[hit] dock icon '{}' -> launch", app.id);
+            if is_running {
+                if crate::diag_enabled() {
+                    eprintln!("[hit] dock icon '{}' -> focus_window({flatpak_id:?})", app.id);
+                }
+                // `comp_client::focus_window` is a blocking socket call
+                // (this file's own header comment / `comp_client`'s own
+                // module doc) — dispatched off a background thread so it
+                // never blocks gpui's render thread, same "fire-and-forget
+                // from a click handler" shape `crate::apps::launch` already
+                // uses for the spawn path, just wrapped in a thread here
+                // because THIS call, unlike `Command::spawn()`, actually
+                // waits on a reply.
+                std::thread::spawn(move || {
+                    if let Err(e) = comp_client::focus_window(flatpak_id) {
+                        if crate::diag_enabled() {
+                            eprintln!("[dock] focus_window({flatpak_id:?}) failed: {e}");
+                        }
+                    }
+                });
+            } else {
+                if crate::diag_enabled() {
+                    eprintln!("[hit] dock icon '{}' -> launch", app.id);
+                }
+                crate::apps::launch(app);
             }
-            crate::apps::launch(app);
         });
         el = el.cursor_pointer().hover(|style| style.opacity(0.85)).on_click(on_click);
     }
     el
+}
+
+// ── Running-windows poll (WP-comp-shell-ipc, 2026-08-22) ────────────────
+
+/// Cadence for the background-thread <-> `cx.spawn` bridge — same value
+/// `overlay/notifications.rs::POLL_INTERVAL` uses for its own gateway poll
+/// bridge (this is the "check the mpsc channel" tick, NOT `running_windows::
+/// POLL_INTERVAL`, which is the "how often do we actually re-fetch"
+/// cadence).
+const BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Called from `dock()` on every render pass. Unlike `overlay/
+/// notifications.rs`'s `schedule_stale_check` (which waits out one full
+/// `REFRESH_STALE_AFTER` before its first check, since it only exists as
+/// belt-and-suspenders on top of a click-triggered `open_and_refresh` fast
+/// path), Home's dock has no equivalent "just opened" event to pair a fast
+/// first fetch against — Home renders continuously from window-open. So
+/// this checks staleness IMMEDIATELY, every render pass; `trigger_refresh_
+/// if_stale` below is cheap and no-ops instantly whenever the feed is
+/// already fresh or a fetch is already in flight, so calling it every
+/// render costs nothing beyond that one no-op check.
+fn schedule_running_windows_poll(cx: &mut Context<ShellView>) {
+    cx.spawn(async move |weak, cx| {
+        let _ = weak.update(cx, |view, cx| {
+            trigger_running_windows_refresh_if_stale(view, cx);
+        });
+    })
+    .detach();
+}
+
+/// Same shape as `overlay/notifications.rs::trigger_refresh_if_stale`:
+/// single-flight guarded (`RunningWindowsFeed::begin_refresh`), dispatches
+/// the actual blocking `comp_client::list_windows()` call on a background
+/// thread, bridges the result back via `mpsc` + a `cx.spawn` poll loop.
+fn trigger_running_windows_refresh_if_stale(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    if !view.running_windows.is_stale() {
+        return;
+    }
+    if !view.running_windows.begin_refresh() {
+        // Already busy — the next render pass's check will catch it once
+        // this one settles.
+        return;
+    }
+    cx.notify();
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = comp_client::list_windows();
+        let _ = tx.send(outcome);
+    });
+
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(outcome) => {
+                let _ = weak.update(cx, |view, cx| {
+                    match outcome {
+                        Ok(windows) => {
+                            if crate::diag_enabled() {
+                                eprintln!("[dock] list_windows ok: {} window(s): {windows:?}", windows.len());
+                            }
+                            view.running_windows.apply_list_ok(windows);
+                        }
+                        Err(e) => {
+                            if crate::diag_enabled() {
+                                eprintln!("[dock] list_windows failed: {e}");
+                            }
+                            view.running_windows.apply_list_err();
+                        }
+                    }
+                    cx.notify();
+                });
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(BRIDGE_POLL_INTERVAL).await;
+    })
+    .detach();
 }
 
 fn dock_agent(agent: &fake_data::DockAgent, palette: ShellPalette) -> Stateful<Div> {

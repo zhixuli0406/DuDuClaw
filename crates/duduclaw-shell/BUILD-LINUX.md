@@ -575,3 +575,143 @@ design-verified (read against the NetworkManager D-Bus API spec, see
 `nm.rs`'s own header/inline comments) but not activity-verified — left for
 the acceptance round, same honesty bar this file's own B-③ section applies
 to `duduclaw-comp`'s input forwarding.
+
+## WP-comp-shell-ipc: dock↔comp window query/control client (2026-08-22)
+
+Comp side: `duduclaw-comp/BUILD.md`'s own "WP-comp-shell-ipc" section has
+the full design (SEPARATE socket from `codrive`'s agent channel, same-uid
+`SO_PEERCRED` auth, no freeze gate, independent audit trail). This section
+covers only the shell-side client + dock wiring and its verification.
+
+### What changed
+
+- **`src/comp_client.rs`** (new file, ~250 lines) — blocking Unix-socket
+  client, wire types hand-mirrored from comp's `shell_control::protocol`
+  (this crate cannot depend on `duduclaw-comp`, a Linux-only detached
+  workspace crate — same reasoning `duduclaw-gateway/src/codrive/client.rs`
+  already gives for its own hand-mirrored `codrive` types). `list_windows()`
+  / `focus_window(query)`, both plain blocking calls per this crate's
+  established `gateway_client` contract. Compiles unconditionally on both
+  macOS and Linux (`std::os::unix::net::UnixStream` exists on both; a dev
+  Mac simply never has a real `duduclaw-comp` running, so every call
+  degrades to the ordinary `NotAvailable`/`Io` error path).
+- **`src/home/running_windows.rs`** (new file, ~180 lines) — `RunningWindowsFeed`,
+  same "pure `&mut self` mutation, no gpui types" discipline `overlay::
+  notifications_feed::NotificationsFeed` establishes: staleness tracking
+  (`POLL_INTERVAL = 3s` — much tighter than the Notifications feed's 30s
+  network-bound cadence, since this is a local socket round trip),
+  `begin_refresh`/`apply_list_ok`/`apply_list_err`, and `is_app_running
+  (app_id)` — matched against `fake_data::DockApp::flatpak_id` (the only
+  real per-icon identity this crate's dock has — see that module's own doc
+  comment on why this is a reasonable-but-unverified assumption, flatpak
+  still being absent from the dev/appliance images per `apps.rs`).
+- **`src/home/home_dock.rs`**: `dock()`/`dock_app()` gained a `running_
+  windows: &RunningWindowsFeed` parameter; a small "running" indicator dot
+  (macOS-dock-style, centered below the icon, distinct corner from the
+  existing Verified-tier dot) now renders for any dock entry whose
+  `flatpak_id` matches a live window; a click on an ALREADY-RUNNING entry
+  now calls `comp_client::focus_window` (off a background thread — this is
+  a blocking socket call, unlike `crate::apps::launch`'s fire-and-forget
+  `Command::spawn()`) instead of launching a second instance.
+  `schedule_running_windows_poll`/`trigger_running_windows_refresh_if_stale`
+  are the poll glue, same `std::thread::spawn` + `mpsc` + `cx.spawn` bridge
+  `overlay/notifications.rs` already established — but, unlike that
+  module's `schedule_stale_check`, checked IMMEDIATELY on every render pass
+  rather than after waiting out one interval first: Home has no
+  click-triggered "just opened" event to pair a fast first fetch against
+  (it renders continuously from window-open), so the render-pass-gated
+  immediate check IS the fast-first-fetch path here.
+- **`src/home.rs`** / **`src/main.rs`**: `running_windows: home::running_
+  windows::RunningWindowsFeed` threaded onto `ShellView` (same "one model,
+  read by whatever surfaces need it" shape `overlay_ui.notifications`
+  already establishes) and down through `home::render`/`home_dock::dock`,
+  same parameter-passing shape `notifications: &NotificationsFeed` already
+  uses.
+
+### Build/clippy/test (this round)
+
+macOS (native):
+```
+cargo build                              -> Finished, zero warnings (besides the pre-existing block v0.1.6 future-incompat notice)
+cargo clippy --all-targets -- -D warnings -> Finished, zero warnings
+cargo test                               -> 266 passed; 0 failed; 4 ignored
+```
+
+Linux container (same volumes/command shape as B-①):
+```
+cargo build                              -> Finished in 1m 42s (cold), zero warnings
+cargo clippy --all-targets -- -D warnings -> Finished, zero warnings
+cargo test                               -> 281 passed; 0 failed; 5 ignored
+```
+
+(Linux has 15 more passing tests than macOS — `nm.rs`'s own `#[cfg(target_os
+= "linux")]`-gated D-Bus tests, unrelated to this round; both runs include
+this round's 13 new tests: 7 in `comp_client.rs` + 6 in `home/running_
+windows.rs`, plus the 2 new `#[ignore]`d live tests below.)
+
+### Live verification (this round, combined with comp's own container run)
+
+Full topology: `weston` (headless, layer 1) → `duduclaw-comp` (layer 2 —
+now ALSO the HOST, providing a real `wl_seat` to its clients, unlike
+weston's headless backend which advertises none — see this file's own
+"`wl_seat` finding" above) → `foot -a foot-A` (layer 3a, a real xdg-shell
+client) + `duduclaw-shell` itself (layer 3b, `WAYLAND_DISPLAY=wayland-1`,
+`DUDUCLAW_SHELL_SKIP_OOBE=1`, `DUDUCLAW_SHELL_DIAG=1`) as TWO concurrent
+clients of comp.
+
+`duduclaw-shell` ran the full 15s under `timeout` with **zero panics** —
+confirming comp's own `wl_seat` (keyboard+pointer) is sufficient for gpui's
+Wayland backend (the `wl_seat.unwrap()` panic this file's B-② section found
+is specific to weston's headless backend having NO seat at all, not a gpui
+limitation in general). Its own passive dock poll fired for real:
+
+```
+[dock] list_windows ok: 2 window(s): [
+  CompWindow { app_id: Some("foot-A"), title: Some("foot"), focused: false },
+  CompWindow { app_id: None, title: None, focused: false }]
+```
+
+(the second entry is `duduclaw-shell`'s own mapped window — gpui doesn't
+set an xdg-shell app_id; an honest finding, not a bug.) Concurrently, a
+SEPARATE process ran this round's two new `#[ignore]`d live tests
+(`comp_client::tests::live_list_windows_against_real_comp` /
+`::live_focus_window_against_real_comp`) against the SAME live comp
+instance:
+
+```
+XDG_RUNTIME_DIR=/tmp/xdg-runtime cargo test -- --ignored \
+  live_list_windows_against_real_comp live_focus_window_against_real_comp --nocapture
+
+[live] focus_window("foot-A") matched: AppId("foot-A")
+[live] 2 window(s): [CompWindow { app_id: Some("foot-A"), ... }, CompWindow { app_id: None, ... }]
+[live] focus_window on a bogus query correctly returned Comp("not_found")
+test result: ok. 2 passed; 0 failed
+```
+
+Comp's own log and shell-control audit trail (see `duduclaw-comp/BUILD.md`'s
+matching section) confirm the resulting `focus: activation set` and
+`focus_window`/`focus_window_failed` audit rows — proving comp correctly
+serves two concurrent one-shot callers (the live `duduclaw-shell` process's
+own background poll, and the separate test process) without interference.
+
+### Honest stub / limitation list (this round)
+
+- **Dock click-to-focus was never exercised via a real mouse click** — this
+  round's containers have no real seat/pointer (same category of gap this
+  file's own "Input devices remain unverified" section already flags).
+  What WAS verified: the exact function (`comp_client::focus_window`)
+  `home_dock.rs`'s click handler calls really works end-to-end against a
+  live comp instance; only the mouse-click-delivers-the-call step is
+  unverified, deferred to a VM/`cage` round same as every other real-input
+  gap this file and `duduclaw-comp/BUILD.md` already flag.
+- **`flatpak_id`-as-xdg-app_id assumption untested against a real flatpak
+  app** — see `home/running_windows.rs`'s own module doc; flatpak is still
+  absent from the dev/appliance images (A4 pending), so only `foot`'s
+  hand-set `-a` app_id was available to test the matching logic against
+  this round.
+- **No visual/screenshot verification** — same limitation this file's B-②
+  section already flags; every claim above is log evidence, not pixel
+  comparison, so the running-indicator DOT's actual on-screen appearance is
+  unconfirmed (only that the underlying `is_app_running` state driving it
+  is correct — `home/running_windows.rs`'s own test module).
+- **Not committed** — per this task's instructions.

@@ -83,6 +83,7 @@
 
 mod apps;
 mod audio;
+mod comp_client;
 mod fake_data;
 mod gateway_client;
 mod home;
@@ -162,6 +163,13 @@ pub struct ShellView {
     /// `oobe` (see this file's own `Render::render` for how the two
     /// combine).
     pub(crate) lockscreen: lockscreen::LockScreenState,
+    /// WP-comp-shell-ipc (2026-08-22) — the dock's real "執行中視窗" feed,
+    /// polled from `duduclaw-comp`'s shell-control socket
+    /// (`comp_client::list_windows`). Same "one model, read by whatever
+    /// surfaces need it" shape `overlay_ui.notifications` already
+    /// establishes for approvals — see `home::running_windows::
+    /// RunningWindowsFeed`'s own header comment.
+    pub(crate) running_windows: home::running_windows::RunningWindowsFeed,
     /// WP-lock-pw (2026-08-22) — the lockscreen's real password-entry
     /// `Entity<OobeTextField>`, same "created once, unconditionally, at
     /// window-open time" precedent `oobe_account_fields`/`oobe_network_fields`
@@ -489,7 +497,12 @@ impl Render for ShellView {
             // none()` guard on the overlay-render block further down).
             root.child(lockscreen::render::render(&self.lockscreen, &self.overlay_ui.notifications, &self.lockscreen_password_field, cx))
         } else {
-            root.child(home::render(home_palette, &self.overlay_ui.notifications, cx))
+            // WP-comp-shell-ipc: `&self.running_windows` threaded down the
+            // same way `&self.overlay_ui.notifications` already is just
+            // above — an immutable borrow of one `self` field alongside
+            // `cx` (a separate parameter, not a second borrow of `self`),
+            // same shape, no conflict.
+            root.child(home::render(home_palette, &self.overlay_ui.notifications, &self.running_windows, cx))
         };
         if self.diag {
             root = root
@@ -631,6 +644,7 @@ fn main() {
                         overlay_ui: overlay::OverlayUiState::default(),
                         audio_ui: audio::AudioUiState::default(),
                         lockscreen: lockscreen::LockScreenState::default(),
+                        running_windows: home::running_windows::RunningWindowsFeed::default(),
                         lockscreen_password_field,
                         oobe: initial_oobe,
                         oobe_ui: oobe::OobeUiState::default(),
