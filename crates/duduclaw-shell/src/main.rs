@@ -81,9 +81,12 @@
 //     `window.focus(...)` itself, so opening/closing an overlay never steals
 //     this root focus — cmd-k/Escape keep working with any overlay open.
 
+mod audio;
 mod fake_data;
+mod gateway_client;
 mod home;
 mod i18n;
+mod lockscreen;
 mod oobe;
 mod overlay;
 mod palette;
@@ -97,7 +100,7 @@ use gpui_platform::application;
 
 use surface::{Overlay, SurfaceState};
 
-actions!(duduclaw_shell, [ToggleLauncher, CloseOverlay, OobeNext]);
+actions!(duduclaw_shell, [ToggleLauncher, CloseOverlay, OobeNext, LockScreenNow]);
 
 /// Diagnostic gate (`DUDUCLAW_SHELL_DIAG=1`). Kept permanently: this
 /// layer-splitting toolkit (in-app keystroke dispatch, raw OS input probes,
@@ -134,6 +137,30 @@ pub struct ShellView {
     /// `overlay::controlcenter` (different modules from this one), and each
     /// needs `view.overlay_ui.xxx()` to compile from there.
     pub(crate) overlay_ui: overlay::OverlayUiState,
+    /// ControlCenter's volume-slider state — Shell-S4 (2026-08-22, real
+    /// `crate::audio::AudioBackend` wiring). Separate from `overlay_ui`
+    /// above rather than folded into `OverlayUiState`'s own fields:
+    /// deliberately touching a NEW sibling field here, not that struct's
+    /// body, keeps this round's diff away from `OverlayUiState`'s existing
+    /// fields (`approval_decisions` etc., owned by Notifications' own
+    /// interaction round) — see `crate::audio::AudioUiState`'s own doc
+    /// comment for what it holds and why it's plain data, not a gpui
+    /// `Entity`.
+    pub(crate) audio_ui: audio::AudioUiState,
+    /// Shell-S4-lock (2026-08-22) — the lock-screen surface's own runtime
+    /// state (locked?/since-when/idle clock). `Some(&self.lockscreen)` never
+    /// exists standalone the way `oobe: Option<...>` does: locking is a
+    /// boolean flag on always-present state, not a separate flow object,
+    /// since (unlike OOBE) there is no multi-step sequence to track — see
+    /// `lockscreen::LockScreenState`'s own doc comment. Mutually exclusive
+    /// with `oobe` being `Some` in PRACTICE (every path that can lock —
+    /// `on_lock_now` below, `lockscreen::render::maybe_auto_lock` — refuses
+    /// while `self.oobe.is_some()`), but not structurally enforced by the
+    /// type itself, same "an invariant enforced by every call site, not by
+    /// the type" tradeoff `surface: SurfaceState` already accepts alongside
+    /// `oobe` (see this file's own `Render::render` for how the two
+    /// combine).
+    pub(crate) lockscreen: lockscreen::LockScreenState,
     /// `Some` while the system-level first-run flow (OOBE) owns the whole
     /// screen — see this file's header comment and `oobe/mod.rs`'s own for
     /// the design. `None` (the boot-resolved normal case once OOBE has
@@ -199,6 +226,18 @@ impl ShellView {
         if diag_enabled() {
             eprintln!("[action] ToggleLauncher fired");
         }
+        // Shell-S4-lock: `cmd-k` is a BOUND key, so a keystroke matching it
+        // never reaches the root's raw `on_key_down` catch-all at all (gpui
+        // consumes it entirely via action dispatch — see `lockscreen::
+        // render::note_input_or_unlock`'s own doc comment for why that
+        // catch-all can't cover this key) — this handler carries its own
+        // identical lock-check for that reason, not relying on the
+        // catch-all to unlock on cmd-k.
+        if self.lockscreen.is_locked() {
+            lockscreen::render::unlock(self, cx);
+            return;
+        }
+        self.lockscreen.note_input();
         if self.oobe.is_some() {
             // The Launcher has no meaning while OOBE owns the whole
             // screen (Home isn't even rendered underneath it) — a no-op,
@@ -214,11 +253,18 @@ impl ShellView {
     /// Escape=返回（第一步不可返回）") — `OobeFlow::back` already refuses
     /// to move past the first step, so no extra guard is needed here.
     /// Otherwise unchanged from Shell-S0: closes whatever Home overlay is
-    /// currently open (a no-op when none is).
+    /// currently open (a no-op when none is). Shell-S4-lock: same
+    /// self-contained lock-check as `on_toggle_launcher` above — `escape`
+    /// is also a bound key, same reasoning applies.
     fn on_close_overlay(&mut self, _action: &CloseOverlay, _window: &mut Window, cx: &mut Context<Self>) {
         if diag_enabled() {
             eprintln!("[action] CloseOverlay fired");
         }
+        if self.lockscreen.is_locked() {
+            lockscreen::render::unlock(self, cx);
+            return;
+        }
+        self.lockscreen.note_input();
         if let Some(flow) = self.oobe.as_mut() {
             flow.back();
             oobe::save_state(flow.state());
@@ -231,11 +277,18 @@ impl ShellView {
 
     /// `enter`'s action handler — OOBE's keyboard "continue" binding (task
     /// brief: "Enter=繼續"). A no-op outside OOBE (Home has no Enter
-    /// binding of its own this round).
+    /// binding of its own this round). Shell-S4-lock: same self-contained
+    /// lock-check as `on_toggle_launcher`/`on_close_overlay` above — `enter`
+    /// is also a bound key.
     fn on_oobe_next(&mut self, _action: &OobeNext, _window: &mut Window, cx: &mut Context<Self>) {
         if diag_enabled() {
             eprintln!("[action] OobeNext fired");
         }
+        if self.lockscreen.is_locked() {
+            lockscreen::render::unlock(self, cx);
+            return;
+        }
+        self.lockscreen.note_input();
         let Some(flow) = self.oobe.as_mut() else {
             return;
         };
@@ -254,6 +307,24 @@ impl ShellView {
             self.oobe = None;
         }
         cx.notify();
+    }
+
+    /// `cmd-l`'s action handler — the manual-lock keyboard shortcut (task
+    /// brief: "手動鎖...快捷鍵"), the keyboard twin of ControlCenter's own
+    /// lock button (`overlay/controlcenter.rs`'s `lock_button`). A no-op
+    /// during OOBE (locking a machine mid-first-run makes no sense) —
+    /// `lockscreen::render::lock_and_refresh` itself is idempotent either
+    /// way (re-locking an already-locked screen is a no-op per
+    /// `LockScreenState::lock`'s own doc comment), so no separate
+    /// already-locked guard is needed here.
+    fn on_lock_now(&mut self, _action: &LockScreenNow, _window: &mut Window, cx: &mut Context<Self>) {
+        if diag_enabled() {
+            eprintln!("[action] LockScreenNow fired");
+        }
+        if self.oobe.is_some() {
+            return;
+        }
+        lockscreen::render::lock_and_refresh(self, cx);
     }
 }
 
@@ -287,6 +358,38 @@ impl Render for ShellView {
             .on_action(cx.listener(Self::on_toggle_launcher))
             .on_action(cx.listener(Self::on_close_overlay))
             .on_action(cx.listener(Self::on_oobe_next))
+            .on_action(cx.listener(Self::on_lock_now))
+            // Shell-S4-lock: always-on (NOT `self.diag`-gated, unlike the
+            // pre-existing raw-input PROBE pair further down — these are
+            // two SEPARATE listener registrations on the same element;
+            // gpui's `key_down_listeners`/`mouse_down_listeners`/`mouse_
+            // move_listeners` are `Vec`s that accumulate rather than
+            // overwrite, confirmed against the pinned gpui rev's own
+            // `elements/div.rs` before relying on this, so adding these
+            // does not disturb the diagnostic pair below). Any key or click
+            // wakes the screen back up while locked; while unlocked, they
+            // just refresh the idle-auto-lock clock. See `lockscreen::
+            // render::note_input_or_unlock`'s own doc comment for why
+            // `cmd-k`/`escape`/`enter` are NOT covered by this catch-all
+            // (those three go through `on_toggle_launcher`/`on_close_
+            // overlay`/`on_oobe_next`'s own lock-checks instead — a bound
+            // key never reaches a raw key listener on the same element).
+            .on_key_down(cx.listener(|view, _ev, _window, cx| {
+                lockscreen::render::note_input_or_unlock(view, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _ev, _window, cx| {
+                    lockscreen::render::note_input_or_unlock(view, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|view, _ev, _window, _cx| {
+                // Mouse movement alone refreshes the idle clock but never
+                // unlocks by itself — task brief's own wording is "任意
+                // 鍵/點擊" (any KEY or CLICK), not "any input", so idly
+                // passing the cursor over a locked screen must not wake it.
+                view.lockscreen.note_input();
+            }))
             .relative()
             .size_full();
         // OOBE, when active, is the root's ENTIRE child — see this file's
@@ -301,8 +404,15 @@ impl Render for ShellView {
         let home_palette = palette::ShellPalette::for_choice(self.theme);
         root = if let Some(flow) = &self.oobe {
             root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, &self.oobe_network_fields, cx))
+        } else if self.lockscreen.is_locked() {
+            // Shell-S4-lock: same "takes over the root's ENTIRE child, no
+            // app chrome underneath" shape OOBE establishes above — Home
+            // isn't rendered at all while locked, so there is nothing for a
+            // Home overlay to sit on top of (mirrors the `self.oobe.is_
+            // none()` guard on the overlay-render block further down).
+            root.child(lockscreen::render::render(&self.lockscreen, &self.overlay_ui.notifications, cx))
         } else {
-            root.child(home::render(home_palette, cx))
+            root.child(home::render(home_palette, &self.overlay_ui.notifications, cx))
         };
         if self.diag {
             root = root
@@ -324,7 +434,11 @@ impl Render for ShellView {
         // toggle_launcher` no-ops during OOBE, and nothing else opens an
         // overlay), but the guard costs nothing and removes the
         // possibility entirely rather than relying on that invariant.
-        if self.oobe.is_none() {
+        // Shell-S4-lock adds the identical guard for `self.lockscreen.is_
+        // locked()` — `lockscreen::render::lock_and_refresh` already calls
+        // `self.surface.close()` on every lock, so in practice this is the
+        // same belt-and-suspenders redundancy, not a load-bearing check.
+        if self.oobe.is_none() && !self.lockscreen.is_locked() {
             if let Some(active) = self.surface.overlay() {
                 // Backdrop click-to-close — now a real `cx.listener` (round
                 // 1's stub only logged, see that commit's own doc comment
@@ -340,7 +454,7 @@ impl Render for ShellView {
                     view.surface.close();
                     cx.notify();
                 });
-                root = root.child(overlay::render(active, &self.overlay_ui, home_palette, on_close, cx));
+                root = root.child(overlay::render(active, &self.overlay_ui, &self.audio_ui, home_palette, on_close, cx));
             }
         }
         root
@@ -366,6 +480,18 @@ impl Render for ShellView {
 //     `DUDUCLAW_SHELL_OOBE_LOCAL_ACCOUNT` above. Read in
 //     `oobe/network/mod.rs`'s `select_backend()` — see that fn's own doc
 //     comment.
+// One more as of Shell-S4 (2026-08-22, real ControlCenter volume backend):
+//   - `DUDUCLAW_SHELL_FAKE_AUDIO=1` — forces ControlCenter's demo volume
+//     backend regardless of platform, same shape as `DUDUCLAW_SHELL_FAKE_NET`
+//     above. Read in `audio/mod.rs`'s `select_backend()` — see that fn's own
+//     doc comment.
+// Two more as of Shell-S4-lock (2026-08-22, lockscreen surface):
+//   - `DUDUCLAW_SHELL_LOCK_PRIVACY=none|count|full` — which privacy tier the
+//     lockscreen's duty-summary card renders at (default `count`). Read
+//     live (not cached at boot) in `lockscreen::privacy_from_env()`.
+//   - `DUDUCLAW_SHELL_LOCK_IDLE_MINS=<N>` — idle-to-auto-lock threshold in
+//     minutes, `0` disables auto-lock entirely (default `10`). Read live in
+//     `lockscreen::idle_after_from_env()`.
 fn main() {
     eprintln!("[main] starting duduclaw-shell S0");
 
@@ -413,6 +539,8 @@ fn main() {
                     cx.new(|cx| ShellView {
                         surface: SurfaceState::default(),
                         overlay_ui: overlay::OverlayUiState::default(),
+                        audio_ui: audio::AudioUiState::default(),
+                        lockscreen: lockscreen::LockScreenState::default(),
                         oobe: initial_oobe,
                         oobe_ui: oobe::OobeUiState::default(),
                         oobe_account_fields,
@@ -441,6 +569,10 @@ fn main() {
             KeyBinding::new("cmd-k", ToggleLauncher, None),
             KeyBinding::new("escape", CloseOverlay, None),
             KeyBinding::new("enter", OobeNext, None),
+            // Shell-S4-lock: manual-lock shortcut (task brief: "手動鎖...快
+            // 捷鍵"), the keyboard twin of ControlCenter's own lock button.
+            // Not previously bound to anything in this crate.
+            KeyBinding::new("cmd-l", LockScreenNow, None),
         ]);
 
         // Give the root element real keyboard focus — see this file's header
@@ -452,23 +584,46 @@ fn main() {
             window.focus(&view.focus_handle, cx);
         });
 
+        // Shell-S4-lock: the idle-auto-lock watchdog — started exactly ONCE
+        // here, not from `Render::render` (unlike this surface's own
+        // clock-tick/stale-check timers, which self-re-arm only while
+        // ALREADY locked — see `lockscreen::render::spawn_idle_watchdog`'s
+        // own doc comment for why THIS one has to run continuously from
+        // boot instead). Needs a `Context<ShellView>`, hence the same
+        // `window.update(cx, |view, _window, cx| ...)` call shape the
+        // `DUDUCLAW_SHELL_DEBUG_SURFACE` override below already uses to get
+        // one post-window-open.
+        let _ = window.update(cx, |_view, _window, cx| {
+            lockscreen::render::spawn_idle_watchdog(cx);
+        });
+
         // Debug-only boot override for headless smoke runs — this crate has
         // no scriptable UI-click automation (same gap
         // `duduclaw-native-gui/src/main.rs`'s own `DUDUCLAW_NATIVE_GUI_
         // DEBUG_PAGE` hook works around for that crate). Unset by default;
         // `DUDUCLAW_SHELL_DEBUG_SURFACE=launcher|notifications|
-        // controlcenter` opens that overlay immediately after boot so a
-        // real render pass over its code path is observable without a
-        // manual cmd-k/click. An unrecognized value is logged and ignored,
-        // never a panic — but an EMPTY value (`export
+        // controlcenter|lockscreen` opens that surface immediately after
+        // boot so a real render pass over its code path is observable
+        // without a manual cmd-k/click/idle-wait. An unrecognized value is
+        // logged and ignored, never a panic — but an EMPTY value (`export
         // DUDUCLAW_SHELL_DEBUG_SURFACE=`, as opposed to leaving it unset
         // entirely) is treated the same as unset, silently: some launch
         // scripts `export VAR=` rather than omitting the var, and printing
         // "unrecognized, ignoring" for that case would wrongly suggest a
         // typo when none occurred — unset and empty both mean "no override
-        // requested", not "a bad value was supplied".
+        // requested", not "a bad value was supplied". `lockscreen` is
+        // handled as a SEPARATE arm before falling to `Overlay::
+        // from_debug_env`, not added as a fourth `Overlay` variant — see
+        // `ShellView.lockscreen`'s own doc comment for why locking is a
+        // flag on always-present state, not another `SurfaceState` overlay.
         match std::env::var("DUDUCLAW_SHELL_DEBUG_SURFACE") {
             Ok(raw) if raw.is_empty() => {}
+            Ok(raw) if raw == "lockscreen" => {
+                let _ = window.update(cx, |view, _window, cx| {
+                    lockscreen::render::lock_and_refresh(view, cx);
+                });
+                eprintln!("[main] DUDUCLAW_SHELL_DEBUG_SURFACE=lockscreen -> locked");
+            }
             Ok(raw) => match Overlay::from_debug_env(&raw) {
                 Some(overlay) => {
                     let _ = window.update(cx, |view, _window, cx| {

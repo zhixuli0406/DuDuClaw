@@ -78,6 +78,8 @@ use gpui::{div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, Bo
 use duduclaw_native_gui::theme;
 
 use crate::fake_data;
+use crate::i18n::{t, Key, Locale};
+use crate::overlay::notifications_feed::{FeedStatus, NotificationsFeed};
 use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::ShellView;
@@ -86,11 +88,17 @@ use crate::ShellView;
 /// task brief: "commercial/ 是 gitignored，資產一律用 appliance/branding 的
 /// 版本"). `include_bytes!` embeds them directly into the binary — no
 /// asset-loader / runtime file path involved, matching the task brief's
-/// "可 include_bytes 內嵌".
-const MARK_32: &[u8] = include_bytes!("../../../appliance/branding/png/mark-32.png");
-const CAT_512: &[u8] = include_bytes!("../../../appliance/branding/png/cat-512.png");
+/// "可 include_bytes 內嵌". `pub(crate)` (not `pub(super)`/private, as this
+/// used to be): Shell-S4's lockscreen surface (`lockscreen/render.rs`, a
+/// SIBLING module of `home`, not a descendant) reuses the SAME embedded
+/// bytes for its own mark icon + cat watermark (LockScreen.dc.html's own
+/// board reuses the identical two assets) — widening visibility here avoids
+/// a second `include_bytes!` of the same PNGs bloating the binary with a
+/// duplicate copy.
+pub(crate) const MARK_32: &[u8] = include_bytes!("../../../appliance/branding/png/mark-32.png");
+pub(crate) const CAT_512: &[u8] = include_bytes!("../../../appliance/branding/png/cat-512.png");
 
-pub(super) fn png(bytes: &'static [u8]) -> Arc<Image> {
+pub(crate) fn png(bytes: &'static [u8]) -> Arc<Image> {
     Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec()))
 }
 
@@ -101,8 +109,13 @@ pub(super) fn png(bytes: &'static [u8]) -> Arc<Image> {
 /// the caller (`ShellView::render` in `main.rs`, from `ShellView.theme`) and
 /// threaded down through every fn in this module — same "recompute fresh,
 /// never cache" convention `OobeFlow::palette()` already established for
-/// OOBE, extended here to Home.
-pub fn render(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+/// OOBE, extended here to Home. `notifications` (Shell-S4, 2026-08-22,
+/// WP-S4-notif) is `&self.overlay_ui.notifications` from the same caller —
+/// the menu-bar approval ticker (`menu_bar_ticker` below) reads it, since
+/// it's the SAME real feed the Notifications overlay panel itself renders
+/// (see `overlay::notifications_feed`'s own header comment on why the two
+/// surfaces share one model rather than each polling independently).
+pub fn render(palette: ShellPalette, notifications: &NotificationsFeed, cx: &mut Context<ShellView>) -> Stateful<Div> {
     div()
         .id("shell-home")
         .relative()
@@ -136,7 +149,7 @@ pub fn render(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Di
             theme::alpha(0x788cc8, if palette.is_dark() { 0.08 } else { 0.12 }),
         ))
         .child(cat_hero())
-        .child(menu_bar(palette, cx))
+        .child(menu_bar(palette, notifications, cx))
         .child(workspace(palette, cx))
         .child(home_dock::goal_cards_row(palette))
         .child(home_dock::activity_shelf(palette))
@@ -174,7 +187,7 @@ fn cat_hero() -> gpui::Img {
 
 // ── Menu bar ─────────────────────────────────────────────────────────────
 
-fn menu_bar(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+fn menu_bar(palette: ShellPalette, notifications: &NotificationsFeed, cx: &mut Context<ShellView>) -> Stateful<Div> {
     // Main.dc.html: bg `rgba(255,255,255,0.82)` light / `rgba(24,24,27,0.82)`
     // dark — the hex IS `palette.surface` in both (0xffffff / 0x18181b),
     // only alpha (0.82) is shared. Bottom border: light `rgba(228,228,231,
@@ -200,7 +213,7 @@ fn menu_bar(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div>
         .text_size(px(13.))
         .text_color(theme::alpha(palette.foreground, 1.0))
         .child(menu_bar_left())
-        .child(menu_bar_ticker(palette, cx))
+        .child(menu_bar_ticker(palette, notifications, cx))
         .child(menu_bar_right(palette, cx))
 }
 
@@ -222,14 +235,19 @@ fn menu_bar_left() -> Div {
 }
 
 /// The approval ticker — "agent 審批 ticker 一條可點文字" per the task
-/// brief. Round 3: a real `cx.listener` opening Notifications, same pattern
-/// `overlay/notifications.rs`'s own approve/reject buttons already
-/// established.
-fn menu_bar_ticker(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+/// brief. Round 3 wired the click to open Notifications; Shell-S4
+/// (2026-08-22, WP-S4-notif) replaces the static `fake_data::
+/// APPROVAL_TICKER` text with the REAL pending-approval feed (the same
+/// `overlay::notifications_feed::NotificationsFeed` the panel itself reads
+/// — see that struct's own header comment for why the two surfaces share
+/// one model). The click now calls `overlay::notifications::
+/// open_and_refresh`, not a bare `surface.open(...)` — opening the panel
+/// this way also kicks off a fetch when the feed is stale (task brief:
+/// "開面板即刷").
+fn menu_bar_ticker(palette: ShellPalette, notifications: &NotificationsFeed, cx: &mut Context<ShellView>) -> Stateful<Div> {
     let on_click = cx.listener(|view, _ev, _window, cx| {
         if crate::diag_enabled() { eprintln!("[hit] ticker -> open Notifications"); }
-        view.surface.open(Overlay::Notifications);
-        cx.notify();
+        crate::overlay::notifications::open_and_refresh(view, cx);
     });
 
     // Main.dc.html: this pill's bg is `#ffffff` light / `#1e1e21` dark —
@@ -238,8 +256,9 @@ fn menu_bar_ticker(palette: ShellPalette, cx: &mut Context<ShellView>) -> Statef
     // dark). Border: opaque `SURFACE_BORDER` light / `rgba(255,255,255,
     // 0.12)` dark (a bespoke alpha, not the field's own stored 0.10).
     let border_color = if palette.is_dark() { theme::alpha(0xffffff, 0.12) } else { theme::alpha(theme::light::SURFACE_BORDER, 1.0) };
+    let has_pending = notifications.pending_count() > 0;
 
-    div()
+    let mut el = div()
         .id("shell-approval-ticker")
         .cursor_pointer()
         .flex()
@@ -253,13 +272,43 @@ fn menu_bar_ticker(palette: ShellPalette, cx: &mut Context<ShellView>) -> Statef
         .py(px(3.))
         .shadow(palette.surface_shadow())
         .text_size(px(12.))
-        .hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0)))
+        .hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0)));
+    if has_pending {
         // The dot uses `warning_dot`, not `warning` — see that field's own
         // doc comment on `ShellPalette` (a small circular alert dot uses a
-        // brighter literal than the badge/ring token in dark).
-        .child(div().w(px(7.)).h(px(7.)).rounded(px(7.)).bg(theme::alpha(palette.warning_dot, 1.0)))
-        .child(div().font_weight(FontWeight::MEDIUM).child(fake_data::APPROVAL_TICKER))
-        .on_click(on_click)
+        // brighter literal than the badge/ring token in dark). Only shown
+        // when there is actually something waiting — an offline/loading/
+        // empty ticker has nothing to alert about.
+        el = el.child(div().w(px(7.)).h(px(7.)).rounded(px(7.)).bg(theme::alpha(palette.warning_dot, 1.0)));
+    }
+    el.child(div().font_weight(FontWeight::MEDIUM).child(ticker_text(notifications))).on_click(on_click)
+}
+
+/// Renders `notifications`' current state as the ticker's one line of text —
+/// see `menu_bar_ticker`'s own doc comment. The "等你批准：" prefix on the
+/// pending-summary case is a plain zh-TW literal (design CONTENT, same as
+/// the old `fake_data::APPROVAL_TICKER` it replaces — Home/overlay's
+/// established non-i18n boundary, see `crate::i18n`'s own header comment);
+/// the three connectivity-state messages route through `crate::i18n`
+/// because they're genuinely NEW process chrome, same reasoning
+/// `overlay::notifications`'s own header comment gives for the panel.
+fn ticker_text(feed: &NotificationsFeed) -> String {
+    match feed.status {
+        FeedStatus::Offline => t(Locale::ZhTw, Key::NotifOfflineBanner).to_string(),
+        FeedStatus::Idle => t(Locale::ZhTw, Key::NotifLoadingLabel).to_string(),
+        FeedStatus::Loading if feed.pending_count() == 0 => t(Locale::ZhTw, Key::NotifLoadingLabel).to_string(),
+        FeedStatus::Loading | FeedStatus::Ready => match feed.rows().first() {
+            None => t(Locale::ZhTw, Key::NotifEmptyLabel).to_string(),
+            Some(first) => {
+                let extra = feed.pending_count().saturating_sub(1);
+                if extra > 0 {
+                    format!("等你批准：{}（+{extra}）", first.summary)
+                } else {
+                    format!("等你批准：{}", first.summary)
+                }
+            }
+        },
+    }
 }
 
 /// Round 3: split into two independent click targets — the ⌘K pill opens
@@ -279,8 +328,7 @@ fn menu_bar_right(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
     });
     let status_click = cx.listener(|view, _ev, _window, cx| {
         if crate::diag_enabled() { eprintln!("[hit] status group -> open Notifications"); }
-        view.surface.open(Overlay::Notifications);
-        cx.notify();
+        crate::overlay::notifications::open_and_refresh(view, cx);
     });
 
     // Main.dc.html: `#f4f4f5`/`#71717b` light == `SECONDARY`/`MUTED_FOREGROUND`

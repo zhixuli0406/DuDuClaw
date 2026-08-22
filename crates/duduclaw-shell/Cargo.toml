@@ -80,8 +80,64 @@ serde_json = "1"
 # {Connection,Proxy}` (the API `nm.rs` uses — see that module's own header
 # comment for why the generic `Proxy`, not the `#[zbus::proxy]` macro), and
 # `async-io` is `blocking-api`'s own required runtime underneath — a small,
-# self-contained executor, NOT `tokio`, so this stays consistent with
-# `oobe/claim.rs`'s "no tokio in this crate" reasoning even though `zbus`
-# itself is now a dependency.
+# self-contained executor, NOT `tokio` (at the time this comment was
+# written — Shell-S4 below is the first thing in this crate that actually
+# needs tokio, for an unrelated reason; zbus's own async-io stays fully
+# independent of it).
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
+
+[dependencies.tokio]
+# Shell-S4 (2026-08-22): `gateway_client::ws_rpc` needs a WebSocket client
+# for `approvals.list`/`approvals.decide` — the gateway's dashboard RPC
+# surface exists ONLY on `/ws` (grepped `duduclaw-gateway/src/server.rs`'s
+# route table before writing this: no REST equivalent for either method),
+# so unlike `oobe/claim.rs`'s HTTP calls, hand-rolling this one is not the
+# right tradeoff — RFC 6455 framing (masking, the Sec-WebSocket-Accept
+# handshake, fragmented frames) is real surface to get subtly wrong, not a
+# few dozen lines like `claim.rs`'s HTTP/1.1 GET/POST.
+#
+# `tokio`/`tokio-tungstenite`/`futures-util` below are NOT new compiled
+# dependencies, despite being declared here for the first time: this crate
+# already depends on `duduclaw-native-gui` by path (see above), and THAT
+# crate's own `ws_status.rs` already pulls in all three at these exact
+# versions for its persistent authenticated `/ws` session. Verified with
+# `cargo tree -p duduclaw-shell -i tokio-tungstenite` (and `-i tokio`, `-i
+# futures-util`) before adding this block: every existing edge into the
+# graph was already `duduclaw-native-gui -> duduclaw-shell`. Declaring them
+# here only promotes an already-compiled transitive dependency to a direct
+# one so `gateway_client` can use it — zero new crates enter the build.
+# Feature list mirrors `duduclaw-native-gui/Cargo.toml`'s own `tokio`
+# declaration for the same reason stated there: Cargo unifies features
+# across the whole resolved graph, so this crate requesting a narrower set
+# would not shrink what's actually compiled either way.
+version = "1"
+features = ["rt-multi-thread", "net", "time", "macros", "sync"]
+
+[dependencies.tokio-tungstenite]
+version = "0.24"
+
+[dependencies.futures-util]
+# `.split()` on the WS stream (`SinkExt`/`StreamExt`) — same as
+# `duduclaw-native-gui/src/ws_status.rs`'s own usage; already in this
+# crate's resolved graph as a DIRECT dependency of `gpui` itself (see this
+# block's own header comment), so this is doubly free.
+version = "0.3"
+
+# Shell-S4-lock (2026-08-22): the lockscreen surface's live clock
+# (`lockscreen/render.rs::now_local_strings`) needs local-time formatting —
+# `chrono::Local::now()`. Same "already-compiled transitive dep, promoted to
+# direct, zero new crates" situation as the `tokio`/`tokio-tungstenite` block
+# above: verified with `cargo tree -p duduclaw-shell -i chrono` before adding
+# this — `chrono` is ALREADY in this crate's resolved graph twice over, via
+# `duduclaw-native-gui` (its own `Cargo.toml` declares the identical
+# `["clock","std"]` feature set, for its own `chrono::Local`/`chrono::Utc`
+# usage across `screens/*.rs`) AND via `gpui` itself. Feature set mirrors
+# `duduclaw-native-gui/Cargo.toml`'s own declaration exactly, same reasoning
+# that file gives (Cargo unifies features across the whole resolved graph
+# regardless, so requesting a narrower set here would not shrink the actual
+# build either way).
+[dependencies.chrono]
+version = "0.4"
+default-features = false
+features = ["clock", "std"]
