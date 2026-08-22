@@ -1888,6 +1888,12 @@
   "gatewayPicker.inUse": "In use",
   "gatewayPicker.discovered.empty.title": "This runtime can't scan the LAN",
   "gatewayPicker.discovered.empty.desc": "LAN mDNS discovery is only available in the DuDuClaw desktop app (Tauri shell) — this native gpui interface has no matching bridge.",
-  "gatewayPicker.manual.hint": "This build connects to a single fixed local gateway; manual switching isn't supported yet (future scope).",
-  "gatewayPicker.connect": "Connect"
+  "gatewayPicker.manual.hint": "Paste the URL of a gateway running on another machine (http/https only). Connect health-checks it first, then switches and remembers your choice.",
+  "gatewayPicker.connect": "Connect",
+  "gatewayPicker.connecting": "Connecting…",
+  "gatewayPicker.local.switchToLocal": "Switch to local",
+  "gatewayPicker.local.status.running": "Running",
+  "gatewayPicker.local.status.starting": "Starting",
+  "gatewayPicker.local.status.stopped": "Stopped",
+  "gatewayPicker.local.status.error": "Error"
 }

@@ -436,7 +436,7 @@ fn actions_cell(locale: Locale, jwt: Option<&str>, f: &FileRow) -> Div {
     let mut cell = div().flex().items_center().justify_end().gap_2();
     if can_preview {
         let path = if is_previewable(&f.name) { "/api/files/download" } else { "/api/files/preview" };
-        let url = file_action_url(crate::api::GATEWAY_BASE_URL, path, agent.as_deref(), &name, jwt);
+        let url = file_action_url(&crate::api::gateway_base_url(), path, agent.as_deref(), &name, jwt);
         cell = cell.child(
             div()
                 .id(SharedString::from(format!("files-preview-{name}")))
@@ -449,7 +449,7 @@ fn actions_cell(locale: Locale, jwt: Option<&str>, f: &FileRow) -> Div {
         );
     }
     let name2 = f.name.clone();
-    let url = file_action_url(crate::api::GATEWAY_BASE_URL, "/api/files/download", agent.as_deref(), &name2, jwt);
+    let url = file_action_url(&crate::api::gateway_base_url(), "/api/files/download", agent.as_deref(), &name2, jwt);
     cell = cell.child(
         div()
             .id(SharedString::from(format!("files-download-{name2}")))
@@ -485,7 +485,7 @@ fn list_row(locale: Locale, jwt: Option<&str>, f: &FileRow, is_last: bool) -> Di
 
 fn icon_card(jwt: Option<&str>, f: &FileRow) -> Stateful<Div> {
     let name = f.display_name.clone().unwrap_or_else(|| f.name.clone());
-    let url = file_action_url(crate::api::GATEWAY_BASE_URL, "/api/files/download", f.source_agent.as_deref(), &f.name, jwt);
+    let url = file_action_url(&crate::api::gateway_base_url(), "/api/files/download", f.source_agent.as_deref(), &f.name, jwt);
     div()
         .id(SharedString::from(format!("files-icon-{}", f.name)))
         .w(px(128.))

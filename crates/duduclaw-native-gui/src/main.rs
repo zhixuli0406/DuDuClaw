@@ -99,12 +99,15 @@ mod api;
 mod chat_protocol;
 mod chat_ws;
 mod config;
+mod gateway_switch;
 mod i18n;
 mod ime_input;
 mod native_menu;
 mod nav;
 mod rpc;
 mod screens;
+mod sidecar;
+mod sidecar_target;
 mod text_field;
 mod ws_status;
 
@@ -119,6 +122,7 @@ mod ws_status;
 use duduclaw_native_gui::{mds_gpui, theme};
 
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{prelude::*, px, App, Bounds, Context, Entity, Render, SharedString, Window, WindowBounds, WindowOptions};
@@ -213,6 +217,28 @@ pub struct RootView {
     /// there's no `Option` to unwrap when `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=
     /// spike_t7` lands on it.
     spike_t7: screens::spike_t7::SpikeT7State,
+    /// WP-C-M2 (2026-08-22): this launch's local gateway sidecar manager.
+    /// Always constructed, regardless of whether the CURRENT target is
+    /// local (see `resolve_startup_gateway`'s doc comment) — `screens::
+    /// gateway_picker`'s "切換到本機" action needs something to call
+    /// `.start()` on even when today's session began pointed at a remote
+    /// gateway or never spawned anything (attached to one already running).
+    sidecar: Arc<sidecar::SidecarManager>,
+    /// The gateway-picker page's manual-entry field (`screens::
+    /// gateway_picker`) — lives here rather than inside a page-local
+    /// `Global`, matching `email_field`/`password_field`'s placement: this
+    /// is a real gpui text-input `Entity` that must be constructed once
+    /// with `&mut App` (available at `RootView` construction time, inside
+    /// `cx.open_window`'s closure), not per-render.
+    gateway_manual_field: Entity<TextField>,
+    /// True while a gateway-picker health-check/connect round trip is in
+    /// flight — drives the manual-entry connect button's loading/disabled
+    /// state, same role `login_loading` plays for the login form.
+    gateway_connecting: bool,
+    /// Localized-ish error line shown under the gateway-picker manual entry
+    /// after a failed connect attempt (health-check failure, or a locally-
+    /// rejected malformed URL). `None` when nothing has failed yet.
+    gateway_connect_error: Option<SharedString>,
 }
 
 impl RootView {
@@ -325,6 +351,16 @@ impl RootView {
     }
 }
 
+// WP-C-M2: `apply_gateway_switch`/`switch_to_local`/`begin_manual_connect`
+// (a second `impl RootView` block) plus `resolve_startup_gateway` (called
+// from `main()` below) live in `gateway_switch.rs` — split out purely to
+// keep this file under this project's 800-line convention. Rust allows an
+// inherent `impl` to be split across files within the same crate, so no
+// signature/call-site changes were needed anywhere: `screens::
+// gateway_picker`'s `this.switch_to_local(cx)` / `this.begin_manual_
+// connect(cx)` and `main()`'s `resolve_startup_gateway()` call below both
+// keep resolving exactly as before.
+
 impl Render for RootView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // `self` reborrows as `&RootView` here (implicit `&mut T -> &T`
@@ -350,6 +386,14 @@ impl Render for RootView {
 
 fn main() {
     eprintln!("[main] starting duduclaw-native-gui S2");
+
+    // WP-C-M2: resolve + seed the gateway target BEFORE anything else in
+    // this crate makes a network call — `api::init_gateway_base_url` must
+    // run ahead of `ws_status::spawn()`'s very first `TryLocalSession`
+    // dispatch below, since that command reads the base URL dynamically
+    // (see `api.rs`'s `GATEWAY_BASE` doc comment).
+    let (initial_gateway_url, sidecar_manager) = gateway_switch::resolve_startup_gateway();
+    api::init_gateway_base_url(initial_gateway_url);
 
     // Spawn the background session manager (HTTP login/local-session +
     // auto-reconnecting authenticated WS) before opening the window, and
@@ -405,6 +449,22 @@ fn main() {
             Err(e) => eprintln!("[main] add_fonts FAILED (falling back to system font): {e}"),
         }
 
+        // WP-C-M2: release a sidecar THIS app spawned on quit (Cmd+Q / Dock
+        // quit / the native menu's QuitApp action — every path funnels
+        // through `cx.quit()`, which fires every `on_app_quit` callback
+        // before the process actually exits). `SidecarManager::stop()` is a
+        // safe no-op both for a gateway this app only attached to (never
+        // spawned) and for one already stopped — "app 關閉時自己 spawn 的
+        // gateway 一併收（非自己 spawn 的不動）" per the task brief.
+        let sidecar_for_quit = sidecar_manager.clone();
+        cx.on_app_quit(move |_cx| {
+            let mgr = sidecar_for_quit.clone();
+            async move {
+                mgr.stop();
+            }
+        })
+        .detach();
+
         // Debug-only boot override, NOT part of the normal user flow: lets a
         // headless verification run (this crate has no scriptable UI-click
         // automation available — no accessibility/CI driver wired up) land
@@ -446,6 +506,7 @@ fn main() {
         let bounds = Bounds::centered(None, gpui::size(px(1440.0), px(960.0)), cx);
         let session_tx_for_view = session_tx.clone();
         let chat_tx_for_view = chat_tx.clone();
+        let sidecar_for_view = sidecar_manager.clone();
         let window = cx
             .open_window(
                 WindowOptions {
@@ -455,6 +516,14 @@ fn main() {
                 |_window, cx| {
                     let email_field = TextField::new(cx, "admin@local", false, "admin@local");
                     let password_field = TextField::new(cx, "••••••••", true, "");
+                    // WP-C-M2: the gateway-picker manual-entry field.
+                    // Placeholder shows the shape a candidate URL should
+                    // take, not a real default — unlike email/password
+                    // there's no natural "current value" to pre-fill (the
+                    // currently-active target is shown READ-ONLY as the
+                    // "本機"/discovered-list rows, not echoed into the input
+                    // the user types a NEW target into).
+                    let gateway_manual_field = TextField::new(cx, "http://192.168.1.5:18789", false, "");
                     // S4: the chat composer entity is created here (needs
                     // `&mut App`, available at this point) and handed into
                     // `ChatState`; the subscription below is what turns its
@@ -503,6 +572,10 @@ fn main() {
                             display_name: None,
                             user_id: None,
                             spike_t7: screens::spike_t7::SpikeT7State::default(),
+                            sidecar: sidecar_for_view,
+                            gateway_manual_field,
+                            gateway_connecting: false,
+                            gateway_connect_error: None,
                         }
                     })
                 },
@@ -558,6 +631,23 @@ fn main() {
             // behind `Global`, it's called from `dashboard::render` itself,
             // same as every other S4b page's own `maybe_fetch*` — no `&mut
             // RootView` needed, so no poll-loop entry needed either.
+
+            // WP-C-M2: the gateway-picker page's "本機" card reads `state.
+            // sidecar.status()`/`.port()` directly (a cheap synchronous
+            // Mutex/Atomic read, no channel needed — see `sidecar.rs`'s
+            // `SidecarManager`) rather than through an event channel like
+            // the session/chat managers above. That means nothing else in
+            // this loop naturally triggers a re-render while the sidecar
+            // transitions `Starting` -> `Running`/`Error` in the
+            // background, so this page gets its own periodic `cx.notify()`
+            // — scoped to ONLY fire while that page is actually visible, to
+            // avoid needless re-render churn on every other page.
+            let _ = window.update(cx, |view, _window, cx| {
+                if view.active_page == "gatewayPicker" {
+                    cx.notify();
+                }
+            });
+
             if session_dead && chat_dead {
                 break;
             }

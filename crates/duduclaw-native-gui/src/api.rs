@@ -25,14 +25,86 @@
 // of this file) without spinning up a window. `ws_status.rs` is the only
 // caller, dispatching these functions from its background tokio thread.
 
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use serde::Deserialize;
 
-/// Base URL for the local gateway. Not configurable in S2 — every other
-/// part of this crate (the WS smoke test this replaces) also hardcodes
-/// `127.0.0.1:18789`; a settings screen to override it is future scope.
-pub const GATEWAY_BASE_URL: &str = "http://127.0.0.1:18789";
+/// Runtime-resolved gateway base URL (WP-C-M2). Was `pub const GATEWAY_BASE_
+/// URL: &str = "http://127.0.0.1:18789"` through S2 — every part of this
+/// crate hardcoded the same literal, with a doc comment calling a settings
+/// screen to override it "future scope". This is that future scope: an
+/// `OnceLock<RwLock<String>>` so `main.rs` can seed it once at startup with
+/// whatever `sidecar::plan_gateway`/`config::load_gateway_selection`/
+/// `DUDUCLAW_GATEWAY_URL` resolve to, AND `screens::gateway_picker` can
+/// change it again later at runtime (switching gateways without a process
+/// restart — see that screen's connect handler).
+///
+/// The lazy default (used only if [`init_gateway_base_url`] is never
+/// called, e.g. every existing unit test in this module/crate that talks to
+/// `login()`/`try_local_session()` directly) is the exact same literal S2
+/// hardcoded, so none of those tests needed to change.
+static GATEWAY_BASE: OnceLock<RwLock<String>> = OnceLock::new();
+
+fn gateway_base_cell() -> &'static RwLock<String> {
+    GATEWAY_BASE.get_or_init(|| RwLock::new("http://127.0.0.1:18789".to_string()))
+}
+
+/// Seed the resolved base URL once at startup, BEFORE any other call in
+/// this module runs (`main.rs`'s very first lines, ahead of spawning
+/// `ws_status`/`chat_ws`/`sidebar_rpc`). A no-op if something already read
+/// the lazy default first — startup order guarantees that never happens in
+/// practice, but silently losing an explicit seed would be worse than a
+/// same-value overwrite, so [`set_gateway_base_url`] (not `.set()`) is used
+/// here too.
+pub fn init_gateway_base_url(url: String) {
+    set_gateway_base_url(url);
+}
+
+/// The gateway base URL currently in effect. Read fresh on every call
+/// (never cached by a caller) so a runtime gateway switch takes effect
+/// immediately for the very next request.
+pub fn gateway_base_url() -> String {
+    gateway_base_cell().read().map(|g| g.clone()).unwrap_or_else(|e| e.into_inner().clone())
+}
+
+/// Point every future call in this crate at a different gateway. Called
+/// exactly twice today: once at startup (via [`init_gateway_base_url`]) and
+/// once per successful `screens::gateway_picker` connect/switch action.
+pub fn set_gateway_base_url(url: String) {
+    match gateway_base_cell().write() {
+        Ok(mut g) => *g = url,
+        Err(e) => *e.into_inner() = url,
+    }
+}
+
+/// Derive a `ws://`/`wss://` URL for `path` from the current base URL —
+/// the WS twin of [`gateway_base_url`], used by `ws_status.rs`/`chat_ws.rs`/
+/// `screens::chat::sidebar_rpc.rs` instead of each hardcoding its own `ws://
+/// 127.0.0.1:18789/...` constant. `path` should start with `/`.
+pub fn gateway_ws_url(path: &str) -> String {
+    derive_ws_url(&gateway_base_url(), path)
+}
+
+/// Pure half of [`gateway_ws_url`] — split out so the http→ws / https→wss
+/// scheme swap is unit-testable without touching the process-global
+/// [`GATEWAY_BASE`] cell (which `login()`/`try_local_session()`'s own live-
+/// gateway tests below also read; a test that mutated it via
+/// [`set_gateway_base_url`] would race with those running concurrently in
+/// the same `cargo test` binary).
+fn derive_ws_url(base: &str, path: &str) -> String {
+    let (scheme, rest) = if let Some(r) = base.strip_prefix("https://") {
+        ("wss", r)
+    } else if let Some(r) = base.strip_prefix("http://") {
+        ("ws", r)
+    } else {
+        // Already schemeless or unrecognized — pass through as `ws://`
+        // rather than producing a malformed URL silently.
+        ("ws", base)
+    };
+    let rest = rest.trim_end_matches('/');
+    format!("{scheme}://{rest}{path}")
+}
 
 /// Custom header `POST /api/session/local` requires (`local_session.rs`'s
 /// `LOCAL_MARKER_HEADER`/`LOCAL_MARKER_VALUE`). Its value is arbitrary — the
@@ -143,7 +215,7 @@ fn client() -> reqwest::Client {
 
 /// `POST /api/login` with `{email, password}`.
 pub async fn login(email: &str, password: &str) -> Result<LoginResponse, AuthError> {
-    login_at(GATEWAY_BASE_URL, email, password).await
+    login_at(&gateway_base_url(), email, password).await
 }
 
 /// Same as [`login`] against an explicit base URL — the seam that makes the
@@ -171,7 +243,7 @@ pub async fn login_at(
 /// loopback box, and that refusal must stay silent (never surfaced as an
 /// error to the caller; the caller just shows the login form).
 pub async fn try_local_session() -> Option<LoginResponse> {
-    try_local_session_at(GATEWAY_BASE_URL).await
+    try_local_session_at(&gateway_base_url()).await
 }
 
 /// Same as [`try_local_session`] against an explicit base URL (test seam,
@@ -232,6 +304,86 @@ pub async fn get_json(
         .filter(|s| !s.is_empty())
         .unwrap_or(body_text);
     Err(AuthError::Other { status: Some(status.as_u16()), detail })
+}
+
+/// WP-C-M2 — validate a gateway URL a user typed into `screens::
+/// gateway_picker`'s manual-entry field. Scheme MUST be `http`/`https`
+/// (fail-closed — anything else, including `file:`/`javascript:`/`data:`
+/// or an unparsable string, is rejected). Returns the normalized
+/// `scheme://host[:port]` origin (path/query/fragment stripped) on success.
+/// Hand-rolled rather than pulling in the `url` crate (this crate has no
+/// existing URL-parsing dependency and the shape needed here — scheme +
+/// host + optional port, nothing else — doesn't warrant one).
+pub fn validate_gateway_url(input: &str) -> Result<String, String> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err("empty URL".to_string());
+    }
+    let (scheme, rest) = if let Some(r) = raw.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = raw.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return Err(format!("unsupported scheme in '{raw}' (only http/https)"));
+    };
+    let host_port = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host_port.is_empty() {
+        return Err("missing host".to_string());
+    }
+    Ok(format!("{scheme}://{host_port}"))
+}
+
+/// True when `url`'s host is a loopback address — used to decide whether a
+/// gateway-picker selection is "local" (persisted as `GatewayMode::Local`,
+/// never releases the sidecar) or "remote" (persisted as `Remote`, releases
+/// a sidecar this app spawned). Best-effort string matching, not full URL
+/// parsing (consistent with [`validate_gateway_url`]'s own scope) — a host
+/// this can't recognize as loopback is treated as remote, the safe default
+/// (never silently keeps a sidecar alive for a target this can't confirm is
+/// actually local).
+pub fn is_local_gateway_url(url: &str) -> bool {
+    let without_scheme = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url);
+    // Bracketed IPv6 (`[::1]:18789`) needs its own split — the naive
+    // `split(['/', ':'])` below would stop at the FIRST colon inside the
+    // brackets and see only `[`.
+    let host = if let Some(rest) = without_scheme.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("").to_string()
+    } else {
+        without_scheme.split(['/', ':']).next().unwrap_or("").to_string()
+    };
+    let host = host.to_ascii_lowercase();
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+/// WP-C-M2 — unauthenticated `GET <base_url>/healthz` probe, used by
+/// `screens::gateway_picker` to validate a candidate URL (local sidecar or
+/// manually-entered remote) before persisting/switching to it. Short
+/// timeout — this is a UI-blocking "does anything answer here at all"
+/// check, not a normal API call, so it does not reuse [`REQUEST_TIMEOUT`].
+/// Reports `(ok, error_detail)` rather than an `AuthError`: an unhealthy
+/// gateway is an expected, common outcome here (the whole point of the
+/// probe), not a failure mode worth the three-way `AuthError` taxonomy.
+pub async fn health_probe(base_url: &str) -> (bool, Option<String>) {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+    let url = format!("{}/healthz", base_url.trim_end_matches('/'));
+    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => return (false, Some(format!("http client: {e}"))),
+    };
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => (true, None),
+        Ok(resp) => (false, Some(format!("HTTP {}", resp.status().as_u16()))),
+        Err(e) => {
+            let detail = if e.is_timeout() {
+                "connection timed out".to_string()
+            } else if e.is_connect() {
+                "could not connect".to_string()
+            } else {
+                e.to_string()
+            };
+            (false, Some(detail))
+        }
+    }
 }
 
 /// A `reqwest::Error` from `.send()` itself (never reached the server, or
@@ -361,7 +513,7 @@ mod tests {
     /// invariant `authorize_file_access` documents server-side.
     #[tokio::test]
     async fn get_json_without_token_against_live_gateway_is_invalid_credentials() {
-        let result = get_json(GATEWAY_BASE_URL, "/api/files", None).await;
+        let result = get_json(&gateway_base_url(), "/api/files", None).await;
         match result {
             Err(AuthError::InvalidCredentials) => {}
             other => panic!(
@@ -389,5 +541,65 @@ mod tests {
             AuthError::Other { status: None, detail: "x".into() }.i18n_key_and_code(),
             ("login.error.unknown", "N/A".to_string())
         );
+    }
+
+    #[test]
+    fn derive_ws_url_swaps_scheme_and_strips_trailing_slash() {
+        assert_eq!(derive_ws_url("http://127.0.0.1:18789", "/ws"), "ws://127.0.0.1:18789/ws");
+        assert_eq!(derive_ws_url("http://127.0.0.1:18789/", "/ws"), "ws://127.0.0.1:18789/ws");
+        assert_eq!(derive_ws_url("https://gw.example.com", "/ws/chat"), "wss://gw.example.com/ws/chat");
+        // Schemeless/unrecognized input degrades to ws:// rather than
+        // producing a malformed string.
+        assert_eq!(derive_ws_url("127.0.0.1:18789", "/ws"), "ws://127.0.0.1:18789/ws");
+    }
+
+    #[tokio::test]
+    async fn health_probe_against_unreachable_host_is_not_ok() {
+        let (ok, detail) = health_probe(UNREACHABLE_BASE_URL).await;
+        assert!(!ok);
+        assert!(detail.is_some());
+    }
+
+    /// Live path: this is the exact round trip `RootView::begin_manual_
+    /// connect` performs before switching gateways — proves the health-
+    /// check half of the manual-entry flow really works against a real
+    /// gateway, not just the unreachable-host failure path above. Same
+    /// live-gateway caveat as every other `_against_live_gateway_` test in
+    /// this file (requires `curl :18789/healthz` to be reachable).
+    #[tokio::test]
+    async fn health_probe_against_live_gateway_is_ok() {
+        let (ok, detail) = health_probe("http://127.0.0.1:18789").await;
+        assert!(ok, "expected the live local gateway to answer /healthz, got detail={detail:?}");
+    }
+
+    #[test]
+    fn validate_gateway_url_accepts_http_and_https_and_strips_path() {
+        assert_eq!(validate_gateway_url("http://192.168.1.5:18789").unwrap(), "http://192.168.1.5:18789");
+        assert_eq!(validate_gateway_url("https://gw.example.com").unwrap(), "https://gw.example.com");
+        assert_eq!(validate_gateway_url("  http://h:1/login?x=1#frag  ").unwrap(), "http://h:1");
+    }
+
+    #[test]
+    fn validate_gateway_url_rejects_dangerous_schemes_fail_closed() {
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,<script>",
+            "ftp://host/x",
+            "not a url",
+            "",
+            "   ",
+        ] {
+            assert!(validate_gateway_url(bad).is_err(), "should reject: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn is_local_gateway_url_detects_loopback() {
+        assert!(is_local_gateway_url("http://127.0.0.1:18789"));
+        assert!(is_local_gateway_url("http://localhost:18789"));
+        assert!(is_local_gateway_url("http://[::1]:18789"));
+        assert!(!is_local_gateway_url("http://192.168.1.5:18789"));
+        assert!(!is_local_gateway_url("https://gw.example.com"));
     }
 }

@@ -494,7 +494,7 @@ fn backup_file_row(locale: Locale, file: &BackupFile, armed: bool, deleting: boo
 /// no percent-encoding helper is pulled in for this one call site.
 fn backup_download_url(state: &RootView, name: &str) -> String {
     let token = state.jwt.as_deref().unwrap_or("");
-    format!("{}/api/device/backups/download?name={name}&token={token}", crate::api::GATEWAY_BASE_URL)
+    format!("{}/api/device/backups/download?name={name}&token={token}", crate::api::gateway_base_url())
 }
 
 fn backup_list_section(locale: Locale, _state: &RootView, cx: &mut Context<RootView>) -> Div {

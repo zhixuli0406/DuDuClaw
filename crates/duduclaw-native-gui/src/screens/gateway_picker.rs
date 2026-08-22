@@ -1,83 +1,43 @@
-// WP-S6b3-R (S6b 第三波, 2026-08-22) — "GatewayPicker" (`GatewayPicker.dc.
-// html`, B23 獨立小視窗). No `nav.rs` entry — self-attached in `screens/
-// shell.rs` only, `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=gatewayPicker`, same "D
-// 先掛好分支就直接可達，未掛就自己掛" precedent every prior self-attached S5b/
-// S6b page already establishes.
+// WP-S6b3-R (S6b 第三波, 2026-08-22) — "GatewayPicker", originally shipped
+// as a UI-only preview: the "本機" card was READ-ONLY (`api::GATEWAY_BASE_
+// URL` was a hardcoded `&str` constant, `ws_state` was purely displayed),
+// "已探索" was an honest empty stub (no mDNS dependency in this crate), and
+// "手動輸入" was a disabled, unclickable field showing the same fixed
+// constant. See git history for that version's full reasoning — most of it
+// (the mDNS honesty, the small-window-as-centered-card layout, the "no
+// fabricated LAN rows" convention) still applies verbatim below.
 //
-// ── Execution-time attribution: read directly, not assumed ──────────────
-// `web/src/pages/GatewayPickerPage.tsx`'s own header comment: "the desktop
-// shell's pre-login landing page... Desktop-only: outside Tauri it redirects
-// to `/`". Its ENTIRE data layer is `web/src/lib/gateway-picker.ts` — a
-// typed wrapper file whose own header comment says it outright: "typed
-// wrappers over the Tauri `gateway_*` commands". Every one of `gatewayDis
-// cover`/`gatewayHealth`/`gatewaySelect`/`gatewayLast`/`gatewayLocalStatus`/
-// `gatewayStartLocal` bottoms out in that file's `invoke(cmd, args)` →
-// `window.__TAURI__.core.invoke(cmd, args)` (grep-verified: zero `ws.send`/
-// gateway-WS-RPC calls anywhere in either file — mDNS LAN discovery, the
-// local-sidecar start/stop lifecycle, and persisted "last gateway" state are
-// all `src-tauri`-side Rust commands, a separate binary/runtime this crate
-// has no IPC channel to, the same "genuinely nothing to call, not a scope
-// cut" structural gap `pet_studio.rs`'s own header comment documents for its
-// page). This is the SECOND page in this S6b3 batch with that shape — see
-// `mascot_overlay.rs` for the one page in the batch that ISN'T fully in
-// this category.
+// WP-C-M2 (2026-08-22, this pass) makes the page real:
 //
-// ── UNLIKE petStudio, though: `duduclaw-native-gui` has its OWN gateway-
-// connection mechanism — much simpler than Tauri's, but real ─────────────
-// This crate is not gateway-agnostic like the web dashboard: it is hard-
-// wired to exactly ONE local gateway. `api::GATEWAY_BASE_URL: &str =
-// "http://127.0.0.1:18789"` is that address (`api.rs`'s own doc comment,
-// verbatim: "Not configurable in S2 — every other part of this crate... also
-// hardcodes `127.0.0.1:18789`; a settings screen to override it is future
-// scope") — `ws_status.rs`'s private `WS_URL` constant points at the same
-// host:port for the `/ws` endpoint. Grep-verified across the whole crate:
-// no env var, no config file, no dashboard RPC anywhere reads or writes
-// this value — it is a compile-time constant, full stop. Per this task's
-// own instruction ("若存在...就把「手動輸入」段真接到該機制的顯示（唯讀呈現
-// 目前連線目標）"), the "手動輸入" section below shows this REAL constant,
-// read-only — not a fake editable+submit flow with nowhere real to send a
-// different value. The "本機" card's connection status is ALSO real: `state.
-// ws_state` (`WsConnState`) is this crate's actual live WS auth state,
-// reusing `shell_sidebar.rs`'s own already-localized `short_label`/
-// `dot_color` helpers (the same connection indicator the persistent sidebar
-// shows) rather than fabricating a Tauri-style "本機側車 執行中" line this
-// runtime cannot verify (there is no sidecar process to poll — the gateway
-// this crate talks to might be a full standalone `duduclaw gateway` install,
-// not a Tauri-spawned sidecar at all).
+// - "本機" now shows LIVE `state.sidecar.status()` (`sidecar::
+//   SidecarManager` — a real same-machine `duduclaw run` child process this
+//   crate spawns/attaches/health-polls, see `sidecar.rs`) instead of just
+//   the WS auth state. A "切換到本機" action (`RootView::switch_to_local`)
+//   appears whenever the local target isn't the one currently in use.
+// - "手動輸入" is a REAL editable field + "連線" button
+//   (`RootView::begin_manual_connect`): health-checks the candidate over
+//   `ws_status::health_check` (the background tokio runtime — gpui's own
+//   executor can't drive `reqwest` directly, see `main.rs`'s gotchas list),
+//   and only on success persists the selection (`config::
+//   save_gateway_selection`) and retargets every future call this crate
+//   makes (`api::set_gateway_base_url`).
+// - "已探索" is STILL the honest empty stub — this task's own scope call
+//   ("mDNS 若無依賴不硬加") keeps it that way; no `mdns`-family crate was
+//   added to this crate's `Cargo.toml`.
 //
-// ── "已探索" (LAN mDNS discovery) — honest empty state ───────────────────
-// No such capability exists in this crate (mDNS browsing is entirely
-// `gateway_discover`, Tauri-side) — rendered as an honest empty state, same
-// "no fabricated records" convention `pet_studio.rs`'s gallery region and
-// `screens::world.rs`'s "no fabricated speech-bubble text" precedent both
-// establish. The canvas's own two example rows ("辦公室 Gateway"/"小杜筆電")
-// are NOT reproduced — they are the design tool's illustrative sample data,
-// not real discoverable gateways this page could ever actually list.
-//
-// ── Small-window canvas, rendered as a centered card in the normal shell
-// (NOT a root-swap) ────────────────────────────────────────────────────────
-// The canvas draws this as its own tiny 900×760 chrome-framed window
-// (traffic-light dots + centered content) — the SAME design-tool preview-
-// frame convention `migrate.rs`'s own header comment documents stripping
-// from every other already-ported canvas in this crate (billing.rs/
-// license.rs/…). This page keeps the sidebar/three-column shell (unlike
-// `migrate.rs`/`launcher.rs`'s full-bleed root swaps) and renders its
-// content as a centered max-width card, per this task's own explicit
-// instruction ("小視窗版面在標準視窗內以置中卡呈現（誠實：獨立視窗形態留
-// desktop 整合）") — a real separate OS-level small window is desktop-shell
-// integration scope, not attempted here.
-//
-// ── No RPC, no page-local mutable state at all ───────────────────────────
-// Every value on this page is either a compile-time constant
-// (`GATEWAY_BASE_URL`) or already lives on `RootView` (`ws_state`) — there
-// is nothing to fetch and nothing to edit, so (unlike every other page in
-// this crate) there is no `Global` state struct, no `ensure_state`, no
-// `maybe_fetch` here at all. `render` is a pure function of `&RootView`.
+// This is the SECOND page in the original S6b3 batch to have a real crate-
+// side mechanism behind it (unlike `pet_studio.rs`, which has none) — see
+// the original version's header comment, preserved in git history, for the
+// grep-verified comparison against the Tauri shell's `gateway_picker.rs`
+// (four Tauri commands + `desktop.json` this crate has no IPC channel to;
+// `config::GatewaySelection`/`native-gui.toml` is this crate's OWN, smaller
+// persistence mechanism, not a port of that file).
 
 use gpui::{div, prelude::*, px, Context, Div, IntoElement, Stateful};
 
 use crate::i18n::{self, Locale};
 use crate::mds_gpui::empty_state;
+use crate::sidecar::SidecarStatus;
 use crate::theme;
 use crate::RootView;
 
@@ -99,11 +59,72 @@ fn row_icon() -> Div {
     div().size(px(34.)).rounded(px(9.)).bg(theme::alpha(theme::MUTED, 1.0)).flex_shrink_0()
 }
 
-/// The "本機" card — real data: `api::GATEWAY_BASE_URL` (this build's one
-/// fixed target) + `state.ws_state` (this crate's actual live connection
-/// state, same source `shell_sidebar.rs`'s persistent indicator reads).
-fn local_card(state: &RootView, locale: Locale) -> Div {
-    let host = crate::api::GATEWAY_BASE_URL.trim_start_matches("http://").trim_start_matches("https://");
+fn sidecar_status_label(locale: Locale, status: SidecarStatus) -> gpui::SharedString {
+    match status {
+        SidecarStatus::Running => i18n::t(locale, "gatewayPicker.local.status.running"),
+        SidecarStatus::Starting => i18n::t(locale, "gatewayPicker.local.status.starting"),
+        SidecarStatus::Stopped => i18n::t(locale, "gatewayPicker.local.status.stopped"),
+        SidecarStatus::Error => i18n::t(locale, "gatewayPicker.local.status.error"),
+    }
+}
+
+fn sidecar_status_color(status: SidecarStatus) -> u32 {
+    match status {
+        SidecarStatus::Running => theme::SUCCESS,
+        SidecarStatus::Starting => theme::WARNING,
+        SidecarStatus::Stopped => theme::MUTED_FOREGROUND,
+        SidecarStatus::Error => theme::DESTRUCTIVE,
+    }
+}
+
+/// The "本機" card. Left side: `state.sidecar.status()`/`.port()` — this
+/// launch's REAL sidecar process state (see `sidecar.rs`'s `SidecarManager`
+/// doc comments for the spawn/health-poll/orphan-reclaim/backoff-restart
+/// mechanics behind it), not the connection-to-whatever-is-currently-active
+/// `ws_state` the original version showed (that conflated "is the local
+/// process alive" with "is THIS app's session authenticated to whichever
+/// gateway currently active", which broke the moment "currently active"
+/// could be remote). Right side: "使用中" when the local target IS the one
+/// in effect, else a real "切換到本機" action.
+fn local_card(state: &RootView, locale: Locale, cx: &mut Context<RootView>) -> Div {
+    let status = state.sidecar.status();
+    let port = state.sidecar.port();
+    let host = format!("127.0.0.1:{port}");
+    let is_current = crate::api::is_local_gateway_url(&crate::api::gateway_base_url());
+
+    // `.id(...)` on both arms (harmless on the non-interactive "使用中"
+    // badge too) so this `if`/`else` unifies to `Stateful<Div>` — see
+    // `main.rs`'s gpui-gotchas doc comment: `.id(...)` changes the concrete
+    // element type from `Div`, so both branches must agree.
+    let action = if is_current {
+        div()
+            .id("gateway-picker-local-in-use")
+            .rounded(px(theme::RADIUS_LG))
+            .bg(theme::alpha(theme::MUTED, 0.5))
+            .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
+            .text_size(px(theme::TEXT_XS))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .px_3p5()
+            .py_1p5()
+            .child(i18n::t(locale, "gatewayPicker.inUse"))
+    } else {
+        div()
+            .id("gateway-picker-switch-local")
+            .rounded(px(theme::RADIUS_LG))
+            .bg(theme::alpha(theme::BRAND, 1.0))
+            .text_color(theme::alpha(theme::BRAND_FOREGROUND, 1.0))
+            .text_size(px(theme::TEXT_XS))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .px_3p5()
+            .py_1p5()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::alpha(theme::BRAND, 0.90)))
+            .active(|style| style.bg(theme::alpha(theme::BRAND, 0.85)))
+            .child(i18n::t(locale, "gatewayPicker.local.switchToLocal"))
+            .on_click(cx.listener(|this, _ev, _window, cx| {
+                this.switch_to_local(cx);
+            }))
+    };
 
     let row = div()
         .flex()
@@ -128,23 +149,13 @@ fn local_card(state: &RootView, locale: Locale) -> Div {
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
-                                .child(div().size(px(6.)).rounded_full().bg(theme::alpha(state.ws_state.dot_color(), 1.0)))
-                                .child(div().text_size(px(11.)).text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0)).child(state.ws_state.short_label(locale)))
+                                .child(div().size(px(6.)).rounded_full().bg(theme::alpha(sidecar_status_color(status), 1.0)))
+                                .child(div().text_size(px(11.)).text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0)).child(sidecar_status_label(locale, status)))
                                 .child(div().text_size(px(11.)).text_color(theme::alpha(theme::MUTED_FOREGROUND, 0.8)).child(format!("· {host}"))),
                         ),
                 ),
         )
-        .child(
-            div()
-                .rounded(px(theme::RADIUS_LG))
-                .bg(theme::alpha(theme::MUTED, 0.5))
-                .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
-                .text_size(px(theme::TEXT_XS))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .px_3p5()
-                .py_1p5()
-                .child(i18n::t(locale, "gatewayPicker.inUse")),
-        );
+        .child(action);
 
     div().flex().flex_col().gap_1p5().child(section_label(locale, "gatewayPicker.section.local")).child(list_box(row))
 }
@@ -163,11 +174,16 @@ fn discovered_section(locale: Locale) -> Div {
         )))
 }
 
-/// The "手動輸入" card — a READ-ONLY display of the one real target this
-/// build can ever reach, per this file's header comment. Not a `TextField`:
-/// there is no write path this could feed (this task's own "唯讀呈現" call).
-fn manual_section(locale: Locale) -> Div {
-    let value = div()
+/// The "手動輸入" card — a real editable field (`state.gateway_manual_
+/// field`) + "連線" button wired to `RootView::begin_manual_connect`
+/// (validate → health-check off the gpui executor → persist + retarget on
+/// success). While `state.gateway_connecting` is true the button shows a
+/// loading/disabled state, same pattern `screens::login`'s submit button
+/// already established for its own in-flight request.
+fn manual_section(state: &RootView, locale: Locale, cx: &mut Context<RootView>) -> Div {
+    let connecting = state.gateway_connecting;
+
+    let field = div()
         .flex_1()
         .rounded(px(theme::RADIUS_LG))
         .bg(theme::dark::input_bg())
@@ -176,34 +192,50 @@ fn manual_section(locale: Locale) -> Div {
         .px_3()
         .py_2()
         .text_size(px(12.5))
-        .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
-        .child(crate::api::GATEWAY_BASE_URL);
+        .child(state.gateway_manual_field.clone());
 
-    let disabled_button = div()
+    let button = div()
+        .id("gateway-picker-manual-connect")
         .rounded(px(theme::RADIUS_LG))
-        .bg(theme::alpha(theme::MUTED, 0.4))
-        .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
+        .bg(theme::alpha(theme::BRAND, if connecting { 0.5 } else { 1.0 }))
+        .text_color(theme::alpha(theme::BRAND_FOREGROUND, 1.0))
         .text_size(px(12.5))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .px(px(18.))
         .py_2()
-        .child(i18n::t(locale, "gatewayPicker.connect"));
+        .child(i18n::t(locale, if connecting { "gatewayPicker.connecting" } else { "gatewayPicker.connect" }))
+        .when(!connecting, |el| {
+            el.cursor_pointer()
+                .hover(|style| style.bg(theme::alpha(theme::BRAND, 0.90)))
+                .active(|style| style.bg(theme::alpha(theme::BRAND, 0.85)))
+                .on_click(cx.listener(|this, _ev, _window, cx| {
+                    this.begin_manual_connect(cx);
+                }))
+        });
 
-    div()
+    let mut col = div()
         .flex()
         .flex_col()
         .gap_1p5()
         .child(section_label(locale, "gatewayPicker.section.manual"))
-        .child(div().flex().items_center().gap_2().child(value).child(disabled_button))
-        .child(div().text_size(px(11.)).text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0)).child(i18n::t(locale, "gatewayPicker.manual.hint")))
+        .child(div().flex().items_center().gap_2().child(field).child(button));
+
+    if let Some(err) = state.gateway_connect_error.clone() {
+        col = col.child(div().text_size(px(11.)).text_color(theme::alpha(theme::DESTRUCTIVE, 1.0)).child(err));
+    } else {
+        col = col.child(div().text_size(px(11.)).text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0)).child(i18n::t(locale, "gatewayPicker.manual.hint")));
+    }
+
+    col
 }
 
 // ── Top-level render ───────────────────────────────────────────────────
-// No `WsConnState` auth GATE (unlike RPC-backed pages) — `state.ws_state`
-// is read as plain DATA here, same as `shell_sidebar.rs`'s own indicator;
-// this page has nothing that requires `Authenticated` to render correctly.
+// No `WsConnState` auth GATE (unlike RPC-backed pages) — `state.ws_state`/
+// `state.sidecar` are read as plain DATA here; this page has nothing that
+// requires `Authenticated` to render correctly (switching gateways is, if
+// anything, more useful while NOT authenticated to anything yet).
 
-pub fn render(state: &RootView, _cx: &mut Context<RootView>) -> Stateful<Div> {
+pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
     let locale = state.locale;
 
     let header = div()
@@ -233,9 +265,9 @@ pub fn render(state: &RootView, _cx: &mut Context<RootView>) -> Stateful<Div> {
         .shadow(theme::floating_shadow())
         .p_6()
         .child(header)
-        .child(local_card(state, locale))
+        .child(local_card(state, locale, cx))
         .child(discovered_section(locale))
-        .child(manual_section(locale));
+        .child(manual_section(state, locale, cx));
 
     div().id("gateway-picker-page").size_full().overflow_y_scroll().flex().items_start().justify_center().p_6().child(card)
 }

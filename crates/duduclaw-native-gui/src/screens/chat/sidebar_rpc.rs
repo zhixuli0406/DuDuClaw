@@ -37,9 +37,9 @@ use serde_json::Value;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::api;
 use crate::rpc::{self, CallError, WsFrame};
 
-const WS_URL: &str = "ws://127.0.0.1:18789/ws";
 /// Matches `ws_status.rs`'s own handshake timeout.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Matches `ws_status.rs`'s own call timeout.
@@ -98,7 +98,14 @@ async fn run(mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>) {
                 // timeout-watchdog reasoning, inlined here since there's no
                 // shared `PendingCalls` registry to delegate the timeout to).
                 tokio::spawn(async move {
-                    let result = tokio::time::timeout(CALL_TIMEOUT, call_once(WS_URL, &j, &method, params))
+                    // WP-C-M2: resolved fresh per call (not a hardcoded
+                    // `WS_URL` const) — this module dials a brand-new
+                    // connection per call anyway (see module doc comment),
+                    // so there's no reconnect-loop lifetime concern here,
+                    // unlike `ws_status.rs`/`chat_ws.rs`'s long-lived
+                    // sessions.
+                    let ws_url = api::gateway_ws_url("/ws");
+                    let result = tokio::time::timeout(CALL_TIMEOUT, call_once(&ws_url, &j, &method, params))
                         .await
                         .unwrap_or(Err(CallError::Timeout));
                     let _ = respond_to.send(result);
@@ -112,10 +119,10 @@ async fn run(mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>) {
 /// request → matching response → close. See module doc comment for why this
 /// dials fresh every time instead of keeping a connection alive.
 ///
-/// `url` is a parameter (not the hardcoded `WS_URL` constant directly) so
-/// the wire parsing is testable against a local mock server without a real
-/// gateway/credentials — same test-seam pattern `ws_status.rs`/`chat_ws.rs`
-/// already use for their own `connect_and_run`/`session_loop`.
+/// `url` is a parameter (not resolved internally via `api::gateway_ws_url`)
+/// so the wire parsing is testable against a local mock server without a
+/// real gateway/credentials — same test-seam pattern `ws_status.rs`/
+/// `chat_ws.rs` already use for their own `connect_and_run`/`session_loop`.
 async fn call_once(url: &str, jwt: &str, method: &str, params: Value) -> Result<Value, CallError> {
     let connect_fut = tokio_tungstenite::connect_async(url);
     let (ws_stream, _resp) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_fut).await {

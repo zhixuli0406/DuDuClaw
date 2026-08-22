@@ -103,12 +103,29 @@ pub(super) fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<D
         .border_color(theme::sidebar_border())
         .shadow(theme::surface_shadow())
         // ── Header: wordmark + WS status dot ─────────────────────────
+        // WP-C-M2: the whole block is clickable -> `screens::gateway_
+        // picker`. Before this change that page was reachable ONLY via the
+        // `DUDUCLAW_NATIVE_GUI_DEBUG_PAGE=gatewayPicker` debug boot override
+        // (see that page's own header comment) — a real user could never
+        // reach it to switch gateways at all. The connection-status dot is
+        // the natural entry point: it's the one piece of chrome ALWAYS
+        // visible regardless of which page is open, and it already shows
+        // exactly the state ("disconnected"/"connecting"/"connected") a
+        // user would click it to go investigate.
         .child(
             div()
+                .id("shell-gateway-status")
                 .flex()
                 .flex_col()
                 .gap_1()
                 .py_2()
+                .cursor_pointer()
+                .rounded(px(theme::RADIUS_LG))
+                .hover(|style| style.bg(theme::alpha(theme::MUTED, 0.5)))
+                .on_click(cx.listener(|this, _ev, _window, cx| {
+                    this.active_page = "gatewayPicker";
+                    cx.notify();
+                }))
                 .child(
                     div()
                         .flex()
