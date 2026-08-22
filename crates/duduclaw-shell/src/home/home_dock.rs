@@ -195,11 +195,15 @@ pub(super) fn dock(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
         .py(px(10.))
         .shadow(shadow);
 
-    // Only "設" (settings) is interactive this round — every other icon
-    // (apps, agents) stays an honest static stub, per the task brief ("其他
-    // dock icon 維持靜態").
+    // Only "設" (settings) was interactive as of Round 3 — every other icon
+    // stayed an honest static stub, per that round's task brief ("其他 dock
+    // icon 維持靜態"). WP-A3 (2026-08-22) adds exactly ONE more: `browser`
+    // (Chromium) now has a real `flatpak_id` (`fake_data::DOCK_APPS`'s own
+    // doc comment) — `dock_app` below wires a click only for entries with
+    // one, so this loop stays a straight extension of the same convention,
+    // not a departure from it.
     for app in fake_data::DOCK_APPS {
-        row = row.child(dock_app(app, palette));
+        row = row.child(dock_app(app, palette, cx));
     }
     row = row.child(dock_divider(palette));
     for agent in fake_data::DOCK_AGENTS {
@@ -218,7 +222,7 @@ fn dock_divider(palette: ShellPalette) -> Div {
     div().w(px(1.)).h(px(34.)).bg(color)
 }
 
-fn dock_app(app: &fake_data::DockApp, palette: ShellPalette) -> Stateful<Div> {
+fn dock_app(app: &'static fake_data::DockApp, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     // The "white/near-white bordered" app tiles (Files/Browser) are the one
     // documented exception to "identity colors stay hardcoded" — see
     // `crate::palette`'s own header comment. Every OTHER (colored,
@@ -250,6 +254,7 @@ fn dock_app(app: &fake_data::DockApp, palette: ShellPalette) -> Stateful<Div> {
 
     let mut el = div()
         .id(app.id)
+        .relative()
         .w(px(44.))
         .h(px(44.))
         .rounded(px(10.))
@@ -271,6 +276,39 @@ fn dock_app(app: &fake_data::DockApp, palette: ShellPalette) -> Stateful<Div> {
     if app.bordered {
         let border_color = if palette.is_dark() { palette.neutral_tile_border } else { theme::alpha(theme::light::SURFACE_BORDER, 1.0) };
         el = el.border_1().border_color(border_color);
+    }
+
+    // WP-A3: a small corner "Verified tier" indicator — see `crate::
+    // palette::ShellPalette::verified_accent_dot`'s own doc comment for why
+    // this stays hidden entirely for `Unrated` (the dock has no room for
+    // the word "未評級" the way a Launcher row does) rather than always
+    // rendering an empty/neutral dot.
+    if let Some(hex) = palette.verified_accent_dot(app.verified) {
+        el = el.child(
+            div()
+                .absolute()
+                .bottom(px(1.))
+                .right(px(1.))
+                .w(px(9.))
+                .h(px(9.))
+                .rounded(px(9.))
+                .bg(theme::alpha(hex, 1.0))
+                .border_2()
+                .border_color(theme::alpha(palette.surface_raised, 1.0)),
+        );
+    }
+
+    // Only a real launch command makes this a real button — every other
+    // icon stays the honest static stub Round 3 established (see this fn's
+    // call site in `dock` above).
+    if app.flatpak_id.is_some() {
+        let on_click = cx.listener(move |_view, _ev, _window, _cx| {
+            if crate::diag_enabled() {
+                eprintln!("[hit] dock icon '{}' -> launch", app.id);
+            }
+            crate::apps::launch(app);
+        });
+        el = el.cursor_pointer().hover(|style| style.opacity(0.85)).on_click(on_click);
     }
     el
 }

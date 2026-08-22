@@ -81,6 +81,7 @@
 //     `window.focus(...)` itself, so opening/closing an overlay never steals
 //     this root focus — cmd-k/Escape keep working with any overlay open.
 
+mod apps;
 mod audio;
 mod fake_data;
 mod gateway_client;
@@ -257,6 +258,13 @@ impl ShellView {
             return;
         }
         self.surface.toggle_launcher();
+        // WP-A3: `toggle_launcher` just as easily CLOSED the Launcher as
+        // opened it (that's the "toggle" in its name) — clearing
+        // unconditionally here is a no-op on the open path (the query is
+        // already empty for a fresh open) and the correct behavior on the
+        // close path, cheaper than branching on `self.surface.overlay()`'s
+        // new value to tell the two apart.
+        self.overlay_ui.close_launcher_query();
         cx.notify();
     }
 
@@ -287,6 +295,7 @@ impl ShellView {
             return;
         }
         self.surface.close();
+        self.overlay_ui.close_launcher_query();
         cx.notify();
     }
 
@@ -399,6 +408,52 @@ impl Render for ShellView {
             .on_key_down(cx.listener(|view, _ev, window, cx| {
                 lockscreen::render::note_input_or_reveal(view, window, cx);
             }))
+            // WP-A3 (2026-08-22): the Launcher's live search typing — a
+            // SECOND, separate `.on_key_down` registration on this same
+            // root element (gpui's `key_down_listeners` is a `Vec` that
+            // accumulates rather than overwrites, per this file's own
+            // comment just above), gated to only act while the Launcher is
+            // the open overlay so it never steals keystrokes meant for
+            // anything else. `cmd-k`/`escape`/`enter` are BOUND actions —
+            // they never reach a raw `on_key_down` listener at all (see
+            // this file's header comment), so this never needs to special-
+            // case them. Same minimal "printable `key_char` appends,
+            // `backspace` pops, no IME composition" pattern `duduclaw-
+            // native-gui/src/text_field.rs`'s own header comment documents
+            // and accepts as an honest gap — composing CJK text into this
+            // box will not work correctly, only ASCII search terms (which
+            // is exactly what `fake_data::DockApp::search_key` is for, see
+            // that field's own doc comment).
+            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _window, cx| {
+                if view.oobe.is_some() || view.lockscreen.is_locked() {
+                    return;
+                }
+                if view.surface.overlay() != Some(Overlay::Launcher) {
+                    return;
+                }
+                let ks = &ev.keystroke;
+                // Let anything chorded with cmd/ctrl/function fall through
+                // instead of being swallowed as "typed text" — same guard
+                // `duduclaw-native-gui/src/text_field.rs::on_key_down`
+                // already applies for the identical reason.
+                if ks.modifiers.platform || ks.modifiers.control || ks.modifiers.function {
+                    return;
+                }
+                match ks.key.as_str() {
+                    "backspace" => {
+                        view.overlay_ui.launcher_query.pop();
+                        cx.notify();
+                    }
+                    _ => {
+                        if let Some(ch) = ks.key_char.as_deref() {
+                            if !ch.is_empty() && ch.chars().all(|c| !c.is_control()) {
+                                view.overlay_ui.launcher_query.push_str(ch);
+                                cx.notify();
+                            }
+                        }
+                    }
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, _ev, window, cx| {
@@ -474,6 +529,7 @@ impl Render for ShellView {
                         eprintln!("[hit] backdrop -> close overlay");
                     }
                     view.surface.close();
+                    view.overlay_ui.close_launcher_query();
                     cx.notify();
                 });
                 root = root.child(overlay::render(active, &self.overlay_ui, &self.audio_ui, home_palette, on_close, cx));
