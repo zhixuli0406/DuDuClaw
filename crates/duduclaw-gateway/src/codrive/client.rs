@@ -53,6 +53,14 @@ pub enum CodriveCmd {
     Highlight { x: f64, y: f64, w: f64, h: f64, ms: u32 },
     Status,
     Resume,
+    /// CD-3 (DESIGN §5's "接手/交還＋watch mode" row): agent-initiated
+    /// hand-off to the human — comp freezes the seat AND disables the
+    /// shadow-bypass exception (see comp's `codrive/takeover.rs`). Ends the
+    /// same way any freeze ends, via the human's Super+Enter.
+    TakeOver { reason: String },
+    /// CD-3: toggles idle-based auto-pause supervision for the rest of this
+    /// session (comp's `codrive/watch.rs`).
+    Watch { enable: bool },
 }
 
 /// Every ack shape the protocol can return, deserialized permissively
@@ -71,6 +79,11 @@ pub struct CodriveAck {
     pub frozen: Option<bool>,
     #[serde(default)]
     pub terminated: Option<bool>,
+    /// CD-3: distinguishes an agent-initiated takeover from an ordinary
+    /// human-triggered freeze — both read `frozen:true`, only this flips
+    /// for a takeover. Present on every `status` ack.
+    #[serde(default)]
+    pub takeover: Option<bool>,
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
@@ -328,6 +341,27 @@ mod tests {
         assert_eq!(serde_json::to_value(&CodriveCmd::Resume).unwrap(), serde_json::json!({"op": "resume"}));
     }
 
+    #[test]
+    fn wire_shape_take_over() {
+        let cmd = CodriveCmd::TakeOver { reason: "login page needs a human".into() };
+        assert_eq!(
+            serde_json::to_value(&cmd).unwrap(),
+            serde_json::json!({"op": "take_over", "reason": "login page needs a human"})
+        );
+    }
+
+    #[test]
+    fn wire_shape_watch() {
+        assert_eq!(
+            serde_json::to_value(&CodriveCmd::Watch { enable: true }).unwrap(),
+            serde_json::json!({"op": "watch", "enable": true})
+        );
+        assert_eq!(
+            serde_json::to_value(&CodriveCmd::Watch { enable: false }).unwrap(),
+            serde_json::json!({"op": "watch", "enable": false})
+        );
+    }
+
     // ── Ack/event deserialization: every documented server shape parses. ─
 
     #[test]
@@ -364,6 +398,16 @@ mod tests {
         assert!(ack.ok);
         assert_eq!(ack.frozen, Some(true));
         assert_eq!(ack.terminated, Some(false));
+        assert_eq!(ack.takeover, None, "an ack from before CD-3 (no takeover field) must parse fine");
+    }
+
+    #[test]
+    fn ack_status_with_takeover_field() {
+        let ack: CodriveAck = serde_json::from_value(
+            serde_json::json!({"ok": true, "frozen": true, "terminated": false, "takeover": true}),
+        )
+        .unwrap();
+        assert_eq!(ack.takeover, Some(true));
     }
 
     #[test]

@@ -35,55 +35,32 @@
 //! That's what makes the freeze latency effectively "one calloop dispatch",
 //! not something that needs a lock or a rendezvous.
 //!
-//! CD-1 additions (task brief): (1) socket auth — every connection's first
-//! line must be `{"op":"auth","token":"<hex>"}`, checked against a fresh
-//! per-run token (see `init`'s token generation and
-//! `CodriveShared::check_token`); the CD-0-era "clear on connect" ordering
-//! bug that let a reconnect bypass an active freeze is now structurally
-//! prevented by moving ALL session bookkeeping behind the auth gate (see
-//! `listener.rs::handle_conn`). (2) resume moves to the human side —
-//! `human_resume` (Super+Enter, `input.rs`), while the socket `resume` op
-//! is now always denied (`listener.rs`). (3) a `status` query. (4) named
-//! functional keys (`key_name`). (5) a target highlight box
-//! (`highlight.rs`).
+//! CD-1 additions (task brief, detail in `listener.rs`/`highlight.rs`): (1)
+//! socket auth (`{"op":"auth","token":"<hex>"}` vs. `CodriveShared::
+//! check_token`; the CD-0 reconnect-bypasses-freeze bug is fixed by moving
+//! ALL session bookkeeping behind the auth gate). (2) resume moves to the
+//! human side (`human_resume`, Super+Enter, `input.rs`) — the socket
+//! `resume` op is now always denied. (3) a `status` query. (4) named
+//! functional keys (`key_name`). (5) a target highlight box.
 //!
-//! CD-2 addition (task brief item 1, DESIGN §9 CD-1 carry-forward "socket
-//! rotation"): (6) the socket-auth token can be rotated WITHOUT restarting
-//! this process — a fresh token is still generated every process start
-//! (unchanged from CD-1), but a long-running comp instance no longer has to
-//! be killed and relaunched to get a new one. Two triggers, both routed
-//! through `CodriveShared::rotate_token`: an authenticated connection
-//! sending `{"op":"rotate_token"}` (`listener.rs`), or this process
-//! receiving `SIGHUP` (`rotation::block_sighup_on_current_thread` +
-//! `rotation::spawn_sighup_rotation_thread`). Either way: the token file is
-//! rewritten in place and the in-memory value `check_token` reads is
-//! swapped atomically under a mutex, so the OLD token stops authenticating
-//! brand-new connections immediately, while any connection already past
-//! `authenticate()` — including the one that may have just requested the
-//! rotation — keeps running untouched (see `rotate_token`'s doc for why
-//! that falls out of `authenticate()`'s existing structure rather than
-//! needing new bookkeeping).
+//! CD-2 additions (full detail in `rotation.rs`/`shadow.rs` — this file only
+//! wires them into the state machine below): (6) socket-auth token rotation
+//! WITHOUT restart (`{"op":"rotate_token"}` or `SIGHUP` → `CodriveShared::
+//! rotate_token`; old token invalid for new connections immediately,
+//! already-authenticated ones unaffected). (7) `{"op":"shadow","enable":…}`
+//! moves the agent's focused window to/from a headless second `Output`
+//! ("duduclaw-shadow-0") with a PiP preview on the main output. (8)
+//! WP-CD2-freeze-scope: a command may bypass an active freeze iff `shadow::
+//! is_freeze_bypass_eligible` confirms it's confined to the shadow output
+//! (never the `Shadow` toggle itself) — `listener.rs` mirrors `shadow_active`
+//! for an optimistic pre-check.
 //!
-//! CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): (7)
-//! `{"op":"shadow","enable":true|false}` moves the agent's currently
-//! focused window to/from a second, headless `Output` ("duduclaw-shadow-0")
-//! that never touches the real display backend — invisible on the main
-//! desktop, not stealing the human's cursor/focus. A small PiP preview of
-//! the shadow output renders into a fixed corner of the main output so the
-//! human can always see what the agent is doing there. Full detail —
-//! including the honest scope limits (no per-window off-screening; fixed
-//! geometry) — lives in `codrive/shadow.rs`'s own module doc, since this
-//! addition needed only two new call-outs into this file's existing state
-//! machine (see `emergency_stop`/`human_resume` below).
-//!
-//! WP-CD2-freeze-scope (DESIGN §3.1 point 3, "凍結的粒度是該共駕 session 的
-//! agent seat…不連坐"): (8) the frozen gate below no longer applies
-//! uniformly — a command may bypass an active freeze iff `shadow::
-//! is_freeze_bypass_eligible` confirms both a shadow session is active AND
-//! this command's own target is confined to the shadow output (never the
-//! `Shadow` toggle op itself — see that function's doc for the decision
-//! table; `listener.rs` mirrors just enough (`CodriveShared::shadow_active`)
-//! for an optimistic pre-check).
+//! CD-3 (DESIGN §5's "接手/交還＋watch mode" row; full detail in
+//! `codrive/takeover.rs`/`codrive/watch.rs`): (9) `take_over` — agent-
+//! initiated hand-off; freezes like human input but ALSO kills the shadow-
+//! bypass exception (`takeover_active`) — zero exceptions for a credential
+//! window. (10) `watch` — idle-based auto-pause; `on_human_input` auto-lifts
+//! it with no explicit resume, since the input itself IS "still watching".
 
 mod audit;
 mod cursor;
@@ -94,6 +71,10 @@ mod listener;
 mod protocol;
 mod rotation;
 mod shadow;
+mod takeover;
+#[cfg(test)]
+mod tests_takeover;
+mod watch;
 
 pub use cursor::build_cursor_elements;
 pub use debug_sim::maybe_init_stdin_simulator;
@@ -150,6 +131,8 @@ pub struct CodriveShared {
     /// access there). Never authoritative — see `shadow::
     /// is_freeze_bypass_eligible`. Written in lockstep by `shadow.rs`.
     pub shadow_active: AtomicBool,
+    /// CD-3 mirror of `codrive_takeover_active` — see `takeover.rs`.
+    pub takeover_active: AtomicBool,
     /// The currently-connected agent's stream, kept so `emergency_stop`
     /// can force-close it and so state-transition events (`frozen`/
     /// `resumed`) can be pushed to it — both from the main thread.
@@ -183,6 +166,7 @@ impl CodriveShared {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
+            takeover_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             audit: None,
             auth_token: Mutex::new(None),
@@ -200,6 +184,7 @@ impl CodriveShared {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
+            takeover_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             audit,
             auth_token: Mutex::new(None),
@@ -289,6 +274,7 @@ impl CodriveShared {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
+            takeover_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             audit: None,
             auth_token: Mutex::new(auth_token),
@@ -307,6 +293,7 @@ impl CodriveShared {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
+            takeover_active: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             audit: None,
             auth_token: Mutex::new(auth_token),
@@ -437,6 +424,7 @@ pub fn init(
         frozen: AtomicBool::new(false),
         terminated: AtomicBool::new(false),
         shadow_active: AtomicBool::new(false),
+        takeover_active: AtomicBool::new(false),
         active_conn: Mutex::new(None),
         audit,
         auth_token: Mutex::new(Some(auth_token)),
@@ -476,6 +464,10 @@ impl DuduclawComp {
     /// cheap no-op (the flag is already set; there's no "extend freeze"
     /// timer at CD-0/CD-1 — that's watch-mode territory, CD-2).
     pub fn on_human_input(&mut self, kind: &'static str) {
+        self.codrive_last_human_activity = std::time::Instant::now();
+        if self.codrive_try_watch_resume() {
+            return; // CD-3: this event itself IS the "still watching" signal.
+        }
         let was_frozen = self.codrive.frozen.swap(true, Ordering::SeqCst);
         if !was_frozen {
             self.codrive_freeze_set_at = Some(std::time::Instant::now());
@@ -513,6 +505,10 @@ impl DuduclawComp {
         // main output regardless of whether the real desktop ever actually
         // froze the seat.
         self.codrive_handback_shadow_if_active("human_super_enter");
+        // CD-3: same "separate state, always check" — ends an active
+        // takeover and/or a stale watch-idle-pause flag either way.
+        self.codrive_end_takeover_if_active("human_super_enter");
+        self.codrive_end_watch_pause("human_super_enter", false);
     }
 
     /// Super+Esc (DESIGN §3.3.3 / §6.3): global emergency stop, not
@@ -531,6 +527,10 @@ impl DuduclawComp {
         // the foreground Watch/Takeover case this function already handled
         // before this addition.
         self.codrive_handback_shadow_if_active(reason);
+        // CD-3: gives takeover/watch-pause a clean, audited terminal
+        // transition too (Super+Esc already reaches them unconditionally).
+        self.codrive_end_takeover_if_active(reason);
+        self.codrive_end_watch_pause(reason, false);
 
         if let Ok(mut guard) = self.codrive.active_conn.lock() {
             if let Some(stream) = guard.take() {
@@ -554,7 +554,10 @@ impl DuduclawComp {
         // WP-CD2-freeze-scope (module doc item 8): drops everything while
         // frozen UNLESS THIS command's actual target is confirmed confined
         // to the shadow output — see `shadow::is_freeze_bypass_eligible`.
-        let shadow_bypass = frozen && shadow::is_freeze_bypass_eligible(self, &cmd);
+        // CD-3 (module doc item 9): an active takeover forces a TOTAL
+        // freeze — no shadow-bypass exception (`takeover.rs` module doc).
+        let shadow_bypass =
+            frozen && !self.codrive_takeover_active && shadow::is_freeze_bypass_eligible(self, &cmd);
 
         if frozen && !shadow_bypass {
             let (op, x, y) = cmd.describe();
@@ -717,6 +720,10 @@ impl DuduclawComp {
                 // below like Move/Button/Key/Text/Highlight already do.
                 self.codrive_set_shadow(enable);
             }
+            // CD-3: full logic lives in `takeover.rs`/`watch.rs` — same
+            // "falls through to the generic record below" shape as Shadow.
+            InjectCmd::TakeOver { reason } => self.codrive_take_over(reason),
+            InjectCmd::Watch { enable } => self.codrive_set_watch(enable),
         }
 
         // WP-CD2-freeze-scope: tag shadow-bypassed applies for the audit

@@ -17,7 +17,7 @@ use crate::approval::{ApprovalBroker, ApprovalStatus, SimulationNarrative};
 use super::client::{CodriveButtonState, CodriveClient, CodriveClientError, CodriveCmd};
 use super::config::CodriveConfig;
 use super::driver::ticker;
-use super::script::{CodriveAction, CodriveConsequential, CodriveStep};
+use super::script::{CodriveAction, CodriveConsequential, CodriveStep, ConsequentialClass};
 
 /// The tool name stamped on every audit row this module writes — matches
 /// the MCP tool name (`codrive_run`) so `tool_calls.jsonl` correlates.
@@ -37,6 +37,11 @@ const APPROVAL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub(super) struct StepSuccess {
     pub(super) approval_id: Option<String>,
     pub(super) reapplied: bool,
+    /// CD-3: true iff this step was executed as a `take_over` hand-off
+    /// (either an explicit `CodriveAction::TakeOver` step or a `Credential`-
+    /// classed step auto-converted to one) rather than a normal action send
+    /// — `driver.rs` maps this to the step outcome `"taken_over"`.
+    pub(super) taken_over: bool,
 }
 
 /// Whole-script-aborting per-step failure.
@@ -70,6 +75,16 @@ pub(super) async fn run_one_step(
     started: Instant,
     deadline: Duration,
 ) -> Result<StepSuccess, StepAbort> {
+    // CD-3 (task brief item 1): a take_over step — explicit
+    // `CodriveAction::TakeOver` or an auto-converted `Credential`-classed
+    // step — skips `gate_consequential`/ApprovalBroker entirely (an
+    // approval dialog for "may the human type their own password" makes no
+    // sense) and never reaches `send_step_actions` (the credential text, if
+    // any, is never sent to comp at all — only the hand-off is).
+    if let Some(reason) = take_over_reason(step) {
+        return run_take_over_step(client, home_dir, agent_id, session_id, reason, started, deadline).await;
+    }
+
     let approval_id = match &step.consequential {
         None => None,
         Some(cons) => match gate_consequential(broker, home_dir, agent_id, target_app, index, step, cons, cfg).await {
@@ -81,7 +96,7 @@ pub(super) async fn run_one_step(
     let mut reapplied = false;
     loop {
         match send_step_actions(client, step).await {
-            Ok(()) => return Ok(StepSuccess { approval_id, reapplied }),
+            Ok(()) => return Ok(StepSuccess { approval_id, reapplied, taken_over: false }),
             Err(CodriveClientError::Frozen) => {
                 ticker(home_dir, agent_id, "codrive_step", session_id, "已被人類輸入凍結，等待交還（Super+Enter）").await;
                 match wait_for_resume(client, started, deadline).await {
@@ -124,6 +139,87 @@ pub(super) async fn run_one_step(
                 });
             }
         }
+    }
+}
+
+/// CD-3 (task brief item 1): does this step get routed to a `take_over`
+/// hand-off instead of its normal action-send/approval path? Returns the
+/// reason to send comp if so — an explicit `CodriveAction::TakeOver`'s own
+/// reason takes priority; a `Credential`-classed step (any action kind)
+/// falls back to its `consequential.description`, or the step's narration
+/// if that's somehow empty (schema allows an empty `description` — never
+/// leave comp's audit trail with a blank reason).
+fn take_over_reason(step: &CodriveStep) -> Option<String> {
+    if let CodriveAction::TakeOver { reason } = &step.action {
+        return Some(reason.clone());
+    }
+    step.consequential
+        .as_ref()
+        .filter(|c| c.class == ConsequentialClass::Credential)
+        .map(|c| if c.description.trim().is_empty() { step.narration.clone() } else { c.description.clone() })
+}
+
+/// Executes a take_over step: sends `{"op":"take_over","reason":…}`, waits
+/// for the human's Super+Enter hand-back (reusing `wait_for_resume` — a
+/// takeover ends via the exact same `frozen:false` transition an ordinary
+/// freeze does; see comp's `codrive/takeover.rs`), then returns without
+/// ever sending the step's own action (module doc: the credential text, if
+/// any, never reaches comp).
+async fn run_take_over_step(
+    client: &mut CodriveClient,
+    home_dir: &Path,
+    agent_id: &str,
+    session_id: &str,
+    reason: String,
+    started: Instant,
+    deadline: Duration,
+) -> Result<StepSuccess, StepAbort> {
+    ticker(home_dir, agent_id, "codrive_step", session_id, &format!("已交棒給人類接手：{reason}")).await;
+
+    match client.send(&CodriveCmd::TakeOver { reason }).await {
+        Ok(_) => {}
+        Err(CodriveClientError::Frozen) => {
+            // Defensive (comp's own doc says this ack shape never actually
+            // happens for `take_over` — see `takeover.rs`'s module doc) —
+            // still handled, not `unreachable!`, per this crate's own
+            // "never trust an upstream invariant alone" convention.
+            ticker(home_dir, agent_id, "codrive_step", session_id, "接手指令送出時已被凍結，等待交還").await;
+        }
+        Err(CodriveClientError::Terminated) => {
+            return Err(StepAbort {
+                step_outcome: "aborted",
+                final_state: "aborted_emergency_stop",
+                detail: "aborted_emergency_stop".to_string(),
+                approval_id: None,
+            });
+        }
+        Err(e) => {
+            return Err(StepAbort {
+                step_outcome: "aborted",
+                final_state: "aborted_connection_lost",
+                detail: format!("連線錯誤，已中止：{e}"),
+                approval_id: None,
+            });
+        }
+    }
+
+    match wait_for_resume(client, started, deadline).await {
+        Ok(()) => {
+            ticker(home_dir, agent_id, "codrive_step", session_id, "已交還，繼續執行下一步").await;
+            Ok(StepSuccess { approval_id: None, reapplied: false, taken_over: true })
+        }
+        Err(WaitAbort::Timeout) => Err(StepAbort {
+            step_outcome: "aborted",
+            final_state: "aborted_frozen_timeout",
+            detail: "aborted_frozen_timeout".to_string(),
+            approval_id: None,
+        }),
+        Err(WaitAbort::EmergencyStop) => Err(StepAbort {
+            step_outcome: "aborted",
+            final_state: "aborted_emergency_stop",
+            detail: "aborted_emergency_stop".to_string(),
+            approval_id: None,
+        }),
     }
 }
 
@@ -226,6 +322,15 @@ async fn send_step_actions(client: &mut CodriveClient, step: &CodriveStep) -> Re
         }
         CodriveAction::Wait { ms } => {
             tokio::time::sleep(Duration::from_millis(u64::from(*ms))).await;
+        }
+        CodriveAction::TakeOver { .. } => {
+            // Defensive, not load-bearing: `run_one_step` already
+            // intercepts every `TakeOver` step via `take_over_reason`
+            // before `send_step_actions` is ever called — kept as an arm
+            // (not `unreachable!`) so a future change fails safe instead of
+            // panicking, matching comp's own `handle_agent_inject` arms for
+            // its socket-thread-only ops.
+            tracing::warn!("codrive: a TakeOver action reached send_step_actions unexpectedly — no-op (see step::take_over_reason)");
         }
     }
     Ok(())

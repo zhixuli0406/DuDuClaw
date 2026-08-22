@@ -281,21 +281,25 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "in_reply_to", description: "Optional mail_id from your inbox that this replies to", required: false },
         ],
     },
-    // ── Human-machine co-drive (CD-1) ────────────────────────────────────
+    // ── Human-machine co-drive (CD-1/CD-2/CD-3) ──────────────────────────
     // GUI-level mouse/keyboard injection into a shared desktop, human
     // supervised throughout: every step is narrated to an activity-feed
     // ticker, consequential steps (send/submit/delete/purchase/other) stop
     // and wait for ApprovalBroker approval before the action is sent, a
-    // credential-class step or a refuse-list hit (banking pages, CAPTCHA
-    // bypass, ...) is refused outright before any connection is even
-    // attempted, and human input on the shared desktop always freezes the
-    // agent immediately. Requires `[capabilities] codrive = true` on this
-    // agent (deny-by-default) in addition to Admin scope.
+    // refuse-list hit (banking pages, CAPTCHA bypass, ...) is refused
+    // outright before any connection is even attempted, and human input on
+    // the shared desktop always freezes the agent immediately. CD-3: a
+    // login/password/payment step (explicit `take_over` action, or a
+    // `credential`-class consequential marker) hands the desktop to the
+    // human instead of being refused — the script continues once they hand
+    // it back; `watch_mode:true` asks for idle-based human-presence
+    // supervision for the rest of the run. Requires `[capabilities] codrive
+    // = true` on this agent (deny-by-default) in addition to Admin scope.
     ToolDef {
         name: "codrive_run",
-        description: "Run a scripted human-machine co-drive session: move the mouse, click, type, and press keys in a shared, human-visible desktop, narrating each step to the activity feed. Every consequential step (send/submit/delete/purchase/other) pauses for human approval before the action is dispatched; a credential-class step (login/password/payment) or a refuse-list hit is rejected outright, before any connection is even attempted. Any human input on the shared desktop immediately freezes your seat — the dropped step is automatically retried once a person hands control back. Requires the codrive capability to be explicitly enabled on this agent.",
+        description: "Run a scripted human-machine co-drive session: move the mouse, click, type, and press keys in a shared, human-visible desktop, narrating each step to the activity feed. Every consequential step (send/submit/delete/purchase/other) pauses for human approval before the action is dispatched; a refuse-list hit (banking pages, CAPTCHA bypass, ...) is rejected outright, before any connection is even attempted. A login/password/payment step (action kind 'take_over', or a consequential class of 'credential') hands the shared desktop to a human instead — you never send the credential text yourself; the script resumes once they hand control back. Any human input on the shared desktop immediately freezes your seat — the dropped step is automatically retried once a person hands control back. Set watch_mode:true on the script for idle-based supervision (auto-pauses if no human input is seen for a while, for the rest of the run). Requires the codrive capability to be explicitly enabled on this agent.",
         params: &[
-            ParamDef { name: "script", description: "JSON object: {target_app, task_summary, steps:[{narration, highlight?:{x,y,w,h}, action:{kind:'move'|'click'|'text'|'key_name'|'wait', ...}, consequential?:{class:'send'|'submit'|'delete'|'purchase'|'credential'|'other', description}}]}. Max 50 steps.", required: true },
+            ParamDef { name: "script", description: "JSON object: {target_app, task_summary, watch_mode?:bool, steps:[{narration, highlight?:{x,y,w,h}, action:{kind:'move'|'click'|'text'|'key_name'|'wait'|'take_over', ...}, consequential?:{class:'send'|'submit'|'delete'|'purchase'|'credential'|'other', description}}]}. A 'take_over' action needs {kind:'take_over', reason}. Max 50 steps.", required: true },
             ParamDef { name: "agent", description: "Optional: run (and capability-check) as a different agent id instead of the caller's own identity. Omit to use your own identity.", required: false },
         ],
     },

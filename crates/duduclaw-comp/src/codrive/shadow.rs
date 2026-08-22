@@ -445,6 +445,15 @@ pub(super) fn freeze_bypass_decision(
         // wildcard, so a future new `InjectCmd` variant fails this match at
         // compile time instead of silently inheriting a bypass by default.
         InjectCmd::Resume | InjectCmd::Status | InjectCmd::RotateToken => false,
+        // CD-3: never bypass-eligible, same reasoning as `Shadow` above —
+        // `TakeOver` is itself a control-plane transition (not something
+        // "confined to the shadow output" even applies to), and `Watch`'s
+        // toggle shouldn't be smugglable through a freeze either. See
+        // `takeover.rs`'s module doc for why an active takeover ALSO forces
+        // every OTHER op's bypass to `false` — that's `mod.rs`'s job
+        // (`!self.codrive_takeover_active` gates the call into this
+        // function at all), not this match's.
+        InjectCmd::TakeOver { .. } | InjectCmd::Watch { .. } => false,
     }
 }
 
@@ -625,5 +634,16 @@ mod tests {
         for cmd in [InjectCmd::Resume, InjectCmd::Status, InjectCmd::RotateToken] {
             assert!(!freeze_bypass_decision(true, &cmd, Some(inside_shadow()), true));
         }
+    }
+
+    #[test]
+    fn freeze_bypass_decision_take_over_and_watch_never_bypass() {
+        // CD-3: same fail-closed reasoning as the Shadow toggle — these are
+        // control-plane transitions, not something a "confined to the
+        // shadow output" check even applies to.
+        let take_over = InjectCmd::TakeOver { reason: "login".to_string() };
+        let watch = InjectCmd::Watch { enable: true };
+        assert!(!freeze_bypass_decision(true, &take_over, Some(inside_shadow()), true));
+        assert!(!freeze_bypass_decision(true, &watch, Some(inside_shadow()), true));
     }
 }

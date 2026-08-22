@@ -109,6 +109,26 @@ pub struct DuduclawComp {
     /// atomic — only ever touched on this calloop main thread, from the
     /// human ("winit") seat's own keyboard arm.
     pub codrive_logo_held_prev: bool,
+    /// CD-3 `take_over` (`codrive/takeover.rs`): true while an agent-
+    /// initiated takeover is active — a stronger freeze than an ordinary
+    /// human-touched one (kills the shadow-bypass exception too). Main-
+    /// thread-only `bool` mirrored onto `codrive.takeover_active`
+    /// (`CodriveShared`) for `listener.rs`'s optimistic pre-check, same
+    /// two-field pattern as `codrive_shadow_active`/`codrive.shadow_active`.
+    pub codrive_takeover_active: bool,
+    /// CD-3 `watch` (`codrive/watch.rs`): true while idle-based auto-pause
+    /// supervision is active for the rest of this session's trajectory.
+    pub codrive_watch_active: bool,
+    /// CD-3: true while the seat is frozen SPECIFICALLY because of a
+    /// watch-mode idle timeout (not human touch, not a takeover) — the only
+    /// frozen cause `on_human_input` auto-clears without an explicit
+    /// Super+Enter, since the input itself re-establishes "human present".
+    pub codrive_watch_paused: bool,
+    /// CD-3: instant of the most recent human-seat input event (ANY kind,
+    /// updated on every `on_human_input` call, unlike `codrive_freeze_
+    /// set_at` which only updates on the not-frozen→frozen transition).
+    /// `codrive_check_watch_idle` compares `Instant::now()` against this.
+    pub codrive_last_human_activity: std::time::Instant,
 }
 
 impl DuduclawComp {
@@ -178,6 +198,10 @@ impl DuduclawComp {
             shadow_output,
             codrive_shadow_active: false,
             codrive_logo_held_prev: false,
+            codrive_takeover_active: false,
+            codrive_watch_active: false,
+            codrive_watch_paused: false,
+            codrive_last_human_activity: start_time,
         }
     }
 

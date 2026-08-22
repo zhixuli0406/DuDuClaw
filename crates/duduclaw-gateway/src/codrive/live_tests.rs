@@ -136,6 +136,7 @@ async fn live_bridge_approve_then_deny_round() {
             },
             step("等待畫面更新", CodriveAction::Wait { ms: 500 }),
         ],
+        watch_mode: false,
     };
     let report = run_script(&home, "live-test-agent", script).await;
     let decided_id = decider.await.expect("decider task panicked");
@@ -164,6 +165,7 @@ async fn live_bridge_approve_then_deny_round() {
                 }),
             },
         ],
+        watch_mode: false,
     };
     let report = run_script(&home, "live-test-agent", script).await;
     let decided_id = decider.await.expect("decider task panicked");
@@ -222,6 +224,7 @@ async fn live_bridge_real_human_freeze_and_resume() {
                 CodriveAction::Text { s: "echo cd2vmfreeze123 > /tmp/cd2-freeze-proof.txt\n".to_string() },
             ),
         ],
+        watch_mode: false,
     };
 
     let report = run_script(&home, "live-test-agent", script).await;
