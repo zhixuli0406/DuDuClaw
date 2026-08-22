@@ -98,6 +98,29 @@ impl DuduclawComp {
                             // comment (`state.rs`) for the rotation
                             // strategy.
                             data.cycle_focus();
+                        } else if key_state == KeyState::Pressed
+                            && modifiers.logo
+                            && is_close_window_keysym(handle.modified_sym())
+                        {
+                            // WM-1 (2026-08-23): Super+Q — politely ask the
+                            // focused window to close. Live report: a Chromium
+                            // window on the appliance could not be closed at
+                            // all (comp advertised no decoration protocol, so
+                            // the client drew no close button, and the dock was
+                            // covered). The decoration protocol is the primary
+                            // fix; this is the compositor-level guarantee that
+                            // works even for a client that draws nothing.
+                            //
+                            // Same human-only keyboard filter closure as
+                            // Super+Esc / Super+Enter / Super+Tab above, so an
+                            // agent-injected key event structurally cannot
+                            // forge it. `is_system_gesture_tail` below already
+                            // exempts any key held with Logo from re-freezing
+                            // the seat, so Q's chord tail needs no changes
+                            // there either. The session shell is refused — see
+                            // `DuduclawComp::close_focused_window`
+                            // (`window_policy.rs`).
+                            data.close_focused_window();
                         }
                         FilterResult::Forward
                     },
@@ -346,9 +369,22 @@ pub(crate) fn is_system_gesture_tail(logo_held_now: bool, logo_held_prev: bool) 
     logo_held_now || logo_held_prev
 }
 
+/// WM-1: does this keysym mean "Q" for the Super+Q close-window binding?
+///
+/// Both cases are accepted. `modified_sym()` is the keysym *after* modifiers
+/// are applied, so a user with Caps Lock on — or one who happens to hold Shift
+/// while reaching for Super — reports `Q` rather than `q`. Refusing the
+/// uppercase form would make the only compositor-level close gesture
+/// intermittently dead, which is the failure mode this binding exists to fix.
+/// Pure and unit-testable, like the two decision functions above.
+pub(crate) fn is_close_window_keysym(sym: Keysym) -> bool {
+    sym == Keysym::new(keysyms::KEY_q) || sym == Keysym::new(keysyms::KEY_Q)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{clamp_to, is_system_gesture_tail};
+    use super::{clamp_to, is_close_window_keysym, is_system_gesture_tail};
+    use smithay::input::keyboard::{keysyms, Keysym};
     use smithay::utils::{Logical, Point, Rectangle, Size};
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
@@ -409,5 +445,27 @@ mod tests {
     #[test]
     fn ordinary_key_with_no_recent_logo_activity_is_not_a_gesture_tail() {
         assert!(!is_system_gesture_tail(false, false));
+    }
+
+    #[test]
+    fn super_q_accepts_both_cases_of_q() {
+        assert!(is_close_window_keysym(Keysym::new(keysyms::KEY_q)));
+        assert!(is_close_window_keysym(Keysym::new(keysyms::KEY_Q)));
+    }
+
+    #[test]
+    fn super_q_does_not_fire_on_neighbouring_or_similar_keys() {
+        for other in [
+            keysyms::KEY_a,
+            keysyms::KEY_w,
+            keysyms::KEY_Tab,
+            keysyms::KEY_Escape,
+            keysyms::KEY_Return,
+        ] {
+            assert!(
+                !is_close_window_keysym(Keysym::new(other)),
+                "keysym {other:#x} must not be treated as the close binding"
+            );
+        }
     }
 }

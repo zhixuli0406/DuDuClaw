@@ -50,7 +50,10 @@ impl CompositorHandler for DuduclawComp {
             }
         };
 
-        xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
+        // WM-1: takes the whole state now (was `&mut popups, &space`) — the
+        // initial-configure branch applies the window layout policy, which
+        // moves the element and reads the session-shell identity.
+        xdg_shell::handle_commit(self, surface);
         resize_grab::handle_commit(&mut self.space, surface);
     }
 }

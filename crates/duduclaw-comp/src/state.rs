@@ -21,7 +21,7 @@ use smithay::{
         cursor_shape::CursorShapeManagerState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
-        shell::xdg::XdgShellState,
+        shell::xdg::{decoration::XdgDecorationState, XdgShellState},
         shm::ShmState,
         socket::ListeningSocketSource,
     },
@@ -58,6 +58,12 @@ pub struct DuduclawComp {
     /// (`wayland/cursor_shape.rs`), so nothing in this crate reads the field.
     /// See `handlers/mod.rs` for why this protocol is worth advertising.
     pub cursor_shape_manager_state: CursorShapeManagerState,
+    /// WM-1: the `zxdg_decoration_manager_v1` global. Held only to keep the
+    /// global alive for the process lifetime — every request it receives is
+    /// dispatched by smithay straight into the `XdgDecorationHandler` impl in
+    /// `handlers/xdg_shell.rs`, so nothing in this crate reads the field.
+    /// Same shape (and same reason) as `cursor_shape_manager_state` above.
+    pub xdg_decoration_state: XdgDecorationState,
     pub popups: PopupManager,
 
     /// The real human seat — every hardware/winit-forwarded input event
@@ -148,6 +154,26 @@ pub struct DuduclawComp {
     /// doc comment for why. Just the audit log today (no freeze/token
     /// state — this channel has neither).
     pub shell_control: std::sync::Arc<shell_control::ShellControlShared>,
+    /// WM-1 (2026-08-23): how much of the output `duduclaw-shell`'s own menu
+    /// bar and dock occupy, and therefore how much an ordinary application
+    /// window must stay out of. Read once at startup; see
+    /// `crate::window_policy`'s module doc for where the numbers come from and
+    /// why this policy exists at all.
+    pub reserved_bands: crate::window_policy::ReservedBands,
+    /// WM-1: the `xdg_toplevel.app_id` that identifies the session shell
+    /// (`window_policy::SHELL_APP_ID`, overridable via env for a stand-in
+    /// shell).
+    pub shell_app_id: String,
+    /// WM-1: the toplevel comp currently treats as the session shell — the one
+    /// window exempt from the reserved bands and from Super+Q. `None` until a
+    /// toplevel claims the role (and again after that window is destroyed).
+    /// See `window_policy::DuduclawComp::classify_shell_window` for the two
+    /// rules that assign it.
+    pub shell_surface: Option<WlSurface>,
+    /// WM-1: true once [`Self::shell_surface`] was chosen by a matching
+    /// `app_id` rather than by the first-mapped fallback. A confirmed role is
+    /// never handed to a later window.
+    pub shell_confirmed: bool,
     /// A4-1 (udev/DRM backend): "something that can change a pixel happened
     /// since the last composite". Set by [`DuduclawComp::queue_redraw`],
     /// consumed (and cleared) by `udev_backend::dispatch_render`.
@@ -176,6 +202,12 @@ impl DuduclawComp {
         // the socket — hence its construction here with the other protocol
         // globals rather than lazily.
         let cursor_shape_manager_state = CursorShapeManagerState::new::<Self>(&dh);
+        // WM-1: advertise `zxdg_decoration_manager_v1`. Same "must exist
+        // before any client binds" constraint as the cursor-shape global
+        // above, hence its construction here rather than lazily. See
+        // `handlers/xdg_shell.rs`'s `XdgDecorationHandler` impl for why comp
+        // always answers `ClientSide`.
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
         let popups = PopupManager::default();
 
         // A4-5: the ORDER these two `wl_seat` globals are created in is the
@@ -266,6 +298,21 @@ impl DuduclawComp {
             cursor::source::CURSOR_THEME_ENV
         );
 
+        // WM-1: read the layout tunables once, here, alongside every other
+        // startup-time env read — and log them, because "the app window is
+        // the wrong height" is otherwise an unanswerable support question.
+        let reserved_bands = crate::window_policy::ReservedBands::from_env();
+        let shell_app_id = crate::window_policy::shell_app_id_from_env();
+        tracing::info!(
+            reserved_top = reserved_bands.top,
+            reserved_bottom = reserved_bands.bottom,
+            shell_app_id = %shell_app_id,
+            "comp: window layout policy (override with {}/{}/{})",
+            crate::window_policy::RESERVED_TOP_ENV,
+            crate::window_policy::RESERVED_BOTTOM_ENV,
+            crate::window_policy::SHELL_APP_ID_ENV,
+        );
+
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
 
@@ -284,6 +331,7 @@ impl DuduclawComp {
             seat_state,
             data_device_state,
             cursor_shape_manager_state,
+            xdg_decoration_state,
             popups,
             seat,
             cursor,
@@ -300,6 +348,10 @@ impl DuduclawComp {
             codrive_watch_paused: false,
             codrive_last_human_activity: start_time,
             shell_control,
+            reserved_bands,
+            shell_app_id,
+            shell_surface: None,
+            shell_confirmed: false,
             pending_redraw: true,
         }
     }

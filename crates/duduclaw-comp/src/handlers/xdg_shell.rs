@@ -3,17 +3,19 @@
 // the full attribution note.
 
 use smithay::{
-    delegate_xdg_shell,
+    delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
-        find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind, PopupManager,
-        PopupPointerGrab, PopupUngrabStrategy, Space, Window,
+        find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind,
+        PopupPointerGrab, PopupUngrabStrategy, Window,
     },
     input::{
         pointer::{Focus, GrabStartData as PointerGrabStartData},
         Seat,
     },
     reexports::{
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_protocols::xdg::{
+            decoration::zv1::server::zxdg_toplevel_decoration_v1, shell::server::xdg_toplevel,
+        },
         wayland_server::{
             protocol::{wl_seat, wl_surface::WlSurface},
             Resource,
@@ -23,6 +25,7 @@ use smithay::{
     wayland::{
         compositor::with_states,
         shell::xdg::{
+            decoration::XdgDecorationHandler,
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
             XdgToplevelSurfaceData,
         },
@@ -69,6 +72,13 @@ impl XdgShellHandler for DuduclawComp {
                 Some("to_shadow (mapped directly — shadow was already active at toplevel-creation time)".into()),
             );
         } else {
+            // WM-1: still `(0, 0)` here on purpose. The real position comes
+            // from `DuduclawComp::apply_window_policy` on this toplevel's
+            // FIRST commit (the initial-configure branch of `handle_commit`
+            // below), because that is the earliest moment the window has an
+            // identity to classify against and the last moment before the
+            // client attaches its first buffer — so nothing is ever drawn at
+            // the provisional origin and there is no visible jump.
             self.space.map_element(window, (0, 0), false);
         }
     }
@@ -303,12 +313,172 @@ impl XdgShellHandler for DuduclawComp {
             self.space.unmap_elem(&window);
         }
 
+        // WM-1: release the session-shell role if this was the shell, so a
+        // restarted shell can claim it again (and so nothing keeps comparing
+        // against a dead surface).
+        self.forget_shell_window(&wl_surface);
+
         self.reassign_focus_on_window_removed(&wl_surface);
+    }
+
+    /// WM-1: the moment the reserved-band policy has been waiting for.
+    ///
+    /// gpui sets `xdg_toplevel.app_id` **after** its first `wl_surface.commit`
+    /// (see `window_policy::DuduclawComp::classify_shell_window`'s doc for the
+    /// exact upstream line numbers), so the initial configure necessarily runs
+    /// on an identity-less window. This handler is where the identity finally
+    /// arrives; re-running the policy here either confirms the first-mapped
+    /// guess (the normal boot, no configure sent — the size is unchanged) or
+    /// corrects it (a window that is really the shell gets the whole output,
+    /// and the provisional holder is demoted to the work area).
+    ///
+    /// Upstream's default is a no-op, so nothing was listening before.
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface().clone();
+        let window = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().unwrap().wl_surface() == &wl_surface)
+            .cloned();
+        if let Some(window) = window {
+            self.apply_window_policy(&window);
+        }
+    }
+
+    /// WM-1: "maximize" means **the work area**, not the whole output — the
+    /// same rule Windows' taskbar and the macOS menu bar enforce, and the
+    /// reason the reserved bands are called a work area at all. Without this
+    /// (upstream's default sends a configure carrying no state change) a
+    /// Chromium/GTK maximize button was simply inert.
+    ///
+    /// This is the one place `xdg_toplevel.State::Maximized` is set. The
+    /// initial configure deliberately still does not set it — see
+    /// `handle_commit` below for why (it changes CSD for every GTK/Qt app we
+    /// host, which is only ever appropriate when the client itself asked).
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        let Some(output_geo) = self.layout_output_geometry() else {
+            surface.send_configure();
+            return;
+        };
+        let area = crate::window_policy::work_area(output_geo, self.reserved_bands);
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Maximized);
+            state.size = Some(area.size);
+        });
+        let wl_surface = surface.wl_surface().clone();
+        let window = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().unwrap().wl_surface() == &wl_surface)
+            .cloned();
+        if let Some(window) = window {
+            if self.space.element_location(&window) != Some(area.loc) {
+                self.space.map_element(window, area.loc, false);
+            }
+        }
+        tracing::info!(
+            surface_id = ?wl_surface.id(),
+            area = ?(area.loc.x, area.loc.y, area.size.w, area.size.h),
+            "xdg_shell: maximize_request — configured to the work area (output minus the shell's reserved bands)"
+        );
+        self.queue_redraw();
+        surface.send_configure();
+    }
+
+    /// WM-1 counterpart to [`Self::maximize_request`]. Comp keeps no restore
+    /// geometry (that is window-management state A5 owns), so this clears the
+    /// `Maximized` state — which is what the client needs to redraw its
+    /// titlebar correctly — and leaves the size where it is rather than
+    /// inventing a "previous" size the compositor never recorded.
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        surface.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Maximized);
+        });
+        tracing::info!(
+            surface_id = ?surface.wl_surface().id(),
+            "xdg_shell: unmaximize_request — clearing the maximized state (comp keeps no restore geometry; A5 owns that)"
+        );
+        self.queue_redraw();
+        surface.send_configure();
+    }
+}
+
+/// WM-1: `zxdg_decoration_manager_v1`, answered **always** `ClientSide`.
+///
+/// The live report was that a Chromium window had no way to be closed. Comp
+/// draws no server-side decorations and did not advertise this protocol at
+/// all, so a client had no negotiated answer to "who draws the title bar" and
+/// was free to draw none. Advertising the global and replying `ClientSide`
+/// makes the contract explicit: the client owns its own title bar, close
+/// button, and drag/resize affordances.
+///
+/// Why not `ServerSide`: comp has no decoration renderer, and inventing one is
+/// explicitly A5's work package, not this transitional one. Claiming
+/// `ServerSide` while drawing nothing would give every window *no* decoration
+/// at all — the exact bug being fixed.
+///
+/// Effect on `duduclaw-shell`: none. gpui's Wayland backend initialises
+/// `decorations: WindowDecorations::Client` regardless
+/// (`gpui_linux/src/linux/wayland/window.rs:610`) and only leaves that state
+/// on an explicit `ServerSide` configure, and `duduclaw-shell` never reads
+/// `Window::window_decorations()` anyway — verified by grep over the shell
+/// crate, not assumed. It creates the decoration object as soon as the global
+/// exists (`window.rs:278`), which is *before* its first commit, so the
+/// `ClientSide` mode rides along on the same initial configure that carries
+/// the size.
+impl XdgDecorationHandler for DuduclawComp {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        self.set_client_side_decoration(&toplevel, "new_decoration");
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: zxdg_toplevel_decoration_v1::Mode) {
+        // A client asking for `ServerSide` gets `ClientSide` anyway — which
+        // the protocol explicitly allows ("the compositor can decide not to
+        // use the client's mode"), and which is the honest answer while comp
+        // draws no decorations. Logged rather than silently overridden so a
+        // "my title bar looks wrong" report is answerable from the log.
+        if mode == zxdg_toplevel_decoration_v1::Mode::ServerSide {
+            tracing::debug!(
+                surface_id = ?toplevel.wl_surface().id(),
+                "xdg_decoration: client asked for server-side decorations — answering client-side (comp draws none)"
+            );
+        }
+        self.set_client_side_decoration(&toplevel, "request_mode");
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        self.set_client_side_decoration(&toplevel, "unset_mode");
+    }
+}
+
+impl DuduclawComp {
+    fn set_client_side_decoration(&mut self, toplevel: &ToplevelSurface, reason: &'static str) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+        });
+        // Sending a configure here BEFORE the initial one would be a
+        // correctness bug, not just noise: `ToplevelSurface::send_configure`
+        // sets `initial_configure_sent` (smithay 0.7.0
+        // `wayland/shell/xdg/mod.rs`), so `handle_commit`'s initial-configure
+        // branch — the only thing that gives a window its size and position —
+        // would never run and the client would fall back to picking its own
+        // geometry. Both gpui and Chromium create their decoration object
+        // before their first commit, so this branch is the normal path.
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
+        tracing::debug!(
+            surface_id = ?toplevel.wl_surface().id(),
+            reason,
+            "xdg_decoration: client-side decorations"
+        );
     }
 }
 
 // Xdg Shell
 delegate_xdg_shell!(DuduclawComp);
+// WM-1: xdg-decoration (see `XdgDecorationHandler` above).
+delegate_xdg_decoration!(DuduclawComp);
 
 fn check_grab(
     seat: &Seat<DuduclawComp>,
@@ -334,13 +504,25 @@ fn check_grab(
 }
 
 /// Should be called on `WlSurface::commit`
-pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: &WlSurface) {
+///
+/// WM-1 changed this from `(&mut PopupManager, &Space<Window>, &WlSurface)` to
+/// the whole state: the initial-configure branch now consults the window
+/// layout policy (`crate::window_policy`), which needs to read the shell
+/// identity and *move* the element, not just read the space.
+pub fn handle_commit(state: &mut DuduclawComp, surface: &WlSurface) {
     // Handle toplevel commits.
-    if let Some(window) = space
+    //
+    // Bound to a `let` first rather than used directly as the `if let`
+    // scrutinee: `if let`'s temporaries live for the whole block, so the
+    // immutable borrow of `state.space` taken by `elements()` would still be
+    // alive at the `state.apply_window_policy(&window)` call below. Same
+    // pattern (and the same reason) as `toplevel_destroyed` above.
+    let committed_window = state
+        .space
         .elements()
         .find(|w| w.toplevel().unwrap().wl_surface() == surface)
-        .cloned()
-    {
+        .cloned();
+    if let Some(window) = committed_window {
         let initial_configure_sent = with_states(surface, |states| {
             states
                 .data_map
@@ -365,36 +547,31 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
             // that is exactly the behaviour comp has to keep now that it is
             // the one running the session.
             //
-            // Scope, deliberately: EVERY toplevel gets the full output, which
-            // matches what comp actually is today — windows are mapped at
-            // (0,0) with no decorations and cycled with Super+Tab, one visible
-            // at a time. When A5's multi-window desktop lands it owns the
-            // layout policy and this becomes its call to make, not a rule
-            // baked in here. Not marking the surface Maximized/Fullscreen on
-            // purpose: the size alone is what fixes the clipping, and those
-            // states also change CSD (shadows, rounded corners, client-side
-            // resize edges) for every GTK/Qt app we host — a visual change
-            // that has not been designed or reviewed.
+            // A4's scope note said "EVERY toplevel gets the full output …
+            // when A5's multi-window desktop lands it owns the layout policy".
+            // WM-1 (2026-08-23) is the transitional half of that: the shell
+            // still gets the full output, every other toplevel gets the output
+            // MINUS the bands the shell's own menu bar and dock occupy — the
+            // "work area" rule every mainstream desktop applies to its own
+            // chrome. Without it the first third-party window covered the
+            // shell entirely and the session had no reachable navigation left.
+            // `crate::window_policy` owns the rule, the numbers, and the
+            // shell-identification logic; A5 still owns real window management.
             //
-            // The primary output is the one at the origin; the CD-2 shadow
-            // output lives far away at `codrive::SHADOW_ORIGIN` and must never
-            // be the size source (a window sized to it would be off-screen
-            // geometry for a window that is about to map on the real screen).
-            // No output yet → leave the 0x0 behaviour untouched rather than
-            // guess a size.
-            let output_size = space
-                .outputs()
-                .filter_map(|o| space.output_geometry(o))
-                .find(|geo| geo.loc.x == 0 && geo.loc.y == 0)
-                .map(|geo| geo.size);
-            if let Some(size) = output_size {
-                window.toplevel().unwrap().with_pending_state(|state| {
-                    state.size = Some(size);
-                });
-            }
+            // Still NOT marking the surface Maximized/Fullscreen here, for A4's
+            // original reason: those states change CSD (shadows, rounded
+            // corners, client-side resize edges) for every GTK/Qt app we host.
+            // `maximize_request` above sets `Maximized` — but only when the
+            // client itself asked for it.
+            //
+            // No real output yet → `apply_window_policy` leaves the 0x0
+            // ("you pick") behaviour untouched rather than guessing a size,
+            // exactly as the pre-WM-1 code did.
+            state.apply_window_policy(&window);
             tracing::info!(
                 surface_id = ?surface.id(),
-                configured_size = ?output_size,
+                configured_size = ?window.toplevel().unwrap().with_pending_state(|s| s.size),
+                location = ?state.space.element_location(&window),
                 "xdg_shell: sending initial configure to toplevel"
             );
             window.toplevel().unwrap().send_configure();
@@ -411,15 +588,15 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
             tracing::debug!(
                 surface_id = ?surface.id(),
                 geometry = ?window.geometry(),
-                location = ?space.element_location(&window),
+                location = ?state.space.element_location(&window),
                 "xdg_shell: toplevel commit (already configured)"
             );
         }
     }
 
     // Handle popup commits.
-    popups.commit(surface);
-    if let Some(popup) = popups.find_popup(surface) {
+    state.popups.commit(surface);
+    if let Some(popup) = state.popups.find_popup(surface) {
         match popup {
             PopupKind::Xdg(ref xdg) => {
                 if !xdg.is_initial_configure_sent() {

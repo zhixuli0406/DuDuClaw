@@ -4015,3 +4015,343 @@ Triage table:
 | Cursor invisible only over one app | That app asked for `Hidden` | `cursor: human pointer image changed cursor=hidden` |
 | Colours look wrong (red/blue swapped) on a **coloured** theme | The `Argb8888`/`Abgr8888` split in `theme.rs`/`fallback.rs` | Only the fallback's byte order is screenshot-proven; a coloured theme is the outstanding test |
 | Brand cursor requested but nothing changes | No brand artwork exists yet | Expected — `DUDUCLAW_COMP_CURSOR_SOURCE=brand` logs `brand cursor theme is not installed` and uses the system theme |
+
+---
+
+## WM-1: third-party app windows covered the whole shell (2026-08-23)
+
+### The report
+
+From the appliance VM, verbatim:
+
+> 開啟 Chromium 後上下方導航列直接不見，而且無法關閉應用程式
+
+Two claims, and they have **different** causes. Both were checked first-hand
+against a real Chromium (Debian bookworm `chromium` 151.0.7922.137) before
+anything was written — see "First-hand Chromium finding" below, which does
+**not** match the hypothesis this work package started from.
+
+### Root cause 1 — every toplevel got the whole output at `(0, 0)`
+
+A4's initial-configure fix (`handlers/xdg_shell.rs`) sized **every** toplevel
+to the full output, and `new_toplevel` mapped every toplevel at `(0, 0)`. Its
+own scope note said as much: *"When A5's multi-window desktop lands it owns
+the layout policy"*. `duduclaw-shell` is itself one full-screen toplevel that
+paints the menu bar and the dock inside its own window, so the first
+third-party window to map covered the shell completely.
+
+**Reproduced, pixel-exact, against the pristine `HEAD` binary** (built in the
+container from `git archive HEAD`, so it is the real pre-WM-1 code, not a
+reconstruction). `foot -a duduclaw-shell` with a green background as the shell
+stand-in, then Chromium; screenshot of comp's composited 1280×800 output:
+
+```
+BASELINE (HEAD)                              WM-1
+y=  0 (221,227,233) chromium frame           y=  0 (161,161,120) shell CSD titlebar
+y= 29 (221,227,233) chromium frame           y= 29 (  0,127,  0) SHELL, visible
+y= 30 (221,227,233) chromium frame           y= 30 (221,227,233) chromium frame starts
+y=400 (255,255,255) chromium page            y=400 (255,255,255) chromium page
+y=709 (255,255,255) chromium page            y=709 (255,255,255) chromium page
+y=710 (255,255,255) chromium page            y=710 (  0,103,  0) SHELL, visible
+y=799 (255,255,255) chromium page            y=799 (  0,170,  0) SHELL, visible
+```
+
+Baseline: **zero** green pixels anywhere on the screen — the shell is 100%
+covered. WM-1: the top 30 rows and the bottom 90 rows are the shell, and the
+Chromium window occupies exactly `(0, 30) 1280×680`.
+
+### The fix — a reserved-band work area (`src/window_policy.rs`)
+
+The transitional policy every mainstream desktop already uses for its own
+chrome: a newly mapped (or maximized) application window gets the output
+**minus** the bands the session chrome occupies. Windows' taskbar and the
+macOS menu bar both work this way. This is deliberately **not** A5: no
+layer-shell, no server-side decoration drawing, no task switcher UI.
+
+Band heights come from `duduclaw-shell`'s own layout and are asserted in a
+unit test so a shell layout change breaks the build rather than the desktop:
+
+| band | shell source | value |
+|---|---|---|
+| top | `duduclaw-shell/src/home.rs` `menu_bar()` — `.absolute().top(0).left(0).right(0).h(px(30.))` | 30 |
+| bottom | `duduclaw-shell/src/home/home_dock.rs` `dock()` — row `.absolute().bottom(px(24.))`, `TILE_DOCK_PX` 44 (`apps/icon_theme.rs`) + `.py(px(10.))`×2 + `.border_1()`×2 = 66 | 24+66 = 90 |
+
+Overrides (env vars are this crate's only configuration mechanism):
+`DUDUCLAW_COMP_RESERVED_TOP`, `DUDUCLAW_COMP_RESERVED_BOTTOM`,
+`DUDUCLAW_COMP_SHELL_APP_ID`. Both band values are logged at startup.
+
+Degenerate cases fall back to the whole output rather than a sliver: an output
+shorter than `bands + MIN_APP_HEIGHT` (120) gets no reservation at all.
+
+### Identifying the shell — and why the `app_id` route needs a fallback
+
+`duduclaw-shell` now sets `app_id = "duduclaw-shell"`
+(`crates/duduclaw-shell/src/main.rs`, `WindowOptions { app_id: … }`). gpui's
+`WindowOptions` has carried an `app_id` field all along; it reaches
+`xdg_toplevel.set_app_id` through `PlatformWindow::set_app_id`
+(`gpui/src/window.rs:1802` → `gpui_linux/src/linux/wayland/window.rs:1604`),
+verified in the pinned rev `7a7c3e1` that `duduclaw-shell/Cargo.toml` uses.
+
+**But it arrives too late to size the shell.** `WaylandWindow::new` issues its
+"kick things off" `surface.commit()` at
+`gpui_linux/src/linux/wayland/window.rs:787`, and `set_app_id` is only called
+after that platform window is constructed, at `gpui/src/window.rs:1801-1802`.
+The initial configure — the one that decides the shell's size — therefore
+necessarily runs on an identity-less toplevel. So comp uses **two** rules:
+
+1. `app_id == "duduclaw-shell"` — authoritative, and supersedes a rule-2 guess.
+2. Otherwise, if no shell has been identified yet, the first toplevel to reach
+   the policy takes the role **provisionally**.
+
+`XdgShellHandler::app_id_changed` (previously unimplemented; upstream's default
+is a no-op) is where the identity finally arrives and either confirms the guess
+or corrects it. A window declaring the shell `app_id` after the role is already
+*confirmed* does not steal it — a shell's auxiliary toplevel must not become a
+second full-screen window.
+
+Both rules were live-verified separately (evidence below).
+
+### Root cause 2 — no `zxdg_decoration_manager_v1`, and the honest finding
+
+Comp advertised no decoration protocol, so a client had no negotiated answer
+to "who draws the title bar". `XdgDecorationState` is now created in
+`state.rs` and the handler in `handlers/xdg_shell.rs` answers **always**
+`ClientSide` (comp draws no server-side decorations; inventing a decoration
+renderer is A5's work package).
+
+One trap worth recording: `ToplevelSurface::send_configure` sets
+`initial_configure_sent` (smithay 0.7.0 `wayland/shell/xdg/mod.rs`), so the
+smithay doc-example's `new_decoration` → `send_configure()` would consume the
+initial configure and `handle_commit`'s sizing branch would **never run**. The
+handler therefore only sends when the initial configure has already gone out;
+both gpui and Chromium create their decoration object before their first
+commit, so in practice one configure carries the size and the decoration mode.
+
+**First-hand Chromium finding — the starting hypothesis was wrong.** The
+premise for this half of the work package was "Chromium may not draw its own
+title bar when there is no decoration negotiation". Measured, not assumed, by
+running the same Chromium against the pristine `HEAD` binary and the WM-1
+binary and diffing the pixels of the window-control area:
+
+```
+BASELINE (no decoration global): chromium never touched xdg-decoration
+WM-1: wl_registry.bind(zxdg_decoration_manager_v1)
+      zxdg_decoration_manager_v1.get_toplevel_decoration(...)
+   -> zxdg_toplevel_decoration_v1.set_mode(1)      # 1 = client_side; chromium ASKS for CSD
+   <- zxdg_toplevel_decoration_v1.configure(1)     # comp agrees
+
+top-right 220×36 of the chromium window, both builds:
+  non-background pixels = 183   (identical)
+  colour histogram      = identical
+  glyph map             = identical:  ─   □   ✕
+```
+
+So **Chromium 151 draws its own minimize/maximize/close controls with or
+without the protocol**. The decoration protocol is therefore *not* proven to
+be the cause of "無法關閉應用程式"; the proven cause is root cause 1 (the window
+covering the dock and the menu bar, leaving no way back to the desktop).
+Advertising the global is still correct — it closes a real protocol gap for
+toolkits that do honour it, and it makes the CSD contract explicit instead of
+implicit — but it is recorded here as a gap closed, **not** as the fix for the
+reported symptom.
+
+### Super+Q — a compositor-level close, independent of the client
+
+Added to the same human-only keyboard filter closure in `input.rs` that
+already carries Super+Esc / Super+Enter / Super+Tab, so an injected agent key
+event structurally cannot forge it. Sends `xdg_toplevel.close` — a polite
+request, not a kill — to the focused window; resolves through a popup's root
+surface when a menu holds focus. **The session shell is always refused**
+(closing it leaves a black screen). Both `q` and `Q` are accepted, so Caps Lock
+does not silently disable the only compositor-level close gesture.
+
+### Also: `maximize_request` now means the work area
+
+Upstream's default is `surface.send_configure()` with no state change, i.e. a
+Chromium/GTK maximize button was inert. It now sets `xdg_toplevel::State::
+Maximized` and configures to the work area — which is the entire point of
+calling the reserved bands a work area. `unmaximize_request` clears the state;
+comp keeps no restore geometry (that is A5's state to own) so it does not
+invent a previous size. The **initial** configure still deliberately does not
+set `Maximized` — A4's reasoning stands (it changes CSD for every GTK/Qt app,
+and is only appropriate when the client itself asked).
+
+### Verification — container
+
+```
+cargo build                               -> Finished, zero warnings
+cargo clippy --all-targets -- -D warnings -> Finished, zero warnings
+cargo test                                -> test result: ok. 226 passed; 0 failed
+```
+
+**226 = 212 pre-existing (all still green) + 14 new**: 12 in `window_policy`
+(band arithmetic, degenerate outputs, per-band env parsing, the shell-`app_id`
+override, and an assertion pinning the band values to the shell's real
+layout), 2 in `input` (the Super+Q keysym predicate).
+
+### Verification — live, Xvfb + winit backend (pixel proof)
+
+Same `Xvfb :99` + `import -window root` recipe as the CUR-1 round. Extra apt
+packages this round needed beyond the A4-1 list: `libxcursor1 libxrandr2
+libxi6 libxinerama1 libx11-xcb1 libxkbcommon-x11-0 libwayland-egl1
+libwayland-cursor0 xvfb x11-utils xdotool imagemagick python3-pil
+wayland-utils` (winit's X11 backend fails at startup with
+`XNotSupported(libXcursor.so.1)` without the first group).
+
+**1. Reserved bands, real clients, real pixels.** `foot -a duduclaw-shell`
+(green) + `foot -a app-B` (red):
+
+```
+window_policy: session shell identified by app_id … app_id=duduclaw-shell demoted=None
+window_policy: applied … is_shell=true  in_shadow=false rect=(0, 0, 1280, 800)
+window_policy: applied … is_shell=false in_shadow=false rect=(0, 30, 1280, 680)
+xdg_shell: sending initial configure … configured_size=1280x680 location=(0, 30)
+```
+
+screenshot rows (`.` sampled every 4 px across 1280):
+
+```
+y=  0..25  (161,161,120)  shell's own CSD titlebar
+y=  29     (0,170,0)      SHELL — visible above the app
+y=  30,31  (161,161,120)  app-B's CSD titlebar, starting exactly at the band edge
+y= 100..709 (204,0,0)     app-B
+y= 710..799 (0,170,0)     SHELL — visible below the app (90 rows)
+```
+
+**2. Rule 2 (first-mapped fallback) and promotion/demotion.** First client
+`foot -a not-the-shell`, then `foot -a duduclaw-shell`:
+
+```
+window_policy: no shell identified yet — treating the first mapped toplevel as the session shell (provisional)
+window_policy: applied … surface@3[0] is_shell=true  rect=(0, 0, 1280, 800)
+window_policy: session shell identified by app_id (superseding the first-mapped guess) … demoted=Some(surface@3[0])
+window_policy: applied … surface@3[0] is_shell=false rect=(0, 30, 1280, 680)   <- demoted
+window_policy: applied … surface@3[1] is_shell=true  rect=(0, 0, 1280, 800)    <- promoted
+```
+
+screenshot confirms it: `y=400` blue (`not-the-shell`, now in the work area),
+`y=711`/`795` green (the real shell, visible in the bottom band).
+
+**3. Super+Q**, driven with real XTEST key events (`xdotool key
+--clearmodifiers super+q` into the winit X window), focus set deterministically
+through the `shell_control` socket:
+
+```
+{"ok":true,"matched_app_id":"app-B"}
+window_policy: Super+Q — sending xdg_toplevel.close to the focused window … app_id=Some("app-B")
+xdg_shell: toplevel destroyed, unmapping and reassigning focus
+  foot app-B still running? -> <gone>
+  foot shell still running? -> alive
+
+{"ok":true,"matched_app_id":"duduclaw-shell"}
+WARN window_policy: Super+Q refused — that window is the session shell (closing it would leave a black screen)
+  foot shell still running? -> alive
+```
+
+**4. `zxdg_decoration_manager_v1` is really advertised** (`wayland-info`):
+
+```
+interface: 'zxdg_decoration_manager_v1',   version:  1, name:  8
+```
+
+**5. B3 `window_geometry` still answers correctly for a non-`(0,0)` window.**
+The op reports `Space::element_location`, which is exactly the value the
+policy now changes — this is the question B3 was designed to answer, so it had
+to be re-confirmed rather than assumed. Same authenticated codrive client:
+
+```
+geom shell : {'ok': True, 'window': {'origin_x': 0, 'origin_y':  0, 'width': 1280, 'height': 800, ...}}
+geom app-B : {'ok': True, 'window': {'origin_x': 0, 'origin_y': 30, 'width': 1280, 'height': 680, ...}}
+```
+
+The agent's `global = origin + atspi_window_offset` arithmetic is unchanged;
+only the origin it is handed is no longer always zero. Injected pointer
+coordinates are unaffected either way — they are global logical coordinates
+and `Space::element_under` has always done the element-location mapping.
+
+**6. CD-2 shadow workspace — no regression.** Real authenticated codrive
+client (token from `$XDG_RUNTIME_DIR/duduclaw-codrive.token`), agent focuses
+`app-B` and pushes it into the shadow workspace:
+
+```
+auth   : {'ok': True, 'authenticated': True}
+shadow : {'ok': True, 'frozen': False}
+audit  : shadow_window_moved(to_shadow) -> shadow_enabled -> inject_applied(op:shadow)
+```
+
+and **no further `window_policy: applied` line after the shadow op** — nothing
+pulls a shadow window back onto the main output. `grep -c 'panic|failed to
+(allocate|bind|render) the shadow'` → `0`. (`apply_window_policy` returns
+immediately for an already-configured window inside the shadow output's
+bounds, and a shadow window can never claim the session-shell role.)
+
+### Honest stub / limitation list (this round)
+
+- **Not verified on real hardware** (udev/DRM backend, real libinput keyboard
+  for Super+Q) — the VM is the operator's. Recipe below.
+- **The shell-side `app_id` change is compile-verified but not run.**
+  `cargo check` on `crates/duduclaw-shell` is green
+  (`Checking duduclaw-shell v1.62.0 … Finished dev profile in 23.69s`). It has
+  not been *run* on the appliance — step 1 of the VM recipe below is what
+  confirms the `app_id` actually reaches comp.
+  Environment note for anyone repeating this: a Homebrew Intel rust in
+  `/usr/local/bin` shadows the rustup toolchain and produces two confusing
+  failures before duduclaw-shell's own code is ever reached — `media`'s
+  build script dying on `libclang … incompatible architecture`, then `gpui`
+  failing on `use of unstable library feature 'cold_path'` (exactly what
+  `rust-toolchain.toml`'s own comment warns about). Run with
+  `PATH="$HOME/.cargo/bin:$PATH"`.
+- **Interactive resize is not constrained.** Dragging an app window's own CSD
+  resize edge can still make it overlap the bands. Constraining interactive
+  window management is A5's job; this round only owns placement at
+  configure/maximize time.
+- **`fullscreen_request` is deliberately still unimplemented** (upstream's
+  no-op default). A fullscreen video legitimately wants to cover the bands, and
+  deciding that is A5's call.
+- **A client that ignores its configure is not forced.** Comp does not crop or
+  clip; xdg-shell configure is the only lever, which is the same lever every
+  compositor has.
+- **udev/DRM output changes are not re-driven.** `reapply_window_policy_all`
+  is wired to the winit backend's `Resized` event; the udev backend builds its
+  outputs once during `init_udev`, before any client can connect, and has no
+  mode-change or hotplug path today. If one is added, it must call that method.
+- **The band values assume scale 1.0**, which is what both backends composite
+  at (`render_output(…, 1.0, …)`). A HiDPI shell would need them scaled.
+- **Not committed**, per this task's instructions, same as every prior round.
+
+### How to check this on the appliance VM
+
+1. Boot normally; confirm the policy is live and reading the right numbers:
+   ```
+   journalctl -u duduclaw-kiosk -b | grep -E 'window layout policy|window_policy'
+   ```
+   Expect `reserved_top=30 reserved_bottom=90 shell_app_id=duduclaw-shell`,
+   then `session shell identified by app_id` (or, if the shell binary was not
+   rebuilt with the `app_id` change, `treating the first mapped toplevel as the
+   session shell (provisional)` — both give the shell the full output).
+2. Open Chromium from the Launcher. **Expected:** the menu bar is still visible
+   as a 30 px strip along the top and the dock still floats in the bottom 90 px;
+   the Chromium window sits between them. Before this change the whole screen
+   was Chromium.
+3. **Click a dock tile.** It must still respond and switch/raise windows — the
+   dock's running-window indicator and focus switching (APP-1) are unchanged;
+   the only reason they were unusable was that the dock was covered.
+4. **Press Super+Q** with Chromium focused: the window closes (Chromium may
+   first ask to confirm — that is its choice, `xdg_toplevel.close` is a
+   request). Press Super+Q again with only the shell on screen: **nothing must
+   happen**, and `journalctl` shows
+   `Super+Q refused — that window is the session shell`.
+5. Chromium's own ✕ / maximize / minimize buttons should also work; clicking
+   maximize must fill the **work area**, i.e. still leaving the menu bar and
+   the dock visible, not the whole screen.
+
+Triage table:
+
+| Symptom | Most likely cause | Check / fix |
+|---|---|---|
+| App window still covers everything | Old comp binary, or the shell is not the first/only `app_id` claimant | `grep 'window_policy: applied'` — the `rect=` on the app window tells you exactly what it was given |
+| The **shell** got squeezed into the work area | Something else mapped a toplevel before the shell and then the shell never sent `app_id` | `grep 'session shell'` — a `provisional` line naming a surface that is not the shell is the smoking gun; rebuild the shell with the `app_id` change |
+| Bands are the wrong height | The shell's menu bar / dock layout changed | Update the table above **and** `window_policy.rs`'s constants; the unit test `the_default_bands_are_the_shells_real_menu_bar_and_dock` is there to force this |
+| Need to tune without a rebuild | — | `DUDUCLAW_COMP_RESERVED_TOP` / `DUDUCLAW_COMP_RESERVED_BOTTOM` in comp's environment, then restart comp |
+| Super+Q does nothing | No keyboard focus (comp only focuses on click), or the focused surface is not a mapped toplevel | The log says which: `Super+Q with no keyboard focus` vs `focused surface is not a mapped toplevel` |
+| Super+Q closes nothing on one specific app | The client ignored `xdg_toplevel.close` | Expected; it is a request. Nothing in comp kills processes |

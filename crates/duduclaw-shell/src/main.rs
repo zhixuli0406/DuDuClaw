@@ -702,7 +702,24 @@ fn main() {
 
         let window = cx
             .open_window(
-                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                // WM-1 (2026-08-23): `app_id` is how `duduclaw-comp` tells the
+                // session shell apart from an ordinary application window.
+                // The shell paints the menu bar and the dock inside its own
+                // full-screen toplevel, so it is the ONE window comp exempts
+                // from the reserved top/bottom bands (and from Super+Q). Comp
+                // has a first-mapped-toplevel fallback for the boot path —
+                // gpui sends `set_app_id` after its first commit, so the
+                // initial configure necessarily arrives without it — but this
+                // is the authoritative signal, and it is also what makes the
+                // shell identifiable to `list_windows` / `activate_window` /
+                // `window_geometry`. Keep it in sync with
+                // `crates/duduclaw-comp/src/window_policy.rs`'s
+                // `SHELL_APP_ID`.
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    app_id: Some("duduclaw-shell".to_string()),
+                    ..Default::default()
+                },
                 |_window, cx| {
                     // `AccountFields::new` needs `&mut App` (creating the two
                     // `OobeTextField` entities), available here — same call
