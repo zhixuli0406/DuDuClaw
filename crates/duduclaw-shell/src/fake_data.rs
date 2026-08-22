@@ -149,7 +149,10 @@ pub const GOAL_CARDS: &[GoalCard] = &[
     },
 ];
 
-pub const APPROVAL_TICKER: &str = "等你批准：要我把 8 月電費單歸檔並付款嗎？";
+// `APPROVAL_TICKER` (the old hardcoded menu-bar ticker text) was removed in
+// Shell-S4 (2026-08-22, WP-S4-notif) — `home.rs::ticker_text` now renders
+// the real `overlay::notifications_feed::NotificationsFeed`'s pending list
+// instead of one static example sentence.
 pub const GREETING: &str = "晚上好，Louis";
 pub const COMPOSER_PLACEHOLDER: &str = "交代一件事給你的 AI 團隊…";
 pub const BATTERY_PCT: &str = "86%";
@@ -231,45 +234,25 @@ pub const LAUNCHER_FOOTER_RIGHT: &str = "Super 鍵隨時喚起";
 // ── Notifications overlay fake data ───────────────────────────────────────
 // Content lifted verbatim from `commercial/design/duduclaw-os-desktop/
 // Notifications.dc.html` — see `overlay/notifications.rs`'s header comment.
+//
+// Shell-S4 (2026-08-22, WP-S4-notif): the approval CARDS themselves stopped
+// being fake data this round — they now come from the real gateway
+// (`gateway_client::list_approvals`, rendered via `overlay::
+// notifications_feed::ApprovalRow`), so the old `ApprovalCard`/
+// `APPROVAL_CARDS` (two hardcoded example approvals) were removed rather
+// than left as unreferenced dead code. `NOTIF_APPROVE_LABEL`/
+// `NOTIF_REJECT_LABEL` below replace the old per-card `approve_label`/
+// `reject_label` pair (which differed per card in the design board itself,
+// "核准"/"駁回" vs "批准"/"先不要") with ONE generic pair: the real gateway
+// has no per-approval button-label field to carry that distinction, so a
+// single consistent label is the honest choice rather than inventing one.
 
-/// One approval card — Notifications' "第一公民" interactive element (task
-/// brief). `approve_label`/`reject_label` differ per card in the design
-/// board itself ("核准"/"駁回" vs "批准"/"先不要") — kept verbatim rather
-/// than normalized to one pair, since that's literally what the board says.
-pub struct ApprovalCard {
-    pub id: &'static str,
-    pub agent_initial: &'static str,
-    pub agent_bg_hex: u32,
-    pub question: &'static str,
-    pub detail: &'static str,
-    pub approve_label: &'static str,
-    pub reject_label: &'static str,
-}
-
-pub const APPROVAL_CARDS: &[ApprovalCard] = &[
-    ApprovalCard {
-        id: "approval-electric-bill",
-        agent_initial: "財",
-        agent_bg_hex: 0x0f766e,
-        question: "要我把 8 月電費單歸檔並付款嗎？",
-        detail: "金額 NT$2,340，與上月持平。付款走既有的台電代扣帳戶。",
-        approve_label: "核准",
-        reject_label: "駁回",
-    },
-    ApprovalCard {
-        id: "approval-refund-lookup",
-        agent_initial: "杜",
-        agent_bg_hex: 0x2171cc,
-        question: "要我去客服系統撈 9 月退費資料嗎？",
-        detail: "唯讀查詢，只貼進月報。",
-        approve_label: "批准",
-        reject_label: "先不要",
-    },
-];
+pub const NOTIF_APPROVE_LABEL: &str = "核准";
+pub const NOTIF_REJECT_LABEL: &str = "駁回";
 
 /// Which avatar an activity row shows — an agent's initial-in-a-circle
-/// (same convention as `DockAgent`/`ApprovalCard`) or the system's own
-/// gradient glyph (the update-available row has no agent behind it).
+/// (same convention as `DockAgent`) or the system's own gradient glyph (the
+/// update-available row has no agent behind it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowAvatar {
     Agent { initial: &'static str, bg_hex: u32 },
@@ -362,6 +345,12 @@ pub const CC_SWITCH_PAUSE_ALL_LABEL: &str = "全部暫停";
 pub const CC_SWITCH_PAUSE_ALL_DESC: &str = "一鍵暫停所有 AI 行為，待辦保留";
 pub const CC_FOOTER_STATUS: &str = "2 位在值 · 1 件等你";
 pub const CC_FOOTER_LINK: &str = "打開管理面";
+/// Shell-S4-lock (2026-08-22): the manual-lock entry point in ControlCenter's
+/// footer — see `overlay/controlcenter.rs::lock_button`'s own doc comment.
+/// Plain zh-TW literal, same "chrome content stays hardcoded" convention
+/// every other `CC_*` string in this block already follows (Home/overlay's
+/// established non-i18n boundary — see `crate::i18n`'s own header comment).
+pub const CC_LOCK_BUTTON: &str = "鎖定";
 
 #[cfg(test)]
 mod tests {
@@ -422,7 +411,6 @@ mod tests {
         for item in MENU_ITEMS {
             assert!(!item.is_empty());
         }
-        assert!(!APPROVAL_TICKER.is_empty());
         assert!(!GREETING.is_empty());
         assert!(!COMPOSER_PLACEHOLDER.is_empty());
         assert!(!BATTERY_PCT.is_empty());
@@ -524,19 +512,6 @@ mod tests {
     // ── Notifications ────────────────────────────────────────────────────
 
     #[test]
-    fn approval_cards_has_two_entries_matching_the_design_board() {
-        assert_eq!(APPROVAL_CARDS.len(), 2);
-    }
-
-    #[test]
-    fn approval_card_ids_are_unique() {
-        let mut ids: Vec<&str> = APPROVAL_CARDS.iter().map(|c| c.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), APPROVAL_CARDS.len());
-    }
-
-    #[test]
     fn today_activity_has_three_entries_matching_the_design_board() {
         assert_eq!(TODAY_ACTIVITY.len(), 3);
     }
@@ -556,14 +531,8 @@ mod tests {
 
     #[test]
     fn notifications_no_field_is_empty() {
-        for c in APPROVAL_CARDS {
-            assert!(!c.id.is_empty());
-            assert!(!c.agent_initial.is_empty());
-            assert!(!c.question.is_empty());
-            assert!(!c.detail.is_empty());
-            assert!(!c.approve_label.is_empty());
-            assert!(!c.reject_label.is_empty());
-        }
+        assert!(!NOTIF_APPROVE_LABEL.is_empty());
+        assert!(!NOTIF_REJECT_LABEL.is_empty());
         for r in TODAY_ACTIVITY {
             assert!(!r.id.is_empty());
             assert!(!r.line1.is_empty());
@@ -631,5 +600,6 @@ mod tests {
         assert!(!CC_SWITCH_PAUSE_ALL_DESC.is_empty());
         assert!(!CC_FOOTER_STATUS.is_empty());
         assert!(!CC_FOOTER_LINK.is_empty());
+        assert!(!CC_LOCK_BUTTON.is_empty());
     }
 }

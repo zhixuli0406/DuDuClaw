@@ -61,32 +61,29 @@ use crate::ShellView;
 
 mod controlcenter;
 mod launcher;
-mod notifications;
-
-/// Three-way outcome of an approval-card decision — Notifications' own
-/// interactive core (task brief: "審批卡第一公民"). Pure enum, no gpui
-/// types, same testable-without-a-window discipline `surface.rs`'s own
-/// header comment establishes for `SurfaceState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalDecision {
-    Pending,
-    Approved,
-    Rejected,
-}
+// `pub(crate)`, not private: `home.rs` (a sibling module of this one, not a
+// descendant) calls `notifications::open_and_refresh` directly from its two
+// "open Notifications" click sites — see that fn's own doc comment.
+pub(crate) mod notifications;
+pub mod notifications_feed;
 
 /// Runtime-mutable state backing the two overlays that have actual
 /// interactive controls this round (round 1's `SurfaceState` only tracked
 /// WHICH overlay is open, never what's inside one). Lives on `ShellView`
 /// itself (see `main.rs`), not re-created per render call, so a
 /// decision/toggle survives closing and reopening the overlay.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OverlayUiState {
-    /// Index-aligned with `fake_data::APPROVAL_CARDS` (2 cards this round).
-    /// A plain `Vec`, not a fixed-size array: `Default` seeds its length
-    /// from `fake_data::APPROVAL_CARDS.len()` at runtime, so a hardcoded
-    /// array length here can't silently drift out of sync with that list if
-    /// a future round adds a third card.
-    approval_decisions: Vec<ApprovalDecision>,
+    /// Shell-S4 (2026-08-22, WP-S4-notif): the Notifications overlay's real
+    /// approval-card feed, replacing the old fake index-aligned
+    /// `approval_decisions: Vec<ApprovalDecision>` (see this struct's git
+    /// history before this round). `pub`, not private, for the same reason
+    /// `overlay_ui` itself is `pub(crate)` on `ShellView` — both
+    /// `overlay::notifications` (the panel) and `home.rs` (the menu-bar
+    /// ticker) read/mutate it, and both are different modules from this
+    /// one — see `notifications_feed`'s own header comment for why they
+    /// share ONE model rather than each keeping their own.
+    pub notifications: notifications_feed::NotificationsFeed,
     automation_on: bool,
     proactive_on: bool,
     pause_all_on: bool,
@@ -95,7 +92,7 @@ pub struct OverlayUiState {
 impl Default for OverlayUiState {
     fn default() -> Self {
         Self {
-            approval_decisions: vec![ApprovalDecision::Pending; crate::fake_data::APPROVAL_CARDS.len()],
+            notifications: notifications_feed::NotificationsFeed::default(),
             // ControlCenter.dc.html: 自動化/主動行為 both render as an ON
             // (blue) toggle, 全部暫停 renders OFF (gray) — the design
             // board's actual snapshot state, kept verbatim as the boot
@@ -108,22 +105,6 @@ impl Default for OverlayUiState {
 }
 
 impl OverlayUiState {
-    pub fn approval_decision(&self, index: usize) -> ApprovalDecision {
-        self.approval_decisions.get(index).copied().unwrap_or(ApprovalDecision::Pending)
-    }
-
-    pub fn approve(&mut self, index: usize) {
-        if let Some(d) = self.approval_decisions.get_mut(index) {
-            *d = ApprovalDecision::Approved;
-        }
-    }
-
-    pub fn reject(&mut self, index: usize) {
-        if let Some(d) = self.approval_decisions.get_mut(index) {
-            *d = ApprovalDecision::Rejected;
-        }
-    }
-
     pub fn automation_on(&self) -> bool {
         self.automation_on
     }
@@ -159,6 +140,12 @@ impl OverlayUiState {
 pub fn render(
     overlay: Overlay,
     ui: &OverlayUiState,
+    // Shell-S4 (2026-08-22): ControlCenter's volume slider needs its own
+    // real-backend UI state (`crate::audio::AudioUiState`, lives on
+    // `ShellView` as `audio_ui` — see that field's own doc comment in
+    // `main.rs`), threaded straight through to `controlcenter::render` the
+    // same way `ui` already is. Launcher/Notifications ignore it.
+    audio_ui: &crate::audio::AudioUiState,
     palette: ShellPalette,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &mut Context<ShellView>,
@@ -182,7 +169,7 @@ pub fn render(
     let panel: Stateful<Div> = match overlay {
         Overlay::Launcher => launcher::render(palette),
         Overlay::Notifications => notifications::render(ui, palette, cx),
-        Overlay::ControlCenter => controlcenter::render(ui, palette, cx),
+        Overlay::ControlCenter => controlcenter::render(ui, audio_ui, palette, cx),
     };
 
     // The wrapper MUST be absolutely positioned (`absolute().inset_0()`),
@@ -213,48 +200,13 @@ mod tests {
     #[test]
     fn default_state_matches_the_design_boards_snapshot() {
         let ui = OverlayUiState::default();
-        assert_eq!(ui.approval_decision(0), ApprovalDecision::Pending);
-        assert_eq!(ui.approval_decision(1), ApprovalDecision::Pending);
+        // Shell-S4: the approval-card feed's own default state
+        // (Idle/no-session/empty) is `notifications_feed`'s own concern —
+        // covered by that module's tests, not re-asserted here.
+        assert_eq!(ui.notifications.status, notifications_feed::FeedStatus::Idle);
         assert!(ui.automation_on());
         assert!(ui.proactive_on());
         assert!(!ui.pause_all_on());
-    }
-
-    #[test]
-    fn default_approval_decisions_length_matches_fake_data() {
-        assert_eq!(OverlayUiState::default().approval_decisions.len(), crate::fake_data::APPROVAL_CARDS.len());
-    }
-
-    #[test]
-    fn approve_only_changes_that_cards_decision() {
-        let mut ui = OverlayUiState::default();
-        ui.approve(0);
-        assert_eq!(ui.approval_decision(0), ApprovalDecision::Approved);
-        assert_eq!(ui.approval_decision(1), ApprovalDecision::Pending);
-    }
-
-    #[test]
-    fn reject_only_changes_that_cards_decision() {
-        let mut ui = OverlayUiState::default();
-        ui.reject(1);
-        assert_eq!(ui.approval_decision(1), ApprovalDecision::Rejected);
-        assert_eq!(ui.approval_decision(0), ApprovalDecision::Pending);
-    }
-
-    #[test]
-    fn approve_then_reject_the_same_card_overwrites_not_stacks() {
-        let mut ui = OverlayUiState::default();
-        ui.approve(0);
-        ui.reject(0);
-        assert_eq!(ui.approval_decision(0), ApprovalDecision::Rejected);
-    }
-
-    #[test]
-    fn out_of_bounds_approve_reject_is_a_noop_not_a_panic() {
-        let mut ui = OverlayUiState::default();
-        ui.approve(99);
-        ui.reject(99);
-        assert_eq!(ui.approval_decision(99), ApprovalDecision::Pending);
     }
 
     #[test]

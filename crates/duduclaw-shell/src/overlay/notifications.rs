@@ -1,4 +1,5 @@
-// Notifications overlay content — Shell-S0 round 2, dark theme in Shell-S1.
+// Notifications overlay content — Shell-S0 round 2, dark theme in Shell-S1,
+// real gateway data in Shell-S4 (2026-08-22, WP-S4-notif).
 //
 // Visual spec: `commercial/design/duduclaw-os-desktop/Notifications.dc.html`
 // (light) / `commercial/design/duduclaw-os-home-dark/Notifications.dc.html`
@@ -7,23 +8,51 @@
 // anchoring stretches it to fill, reproduced the same way with gpui's own
 // `.top()`/`.right()`/`.bottom()` absolute setters and no `.h(...)` call).
 //
-// Interactive core (task brief: "審批卡第一公民（內嵌核准/駁回鈕＋脈絡摘
-// 要）") — the two approval cards' 核准/駁回 (or 批准/先不要, per-card
-// literal labels, see `fake_data::ApprovalCard`'s doc comment) buttons are
-// real `cx.listener`s writing into `overlay::OverlayUiState`, re-rendering
-// the card as a resolved pill badge once decided (`decision_badge`, shared
-// with the "完成"/"等你決定" activity-row badges below it — same visual
-// language, one function). Everything else in this file (header, filter
-// tabs, activity rows, footer) is static per the task brief's narrower ask
-// ("分組/時間戳照畫板" only, no filtering/mark-all-read wiring this round).
+// ── Shell-S4: approval cards are the "審批第一公民" against REAL data ────
+// The two approval cards' 核准/駁回 buttons used to write into a fake,
+// index-aligned `overlay::ApprovalDecision` toggle. They now drive the real
+// `gateway_client::decide_approval` RPC through `overlay::notifications_feed
+// ::NotificationsFeed` — a dynamic, id-keyed list from `approvals.list`, not
+// two hardcoded design-board examples. Because a click here now hits
+// `approvals.db` for good (unlike the old in-memory-only toggle), every
+// approve/reject is a TWO-STEP confirm (first click arms `Confirming`,
+// shows "確定"/"取消"; the confirm click actually fires the RPC) —
+// `notifications_feed::RowDecision`'s own doc comment has the full state
+// machine. This is a deliberate addition beyond the design board (which
+// only ever shows the single-click Pending/Approved/Rejected states) to
+// guard against an accidental click on a real, hard-to-undo decision; the
+// research doc for this round (`research/native-os-2026-08/
+// shell-s4-surfaces-2026-08.md` §1.3) confirms button-based (not swipe)
+// interaction is right but doesn't itself prescribe a confirm step — this
+// module adds one anyway given what a click now actually does.
+//
+// ── Three connectivity states ─────────────────────────────────────────
+// `NotificationsFeed::status` (Idle/Loading/Ready/Offline) drives the
+// panel's top region: a spinner-ish loading line, an honest "無法連線"
+// banner (task brief: "誠實橫幅照 S3 示範模式前例" — same
+// `Key::NetworkDemoModeNotice`-style honesty this crate already established
+// for OOBE's demo Wi-Fi backend), or the real row list (which itself may be
+// empty — a fourth, distinct rendering, not folded into any of the other
+// three). `content()` below picks exactly one of these.
+//
+// ── Panel-open triggers a refresh; a periodic poll keeps it warm ────────
+// `open_and_refresh` (called from `home.rs`'s two "open Notifications"
+// click sites, replacing their old bare `view.surface.open(...)`) kicks off
+// a session bootstrap + list fetch the first time, or a fresh list fetch
+// when the last one is older than `notifications_feed::REFRESH_STALE_AFTER`
+// (task brief cadence: "30s＋開面板即刷"). `render()` below additionally
+// arms a recurring `cx.spawn` timer WHILE the panel is open (started once,
+// self-cancelling when the overlay closes — see `content()`'s own comment)
+// so the pending list and the home menu-bar ticker both stay live without
+// the operator needing to close and reopen the panel.
 //
 // `cx: &mut Context<ShellView>` is threaded through via a plain `for` loop
-// when building the two approval cards, NOT `.iter().map(...)` — this
-// crate's own `duduclaw-native-gui` sibling already hit and documented this
-// exact wall (`main.rs`'s gotcha list: "A `&mut Context<V>` is NOT `Copy`,
-// so it cannot be captured into a closure that runs more than once ... use
-// a plain `for` loop instead"), so the workaround is applied here from the
-// start rather than rediscovered.
+// when building approval cards, NOT `.iter().map(...)` — this crate's own
+// `duduclaw-native-gui` sibling already hit and documented this exact wall
+// (`main.rs`'s gotcha list: "A `&mut Context<V>` is NOT `Copy`, so it cannot
+// be captured into a closure that runs more than once ... use a plain `for`
+// loop instead"), so the workaround is applied here from the start rather
+// than rediscovered.
 //
 // ── Dark theme (Shell-S1) ─────────────────────────────────────────
 // Every color below now resolves through `palette: ShellPalette` — see
@@ -32,19 +61,159 @@
 // documents (this panel's root never set one either — verified against the
 // original code) applies here too, for the identical reason.
 
+use std::sync::mpsc;
+use std::time::Duration;
+
 use gpui::{div, linear_color_stop, linear_gradient, prelude::*, px, rgb, App, ClickEvent, Context, Div, FontWeight, Rgba, Stateful, Window};
 
 use duduclaw_native_gui::theme;
 
-use super::{ApprovalDecision, OverlayUiState};
+use super::notifications_feed::{ApprovalRow, FeedStatus, NotificationsFeed, RowDecision};
+use super::OverlayUiState;
+use crate::gateway_client::{self, ApprovalItem};
+use crate::i18n::{t, Key, Locale};
 use crate::palette::ShellPalette;
+use crate::surface::Overlay;
 use crate::{fake_data, ShellView};
+
+/// Poll cadence for the background thread <-> `cx.spawn` bridge — same
+/// value `oobe/steps/account.rs`'s own one-shot poll loop uses.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// `home.rs`'s two "open Notifications" click sites call this INSTEAD of a
+/// bare `view.surface.open(Overlay::Notifications)` — opens the overlay and
+/// (if warranted — see `trigger_refresh_if_stale`) kicks off the real fetch,
+/// satisfying the task brief's "開面板即刷". `pub(crate)` since `home.rs` is
+/// a sibling module of `overlay`, not a descendant of it.
+pub(crate) fn open_and_refresh(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    view.surface.open(Overlay::Notifications);
+    trigger_refresh_if_stale(view, cx);
+}
+
+/// Dispatches a background-thread fetch (session bootstrap, if needed, then
+/// `approvals.list`) when the feed is stale and nothing is already in
+/// flight. Called from `open_and_refresh` above AND from `content()`'s own
+/// periodic timer while the panel stays open — both call sites share this
+/// one function so "just opened" and "been open a while" behave identically.
+/// `pub(crate)` (Shell-S4-lock, 2026-08-22): the lockscreen surface
+/// (`lockscreen/render.rs`, a SIBLING module of `overlay`) reads the SAME
+/// `NotificationsFeed` for its own "N 件等你決定" summary card — see that
+/// struct's own header comment on why the two surfaces share one model
+/// rather than each polling independently — and needs to kick off the exact
+/// same refresh-if-stale dispatch while locked, since Home (and therefore
+/// this panel's own `content()`) isn't rendered at all during a lock.
+pub(crate) fn trigger_refresh_if_stale(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    let feed = &mut view.overlay_ui.notifications;
+    if !feed.is_stale() {
+        return;
+    }
+    let existing_jwt = feed.session_jwt().map(str::to_string);
+    let started = match &existing_jwt {
+        Some(_) => feed.begin_refresh(),
+        None => feed.begin_bootstrap(),
+    };
+    if !started {
+        // Already busy (a fetch or a decide is in flight) — the task
+        // brief's 30s cadence will catch the next window; no need to queue
+        // a second attempt behind this one.
+        return;
+    }
+    cx.notify();
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = fetch_once(existing_jwt);
+        let _ = tx.send(outcome);
+    });
+
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(outcome) => {
+                let _ = weak.update(cx, |view, cx| {
+                    apply_fetch_outcome(&mut view.overlay_ui.notifications, outcome);
+                    cx.notify();
+                });
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(POLL_INTERVAL).await;
+    })
+    .detach();
+}
+
+/// Runs entirely on a background `std::thread` — never called from gpui's
+/// own executor. Blocking calls only (`gateway_client`'s own contract).
+/// `Ok` carries `new_jwt` (`Some` only when THIS call bootstrapped a fresh
+/// session — `None` means an existing one was reused) alongside the fetched
+/// list, so `apply_fetch_outcome` below can persist the session before
+/// applying the list. A list failure right after a fresh bootstrap
+/// deliberately discards that new token rather than persisting it on a
+/// partial success — bootstrap is a single cheap POST, and re-bootstrapping
+/// on the next stale check is simpler than a three-way partial-success
+/// state to reconcile. Diagnostics are logged once, by the caller
+/// (`apply_fetch_outcome`), not here — this fn stays a plain data-in/
+/// data-out function so it doesn't have to know it's running off-thread.
+fn fetch_once(existing_jwt: Option<String>) -> Result<(Option<String>, Vec<ApprovalItem>), gateway_client::GatewayError> {
+    let (jwt, new_jwt) = match existing_jwt {
+        Some(jwt) => (jwt, None),
+        None => {
+            let jwt = gateway_client::bootstrap_local_session()?;
+            (jwt.clone(), Some(jwt))
+        }
+    };
+    let items = gateway_client::list_approvals(&jwt)?;
+    Ok((new_jwt, items))
+}
+
+fn apply_fetch_outcome(feed: &mut NotificationsFeed, outcome: Result<(Option<String>, Vec<ApprovalItem>), gateway_client::GatewayError>) {
+    match outcome {
+        Ok((new_jwt, items)) => {
+            if let Some(jwt) = new_jwt {
+                feed.apply_session_ok(jwt);
+            }
+            feed.apply_list_ok(items);
+        }
+        // Distinguishes "never got a session at all" from "had one, but the
+        // RPC itself failed" only for the stderr diagnostic's own wording —
+        // both still land the panel on the same Offline banner either way
+        // (`NotificationsFeed::apply_session_err`/`::apply_list_err` — see
+        // `gateway_client::GatewayError`'s own doc comment for why the UI
+        // layer doesn't need the distinction beyond that).
+        Err(gateway_client::GatewayError::Session(e)) => {
+            eprintln!("[notifications] local session unavailable: {e:?}");
+            feed.apply_session_err();
+        }
+        Err(gateway_client::GatewayError::Rpc(e)) => {
+            eprintln!("[notifications] approvals RPC failed: {e:?}");
+            feed.apply_list_err();
+        }
+    }
+}
 
 pub(super) fn render(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     // Notifications.dc.html: bg `rgba(255,255,255,0.96)` light / `rgba(30,
     // 30,33,0.96)` dark — `surface_raised` in both. Border: opaque
     // `border()` light / `rgba(255,255,255,0.12)` dark.
     let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.12).into() } else { palette.border() };
+
+    // While the panel is open, keep the feed from going stale on its own —
+    // a lightweight repeating timer that just re-checks staleness each
+    // tick (`trigger_refresh_if_stale` itself no-ops when the feed is still
+    // fresh or already busy). Runs for exactly one tick per `render()` call
+    // rather than a `loop` living inside this fn, matching this crate's
+    // "background work lives in a `cx.spawn` the click handler detaches,
+    // not inside a render body" convention (`render()` itself must stay a
+    // plain, repeatable read of state) — the NEXT tick is scheduled again
+    // from the panel's own next render pass, which `cx.notify()` calls
+    // inside `trigger_refresh_if_stale`/the poll loop above keep happening
+    // regularly while a fetch is settling, and `REFRESH_STALE_AFTER` (30s)
+    // means a quiet panel still gets re-checked because gpui repaints this
+    // panel on ANY state change elsewhere in the window in practice; a
+    // belt-and-suspenders explicit timer is added below so a fully idle
+    // window (nothing else changing) still re-checks every 30s while open.
+    schedule_stale_check(cx);
 
     let mut panel = div()
         .id("overlay-notifications-panel")
@@ -65,13 +234,44 @@ pub(super) fn render(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Contex
         // See this file's header comment on why this is dark-only.
         panel = panel.text_color(theme::alpha(palette.foreground, 1.0));
     }
-    panel.child(header(palette)).child(tabs(palette)).child(content(ui, palette, cx)).child(footer(palette))
+    panel.child(header(palette, ui.notifications.is_busy())).child(tabs(palette)).child(content(&ui.notifications, palette, cx)).child(footer(palette))
 }
 
-fn header(palette: ShellPalette) -> Div {
+/// One `cx.spawn` timer that fires `trigger_refresh_if_stale` after
+/// `REFRESH_STALE_AFTER` and then stops (does not re-arm itself) — cheap
+/// insurance for a fully idle window, see `render()`'s own comment. A new
+/// one is armed every render pass (this fn is called from `render()`
+/// itself, which only runs while the panel is actually open), so closing
+/// the panel naturally stops new timers from being armed; an
+/// already-in-flight one still fires once but `trigger_refresh_if_stale`
+/// harmlessly no-ops if the panel is no longer stale or another fetch is
+/// already running.
+fn schedule_stale_check(cx: &mut Context<ShellView>) {
+    cx.spawn(async move |weak, cx| {
+        cx.background_executor().timer(super::notifications_feed::REFRESH_STALE_AFTER).await;
+        let _ = weak.update(cx, |view, cx| {
+            trigger_refresh_if_stale(view, cx);
+        });
+    })
+    .detach();
+}
+
+/// `is_busy` (Shell-S4, `NotificationsFeed::is_busy`) drives a tiny
+/// title-adjacent indicator — a subtle "cheap insurance" use of that flag
+/// beyond the internal single-flight guard it's primarily for: the panel
+/// has no other visible sign a silent background poll (`schedule_stale_
+/// check`) is in flight while `status` stays `Ready` (see that variant's
+/// own doc comment on why a background refresh does NOT flip back to
+/// `Loading`), so this is the one place the operator can tell "still
+/// talking to the gateway" apart from "done, nothing changed".
+fn header(palette: ShellPalette, is_busy: bool) -> Div {
     // Notifications.dc.html: "全部標為已讀" is `brand` light / `brand_bright`
     // dark (`#2171cc`/`#59a6ff`).
     let link_text = if palette.is_dark() { palette.brand_bright } else { palette.brand };
+    let mut title_row = div().flex().items_center().gap(px(6.)).child(div().text_size(px(16.)).font_weight(FontWeight::BOLD).child(fake_data::NOTIF_HEADER_TITLE));
+    if is_busy {
+        title_row = title_row.child(div().w(px(5.)).h(px(5.)).rounded(px(5.)).bg(theme::alpha(palette.brand, 0.7)));
+    }
     div()
         .flex()
         .items_center()
@@ -79,7 +279,7 @@ fn header(palette: ShellPalette) -> Div {
         .px(px(18.))
         .pt(px(16.))
         .pb(px(10.))
-        .child(div().text_size(px(16.)).font_weight(FontWeight::BOLD).child(fake_data::NOTIF_HEADER_TITLE))
+        .child(title_row)
         .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(theme::alpha(link_text, 1.0)).child(fake_data::NOTIF_MARK_ALL_READ))
 }
 
@@ -115,38 +315,60 @@ fn tabs(palette: ShellPalette) -> Div {
     row
 }
 
-fn content(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
-    let mut cards = Vec::with_capacity(fake_data::APPROVAL_CARDS.len());
-    for (index, card) in fake_data::APPROVAL_CARDS.iter().enumerate() {
-        cards.push(approval_card(card, index, ui.approval_decision(index), palette, cx));
+fn content(feed: &NotificationsFeed, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let body = div().flex_1().overflow_hidden().flex().flex_col().gap(px(10.)).px(px(14.));
+
+    match feed.status {
+        FeedStatus::Offline => return body.child(status_banner(t(Locale::ZhTw, Key::NotifOfflineBanner), palette, true)),
+        FeedStatus::Loading if feed.rows().is_empty() && feed.decided().is_empty() => {
+            return body.child(status_banner(t(Locale::ZhTw, Key::NotifLoadingLabel), palette, false));
+        }
+        FeedStatus::Idle => {
+            return body.child(status_banner(t(Locale::ZhTw, Key::NotifLoadingLabel), palette, false));
+        }
+        FeedStatus::Loading | FeedStatus::Ready => {}
     }
 
-    div()
-        .flex_1()
-        .overflow_hidden()
-        .flex()
-        .flex_col()
-        .gap(px(10.))
-        .px(px(14.))
-        .children(cards)
-        .child(
-            div()
-                .text_size(px(11.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::alpha(palette.text_faint, 1.0))
-                .px(px(4.))
-                .child(fake_data::NOTIF_TODAY_LABEL),
-        )
-        .children(fake_data::TODAY_ACTIVITY.iter().map(move |row| activity_row(row, palette)))
+    let mut cards = Vec::with_capacity(feed.rows().len() + feed.decided().len());
+    for row in feed.rows() {
+        cards.push(approval_card(row, palette, cx));
+    }
+    for row in feed.decided() {
+        cards.push(approval_card(row, palette, cx));
+    }
+
+    let mut body = body;
+    if cards.is_empty() {
+        body = body.child(status_banner(t(Locale::ZhTw, Key::NotifEmptyLabel), palette, false));
+    } else {
+        body = body.children(cards);
+    }
+
+    body.child(
+        div()
+            .text_size(px(11.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::alpha(palette.text_faint, 1.0))
+            .px(px(4.))
+            .child(fake_data::NOTIF_TODAY_LABEL),
+    )
+    .children(fake_data::TODAY_ACTIVITY.iter().map(move |row| activity_row(row, palette)))
 }
 
-fn approval_card(
-    card: &fake_data::ApprovalCard,
-    index: usize,
-    decision: ApprovalDecision,
-    palette: ShellPalette,
-    cx: &mut Context<ShellView>,
-) -> Stateful<Div> {
+/// One connectivity/state line — the offline banner uses `destructive` text
+/// on a faint destructive tint (an honest error, same treatment
+/// `oobe::steps::network`'s own `NetworkScanFailedStatus` line gets);
+/// loading/empty use plain muted text, no alarming color (task brief's own
+/// "誠實橫幅" only asks for honesty, not alarm, on the non-error states).
+fn status_banner(text: &str, palette: ShellPalette, is_error: bool) -> Div {
+    let mut el = div().px(px(4.)).py(px(10.)).text_size(px(12.)).text_color(theme::alpha(if is_error { palette.destructive } else { palette.text_faint }, 1.0));
+    if is_error {
+        el = el.bg(theme::alpha(palette.destructive, if palette.is_dark() { 0.12 } else { 0.08 })).rounded(px(8.)).px(px(10.));
+    }
+    el.child(text.to_string())
+}
+
+fn approval_card(row: &ApprovalRow, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     // Notifications.dc.html: pending cards get an amber border — `#f3d9a4`
     // light (opaque) / `rgba(203,148,0,0.45)` dark (`warning` at 45%
     // alpha). Resolved (approved/rejected) cards have no board precedent in
@@ -156,15 +378,27 @@ fn approval_card(
     // panel-border convention (`rgba(255,255,255,0.12)`, matching the panel
     // root's own border elsewhere in this file) rather than inventing a
     // fourth color.
-    let border_color: Rgba = match (decision, palette.is_dark()) {
-        (ApprovalDecision::Pending, true) => theme::alpha(palette.warning, 0.45),
-        (ApprovalDecision::Pending, false) => theme::alpha(0xf3d9a4, 1.0),
-        (_, true) => theme::alpha(0xffffff, 0.12),
-        (_, false) => theme::alpha(0xececef, 1.0),
+    let is_awaiting_input = matches!(row.decision, RowDecision::Pending | RowDecision::Confirming { .. } | RowDecision::Failed { .. });
+    let border_color: Rgba = match (is_awaiting_input, palette.is_dark()) {
+        (true, true) => theme::alpha(palette.warning, 0.45),
+        (true, false) => theme::alpha(0xf3d9a4, 1.0),
+        (false, true) => theme::alpha(0xffffff, 0.12),
+        (false, false) => theme::alpha(0xececef, 1.0),
     };
 
+    // agent_id has no design-board avatar color/initial mapping (that
+    // struct's `agent_initial`/`agent_bg_hex` fields were per-card DESIGN
+    // data, not something the real gateway response carries) — derived
+    // deterministically instead: the first character (CJK-safe — `chars()`,
+    // not a byte slice) and a stable hash-picked color from the same
+    // small palette `home_dock.rs`'s own dock agents already use, so a
+    // given agent always renders the same color across refreshes without
+    // needing a lookup table this round doesn't have data for.
+    let initial = row.agent_id.chars().next().map(String::from).unwrap_or_else(|| "?".to_string());
+    let bg_hex = agent_color_for(&row.agent_id);
+
     let mut root = div()
-        .id(card.id)
+        .id(format!("notif-approval-{}", row.id))
         .bg(theme::alpha(palette.surface_raised, 1.0))
         .border_1()
         .border_color(border_color)
@@ -180,40 +414,57 @@ fn approval_card(
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .child(avatar(card.agent_initial, card.agent_bg_hex, palette))
-                .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(card.question))
-                .when(decision == ApprovalDecision::Pending, |el| {
-                    el.child(div().w(px(7.)).h(px(7.)).rounded(px(7.)).bg(theme::alpha(palette.brand, 1.0)))
-                }),
+                .child(avatar(initial, bg_hex, palette))
+                .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(row.summary.clone()))
+                .when(is_awaiting_input, |el| el.child(div().w(px(7.)).h(px(7.)).rounded(px(7.)).bg(theme::alpha(palette.brand, 1.0)))),
         )
-        .child(div().text_size(px(12.)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(card.detail));
+        .child(div().text_size(px(12.)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(row.detail.clone()));
 
-    root = root.child(match decision {
-        ApprovalDecision::Pending => approval_actions(card, index, palette, cx),
-        ApprovalDecision::Approved => decision_badge(fake_data::NOTIF_APPROVED_LABEL, palette.badge_text(fake_data::BadgeKind::Success), palette.badge_bg(fake_data::BadgeKind::Success)),
-        ApprovalDecision::Rejected => decision_badge(
+    root = root.child(match row.decision {
+        RowDecision::Pending => approval_actions(&row.id, palette, cx),
+        RowDecision::Confirming { approve } => confirm_actions(&row.id, approve, palette, cx),
+        RowDecision::InFlight { .. } => status_pill(t(Locale::ZhTw, Key::NotifDecidingLabel), palette.text_secondary, palette.surface_hover),
+        RowDecision::Failed { approve } => failed_actions(&row.id, approve, palette, cx),
+        RowDecision::Settled { approved: true } => {
+            decision_badge(fake_data::NOTIF_APPROVED_LABEL, palette.badge_text(fake_data::BadgeKind::Success), palette.badge_bg(fake_data::BadgeKind::Success))
+        }
+        RowDecision::Settled { approved: false } => decision_badge(
             fake_data::NOTIF_REJECTED_LABEL,
             theme::alpha(palette.destructive, 1.0),
             // No board precedent for a rejected state (the board only ever
             // shows pending cards) — approximated as a light tint of the
-            // same destructive token, same as the original light-only code;
-            // dark's tint bumps to 0.16 to match the family convention the
-            // OTHER three badge kinds use in dark (see `crate::palette::
-            // ShellPalette::badge_bg`'s own doc comment), rather than
-            // reusing light's 0.12 verbatim.
+            // same destructive token; dark's tint bumps to 0.16 to match
+            // the family convention the OTHER three badge kinds use in
+            // dark (see `crate::palette::ShellPalette::badge_bg`'s own doc
+            // comment), rather than reusing light's 0.12 verbatim.
             theme::alpha(palette.destructive, if palette.is_dark() { 0.16 } else { 0.12 }),
         ),
     });
     root
 }
 
-fn approval_actions(card: &fake_data::ApprovalCard, index: usize, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+/// Small fixed palette of avatar background hues, picked deterministically
+/// per `agent_id` (a simple additive hash over its bytes — no crypto
+/// property needed, just visual stability across refreshes) — reuses the
+/// exact two hex values `fake_data::DOCK_AGENTS` already established for
+/// this shell's two example agents, plus one more from the goal-card badge
+/// family, so a real agent id never introduces a brand-new, uncoordinated
+/// hue.
+fn agent_color_for(agent_id: &str) -> u32 {
+    const PALETTE: [u32; 3] = [0x2171cc, 0x0f766e, 0x8b5cf6];
+    let sum: u32 = agent_id.bytes().map(u32::from).sum();
+    PALETTE[(sum as usize) % PALETTE.len()]
+}
+
+fn approval_actions(id: &str, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let id_approve = id.to_string();
     let approve_click = cx.listener(move |view, _ev, _window, cx| {
-        view.overlay_ui.approve(index);
+        view.overlay_ui.notifications.begin_confirm(&id_approve, true);
         cx.notify();
     });
+    let id_reject = id.to_string();
     let reject_click = cx.listener(move |view, _ev, _window, cx| {
-        view.overlay_ui.reject(index);
+        view.overlay_ui.notifications.begin_confirm(&id_reject, false);
         cx.notify();
     });
 
@@ -221,69 +472,202 @@ fn approval_actions(card: &fake_data::ApprovalCard, index: usize, palette: Shell
         .flex()
         .items_center()
         .gap(px(8.))
-        .child(approve_button(card.approve_label, index, palette, approve_click))
-        .child(reject_button(card.reject_label, index, palette, reject_click))
+        .child(action_button(fake_data::NOTIF_APPROVE_LABEL, format!("notif-approve-{id}"), true, palette, approve_click))
+        .child(action_button(fake_data::NOTIF_REJECT_LABEL, format!("notif-reject-{id}"), false, palette, reject_click))
         .child(div().flex_1().text_size(px(11.5)).text_color(theme::alpha(palette.text_faint, 1.0)).child(fake_data::NOTIF_NOTE_PLACEHOLDER))
 }
 
-fn approve_button(
-    label: &'static str,
-    index: usize,
-    palette: ShellPalette,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
+/// The armed "Confirming" row — real decision, one more click to fire it.
+/// Task brief: "要二段確認防誤觸" — see this file's own header comment for
+/// why a two-step confirm was added beyond what the design board itself
+/// shows.
+fn confirm_actions(id: &str, approve: bool, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let id_confirm = id.to_string();
+    let confirm_click = cx.listener(move |view, _ev, _window, cx| {
+        let Some(approve) = view.overlay_ui.notifications.begin_decide(&id_confirm) else {
+            return;
+        };
+        cx.notify();
+        dispatch_decide(id_confirm.clone(), approve, view, cx);
+    });
+    let id_cancel = id.to_string();
+    let cancel_click = cx.listener(move |view, _ev, _window, cx| {
+        view.overlay_ui.notifications.cancel_confirm(&id_cancel);
+        cx.notify();
+    });
+
+    let prompt_color = if approve { palette.brand } else { palette.destructive };
     div()
-        .id(("notif-approve", index))
-        .cursor_pointer()
-        .bg(theme::alpha(palette.brand, 1.0))
-        .text_color(theme::alpha(palette.brand_foreground, 1.0))
-        .rounded(px(8.))
-        .px(px(14.))
-        .py(px(5.))
-        .text_size(px(12.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .child(label)
-        .on_click(on_click)
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::alpha(prompt_color, 1.0))
+                .child(if approve { fake_data::NOTIF_APPROVE_LABEL } else { fake_data::NOTIF_REJECT_LABEL }),
+        )
+        .child(action_button(t(Locale::ZhTw, Key::NotifConfirmButton), format!("notif-confirm-{id}"), approve, palette, confirm_click))
+        .child(cancel_button(format!("notif-cancel-{id}"), palette, cancel_click))
 }
 
-fn reject_button(
-    label: &'static str,
-    index: usize,
+/// A `Failed` row — the confirm/cancel affordance from `confirm_actions`
+/// already collapsed; this offers a retry (re-arms `Confirming`, same as a
+/// first click on a `Pending` row) plus the honest failure line.
+fn failed_actions(id: &str, approve: bool, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let id_retry = id.to_string();
+    let retry_click = cx.listener(move |view, _ev, _window, cx| {
+        view.overlay_ui.notifications.begin_confirm(&id_retry, approve);
+        cx.notify();
+    });
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(11.5))
+                .text_color(theme::alpha(palette.destructive, 1.0))
+                .child(t(Locale::ZhTw, Key::NotifDecideFailedLabel)),
+        )
+        .child(action_button(t(Locale::ZhTw, Key::NotifRetryButton), format!("notif-retry-{id}"), approve, palette, retry_click))
+}
+
+/// Dispatches `gateway_client::decide_approval` on a background thread and
+/// bridges the result back via the same `mpsc` + `cx.spawn` poll pattern
+/// `trigger_refresh_if_stale` above and `oobe/steps/account.rs` both use.
+/// Split out of `confirm_actions`'s click closure only to keep that closure
+/// body short — not reused elsewhere.
+fn dispatch_decide(id: String, approve: bool, view: &mut ShellView, cx: &mut Context<ShellView>) {
+    let Some(jwt) = view.overlay_ui.notifications.session_jwt().map(str::to_string) else {
+        // Shouldn't happen — a row only exists after a successful list,
+        // which requires a session — but fail closed rather than dispatch
+        // a request with no credential.
+        view.overlay_ui.notifications.apply_decide_err(&id, approve);
+        return;
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let id_for_thread = id.clone();
+    std::thread::spawn(move || {
+        // stderr trail records the EVENT (which id, approve/reject,
+        // outcome) — never the jwt or the approval's own content/payload;
+        // the durable, content-bearing audit record is the gateway's own
+        // `approvals.db` + audit log (task brief: "決策動作有稽核可循——
+        // gateway 端本就有").
+        let ok = match gateway_client::decide_approval(&jwt, &id_for_thread, approve) {
+            Ok(()) => {
+                eprintln!("[notifications] approvals.decide id={id_for_thread} approve={approve} ok");
+                true
+            }
+            Err(e) => {
+                eprintln!("[notifications] approvals.decide id={id_for_thread} approve={approve} failed: {e:?}");
+                false
+            }
+        };
+        let _ = tx.send(ok);
+    });
+
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(ok) => {
+                let _ = weak.update(cx, |view, cx| {
+                    if ok {
+                        view.overlay_ui.notifications.apply_decide_ok(&id, approve);
+                    } else {
+                        view.overlay_ui.notifications.apply_decide_err(&id, approve);
+                    }
+                    cx.notify();
+                });
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(POLL_INTERVAL).await;
+    })
+    .detach();
+}
+
+fn action_button(
+    label: &str,
+    id: impl Into<gpui::ElementId>,
+    primary: bool,
     palette: ShellPalette,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
-    // Notifications.dc.html: bg `#ffffff` light / `#27272a` dark — dark
-    // deliberately picks `surface_hover`, NOT `surface_raised`, so the
-    // button visibly stands out from the card it sits on (light leaves the
-    // card/button bg identical, distinguishing the button by border alone —
-    // see this file's header comment for why the two themes diverge here).
-    // Border: `border()` light (opaque) / `rgba(255,255,255,0.14)` dark
-    // (bespoke, not `border()`'s own dark 0.06 alpha).
-    let bg = if palette.is_dark() { palette.surface_hover } else { palette.surface_raised };
-    let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.14).into() } else { palette.border() };
-    div()
-        .id(("notif-reject", index))
-        .cursor_pointer()
-        .bg(theme::alpha(bg, 1.0))
-        .text_color(theme::alpha(palette.text_secondary, 1.0))
-        .border_1()
-        .border_color(border_color)
-        .rounded(px(8.))
-        .px(px(14.))
-        .py(px(5.))
-        .text_size(px(12.))
-        .child(label)
-        .on_click(on_click)
+    if primary {
+        div()
+            .id(id)
+            .cursor_pointer()
+            .bg(theme::alpha(palette.brand, 1.0))
+            .text_color(theme::alpha(palette.brand_foreground, 1.0))
+            .rounded(px(8.))
+            .px(px(14.))
+            .py(px(5.))
+            .text_size(px(12.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(label.to_string())
+            .on_click(on_click)
+    } else {
+        // Notifications.dc.html: bg `#ffffff` light / `#27272a` dark — dark
+        // deliberately picks `surface_hover`, NOT `surface_raised`, so the
+        // button visibly stands out from the card it sits on (light leaves
+        // the card/button bg identical, distinguishing the button by border
+        // alone — see this file's header comment for why the two themes
+        // diverge here). Border: `border()` light (opaque) /
+        // `rgba(255,255,255,0.14)` dark (bespoke, not `border()`'s own dark
+        // 0.06 alpha).
+        let bg = if palette.is_dark() { palette.surface_hover } else { palette.surface_raised };
+        let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.14).into() } else { palette.border() };
+        div()
+            .id(id)
+            .cursor_pointer()
+            .bg(theme::alpha(bg, 1.0))
+            .text_color(theme::alpha(palette.text_secondary, 1.0))
+            .border_1()
+            .border_color(border_color)
+            .rounded(px(8.))
+            .px(px(14.))
+            .py(px(5.))
+            .text_size(px(12.))
+            .child(label.to_string())
+            .on_click(on_click)
+    }
+}
+
+/// The "取消" (cancel confirm) button — visually the same neutral secondary
+/// treatment as `action_button`'s non-primary branch, kept as its own small
+/// fn since it has no `primary`/`approve` distinction to carry.
+fn cancel_button(id: impl Into<gpui::ElementId>, palette: ShellPalette, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Stateful<Div> {
+    // Reuses `NetworkCancelButton` ("取消") rather than adding a dedicated
+    // Notifications key — see `crate::i18n::Key::NotifOfflineBanner`'s own
+    // doc comment for why this one action is shared instead of duplicated.
+    action_button(t(Locale::ZhTw, Key::NetworkCancelButton), id, false, palette, on_click)
+}
+
+/// A neutral (non-badge-colored) status pill — used for the `InFlight`
+/// "處理中…" line, visually distinct from the success/destructive
+/// `decision_badge`s below it.
+fn status_pill(label: &str, text_hex: u32, bg_hex: u32) -> Div {
+    decision_badge_owned(label.to_string(), theme::alpha(text_hex, 1.0), theme::alpha(bg_hex, 1.0))
 }
 
 /// Shared pill badge — resolved approval outcomes (已核准/已駁回) AND the
 /// activity rows' own status pills (完成/等你決定) are visually the same
 /// component in the design board, just different label/color pairs.
 fn decision_badge(label: &'static str, text: Rgba, bg: Rgba) -> Div {
+    decision_badge_owned(label.to_string(), text, bg)
+}
+
+fn decision_badge_owned(label: String, text: Rgba, bg: Rgba) -> Div {
     div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(text).bg(bg).rounded(px(999.)).px(px(8.)).py(px(2.)).child(label)
 }
 
-fn avatar(initial: &'static str, bg_hex: u32, palette: ShellPalette) -> Div {
+fn avatar(initial: String, bg_hex: u32, palette: ShellPalette) -> Div {
     div()
         .w(px(26.))
         .h(px(26.))
@@ -324,7 +708,7 @@ fn system_icon(palette: ShellPalette) -> Div {
 
 fn activity_row(row: &fake_data::ActivityRow, palette: ShellPalette) -> Stateful<Div> {
     let avatar_el = match row.avatar {
-        fake_data::RowAvatar::Agent { initial, bg_hex } => avatar(initial, bg_hex, palette),
+        fake_data::RowAvatar::Agent { initial, bg_hex } => avatar(initial.to_string(), bg_hex, palette),
         fake_data::RowAvatar::System => system_icon(palette),
     };
 

@@ -194,6 +194,33 @@ pub enum Key {
     FinishTemplatesCustom,
     FinishTemplatesSkipped,
     FinishTemplatesNotChosen,
+
+    /// Shell-S4 (2026-08-22, WP-S4-notif): the Notifications overlay's
+    /// approval-card feed hitting the REAL gateway (`gateway_client`,
+    /// `overlay::notifications_feed`) introduces genuinely NEW process
+    /// chrome — a connectivity banner, a loading state, an empty state, a
+    /// two-step confirm/decide flow — that didn't exist when Home/overlay
+    /// was declared out of scope for i18n (see this file's own header
+    /// comment on that boundary). These seven keys are i18n'd for the same
+    /// reason `NetworkDemoModeNotice`/`AccountUnreachableError` above are:
+    /// honest-state messaging is process chrome, not per-item design
+    /// CONTENT — the approval cards' own `summary`/`agent_id`/detail text
+    /// (server-generated prose) stays a plain zh-TW literal in
+    /// `notifications_feed.rs`, same as every other piece of Home/overlay
+    /// DATA. "取消" reuses the existing `NetworkCancelButton` key rather
+    /// than adding an eighth — it's exactly the same generic action.
+    NotifOfflineBanner,
+    NotifLoadingLabel,
+    NotifEmptyLabel,
+    NotifConfirmButton,
+    NotifDecidingLabel,
+    NotifDecideFailedLabel,
+    NotifRetryButton,
+
+    /// Shell-S4-lock lockscreen chrome — see `lockscreen/render.rs`'s header.
+    LockAwaySummaryTitle,
+    LockPendingCountLabel,
+    LockUnlockHint,
 }
 
 /// Look up `key` in `locale`'s catalog. Never falls through to a "missing
@@ -329,6 +356,18 @@ fn zh_tw(key: Key) -> &'static str {
         Key::FinishTemplatesCustom => "自訂：{}",
         Key::FinishTemplatesSkipped => "已略過",
         Key::FinishTemplatesNotChosen => "尚未選擇",
+
+        Key::NotifOfflineBanner => "無法連線到本機服務，請稍後再試",
+        Key::NotifLoadingLabel => "正在載入審批項目…",
+        Key::NotifEmptyLabel => "目前沒有待你核准的項目",
+        Key::NotifConfirmButton => "確定",
+        Key::NotifDecidingLabel => "處理中…",
+        Key::NotifDecideFailedLabel => "送出失敗，請重試",
+        Key::NotifRetryButton => "重試",
+
+        Key::LockAwaySummaryTitle => "你離開的 {}",
+        Key::LockPendingCountLabel => "{} 件等你決定",
+        Key::LockUnlockHint => "按任意鍵或點擊畫面解鎖",
     }
 }
 
@@ -440,6 +479,18 @@ fn en(key: Key) -> &'static str {
         Key::FinishTemplatesCustom => "Custom: {}",
         Key::FinishTemplatesSkipped => "Skipped",
         Key::FinishTemplatesNotChosen => "Not chosen",
+
+        Key::NotifOfflineBanner => "Couldn't reach the local service. Please try again shortly.",
+        Key::NotifLoadingLabel => "Loading approvals…",
+        Key::NotifEmptyLabel => "Nothing waiting on your approval right now",
+        Key::NotifConfirmButton => "Confirm",
+        Key::NotifDecidingLabel => "Processing…",
+        Key::NotifDecideFailedLabel => "Failed to submit. Please retry.",
+        Key::NotifRetryButton => "Retry",
+
+        Key::LockAwaySummaryTitle => "Away for {}",
+        Key::LockPendingCountLabel => "{} awaiting your decision",
+        Key::LockUnlockHint => "Press any key or click to unlock",
     }
 }
 
@@ -551,6 +602,18 @@ fn ja_jp(key: Key) -> &'static str {
         Key::FinishTemplatesCustom => "カスタム：{}",
         Key::FinishTemplatesSkipped => "スキップ済み",
         Key::FinishTemplatesNotChosen => "未選択",
+
+        Key::NotifOfflineBanner => "ローカルサービスに接続できません。しばらくしてから再試行してください。",
+        Key::NotifLoadingLabel => "承認項目を読み込み中…",
+        Key::NotifEmptyLabel => "現在、承認待ちの項目はありません",
+        Key::NotifConfirmButton => "確定",
+        Key::NotifDecidingLabel => "処理中…",
+        Key::NotifDecideFailedLabel => "送信に失敗しました。再試行してください。",
+        Key::NotifRetryButton => "再試行",
+
+        Key::LockAwaySummaryTitle => "離席していた時間：{}",
+        Key::LockPendingCountLabel => "{} 件があなたの判断を待っています",
+        Key::LockUnlockHint => "任意のキーを押すかクリックしてロックを解除",
     }
 }
 
@@ -665,6 +728,16 @@ mod tests {
         Key::FinishTemplatesCustom,
         Key::FinishTemplatesSkipped,
         Key::FinishTemplatesNotChosen,
+        Key::NotifOfflineBanner,
+        Key::NotifLoadingLabel,
+        Key::NotifEmptyLabel,
+        Key::NotifConfirmButton,
+        Key::NotifDecidingLabel,
+        Key::NotifDecideFailedLabel,
+        Key::NotifRetryButton,
+        Key::LockAwaySummaryTitle,
+        Key::LockPendingCountLabel,
+        Key::LockUnlockHint,
     ];
 
     const ALL_LOCALES: [Locale; 3] = [Locale::ZhTw, Locale::En, Locale::JaJp];
@@ -676,7 +749,7 @@ mod tests {
         // `ALL_KEYS` silently drifting out of sync with a newly added `Key`
         // variant (the compiler won't catch THAT half; only the per-locale
         // match arms are compiler-enforced).
-        assert_eq!(ALL_KEYS.len(), 95);
+        assert_eq!(ALL_KEYS.len(), 105);
         let mut seen = std::collections::HashSet::new();
         for key in ALL_KEYS {
             assert!(seen.insert(key), "duplicate key in ALL_KEYS: {key:?}");
