@@ -10,25 +10,37 @@
 // rather than carrying gpui a CSS-style percentage+negative-margin
 // centering trick that only this one screen would ever use.
 //
-// Interaction scope this round (task brief: "本輪做「靜態預打字狀態」即
-// 可"): the query text, its trailing cursor bar, and the "Enter 交辦"
-// delegate suggestion all render as a STATIC snapshot of what a mid-type
-// launcher query looks like — no live text input, no keyboard nav between
-// result rows, no click handlers anywhere in this file (hence every row
-// below returns `Stateful<Div>` purely so it carries a stable `.id()` for
-// whenever real interactivity lands, not because anything here is
-// clickable yet). Real typing/IME wiring is later-round scope — this
-// crate's `duduclaw-native-gui` sibling's `ime_input` module is the
-// reference for when that happens.
+// ── Interaction scope, WP-A3 (2026-08-22, A-line S5 "殼整合") ──────────────
+// Round 2's "static predisplay" is gone for the query row and the app
+// section: `render()` now takes a live `query: &str` (owned by `ShellView.
+// overlay_ui.launcher_query`, typed via `main.rs`'s root `on_key_down`
+// listener — the exact same "plain `on_key_down`, printable `key_char`
+// appends, `backspace` pops, no IME composition" pattern `duduclaw-native-
+// gui/src/text_field.rs`'s own header comment already documents and
+// accepts as an honest gap, not this file's own invention) and
+// `apps_section` filters `crate::apps::search(query)` — real substring
+// search over `fake_data::DOCK_APPS` (now doubling as this crate's whole
+// app registry, see that const's own doc comment), not two hardcoded
+// canned rows tied to one fixed demo scenario (the old `LauncherAppResult`/
+// `LAUNCHER_APP_RESULTS`, removed). A result row with a known `flatpak_id`
+// is a REAL click-to-launch button (`crate::apps::launch`, `flatpak run
+// <id>`) — today that's exactly one entry (`browser`/Chromium, see
+// `fake_data::DOCK_APPS`'s own header comment for why); every other row
+// stays a non-interactive, honestly-labeled stub, same "only wire what's
+// actually real" convention `home/home_dock.rs`'s Round 3 established for
+// the dock. The delegate card and the files section stay untouched static
+// DEMO content (task brief: "既有交辦框並存、交辦優先序不變") — see
+// `render()`'s own comment below for why they only show in the EMPTY-query
+// state rather than trying to (dishonestly) react to arbitrary typed text
+// with no real NL-delegation/file-search backend behind them yet.
 //
 // Icon glyphs: same "single CJK character, no `gpui::svg()`" convention
 // `home.rs`'s header comment establishes (this codebase has no
 // `gpui::svg()` usage anywhere, and the bundled font stack has no
 // guaranteed pictographic glyph coverage) — the board's own search-icon SVG
 // is dropped rather than risk a tofu box, same as `home.rs`'s menu-bar bell.
-// The Files/Mail app-result rows reuse `fake_data::DOCK_APPS`' own
-// glyph+gradient choices verbatim (see `fake_data.rs`'s doc comment on
-// `LAUNCHER_APP_RESULTS`) since the design board reuses the identical icons.
+// App-result rows reuse `fake_data::DOCK_APPS`' own glyph+gradient choices
+// verbatim since the design board's Files/Mail rows use the identical icons.
 //
 // ── Dark theme (Shell-S1) ─────────────────────────────────────────
 // Every color below now resolves through `palette: ShellPalette` — see
@@ -46,18 +58,20 @@
 // this crate's "light stays byte-identical" constraint holds exactly, while
 // dark gets a real, correct default instead of inheriting pure black.
 
-use gpui::{div, linear_color_stop, linear_gradient, prelude::*, px, rgb, BoxShadow, Div, FontWeight, Stateful};
+use gpui::{div, linear_color_stop, linear_gradient, prelude::*, px, rgb, BoxShadow, Context, Div, FontWeight, Stateful};
 
 use duduclaw_native_gui::theme;
 
-use crate::fake_data;
+use crate::fake_data::{self, DockApp, VerifiedTier};
+use crate::i18n::{t, Key, Locale};
 use crate::palette::ShellPalette;
+use crate::ShellView;
 
 const PANEL_WIDTH: f32 = 660.;
 const PANEL_LEFT: f32 = (1440. - PANEL_WIDTH) / 2.; // 390 — see header comment
 const PANEL_TOP: f32 = 170.;
 
-pub(super) fn render(palette: ShellPalette) -> Stateful<Div> {
+pub(super) fn render(query: &str, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     // Launcher.dc.html: bg `rgba(255,255,255,0.97)` light / `rgba(30,30,33,
     // 0.97)` dark — `surface_raised` in both (see `home.rs`'s
     // `menu_bar_ticker` comment for why not `surface`). Border: opaque
@@ -96,18 +110,37 @@ pub(super) fn render(palette: ShellPalette) -> Stateful<Div> {
         // See this file's header comment on why this is dark-only.
         panel = panel.text_color(theme::alpha(palette.foreground, 1.0));
     }
-    panel
-        .child(query_row(palette))
-        .child(delegate_section(palette))
-        .child(apps_section(palette))
-        .child(files_section(palette))
-        .child(footer(palette))
+    panel = panel.child(query_row(query, palette));
+    // The delegate card and files section are still fixed DEMO content (see
+    // this file's header comment) — showing them alongside a live-typed
+    // query that has nothing to do with "請款單" would be actively
+    // misleading, not just stale, so they only appear in the pre-typing
+    // empty state. A non-empty query shows ONLY the (now real) app results —
+    // "既有交辦框並存、交辦優先序不變" is satisfied by the delegate card
+    // still being the visually FIRST thing a fresh Launcher open shows, not
+    // by forcing it to survive every possible typed query.
+    if query.trim().is_empty() {
+        panel = panel.child(delegate_section(palette)).child(apps_section(query, palette, cx)).child(files_section(palette));
+    } else {
+        panel = panel.child(apps_section(query, palette, cx));
+    }
+    panel.child(footer(palette))
 }
 
-fn query_row(palette: ShellPalette) -> Div {
+fn query_row(query: &str, palette: ShellPalette) -> Div {
     // Launcher.dc.html: border-bottom `#f0f0f2` light / `rgba(255,255,255,
     // 0.08)` dark.
     let border_color = if palette.is_dark() { theme::alpha(0xffffff, 0.08) } else { theme::alpha(0xf0f0f2, 1.0) };
+    let text_color = if query.is_empty() { theme::alpha(palette.text_faint, 1.0) } else { theme::alpha(palette.foreground, 1.0) };
+    // Empty query shows the placeholder (new chrome — see this file's
+    // header comment on why it routes through `crate::i18n` rather than a
+    // plain literal, same boundary `home.rs::ticker_text` already draws).
+    // `Locale::ZhTw` is hardcoded, not read from a real preference — Home/
+    // overlay locale selection is still a documented future step (see
+    // `crate::i18n`'s own header comment), same as every other `t(Locale::
+    // ZhTw, ...)` call site in this crate today.
+    let display: String =
+        if query.is_empty() { t(Locale::ZhTw, Key::LauncherSearchPlaceholder).to_string() } else { query.to_string() };
     div()
         .flex()
         .items_center()
@@ -116,9 +149,10 @@ fn query_row(palette: ShellPalette) -> Div {
         .py(px(18.))
         .border_b_1()
         .border_color(border_color)
-        .child(div().text_size(px(17.)).font_weight(FontWeight::MEDIUM).child(fake_data::LAUNCHER_QUERY))
+        .child(div().text_size(px(17.)).font_weight(FontWeight::MEDIUM).text_color(text_color).child(display))
         // The blinking text cursor — static bar, no actual blink animation
-        // this round (task brief: static predisplay).
+        // this round (unchanged limitation from before WP-A3; only the text
+        // beside it went live).
         .child(div().w(px(2.)).h(px(22.)).bg(theme::alpha(palette.brand, 1.0)))
 }
 
@@ -200,15 +234,34 @@ fn delegate_section(palette: ShellPalette) -> Div {
     )
 }
 
-fn apps_section(palette: ShellPalette) -> Div {
-    let mut rows = div().flex().flex_col().px(px(12.));
-    for item in fake_data::LAUNCHER_APP_RESULTS {
-        rows = rows.child(app_result_row(item, palette));
+/// The Launcher's "app" result category — WP-A3: real `crate::apps::search`
+/// over `fake_data::DOCK_APPS`, not a fixed two-row demo (see this file's
+/// header comment). `cx: &mut Context<ShellView>` threaded through via a
+/// plain `for` loop, not `.iter().map(...)` — `&mut Context<V>` isn't
+/// `Copy`, same wall `overlay/notifications.rs`'s own header comment
+/// documents and works around identically for its approval cards.
+fn apps_section(query: &str, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let results = crate::apps::search(query);
+    let mut section = div().pt(px(6.)).pb(px(4.)).flex().flex_col().child(section_label(fake_data::LAUNCHER_SECTION_APPS, palette));
+    if results.is_empty() {
+        section = section.child(
+            div()
+                .px(px(22.))
+                .py(px(8.))
+                .text_size(px(12.5))
+                .text_color(theme::alpha(palette.text_faint, 1.0))
+                .child(t(Locale::ZhTw, Key::LauncherNoAppResults)),
+        );
+        return section;
     }
-    div().pt(px(6.)).pb(px(4.)).flex().flex_col().child(section_label(fake_data::LAUNCHER_SECTION_APPS, palette)).child(rows)
+    let mut rows = div().flex().flex_col().px(px(12.));
+    for item in results {
+        rows = rows.child(app_result_row(item, palette, cx));
+    }
+    section.child(rows)
 }
 
-fn app_result_row(item: &fake_data::LauncherAppResult, palette: ShellPalette) -> Stateful<Div> {
+fn app_result_row(item: &'static DockApp, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     // Same "white/near-white bordered tile -> dark gradient" exception
     // `home/home_dock.rs::dock_app` applies — see `crate::palette`'s own
     // header comment. Non-bordered (colored) icons keep their identity
@@ -246,7 +299,7 @@ fn app_result_row(item: &fake_data::LauncherAppResult, palette: ShellPalette) ->
         icon = icon.border_1().border_color(border_color);
     }
 
-    div()
+    let mut row = div()
         .id(item.id)
         .flex()
         .items_center()
@@ -256,7 +309,48 @@ fn app_result_row(item: &fake_data::LauncherAppResult, palette: ShellPalette) ->
         .py(px(8.))
         .child(icon)
         .child(div().flex_1().text_size(px(13.5)).child(item.label))
-        .child(div().text_size(px(11.)).text_color(theme::alpha(palette.text_faint, 1.0)).child(item.tag))
+        .child(verified_badge(item.verified, palette));
+
+    // Only a row with a real launch command is a real button — every other
+    // entry stays an honest, non-interactive stub (see this file's header
+    // comment). `item` is `&'static DockApp` (a reference into `fake_data::
+    // DOCK_APPS`), `Copy`, so it captures into `move` with no lifetime/clone
+    // ceremony.
+    if item.flatpak_id.is_some() {
+        let on_click = cx.listener(move |_view, _ev, _window, _cx| {
+            if crate::diag_enabled() {
+                eprintln!("[hit] launcher app row '{}' -> launch", item.id);
+            }
+            crate::apps::launch(item);
+        });
+        row = row.cursor_pointer().hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0))).on_click(on_click);
+    }
+    row
+}
+
+/// The D8 "DuDuClaw Verified" tier badge pill — see `crate::palette::
+/// ShellPalette::verified_bg`/`verified_text`'s own doc comments for why
+/// this resolves through the existing `BadgeKind`/`destructive` tokens
+/// rather than a new color family. Labels are new chrome (no board
+/// precedent — see this file's header comment), so they route through
+/// `crate::i18n` like the placeholder/no-results strings above.
+fn verified_badge(tier: VerifiedTier, palette: ShellPalette) -> Div {
+    let label = match tier {
+        VerifiedTier::Verified => Key::VerifiedTierVerified,
+        VerifiedTier::Works => Key::VerifiedTierWorks,
+        VerifiedTier::Partial => Key::VerifiedTierPartial,
+        VerifiedTier::Unsupported => Key::VerifiedTierUnsupported,
+        VerifiedTier::Unrated => Key::VerifiedTierUnrated,
+    };
+    div()
+        .text_size(px(11.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(palette.verified_text(tier))
+        .bg(palette.verified_bg(tier))
+        .rounded(px(999.))
+        .px(px(8.))
+        .py(px(2.))
+        .child(t(Locale::ZhTw, label))
 }
 
 fn files_section(palette: ShellPalette) -> Div {

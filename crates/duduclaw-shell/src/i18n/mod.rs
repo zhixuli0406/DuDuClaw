@@ -242,6 +242,23 @@ pub enum Key {
     /// a submit is still accepted once the cooldown elapses, this is
     /// informational, not a hard lockout.
     LockThrottledLabel,
+
+    /// WP-A3 (2026-08-22): the Launcher's live search box going from a
+    /// static predisplay to real typing (`overlay/launcher.rs`) introduces
+    /// genuinely new process chrome — same "honest-state messaging is
+    /// chrome, not per-item DESIGN content" boundary the `Notif*` keys
+    /// above already establish (see that block's own comment). The five
+    /// `VerifiedTier*` keys below are the D8 "DuDuClaw Verified" badge
+    /// labels (`fake_data::VerifiedTier`) — also new chrome, no design-board
+    /// precedent (neither `Launcher.dc.html` nor any other board shows a
+    /// Verified badge).
+    LauncherSearchPlaceholder,
+    LauncherNoAppResults,
+    VerifiedTierVerified,
+    VerifiedTierWorks,
+    VerifiedTierPartial,
+    VerifiedTierUnsupported,
+    VerifiedTierUnrated,
 }
 
 /// Look up `key` in `locale`'s catalog. Never falls through to a "missing
@@ -394,6 +411,14 @@ fn zh_tw(key: Key) -> &'static str {
         Key::LockOfflineError => "本機服務未回應，請稍後再試",
         Key::LockVerifyingLabel => "驗證中…",
         Key::LockThrottledLabel => "嘗試次數過多，請稍候再試",
+
+        Key::LauncherSearchPlaceholder => "輸入以搜尋…",
+        Key::LauncherNoAppResults => "沒有符合的 app",
+        Key::VerifiedTierVerified => "已驗證",
+        Key::VerifiedTierWorks => "可用",
+        Key::VerifiedTierPartial => "部分支援",
+        Key::VerifiedTierUnsupported => "不支援",
+        Key::VerifiedTierUnrated => "未評級",
     }
 }
 
@@ -522,6 +547,14 @@ fn en(key: Key) -> &'static str {
         Key::LockOfflineError => "Local service isn't responding. Please try again shortly.",
         Key::LockVerifyingLabel => "Verifying…",
         Key::LockThrottledLabel => "Too many attempts. Please wait a moment.",
+
+        Key::LauncherSearchPlaceholder => "Type to search…",
+        Key::LauncherNoAppResults => "No matching apps",
+        Key::VerifiedTierVerified => "Verified",
+        Key::VerifiedTierWorks => "Works",
+        Key::VerifiedTierPartial => "Partial",
+        Key::VerifiedTierUnsupported => "Unsupported",
+        Key::VerifiedTierUnrated => "Unrated",
     }
 }
 
@@ -650,6 +683,14 @@ fn ja_jp(key: Key) -> &'static str {
         Key::LockOfflineError => "ローカルサービスが応答していません。しばらくしてから再試行してください。",
         Key::LockVerifyingLabel => "確認中…",
         Key::LockThrottledLabel => "試行回数が多すぎます。少し待ってから再試行してください。",
+
+        Key::LauncherSearchPlaceholder => "入力して検索…",
+        Key::LauncherNoAppResults => "該当するアプリがありません",
+        Key::VerifiedTierVerified => "検証済み",
+        Key::VerifiedTierWorks => "動作確認済み",
+        Key::VerifiedTierPartial => "一部対応",
+        Key::VerifiedTierUnsupported => "非対応",
+        Key::VerifiedTierUnrated => "未評価",
     }
 }
 

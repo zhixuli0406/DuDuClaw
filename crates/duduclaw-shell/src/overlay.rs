@@ -87,6 +87,13 @@ pub struct OverlayUiState {
     automation_on: bool,
     proactive_on: bool,
     pause_all_on: bool,
+    /// WP-A3 (2026-08-22): the Launcher's live search box text — see
+    /// `overlay/launcher.rs`'s header comment for why round 2's static
+    /// predisplay became real typing this round. Typed via `main.rs`'s root
+    /// `on_key_down` listener (gated on the Launcher actually being the
+    /// open overlay), cleared by `close_launcher_query` below whenever the
+    /// overlay closes so a fresh open never shows a stale search.
+    pub(crate) launcher_query: String,
 }
 
 impl Default for OverlayUiState {
@@ -100,6 +107,7 @@ impl Default for OverlayUiState {
             automation_on: true,
             proactive_on: true,
             pause_all_on: false,
+            launcher_query: String::new(),
         }
     }
 }
@@ -127,6 +135,19 @@ impl OverlayUiState {
 
     pub fn toggle_pause_all(&mut self) {
         self.pause_all_on = !self.pause_all_on;
+    }
+
+    /// Clears the Launcher search box — called from every path that closes
+    /// an overlay (`main.rs`'s `on_close_overlay`/`on_toggle_launcher`, and
+    /// the backdrop-click listener in `render` below) so reopening the
+    /// Launcher always starts from its empty/pre-typing state rather than
+    /// showing whatever was typed last time. A no-op when it's already
+    /// empty (closing Notifications/ControlCenter calls this too, same as
+    /// every other overlay-close path — cheaper than threading an
+    /// `Overlay`-specific branch through three call sites for a plain
+    /// `String::clear()`).
+    pub(crate) fn close_launcher_query(&mut self) {
+        self.launcher_query.clear();
     }
 }
 
@@ -167,7 +188,7 @@ pub fn render(
         .on_click(on_close);
 
     let panel: Stateful<Div> = match overlay {
-        Overlay::Launcher => launcher::render(palette),
+        Overlay::Launcher => launcher::render(&ui.launcher_query, palette, cx),
         Overlay::Notifications => notifications::render(ui, palette, cx),
         Overlay::ControlCenter => controlcenter::render(ui, audio_ui, palette, cx),
     };
@@ -207,6 +228,17 @@ mod tests {
         assert!(ui.automation_on());
         assert!(ui.proactive_on());
         assert!(!ui.pause_all_on());
+        assert!(ui.launcher_query.is_empty());
+    }
+
+    #[test]
+    fn close_launcher_query_clears_a_typed_search_and_is_a_noop_when_already_empty() {
+        let mut ui = OverlayUiState::default();
+        ui.launcher_query.push_str("chrome");
+        ui.close_launcher_query();
+        assert!(ui.launcher_query.is_empty());
+        ui.close_launcher_query();
+        assert!(ui.launcher_query.is_empty());
     }
 
     #[test]

@@ -427,6 +427,58 @@ impl ShellPalette {
             }
         }
     }
+
+    /// WP-A3 (2026-08-22): resolves the D8 "DuDuClaw Verified" four-tier
+    /// rating (`fake_data::VerifiedTier`) onto this palette's existing
+    /// `BadgeKind`/`destructive` tokens — deliberately NOT a fourth/fifth
+    /// `BadgeKind` variant (same "no board precedent, reuse the plain
+    /// `destructive` field instead of growing the enum" call this module's
+    /// header comment already makes for the Rejected approval outcome).
+    /// `Unrated` (no rating evidence — see that variant's own doc comment)
+    /// resolves through `text_faint` rather than any accent color, since it
+    /// isn't a rating at all.
+    pub(crate) fn verified_bg(&self, tier: crate::fake_data::VerifiedTier) -> Rgba {
+        use crate::fake_data::VerifiedTier;
+        match tier {
+            VerifiedTier::Verified => self.badge_bg(BadgeKind::Success),
+            VerifiedTier::Works => self.badge_bg(BadgeKind::Brand),
+            VerifiedTier::Partial => self.badge_bg(BadgeKind::Warning),
+            // Same destructive-tint recipe `overlay/notifications.rs`'s own
+            // rejected-outcome pill already uses (0.12 light / 0.16 dark).
+            VerifiedTier::Unsupported => theme::alpha(self.destructive, if self.dark { 0.16 } else { 0.12 }),
+            VerifiedTier::Unrated => theme::alpha(self.text_faint, if self.dark { 0.14 } else { 0.10 }),
+        }
+    }
+
+    /// Text color half of [`Self::verified_bg`] — see that fn's own doc
+    /// comment.
+    pub(crate) fn verified_text(&self, tier: crate::fake_data::VerifiedTier) -> Rgba {
+        use crate::fake_data::VerifiedTier;
+        match tier {
+            VerifiedTier::Verified => self.badge_text(BadgeKind::Success),
+            VerifiedTier::Works => self.badge_text(BadgeKind::Brand),
+            VerifiedTier::Partial => self.badge_text(BadgeKind::Warning),
+            VerifiedTier::Unsupported => theme::alpha(self.destructive, 1.0),
+            VerifiedTier::Unrated => theme::alpha(self.text_faint, 1.0),
+        }
+    }
+
+    /// A single solid accent hex for the dock's space-constrained corner
+    /// dot (see `home/home_dock.rs::dock_app`) — `None` for `Unrated`, so
+    /// the dock (unlike the Launcher's roomier badge pill) shows NOTHING
+    /// extra for the common "no rating evidence" case rather than a
+    /// cluttered always-on dot; this is the "無資料誠實顯示" boundary
+    /// applied to a context with no room for the word "未評級" itself.
+    pub(crate) fn verified_accent_dot(&self, tier: crate::fake_data::VerifiedTier) -> Option<u32> {
+        use crate::fake_data::VerifiedTier;
+        match tier {
+            VerifiedTier::Verified => Some(self.success),
+            VerifiedTier::Works => Some(self.brand),
+            VerifiedTier::Partial => Some(self.warning),
+            VerifiedTier::Unsupported => Some(self.destructive),
+            VerifiedTier::Unrated => None,
+        }
+    }
 }
 
 impl Default for ShellPalette {
@@ -602,6 +654,60 @@ mod tests {
         for kind in [BadgeKind::Warning, BadgeKind::Success, BadgeKind::Brand] {
             assert_eq!(light.badge_bg(kind).a, 1.0, "{kind:?}");
             assert!(dark.badge_bg(kind).a < 1.0, "{kind:?}");
+        }
+    }
+
+    // ── WP-A3: DuDuClaw Verified badge ──────────────────────────────────────
+
+    #[test]
+    fn verified_bg_and_text_differ_between_light_and_dark_for_every_tier() {
+        use crate::fake_data::VerifiedTier;
+        let light = ShellPalette::light();
+        let dark = ShellPalette::dark();
+        for tier in
+            [VerifiedTier::Verified, VerifiedTier::Works, VerifiedTier::Partial, VerifiedTier::Unsupported, VerifiedTier::Unrated]
+        {
+            assert_ne!(light.verified_bg(tier), dark.verified_bg(tier), "{tier:?} bg must differ");
+            assert_ne!(light.verified_text(tier), dark.verified_text(tier), "{tier:?} text must differ");
+        }
+    }
+
+    #[test]
+    fn verified_bg_and_text_are_never_fully_transparent() {
+        // A badge nobody can read is worse than no badge — every tier
+        // (including `Unrated`, which has no accent color of its own) must
+        // still resolve to a visible pill.
+        use crate::fake_data::VerifiedTier;
+        for palette in [ShellPalette::light(), ShellPalette::dark()] {
+            for tier in
+                [VerifiedTier::Verified, VerifiedTier::Works, VerifiedTier::Partial, VerifiedTier::Unsupported, VerifiedTier::Unrated]
+            {
+                assert!(palette.verified_bg(tier).a > 0.0, "{tier:?} bg must not be fully transparent");
+                assert!(palette.verified_text(tier).a > 0.0, "{tier:?} text must not be fully transparent");
+            }
+        }
+    }
+
+    #[test]
+    fn verified_accent_dot_is_none_only_for_unrated() {
+        use crate::fake_data::VerifiedTier;
+        for palette in [ShellPalette::light(), ShellPalette::dark()] {
+            assert_eq!(palette.verified_accent_dot(VerifiedTier::Unrated), None);
+            for tier in [VerifiedTier::Verified, VerifiedTier::Works, VerifiedTier::Partial, VerifiedTier::Unsupported] {
+                assert!(palette.verified_accent_dot(tier).is_some(), "{tier:?} must have a dot color");
+            }
+        }
+    }
+
+    #[test]
+    fn verified_unsupported_reuses_the_plain_destructive_token() {
+        // Same "no board precedent, reuse `destructive` instead of a new
+        // color family" call this module's header comment already makes for
+        // the Rejected approval outcome — pin it so a future refactor can't
+        // silently reintroduce a fourth/fifth `BadgeKind` variant instead.
+        use crate::fake_data::VerifiedTier;
+        for palette in [ShellPalette::light(), ShellPalette::dark()] {
+            assert_eq!(palette.verified_accent_dot(VerifiedTier::Unsupported), Some(palette.destructive));
         }
     }
 }
