@@ -47,6 +47,9 @@ mod tests;
 #[cfg(test)]
 mod tests_identity;
 
+#[cfg(all(test, unix))]
+mod tests_takeover;
+
 /// Permanent `#[ignore]` live-bridge harness against the real comp
 /// container stack — see its module doc for the playbook.
 #[cfg(all(test, unix))]

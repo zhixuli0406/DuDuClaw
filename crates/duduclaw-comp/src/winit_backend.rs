@@ -165,6 +165,11 @@ pub fn init_winit(
                         .into_iter()
                         .map(CodriveElement::Solid),
                 );
+                // CD-3 watch mode (task brief item 3, `codrive/watch.rs`):
+                // same per-redraw hook as the highlight expiry check above —
+                // cheap `Instant`-only work, safe for this crate's tight
+                // unthrottled redraw loop.
+                state.codrive_check_watch_idle(std::time::Instant::now());
 
                 // CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): a
                 // second, offscreen render pass of the shadow output into a

@@ -26,9 +26,9 @@ use crate::approval::ApprovalBroker;
 use crate::events_store::EventBusStore;
 use crate::task_store::{ActivityRow, TaskStore};
 
-use super::client::CodriveClient;
+use super::client::{CodriveClient, CodriveCmd};
 use super::config::CodriveConfig;
-use super::script::{CodriveScript, ConsequentialClass};
+use super::script::CodriveScript;
 use super::step::{TOOL_NAME, run_one_step};
 
 /// Refuse-list keywords (design §8-3 initial list): hitting one of these
@@ -43,7 +43,7 @@ pub struct CodriveStepReport {
     pub index: usize,
     pub narration: String,
     /// One of: `applied` / `refused` / `denied` / `dropped_frozen_reapplied`
-    /// / `aborted`.
+    /// / `taken_over` (CD-3) / `aborted`.
     pub outcome: &'static str,
     pub detail: Option<String>,
     pub approval_id: Option<String>,
@@ -56,9 +56,12 @@ pub struct CodriveStepReport {
 pub struct CodriveRunReport {
     pub session_id: String,
     /// e.g. `completed` / `refused_invalid` / `refused_denylist` /
-    /// `refused_credential` / `aborted_connect` / `aborted_approval_denied`
-    /// / `aborted_approval_expired` / `aborted_frozen_timeout` /
-    /// `aborted_emergency_stop` / `aborted_connection_lost`.
+    /// `aborted_connect` / `aborted_approval_denied` /
+    /// `aborted_approval_expired` / `aborted_frozen_timeout` /
+    /// `aborted_emergency_stop` / `aborted_connection_lost`. (CD-3: a
+    /// `Credential`-classed step no longer produces `refused_credential` —
+    /// see `step::take_over_reason`; the step's own outcome becomes
+    /// `taken_over` instead and the script continues.)
     pub final_state: &'static str,
     pub detail: Option<String>,
     pub steps: Vec<CodriveStepReport>,
@@ -128,30 +131,10 @@ pub async fn run_script(
             steps,
         };
     }
-    if let Some(reason) = credential_hit(&script) {
-        duduclaw_security::audit::append_tool_call_denied(
-            home_dir,
-            agent_id,
-            TOOL_NAME,
-            "codrive_refused_credential",
-            &reason,
-            None,
-        );
-        ticker(
-            home_dir,
-            agent_id,
-            "codrive_session",
-            &session_id,
-            &format!("共駕請求被拒（憑證類一律交人）：{reason}"),
-        )
-        .await;
-        return CodriveRunReport {
-            session_id,
-            final_state: "refused_credential",
-            detail: Some(reason),
-            steps,
-        };
-    }
+    // CD-3 (task brief item 1): a credential-classed step is no longer a
+    // whole-script refusal — see `step::take_over_reason` for the
+    // per-step auto-conversion to a `take_over` hand-off. The refuse-list
+    // above (banking/CAPTCHA keywords) is a SEPARATE, unchanged gate.
 
     let cfg = CodriveConfig::from_home(home_dir);
     let (socket_path, token) = match resolve_endpoint(&cfg).await {
@@ -204,6 +187,22 @@ pub async fn run_script(
     )
     .await;
 
+    // CD-3 (task brief item 3, DESIGN §3.4 watch mode): opt-in, whole-
+    // script idle-supervision request. Best-effort — a failed `watch`
+    // toggle degrades to "no idle supervision this run", never aborts the
+    // script (supervision is a safety ENHANCEMENT here, not itself a
+    // safety GATE like the approval/refuse-list checks above).
+    if script.watch_mode {
+        match client.send(&CodriveCmd::Watch { enable: true }).await {
+            Ok(_) => {
+                ticker(home_dir, agent_id, "codrive_session", &session_id, "已啟用旁觀模式（人離開自動暫停）").await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "codrive: failed to enable watch mode — continuing without idle supervision");
+            }
+        }
+    }
+
     // Fail-closed: if the broker can't even open, every consequential step
     // is denied (see `step::run_one_step`'s `broker.is_none()` branch) — a
     // script with no consequential steps still runs fine.
@@ -239,7 +238,9 @@ pub async fn run_script(
         .await
         {
             Ok(s) => {
-                let outcome = if s.reapplied {
+                let outcome = if s.taken_over {
+                    "taken_over"
+                } else if s.reapplied {
                     "dropped_frozen_reapplied"
                 } else {
                     "applied"
@@ -295,15 +296,6 @@ fn denylist_hit(script: &CodriveScript) -> Option<String> {
         }
     }
     None
-}
-
-fn credential_hit(script: &CodriveScript) -> Option<String> {
-    script.steps.iter().enumerate().find_map(|(i, step)| {
-        step.consequential
-            .as_ref()
-            .filter(|c| c.class == ConsequentialClass::Credential)
-            .map(|_| format!("步驟 {} 含憑證類後果動作，一律交人", i + 1))
-    })
 }
 
 async fn resolve_endpoint(cfg: &CodriveConfig) -> Result<(std::path::PathBuf, String), String> {

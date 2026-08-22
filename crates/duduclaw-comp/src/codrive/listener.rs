@@ -252,7 +252,18 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
             InjectCmd::Status => {
                 let frozen = shared.frozen.load(Ordering::SeqCst);
                 let terminated = shared.terminated.load(Ordering::SeqCst);
-                let _ = writeln!(writer, r#"{{"ok":true,"frozen":{frozen},"terminated":{terminated}}}"#);
+                // CD-3: `takeover` distinguishes an agent-initiated hand-off
+                // from an ordinary human-triggered freeze — both read
+                // `frozen:true`, but only a take_over also flips this. Still
+                // answered here, unconditionally (task brief item 2:
+                // "status 除外" — the one query op that always answers, even
+                // mid-takeover, so the driver's `wait_for_resume` poll keeps
+                // working).
+                let takeover = shared.takeover_active.load(Ordering::SeqCst);
+                let _ = writeln!(
+                    writer,
+                    r#"{{"ok":true,"frozen":{frozen},"terminated":{terminated},"takeover":{takeover}}}"#
+                );
                 continue;
             }
             InjectCmd::Resume => {
@@ -326,8 +337,15 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
             // it and let the main thread decide for real; it may still get
             // dropped there. Everything else denies here exactly as
             // before this WP — byte-identical for the non-shadow case.
-            let shadow_bypass_candidate =
-                shared.shadow_active.load(Ordering::SeqCst) && !matches!(cmd, InjectCmd::Shadow { .. });
+            // CD-3 (takeover.rs module doc): an active takeover is a TOTAL
+            // freeze — no shadow-bypass exception, unlike an ordinary
+            // human-triggered freeze. Mirrored here as an atomic (like
+            // `shadow_active`) purely for this optimistic pre-check; the
+            // main thread's `handle_agent_inject` makes the authoritative
+            // call the same way.
+            let shadow_bypass_candidate = shared.shadow_active.load(Ordering::SeqCst)
+                && !shared.takeover_active.load(Ordering::SeqCst)
+                && !matches!(cmd, InjectCmd::Shadow { .. });
 
             if !shadow_bypass_candidate {
                 let (op, x, y) = cmd.describe();
@@ -369,8 +387,11 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
 /// Field-level validation for the variants that carry free-form strings.
 /// Rejecting here (not just in `codrive::exec` on the main thread) means a
 /// malformed command never even reaches the channel — the socket thread is
-/// the trust boundary, `codrive::exec` is trusted executor.
-fn validate(cmd: &InjectCmd) -> Result<(), String> {
+/// the trust boundary, `codrive::exec` is trusted executor. `pub(super)` (not
+/// private) so `codrive/tests_takeover.rs` can exercise the `TakeOver` arm
+/// directly — see that file's module doc for why its scenarios live outside
+/// this file's own `#[cfg(test)]` block.
+pub(super) fn validate(cmd: &InjectCmd) -> Result<(), String> {
     match cmd {
         InjectCmd::Button { btn, state } => {
             super::protocol::parse_button_code(btn)?;
@@ -405,11 +426,21 @@ fn validate(cmd: &InjectCmd) -> Result<(), String> {
             }
             Ok(())
         }
+        InjectCmd::TakeOver { reason } => {
+            if reason.len() > super::protocol::MAX_TAKE_OVER_REASON_BYTES {
+                return Err(format!(
+                    "take_over reason exceeds {} bytes",
+                    super::protocol::MAX_TAKE_OVER_REASON_BYTES
+                ));
+            }
+            Ok(())
+        }
         InjectCmd::Text { .. }
         | InjectCmd::Resume
         | InjectCmd::Status
         | InjectCmd::RotateToken
-        | InjectCmd::Shadow { .. } => Ok(()),
+        | InjectCmd::Shadow { .. }
+        | InjectCmd::Watch { .. } => Ok(()),
     }
 }
 
@@ -756,4 +787,10 @@ mod tests {
 
         let _ = std::fs::remove_file(&sock_path);
     }
+
+    // CD-3 socket-level scenarios (takeover-overrides-shadow-bypass, the
+    // `status` ack's new `takeover` field, `validate`'s new reason-length
+    // check) live in `codrive/tests_takeover.rs`, not here — this file was
+    // already at this project's per-file size convention (200-400 lines
+    // typical, 800 max) before CD-3; see that file's module doc.
 }

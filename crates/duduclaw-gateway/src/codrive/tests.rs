@@ -33,15 +33,20 @@ use super::script::{
 /// `std::env::temp_dir()` resolves to a long per-user `$TMPDIR` on macOS
 /// (`/var/folders/.../T/`) that alone eats most of that budget, so tests
 /// that bind a real `UnixListener` use `/tmp` directly with a short,
-/// 8-hex-char suffix instead of a full UUID.
-fn tempdir(label: &str) -> PathBuf {
+/// 8-hex-char suffix instead of a full UUID. `pub(super)` (not private) so
+/// `tests_takeover.rs` (CD-3's own "new scenarios get their own file"
+/// module, per this file's header comment) can reuse this whole fake-comp
+/// harness instead of duplicating an ~80-line fake server a second time —
+/// unlike `live_tests.rs`'s much smaller `tempdir` duplicate, this harness
+/// is substantial enough that DRY wins over per-file self-containment here.
+pub(super) fn tempdir(label: &str) -> PathBuf {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let p = PathBuf::from("/tmp").join(format!("cdt-{label}-{}", &suffix[..8]));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
 
-fn write_codrive_config(
+pub(super) fn write_codrive_config(
     home: &Path,
     sock_path: &Path,
     token_path: &Path,
@@ -57,12 +62,12 @@ fn write_codrive_config(
 }
 
 /// Shared state a fake comp server exposes back to the test driving it.
-struct FakeComp {
+pub(super) struct FakeComp {
     /// Every post-auth command line received, in order (including ones
     /// rejected for being frozen — the test asserts on `outcome`, not on
     /// this log alone, when that distinction matters).
-    received: Arc<AsyncMutex<Vec<Value>>>,
-    frozen: Arc<AtomicBool>,
+    pub(super) received: Arc<AsyncMutex<Vec<Value>>>,
+    pub(super) frozen: Arc<AtomicBool>,
 }
 
 /// Spawn a fake comp server listening on `home/codrive.sock`, with token
@@ -70,7 +75,7 @@ struct FakeComp {
 /// protocol from the WP brief. `emergency_stop_after` — if set, sends
 /// `{"event":"emergency_stop"}` then closes the connection right after
 /// that many post-auth commands, instead of acking the triggering one.
-fn spawn_fake_comp(
+pub(super) fn spawn_fake_comp(
     home: &Path,
     token: &str,
     emergency_stop_after: Option<usize>,
@@ -152,7 +157,7 @@ fn spawn_fake_comp(
     (sock_path, token_path, FakeComp { received, frozen })
 }
 
-fn plain_step(narration: &str, action: CodriveAction) -> CodriveStep {
+pub(super) fn plain_step(narration: &str, action: CodriveAction) -> CodriveStep {
     CodriveStep {
         narration: narration.to_string(),
         highlight: None,
@@ -161,7 +166,7 @@ fn plain_step(narration: &str, action: CodriveAction) -> CodriveStep {
     }
 }
 
-fn consequential_step(
+pub(super) fn consequential_step(
     narration: &str,
     action: CodriveAction,
     class: ConsequentialClass,
@@ -190,6 +195,7 @@ async fn auth_success_completes_simple_script() {
         target_app: "foot".into(),
         task_summary: "測試".into(),
         steps: vec![plain_step("move", CodriveAction::Move { x: 1.0, y: 2.0 })],
+        watch_mode: false,
     };
     let report = tokio::time::timeout(Duration::from_secs(10), run_script(&home, "agent1", script))
         .await
@@ -216,6 +222,7 @@ async fn auth_failure_aborts_before_any_action() {
         target_app: "foot".into(),
         task_summary: "test".into(),
         steps: vec![plain_step("move", CodriveAction::Move { x: 1.0, y: 2.0 })],
+        watch_mode: false,
     };
     let report = tokio::time::timeout(Duration::from_secs(10), run_script(&home, "agent1", script))
         .await
@@ -235,6 +242,7 @@ async fn deny_keyword_refuses_before_connect() {
         target_app: "chrome".into(),
         task_summary: "填寫 captcha 驗證碼".into(),
         steps: vec![plain_step("click", CodriveAction::Move { x: 1.0, y: 1.0 })],
+        watch_mode: false,
     };
     let report = tokio::time::timeout(Duration::from_secs(5), run_script(&home, "agent1", script))
         .await
@@ -244,9 +252,18 @@ async fn deny_keyword_refuses_before_connect() {
     assert!(report.steps.is_empty());
 }
 
+// CD-3 (task brief item 1): a `Credential`-classed step no longer refuses
+// the whole script — it auto-converts to a `take_over` hand-off. This
+// replaces the CD-1/CD-2-era `credential_class_refuses_before_connect_and_
+// creates_no_approval_row` test, which pinned the superseded behavior; the
+// invariant it protected ("credential class must never create an approval
+// row") is preserved below, just via a different final_state.
 #[tokio::test]
-async fn credential_class_refuses_before_connect_and_creates_no_approval_row() {
-    let home = tempdir("deny-cred");
+async fn credential_class_auto_converts_to_take_over_and_never_sends_the_credential_text() {
+    let home = tempdir("cred-takeover");
+    let (sock, tok, fake) = spawn_fake_comp(&home, "goodtoken", None);
+    write_codrive_config(&home, &sock, &tok, 30, 30);
+
     let script = CodriveScript {
         target_app: "chrome".into(),
         task_summary: "登入銀行".into(),
@@ -258,13 +275,29 @@ async fn credential_class_refuses_before_connect_and_creates_no_approval_row() {
             ConsequentialClass::Credential,
             "輸入登入密碼",
         )],
+        watch_mode: false,
     };
-    let report = tokio::time::timeout(Duration::from_secs(5), run_script(&home, "agent1", script))
+    let report = tokio::time::timeout(Duration::from_secs(10), run_script(&home, "agent1", script))
         .await
         .expect("run_script must finish");
 
-    assert_eq!(report.final_state, "refused_credential");
-    assert!(report.steps.is_empty());
+    assert_eq!(report.final_state, "completed", "detail: {:?}", report.detail);
+    assert_eq!(report.steps.len(), 1);
+    assert_eq!(report.steps[0].outcome, "taken_over");
+    assert_eq!(report.steps[0].approval_id, None, "a take_over step must never carry an approval id");
+
+    let received = fake.received.lock().await;
+    // [take_over, status] — `wait_for_resume` always polls `status` at
+    // least once (see `step::wait_for_resume`), even against this fake
+    // server, which starts unfrozen and so hands back on the first poll.
+    assert_eq!(received.len(), 2, "expected exactly [take_over, status]: {received:?}");
+    assert_eq!(received[0]["op"], "take_over");
+    assert_eq!(received[0]["reason"], "輸入登入密碼", "the reason should be the consequential description, not the credential text");
+    assert!(
+        !received.iter().any(|v| v["op"] == "text"),
+        "the credential text must NEVER be sent to comp: {received:?}"
+    );
+    drop(received);
 
     let broker = ApprovalBroker::open(&home).expect("open broker");
     let pending = broker.list_pending(None).await.expect("list_pending");
@@ -296,6 +329,7 @@ async fn approved_consequential_step_sends_action_only_after_decision() {
                 "執行輸入的指令",
             ),
         ],
+        watch_mode: false,
     };
 
     let home2 = home.clone();
@@ -349,6 +383,7 @@ async fn denied_consequential_step_never_sends_action_and_aborts() {
             ConsequentialClass::Delete,
             "刪除選取的檔案",
         )],
+        watch_mode: false,
     };
 
     let home2 = home.clone();
@@ -391,6 +426,7 @@ async fn expired_consequential_step_never_sends_action_and_aborts() {
             ConsequentialClass::Purchase,
             "送出付款表單",
         )],
+        watch_mode: false,
     };
 
     let report = tokio::time::timeout(Duration::from_secs(10), run_script(&home, "agent1", script))
@@ -441,6 +477,7 @@ async fn frozen_action_is_reapplied_after_resume() {
         target_app: "foot".into(),
         task_summary: "移動游標".into(),
         steps: vec![plain_step("移動", CodriveAction::Move { x: 5.0, y: 5.0 })],
+        watch_mode: false,
     };
     let report = tokio::time::timeout(Duration::from_secs(10), run_script(&home, "agent1", script))
         .await
@@ -466,6 +503,7 @@ async fn frozen_forever_aborts_on_session_timeout() {
         target_app: "foot".into(),
         task_summary: "移動游標".into(),
         steps: vec![plain_step("移動", CodriveAction::Move { x: 5.0, y: 5.0 })],
+        watch_mode: false,
     };
     let report = tokio::time::timeout(Duration::from_secs(10), run_script(&home, "agent1", script))
         .await
@@ -487,6 +525,7 @@ async fn emergency_stop_event_aborts_the_script() {
         target_app: "foot".into(),
         task_summary: "移動游標".into(),
         steps: vec![plain_step("移動", CodriveAction::Move { x: 5.0, y: 5.0 })],
+        watch_mode: false,
     };
     let report = tokio::time::timeout(Duration::from_secs(10), run_script(&home, "agent1", script))
         .await

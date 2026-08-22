@@ -17,8 +17,22 @@
 // table): `key_name` (named functional keys), `status` (read-only query),
 // `highlight` (target highlight box). `auth` is deliberately NOT a variant
 // here — see `AuthLine` below.
+//
+// CD-3 additions (task brief items 1/3, DESIGN §5's "接手/交還＋watch mode"
+// row — full behavior lives in `codrive/takeover.rs` and `codrive/watch.rs`):
+// `take_over` (agent-initiated hand-off to the human, e.g. a login step) and
+// `watch` (toggles idle-based auto-pause supervision for the rest of this
+// session's trajectory).
 
 use serde::Deserialize;
+
+/// Hard cap on `take_over`'s `reason` field, bytes. This crate has no
+/// `duduclaw_core::truncate_chars` dependency (deliberately dependency-thin,
+/// see Cargo.toml's workspace-detach comment) — reject-not-truncate avoids
+/// needing a CJK-safe byte-truncation helper here for what's already bounded
+/// by `listener.rs::MAX_LINE_BYTES` anyway; this is a tighter, more honest
+/// limit specific to one human-readable field.
+pub const MAX_TAKE_OVER_REASON_BYTES: usize = 500;
 
 /// One line of the injection protocol, `{"op": "...", ...}`.
 ///
@@ -61,6 +75,20 @@ use serde::Deserialize;
 ///   codrive_set_shadow`, `codrive/shadow.rs`) — it moves real windows in
 ///   `self.space`, so it's subject to the same frozen/terminated gates as
 ///   `move`/`button`/`key`/`text`/`highlight`.
+/// - `{"op":"take_over","reason":"登入頁需要人工輸入密碼"}` — CD-3: the agent
+///   proactively yields the desktop to the human (DESIGN §3.1 "agent 出
+///   take_over 動作 → 同上（主動交棒）"). Reaches the main thread
+///   (`codrive::handle_agent_inject` → `DuduclawComp::codrive_take_over`,
+///   `codrive/takeover.rs`) — it freezes the seat exactly like human input
+///   does, plus marks the freeze as agent-initiated (blocks the shadow-
+///   bypass exception; see `takeover.rs`'s module doc) and audits
+///   `takeover_started`. Ends the same way any freeze ends — human-side
+///   Super+Enter (`human_resume`) — which additionally audits
+///   `takeover_ended`.
+/// - `{"op":"watch","enable":true|false}` — CD-3: toggles watch-mode idle
+///   supervision (DESIGN §3.4 "watch mode…人離開即自動暫停") for the rest of
+///   this session. Reaches the main thread (`DuduclawComp::codrive_set_watch`,
+///   `codrive/watch.rs`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum InjectCmd {
@@ -74,6 +102,8 @@ pub enum InjectCmd {
     Highlight { x: f64, y: f64, w: f64, h: f64, ms: Option<u64> },
     RotateToken,
     Shadow { enable: bool },
+    TakeOver { reason: String },
+    Watch { enable: bool },
 }
 
 impl InjectCmd {
@@ -92,6 +122,8 @@ impl InjectCmd {
             InjectCmd::Highlight { x, y, .. } => ("highlight", Some(*x), Some(*y)),
             InjectCmd::RotateToken => ("rotate_token", None, None),
             InjectCmd::Shadow { .. } => ("shadow", None, None),
+            InjectCmd::TakeOver { .. } => ("take_over", None, None),
+            InjectCmd::Watch { .. } => ("watch", None, None),
         }
     }
 }

@@ -2134,3 +2134,157 @@ this round added a `tcp dport 7778 accept` rule (for a guest-local
 `tcp_unix_bridge.py` Unix↔TCP relay, QEMU `hostfwd`'d to the host) that is
 **not persisted** (VM was stopped via QMP `quit`, not a graceful `nft
 save`), so a future round needing host→guest TCP again must re-add it.
+
+## CD-3: take_over / watch mode (2026-08-22)
+
+Implements DESIGN-codrive-desktop-2026-08.md §5's "接手/交還＋watch mode"
+row (recorded as CD-2 in that table; the numeral CD-3 is used throughout
+this section and in the gateway crate per the task brief's own numbering
+note — the statutory CD-2 slot was already consumed by the shadow-workspace
+round). Two new comp-side ops, both fully documented in their own module
+docs: `{"op":"take_over","reason":"…"}` (`src/codrive/takeover.rs`) and
+`{"op":"watch","enable":true|false}` (`src/codrive/watch.rs`). New files
+only — `mod.rs`/`listener.rs`/`state.rs`/`input.rs`/`winit_backend.rs`/
+`shadow.rs` each got the minimum wiring needed (new `InjectCmd` match arms,
+new `CodriveShared`/`DuduclawComp` fields, an exhaustiveness arm in
+`shadow::freeze_bypass_decision`, one call into `codrive_check_watch_idle`
+from the redraw loop). `mod.rs` sits at exactly 800 lines and `listener.rs`
+at 796 after this round — both at this project's hard per-file cap; a
+follow-up round should consider splitting `CodriveShared`'s struct
+definition + its five constructors out of `mod.rs` into its own file (the
+same "new logic → new file" move this round already applied to everything
+past the struct itself) if a future WP needs to add another field there.
+
+### State-machine relationship (takeover / frozen / watch-paused / shadow)
+
+Four independent-but-interacting pieces of state, all on `DuduclawComp`/
+`CodriveShared`:
+
+| State flag | Set by | Cleared by | Effect |
+|---|---|---|---|
+| `frozen` (existing, CD-0) | any human input, `take_over`, watch-idle timeout | `human_resume` (Super+Enter), watch-idle auto-resume | Denies every injection/query op except `status`, UNLESS shadow-bypass-eligible |
+| `codrive_takeover_active` (CD-3) | `take_over` op | `human_resume`, `emergency_stop` | On top of `frozen`: disables the shadow-bypass exception entirely (§3.4 "零例外") |
+| `codrive_watch_paused` (CD-3) | idle timeout while `codrive_watch_active` | the VERY NEXT human input event (no explicit resume needed), or `human_resume`/`emergency_stop`/`watch:false` | Sets `frozen` like any other cause; its own clearing path is the ONLY one that doesn't require Super+Enter |
+| `codrive_shadow_active` (CD-2) | `{"op":"shadow","enable":true}` | `{"op":"shadow","enable":false}`, `human_resume`, `emergency_stop` | Makes shadow-confined ops bypass `frozen` — UNLESS `codrive_takeover_active` is also true |
+
+Worked-out interactions:
+- **Plain human touch, no takeover, shadow active**: `frozen=true`,
+  `codrive_takeover_active=false` → shadow-confined ops still apply
+  (pre-existing WP-CD2-freeze-scope behavior, byte-identical).
+- **`take_over`, shadow active**: `frozen=true`,
+  `codrive_takeover_active=true` → shadow-confined ops ALSO denied now —
+  the one behavior CD-3 makes strictly stronger than an ordinary freeze,
+  because a credential window is a total sensory blackout regardless of
+  what else is running.
+- **Watch-idle pause, shadow active**: `frozen=true` from a TIMER, not a
+  takeover (`codrive_takeover_active` stays `false`) → shadow-confined ops
+  still apply, same as plain human touch — "shadow session 不受 watch 暫停"
+  falls out of the SAME mechanism, not a special case.
+- **`take_over` while already watch-paused (or vice versa)**: both flags
+  can be true simultaneously (independent bookkeeping); `human_resume`
+  clears both unconditionally, regardless of which one (or both) applied.
+
+### Container verification (this round)
+
+`cargo build` / `cargo clippy --all-targets -- -D warnings` / `cargo test`
+inside the reproducible Docker command this file's earlier sections
+already document (same `rust:bookworm` image + cached cargo/target
+volumes): all three green, **70 tests passing** (up from CD-2's 54 — 16
+new: 2 in `takeover.rs`, 6 in `watch.rs`, 2 new arms in `shadow.rs`'s
+`freeze_bypass_decision` tests, 8 in the new `tests_takeover.rs` socket-
+level integration file), zero clippy warnings.
+
+### Live nested-headless verification (this round, `DUDUCLAW_CODRIVE_DEBUG_STDIN=1`)
+
+Both new features are driven end-to-end against a REAL running
+`duduclaw-comp` process (weston headless → comp → foot, same three-layer
+stack as every prior round) — `take_over` is agent-initiated (a plain
+socket op, no real input device needed at all, so this round's evidence for
+it is NOT a container-limitation stand-in the way Super+Esc/Super+Enter
+detection itself is), and watch-mode's resume path only needs "any human
+input event", which `simulate_human`/`simulate_super_enter` legitimately
+proxy for (same "drives the state machine, not the hardware event
+delivery" category `debug_sim.rs`'s module doc already establishes).
+
+**take_over round-trip** (`DUDUCLAW_CODRIVE_WATCH_IDLE_SECS=5` set for the
+same run):
+```
+STATUS_BEFORE:  {"ok":true,"frozen":false,"terminated":false,"takeover":false}
+TAKE_OVER ->    (accepted; comp pushes {"event":"takeover_started"})
+STATUS_DURING:  {"ok":true,"frozen":true,"terminated":false,"takeover":true}
+MOVE_WHILE_TAKEOVER -> denied (audit: inject_dropped op:move, frozen:true)
+[echo simulate_super_enter >&9]
+STATUS_AFTER_RESUME: frozen:false
+MOVE_AFTER_RESUME:   {"ok":true,"frozen":false} (applied — audit inject_applied op:move x:11.0 y:11.0)
+```
+Audit trail excerpt (verbatim):
+```
+{"kind":"takeover_started","op":"take_over","detail":"reason=login page needs a human; frame_feed:none (no screencopy/screenshot mechanism implemented at this stage — see DESIGN §3.4, reserved for CD-4)","frozen":true}
+{"kind":"inject_applied","op":"take_over","frozen":true}
+{"kind":"inject_dropped","op":"move","x":10.0,"y":10.0,"detail":"agent seat frozen (human input active) — dropped, not buffered","frozen":true}
+{"kind":"resume","op":"human_super_enter","frozen":false}
+{"kind":"takeover_ended","detail":"human_super_enter","frozen":false}
+```
+Confirms, with real audit evidence: takeover freezes on arrival (`status`
+flips `takeover:true` alongside `frozen:true`), every injection op is
+denied while active (`status` itself still answers per task brief item 2),
+the ending is the ordinary Super+Enter path plus a dedicated
+`takeover_ended` line, and the honest `frame_feed:none` claim (task brief
+item 2 — this stage genuinely has no screen-copy mechanism, see
+`takeover.rs`'s module doc) is present verbatim in the audit trail.
+
+**Watch-mode idle round-trip** (threshold set to 5s via the env var):
+```
+WATCH_ON:              {"ok":true,"frozen":false}
+STATUS_JUST_ENABLED:   frozen:false  (enabling reset the idle clock — no false trigger)
+[sleep 7s, past the 5s threshold, no human input]
+STATUS_AFTER_IDLE:     {"ok":true,"frozen":true,"terminated":false,"takeover":false}
+[echo simulate_human >&9]
+STATUS_AFTER_PRESENCE: {"ok":true,"frozen":false,"terminated":false,"takeover":false}
+```
+Audit trail excerpt:
+```
+{"kind":"watch_enabled","op":"watch","frozen":false}
+{"kind":"watch_paused","detail":"idle_for=5s (threshold=5s)","frozen":true}
+{"kind":"watch_resumed","detail":"human_input","frozen":false}
+```
+Confirms: idle timeout freezes the seat WITHOUT setting `takeover:true`
+(independent freeze cause, as designed), the pause lifts on the very next
+human input with NO explicit Super+Enter (the `watch_resumed` line, not a
+`resume` line — a real behavioral difference from every other frozen state
+this crate has), and the 5-second real-clock measurement matches the
+configured threshold (`idle_for=5s` against a 7s sleep, i.e. it fired at
+the threshold, not late).
+
+### Honest stub / limitation list (this round)
+
+- **Real-hardware QMP round not run this session** — everything above is
+  container-level (nested headless weston + debug-stdin simulator). Given
+  `take_over` reaches the seat via the socket (no real input device
+  involved at all) and watch-mode's resume path only needs "a human input
+  event happened" (which the debug-stdin simulator legitimately stands in
+  for, same category as CD-0/CD-1's own container rounds), this is
+  reasonably strong evidence for the state-machine logic itself — but the
+  VM/QMP round's own unique value (real Super+Enter chord timing quirks,
+  visual confirmation) was NOT re-run for CD-3 specifically. Left for
+  acceptance side, same pattern every prior CD round has used.
+- **Takeover-blocks-shadow-bypass interaction is unit-tested, not container-
+  live-verified** — `shadow.rs`'s `freeze_bypass_decision_take_over_and_
+  watch_never_bypass` test and the two new `tests_takeover.rs` socket-level
+  tests (`frozen_with_takeover_active_denies_even_with_shadow_active`,
+  `frozen_with_shadow_active_and_no_takeover_still_forwards`) pin the exact
+  contract, but this round's live run did not additionally spin up a real
+  shadow session + take_over simultaneously against a real second window.
+- **`DUDUCLAW_CODRIVE_WATCH_IDLE_SECS` is an env var, checked once at
+  process start** (`watch.rs` module doc explains the "env var, not CLI
+  flag or config file" choice) — an operator changing it mid-run has no
+  effect until restart, same limitation `DUDUCLAW_CODRIVE_DEBUG_STDIN`
+  already has.
+- **No frame-supply mechanism exists at this stage at all** (confirmed via
+  `Cargo.toml`'s enabled smithay features + a repo-wide grep before writing
+  `takeover.rs`'s module doc) — so "感知/事件流停止" for `take_over` is
+  currently satisfied entirely by the existing `frozen` gate; there is
+  nothing separate to additionally cut off. The `frame_feed:none` audit
+  note reserves the vocabulary for CD-4's perception upgrade (C-L2/C-L3)
+  to fill in honestly once a real mechanism exists — this is not deferred
+  work silently dropped, it's a documented non-applicability at this stage.

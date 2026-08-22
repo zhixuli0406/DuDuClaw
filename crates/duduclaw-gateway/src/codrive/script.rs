@@ -24,6 +24,11 @@ pub const MAX_CONSEQUENTIAL_DESC_CHARS: usize = 300;
 /// `wait{ms}` is clamped, not rejected — a caller asking for a longer
 /// pause just gets the ceiling instead of the whole script failing.
 pub const MAX_WAIT_MS: u32 = 10_000;
+/// `take_over`'s `reason` char cap — mirrors comp's own `MAX_TAKE_OVER_
+/// REASON_BYTES` byte cap (`duduclaw-comp/src/codrive/protocol.rs`) with a
+/// CJK-safe char count instead of a byte count (this crate, unlike comp,
+/// has `duduclaw_core::truncate_chars` available).
+pub const MAX_TAKE_OVER_REASON_CHARS: usize = 200;
 
 /// The full script one `codrive_run` call executes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +36,13 @@ pub struct CodriveScript {
     pub target_app: String,
     pub task_summary: String,
     pub steps: Vec<CodriveStep>,
+    /// CD-3 (DESIGN §3.4 "Watch mode…敏感情境觸發後，該軌跡剩餘全程要求人在
+    /// 場"): opt-in, whole-script idle-supervision request — sent to comp as
+    /// `{"op":"watch","enable":true}` right after connecting. `false`
+    /// (comp's default) when omitted — existing callers/scripts are
+    /// unaffected.
+    #[serde(default)]
+    pub watch_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,14 +78,28 @@ pub enum CodriveAction {
     Text { s: String },
     KeyName { name: String },
     Wait { ms: u32 },
+    /// CD-3 (DESIGN §3.1 "agent 出 take_over 動作 → 同上（主動交棒）", task
+    /// brief item 1 "script step 可宣告 take_over（例如登入步）"): this
+    /// step's whole "action" is handing the desktop to the human — see
+    /// `driver.rs`/`step.rs`'s `take_over_reason`/`run_take_over_step` for
+    /// how it's dispatched (never through `send_step_actions`, and never
+    /// gated by `consequential`/ApprovalBroker — a take_over step neither
+    /// needs nor gets an approval row, same invariant credential-class
+    /// auto-conversion already had).
+    TakeOver { reason: String },
 }
 
-/// Closed enum of consequential-step classes. `Credential` is refused at
-/// the whole-script level before any connection is attempted (see
-/// `driver::credential_hit`), so it should never reach the per-step
-/// approval path — it stays a real variant here (not special-cased out of
-/// the schema) so a script that only *mentions* it still parses and gets
-/// an honest "refused" report instead of a schema error.
+/// Closed enum of consequential-step classes. `Credential` is CD-3's
+/// `take_over` auto-conversion trigger (see `step::take_over_reason`) — a
+/// step marked `Credential` never reaches `gate_consequential`/
+/// ApprovalBroker at all (an approval dialog asking "approve entering your
+/// password?" makes no sense when the whole point is the human types it
+/// themselves); it is instead routed straight to a take_over hand-off,
+/// same as an explicit `CodriveAction::TakeOver` step. (Superseded CD-1/
+/// CD-2 behavior: a `Credential`-classed step used to refuse the WHOLE
+/// script upfront — task brief item 1 replaced that with this per-step
+/// auto-conversion; the whole-script refuse-list in `driver.rs` for
+/// banking-page/CAPTCHA keywords is unrelated and unchanged.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsequentialClass {
@@ -128,8 +154,12 @@ impl CodriveScript {
         for step in &mut self.steps {
             step.narration =
                 duduclaw_core::truncate_chars(step.narration.trim(), MAX_NARRATION_CHARS);
-            if let CodriveAction::Wait { ms } = &mut step.action {
-                *ms = (*ms).min(MAX_WAIT_MS);
+            match &mut step.action {
+                CodriveAction::Wait { ms } => *ms = (*ms).min(MAX_WAIT_MS),
+                CodriveAction::TakeOver { reason } => {
+                    *reason = duduclaw_core::truncate_chars(reason.trim(), MAX_TAKE_OVER_REASON_CHARS);
+                }
+                CodriveAction::Move { .. } | CodriveAction::Click { .. } | CodriveAction::Text { .. } | CodriveAction::KeyName { .. } => {}
             }
             if let Some(c) = &mut step.consequential {
                 c.description = duduclaw_core::truncate_chars(
@@ -158,6 +188,7 @@ mod tests {
                     consequential: None,
                 })
                 .collect(),
+            watch_mode: false,
         }
     }
 
