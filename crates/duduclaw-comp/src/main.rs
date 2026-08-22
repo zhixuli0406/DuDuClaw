@@ -42,6 +42,7 @@ mod seat_order;
 mod shell_control;
 mod state;
 mod udev_backend;
+mod window_policy;
 mod winit_backend;
 
 use smithay::reexports::{

@@ -131,6 +131,14 @@ pub fn init_winit(
                     None,
                     None,
                 );
+                // WM-1: the reserved bands are computed against the output, so
+                // a changed output has to re-drive the policy or every already
+                // mapped window keeps the old work area (an app window would
+                // then either cover the dock or float short of it). Cheap and
+                // idempotent — `apply_window_policy` sends a configure only
+                // when something actually changed, and never moves a window
+                // that is already where the policy wants it.
+                state.reapply_window_policy_all();
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {
