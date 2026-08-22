@@ -99,7 +99,15 @@ pub(crate) fn render(
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
     schedule_clock_tick(cx);
-    schedule_stale_check(cx);
+    // The gateway-data poll (task brief's own "鎖定期間資料輪詢維持（30s 刷
+    // 件數）") is the SAME single checker the Notifications panel uses, not
+    // a second timer of this surface's own — see this file's header comment
+    // on why this surface never maintains an independent poll of the same
+    // data, and `overlay::notifications::schedule_stale_check`'s own doc
+    // comment for the WP-A4-4 pile-up that a near-duplicate copy here (as
+    // this file carried until 2026-08-22) helped produce. Both calls are
+    // idempotent claims, so calling them from a render body is safe.
+    crate::overlay::notifications::schedule_stale_check(cx);
 
     let privacy = super::privacy_from_env();
     let (time_text, date_text) = now_local_strings();
@@ -559,39 +567,44 @@ fn apply_unlock_result(view: &mut ShellView, result: Result<(), crate::gateway_c
 
 // ── Background timers ──────────────────────────────────────────────────
 
-/// One-shot, self-re-arming timer that just calls `cx.notify()` while
-/// locked — same "arm again every render pass, closing the surface stops
-/// new timers from being armed" shape `overlay/notifications.rs`'s own
-/// `schedule_stale_check` establishes, repurposed here for a pure repaint
-/// (no data fetch) so the clock keeps advancing even when the gateway is
-/// unreachable (task brief: "gateway 不可達時...純時鐘照常").
+/// The ONE clock-advance timer — a pure repaint (no data fetch) so the
+/// clock keeps ticking even when the gateway is unreachable (task brief:
+/// "gateway 不可達時...純時鐘照常").
+///
+/// WP-A4-4 (2026-08-22): this used to arm a fresh one-shot timer on every
+/// render pass and rely on repaints to re-arm it — while itself being a
+/// pure repaint trigger. Every repaint caused by anything else (the
+/// approvals poll settling, an unlock attempt, a summary-card update)
+/// therefore added another permanent tick to the pile, and each of those
+/// added more. On the real 值班機 that ran unattended for 5h48m and ended
+/// with `cage` — whose only client is this shell — burning ~100% CPU on a
+/// completely static screen. Now: claim one slot (`LockScreenState::
+/// try_arm_clock_timer`), then loop internally; the loop exits and releases
+/// the slot the moment the screen is no longer locked, so an unlocked Home
+/// costs nothing and the next lock re-arms exactly one.
 fn schedule_clock_tick(cx: &mut Context<ShellView>) {
     cx.spawn(async move |weak, cx| {
-        cx.background_executor().timer(CLOCK_TICK_INTERVAL).await;
-        let _ = weak.update(cx, |view, cx| {
-            if view.lockscreen.is_locked() {
+        let claimed = weak.update(cx, |view, _cx| view.lockscreen.try_arm_clock_timer()).unwrap_or(false);
+        if !claimed {
+            return;
+        }
+        loop {
+            cx.background_executor().timer(CLOCK_TICK_INTERVAL).await;
+            let keep_ticking = weak.update(cx, |view, cx| {
+                if !view.lockscreen.is_locked() {
+                    view.lockscreen.disarm_clock_timer();
+                    return false;
+                }
                 cx.notify();
+                true
+            });
+            match keep_ticking {
+                Ok(true) => {}
+                // `Ok(false)` already released the slot; `Err` means the
+                // view (and its state) is gone.
+                Ok(false) | Err(_) => return,
             }
-        });
-    })
-    .detach();
-}
-
-/// Same self-re-arming shape as `schedule_clock_tick` above, but for the
-/// gateway data itself — task brief's own cadence ("鎖定期間資料輪詢維
-/// 持（30s 刷件數）"), reusing `overlay::notifications_feed::
-/// REFRESH_STALE_AFTER` (30s) as the threshold and `overlay::notifications::
-/// trigger_refresh_if_stale` (widened to `pub(crate)` this round) as the
-/// actual dispatch — see this file's header comment on why this surface
-/// does not maintain a second, independent poll of the same data.
-fn schedule_stale_check(cx: &mut Context<ShellView>) {
-    cx.spawn(async move |weak, cx| {
-        cx.background_executor().timer(crate::overlay::notifications_feed::REFRESH_STALE_AFTER).await;
-        let _ = weak.update(cx, |view, cx| {
-            if view.lockscreen.is_locked() {
-                crate::overlay::notifications::trigger_refresh_if_stale(view, cx);
-            }
-        });
+        }
     })
     .detach();
 }

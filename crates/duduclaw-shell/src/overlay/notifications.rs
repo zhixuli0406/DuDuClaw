@@ -41,10 +41,29 @@
 // a session bootstrap + list fetch the first time, or a fresh list fetch
 // when the last one is older than `notifications_feed::REFRESH_STALE_AFTER`
 // (task brief cadence: "30s＋開面板即刷"). `render()` below additionally
-// arms a recurring `cx.spawn` timer WHILE the panel is open (started once,
-// self-cancelling when the overlay closes — see `content()`'s own comment)
+// makes sure the ONE periodic checker is running (`schedule_stale_check`)
 // so the pending list and the home menu-bar ticker both stay live without
 // the operator needing to close and reopen the panel.
+//
+// ── WP-A4-4 (2026-08-22): the appliance VM's 429 storm ──────────────────
+// On the real 值班機, `journalctl -u duduclaw-kiosk` showed six-plus
+// identical `approvals RPC failed: ... 429 Too Many Requests` lines PER
+// SECOND, and `cage` (whose only client is this shell) sat at ~100% CPU
+// with a static screen. Three defects compounded, all fixed this round:
+//   1. `schedule_stale_check` armed a NEW one-shot timer on every render
+//      pass while relying on repaints for continuity, and the refresh it
+//      triggers itself causes repaints — so the pending-timer count only
+//      ever grew. Now: one claimed slot + a self-re-arming loop.
+//   2. `NotificationsFeed::apply_list_err` left `last_refreshed_at`
+//      untouched, so `is_stale()` was permanently true after the first
+//      failure and every timer that landed while no fetch was in flight
+//      fired another one immediately. Now: `overlay::notifications_backoff`
+//      (exponential + jitter, 429 gets a much longer base, 60s ceiling).
+//   3. Every failure printed a line. Now: first-of-streak, kind changes,
+//      and powers of two, with the suppressed count carried forward.
+// A fourth, smaller change removes the repaints that a background poll
+// caused on surfaces that draw nothing affected by it — see
+// `trigger_refresh_if_stale`'s own comment on the busy dot.
 //
 // `cx: &mut Context<ShellView>` is threaded through via a plain `for` loop
 // when building approval cards, NOT `.iter().map(...)` — this crate's own
@@ -68,6 +87,7 @@ use gpui::{div, linear_color_stop, linear_gradient, prelude::*, px, rgb, App, Cl
 
 use duduclaw_native_gui::theme;
 
+use super::notifications_backoff::{FailureKind, LogVerdict};
 use super::notifications_feed::{ApprovalRow, FeedStatus, NotificationsFeed, RowDecision};
 use super::OverlayUiState;
 use crate::gateway_client::{self, ApprovalItem};
@@ -118,7 +138,17 @@ pub(crate) fn trigger_refresh_if_stale(view: &mut ShellView, cx: &mut Context<Sh
         // a second attempt behind this one.
         return;
     }
-    cx.notify();
+    // WP-A4-4 "無變化不 notify": the ONLY thing this state change draws is
+    // the panel header's busy dot (`header`'s `is_busy` argument), and the
+    // panel is the only surface that draws it. Home's menu-bar ticker and
+    // the lockscreen summary card both read `pending_count()`, which a
+    // dispatch cannot have changed yet. Repainting them here was one of the
+    // two renders per poll cycle that fed the appliance VM's timer pile-up
+    // (see `schedule_stale_check` below) — with the panel closed, this
+    // whole cycle is now repaint-free unless the DATA actually moves.
+    if notifications_panel_open(view) {
+        cx.notify();
+    }
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -130,8 +160,13 @@ pub(crate) fn trigger_refresh_if_stale(view: &mut ShellView, cx: &mut Context<Sh
         match rx.try_recv() {
             Ok(outcome) => {
                 let _ = weak.update(cx, |view, cx| {
-                    apply_fetch_outcome(&mut view.overlay_ui.notifications, outcome);
-                    cx.notify();
+                    let changed = apply_fetch_outcome(&mut view.overlay_ui.notifications, outcome);
+                    // Same rule as the dispatch-side notify above, plus the
+                    // panel's own busy dot going back OFF (which only the
+                    // panel draws, and only while it is open).
+                    if changed || notifications_panel_open(view) {
+                        cx.notify();
+                    }
                 });
                 break;
             }
@@ -141,6 +176,14 @@ pub(crate) fn trigger_refresh_if_stale(view: &mut ShellView, cx: &mut Context<Sh
         cx.background_executor().timer(POLL_INTERVAL).await;
     })
     .detach();
+}
+
+/// Is the Notifications panel the overlay currently on screen? `ShellView.
+/// surface` is a private field, but this module is a DESCENDANT of the
+/// crate root where `ShellView` is defined, so it is in scope here — the
+/// same access `open_and_refresh` above already relies on.
+fn notifications_panel_open(view: &ShellView) -> bool {
+    view.surface.overlay() == Some(Overlay::Notifications)
 }
 
 /// Runs entirely on a background `std::thread` — never called from gpui's
@@ -167,13 +210,32 @@ fn fetch_once(existing_jwt: Option<String>) -> Result<(Option<String>, Vec<Appro
     Ok((new_jwt, items))
 }
 
-fn apply_fetch_outcome(feed: &mut NotificationsFeed, outcome: Result<(Option<String>, Vec<ApprovalItem>), gateway_client::GatewayError>) {
+/// Applies one settled fetch and emits (at most) one stderr line for it.
+/// Returns whether anything a surface actually DRAWS changed — see
+/// `NotificationsFeed::apply_list_ok`'s own doc comment for why `busy`
+/// deliberately isn't part of that answer.
+///
+/// ── Log denoise (WP-A4-4) ──────────────────────────────────────────────
+/// The appliance VM's journal carried six-plus IDENTICAL failure lines per
+/// second for minutes on end. The frequency itself is fixed by the backoff
+/// plus the timer-arm guard, but a wedged gateway would still produce one
+/// line per retry forever, so `notifications_backoff::RefreshBackoff::
+/// record_failure`'s verdict gates the line too: first failure of a streak,
+/// any change of failure kind, then powers of two. Suppressed failures are
+/// COUNTED and reported by the next emitted line — this is "stop repeating
+/// yourself", never "swallow it" (5.誠實回報). Recovery gets exactly one
+/// line, and only when there was a streak to recover from.
+fn apply_fetch_outcome(feed: &mut NotificationsFeed, outcome: Result<(Option<String>, Vec<ApprovalItem>), gateway_client::GatewayError>) -> bool {
     match outcome {
         Ok((new_jwt, items)) => {
             if let Some(jwt) = new_jwt {
                 feed.apply_session_ok(jwt);
             }
-            feed.apply_list_ok(items);
+            let ok = feed.apply_list_ok(items);
+            if let Some(streak) = ok.recovered {
+                eprintln!("[notifications] gateway reachable again after {streak} consecutive failure(s)");
+            }
+            ok.changed
         }
         // Distinguishes "never got a session at all" from "had one, but the
         // RPC itself failed" only for the stderr diagnostic's own wording —
@@ -181,13 +243,21 @@ fn apply_fetch_outcome(feed: &mut NotificationsFeed, outcome: Result<(Option<Str
         // (`NotificationsFeed::apply_session_err`/`::apply_list_err` — see
         // `gateway_client::GatewayError`'s own doc comment for why the UI
         // layer doesn't need the distinction beyond that).
-        Err(gateway_client::GatewayError::Session(e)) => {
-            eprintln!("[notifications] local session unavailable: {e:?}");
-            feed.apply_session_err();
-        }
-        Err(gateway_client::GatewayError::Rpc(e)) => {
-            eprintln!("[notifications] approvals RPC failed: {e:?}");
-            feed.apply_list_err();
+        Err(err) => {
+            let kind = FailureKind::classify(&err);
+            let outcome = match &err {
+                gateway_client::GatewayError::Session(_) => feed.apply_session_err(kind),
+                gateway_client::GatewayError::Rpc(_) => feed.apply_list_err(kind),
+            };
+            if let LogVerdict::Emit { suppressed } = outcome.log {
+                let what = match &err {
+                    gateway_client::GatewayError::Session(e) => format!("local session unavailable: {e:?}"),
+                    gateway_client::GatewayError::Rpc(e) => format!("approvals RPC failed: {e:?}"),
+                };
+                let quiet = if suppressed > 0 { format!(", {suppressed} identical failure(s) not logged") } else { String::new() };
+                eprintln!("[notifications] {what} (failure #{}{quiet}; next retry in ~{:?})", outcome.failures, feed.next_check_delay());
+            }
+            outcome.changed
         }
     }
 }
@@ -198,21 +268,13 @@ pub(super) fn render(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Contex
     // `border()` light / `rgba(255,255,255,0.12)` dark.
     let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.12).into() } else { palette.border() };
 
-    // While the panel is open, keep the feed from going stale on its own —
-    // a lightweight repeating timer that just re-checks staleness each
-    // tick (`trigger_refresh_if_stale` itself no-ops when the feed is still
-    // fresh or already busy). Runs for exactly one tick per `render()` call
-    // rather than a `loop` living inside this fn, matching this crate's
-    // "background work lives in a `cx.spawn` the click handler detaches,
-    // not inside a render body" convention (`render()` itself must stay a
-    // plain, repeatable read of state) — the NEXT tick is scheduled again
-    // from the panel's own next render pass, which `cx.notify()` calls
-    // inside `trigger_refresh_if_stale`/the poll loop above keep happening
-    // regularly while a fetch is settling, and `REFRESH_STALE_AFTER` (30s)
-    // means a quiet panel still gets re-checked because gpui repaints this
-    // panel on ANY state change elsewhere in the window in practice; a
-    // belt-and-suspenders explicit timer is added below so a fully idle
-    // window (nothing else changing) still re-checks every 30s while open.
+    // Keep the feed from going stale on its own. Idempotent by
+    // construction as of WP-A4-4 — the FIRST call arms the one periodic
+    // checker, every subsequent call (including one per render pass, which
+    // is what this is) fails the claim and returns immediately. See
+    // `schedule_stale_check`'s own doc comment for the appliance-VM
+    // pile-up that made the previous "arm a fresh one-shot timer every
+    // render" shape untenable.
     schedule_stale_check(cx);
 
     let mut panel = div()
@@ -237,21 +299,88 @@ pub(super) fn render(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Contex
     panel.child(header(palette, ui.notifications.is_busy())).child(tabs(palette)).child(content(&ui.notifications, palette, cx)).child(footer(palette))
 }
 
-/// One `cx.spawn` timer that fires `trigger_refresh_if_stale` after
-/// `REFRESH_STALE_AFTER` and then stops (does not re-arm itself) — cheap
-/// insurance for a fully idle window, see `render()`'s own comment. A new
-/// one is armed every render pass (this fn is called from `render()`
-/// itself, which only runs while the panel is actually open), so closing
-/// the panel naturally stops new timers from being armed; an
-/// already-in-flight one still fires once but `trigger_refresh_if_stale`
-/// harmlessly no-ops if the panel is no longer stale or another fetch is
-/// already running.
-fn schedule_stale_check(cx: &mut Context<ShellView>) {
+/// The ONE periodic stale-check timer — WP-A4-4 (2026-08-22).
+///
+/// ── What this replaced, and why ────────────────────────────────────────
+/// Until this round, every call armed a fresh one-shot 30s timer and simply
+/// relied on "a new one is armed every render pass" for continuity. That is
+/// a pile-up generator, and the appliance VM proved it: an armed timer
+/// fires, `trigger_refresh_if_stale` calls `cx.notify()`, gpui repaints,
+/// the repaint arms ANOTHER timer — and, critically, `lockscreen::render`
+/// armed a second one of these plus a clock tick on the same pass, so each
+/// poll cycle's two repaints left MORE pending timers behind than the one
+/// that fired. The pending count grew for the whole 5h48m uptime; by the
+/// time the machine was inspected, `cage` (whose only client is this shell)
+/// was at ~100% CPU with a static screen, and every one of those timers
+/// that landed while no fetch happened to be in flight started another
+/// `approvals.list` — hence six-plus 429s per second in `journalctl`.
+///
+/// The shape now: a SINGLE task that claims `NotificationsFeed::
+/// try_arm_stale_timer`'s one slot before doing anything, then re-arms
+/// itself internally (`spawn_idle_watchdog`'s established loop shape in
+/// `lockscreen/render.rs`) instead of relying on repaints to re-arm it.
+/// Callers may therefore call this from a render body as often as they like
+/// — every call after the first is a claim that fails and returns
+/// immediately. It exits (releasing the slot for a later render to re-arm)
+/// when OOBE takes over the screen or the window is gone.
+///
+/// Sleep length comes from `NotificationsFeed::next_check_delay`, so an
+/// open backoff window is waited out exactly rather than being polled
+/// through and refused — see that fn's own doc comment.
+///
+/// `pub(crate)`: `lockscreen::render` calls this SAME function (it used to
+/// carry a near-identical private copy of its own — a second timer against
+/// the same feed, which is exactly how two surfaces between them rebuilt
+/// the pile-up this fn now prevents).
+///
+/// ── One deliberate behaviour change worth naming ───────────────────────
+/// Because the loop now outlives the render pass that armed it, a checker
+/// started from the lock screen (or from opening the panel) keeps running
+/// after an unlock (or a close), at one attempt per `REFRESH_STALE_AFTER`.
+/// Before, it stopped as soon as neither surface was rendering. That is a
+/// net improvement rather than a leak: Home's own menu-bar approval ticker
+/// (`home::menu_bar_ticker`) reads this exact feed and previously showed
+/// whatever count happened to be left over from the last time the panel or
+/// the lock screen was on screen. Nothing on Home arms it in the first
+/// place, though — so a machine that has never locked and never opened the
+/// panel still has an un-polled ticker. Fixing THAT means arming from
+/// `home::render` too, which is a scope call for a later round, not
+/// something to sneak in with a CPU fix.
+pub(crate) fn schedule_stale_check(cx: &mut Context<ShellView>) {
     cx.spawn(async move |weak, cx| {
-        cx.background_executor().timer(super::notifications_feed::REFRESH_STALE_AFTER).await;
-        let _ = weak.update(cx, |view, cx| {
-            trigger_refresh_if_stale(view, cx);
-        });
+        // Claim the single slot. `weak.update` runs on the foreground
+        // executor, so N tasks spawned by N repaints in the same frame are
+        // serialised here and exactly one of them wins.
+        let claimed = weak.update(cx, |view, _cx| view.overlay_ui.notifications.try_arm_stale_timer()).unwrap_or(false);
+        if !claimed {
+            return;
+        }
+        loop {
+            let delay = match weak.update(cx, |view, _cx| view.overlay_ui.notifications.next_check_delay()) {
+                Ok(d) => d,
+                // View gone (window closed) — nothing left to release.
+                Err(_) => return,
+            };
+            cx.background_executor().timer(delay).await;
+            let keep_polling = weak.update(cx, |view, cx| {
+                // Nothing on screen wants this data during first-run setup,
+                // and OOBE has no gateway session yet either — release the
+                // slot rather than poll into a void; the first Home/lock
+                // render after OOBE finishes re-arms it.
+                if view.oobe.is_some() {
+                    view.overlay_ui.notifications.disarm_stale_timer();
+                    return false;
+                }
+                trigger_refresh_if_stale(view, cx);
+                true
+            });
+            match keep_polling {
+                Ok(true) => {}
+                // `Ok(false)` already disarmed above; `Err` means the view
+                // is gone and the slot went with it.
+                Ok(false) | Err(_) => return,
+            }
+        }
     })
     .detach();
 }

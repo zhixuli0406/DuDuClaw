@@ -34,6 +34,19 @@
 // state rather than trying to (dishonestly) react to arbitrary typed text
 // with no real NL-delegation/file-search backend behind them yet.
 //
+// ── Install confirmation gate, WP-A4-4 (2026-08-22) ───────────────────────
+// A3 left INSTALL as stated debt: a result row could LAUNCH an app it
+// already had, and that was all. A row whose registry entry names both a
+// `flatpak_id` and a `flatpak_remote` now also carries a small secondary
+// "安裝" chip. It does not install anything — it arms a confirmation sheet
+// (`overlay::install_gate`, a pure state machine with its own tests) that
+// REPLACES this panel's result list until the operator answers, naming the
+// app, the remote, the download size (or an honest "無法取得"), and where it
+// lands. Cancel drops the gate and nothing ever ran. See that module's
+// header comment for the honesty rules the type itself enforces, and
+// `crate::apps`'s "Install" section for why every install argv must carry
+// `--installation=data`.
+//
 // Icon glyphs: same "single CJK character, no `gpui::svg()`" convention
 // `home.rs`'s header comment establishes (this codebase has no
 // `gpui::svg()` usage anywhere, and the bundled font stack has no
@@ -58,20 +71,32 @@
 // this crate's "light stays byte-identical" constraint holds exactly, while
 // dark gets a real, correct default instead of inheriting pure black.
 
+use std::sync::mpsc;
+use std::time::Duration;
+
 use gpui::{div, linear_color_stop, linear_gradient, prelude::*, px, rgb, BoxShadow, Context, Div, FontWeight, Stateful};
 
 use duduclaw_native_gui::theme;
 
+use super::install_gate::{GateStage, InstallGate, SizeProbe};
+use super::OverlayUiState;
 use crate::fake_data::{self, DockApp, VerifiedTier};
 use crate::i18n::{t, Key, Locale};
 use crate::palette::ShellPalette;
 use crate::ShellView;
 
+/// Cadence for the background-thread <-> `cx.spawn` bridge the install
+/// gate's two blocking `flatpak` calls use — same value `overlay/
+/// notifications.rs::POLL_INTERVAL` and `home/home_dock.rs::
+/// BRIDGE_POLL_INTERVAL` already use for theirs.
+const BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 const PANEL_WIDTH: f32 = 660.;
 const PANEL_LEFT: f32 = (1440. - PANEL_WIDTH) / 2.; // 390 — see header comment
 const PANEL_TOP: f32 = 170.;
 
-pub(super) fn render(query: &str, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+pub(super) fn render(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    let query = ui.launcher_query.as_str();
     // Launcher.dc.html: bg `rgba(255,255,255,0.97)` light / `rgba(30,30,33,
     // 0.97)` dark — `surface_raised` in both (see `home.rs`'s
     // `menu_bar_ticker` comment for why not `surface`). Border: opaque
@@ -111,6 +136,16 @@ pub(super) fn render(query: &str, palette: ShellPalette, cx: &mut Context<ShellV
         panel = panel.text_color(theme::alpha(palette.foreground, 1.0));
     }
     panel = panel.child(query_row(query, palette));
+    // WP-A4-4: an armed install confirmation REPLACES the result list. It is
+    // a decision the operator has to answer before anything else in this
+    // panel means much, and leaving the underlying rows clickable behind a
+    // pending "are you sure" would let a second click start a launch (or
+    // another gate) while the first question is still on screen. Same
+    // "takes over its container" shape OOBE/lockscreen use at the window
+    // level, applied here at the panel level.
+    if let Some(gate) = &ui.install_gate {
+        return panel.child(install_sheet(gate, palette, cx)).child(footer(palette));
+    }
     // The delegate card and files section are still fixed DEMO content (see
     // this file's header comment) — showing them alongside a live-typed
     // query that has nothing to do with "請款單" would be actively
@@ -308,8 +343,19 @@ fn app_result_row(item: &'static DockApp, palette: ShellPalette, cx: &mut Contex
         .px(px(10.))
         .py(px(8.))
         .child(icon)
-        .child(div().flex_1().text_size(px(13.5)).child(item.label))
-        .child(verified_badge(item.verified, palette));
+        .child(div().flex_1().text_size(px(13.5)).child(item.label));
+
+    // WP-A4-4: a row this shell could actually INSTALL gets a secondary
+    // button next to its Verified badge. It is deliberately a separate,
+    // explicitly-labelled control rather than a second meaning for the row
+    // click — installing and launching are not interchangeable, and the row
+    // click has meant "launch" since A3. The button only ARMS the
+    // confirmation sheet; nothing is downloaded or written until the sheet
+    // itself is confirmed (`overlay::install_gate`).
+    if item.flatpak_id.is_some() && item.flatpak_remote.is_some() {
+        row = row.child(install_button(item, palette, cx));
+    }
+    row = row.child(verified_badge(item.verified, palette));
 
     // Only a row with a real launch command is a real button — every other
     // entry stays an honest, non-interactive stub (see this file's header
@@ -326,6 +372,295 @@ fn app_result_row(item: &'static DockApp, palette: ShellPalette, cx: &mut Contex
         row = row.cursor_pointer().hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0))).on_click(on_click);
     }
     row
+}
+
+// ── Install confirmation gate (WP-A4-4, 2026-08-22) ─────────────────────
+
+/// The secondary "安裝" control on an installable result row. Arms the
+/// confirmation sheet and kicks off the size probe — it does NOT install
+/// anything. Styled as a quiet outlined chip (same neutral treatment
+/// `overlay/notifications.rs`'s own secondary buttons use) so it never
+/// competes visually with the row itself, which still means "launch".
+fn install_button(item: &'static DockApp, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    let bg = if palette.is_dark() { palette.surface_hover } else { palette.surface_raised };
+    let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.14).into() } else { palette.border() };
+    let on_click = cx.listener(move |view, _ev, _window, cx| {
+        if crate::diag_enabled() {
+            eprintln!("[hit] launcher install chip '{}' -> arm confirmation gate", item.id);
+        }
+        open_install_gate(item, view, cx);
+    });
+    div()
+        .id(format!("launcher-install-{}", item.id))
+        .cursor_pointer()
+        .bg(theme::alpha(bg, 1.0))
+        .text_color(theme::alpha(palette.text_secondary, 1.0))
+        .border_1()
+        .border_color(border_color)
+        .rounded(px(8.))
+        .px(px(10.))
+        .py(px(3.))
+        .text_size(px(11.5))
+        .child(t(Locale::ZhTw, Key::LauncherInstallButton).to_string())
+        .on_click(on_click)
+}
+
+/// Arms the gate and dispatches the (blocking) size probe on a background
+/// thread. A `DockApp` with no `flatpak_id`/`flatpak_remote` produces no
+/// gate at all (`InstallGate::open` returns `None`) — the button is only
+/// rendered for entries that have both, so this is belt-and-suspenders.
+fn open_install_gate(item: &'static DockApp, view: &mut ShellView, cx: &mut Context<ShellView>) {
+    let Some(gate) = InstallGate::open(item, crate::apps::INSTALL_DESTINATION_LABEL.to_string()) else {
+        return;
+    };
+    let (remote, flatpak_id, app_id) = (gate.remote, gate.flatpak_id, gate.app_id);
+    view.overlay_ui.install_gate = Some(gate);
+    cx.notify();
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::apps::probe_download_size(remote, flatpak_id));
+    });
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(size) => {
+                let _ = weak.update(cx, |view, cx| {
+                    if let Some(gate) = view.overlay_ui.install_gate.as_mut() {
+                        gate.apply_size_probe(app_id, size);
+                        cx.notify();
+                    }
+                });
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(BRIDGE_POLL_INTERVAL).await;
+    })
+    .detach();
+}
+
+/// The confirmation sheet. Everything the operator needs to answer "should
+/// this run" is on it: which app, from which remote, how big the download
+/// is (or an honest "無法取得"), and where it lands.
+fn install_sheet(gate: &InstallGate, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let size_text = match &gate.size {
+        SizeProbe::Probing => t(Locale::ZhTw, Key::InstallGateSizeProbing).to_string(),
+        SizeProbe::Known(text) => text.clone(),
+        SizeProbe::Unavailable => t(Locale::ZhTw, Key::InstallGateSizeUnknown).to_string(),
+    };
+
+    let mut sheet = div()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .px(px(22.))
+        .pt(px(16.))
+        .pb(px(16.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                // The app's OWN existing glyph — no new pictogram is
+                // introduced here; this crate has zero emoji and no
+                // `gpui::svg()` usage to draw a stroke icon with (see
+                // `home.rs`'s header comment on that gap).
+                .child(div().text_size(px(20.)).text_color(theme::alpha(palette.text_secondary, 1.0)).child(gate.glyph))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(t(Locale::ZhTw, Key::InstallGateTitle).to_string()))
+                        // The app's own identity, one line, prominent: the
+                        // display name the operator recognizes plus the
+                        // exact flatpak id that will actually be fetched —
+                        // a confirmation sheet that only showed the pretty
+                        // name would be asking them to approve something
+                        // they cannot verify.
+                        .child(
+                            div()
+                                .mt(px(2.))
+                                .text_size(px(12.5))
+                                .text_color(theme::alpha(palette.text_secondary, 1.0))
+                                .child(format!("{} · {}", gate.label, gate.flatpak_id)),
+                        ),
+                ),
+        )
+        .child(div().text_size(px(12.5)).text_color(theme::alpha(palette.text_secondary, 1.0)).child(t(Locale::ZhTw, Key::InstallGateNotice).to_string()))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .mt(px(2.))
+                .child(detail_row(t(Locale::ZhTw, Key::InstallGateSourceLabel), gate.remote.to_string(), palette))
+                .child(detail_row(t(Locale::ZhTw, Key::InstallGateSizeLabel), size_text, palette))
+                .child(detail_row(t(Locale::ZhTw, Key::InstallGateLocationLabel), gate.install_root.clone(), palette)),
+        );
+
+    sheet = sheet.child(match &gate.stage {
+        GateStage::Confirming => decision_row(palette, cx),
+        // No dismiss button while the spawn is in flight — there is nothing
+        // useful to press, and offering one that cannot actually stop the
+        // child process would be a lie.
+        GateStage::Installing => status_line(t(Locale::ZhTw, Key::InstallGateInstallingLabel).to_string(), palette.text_secondary),
+        GateStage::Started => settled_row(t(Locale::ZhTw, Key::InstallGateStartedLabel).to_string(), palette.text_secondary, palette, cx),
+        // The raw reason (e.g. "No such file or directory") goes to stderr
+        // only, same split `lockscreen::render::apply_unlock_result` draws:
+        // the operator-facing line stays one honest sentence.
+        GateStage::Failed(_) => settled_row(t(Locale::ZhTw, Key::InstallGateFailedLabel).to_string(), palette.destructive, palette, cx),
+    });
+    sheet
+}
+
+/// A settled sheet's status line plus a way back to the result list. Escape
+/// and a backdrop click already dismiss the whole Launcher (and with it the
+/// gate, via `OverlayUiState::close_launcher_query`), but the footer never
+/// advertises Escape — leaving a finished sheet with no visible exit would
+/// read as stuck.
+fn settled_row(text: String, text_hex: u32, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let back_click = cx.listener(|view, _ev, _window, cx| {
+        view.overlay_ui.install_gate = None;
+        cx.notify();
+    });
+    let bg = if palette.is_dark() { palette.surface_hover } else { palette.surface_raised };
+    let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.14).into() } else { palette.border() };
+    div()
+        .mt(px(4.))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .child(div().flex_1().text_size(px(12.)).text_color(theme::alpha(text_hex, 1.0)).child(text))
+        .child(
+            div()
+                .id("install-gate-back")
+                .cursor_pointer()
+                .bg(theme::alpha(bg, 1.0))
+                .text_color(theme::alpha(palette.text_secondary, 1.0))
+                .border_1()
+                .border_color(border_color)
+                .rounded(px(8.))
+                .px(px(12.))
+                .py(px(4.))
+                .text_size(px(12.))
+                .child(t(Locale::ZhTw, Key::NavBack).to_string())
+                .on_click(back_click),
+        )
+}
+
+/// One label/value line of the sheet. `flex_1` on the value side so a long
+/// flatpak id or path wraps rather than pushing the panel wide.
+fn detail_row(label: &str, value: String, palette: ShellPalette) -> Div {
+    div()
+        .flex()
+        .gap(px(10.))
+        .text_size(px(12.5))
+        .child(div().w(px(72.)).text_color(theme::alpha(palette.text_faint, 1.0)).child(label.to_string()))
+        .child(div().flex_1().child(value))
+}
+
+/// One post-decision status line (installing / started / failed). Takes the
+/// resolved hex rather than the whole palette because the three call sites
+/// already pick their own token — there is no per-theme branch left here.
+fn status_line(text: String, color_hex: u32) -> Div {
+    div().mt(px(4.)).text_size(px(12.)).text_color(theme::alpha(color_hex, 1.0)).child(text)
+}
+
+/// 開始安裝 / 取消. Cancel simply drops the gate — see `install_gate::
+/// InstallGate`'s own header comment for why that is enough to guarantee
+/// nothing ran.
+fn decision_row(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let confirm_click = cx.listener(|view, _ev, _window, cx| {
+        let Some(gate) = view.overlay_ui.install_gate.as_mut() else {
+            return;
+        };
+        let Some((remote, app_id)) = gate.confirm() else {
+            return;
+        };
+        cx.notify();
+        dispatch_install(remote, app_id, cx);
+    });
+    let cancel_click = cx.listener(|view, _ev, _window, cx| {
+        if crate::diag_enabled() {
+            eprintln!("[hit] install gate -> cancel (nothing runs)");
+        }
+        view.overlay_ui.install_gate = None;
+        cx.notify();
+    });
+
+    let cancel_bg = if palette.is_dark() { palette.surface_hover } else { palette.surface_raised };
+    let cancel_border: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.14).into() } else { palette.border() };
+
+    div()
+        .mt(px(6.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .id("install-gate-confirm")
+                .cursor_pointer()
+                .bg(theme::alpha(palette.brand, 1.0))
+                .text_color(theme::alpha(palette.brand_foreground, 1.0))
+                .rounded(px(8.))
+                .px(px(14.))
+                .py(px(6.))
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(t(Locale::ZhTw, Key::InstallGateConfirmButton).to_string())
+                .on_click(confirm_click),
+        )
+        .child(
+            div()
+                .id("install-gate-cancel")
+                .cursor_pointer()
+                .bg(theme::alpha(cancel_bg, 1.0))
+                .text_color(theme::alpha(palette.text_secondary, 1.0))
+                .border_1()
+                .border_color(cancel_border)
+                .rounded(px(8.))
+                .px(px(14.))
+                .py(px(6.))
+                .text_size(px(12.5))
+                // Reuses the OOBE network step's own "取消" rather than
+                // adding a second identical key — same sharing
+                // `overlay/notifications.rs::cancel_button` already does.
+                .child(t(Locale::ZhTw, Key::NetworkCancelButton).to_string())
+                .on_click(cancel_click),
+        )
+}
+
+/// Runs `apps::install` off the render thread and settles the gate with the
+/// SPAWN result — same `std::thread::spawn` + `mpsc` + `cx.spawn` bridge
+/// every other blocking call in this crate uses.
+fn dispatch_install(remote: &'static str, app_id: &'static str, cx: &mut Context<ShellView>) {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = crate::apps::install(remote, app_id);
+        if let Err(e) = &result {
+            eprintln!("[apps] install {remote} {app_id} could not start: {e}");
+        }
+        let _ = tx.send(result);
+    });
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(result) => {
+                let _ = weak.update(cx, |view, cx| {
+                    if let Some(gate) = view.overlay_ui.install_gate.as_mut() {
+                        gate.apply_install_result(result);
+                        cx.notify();
+                    }
+                });
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(BRIDGE_POLL_INTERVAL).await;
+    })
+    .detach();
 }
 
 /// The D8 "DuDuClaw Verified" tier badge pill — see `crate::palette::
