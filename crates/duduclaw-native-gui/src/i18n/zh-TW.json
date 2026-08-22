@@ -1888,6 +1888,12 @@
   "gatewayPicker.inUse": "使用中",
   "gatewayPicker.discovered.empty.title": "此執行環境無法掃描區域網路",
   "gatewayPicker.discovered.empty.desc": "LAN mDNS 探索僅由 DuDuClaw 桌面版（Tauri 殼）提供，這個原生 gpui 介面沒有對應的橋接機制。",
-  "gatewayPicker.manual.hint": "此版本固定連線到單一本機 gateway，尚未支援手動切換（future scope）。",
-  "gatewayPicker.connect": "連線"
+  "gatewayPicker.manual.hint": "貼上另一台機器上執行中的 gateway 網址（僅接受 http/https）。按下連線會先做健康檢查，成功後才會切換並記住這個選擇。",
+  "gatewayPicker.connect": "連線",
+  "gatewayPicker.connecting": "連線中…",
+  "gatewayPicker.local.switchToLocal": "切換到本機",
+  "gatewayPicker.local.status.running": "運行中",
+  "gatewayPicker.local.status.starting": "啟動中",
+  "gatewayPicker.local.status.stopped": "已停止",
+  "gatewayPicker.local.status.error": "發生錯誤"
 }

@@ -315,7 +315,7 @@ const CARD_BASE_WIDTH: f32 = 520.0;
 
 fn content_card(agent_id: &str, info: &CanvasInfo, locale: Locale, zoom: f32) -> Div {
     let when = relative_time(locale, &info.updated_at, chrono::Utc::now());
-    let dashboard_url: SharedString = format!("{}/canvas?agent={}", api::GATEWAY_BASE_URL, agent_id).into();
+    let dashboard_url: SharedString = format!("{}/canvas?agent={}", api::gateway_base_url(), agent_id).into();
 
     div()
         .w(px((CARD_BASE_WIDTH * zoom).max(220.0)))

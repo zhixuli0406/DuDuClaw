@@ -39,9 +39,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::api;
 use crate::chat_protocol::{self, InFrame};
 
-const CHAT_WS_URL: &str = "ws://127.0.0.1:18789/ws/chat";
 /// Matches `ws_status.rs`'s own numbers (see that file's module doc comment
 /// for why the task brief's 1s/5s pair, not `ws-client.ts`'s 1s/30s/10-cap
 /// pair, is what this crate follows).
@@ -136,7 +136,11 @@ async fn run(mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>, evt_tx: std_mps
                 *out_tx.lock().await = None;
                 let evt_tx = evt_tx.clone();
                 let out_tx = out_tx.clone();
-                task = Some(tokio::spawn(session_loop(CHAT_WS_URL, jwt, evt_tx, out_tx)));
+                // WP-C-M2: resolved fresh (not a hardcoded `CHAT_WS_URL`
+                // const) — see `ws_status.rs`'s matching `ConnectWs` arm for
+                // why this must happen at connect time.
+                let chat_ws_url = api::gateway_ws_url("/ws/chat");
+                task = Some(tokio::spawn(session_loop(chat_ws_url, jwt, evt_tx, out_tx)));
             }
             Command::Send { content, session_id, agent, conv } => {
                 let frame = chat_protocol::build_user_message(&content, session_id, agent, conv);
@@ -165,7 +169,7 @@ enum Outcome {
 }
 
 async fn session_loop(
-    url: &str,
+    url: String,
     jwt: String,
     evt_tx: std_mpsc::Sender<Event>,
     out_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio_mpsc::UnboundedSender<Message>>>>,
@@ -173,7 +177,7 @@ async fn session_loop(
     let mut backoff = RECONNECT_FLOOR;
     loop {
         let _ = evt_tx.send(Event::ConnState(ConnState::Connecting));
-        match connect_and_run(url, &jwt, &evt_tx, &out_tx).await {
+        match connect_and_run(&url, &jwt, &evt_tx, &out_tx).await {
             Outcome::AuthFailed => {
                 let _ = evt_tx.send(Event::AuthFailed);
                 let _ = evt_tx.send(Event::ConnState(ConnState::Disconnected));
@@ -380,7 +384,7 @@ mod tests {
     async fn chat_reconnect_backoff_grows_and_caps_against_unreachable_host() {
         let (evt_tx, evt_rx) = std_mpsc::channel::<Event>();
         let out_tx = std::sync::Arc::new(tokio::sync::Mutex::new(None));
-        let handle = tokio::spawn(session_loop(UNREACHABLE_URL, "x".to_string(), evt_tx, out_tx));
+        let handle = tokio::spawn(session_loop(UNREACHABLE_URL.to_string(), "x".to_string(), evt_tx, out_tx));
 
         let start = std::time::Instant::now();
         let deadline = start + Duration::from_secs(11);
@@ -481,7 +485,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn chat_full_round_trip_against_mock_server() {
-        let url: &'static str = Box::leak(spawn_mock_chat_server().await.into_boxed_str());
+        let url = spawn_mock_chat_server().await;
         let (evt_tx, evt_rx) = std_mpsc::channel::<Event>();
         let out_tx = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         let handle = tokio::spawn(session_loop(url, "test-jwt".to_string(), evt_tx, out_tx));

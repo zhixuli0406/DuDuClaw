@@ -1888,6 +1888,12 @@
   "gatewayPicker.inUse": "使用中",
   "gatewayPicker.discovered.empty.title": "この実行環境は LAN をスキャンできません",
   "gatewayPicker.discovered.empty.desc": "LAN mDNS 探索は DuDuClaw デスクトップ版（Tauri シェル）でのみ提供され、このネイティブ gpui インターフェースには対応するブリッジがありません。",
-  "gatewayPicker.manual.hint": "このビルドは単一の固定ローカル gateway にのみ接続します。手動切り替えは今後の対応予定です。",
-  "gatewayPicker.connect": "接続"
+  "gatewayPicker.manual.hint": "別のマシンで動作している gateway の URL（http/https のみ）を貼り付けてください。「接続」を押すとまずヘルスチェックを行い、成功すると切り替えて選択内容を記憶します。",
+  "gatewayPicker.connect": "接続",
+  "gatewayPicker.connecting": "接続中…",
+  "gatewayPicker.local.switchToLocal": "ローカルに切り替え",
+  "gatewayPicker.local.status.running": "実行中",
+  "gatewayPicker.local.status.starting": "起動中",
+  "gatewayPicker.local.status.stopped": "停止中",
+  "gatewayPicker.local.status.error": "エラー"
 }

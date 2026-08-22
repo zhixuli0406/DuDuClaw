@@ -36,7 +36,6 @@ use crate::api::{self, AuthError, LoginResponse};
 use crate::i18n::{self, Locale};
 use crate::rpc::{self, CallError, PendingCalls};
 
-const WS_URL: &str = "ws://127.0.0.1:18789/ws";
 const RECONNECT_FLOOR: Duration = Duration::from_secs(1);
 const RECONNECT_CEILING: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,6 +83,18 @@ pub enum Command {
         jwt: Option<String>,
         respond_to: oneshot::Sender<Result<serde_json::Value, String>>,
     },
+    /// WP-C-M2: probe `GET <base_url>/healthz`, dispatched on this
+    /// manager's own background tokio runtime for the same reason
+    /// `RestGet` is (gpui's executor is not a tokio context). Used by
+    /// `screens::gateway_picker` to validate a candidate URL before
+    /// persisting/switching to it — deliberately independent of whatever
+    /// gateway is CURRENTLY connected (`base_url` is caller-supplied, not
+    /// read from `api::gateway_base_url()` here), so probing a candidate
+    /// can never be confused with the live connection's own state.
+    HealthCheck {
+        base_url: String,
+        respond_to: oneshot::Sender<(bool, Option<String>)>,
+    },
 }
 
 /// Issue one RPC call and return a receiver for its eventual result.
@@ -121,6 +132,19 @@ pub fn rest_get(
 ) -> oneshot::Receiver<Result<serde_json::Value, String>> {
     let (respond_to, rx) = oneshot::channel();
     let _ = session_tx.send(Command::RestGet { path_and_query: path_and_query.into(), jwt, respond_to });
+    rx
+}
+
+/// Probe a candidate gateway URL's `/healthz` and return a receiver for the
+/// `(ok, error_detail)` result — the health-check twin of [`rest_get`]. Same
+/// never-blocks-never-fails-synchronously contract: a dead manager thread
+/// makes this a silent no-op and the receiver never resolves.
+pub fn health_check(
+    session_tx: &tokio_mpsc::UnboundedSender<Command>,
+    base_url: impl Into<String>,
+) -> oneshot::Receiver<(bool, Option<String>)> {
+    let (respond_to, rx) = oneshot::channel();
+    let _ = session_tx.send(Command::HealthCheck { base_url: base_url.into(), respond_to });
     rx
 }
 
@@ -282,16 +306,28 @@ async fn run(mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>, evt_tx: std_mps
                 let evt_tx = evt_tx.clone();
                 let pending = pending.clone();
                 let active_writer = active_writer.clone();
-                ws_task = Some(tokio::spawn(ws_session_loop(WS_URL, jwt, evt_tx, pending, active_writer)));
+                // WP-C-M2: resolved fresh at connect time (not a hardcoded
+                // `WS_URL` const) — picks up whatever `api::set_gateway_
+                // base_url` most recently set, so a gateway-picker switch
+                // followed by a fresh login reconnects to the NEW target
+                // without needing a second, separate "retarget" command.
+                let ws_url = api::gateway_ws_url("/ws");
+                ws_task = Some(tokio::spawn(ws_session_loop(ws_url, jwt, evt_tx, pending, active_writer)));
             }
             Command::Call { method, params, respond_to } => {
                 dispatch_call(&pending, &active_writer, method, params, respond_to).await;
             }
             Command::RestGet { path_and_query, jwt, respond_to } => {
                 tokio::spawn(async move {
-                    let result = api::get_json(api::GATEWAY_BASE_URL, &path_and_query, jwt.as_deref())
+                    let result = api::get_json(&api::gateway_base_url(), &path_and_query, jwt.as_deref())
                         .await
                         .map_err(|e| describe_rest_auth_error(&e));
+                    let _ = respond_to.send(result);
+                });
+            }
+            Command::HealthCheck { base_url, respond_to } => {
+                tokio::spawn(async move {
+                    let result = api::health_probe(&base_url).await;
                     let _ = respond_to.send(result);
                 });
             }
@@ -381,13 +417,16 @@ enum ConnectOutcome {
 /// server rejects the JWT (terminal) or this task is aborted by a newer
 /// `ConnectWs` command superseding it (see `run`'s `handle.abort()`).
 ///
-/// `url` is a parameter (not the hardcoded `WS_URL` constant directly) so
-/// the reconnect/backoff behavior and the auth-failure-is-terminal behavior
-/// are both directly testable — see the tests at the bottom of this file,
-/// which call this function against the real local gateway (auth-failure
-/// path) and against an unreachable port (backoff-growth/ceiling path).
+/// `url` is a parameter (owned, not the hardcoded `WS_URL` constant this
+/// used to be — see `run`'s `Command::ConnectWs` arm for why it must now be
+/// resolved fresh per connect and therefore owned, not borrowed from a
+/// `'static` const) so the reconnect/backoff behavior and the
+/// auth-failure-is-terminal behavior are both directly testable — see the
+/// tests at the bottom of this file, which call this function against the
+/// real local gateway (auth-failure path) and against an unreachable port
+/// (backoff-growth/ceiling path).
 async fn ws_session_loop(
-    url: &str,
+    url: String,
     jwt: String,
     evt_tx: std_mpsc::Sender<Event>,
     pending: Arc<TokioMutex<PendingCalls>>,
@@ -398,7 +437,7 @@ async fn ws_session_loop(
     loop {
         let _ = evt_tx.send(Event::WsState(WsConnState::Connecting));
 
-        match connect_and_run(url, &jwt, &evt_tx, &pending, &active_writer).await {
+        match connect_and_run(&url, &jwt, &evt_tx, &pending, &active_writer).await {
             ConnectOutcome::AuthFailed => {
                 let _ = evt_tx.send(Event::WsAuthFailed);
                 let _ = evt_tx.send(Event::WsState(WsConnState::Disconnected));
@@ -662,7 +701,7 @@ mod tests {
         let pending = Arc::new(TokioMutex::new(PendingCalls::new()));
         let active_writer = Arc::new(TokioMutex::new(None));
         let handle = tokio::spawn(ws_session_loop(
-            UNREACHABLE_WS_URL,
+            UNREACHABLE_WS_URL.to_string(),
             "x".to_string(),
             evt_tx,
             pending,
