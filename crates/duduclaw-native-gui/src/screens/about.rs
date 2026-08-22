@@ -95,6 +95,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::i18n::{self, Locale};
 use crate::rpc::CallError;
 use crate::theme;
+use crate::updater::UpdaterStatus;
 use crate::ws_status::{self, Command as SessionCommand, WsConnState};
 use crate::RootView;
 
@@ -397,6 +398,206 @@ fn link_row(id: &'static str, label: SharedString, url: &'static str) -> Statefu
         .child(label)
 }
 
+// ── WP-C-M3: native-gui app self-update card ─────────────────────────────
+//
+// A SEPARATE update surface from the "update-status line" already rendered
+// in `header` above (`system.check_update`, an RPC to the GATEWAY sidecar
+// process — see this page's `AboutState`/`update_status_line` doc comments)
+// — this card checks/installs updates for THIS `.app` bundle itself, via
+// `state.app_updater` (`updater::UpdaterManager`, see that module's header
+// comment for why it's a synchronous-Mutex-poll manager like `sidecar.rs`,
+// not a channel actor like `ws_status.rs`). Deliberately independent of the
+// gateway `/ws` connection: `state.app_updater.status()` works exactly the
+// same whether or not the gateway is reachable, since the update check goes
+// straight to GitHub, not through the local gateway.
+
+/// `(dot color, status text)` for every `UpdaterStatus` variant — mirrors
+/// `update_status_line`'s own per-state color mapping just above.
+fn app_update_status_text(locale: Locale, status: &UpdaterStatus) -> (u32, SharedString) {
+    match status {
+        UpdaterStatus::Idle => (theme::MUTED_FOREGROUND, i18n::t(locale, "native.about.appUpdate.status.idle")),
+        UpdaterStatus::Checking => {
+            (theme::MUTED_FOREGROUND, i18n::t(locale, "native.about.appUpdate.status.checking"))
+        }
+        UpdaterStatus::UpToDate => (theme::SUCCESS, i18n::t(locale, "native.about.appUpdate.status.upToDate")),
+        UpdaterStatus::Available { version, .. } => {
+            (theme::WARNING, i18n::t1(locale, "native.about.appUpdate.status.available", "version", version))
+        }
+        UpdaterStatus::Downloading { attempt, max_attempts } => (
+            theme::MUTED_FOREGROUND,
+            i18n::tn(
+                locale,
+                "native.about.appUpdate.status.downloading",
+                &[("attempt", &attempt.to_string()), ("max", &max_attempts.to_string())],
+            ),
+        ),
+        UpdaterStatus::Installing => {
+            (theme::MUTED_FOREGROUND, i18n::t(locale, "native.about.appUpdate.status.installing"))
+        }
+        UpdaterStatus::ReadyToRestart { version } => {
+            (theme::SUCCESS, i18n::t1(locale, "native.about.appUpdate.status.readyToRestart", "version", version))
+        }
+        UpdaterStatus::Failed { message } => {
+            (theme::DESTRUCTIVE, i18n::t1(locale, "native.about.appUpdate.status.failed", "message", message))
+        }
+    }
+}
+
+/// The action button for the current status — one `mds_gpui::button` call
+/// per branch rather than a shared helper with a `button_kind` enum: each
+/// branch's label AND click behavior differ together, so a shared helper
+/// would just relocate the same `match` one level down.
+fn app_update_button(locale: Locale, status: &UpdaterStatus, cx: &mut Context<RootView>) -> Stateful<Div> {
+    match status {
+        UpdaterStatus::Idle | UpdaterStatus::Failed { .. } => crate::mds_gpui::button(
+            "about-app-update-check",
+            i18n::t(locale, "native.about.appUpdate.button.check"),
+            crate::mds_gpui::ButtonVariant::Primary,
+            false,
+            None,
+            cx.listener(|this, _ev, _window, cx| {
+                this.app_updater.check();
+                cx.notify();
+            }),
+        ),
+        UpdaterStatus::UpToDate => crate::mds_gpui::button(
+            "about-app-update-recheck",
+            i18n::t(locale, "native.about.appUpdate.button.recheck"),
+            crate::mds_gpui::ButtonVariant::Secondary,
+            false,
+            None,
+            cx.listener(|this, _ev, _window, cx| {
+                this.app_updater.check();
+                cx.notify();
+            }),
+        ),
+        UpdaterStatus::Available { .. } => crate::mds_gpui::button(
+            "about-app-update-install",
+            i18n::t(locale, "native.about.appUpdate.button.install"),
+            crate::mds_gpui::ButtonVariant::Primary,
+            false,
+            None,
+            cx.listener(|this, _ev, _window, cx| {
+                this.app_updater.install();
+                cx.notify();
+            }),
+        ),
+        UpdaterStatus::Checking | UpdaterStatus::Downloading { .. } | UpdaterStatus::Installing => {
+            crate::mds_gpui::button(
+                "about-app-update-working",
+                i18n::t(locale, "native.about.appUpdate.button.working"),
+                crate::mds_gpui::ButtonVariant::Secondary,
+                true,
+                None,
+                |_ev, _window, _cx| {},
+            )
+        }
+        UpdaterStatus::ReadyToRestart { .. } => crate::mds_gpui::button(
+            "about-app-update-restart",
+            i18n::t(locale, "native.about.appUpdate.button.restart"),
+            crate::mds_gpui::ButtonVariant::Primary,
+            false,
+            None,
+            |_ev, _window, cx| {
+                // No `RootView` mutation needed here (unlike the other
+                // branches above) — relaunching spawns a detached process
+                // and quits THIS one, so there is no post-click state left
+                // to render. `cx: &mut App` (not `Context<RootView>`) is
+                // enough for both `relaunch_current_binary` (a free
+                // function, no view access) and `cx.quit()`.
+                match crate::updater::relaunch_current_binary() {
+                    Ok(()) => cx.quit(),
+                    Err(e) => eprintln!("[about] relaunch failed, staying open: {e}"),
+                }
+            },
+        ),
+    }
+}
+
+fn app_update_card(state: &RootView, locale: Locale, cx: &mut Context<RootView>) -> Div {
+    let status = state.app_updater.status();
+    let (dot_color, status_text) = app_update_status_text(locale, &status);
+    let unsupported = crate::updater::manifest::platform_key().is_none();
+
+    let rows = div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(theme::TEXT_XS))
+                        .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
+                        .child(i18n::t(locale, "native.about.appUpdate.currentVersion")),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::TEXT_XS))
+                        .font_family("SF Mono")
+                        .text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0))
+                        .child(state.app_updater.app_version().to_string()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(div().size(px(7.)).rounded_full().bg(theme::alpha(dot_color, 1.0)))
+                .child(div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(theme::MUTED_FOREGROUND, 1.0)).child(status_text)),
+        );
+
+    let body: Div = if unsupported {
+        // Honest stub for the two placeholder CI legs (Windows/Linux — see
+        // `native-gui-desktop-release.yml`'s header comment): no button at
+        // all, since there is nothing this build could ever install.
+        rows.child(
+            div()
+                .text_size(px(theme::TEXT_XS))
+                .text_color(theme::alpha(theme::MUTED_FOREGROUND, 0.8))
+                .child(i18n::t(locale, "native.about.appUpdate.platformUnsupported")),
+        )
+    } else {
+        // Release notes, when an update is actually available — the ONE
+        // piece of `UpdateManifest::notes` this page shows (never shown for
+        // any other status: `Idle`/`Checking`/`UpToDate`/... have nothing
+        // meaningful to caption).
+        let notes_row = match &status {
+            UpdaterStatus::Available { notes, .. } if !notes.trim().is_empty() => Some(
+                div()
+                    .text_size(px(theme::TEXT_XS))
+                    .text_color(theme::alpha(theme::MUTED_FOREGROUND, 0.85))
+                    .child(notes.clone()),
+            ),
+            _ => None,
+        };
+        rows.children(notes_row).child(div().mt_1().child(app_update_button(locale, &status, cx)))
+    };
+
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3p5()
+        .rounded(px(theme::RADIUS_XL))
+        .bg(theme::alpha(theme::SURFACE, 1.0))
+        .border_1()
+        .border_color(theme::surface_border())
+        .child(
+            div()
+                .text_size(px(theme::TEXT_XS))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::alpha(theme::FOREGROUND, 1.0))
+                .child(i18n::t(locale, "native.about.appUpdate.title")),
+        )
+        .child(body)
+}
+
 // ── Top-level render ───────────────────────────────────────────────────
 
 pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
@@ -527,6 +728,7 @@ pub fn render(state: &RootView, cx: &mut Context<RootView>) -> Stateful<Div> {
         .gap_4()
         .child(header)
         .child(info_group)
+        .child(app_update_card(state, locale, cx))
         .child(links)
         .child(
             div()
