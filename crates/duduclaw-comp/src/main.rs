@@ -15,28 +15,40 @@
 //! context (D11: smithay self-built compositor, MIT, closed-source-capable).
 //!
 //! What this spike deliberately does NOT carry over from smallvil/anvil:
-//! - No DRM/udev/libinput backend — `winit`-only, so it always runs nested
-//!   inside a host compositor/X server rather than owning real hardware.
 //! - No layer-shell server side yet (DESIGN §13.5 calls for it on L1
 //!   eventually; smallvil doesn't implement it either, so this spike stays
 //!   at parity with upstream rather than adding scope).
 //! - No XWayland support.
-//! - No screen-copy / damage-tracking protocols beyond what `desktop::space`
-//!   gives for free.
+//! - No screen-copy protocols.
+//!
+//! **A4-1 (2026-08-22) removed the first item on that list.** There are now
+//! two backends in this one binary, picked at runtime by
+//! `backend_choice::choose_backend`:
+//! - `winit_backend.rs` — nested inside a host Wayland/X11 session
+//!   (development, CI, BUILD.md's container rounds).
+//! - `udev_backend.rs` — libseat + DRM/KMS + libinput, owning real hardware.
+//!   See that module's doc comment for exactly what it does and does not
+//!   support.
 
 mod handlers;
 
+mod backend_choice;
 mod codrive;
 mod grabs;
 mod input;
+mod render;
+mod seat_order;
 mod shell_control;
 mod state;
+mod udev_backend;
 mod winit_backend;
 
 use smithay::reexports::{
     calloop::EventLoop,
     wayland_server::{Display, DisplayHandle},
 };
+
+use backend_choice::BackendKind;
 
 pub use state::DuduclawComp;
 
@@ -45,6 +57,12 @@ pub use state::DuduclawComp;
 pub struct CalloopData {
     state: DuduclawComp,
     display_handle: DisplayHandle,
+    /// A4-1: `Some` only on the udev/DRM backend. Every calloop source the
+    /// udev backend registers reaches its state through this field and
+    /// degrades to a no-op while it is `None` — that is what keeps the winit
+    /// path from paying for (or being perturbed by) hardware plumbing it
+    /// never uses.
+    udev: Option<udev_backend::UdevBackendState>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,9 +81,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut data = CalloopData {
         state,
         display_handle,
+        udev: None,
     };
 
-    crate::winit_backend::init_winit(&mut event_loop, &mut data)?;
+    // A4-1: runtime backend selection. See `backend_choice.rs` for the rule
+    // and `udev_backend.rs` for what the hardware path does.
+    let backend = crate::backend_choice::choose_backend_from_env()?;
+    tracing::info!(
+        backend = backend.as_str(),
+        wayland_display = ?std::env::var("WAYLAND_DISPLAY").ok(),
+        display = ?std::env::var("DISPLAY").ok(),
+        "duduclaw-comp: selected display backend"
+    );
+    match backend {
+        BackendKind::Winit => crate::winit_backend::init_winit(&mut event_loop, &mut data)?,
+        BackendKind::Udev => {
+            // Deliberately NOT falling back to winit on failure: on a bare
+            // TTY there is nothing to nest inside, so a "fallback" would
+            // just be a second, more confusing error. Fail loudly with the
+            // real reason (missing seatd, no DRM device, no CRTC, …).
+            let udev = crate::udev_backend::init_udev(&mut event_loop, &mut data)?;
+            tracing::info!(seat = %udev.seat_name(), "duduclaw-comp: udev backend ready");
+            data.udev = Some(udev);
+        }
+    }
 
     // CD-0 codrive spike verification aid — see codrive/debug_sim.rs module
     // doc. No-op (reads nothing, registers nothing) unless
@@ -93,8 +132,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "duduclaw-comp listening; export WAYLAND_DISPLAY to connect a client"
     );
 
-    event_loop.run(None, &mut data, move |_| {
-        // duduclaw-comp is running
+    // Timeout `None` = block in `epoll` until an event source fires. On the
+    // udev backend that is what makes "nothing changed" cost literally zero
+    // CPU: nothing schedules a redraw, so nothing wakes us (bar the udev
+    // backend's own 1 Hz housekeeping tick). The winit backend keeps its
+    // own `request_redraw()` self-perpetuating loop and is unaffected.
+    event_loop.run(None, &mut data, move |data| {
+        // No-op unless the udev backend is active; see `dispatch_render`.
+        crate::udev_backend::dispatch_render(data);
+        // Flush pending events to clients EVERY loop iteration, not just on
+        // the render path. Found live on the appliance VM (2026-08-22, A4-1
+        // acceptance): `render_surface` ends with its own `flush_clients()`,
+        // but `dispatch_render` returns early whenever nothing is dirty — so
+        // a client that had just connected and was still doing its opening
+        // `wl_registry` / `wl_display.sync` roundtrip never had those replies
+        // written back to its socket. Nothing it does during that roundtrip
+        // damages an output, so nothing ever scheduled the render that would
+        // have flushed them. `duduclaw-shell` hung forever in `do_sys_poll`
+        // on a single thread at 0% CPU with comp showing only "xdg client
+        // connected" — i.e. the appliance would boot to an empty desktop.
+        // The winit backend never showed this because its self-perpetuating
+        // `request_redraw()` loop flushes every frame regardless of damage,
+        // which is exactly the property the udev backend deliberately drops.
+        // Idle cost is unchanged: with a `None` timeout this callback only
+        // runs after a source actually fired, so an idle compositor still
+        // blocks in `epoll` and flushes nothing.
+        let _ = data.display_handle.flush_clients();
     })?;
 
     Ok(())

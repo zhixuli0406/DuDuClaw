@@ -40,6 +40,8 @@ impl XdgShellHandler for DuduclawComp {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // A4-1 damage source: a new window enters the stack.
+        self.queue_redraw();
         // Live-run evidence (Shell-S0 nested headless round, 2026-08-19/20):
         // a real xdg_toplevel object was created by a connected client. This
         // fires before the client's first commit/configure ack, so
@@ -72,6 +74,8 @@ impl XdgShellHandler for DuduclawComp {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        // A4-1 damage source: a popup enters the stack.
+        self.queue_redraw();
         self.unconstrain_popup(&surface);
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
     }
@@ -276,6 +280,12 @@ impl XdgShellHandler for DuduclawComp {
     /// now on top — see that method's doc (`state.rs`) for why it's
     /// per-seat and conditional rather than unconditional.
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // A4-1 damage source: whatever the closed window was covering has to
+        // be repainted. Set here rather than relying on
+        // `reassign_focus_on_window_removed` → `focus_window`, because that
+        // path deliberately does nothing when the destroyed window did not
+        // hold focus — and a background window closing still leaves a hole.
+        self.queue_redraw();
         let wl_surface = surface.wl_surface().clone();
         tracing::info!(surface_id = ?wl_surface.id(), "xdg_shell: toplevel destroyed, unmapping and reassigning focus");
 

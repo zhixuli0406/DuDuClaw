@@ -27,6 +27,16 @@
 // WP-CD4a-COMP addition (B-line CD-4a, multi-window targeting): `activate_
 // window` — raises/focuses a toplevel by xdg-shell app_id (or a title-prefix
 // fallback). Full behavior lives in `codrive/window_target.rs`.
+//
+// WP-CD4b-fix addition (B3, AT-SPI2 coordinate translation): `window_
+// geometry` — a READ-ONLY query returning where a client's visible window
+// sits in compositor global coordinates, so the gateway can convert an
+// AT-SPI `CoordType::Window` offset into a real click point (GTK4 hard-codes
+// `CoordType::Screen` to zeros — see `codrive/window_geometry.rs`'s module
+// doc for the first-hand GTK source citations). Answered by a oneshot
+// request/response round trip to the calloop main thread, like
+// `crate::shell_control`'s ops, NOT over the fire-and-forget `InjectCmd`
+// channel.
 
 use serde::Deserialize;
 
@@ -116,6 +126,16 @@ pub const MAX_ACTIVATE_WINDOW_QUERY_BYTES: usize = 255;
 ///   `shadow.rs`'s `freeze_bypass_decision`). No match found is answered
 ///   honestly with an `activate_window_failed` audit line, never a silent
 ///   no-op.
+/// - `{"op":"window_geometry","pid":1234,"app_id":"…"}` — WP-CD4b-fix (B3):
+///   READ-ONLY query for a client's visible-window origin + size in global
+///   logical coordinates. At least one of `pid`/`app_id` is required
+///   (`listener::validate`). Like `status`/`rotate_token` it is answered
+///   *outside* the frozen/terminated gates (it mutates nothing) — but unlike
+///   them it needs `self.space`, so `listener.rs` bridges it to the calloop
+///   main thread over a separate oneshot-reply channel and blocks, bounded,
+///   for the answer. Full behavior + the GTK4 `CoordType::Screen`-is-hard-
+///   coded-to-zero background it exists to work around live in
+///   `codrive/window_geometry.rs`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum InjectCmd {
@@ -132,6 +152,15 @@ pub enum InjectCmd {
     TakeOver { reason: String },
     Watch { enable: bool },
     ActivateWindow { app_id: String },
+    /// WP-CD4b-fix (B3). Both fields optional at the serde layer so a caller
+    /// may send either or both; `listener::validate` rejects the
+    /// all-absent case rather than letting an identity-less query through.
+    WindowGeometry {
+        #[serde(default)]
+        app_id: Option<String>,
+        #[serde(default)]
+        pid: Option<u32>,
+    },
 }
 
 impl InjectCmd {
@@ -153,6 +182,7 @@ impl InjectCmd {
             InjectCmd::TakeOver { .. } => ("take_over", None, None),
             InjectCmd::Watch { .. } => ("watch", None, None),
             InjectCmd::ActivateWindow { .. } => ("activate_window", None, None),
+            InjectCmd::WindowGeometry { .. } => ("window_geometry", None, None),
         }
     }
 }

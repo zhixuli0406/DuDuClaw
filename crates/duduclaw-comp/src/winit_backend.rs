@@ -18,7 +18,6 @@ use smithay::{
     backend::{
         renderer::{
             damage::OutputDamageTracker,
-            element::{render_elements, solid::SolidColorRenderElement, texture::TextureRenderElement},
             gles::{GlesRenderer, GlesTexture},
         },
         winit::{self, WinitEvent},
@@ -28,28 +27,33 @@ use smithay::{
     utils::{Rectangle, Transform},
 };
 
-use crate::{CalloopData, DuduclawComp};
+// A4-1: `CodriveElement` moved to `crate::render` so the udev backend can
+// use it without depending on this module. Definition unchanged.
+use crate::{render::CodriveElement, CalloopData, DuduclawComp};
 
-// CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): the same
-// "compositor-internal render element" convention `codrive/cursor.rs` and
-// `codrive/highlight.rs` already use for the two cursors and the target
-// highlight box (both zero-texture `SolidColorRenderElement`s), extended
-// with a real sampled texture for the PiP thumbnail
-// (`DuduclawComp::codrive_render_pip`, `codrive/shadow.rs`). smithay's
-// `render_elements!` macro (used the same way anvil-class compositors
-// combine heterogeneous custom-element types) generates the `Element`/
-// `RenderElement<GlesRenderer>` glue for this enum so `render_output`'s
-// single `custom_elements: &[C]` slice can carry both element kinds without
-// either `codrive/cursor.rs` or `codrive/shadow.rs` needing to know about
-// each other or about `GlesRenderer` specifically — this enum is the one
-// place in the crate that combines them, mirroring why this file (not
-// `codrive/`) is the one place that already knows about `GlesRenderer`
-// concretely.
-render_elements! {
-    pub CodriveElement<=GlesRenderer>;
-    Solid=SolidColorRenderElement,
-    Pip=TextureRenderElement<GlesTexture>,
-}
+// A4-1 note — why this backend still redraws unconditionally while
+// `udev_backend.rs` is strictly on-demand, and why that is not an
+// inconsistency to "fix later":
+//
+// `WinitEvent::Redraw` is emitted from winit's `WindowEvent::RedrawRequested`,
+// which only ever arrives in response to `Window::request_redraw()` (smithay
+// 0.7.0 `src/backend/winit/mod.rs:451`). So a winit compositor must call
+// `request_redraw()` to be scheduled at all — and the only handle to the
+// window lives inside `WinitGraphicsBackend`, which this function moves into
+// the event-source closure below because that closure is also what renders.
+// An on-demand winit path therefore needs the backend hoisted out into
+// `CalloopData` so the post-dispatch callback in `main.rs` can re-arm it
+// (exactly the shape `udev_backend::dispatch_render` uses).
+//
+// That refactor was attempted in this round and deliberately reverted: a
+// "skip the composite but still re-arm" version was measured in-container at
+// 100% CPU with ~780 000 skipped frames per 5 s — winit re-fires
+// `RedrawRequested` immediately, so the early return is a hot spin, strictly
+// worse than compositing. Hoisting the backend instead would rewrite the one
+// code path every previous round's live verification covers, for a backend
+// that only ever runs nested during development and CI. The appliance runs
+// the udev backend. See BUILD.md's "A4-1 CPU accounting" section for the
+// measured numbers.
 
 pub fn init_winit(
     event_loop: &mut EventLoop<CalloopData>,
@@ -102,6 +106,9 @@ pub fn init_winit(
     let mut pip_texture: Option<GlesTexture> = None;
     let mut pip_damage_tracker = OutputDamageTracker::from_output(&state.shadow_output);
 
+    // A4-1: read once at startup (same shape as every other comp-level env
+    // tunable in this crate — see `codrive/watch.rs`'s module doc).
+
     // SAFETY: single-threaded at this point in startup, before the event
     // loop starts running client callbacks — matches smallvil's own use of
     // `set_var` here (see attribution note above).
@@ -127,6 +134,12 @@ pub fn init_winit(
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {
+                // The udev backend consumes `pending_redraw` to decide
+                // whether to composite at all; this backend composites
+                // unconditionally (see the A4-1 note above this function)
+                // and just clears the flag so it can't go stale.
+                state.pending_redraw = false;
+
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
 

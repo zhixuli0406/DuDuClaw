@@ -105,6 +105,10 @@ mod tests_listener;
 #[cfg(test)]
 mod tests_takeover;
 mod watch;
+// WP-CD4b-fix (B3): the READ-ONLY `window_geometry` query — see that file's
+// module doc for the GTK4 `CoordType::Screen`-returns-zeros defect it
+// exists to close and the smithay coordinate semantics it depends on.
+mod window_geometry;
 // WP-comp-shell-ipc (2026-08-22): widened module-private -> `pub(crate)` so
 // `crate::shell_control` can reuse `find_target_window`/`window_identity`
 // (see `window_target.rs`'s own module doc "WP-comp-shell-ipc reuse"
@@ -271,6 +275,17 @@ pub fn init(
 
     let (tx, rx) = calloop::channel::channel::<InjectCmd>();
 
+    // WP-CD4b-fix (B3): a SECOND, separate channel for the read-only
+    // `window_geometry` query. Deliberately not folded into the `InjectCmd`
+    // channel above: that one is fire-and-forget (the listener acks from
+    // what it already knows), whereas a query genuinely needs the main
+    // thread's computed answer routed back — the same request/response
+    // shape `crate::shell_control` uses, and the reason its message type
+    // carries a oneshot `reply_tx`. Installed on `shared` BEFORE the
+    // listener is spawned so no connection can observe a half-built bridge.
+    let (query_tx, query_rx) = calloop::channel::channel::<window_geometry::CodriveQuery>();
+    shared.set_query_channel(query_tx);
+
     if let Err(e) = listener::spawn(sock_path, Arc::clone(&shared), tx) {
         tracing::error!(error = %e, "codrive: failed to start the agent injection socket listener — agent seat will receive no events this run");
     }
@@ -290,6 +305,22 @@ pub fn init(
             }
         })
         .expect("codrive: failed to insert the injection channel into the event loop");
+
+    // WP-CD4b-fix (B3): the query bridge's main-thread end. Read-only —
+    // `codrive_window_geometry` takes `&self`, queues no redraw, records no
+    // audit row (see `window_geometry.rs`'s "Not an action" section). A
+    // dropped receiver on the socket side (caller gave up / timed out) makes
+    // `reply_tx.send` fail, which is fine to ignore: that caller already got
+    // its own honest `timeout` answer.
+    event_loop
+        .handle()
+        .insert_source(query_rx, |event, _, data: &mut CalloopData| {
+            if let calloop::channel::Event::Msg(msg) = event {
+                let reply = data.state.codrive_window_geometry(&msg.req);
+                let _ = msg.reply_tx.send(reply);
+            }
+        })
+        .expect("codrive: failed to insert the window-geometry query channel into the event loop");
 
     (agent_seat, shared)
 }
@@ -546,6 +577,20 @@ impl DuduclawComp {
                 tracing::warn!("codrive: Status reached handle_agent_inject unexpectedly — no-op (see listener.rs)");
                 return;
             }
+            InjectCmd::WindowGeometry { .. } => {
+                // WP-CD4b-fix (B3): answered by the socket thread over its
+                // own oneshot query bridge (listener.rs → `CodriveShared::
+                // query_window_geometry` → this file's `init`-installed
+                // query source → `codrive_window_geometry`), so it never
+                // travels down THIS channel. Kept as an arm for the same
+                // fail-safe reasoning as Resume/Status/RotateToken below —
+                // and critically, returning here means it can never fall
+                // through to the `queue_redraw()`/`inject_applied` tail, so
+                // a read-only query stays read-only even if a future change
+                // starts routing it here.
+                tracing::warn!("codrive: WindowGeometry reached handle_agent_inject unexpectedly — no-op (see listener.rs)");
+                return;
+            }
             InjectCmd::RotateToken => {
                 // Handled synchronously by the socket thread (listener.rs) —
                 // touches only `CodriveShared`/the token file, never the
@@ -572,6 +617,15 @@ impl DuduclawComp {
             // every other seat/space-touching op above.
             InjectCmd::ActivateWindow { app_id } => self.codrive_activate_window(app_id),
         }
+
+        // A4-1 damage source: every arm above that reaches this point moved
+        // the agent cursor, clicked, typed into a focused surface, armed a
+        // highlight box, or toggled the shadow workspace / takeover / watch
+        // state — all of which change what the next composited frame should
+        // look like (the agent cursor's colour alone flips on freeze). The
+        // early-`return` arms (Resume/Status/RotateToken and the invalid-
+        // input drops) deliberately skip this: they change no pixels.
+        self.queue_redraw();
 
         // WP-CD2-freeze-scope: tag shadow-bypassed applies for the audit
         // trail; `None` (unchanged) for every non-bypass apply.

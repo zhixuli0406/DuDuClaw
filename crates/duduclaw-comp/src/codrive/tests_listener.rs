@@ -451,3 +451,109 @@ fn activate_window_forwarded_to_channel_when_not_frozen() {
 
     let _ = std::fs::remove_file(&sock_path);
 }
+
+// ── WP-CD4b-fix (B3): the read-only `window_geometry` query ──
+
+/// Field-level validation: an identity-less query is refused outright
+/// rather than being "helpfully" matched against whatever single window
+/// happens to be mapped (`window_geometry.rs`'s fail-closed policy).
+#[test]
+fn validate_rejects_window_geometry_without_any_identity() {
+    let cmd = InjectCmd::WindowGeometry { app_id: None, pid: None };
+    assert!(validate(&cmd).is_err());
+}
+
+#[test]
+fn validate_rejects_window_geometry_empty_or_oversized_app_id() {
+    let empty = InjectCmd::WindowGeometry { app_id: Some(String::new()), pid: None };
+    assert!(validate(&empty).is_err());
+    let oversized = InjectCmd::WindowGeometry {
+        app_id: Some("x".repeat(super::protocol::MAX_ACTIVATE_WINDOW_QUERY_BYTES + 1)),
+        pid: None,
+    };
+    assert!(validate(&oversized).is_err());
+}
+
+#[test]
+fn validate_rejects_window_geometry_pid_zero() {
+    let cmd = InjectCmd::WindowGeometry { app_id: None, pid: Some(0) };
+    assert!(validate(&cmd).is_err());
+}
+
+#[test]
+fn validate_accepts_window_geometry_with_either_identity() {
+    assert!(validate(&InjectCmd::WindowGeometry { app_id: None, pid: Some(1234) }).is_ok());
+    assert!(validate(&InjectCmd::WindowGeometry { app_id: Some("foot".into()), pid: None }).is_ok());
+    assert!(validate(&InjectCmd::WindowGeometry { app_id: Some("foot".into()), pid: Some(1234) }).is_ok());
+}
+
+/// With no main-thread query bridge installed (exactly the state
+/// `CodriveShared::for_test` leaves it in, and the state a real run is in
+/// if `init` ever failed before wiring it), the query answers an explicit
+/// `compositor_unavailable` — never a fabricated coordinate, and never a
+/// hang. This is the property the whole fix rests on: an unanswerable
+/// query must produce a REFUSAL the gateway can fall back from.
+#[test]
+fn window_geometry_without_a_main_thread_bridge_fails_closed() {
+    let sock_path = std::env::temp_dir().join(format!("duduclaw-codrive-test-wgnb-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock_path);
+
+    let shared = Arc::new(CodriveShared::for_test(Some("tok".to_string())));
+    let (tx, rx) = calloop::channel::channel::<InjectCmd>();
+    spawn(sock_path.clone(), Arc::clone(&shared), tx).expect("test listener failed to bind");
+
+    let conn = UnixStream::connect(&sock_path).expect("test client failed to connect");
+    let mut writer = conn.try_clone().unwrap();
+    let mut br = BufReader::new(&conn);
+    writeln!(writer, r#"{{"op":"auth","token":"tok"}}"#).unwrap();
+    let mut reply = String::new();
+    br.read_line(&mut reply).unwrap();
+
+    writeln!(writer, r#"{{"op":"window_geometry","pid":4321}}"#).unwrap();
+    reply.clear();
+    br.read_line(&mut reply).unwrap();
+    assert!(reply.contains(r#""ok":false"#), "unexpected window_geometry ack: {reply}");
+    assert!(reply.contains("compositor_unavailable"), "unexpected window_geometry ack: {reply}");
+    assert!(
+        rx.try_recv().is_err(),
+        "a query must never travel down the fire-and-forget InjectCmd channel"
+    );
+
+    let _ = std::fs::remove_file(&sock_path);
+}
+
+/// The query is answered even while the seat is frozen, exactly like
+/// `status` — see `window_geometry.rs`'s "Not an action" section for why
+/// denying a read-only query under freeze would push the agent toward the
+/// LESS informed click, not away from it. What matters here is that the
+/// answer is NOT `agent_seat_frozen`.
+#[test]
+fn window_geometry_is_answered_while_frozen() {
+    let sock_path = std::env::temp_dir().join(format!("duduclaw-codrive-test-wgfz-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock_path);
+
+    let shared = Arc::new(CodriveShared::for_test(Some("tok".to_string())));
+    // `terminated` is deliberately NOT set here: `handle_conn` clears it on
+    // every successful auth (a fresh connection IS a fresh session), so it
+    // could never be observed by a command on this connection anyway.
+    shared.frozen.store(true, Ordering::SeqCst);
+    let (tx, _rx) = calloop::channel::channel::<InjectCmd>();
+    spawn(sock_path.clone(), Arc::clone(&shared), tx).expect("test listener failed to bind");
+
+    let conn = UnixStream::connect(&sock_path).expect("test client failed to connect");
+    let mut writer = conn.try_clone().unwrap();
+    let mut br = BufReader::new(&conn);
+    writeln!(writer, r#"{{"op":"auth","token":"tok"}}"#).unwrap();
+    let mut reply = String::new();
+    br.read_line(&mut reply).unwrap();
+
+    writeln!(writer, r#"{{"op":"window_geometry","app_id":"foot-A"}}"#).unwrap();
+    reply.clear();
+    br.read_line(&mut reply).unwrap();
+    assert!(
+        !reply.contains("agent_seat_frozen"),
+        "a read-only query must be answered outside the frozen gate, got: {reply}"
+    );
+
+    let _ = std::fs::remove_file(&sock_path);
+}

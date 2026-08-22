@@ -444,7 +444,15 @@ pub(super) fn freeze_bypass_decision(
         // answers them synchronously) — listed explicitly, not via a `_`
         // wildcard, so a future new `InjectCmd` variant fails this match at
         // compile time instead of silently inheriting a bypass by default.
-        InjectCmd::Resume | InjectCmd::Status | InjectCmd::RotateToken => false,
+        // WP-CD4b-fix (B3): `WindowGeometry` joins this group for the same
+        // reason — the socket thread answers it over its own oneshot query
+        // bridge, so it never reaches `handle_agent_inject`. `false` here
+        // is not a denial of the query (nothing consults this function for
+        // it); it is the honest "this is not an injection that could be
+        // confined to the shadow output" answer, and it keeps the match
+        // exhaustive-without-wildcard so the next new variant still has to
+        // be thought about.
+        InjectCmd::Resume | InjectCmd::Status | InjectCmd::RotateToken | InjectCmd::WindowGeometry { .. } => false,
         // CD-3: never bypass-eligible, same reasoning as `Shadow` above —
         // `TakeOver` is itself a control-plane transition (not something
         // "confined to the shadow output" even applies to), and `Watch`'s

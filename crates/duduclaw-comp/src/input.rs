@@ -8,13 +8,13 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::{
         keyboard::{keysyms, FilterResult, Keysym},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
-    utils::SERIAL_COUNTER,
+    utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
 };
 
 use crate::state::DuduclawComp;
@@ -28,6 +28,12 @@ impl DuduclawComp {
     /// coming through `process_input_event` can ever be agent-originated
     /// input freezing itself.
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        // A4-1: any human input can move the human cursor overlay, change
+        // focus, or drag a window under an active grab. Marking dirty here
+        // (once, for every arm) is what lets the udev backend stay blocked
+        // in `epoll` the rest of the time. No-op for the winit backend,
+        // which drives its own unconditional redraw loop.
+        self.queue_redraw();
         match event {
             InputEvent::Keyboard { event, .. } => {
                 let serial = SERIAL_COUNTER.next_serial();
@@ -120,14 +126,51 @@ impl DuduclawComp {
                     self.on_human_input("keyboard");
                 }
             }
-            InputEvent::PointerMotion { .. } => {
+            InputEvent::PointerMotion { event, .. } => {
                 self.on_human_input("pointer_motion");
+
+                // A4-1: this arm used to be a bare `on_human_input` call and
+                // nothing else. That was harmless on the winit backend —
+                // smithay's winit backend only ever emits
+                // `PointerMotionAbsolute` (see `backend/winit/mod.rs`), so
+                // relative motion never arrived. libinput emits exactly the
+                // opposite for an ordinary mouse/trackpad, so on real
+                // hardware an unimplemented arm here means "the pointer
+                // never moves at all". Implemented as
+                // accumulate-delta-then-clamp, the standard shape for a
+                // compositor with no pointer-constraint protocol.
+                let serial = SERIAL_COUNTER.next_serial();
+                let time = event.time_msec();
+                let pointer = self.seat.get_pointer().unwrap();
+                let pos = self.clamp_pointer(pointer.current_location() + event.delta());
+                let under = self.surface_under(pos);
+                pointer.motion(
+                    self,
+                    under,
+                    &MotionEvent {
+                        location: pos,
+                        serial,
+                        time,
+                    },
+                );
+                pointer.frame(self);
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 self.on_human_input("pointer_motion_absolute");
 
-                let output = self.space.outputs().next().unwrap();
-                let output_geo = self.space.output_geometry(output).unwrap();
+                // A4-1 bug fix: this used to be `self.space.outputs().next()`,
+                // which since the CD-2 shadow workspace landed has returned
+                // the HEADLESS shadow output (mapped first, in
+                // `DuduclawComp::new`, at `codrive::SHADOW_ORIGIN` =
+                // `(0, 100_000)`), not the real one. Absolute pointer
+                // positions were therefore being mapped 100 000 px below
+                // every real window. See `DuduclawComp::primary_output`.
+                let Some(output) = self.primary_output().cloned() else {
+                    return;
+                };
+                let Some(output_geo) = self.space.output_geometry(&output) else {
+                    return;
+                };
 
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
 
@@ -232,6 +275,52 @@ impl DuduclawComp {
             _ => {}
         }
     }
+
+    /// A4-1: keeps a relative-motion pointer inside the union of the REAL
+    /// outputs (the CD-2 shadow output at `codrive::SHADOW_ORIGIN` is
+    /// excluded via `primary_output`-style filtering, otherwise the union
+    /// would stretch 100 000 px down and the cursor could wander off the
+    /// visible screen into the shadow workspace).
+    ///
+    /// With no real output mapped yet the position is returned unchanged —
+    /// clamping to an empty region would pin the cursor at the origin.
+    fn clamp_pointer(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+        let mut bounds: Option<Rectangle<i32, Logical>> = None;
+        for output in self.space.outputs() {
+            if output == &self.shadow_output {
+                continue;
+            }
+            if let Some(geo) = self.space.output_geometry(output) {
+                bounds = Some(match bounds {
+                    Some(b) => b.merge(geo),
+                    None => geo,
+                });
+            }
+        }
+        let Some(b) = bounds else {
+            return pos;
+        };
+        clamp_to(pos, b)
+    }
+}
+
+/// Pure clamp, split out of [`DuduclawComp::clamp_pointer`] so the geometry
+/// rule is unit-testable without a `Space`/`Output` (this crate's standing
+/// constraint — see `is_system_gesture_tail` below).
+///
+/// The upper bound is exclusive-ish: a pointer exactly on `loc + size` would
+/// be one pixel past the last addressable pixel and `surface_under` would
+/// find nothing there, so it is pulled back by a hair.
+pub(crate) fn clamp_to(pos: Point<f64, Logical>, bounds: Rectangle<i32, Logical>) -> Point<f64, Logical> {
+    const EPS: f64 = 1.0;
+    let min_x = bounds.loc.x as f64;
+    let min_y = bounds.loc.y as f64;
+    let max_x = (bounds.loc.x + bounds.size.w) as f64 - EPS;
+    let max_y = (bounds.loc.y + bounds.size.h) as f64 - EPS;
+    Point::from((
+        pos.x.clamp(min_x, min_x.max(max_x)),
+        pos.y.clamp(min_y, min_y.max(max_y)),
+    ))
 }
 
 /// Pure decision function, kept unit-testable without a full `DuduclawComp`
@@ -259,7 +348,49 @@ pub(crate) fn is_system_gesture_tail(logo_held_now: bool, logo_held_prev: bool) 
 
 #[cfg(test)]
 mod tests {
-    use super::is_system_gesture_tail;
+    use super::{clamp_to, is_system_gesture_tail};
+    use smithay::utils::{Logical, Point, Rectangle, Size};
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+    }
+
+    #[test]
+    fn a_pointer_inside_the_bounds_is_untouched() {
+        let p = clamp_to(Point::from((640.0, 400.0)), rect(0, 0, 1280, 800));
+        assert_eq!((p.x, p.y), (640.0, 400.0));
+    }
+
+    #[test]
+    fn a_pointer_off_the_left_or_top_is_pulled_back_to_the_origin() {
+        let p = clamp_to(Point::from((-50.0, -9.0)), rect(0, 0, 1280, 800));
+        assert_eq!((p.x, p.y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_pointer_off_the_right_or_bottom_stays_on_an_addressable_pixel() {
+        let p = clamp_to(Point::from((99_999.0, 99_999.0)), rect(0, 0, 1280, 800));
+        assert_eq!((p.x, p.y), (1279.0, 799.0));
+    }
+
+    #[test]
+    fn a_non_zero_origin_is_respected_in_both_directions() {
+        // Second monitor in a left-to-right layout.
+        let b = rect(1280, 0, 1920, 1080);
+        assert_eq!(clamp_to(Point::from((0.0, 0.0)), b).x, 1280.0);
+        assert_eq!(clamp_to(Point::from((99_999.0, 0.0)), b).x, 3199.0);
+    }
+
+    #[test]
+    fn a_degenerate_one_pixel_output_does_not_invert_the_clamp_range() {
+        // `min.max(max)` guards `clamp`'s "min > max" panic for a 1px (or
+        // 0px) output — a real possibility for a connector that reports a
+        // nonsense mode.
+        let p = clamp_to(Point::from((50.0, 50.0)), rect(10, 10, 1, 1));
+        assert_eq!((p.x, p.y), (10.0, 10.0));
+        let p = clamp_to(Point::from((50.0, 50.0)), rect(10, 10, 0, 0));
+        assert_eq!((p.x, p.y), (10.0, 10.0));
+    }
 
     #[test]
     fn logo_currently_held_is_always_a_gesture_tail() {
