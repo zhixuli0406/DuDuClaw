@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened Runtime entitlements for the DuDuClaw native GUI (gpui-based
+  app, WP-C-M01). Trimmed from src-tauri/entitlements.plist:
+
+  - com.apple.security.cs.allow-jit and
+    com.apple.security.cs.allow-unsigned-executable-memory were needed by
+    the Tauri shell's bundled WebKit/JS runtime. This app has no embedded
+    webview (gpui renders natively via Metal) and does not JIT-compile
+    anything at runtime, so both are dropped — narrower entitlements are
+    strictly better for App Review / Gatekeeper trust.
+  - com.apple.security.cs.allow-dyld-environment-variables and
+    com.apple.security.cs.disable-library-validation are dropped for the
+    same reason: nothing in this crate loads unsigned dylibs or relies on
+    DYLD_* env vars at runtime.
+
+  Kept: network client/server (the app talks to the local gateway sidecar
+  over loopback WebSocket/HTTP, and — like the Tauri shell — may itself act
+  as a local listener) and Computer Use automation (enigo/xcap-style system
+  events); the OS still prompts the user for Accessibility/Screen Recording
+  on first use regardless of this entitlement.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>

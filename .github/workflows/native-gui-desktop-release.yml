@@ -1,0 +1,128 @@
+# Native GUI (gpui) desktop app release pipeline (WP-C-M01 / C-line S7).
+#
+# Builds crates/duduclaw-native-gui — NOT the Tauri shell (see
+# .github/workflows/desktop-release.yml for that) — into a plain macOS
+# `DuDuClaw.app` bundle via scripts/desktop/bundle-native-gui-macos.sh, then
+# signs + notarizes it via the shared scripts/desktop/sign-notarize-macos.sh
+# (passing this crate's own trimmed entitlements file).
+#
+# Windows and Linux are placeholder legs only (`if: false`) — the native-gui
+# crate is gpui-based and macOS-only today (see crate Cargo.toml comments on
+# the zed-industries/zed git dependency); flip them on once gpui ports land.
+#
+# Required repo secrets (Settings → Secrets → Actions) — same names as
+# desktop-release.yml, reused rather than duplicated:
+#   APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD   (Developer ID .p12, base64)
+#
+# This file is written but deliberately NOT wired to auto-fire on every push
+# — pushing a native-gui-v* tag is a human decision (see `on:` below).
+name: native-gui-desktop-release
+
+on:
+  push:
+    tags: ["native-gui-v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          # Placeholders — gpui has no Windows/Linux backend wired into this
+          # crate yet. Keep the matrix leg declared (so turning it on later
+          # is a one-line flip) but never actually run it.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            placeholder: true
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            placeholder: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        if: matrix.placeholder != true
+        uses: actions/checkout@v7
+
+      # native-gui pins an exact toolchain via rust-toolchain.toml (gpui
+      # depends on a std feature stabilized after this repo's usual rustc —
+      # see crate CLAUDE.md / main.rs doc comment). Install that pinned
+      # version explicitly plus the cross target, rather than relying on
+      # rustup's directory-override auto-install alone.
+      - name: Install pinned Rust toolchain (native-gui)
+        if: matrix.placeholder != true
+        shell: bash
+        run: |
+          TOOLCHAIN="$(awk -F'"' '/^channel/{print $2; exit}' crates/duduclaw-native-gui/rust-toolchain.toml)"
+          echo "Pinned toolchain: $TOOLCHAIN"
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          rustup target add "${{ matrix.target }}" --toolchain "$TOOLCHAIN"
+
+      - name: Build release binary
+        if: matrix.placeholder != true
+        shell: bash
+        run: |
+          cd crates/duduclaw-native-gui
+          cargo build --release --target "${{ matrix.target }}"
+
+      - name: Bundle DuDuClaw.app
+        if: matrix.placeholder != true
+        shell: bash
+        run: |
+          OUT_DIR="dist/native-gui-macos" SKIP_BUILD=1 \
+            scripts/desktop/bundle-native-gui-macos.sh "${{ matrix.target }}"
+
+      - name: Import Apple certificate
+        if: matrix.placeholder != true && matrix.os == 'macos-latest'
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Sign, notarize, staple
+        if: matrix.placeholder != true && matrix.os == 'macos-latest'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          scripts/desktop/sign-notarize-macos.sh \
+            "dist/native-gui-macos/DuDuClaw.app" \
+            "crates/duduclaw-native-gui/entitlements.plist"
+
+      - name: Verify Gatekeeper acceptance
+        if: matrix.placeholder != true && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          spctl -a -vvv "dist/native-gui-macos/DuDuClaw.app"
+
+      - name: Package .dmg for release
+        if: matrix.placeholder != true && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          hdiutil create -volname "DuDuClaw" \
+            -srcfolder "dist/native-gui-macos/DuDuClaw.app" \
+            -ov -format UDZO \
+            "dist/release/DuDuClaw-native-gui-${{ github.ref_name }}-${{ matrix.target }}.dmg"
+
+      - name: Upload release asset
+        if: matrix.placeholder != true
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/release/*.dmg
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
