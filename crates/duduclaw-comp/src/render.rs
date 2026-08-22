@@ -9,7 +9,11 @@
 //! the doc comment below (moved here verbatim) for why it exists at all.
 
 use smithay::backend::renderer::{
-    element::{render_elements, solid::SolidColorRenderElement, texture::TextureRenderElement},
+    element::{
+        memory::MemoryRenderBufferRenderElement, render_elements,
+        solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
+        texture::TextureRenderElement,
+    },
     gles::{GlesRenderer, GlesTexture},
 };
 
@@ -27,8 +31,18 @@ use smithay::backend::renderer::{
 // each other or about `GlesRenderer` specifically — this module is the one
 // place in the crate that combines them, mirroring why it (not `codrive/`)
 // is the one place that already knows about `GlesRenderer` concretely.
+// CUR-1 (2026-08-22) added the last two variants. The human pointer is no
+// longer a solid rectangle: it is either a themed XCursor image uploaded from
+// main memory (`Memory`, `crate::cursor::theme` / `crate::cursor::fallback`)
+// or a client-provided cursor surface drawn as a real surface tree
+// (`Surface`, `wl_pointer.set_cursor`). Both are per-frame element types
+// exactly like the two above, so they belong in the same enum rather than in
+// a second `custom_elements` mechanism — `render_output` takes ONE
+// `&[C]` slice, and every element in a frame has to be one `C`.
 render_elements! {
     pub CodriveElement<=GlesRenderer>;
     Solid=SolidColorRenderElement,
     Pip=TextureRenderElement<GlesTexture>,
+    Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
 }

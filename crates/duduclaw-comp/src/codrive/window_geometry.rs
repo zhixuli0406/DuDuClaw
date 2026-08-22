@@ -214,7 +214,7 @@ pub(crate) enum GeometryMatch {
 ///    - exactly 1 left ⇒ `Unique` (the app_id, if any, is not even
 ///      consulted: pid already identified the process uniquely, and the
 ///      Wayland app_id need not equal the AT-SPI application name).
-///    - >1 left ⇒ narrow with `app_id` (exact), then `title` (prefix),
+///    - `>1` left ⇒ narrow with `app_id` (exact), then `title` (prefix),
 ///      inside that pid pool only; anything short of exactly one survivor
 ///      is `Ambiguous`.
 /// 2. `pid` absent → `app_id` exact over all toplevels, then `title`

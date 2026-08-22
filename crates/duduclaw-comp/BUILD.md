@@ -3701,3 +3701,317 @@ With that upstream, comp's order becomes irrelevant and
   keyboard obtained from the **second** `wl_seat` in the trace.
 - **Not committed** — per this task's instructions, same as every prior round
   in this file.
+
+## CUR-1: a real mouse cursor (2026-08-22)
+
+Reported from a real appliance run: *"滑鼠是一個方塊，而非主流鼠標，而且還是白色
+的誰看得到"*. Two defects stacked.
+
+1. **Client cursor requests were silently discarded.**
+   `SeatHandler::cursor_image` was an empty function
+   (`src/handlers/mod.rs`, pre-CUR-1 line 32:
+   `fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}`).
+   Every `wl_pointer.set_cursor` any client ever sent went nowhere: no I-beam
+   over a text field, no hand over a link, no resize arrow on a window edge.
+2. **What comp drew instead was a CD-0 placeholder.** `codrive/cursor.rs`
+   drew the human pointer as a 10×10 `SolidColorRenderElement` at
+   `HUMAN_COLOR = [0.95, 0.95, 0.95, 0.95]` — its own header called it a
+   placeholder. White on the light OOBE background is invisible.
+
+### What changed
+
+| File | What |
+|---|---|
+| `src/cursor/mod.rs` | New. Human-pointer state machine + render elements. `CursorState` (`:75`), `set_human_cursor_image` (`:108`), `build_human_cursor_elements` (`:136`), `send_cursor_frames` (`:221`). |
+| `src/cursor/theme.rs` | New. XCursor theme load + per-icon cache + negative cache + fallback. `CursorThemeStore::new` (`:99`), `cursor_for` (`:187`), `pick_image` size selection. |
+| `src/cursor/source.rs` | New. The configuration seam: `CursorSource` (`:68`), `from_env_value` (`:117`), `resolve_theme_name` (`:153`), `resolve_size` (`:173`). |
+| `src/cursor/fallback.rs` | New. Asset-free built-in arrow: `ARROW` mask (`:39`), `rasterize` (`:105`), `build_buffer` (`:141`). |
+| `src/handlers/mod.rs` | `cursor_image` implemented (`:55`); `impl TabletSeatHandler` (`:80`); `delegate_cursor_shape!` (`:89`). |
+| `src/state.rs` | `cursor_shape_manager_state` field (`:60`) + construction (`:178`); `cursor: CursorState` field (`:71`) + `from_env` (`:252`) + one boot log line. |
+| `src/render.rs` | `CodriveElement` gains `Memory=` (`:46`) and `Surface=` (`:47`) variants. |
+| `src/codrive/cursor.rs` | Human half deleted; `build_cursor_elements` → `build_agent_cursor_elements`. **The amber cross and its frozen dark-red variant are untouched** (DESIGN §3.3.2 "與人游標明確異形異色"). |
+| `src/winit_backend.rs` / `src/udev_backend.rs` | Human elements built first (topmost), then the agent cross; `send_cursor_frames` after the per-window `send_frame` loop. |
+| `src/codrive/debug_sim.rs` | New opt-in `simulate_pointer <x> <y>` command — the only way to move the HUMAN pointer in a headless container (nested weston advertises zero input devices). |
+| `Cargo.toml` | `xcursor = "0.3"` promoted from a transitive dependency (already in `Cargo.lock` at 0.3.11 via `wayland-cursor`) to a direct one. No new crate in the tree. |
+
+Drive-by (both pre-existing, both surfaced by the newer clippy 0.1.97 in the
+current `rust:bookworm`, both needed to keep `-D warnings` green):
+`src/seat_order.rs` manual `Default` impl → `#[derive(Default)]` +
+`#[default]`; `src/codrive/window_geometry.rs:218` `- >1 left` →
+`` - `>1` left `` (the bare `>` after a list marker parses as a blockquote).
+
+### Both client protocols are served — and why
+
+`wl_pointer.set_cursor` → `CursorImageStatus::Surface`;
+`wp_cursor_shape_device_v1.set_shape` → `CursorImageStatus::Named`. Both land
+in the same `cursor_image` handler.
+
+Implementing only the first would have been *sufficient* for the shell: at the
+pinned gpui rev, `crates/gpui_linux/src/linux/wayland/client.rs:1067`
+`set_cursor_style` uses the cursor-shape device **if it bound one**, else
+falls back to loading a theme itself and sending a surface. But
+`cursor_shape_manager` there is `Option` (`:244`, `globals.bind(1..=1).ok()`),
+so which branch it takes is *our* choice. Advertising the global is worth it:
+
+* one theme, chosen by the compositor, for every client at once — `foot`,
+  chromium and GTK apps otherwise each run their own loader with their own
+  idea of `XCURSOR_THEME`;
+* the brand-cursor seam below becomes a single compositor-side switch instead
+  of something each client would have to honour;
+* it costs one field, one empty trait impl and one `delegate_` macro, because
+  smithay 0.7.0 already implements the protocol.
+
+### Configuration seam for the brand cursor
+
+The user's call was explicit: *"手繪爪形品牌游標這個我認為可以當設定中的替換，
+正常還是用正常的游標就好了"*. So:
+
+```
+DUDUCLAW_COMP_CURSOR_SOURCE=system   # default — the machine's XCursor theme
+DUDUCLAW_COMP_CURSOR_SOURCE=brand    # the "DuDuClaw" XCursor theme
+DUDUCLAW_COMP_CURSOR_THEME=<name>    # explicit theme override, either source
+XCURSOR_THEME / XCURSOR_SIZE         # freedesktop standards, honoured
+```
+
+`brand` is **fail-safe**: no such theme installed ⇒ one `WARN` line and a
+fall back to the system theme. No brand artwork exists yet — that is a
+separate design work package — and `brand` deliberately means "an ordinary
+XCursor theme named `DuDuClaw`", so the art package needs **zero** new loading
+code when it lands.
+
+**Why an env var** (full reasoning in `src/cursor/source.rs`'s module doc):
+comp has no config file and the brief forbids inventing one; every existing
+comp tunable is an env var read at startup (`DUDUCLAW_COMP_SEAT_ORDER`,
+`DUDUCLAW_COMP_BACKEND`, `DUDUCLAW_COMP_DRM_DEVICE`,
+`DUDUCLAW_CODRIVE_WATCH_IDLE_SECS`); and `shell_control` is a control channel
+with no persistence, so a socket op would *still* need a durable value outside
+comp — i.e. this env var — plus a second mechanism on top.
+
+**How a shell settings page wires to it later:** write the value into comp's
+spawn environment and restart comp — mechanically identical to what an
+operator does for `DUDUCLAW_COMP_SEAT_ORDER` today. If a future round wants it
+live without a restart, the hook is already shaped: `from_env_value` is pure
+and the live value is a plain field, so a `shell_control` `set_cursor_source`
+op would only set the field, drop the theme cache and `queue_redraw()`. That
+op is **not** implemented here — it is a live-reconfiguration feature with its
+own auth/audit surface.
+
+### The `pixels_rgba` trap (checked against sources, not assumed)
+
+`xcursor::parser::Image::pixels_rgba` is **not** RGBA. The parser copies the
+file's pixel block verbatim (`parse_img`: `take_bytes`, no reordering) and its
+own doc concedes "(or, in the order of the file)". libXcursor writes each
+pixel as an ARGB32 word through `_XcursorWriteUInt`, little-endian ⇒ the bytes
+on disk are **B, G, R, A** — which is exactly DRM/wl_shm `ARGB8888`.
+Confirmation from working code: `wayland-cursor` (the client-side consumer of
+this same crate, used by winit/SCTK) writes `pixels_rgba` straight into an shm
+buffer declared `Format::Argb8888` (`wayland-cursor-0.31.14/src/lib.rs` lines
+367 and 384). The sibling `pixels_argb` is no better — it is derived assuming
+RGBA input, so it comes out A,B,G,R.
+
+So `theme.rs` uses `Fourcc::Argb8888`, while `fallback.rs` uses
+`Fourcc::Abgr8888` for its own hand-authored R,G,B,A array. Two formats, each
+correct for its own data; both are natively supported by `GlesRenderer`.
+
+### Verification — container (`rust:bookworm`, A4-1 system dependency list)
+
+```
+cargo build                              -> Finished dev profile in 8.46s
+cargo clippy --all-targets -- -D warnings -> Finished (exit 0, no warnings)
+cargo test                               -> test result: ok. 182 passed; 0 failed
+```
+
+**182 = 156 pre-existing + 26 new** (9 `cursor::source`, 7 `cursor::fallback`,
+7 `cursor::theme`, 3 `codrive::debug_sim`).
+
+### Verification — live, nested weston (the legacy `set_cursor` path)
+
+`weston --backend=headless-backend.so` → `duduclaw-comp` → `foot` 1.13.1
+(which does **not** implement cursor-shape-v1, so it exercises the surface
+path), driven with the new `simulate_pointer`:
+
+```
+cursor: XCursor theme loaded source="system" theme=Adwaita size=24
+codrive: debug stdin — simulating human pointer motion x=10 y=10
+cursor: human pointer image changed cursor=client-surface
+codrive: debug stdin — simulating human pointer motion x=400 y=300
+cursor: human pointer image changed cursor=default
+cursor: human pointer image changed cursor=client-surface
+```
+
+Pre-CUR-1 not one of those `cursor:` lines could exist — the handler was empty.
+
+### Verification — live, Xvfb + winit backend (pixel proof)
+
+The winit backend also runs on X11, so `Xvfb :99` + `import -window root`
+gives a real screenshot of comp's own composited output. (weston's headless
+backend does advertise `weston_screenshooter`, but `weston-screenshooter`
+hangs against it — that route is unavailable, X11 is.) Comp's window is
+1280×800 at +0+0, so screen coordinates equal comp's logical coordinates.
+
+**1. Default cursor from the Adwaita theme.** Human pointer moved to logical
+(600, 400); the drawn image starts at screen (599, 399) — hotspot (1,1)
+applied. ASCII rendering of the 22×28 region (`#` = bright, `X` = dark,
+`.` = the `[0.1,0.1,0.1]` clear colour):
+
+```
+.X+X..................
+.X#+X.................
+.X##+X................
+.X#X#+X...............
+.X#XX#+X..............
+.X#XXX#+X.............
+.X#XXXX#+X............
+.X#XXXX+#+X...........
+.X#XXXXX+#XX..........
+.X#XXXXXX+#XX.........
+.X#XXXXXXX+#XX........
+.X#XXXXXXXX+#XX.......
+.X#XXXXX######XX......
+.X#XXX+X+#XXXXXX......
+.X#XX##XX#XXXXX.......
+.X#X#+++X++X..........
+.X##+XX#.X#XX.........
+.X#+XXX++X#+X.........
+.X+XX..X###XX.........
+..XX...XXXXXX.........
+........XXXX..........
+```
+
+An arrow, not a square: triangular head, diagonal right edge, notch, tail —
+Adwaita's black-body/white-outline `default`.
+
+**2. `cursor-shape-v1` end to end.** A throwaway 140-line C client (built
+in-container from `wayland-scanner` output; **not** added to the repo) binds
+`wp_cursor_shape_manager_v1`, keeps the *last* advertised seat exactly as gpui
+does, and on `wl_pointer.enter` calls `set_shape(serial, TEXT)`:
+
+```
+client: bound wp_cursor_shape_manager_v1
+client: seat name = duduclaw-agent
+client: got wl_pointer (replacing any previous seat's)
+client: seat name = winit
+client: got wl_pointer (replacing any previous seat's)
+client: requested TEXT cursor via cursor-shape-v1 (serial 3)
+comp:   cursor: human pointer image changed cursor=text
+```
+
+and the pixels over the client's window (`.` = the client's blue):
+
+```
+...........#######+...........
+...........#XX+XX#X...........
+...........###X###X...........
+...........+X#X#XX+...........
+............+#X#X+............      <- 10 identical stem rows
+...........###X###+...........
+...........#XXXXX#X...........
+...........#######X...........
+```
+
+An I-beam. The whole chain — modern protocol → smithay dispatch → our
+`cursor_image` → theme lookup → render element — is live-proven.
+
+**3. `wp_cursor_shape_manager_v1` really is advertised** (`wayland-info`):
+
+```
+interface: 'wp_cursor_shape_manager_v1',   version:  2, name:  7
+```
+
+**4. The asset-free fallback, pixel-exact.** With
+`DUDUCLAW_COMP_CURSOR_THEME=duduclaw-no-such-theme-cur1`:
+
+```
+WARN cursor: no XCursor theme found (looked for 'duduclaw-no-such-theme-cur1' on
+     XCURSOR_PATH / the default icon search path) — drawing the built-in outlined
+     arrow instead. Install a cursor theme (e.g. the adwaita-icon-theme package)
+     or set DUDUCLAW_COMP_CURSOR_THEME to a theme that exists.
+DEBUG cursor: theme has no image for this icon — using the default cursor icon="default"
+WARN  cursor: falling back to the built-in outlined arrow …
+```
+
+screenshot histogram:
+
+```
+1023789: (26,26,26) #1A1A1A   <- clear colour
+    117: (250,250,249) #FAFAF9 <- stone-50 fill
+     62: (28,25,23)   #1C1917  <- stone-900 outline
+```
+
+117 and 62 are the **exact** `#` and `X` cell counts of the `ARROW` mask in
+`fallback.rs` — the arrow renders pixel-perfect, at the right colours, in the
+right byte order (a red/blue swap would have read `(23,25,28)`).
+
+**5. Brand fail-safe, garbage input, size.**
+
+```
+DUDUCLAW_COMP_CURSOR_SOURCE=brand    -> WARN cursor: brand cursor theme is not installed
+                                            — falling back to the system theme
+                                            requested_theme=DuDuClaw fell_back_to=Adwaita
+DUDUCLAW_COMP_CURSOR_SOURCE=nonsense -> INFO cursor: XCursor theme loaded source="system"
+                                            theme=Adwaita size=24
+XCURSOR_SIZE=48                      -> INFO cursor: XCursor theme loaded … size=48
+```
+
+### Honest limitation list (this round)
+
+- **Animated cursors show frame 0 only.** XCursor files store every frame of
+  e.g. `wait`/`progress` at one nominal size; `pick_image` takes the first and
+  ignores `delay`. Real animation needs a per-frame timer feeding
+  `queue_redraw` — a scheduling change, deliberately not in a cursor-loading
+  work package.
+- **No scalable (SVG) cursors.** `xcursor` 0.3 can locate `cursors_scalable/`
+  entries but leaves rendering to the caller; that means an SVG rasteriser.
+  Raster themes are what the appliance image ships.
+- **No HiDPI / fractional cursor scaling.** Everything renders at scale 1.0
+  (`render_output(…, 1.0, …)` in both backends), so the cursor agrees with the
+  rest of the screen. `XCURSOR_SIZE` still picks a bigger cursor.
+- **No hardware cursor plane.** The pointer is composited into the primary
+  plane, so a pointer move costs a full composite. `Kind::Cursor` is set so
+  smithay's damage tracker knows, but the DRM cursor plane is untouched.
+- **Colour-channel correctness is proven for the fallback only.** Adwaita's
+  cursors are greyscale, so a red/blue swap would be invisible in evidence 1
+  and 2; the `Argb8888` choice for theme images rests on the sourced reasoning
+  above (libXcursor byte order + `wayland-cursor` doing the identical thing),
+  not on a screenshot. A coloured cursor theme on the VM would close this.
+- **The live (amber) agent cross was not observed in-container.** Under Xvfb
+  the host pointer enters comp's window immediately, which counts as human
+  input, so the agent seat is frozen from boot and its cross renders dark red
+  (`#AA2323`, 28 px at the agent pointer's (0,0) home). That is pre-existing
+  comp behaviour, unrelated to CUR-1; `codrive/cursor.rs`'s cross geometry and
+  both colour constants are untouched by this round's diff.
+- **`simulate_pointer` calls `on_human_input`** exactly as a real event does,
+  so using it freezes the agent seat. That is intentional — a debug backdoor
+  must not be a way around the codrive safety model.
+- **Not verified on real hardware** (udev/DRM backend, real libinput pointer)
+  — the VM is the operator's. Recipe below.
+- **Not committed**, per this task's instructions, same as every prior round.
+
+### How to check this on the appliance VM
+
+1. Boot normally and look at the compositor log first:
+   ```
+   journalctl -u duduclaw-kiosk -b | grep -i cursor
+   ```
+   * Healthy: `cursor: XCursor theme loaded source="system" theme=Adwaita size=24`
+   * Degraded but working: `cursor: no XCursor theme found … drawing the
+     built-in outlined arrow instead` — you will see a white arrow with a dark
+     outline; the theme package is missing.
+2. Move the mouse. It must be an **arrow**, not a square. Over a text field
+   (the shell's prompt bar, a `foot` window) it must become an **I-beam**;
+   over a window edge, a resize arrow.
+3. To watch the decisions live, restart comp with
+   `RUST_LOG=info,duduclaw_comp::cursor=debug` and hover around — one
+   `cursor: human pointer image changed cursor=<name>` line per change.
+
+Triage table:
+
+| Symptom | Most likely cause | Check / fix |
+|---|---|---|
+| Still a small white square | Old binary still running | `duduclaw-comp --version`-less build: compare the binary's mtime; the square only exists pre-CUR-1 |
+| Arrow appears but never changes shape over text | Client is not requesting anything (very old toolkit), or the theme lacks `text`/`xterm` | `RUST_LOG=…cursor=debug`: no `image changed` line ⇒ the client never asked; a `text` line but no visual change ⇒ theme gap, see the `theme has no image for this icon` debug line |
+| White-with-dark-outline arrow, never themed | No XCursor theme found | The `no XCursor theme found` WARN names the theme it looked for; install `adwaita-icon-theme` or set `DUDUCLAW_COMP_CURSOR_THEME` |
+| Cursor is offset from where clicks land | Hotspot wrong for a client-provided surface | `cursor=client-surface` in the log ⇒ the client declared that hotspot; compare against another compositor before blaming comp |
+| Cursor invisible only over one app | That app asked for `Hidden` | `cursor: human pointer image changed cursor=hidden` |
+| Colours look wrong (red/blue swapped) on a **coloured** theme | The `Argb8888`/`Abgr8888` split in `theme.rs`/`fallback.rs` | Only the fallback's byte order is screenshot-proven; a coloured theme is the outstanding test |
+| Brand cursor requested but nothing changes | No brand artwork exists yet | Expected — `DUDUCLAW_COMP_CURSOR_SOURCE=brand` logs `brand cursor theme is not installed` and uses the system theme |

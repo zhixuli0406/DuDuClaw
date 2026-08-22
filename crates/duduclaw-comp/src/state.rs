@@ -18,6 +18,7 @@ use smithay::{
     utils::{Logical, Point, Rectangle, Serial, SERIAL_COUNTER},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
+        cursor_shape::CursorShapeManagerState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::xdg::XdgShellState,
@@ -26,7 +27,7 @@ use smithay::{
     },
 };
 
-use crate::{codrive, seat_order::SeatAdvertiseOrder, shell_control, CalloopData};
+use crate::{codrive, cursor, seat_order::SeatAdvertiseOrder, shell_control, CalloopData};
 
 /// Top-level compositor state. One instance per compositor process — this
 /// is the `D` type parameter smithay's `delegate_*!` macros generate
@@ -51,11 +52,23 @@ pub struct DuduclawComp {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<DuduclawComp>,
     pub data_device_state: DataDeviceState,
+    /// CUR-1: the `wp_cursor_shape_manager_v1` global. Held only to keep the
+    /// global alive for the process lifetime — every request it receives is
+    /// dispatched by smithay straight into `SeatHandler::cursor_image`
+    /// (`wayland/cursor_shape.rs`), so nothing in this crate reads the field.
+    /// See `handlers/mod.rs` for why this protocol is worth advertising.
+    pub cursor_shape_manager_state: CursorShapeManagerState,
     pub popups: PopupManager,
 
     /// The real human seat — every hardware/winit-forwarded input event
     /// goes here (see `input.rs`).
     pub seat: Seat<Self>,
+
+    /// CUR-1: the human pointer's image — what clients asked for, the loaded
+    /// XCursor theme, and the asset-free fallback. See `crate::cursor`'s
+    /// module doc. The AGENT pointer is deliberately not represented here;
+    /// it stays a compositor-owned amber cross (`codrive/cursor.rs`).
+    pub cursor: cursor::CursorState,
 
     /// CD-0 codrive spike (DESIGN-codrive-desktop-2026-08.md §3.3.1): the
     /// agent-only `wl_seat`. Injected commands from `codrive::listener` are
@@ -158,6 +171,11 @@ impl DuduclawComp {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        // CUR-1: advertise `wp_cursor_shape_manager_v1`. Must exist before
+        // any client binds, i.e. before `init_wayland_listener` below opens
+        // the socket — hence its construction here with the other protocol
+        // globals rather than lazily.
+        let cursor_shape_manager_state = CursorShapeManagerState::new::<Self>(&dh);
         let popups = PopupManager::default();
 
         // A4-5: the ORDER these two `wl_seat` globals are created in is the
@@ -226,6 +244,20 @@ impl DuduclawComp {
         let shadow_output = codrive::create_shadow_output(&dh);
         space.map_output(&shadow_output, codrive::SHADOW_ORIGIN);
 
+        // CUR-1: load the cursor theme once, here, rather than on first
+        // pointer motion — a synchronous filesystem walk on the render path
+        // would be a frame hitch, and doing it at startup is what makes the
+        // "which theme did we get, and why not" line land in the boot log
+        // where an operator can find it.
+        let cursor = cursor::CursorState::from_env();
+        tracing::info!(
+            source = cursor.theme.source().as_str(),
+            theme = %cursor.theme.theme_name(),
+            "comp: human cursor configured (override with {}=system|brand, {}=<theme>)",
+            cursor::source::CURSOR_SOURCE_ENV,
+            cursor::source::CURSOR_THEME_ENV
+        );
+
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
 
@@ -243,8 +275,10 @@ impl DuduclawComp {
             output_manager_state,
             seat_state,
             data_device_state,
+            cursor_shape_manager_state,
             popups,
             seat,
+            cursor,
 
             agent_seat,
             codrive,

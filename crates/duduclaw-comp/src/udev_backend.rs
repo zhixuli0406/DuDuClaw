@@ -46,9 +46,13 @@
 //!   not called and no `DmabufState` global is advertised. GPU clients will
 //!   fall back to software buffers.
 //! - **Hardware cursor / overlay planes / direct scanout.** Everything is
-//!   composited into the primary plane. The two codrive cursors stay what
-//!   they always were: ordinary `SolidColorRenderElement`s
-//!   (`codrive/cursor.rs`).
+//!   composited into the primary plane. The agent cursor is an ordinary
+//!   `SolidColorRenderElement` (`codrive/cursor.rs`) and the human cursor an
+//!   ordinary memory/surface element (`crate::cursor`, CUR-1) — neither is
+//!   promoted to a DRM cursor plane. That costs a full composite per pointer
+//!   motion instead of a plane update; acceptable at this stage, and it is
+//!   the reason `Kind::Cursor` is set on those elements (smithay's damage
+//!   tracker uses the hint).
 //! - **VT switching.** No `Ctrl+Alt+F<n>` binding is installed. Two reasons:
 //!   (a) the appliance kiosk unit is deliberately not a PAM/logind session
 //!   (`appliance/mkosi.extra/etc/systemd/system/duduclaw-kiosk.service`), so
@@ -763,15 +767,19 @@ fn render_surface(
     let offset = Point::<f64, Logical>::from((-(output_loc.x as f64), -(output_loc.y as f64)));
 
     let now = Instant::now();
-    let human_pos = state.seat.get_pointer().unwrap().current_location() + offset;
     let agent_pos = state.agent_seat.get_pointer().unwrap().current_location() + offset;
     let agent_frozen = state.codrive.is_frozen();
 
-    let mut elements: Vec<CodriveElement> =
-        crate::codrive::build_cursor_elements(human_pos, agent_pos, agent_frozen)
+    // CUR-1: the human cursor is built first so it sorts above every other
+    // custom element, and it takes `offset` itself (it reads the pointer
+    // position internally) rather than a pre-offset position, unlike the
+    // agent cross below.
+    let mut elements: Vec<CodriveElement> = state.build_human_cursor_elements(renderer, offset);
+    elements.extend(
+        crate::codrive::build_agent_cursor_elements(agent_pos, agent_frozen)
             .into_iter()
-            .map(CodriveElement::Solid)
-            .collect();
+            .map(CodriveElement::Solid),
+    );
     elements.extend(
         state
             .codrive_highlight_elements_at(now, offset)
@@ -849,6 +857,9 @@ fn render_surface(
     state.space.elements().for_each(|window| {
         window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| Some(output.clone()))
     });
+    // CUR-1: see the identical call in `winit_backend.rs` — a client-provided
+    // cursor surface lives outside `space` and needs its own frame callback.
+    state.send_cursor_frames(&output, elapsed);
     state.space.refresh();
     state.popups.cleanup();
     let _ = display_handle.flush_clients();
