@@ -1066,6 +1066,28 @@ fn must_change_password_reject_frame() -> WsFrame {
     }
 }
 
+/// Machine-readable code returned to a caller on an unauthenticated
+/// (lock-screen) WebSocket connection that asked for anything outside
+/// `power_local::PRE_AUTH_ALLOWED_METHOD`. Stable string — same pattern as
+/// `MUST_CHANGE_PASSWORD_ERROR_CODE`, so a client can branch on it rather
+/// than on prose.
+pub const LOGIN_REQUIRED_ERROR_CODE: &str = "login_required";
+
+/// Structured refusal for a pre-auth connection reaching a non-allowlisted
+/// RPC. End-user zh-TW copy — names no method, module or internal term, same
+/// discipline as `must_change_password_reject_frame`.
+fn login_required_reject_frame() -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({
+            "code": LOGIN_REQUIRED_ERROR_CODE,
+            "message": "請先登入後再使用這項功能。",
+        })),
+    }
+}
+
 /// Machine-readable code returned to a caller reaching a `device.*` RPC on a
 /// non-appliance install. Stable string — mirrors
 /// `MUST_CHANGE_PASSWORD_ERROR_CODE`/`ENTERPRISE_ONLY_ERROR_CODE`'s pattern.
@@ -1144,6 +1166,38 @@ fn device_op_result_frame(result: crate::device_ops::OpResult) -> WsFrame {
             payload: None,
             error: Some(json!({ "code": "io_error", "message": msg })),
         },
+    }
+}
+
+/// `device.power_local`'s own result-frame mapping. UNLIKE the generic
+/// [`device_op_result_frame`] (whose dashboard callers render the
+/// stdout/stderr payload, so `ok:true` + `success:false` is legible there),
+/// the lock screen branches on `ok` alone and deliberately renders nothing
+/// on success — a power action that RAN but FAILED (e.g. `systemctl reboot`
+/// under a polkit `Access denied`) must therefore answer `ok:false`, or the
+/// operator watches "正在送出…" forever while nothing happens. That exact
+/// laundering — shell-out fails, `OpOutput::success:false` rides an
+/// `ok:true` frame, lock screen reads success — happened live on the
+/// appliance VM (2026-08-23), alongside the sysd socket-permission defect
+/// that forced the `SystemDeviceOps` fallback in the first place.
+fn power_local_result_frame(result: crate::device_ops::OpResult) -> WsFrame {
+    match result {
+        Ok(out) if !out.success => {
+            warn!(
+                stderr = %duduclaw_core::truncate_chars(&out.stderr, 200),
+                "lock-screen power action executed but the command failed"
+            );
+            WsFrame::Response {
+                id: String::new(),
+                ok: false,
+                payload: None,
+                error: Some(json!({
+                    "code": "exec_failed",
+                    "message": "電源指令執行失敗，請稍後再試。",
+                })),
+            }
+        }
+        other => device_op_result_frame(other),
     }
 }
 
@@ -5256,13 +5310,51 @@ impl MethodHandler {
     ///
     /// `request_id` is carried through so that all response frames are correctly
     /// correlated with the originating client request.
+    ///
+    /// In-process entry point: carries no transport facts, so it dispatches
+    /// with [`RpcConnInfo::internal`] — `peer: None` (which reads as **not**
+    /// loopback, fail-closed) and `pre_auth: false`. Callers that DO own a
+    /// socket (`server.rs::handle_socket`) use [`Self::handle_conn`].
     pub async fn handle(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
-        let response = self.dispatch(method, params, ctx).await;
-        response
+        self.handle_conn(method, params, ctx, crate::power_local::RpcConnInfo::internal())
+            .await
+    }
+
+    /// Route `method` with the originating connection's transport facts
+    /// attached (peer address + whether the WS handshake carried any
+    /// credential). Only `server.rs::handle_socket` has that information;
+    /// everything else goes through [`Self::handle`].
+    pub async fn handle_conn(
+        &self,
+        method: &str,
+        params: Value,
+        ctx: &UserContext,
+        conn: crate::power_local::RpcConnInfo,
+    ) -> WsFrame {
+        self.dispatch(method, params, ctx, conn).await
     }
 
     /// Internal dispatch — returns a WsFrame with placeholder id (overwritten by caller).
-    async fn dispatch(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+    async fn dispatch(
+        &self,
+        method: &str,
+        params: Value,
+        ctx: &UserContext,
+        conn: crate::power_local::RpcConnInfo,
+    ) -> WsFrame {
+        // ── Pre-auth connection gate (appliance lock screen) ─────────────
+        // Runs before EVERY other gate, including the forced-password-change
+        // and edition gates below: those two answer "may this identity do
+        // that?", and a pre-auth connection has no identity at all. A WS
+        // connection that completed the handshake with no credential
+        // (`server.rs::handle_socket`, which only grants that on an appliance
+        // over loopback) may reach exactly ONE method — see
+        // `power_local::PRE_AUTH_ALLOWED_METHOD` and that module's header for
+        // why a login-free power control is the right call on a lock screen.
+        if conn.pre_auth && !crate::power_local::is_pre_auth_allowlisted(method) {
+            return login_required_reject_frame();
+        }
+
         // ── Forced password-change gate ─────────────────────────────────
         // Runs FIRST — before the edition gate, before the plugin extension
         // dispatch, before the method match. Which features exist has no
@@ -7032,6 +7124,23 @@ impl MethodHandler {
                 require_confirm!();
                 self.handle_device_power(params).await
             }
+            // ── IMPL-POWER: the lock screen's login-free power surface ──
+            // Deliberately carries NONE of the three macros above:
+            //   * no `require_admin!()` — this method exists precisely to be
+            //     reachable before anyone has logged in (see
+            //     `power_local`'s module header on why every desktop OS puts
+            //     power controls on its lock screen);
+            //   * no `require_appliance!()` / `require_confirm!()` — the
+            //     appliance fence is not skipped, it moves INTO
+            //     `power_local::evaluate` together with the loopback and
+            //     action fences, so the whole gate is one pure, ordered,
+            //     exhaustively unit-tested function instead of three macro
+            //     expansions plus a stray `match` on `action`. Confirmation
+            //     is a lock-screen UI affordance (the menu itself is the
+            //     confirm step), not a param the caller asserts about itself.
+            // What replaces them is stricter, not looser: appliance AND
+            // loopback-peer AND a closed two-value action AND a rate limit.
+            "device.power_local" => self.handle_device_power_local(params, conn).await,
 
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
@@ -7301,6 +7410,7 @@ impl MethodHandler {
                     { "name": "device.backup_restore", "description": "Stage an uploaded backup for device-migration restore on next boot (admin, appliance-only, destructive: requires confirm)" },
                     { "name": "device.factory_reset", "description": "Wipe device state and re-provision on next boot (admin, appliance-only, destructive: requires confirm)" },
                     { "name": "device.power", "description": "Restart or shut down the device (admin, appliance-only, destructive: requires confirm)" },
+                    { "name": "device.power_local", "description": "Lock-screen power menu: restart or shut down the device (no login, appliance-only, loopback-only, rate limited)" },
                 ]
             }),
         )
@@ -44041,6 +44151,86 @@ impl MethodHandler {
         }
     }
 
+    /// `device.power_local` — the appliance lock screen's power menu
+    /// (restart / shut down), reachable WITHOUT logging in.
+    ///
+    /// Gate order (all fail-closed, all in one place):
+    /// 1. `power_local::evaluate` — appliance mode, loopback peer, closed
+    ///    two-value action. See that function and its module header.
+    /// 2. Rate limit — conservative, per source.
+    /// 3. Audit **then** act: a reboot kills this process, so the row is
+    ///    written before the call, never after.
+    /// 4. Execute through the SAME `DeviceOps::reboot`/`poweroff` verbs the
+    ///    admin-only `device.power` uses — on the appliance image that means
+    ///    the privilege-separated `duduclaw-sysd` daemon, with one hardcoded
+    ///    argv per verb and no shell anywhere.
+    ///
+    /// Failures are returned as the standard structured error envelope — a
+    /// device that did not reboot never reports that it did.
+    async fn handle_device_power_local(
+        &self,
+        params: Value,
+        conn: crate::power_local::RpcConnInfo,
+    ) -> WsFrame {
+        use crate::power_local;
+
+        // Missing/non-string `action` is treated as the empty string, which
+        // `parse_action` refuses — one refusal path, no separate "absent"
+        // branch that could drift from the "wrong value" branch.
+        let raw_action = params.get("action").and_then(Value::as_str).unwrap_or("");
+
+        let action = match power_local::evaluate(
+            duduclaw_core::is_appliance(),
+            conn.peer_is_loopback(),
+            raw_action,
+        ) {
+            Ok(a) => a,
+            Err(denial) => return self.reject_power_local(raw_action, denial, &conn),
+        };
+
+        if let Err(denial) =
+            power_local::check_rate_limit(power_local::power_limiter(), &conn).await
+        {
+            return self.reject_power_local(raw_action, denial, &conn);
+        }
+
+        power_local::audit_accepted(self.home_dir(), action, &conn);
+        info!(
+            action = action.as_str(),
+            source = %conn.peer_label(),
+            pre_auth = conn.pre_auth,
+            "lock-screen power action accepted"
+        );
+
+        power_local_result_frame(
+            power_local::run_power_action(&*crate::device_ops::select_device_ops(), action).await,
+        )
+    }
+
+    /// One refusal path for `device.power_local`: audit (only the refusals
+    /// that already cleared the appliance + loopback fences — see
+    /// `PowerLocalDenial::is_auditable`), log, and answer with the standard
+    /// structured error envelope carrying end-user zh-TW copy.
+    fn reject_power_local(
+        &self,
+        raw_action: &str,
+        denial: crate::power_local::PowerLocalDenial,
+        conn: &crate::power_local::RpcConnInfo,
+    ) -> WsFrame {
+        crate::power_local::audit_denied(self.home_dir(), raw_action, denial, conn);
+        warn!(
+            reason = denial.as_label(),
+            source = %conn.peer_label(),
+            "lock-screen power action refused"
+        );
+        WsFrame::Response {
+            id: String::new(),
+            ok: false,
+            payload: None,
+            error: Some(json!({ "code": denial.code(), "message": denial.message() })),
+        }
+    }
+
     /// `device.backup_create` — archives the writable data partition (the
     /// parent of `home_dir`; on the appliance image `home_dir` is
     /// `/data/duduclaw` so its parent is `/data`, matching the "整個 /data
@@ -44384,6 +44574,10 @@ mod device_rpc_tests {
             ("device.backup_restore", json!({"path": "/tmp/x.tar.gz", "confirm": true})),
             ("device.factory_reset", json!({"confirm": true})),
             ("device.power", json!({"action": "restart", "confirm": true})),
+            // The login-free lock-screen twin refuses off-appliance with the
+            // SAME code as the rest of the family (`PowerLocalDenial::
+            // NotAppliance`), so a client branches on one string, not two.
+            ("device.power_local", json!({"action": "reboot"})),
         ] {
             let frame = handler.handle(method, params, &ctx).await;
             assert_eq!(
@@ -44522,9 +44716,255 @@ mod device_rpc_tests {
         assert_eq!(frame_error_code(&io_err).as_deref(), Some("io_error"));
     }
 
+    /// The 2026-08-23 appliance regression: a power command that ran but
+    /// exited non-zero (polkit `Access denied`) rode an `ok:true` frame and
+    /// the lock screen — which branches on `ok` alone and renders nothing on
+    /// success — showed "正在送出…" forever. `device.power_local`'s own frame
+    /// mapping must turn ran-but-failed into `ok:false`; genuine success and
+    /// the `Err` variants stay identical to the generic mapping.
+    #[test]
+    fn power_local_result_frame_turns_ran_but_failed_into_an_error() {
+        use crate::device_ops::{DeviceOpError, OpOutput};
+
+        let failed = power_local_result_frame(Ok(OpOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "Call to Reboot failed: Access denied".to_string(),
+        }));
+        assert!(matches!(failed, WsFrame::Response { ok: false, .. }));
+        assert_eq!(frame_error_code(&failed).as_deref(), Some("exec_failed"));
+
+        let ok = power_local_result_frame(Ok(OpOutput {
+            success: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+        assert!(matches!(ok, WsFrame::Response { ok: true, .. }));
+
+        let unsupported =
+            power_local_result_frame(Err(DeviceOpError::Unsupported("no sysd".to_string())));
+        assert_eq!(frame_error_code(&unsupported).as_deref(), Some("unsupported"));
+    }
+
     #[test]
     fn network_write_detection_gates_static_ip_params() {
         assert!(crate::device::is_network_write_request(&json!({"static_ip": "10.0.0.5"})));
         assert!(!crate::device::is_network_write_request(&json!({})));
+    }
+}
+
+/// IMPL-POWER — dispatch-level coverage for the lock screen's login-free
+/// power surface (`device.power_local`) and the pre-auth allowlist that
+/// contains it.
+///
+/// The pure gate matrix (appliance × loopback × action, plus the rate limit,
+/// the audit rows and the `DeviceOps` execution path driven through
+/// `MockDeviceOps`) lives in `power_local.rs`'s own test module — deliberately
+/// there rather than here, because those cases need to vary the appliance flag
+/// as a plain boolean and this process never sets the real, process-global
+/// `DUDUCLAW_APPLIANCE` env var (same discipline as `device_rpc_tests` above
+/// and `duduclaw_core::appliance::appliance_flag`). What THIS module locks
+/// down is what only exists at the dispatch layer: which methods a pre-auth
+/// connection may reach, and that the transport facts are actually consulted.
+#[cfg(test)]
+mod power_local_dispatch_tests {
+    use super::*;
+    use crate::power_local::RpcConnInfo;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn admin_ctx() -> UserContext {
+        UserContext::admin_fallback()
+    }
+
+    fn frame_error_code(f: &WsFrame) -> Option<String> {
+        match f {
+            WsFrame::Response { error: Some(e), .. } => {
+                e.get("code").and_then(|c| c.as_str()).map(str::to_string)
+            }
+            _ => None,
+        }
+    }
+
+    fn loopback_conn(pre_auth: bool) -> RpcConnInfo {
+        RpcConnInfo::from_ws(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321),
+            pre_auth,
+        )
+    }
+
+    fn lan_conn(pre_auth: bool) -> RpcConnInfo {
+        RpcConnInfo::from_ws(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)), 54321),
+            pre_auth,
+        )
+    }
+
+    async fn handler() -> (tempfile::TempDir, MethodHandler) {
+        let home = tempfile::tempdir().unwrap();
+        let h = MethodHandler::new(home.path().to_path_buf()).await;
+        (home, h)
+    }
+
+    // ── The pre-auth allowlist at the dispatch chokepoint ────────────────
+
+    /// The direction that matters most: a credential-less connection reaches
+    /// NOTHING except the one power method — not the admin-only `device.power`
+    /// twin, not the self-service methods the *password-change* allowlist
+    /// opens, not ordinary daily-driver RPCs. Every refusal is the
+    /// distinguishable coded error, never a silent drop.
+    #[tokio::test]
+    async fn pre_auth_connection_is_blocked_from_everything_else() {
+        let (_home, handler) = handler().await;
+        for method in [
+            "device.power",
+            "device.status",
+            "device.factory_reset",
+            "users.me",
+            "users.change_password",
+            "users.list",
+            "agents.list",
+            "system.status",
+            "tasks.list",
+            "evolution.status",
+        ] {
+            let frame = handler
+                .handle_conn(method, json!({}), &admin_ctx(), loopback_conn(true))
+                .await;
+            assert!(
+                !matches!(frame, WsFrame::Response { ok: true, .. }),
+                "{method} must be blocked on a pre-auth connection: {frame:?}"
+            );
+            assert_eq!(
+                frame_error_code(&frame).as_deref(),
+                Some(LOGIN_REQUIRED_ERROR_CODE),
+                "{method} must carry the login-required code, not a generic denial"
+            );
+        }
+    }
+
+    /// The pre-auth gate runs ahead of the role check, so even a context that
+    /// claims Admin (as the fixture above does — a pre-auth connection could
+    /// never legitimately carry one, which is exactly why the test uses it)
+    /// gets nowhere. The gate is a property of the CONNECTION, not the claimed
+    /// identity.
+    #[tokio::test]
+    async fn pre_auth_gate_outranks_an_admin_looking_context() {
+        let (_home, handler) = handler().await;
+        let frame = handler
+            .handle_conn("users.list", json!({}), &admin_ctx(), loopback_conn(true))
+            .await;
+        assert_eq!(
+            frame_error_code(&frame).as_deref(),
+            Some(LOGIN_REQUIRED_ERROR_CODE),
+            "{frame:?}"
+        );
+    }
+
+    /// The allowlisted method is NOT short-circuited by the pre-auth gate —
+    /// it reaches the real handler, which then applies its own fences (here,
+    /// off-appliance, so `not_appliance`). A `login_required` answer would
+    /// mean the allowlist never let it through.
+    #[tokio::test]
+    async fn the_allowlisted_method_passes_the_pre_auth_gate() {
+        let (_home, handler) = handler().await;
+        let frame = handler
+            .handle_conn(
+                "device.power_local",
+                json!({"action": "reboot"}),
+                &admin_ctx(),
+                loopback_conn(true),
+            )
+            .await;
+        assert_eq!(
+            frame_error_code(&frame).as_deref(),
+            Some(crate::power_local::PowerLocalDenial::NotAppliance.code()),
+            "must reach the handler's own fences, not stop at the allowlist: {frame:?}"
+        );
+    }
+
+    /// An ordinary authenticated connection is completely unaffected by the
+    /// new gate — the pre-auth restriction is opt-in per connection.
+    #[tokio::test]
+    async fn authenticated_connections_are_unaffected() {
+        let (_home, handler) = handler().await;
+        let frame = handler
+            .handle_conn("system.status", json!({}), &admin_ctx(), loopback_conn(false))
+            .await;
+        assert!(
+            matches!(frame, WsFrame::Response { ok: true, .. }),
+            "an authenticated connection must still work: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn login_required_frame_is_coded_and_leak_free() {
+        match login_required_reject_frame() {
+            WsFrame::Response { ok: false, error: Some(err), .. } => {
+                assert_eq!(
+                    err.get("code").and_then(|v| v.as_str()),
+                    Some(LOGIN_REQUIRED_ERROR_CODE)
+                );
+                let msg = err.get("message").and_then(|v| v.as_str()).unwrap();
+                assert!(msg.contains("登入"), "plain-language copy: {msg}");
+                for leak in ["RPC", "dispatch", "pre_auth", "WsFrame", "device.power_local"] {
+                    assert!(!msg.contains(leak), "internal term leaked: {leak}");
+                }
+            }
+            other => panic!("expected structured error response, got {other:?}"),
+        }
+    }
+
+    // ── The RPC's own fences, as seen through dispatch ───────────────────
+
+    /// Off-appliance (this process never sets `DUDUCLAW_APPLIANCE`) the widest
+    /// fence answers first, for every combination of connection and action —
+    /// including a LAN peer, which must never learn anything more specific.
+    #[tokio::test]
+    async fn off_appliance_refuses_every_combination() {
+        assert!(
+            !duduclaw_core::is_appliance(),
+            "precondition: DUDUCLAW_APPLIANCE must be unset in the test process"
+        );
+        let (_home, handler) = handler().await;
+        for conn in [loopback_conn(true), loopback_conn(false), lan_conn(true), lan_conn(false)] {
+            for action in [json!({"action": "reboot"}), json!({"action": "shutdown"}), json!({})] {
+                let frame = handler
+                    .handle_conn("device.power_local", action.clone(), &admin_ctx(), conn)
+                    .await;
+                assert_eq!(
+                    frame_error_code(&frame).as_deref(),
+                    Some("not_appliance"),
+                    "conn={conn:?} action={action} → {frame:?}"
+                );
+            }
+        }
+    }
+
+    /// The in-process entry point (`handle`, used by every non-WebSocket
+    /// caller and by 90-odd existing tests) carries no peer, and `None` reads
+    /// as NOT loopback — so the surface is unreachable that way by
+    /// construction, not by accident.
+    #[tokio::test]
+    async fn in_process_dispatch_has_no_peer_and_is_never_local() {
+        let (_home, handler) = handler().await;
+        assert!(!RpcConnInfo::internal().peer_is_loopback());
+        let frame = handler
+            .handle("device.power_local", json!({"action": "reboot"}), &admin_ctx())
+            .await;
+        assert!(!matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+    }
+
+    /// The method is discoverable in the RPC catalog — a surface the shell
+    /// has to call but that no dashboard screen lists would otherwise be
+    /// invisible to anyone auditing what this gateway exposes.
+    #[tokio::test]
+    async fn power_local_is_listed_in_the_method_catalog() {
+        let (_home, handler) = handler().await;
+        let frame = handler.handle("tools.catalog", json!({}), &admin_ctx()).await;
+        let listed = serde_json::to_string(&frame).unwrap();
+        assert!(
+            listed.contains("device.power_local"),
+            "device.power_local must appear in the method catalog"
+        );
     }
 }

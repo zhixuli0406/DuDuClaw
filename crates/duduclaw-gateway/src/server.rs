@@ -4639,12 +4639,76 @@ async fn ws_handler(
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
     ws.max_message_size(1024 * 1024) // 1MB max WebSocket message
-        .on_upgrade(move |socket| handle_socket(socket, state))
+        .on_upgrade(move |socket| handle_socket(socket, state, addr))
+}
+
+/// May a credential-less `connect` frame be admitted as a **restricted
+/// pre-auth session** — the appliance lock screen asking for the one thing it
+/// is allowed to do before anyone logs in (`power_local`'s module header
+/// explains why a login-free power control belongs on a lock screen)?
+///
+/// Pure, so the whole matrix is unit-testable without an `AppState`, a socket
+/// or the process-global `DUDUCLAW_APPLIANCE` env var — same rationale as
+/// [`jwt_account_gate`] and `local_session::evaluate`.
+///
+/// Every condition is a fence, and every fence fails closed:
+/// * `has_credential` — a frame that DID present a jwt/token must
+///   authenticate or be refused; it never silently degrades to a restricted
+///   session (that would turn an expired token into a quiet downgrade).
+/// * `explicitly_requested || !ed25519_configured` — an Ed25519 client's own
+///   `connect` frame is credential-less by design (the signature arrives in
+///   the *next* frame), so on an Ed25519-configured gateway the caller has to
+///   say `pre_auth: true` to opt out of the challenge flow. With no Ed25519
+///   configured there is no such ambiguity and the marker is optional.
+/// * `is_appliance` / `peer_is_loopback` — the same two fences the RPC itself
+///   re-checks (`power_local::evaluate`). Checking them here as well means an
+///   off-appliance or off-box caller never even gets a session object, and
+///   the RPC-level check is defence in depth, not the only guard.
+fn pre_auth_handshake_allowed(
+    has_credential: bool,
+    explicitly_requested: bool,
+    ed25519_configured: bool,
+    is_appliance: bool,
+    peer_is_loopback: bool,
+) -> bool {
+    !has_credential
+        && (explicitly_requested || !ed25519_configured)
+        && is_appliance
+        && peer_is_loopback
+}
+
+/// The `UserContext` a restricted pre-auth (lock-screen) connection carries.
+///
+/// Deliberately NOT `UserContext::admin_fallback()`: the dispatch-top
+/// allowlist (`handlers.rs`) is what actually restricts such a connection, and
+/// if that allowlist ever had a hole the blast radius must be "the lowest role
+/// in the system, bound to no agent", not "full admin". `user_id`/`email` name
+/// the surface honestly rather than impersonating a real account, so audit
+/// rows never claim a person did this.
+fn pre_auth_context() -> UserContext {
+    UserContext {
+        user_id: "lockscreen".to_string(),
+        email: "lockscreen@local".to_string(),
+        role: duduclaw_auth::UserRole::Employee,
+        agent_access: HashMap::new(),
+        must_change_password: false,
+    }
 }
 
 /// Process a single WebSocket connection.
-async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+///
+/// `peer` is the connection's real TCP address, forwarded from
+/// [`ws_handler`]'s `ConnectInfo` — the ONLY source of "did this come from the
+/// machine itself" used anywhere downstream. A request header is never
+/// consulted for that question: headers are caller-controlled, which is
+/// exactly how a "localhost only" check gets bypassed.
+async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: SocketAddr) {
     info!("New WebSocket connection established");
+
+    // Set only by the credential-less lock-screen branch below; every other
+    // authentication path leaves it false, so `RpcConnInfo::pre_auth` (and
+    // with it the dispatch-top allowlist) is opt-in, never a fallback.
+    let mut pre_auth = false;
 
     // --- Authentication gate ---
     // Resolve a UserContext from the first "connect" message.
@@ -4679,8 +4743,31 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                     match serde_json::from_str::<WsFrame>(&text) {
                         Ok(WsFrame::Request { id, method, params }) if method == "connect" => {
+                            // Credentials are read once, trimmed, and blanks
+                            // treated as absent — `{"jwt": ""}` is a caller
+                            // that presented nothing, not a caller presenting
+                            // an empty token, and the two must not take
+                            // different branches.
+                            let jwt_param = params
+                                .get("jwt")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            let token_param = params
+                                .get("token")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty());
+                            let pre_auth_ok = pre_auth_handshake_allowed(
+                                jwt_param.is_some() || token_param.is_some(),
+                                params.get("pre_auth").and_then(|v| v.as_bool()) == Some(true),
+                                state.auth.is_ed25519(),
+                                duduclaw_core::is_appliance(),
+                                crate::power_local::ip_is_loopback(peer.ip()),
+                            );
+
                             // ── JWT authentication (new) ─────────────────────
-                            if let Some(jwt_str) = params.get("jwt").and_then(|v| v.as_str()) {
+                            if let Some(jwt_str) = jwt_param {
                                 match authenticate_jwt(&state, jwt_str) {
                                     Ok(ctx) => {
                                         // `must_change_password` is surfaced here so a
@@ -4725,6 +4812,33 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                         Err(())
                                     }
                                 }
+                            }
+                            // ── Restricted pre-auth (appliance lock screen) ─────
+                            // Ordered AFTER the JWT branch (a presented
+                            // credential always authenticates or fails) and
+                            // BEFORE Ed25519/legacy-token, guarded by
+                            // `pre_auth_handshake_allowed` so it can only ever
+                            // win for a credential-less caller sitting at an
+                            // appliance. The session it grants is restricted at
+                            // the RPC dispatch chokepoint
+                            // (`handlers.rs`'s pre-auth allowlist) to exactly
+                            // `power_local::PRE_AUTH_ALLOWED_METHOD` — the same
+                            // "handshake succeeds, dispatch-top allowlist
+                            // restricts" shape the bootstrap-admin deadlock fix
+                            // established for `users.change_password`.
+                            else if pre_auth_ok {
+                                pre_auth = true;
+                                let ok = WsFrame::ok_response(
+                                    &id,
+                                    serde_json::json!({ "status": "pre_auth" }),
+                                );
+                                let _ = socket
+                                    .send(Message::Text(
+                                        serde_json::to_string(&ok).unwrap_or_default().into(),
+                                    ))
+                                    .await;
+                                info!(peer = %peer.ip(), "lock-screen pre-auth WebSocket session granted");
+                                Ok(pre_auth_context())
                             }
                             // ── Ed25519 challenge-response ──────────────────────
                             else if state.auth.is_ed25519() {
@@ -4885,7 +4999,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         UserContext::admin_fallback()
     };
 
-    info!(user = %user_ctx.email, role = %user_ctx.role, "WebSocket authenticated");
+    info!(user = %user_ctx.email, role = %user_ctx.role, pre_auth, "WebSocket authenticated");
+
+    // Transport facts for this connection, resolved once and carried on every
+    // RPC it makes: the real TCP peer (the sole basis for "is this caller
+    // sitting at the machine") and whether the handshake was credential-less.
+    let conn_info = crate::power_local::RpcConnInfo::from_ws(peer, pre_auth);
 
     // Split the socket so we can drive sending and receiving concurrently.
     let (mut sink, mut stream) = socket.split();
@@ -4984,7 +5103,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 tokio::spawn(async move {
                                     let mut response = task_state
                                         .handler
-                                        .handle(&method, params, &task_ctx)
+                                        .handle_conn(&method, params, &task_ctx, conn_info)
                                         .await;
 
                                     // P4-3+ OS live event tail: unlike `logs.subscribe` above
@@ -5767,6 +5886,107 @@ mod jwt_account_gate_tests {
         assert!(jwt_account_gate(duduclaw_auth::UserStatus::Suspended, false).is_err());
         assert!(jwt_account_gate(duduclaw_auth::UserStatus::Suspended, true).is_err());
         assert!(jwt_account_gate(duduclaw_auth::UserStatus::Offboarded, false).is_err());
+    }
+}
+
+/// IMPL-POWER — the WS handshake half of the appliance lock screen's
+/// login-free power surface. Mirrors `jwt_account_gate_tests`' shape above:
+/// the decision is a pure function, so every combination is checked without an
+/// `AppState`, a socket, or the process-global `DUDUCLAW_APPLIANCE` env var.
+#[cfg(test)]
+mod pre_auth_handshake_tests {
+    use super::*;
+
+    /// Argument order is easy to transpose, so name them at every call site.
+    fn allowed(
+        has_credential: bool,
+        explicitly_requested: bool,
+        ed25519: bool,
+        appliance: bool,
+        loopback: bool,
+    ) -> bool {
+        pre_auth_handshake_allowed(has_credential, explicitly_requested, ed25519, appliance, loopback)
+    }
+
+    /// The one accepted shape: no credential, on an appliance, over loopback.
+    /// With no Ed25519 configured the explicit marker is optional, so the
+    /// shell works whether or not it sends one.
+    #[test]
+    fn credential_less_loopback_appliance_is_admitted_with_or_without_the_marker() {
+        assert!(allowed(false, true, false, true, true));
+        assert!(allowed(false, false, false, true, true));
+    }
+
+    /// Each fence, failed on its own, refuses — nothing here is advisory.
+    #[test]
+    fn every_fence_refuses_independently() {
+        // Presented a credential: must authenticate or fail, never silently
+        // degrade to a restricted session (an expired token is not a lock
+        // screen).
+        assert!(!allowed(true, true, false, true, true));
+        // Not an appliance.
+        assert!(!allowed(false, true, false, false, true));
+        // Not sitting at the machine.
+        assert!(!allowed(false, true, false, true, false));
+    }
+
+    /// An Ed25519 client's own `connect` frame is credential-less by design
+    /// (the signature arrives in the NEXT frame), so on an Ed25519-configured
+    /// gateway the pre-auth branch must not swallow it — only an explicit
+    /// `pre_auth: true` opts out of the challenge flow.
+    #[test]
+    fn ed25519_challenge_flow_is_not_hijacked() {
+        assert!(!allowed(false, false, true, true, true));
+        assert!(allowed(false, true, true, true, true));
+    }
+
+    /// The blanket case worth stating once: off-appliance, NOTHING admits a
+    /// pre-auth session — not the marker, not loopback, not both.
+    #[test]
+    fn off_appliance_nothing_admits_a_pre_auth_session() {
+        for &requested in &[true, false] {
+            for &ed25519 in &[true, false] {
+                for &loopback in &[true, false] {
+                    assert!(
+                        !allowed(false, requested, ed25519, false, loopback),
+                        "requested={requested} ed25519={ed25519} loopback={loopback}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The restricted context is the lowest role in the system, bound to no
+    /// agent, and does not impersonate a real account — so a hole in the
+    /// dispatch-top allowlist could never mean "full admin", and audit rows
+    /// never claim a person did this.
+    #[test]
+    fn pre_auth_context_is_least_privilege_and_honestly_named() {
+        let ctx = pre_auth_context();
+        assert_eq!(ctx.role, duduclaw_auth::UserRole::Employee);
+        assert!(!ctx.is_admin());
+        assert!(ctx.agent_access.is_empty());
+        assert!(!ctx.must_change_password);
+        assert_ne!(ctx.user_id, UserContext::admin_fallback().user_id);
+        assert_ne!(ctx.email, "admin@local");
+    }
+
+    /// The handshake fence and the RPC fence must read loopback the same way
+    /// — including the IPv4-mapped IPv6 form a dual-stack listener reports.
+    /// Two implementations that disagree would let one of them be bypassed.
+    #[test]
+    fn handshake_and_rpc_share_one_loopback_authority() {
+        use std::net::IpAddr;
+        for (raw, expected) in [
+            ("127.0.0.1", true),
+            ("::1", true),
+            ("::ffff:127.0.0.1", true),
+            ("192.168.1.10", false),
+            ("::ffff:192.168.1.10", false),
+        ] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert_eq!(crate::power_local::ip_is_loopback(ip), expected, "{raw}");
+        }
     }
 }
 

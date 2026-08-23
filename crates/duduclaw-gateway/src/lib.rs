@@ -37,6 +37,8 @@ pub mod auth;
 // ── WP-B: appliance-image device management (`device.*` dashboard RPCs) ──
 pub mod device;
 pub mod device_ops;
+// ── IMPL-POWER: the appliance lock screen's login-free power surface ─────
+pub mod power_local;
 // ── WP-G1: scheduled backups + device-migration restore ──────────────────
 pub mod backup_restore;
 pub mod backup_schedule;
