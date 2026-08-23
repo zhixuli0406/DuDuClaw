@@ -60,6 +60,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 48 | [Goal Intent Router](48-goal-intent-router.md) | Chat channels notice task delegation and offer to create a goal; never auto-created |
 | 49 | [Code Security Audit](49-code-security-audit.md) | `duduclaw secaudit`: static scanners + AI deep audit + adversarial review + sandboxed PoC |
 | 50 | [DuDuClaw OS Appliance](50-duduclaw-os-appliance.md) | Bootable appliance image — LAN dashboard onboarding, device page, sysd privilege separation, webhook relay |
+| 51 | [OS Keyboard Shortcuts](51-os-keyboard-shortcuts.md) | Every DuDuClaw OS shortcut — global compositor bindings, shell UI, first-run setup, lock screen (zh-TW) |
 
 ---
 
