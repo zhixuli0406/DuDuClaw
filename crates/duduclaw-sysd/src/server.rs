@@ -33,20 +33,37 @@ pub struct SysdServerConfig {
 /// Bind the UDS.
 ///
 /// Ordering matters for the "never world-accessible" guarantee: create
-/// the parent directory (or confirm it exists) and IMMEDIATELY tighten
-/// its mode to `0700` before doing anything else; same for the socket
-/// file after `bind()`. No connection can be accepted before `serve()` is
-/// called on the returned listener, so there is no window in which a
-/// connection could race the permission tightening.
+/// the parent directory (or confirm it exists) and IMMEDIATELY set its
+/// mode before doing anything else; same for the socket file after
+/// `bind()`. No connection can be accepted before `serve()` is called on
+/// the returned listener, so there is no window in which a connection
+/// could race the permission tightening.
+///
+/// The file-permission layer must ADMIT the same audience the
+/// SO_PEERCRED gate in `handle_connection` admits, or that gate is dead
+/// logic: the client uid is never root (that is the whole point of the
+/// privilege separation), and the original `0700` parent + `0600 root`
+/// socket stopped exactly the one uid `allowed_uid` exists to let in —
+/// connect() failed with EACCES before peer credentials were ever read.
+/// Found live on the appliance VM (2026-08-23): the lock-screen reboot
+/// was audited by the gateway and then silently did nothing. So, when an
+/// allowed uid is configured: parent `0711` (traverse-only for others —
+/// path-walking to the socket is possible, listing the directory is
+/// not), socket chown'd to that uid with mode `0600` (owner + root can
+/// connect, everyone else is refused at the filesystem). The peer-cred
+/// check stays authoritative; the two layers now agree instead of
+/// contradicting each other. With no allowed uid the old fully-closed
+/// modes are kept — sysd rejects every connection in that state anyway.
 ///
 /// A stale socket file left behind by an unclean shutdown is removed
 /// first (bind() would otherwise fail with `AddrInUse`) — this only ever
 /// removes a file at the exact configured socket path, never anything
 /// else under the directory.
-pub fn bind(socket_path: &Path) -> io::Result<UnixListener> {
+pub fn bind(socket_path: &Path, allowed_uid: Option<u32>) -> io::Result<UnixListener> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        let parent_mode = if allowed_uid.is_some() { 0o711 } else { 0o700 };
+        fs::set_permissions(parent, fs::Permissions::from_mode(parent_mode))?;
     }
     match fs::remove_file(socket_path) {
         Ok(()) => {}
@@ -54,6 +71,16 @@ pub fn bind(socket_path: &Path) -> io::Result<UnixListener> {
         Err(e) => return Err(e),
     }
     let listener = UnixListener::bind(socket_path)?;
+    if let Some(uid) = allowed_uid {
+        // Non-fatal: an unprivileged process (dev/test — production sysd is
+        // root) cannot chown to a DIFFERENT uid (EPERM). Failing open here
+        // only leaves the socket LESS accessible (still owner-only), never
+        // more — this is an admission fix, not a security gate; the
+        // SO_PEERCRED check in `handle_connection` stays authoritative.
+        if let Err(e) = std::os::unix::fs::chown(socket_path, Some(uid), None) {
+            warn!(uid, error = %e, "sysd: could not chown socket to allowed uid; socket stays owner-only");
+        }
+    }
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
@@ -235,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn authorized_peer_gets_a_dispatched_response() {
         let socket_path = temp_socket_path();
-        let listener = bind(&socket_path).unwrap();
+        let listener = bind(&socket_path, None).unwrap();
         let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid: Some(current_uid()) };
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -269,7 +296,7 @@ mod tests {
     #[tokio::test]
     async fn mismatched_uid_is_rejected() {
         let socket_path = temp_socket_path();
-        let listener = bind(&socket_path).unwrap();
+        let listener = bind(&socket_path, None).unwrap();
         let wrong_uid = current_uid().wrapping_add(1);
         let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid: Some(wrong_uid) };
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -294,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_allowed_uid_denies_everyone() {
         let socket_path = temp_socket_path();
-        let listener = bind(&socket_path).unwrap();
+        let listener = bind(&socket_path, None).unwrap();
         let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid: None };
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -315,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_verb_is_a_structured_bad_request() {
         let socket_path = temp_socket_path();
-        let listener = bind(&socket_path).unwrap();
+        let listener = bind(&socket_path, None).unwrap();
         let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid: Some(current_uid()) };
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -336,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_json_is_a_structured_bad_request_not_a_crash() {
         let socket_path = temp_socket_path();
-        let listener = bind(&socket_path).unwrap();
+        let listener = bind(&socket_path, None).unwrap();
         let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid: Some(current_uid()) };
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -377,7 +404,7 @@ mod tests {
     async fn bind_sets_directory_and_socket_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("nested").join("sysd.sock");
-        let _listener = bind(&socket_path).unwrap();
+        let _listener = bind(&socket_path, None).unwrap();
 
         let dir_mode = fs::metadata(socket_path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "parent dir must be 0700");
@@ -386,17 +413,40 @@ mod tests {
         assert_eq!(sock_mode, 0o600, "socket file must be 0600");
     }
 
+    /// The 2026-08-23 appliance regression: with an allowed uid configured,
+    /// the parent dir must be traversable (0711) and the socket owned by
+    /// that uid, or connect() dies with EACCES before the SO_PEERCRED gate
+    /// ever runs. chown-to-own-uid is a no-op that succeeds unprivileged,
+    /// so this pins the whole code path without needing root.
+    #[tokio::test]
+    async fn bind_with_allowed_uid_makes_the_socket_reachable_by_that_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("nested").join("sysd.sock");
+        let _listener = bind(&socket_path, Some(current_uid())).unwrap();
+
+        let dir_mode = fs::metadata(socket_path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o711, "parent dir must be traverse-only for non-owners");
+
+        let meta = fs::metadata(&socket_path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "socket file must stay 0600");
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::uid(&meta),
+            current_uid(),
+            "socket must be owned by the allowed uid so its 0600 admits that uid"
+        );
+    }
+
     #[tokio::test]
     async fn bind_removes_a_stale_socket_file() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("sysd.sock");
         // First bind + drop leaves the socket file on disk (no cleanup on Drop).
         {
-            let _listener = bind(&socket_path).unwrap();
+            let _listener = bind(&socket_path, None).unwrap();
         }
         assert!(socket_path.exists());
         // Second bind must succeed despite the stale file, not fail with AddrInUse.
-        let _listener2 = bind(&socket_path).unwrap();
+        let _listener2 = bind(&socket_path, None).unwrap();
     }
 
     /// Blocking helper: connect over the real UDS, write one line, read

@@ -25,7 +25,7 @@ async fn spawn_test_server(
     let socket_path = dir.path().join("sysd.sock");
     std::mem::forget(dir); // keep the directory alive for the socket's lifetime
 
-    let listener = bind(&socket_path).unwrap();
+    let listener = bind(&socket_path, None).unwrap();
     let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid };
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {

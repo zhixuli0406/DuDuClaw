@@ -530,7 +530,7 @@ mod tests {
                 let socket_path = dir.path().join("sysd.sock");
                 std::mem::forget(dir); // keep alive for the socket's lifetime
 
-                let listener = duduclaw_sysd::bind(&socket_path).unwrap();
+                let listener = duduclaw_sysd::bind(&socket_path, allowed_uid).unwrap();
                 let config = duduclaw_sysd::SysdServerConfig {
                     socket_path: socket_path.clone(),
                     allowed_uid,

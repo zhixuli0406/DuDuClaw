@@ -1,7 +1,9 @@
 //! `duduclaw-sysd` binary entrypoint.
 //!
 //! Production posture: launched by systemd as `root`, listening on
-//! `/run/duduclaw/sysd.sock` (0600, parent dir 0700), only ever reachable
+//! `/run/duduclaw/sysd.sock` (0600, chown'd to the allowed uid; parent dir
+//! 0711 — see `server::bind`'s doc comment for why the file layer must
+//! admit the same audience the SO_PEERCRED gate does), only ever usable
 //! by the uid passed via `--allowed-uid` / `DUDUCLAW_SYSD_ALLOWED_UID`
 //! (normally the `duduclaw` service user's uid). Dev/test posture: run as
 //! any user, socket path overridden via `--socket` / `DUDUCLAW_SYSD_SOCKET`
@@ -66,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!(socket = %socket_path.display(), allowed_uid = ?allowed_uid, "sysd: starting");
-    let listener = bind(&socket_path)?;
+    let listener = bind(&socket_path, allowed_uid)?;
     info!(socket = %socket_path.display(), "sysd: listening");
 
     let config = SysdServerConfig { socket_path: socket_path.clone(), allowed_uid };
