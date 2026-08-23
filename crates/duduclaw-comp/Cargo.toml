@@ -51,6 +51,17 @@ libc = "0.2"
 # `/usr/share/icons/<theme>/cursors/<name>` files and parses them.
 xcursor = "0.3"
 
+# WM-2 (2026-08-23): glyph rasterisation for the server-side title bar
+# (`src/decor/text.rs`). Pure Rust, zero system dependencies, no font-config
+# / HarfBuzz / FreeType — it parses a TTF and hands back antialiased coverage
+# for one glyph at a time, which is exactly (and only) what a title bar with
+# no bidi, no ligatures and no complex-script shaping needs. The two fonts it
+# rasterises are vendored under `assets/fonts/` and `include_bytes!`-embedded,
+# so a title bar renders identically on the appliance image and in a bare
+# build container (no `/usr/share/fonts` dependency — the same reasoning
+# `cursor/fallback.rs` used for the built-in arrow).
+ab_glyph = "0.2"
+
 # Version pin rationale (2026-08-19, Shell-S0 spike):
 # smithay's latest crates.io release is 0.7.0 (published 2025-06-24,
 # rust-version = "1.80.1"). We deliberately pin to the published release

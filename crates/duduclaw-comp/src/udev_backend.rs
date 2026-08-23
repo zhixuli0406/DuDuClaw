@@ -798,6 +798,14 @@ fn render_surface(
         }
     }
 
+    // WM-2: fold the per-window decorations and the windows themselves into
+    // one interleaved list. Replaces `desktop::space::render_output`, which
+    // could only stack every custom element above every window — see
+    // `decor/paint.rs`'s module doc. Built BEFORE `next_buffer`/`bind`, like
+    // the cursor and PiP elements above, so nothing holds a second mutable
+    // borrow of the renderer across the bind.
+    let elements = state.build_output_elements(renderer, &output, elements);
+
     let (mut dmabuf, age) = match surface.gbm_surface.next_buffer() {
         Ok(v) => v,
         Err(e) => {
@@ -816,15 +824,11 @@ fn render_surface(
                 return;
             }
         };
-        match smithay::desktop::space::render_output::<_, CodriveElement, _, _>(
-            &output,
+        match surface.damage_tracker.render_output(
             renderer,
             &mut framebuffer,
-            1.0,
             age as usize,
-            [&state.space],
             &elements,
-            &mut surface.damage_tracker,
             CLEAR_COLOR,
         ) {
             Ok(res) => {

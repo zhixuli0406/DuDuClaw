@@ -35,6 +35,7 @@ mod handlers;
 mod backend_choice;
 mod codrive;
 mod cursor;
+mod decor;
 mod grabs;
 mod input;
 mod render;

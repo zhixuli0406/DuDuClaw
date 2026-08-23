@@ -10,14 +10,20 @@ use smithay::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
         KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
+    desktop::Window,
     input::{
         keyboard::{keysyms, FilterResult, Keysym},
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent},
     },
-    utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
+    reexports::wayland_server::Resource,
+    utils::{Logical, Point, Rectangle, Serial, SERIAL_COUNTER},
 };
 
-use crate::state::DuduclawComp;
+use crate::{
+    decor::FrameHit,
+    grabs::{MoveClamp, MoveSurfaceGrab},
+    state::DuduclawComp,
+};
 
 impl DuduclawComp {
     /// Every arm below runs exclusively on the real human ("winit") seat —
@@ -166,6 +172,10 @@ impl DuduclawComp {
                 let time = event.time_msec();
                 let pointer = self.seat.get_pointer().unwrap();
                 let pos = self.clamp_pointer(pointer.current_location() + event.delta());
+                // WM-2: the close button lights up on hover, and the title bar
+                // is not a surface, so nothing downstream of `pointer.motion`
+                // would ever notice the pointer entering it.
+                self.update_close_hover(pos);
                 let under = self.surface_under(pos);
                 pointer.motion(
                     self,
@@ -199,6 +209,8 @@ impl DuduclawComp {
 
                 let serial = SERIAL_COUNTER.next_serial();
                 let pointer = self.seat.get_pointer().unwrap();
+                // WM-2: see the identical call in the relative-motion arm.
+                self.update_close_hover(pos);
                 let under = self.surface_under(pos);
 
                 pointer.motion(
@@ -234,10 +246,38 @@ impl DuduclawComp {
                 // inactive titlebar styling keyed off it) never lit up.
                 // `focus_window` sets it for every window on every call.
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
-                    let window = self
-                        .space
-                        .element_under(pointer.current_location())
-                        .map(|(w, _)| w.clone());
+                    let pos = pointer.current_location();
+                    // WM-2: the compositor's own decoration gets first refusal
+                    // on a press. It has to, because a title bar is not a
+                    // surface and `Space::element_under` cannot see it — see
+                    // `crate::decor`'s module doc on the geometry model.
+                    // `frame_hit_at` returns `None` for a press in a window's
+                    // CONTENT area, which is what makes this an interception
+                    // rather than a replacement of the ordinary routing below.
+                    if let Some((window, hit)) = self.frame_hit_at(pos) {
+                        // Clicking any part of the decoration raises and
+                        // focuses the window first — including the close
+                        // button, so a mis-click still leaves the window you
+                        // aimed at in front rather than doing nothing.
+                        let seat = self.seat.clone();
+                        self.focus_window(&seat, Some(&window), serial);
+                        match hit {
+                            FrameHit::Close => {
+                                self.close_window_politely(&window, "titlebar_close_button");
+                            }
+                            FrameHit::TitleBar => {
+                                self.begin_titlebar_move(&window, pos, serial, button);
+                            }
+                        }
+                        // Deliberately NOT forwarded to any client: the press
+                        // landed on compositor-owned pixels. (It would be
+                        // harmless — the pointer has no surface focus there —
+                        // but "the compositor consumed this" should be
+                        // explicit rather than incidental.)
+                        return;
+                    }
+
+                    let window = self.space.element_under(pos).map(|(w, _)| w.clone());
                     let seat = self.seat.clone();
                     self.focus_window(&seat, window.as_ref(), serial);
                 }
@@ -297,6 +337,112 @@ impl DuduclawComp {
             }
             _ => {}
         }
+    }
+
+    /// WM-2: which window's **server-side decoration** is under `pos`, and
+    /// what part of it.
+    ///
+    /// Walks the stack top-down and stops at the first window whose frame
+    /// contains the point — including when that window answers "not my
+    /// decoration". Stopping there is the whole correctness argument: a
+    /// press inside window A's content area must never fall through to
+    /// window B's title bar just because B happens to be underneath A.
+    ///
+    /// Returns `None` for a point on no window, on an undecorated window, or
+    /// inside a decorated window's content area. All three cases mean the same
+    /// thing to the caller: "carry on with the ordinary surface routing".
+    pub(crate) fn frame_hit_at(&self, pos: Point<f64, Logical>) -> Option<(Window, FrameHit)> {
+        for window in self.space.elements().rev() {
+            let insets = self.window_insets(window);
+            let Some(content) = self.space.element_geometry(window) else {
+                continue;
+            };
+            let frame = crate::decor::frame_rect(content, insets);
+            if !frame.to_f64().contains(pos) {
+                continue;
+            }
+            return crate::decor::hit_frame(frame, insets, pos).map(|hit| (window.clone(), hit));
+        }
+        None
+    }
+
+    /// WM-2: keeps the close button's hover highlight in step with the human
+    /// pointer.
+    ///
+    /// Only repaints on an actual transition. Pointer motion is the highest
+    /// frequency event this compositor sees, and marking the frame dirty on
+    /// every one of them would defeat the udev backend's "no damage ⇒ no page
+    /// flip" idle behaviour for the entire time a pointer is moving over a
+    /// title bar.
+    pub(crate) fn update_close_hover(&mut self, pos: Point<f64, Logical>) {
+        let hovered = self.frame_hit_at(pos).and_then(|(window, hit)| {
+            if hit != FrameHit::Close {
+                return None;
+            }
+            Some(window.toplevel()?.wl_surface().id())
+        });
+        if self.decor.hovered_close != hovered {
+            self.decor.hovered_close = hovered;
+            self.queue_redraw();
+        }
+    }
+
+    /// WM-2: starts a compositor-driven, **clamped** move grab from a title
+    /// bar press.
+    ///
+    /// The grab itself is the same `MoveSurfaceGrab` a client-initiated
+    /// `xdg_toplevel.move` uses (`handlers/xdg_shell.rs`); the only difference
+    /// is the [`MoveClamp`], which exists because this path is the human
+    /// dragging a window and there is no way to recover one that has been
+    /// thrown off the screen.
+    ///
+    /// `start_data.focus` is `None` on purpose: the press landed on
+    /// compositor-owned pixels, so there is no client surface the grab could
+    /// legitimately name as its origin.
+    fn begin_titlebar_move(
+        &mut self,
+        window: &Window,
+        pos: Point<f64, Logical>,
+        serial: Serial,
+        button: u32,
+    ) {
+        let Some(initial_window_location) = self.space.element_location(window) else {
+            return;
+        };
+        let insets = self.window_insets(window);
+        let frame_size = self
+            .space
+            .element_geometry(window)
+            .map(|content| crate::decor::frame_rect(content, insets).size);
+        let clamp = match (self.layout_work_area(), frame_size) {
+            (Some(work), Some(frame_size)) => Some(MoveClamp {
+                work,
+                frame_size,
+                insets,
+            }),
+            // No real output mapped yet: better an unclamped drag than a drag
+            // clamped against a rectangle we invented.
+            _ => None,
+        };
+
+        let grab = MoveSurfaceGrab {
+            start_data: PointerGrabStartData {
+                focus: None,
+                button,
+                location: pos,
+            },
+            window: window.clone(),
+            initial_window_location,
+            clamp,
+        };
+        tracing::info!(
+            surface_id = ?window.toplevel().map(|t| t.wl_surface().id()),
+            ?initial_window_location,
+            clamped = clamp.is_some(),
+            "input: title bar pressed — move grab armed"
+        );
+        let pointer = self.seat.get_pointer().unwrap();
+        pointer.set_grab(self, grab, serial, Focus::Clear);
     }
 
     /// A4-1: keeps a relative-motion pointer inside the union of the REAL

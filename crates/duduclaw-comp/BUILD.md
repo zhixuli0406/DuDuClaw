@@ -4355,3 +4355,501 @@ Triage table:
 | Need to tune without a rebuild | — | `DUDUCLAW_COMP_RESERVED_TOP` / `DUDUCLAW_COMP_RESERVED_BOTTOM` in comp's environment, then restart comp |
 | Super+Q does nothing | No keyboard focus (comp only focuses on click), or the focused surface is not a mapped toplevel | The log says which: `Super+Q with no keyboard focus` vs `focused surface is not a mapped toplevel` |
 | Super+Q closes nothing on one specific app | The client ignored `xdg_toplevel.close` | Expected; it is a request. Nothing in comp kills processes |
+
+## CUR-3: cursor SIZE as a live, persisted, socket-driven setting (2026-08-23)
+
+The third and last axis of the human pointer's appearance. CUR-1 gave it real
+artwork, CUR-2 gave the *source* a live switch; this round does the same for
+**size**, for the shell's 協助工具 › 指向與點按 page (five segment buttons:
+**24 / 32 / 48 / 64 / 96**). Before this, size was `XCURSOR_SIZE`-only —
+operator-facing, and read exactly once at startup.
+
+### Wire contract (the shell was written against this — do not change the shape)
+
+```text
+-> {"op":"get_cursor_source"}
+<- {"ok":true,"cursor":{"source":"system","requested":"system","theme":"Adwaita",
+                        "origin":"default","size":24,"effective_size":24,
+                        "size_env_pinned":false,"env_pinned":false}}
+
+-> {"op":"set_cursor_size","params":{"size":32}}
+<- {"ok":true,"cursor":{…,"size":32,"effective_size":32,"persisted":true}}
+
+-> {"op":"set_cursor_size","params":{"size":40}}
+<- {"ok":false,"error":"invalid_cursor_size"}
+```
+
+`get_cursor_source` keeps its CUR-2 name (renaming it to `get_cursor_config`
+would break shipped callers for cosmetics); the reply is purely additive, so a
+CUR-2-era client ignores the new keys.
+
+### Two size gates, deliberately different
+
+| Surface | Accepts | Where |
+|---|---|---|
+| `XCURSOR_SIZE` (OPERATOR) | any integer, clamped 8–512 | `source::resolve_size` |
+| `set_cursor_size` op + `cursor.json` (UI) | exactly 24/32/48/64/96 | `source::cursor_size_from_wire` |
+
+The env var is the operator's machine-level channel — an operator wanting a
+40 px pointer for one panel has a reason no settings UI can anticipate. The op
+is the *UI's* channel, and accepting a sixth value would immediately produce
+the failure `CursorSource::parse_strict`'s doc already warns about: a settings
+page with no button matching the stored value. Lenient parser guards boot,
+strict parser guards the control channel — the same split CUR-2 made for the
+source enum, applied to a number. The stored `size` key is held to the strict
+rule because the only writer of it is the strict op.
+
+Priority is CUR-2's, one level down (`source::resolve_startup_size`):
+`XCURSOR_SIZE` > `cursor.json` > 24. A present-but-garbage `XCURSOR_SIZE`
+still counts as "the operator spoke" and lands on 24 rather than falling
+through to a stored preference.
+
+### `size` vs `effective_size` — the honest-reporting field
+
+**A 96 px request against a theme whose largest image is 64 draws a 64 px
+cursor, at 64 px. Nothing is upscaled.** Traced through the code and then
+confirmed on real pixels (evidence 5 below):
+
+- `theme::pick_image` chooses the image whose **nominal** size is nearest the
+  request (ties to the larger).
+- `build_from_images` wraps that image at its own `(width, height)` with
+  buffer scale 1.
+- `cursor/mod.rs` calls `MemoryRenderBufferRenderElement::from_buffer(…,
+  src: None, size: None, …)`, and smithay 0.7.0 resolves that to
+  `inner.mem.size().to_logical(scale, transform)` — the buffer's own pixel
+  dimensions (read in `element/memory.rs`, not assumed).
+
+So the third-largest possibility — "64 image stretched to 96" — does not
+happen. Forcing it *is* possible (pass `size: Some(96)`) and was **rejected**:
+it bilinear-stretches a 64 px bitmap, which is the "upscaled mush"
+`pick_image`'s own tie-break comment already turns down and which would wreck
+the dark outline CUR-1 exists to keep legible. An honestly-64 px cursor beats a
+nominally-96 px unreadable one.
+
+What must not happen is the *silent* version — reporting 96 while drawing 64.
+Hence `effective_size` on the wire, `CursorThemeStore::effective_size()`
+behind it (answered through the same `cursor_for` path that draws the frame,
+so there is no second size-selection rule to drift), and an `INFO` line at
+switch time naming both numbers.
+
+**On the appliance's own theme the two are always equal at every step.**
+Checked rather than assumed, by reading the `Xcur` table of contents of
+Debian `adwaita-icon-theme`'s cursor files: nominal sizes `[24, 32, 48, 64, 96]`
+with matching `width`/`height` — *exactly* `CURSOR_SIZE_STEPS`. A divergence in
+the field therefore means a sparse third-party theme or no theme at all, which
+is worth surfacing. The asset-free fallback arrow also quantises (integer scale
+of a 24-cell mask), so **32 draws 24 and 64 draws 48** there — reported the same
+honest way via `fallback::rasterized_height`.
+
+### What changed
+
+- **`cursor/source.rs`**: `CURSOR_SIZE_STEPS`, `cursor_size_from_wire(i64)`
+  (strict, refuses rather than clamps), `resolve_startup_size`, `env_pins_size`.
+- **`cursor/persist.rs`**: `CursorPrefs` gains `size: Option<i64>`; `load_size`;
+  `store_size`. **Writes became read-modify-write** — with two keys, the old
+  unconditional overwrite was a live data-loss bug (`store(source)` would have
+  erased a stored `size`, and vice versa). The read half keeps RAW field values,
+  so a hand-edited `{"source":"claw"}` survives a size write instead of being
+  silently deleted. Honest limitation, pinned by a test: an unknown top-level
+  *key* is still dropped (no `#[serde(flatten)]` catch-all).
+- **`cursor/theme.rs`**: `LoadedCursor.nominal_size`; `size()`,
+  `effective_size()`, `set_size()`. A size switch drops **both** caches — the
+  per-icon `cache` *and* the separately-cached `fallback` arrow. Missing the
+  second one would make the whole op a no-op on a themeless machine, which is
+  precisely the container case. It deliberately does **not** reload the theme:
+  `resolve_theme_name` takes no size, and the loaded `xcursor::CursorTheme` is a
+  path resolver, not a rasterised image set.
+- **`cursor/fallback.rs`**: `rasterized_height(size)`, derived from the same
+  `scale_for_size` the rasteriser uses (a hand-maintained table would drift).
+- **`cursor/mod.rs`**: `CursorSourceInfo` gains `size` / `effective_size` /
+  `size_env_pinned`; `cursor_source_info` became `&mut self`;
+  `DuduclawComp::set_cursor_size`.
+- **`shell_control/{protocol,listener,mod}.rs`**: the `SetCursorSize { size:
+  i64 }` op, its `invalid_cursor_size` validation, and the audited handler.
+
+`size` is typed `i64` on the wire so `{"size":-5}` answers `invalid_cursor_size`
+— an honest statement about the *value* — instead of `parse_error`, which would
+blame the JSON. `{"size":3.5}` and `{"size":"32"}` stay `parse_error`: those
+genuinely are schema violations, not out-of-range sizes.
+
+There is deliberately **no** `size_origin` string to match `origin` (which
+describes the source only). The one thing a UI must not get wrong is "will my
+choice stick?", and `size_env_pinned` answers it.
+
+### Build / clippy / test (verified 2026-08-23)
+
+Same one-shot container shape as the CD-0 round, plus A4-1's system deps
+(`libinput-dev libudev-dev libseat-dev libgbm-dev libdrm-dev` — without
+`libseat` the test binary dies at load with `libseat.so.1: cannot open shared
+object file`, which looks like a test failure and is not).
+
+```
+cargo build                                -> Finished in 8.19s, zero warnings
+cargo test                                 -> 253 passed; 0 failed   (baseline 226, +27)
+cargo clippy --all-targets -- -D warnings  -> Finished, zero warnings
+```
+
+### Live verification — Xvfb + winit backend (pixel proof)
+
+Same `Xvfb :99` + `import -window root` recipe as CUR-1/WM-1. Bounding boxes
+are of every pixel differing from comp's `(26,26,26)` clear colour, measured in
+a 180×160 crop around the pointer at logical (600, 400), so the agent seat's
+cross at (0,0) is out of frame.
+
+**1. Adwaita, live switch, no restart.** Human pointer at (600, 400):
+
+```
+get_cursor_source -> "size":24,"effective_size":24,"origin":"default"
+                     bbox 15x21, 202 px
+set_cursor_size 32 -> "size":32,"effective_size":32,"persisted":true
+                     bbox 19x29, 345 px
+set_cursor_size 96 -> "size":96,"effective_size":96,"persisted":true
+                     bbox 54x84, 2906 px
+set_cursor_size 24 -> bbox 15x21, 202 px   (byte-identical to the start)
+```
+
+The pointer really grows and really shrinks back; 84/21 = 4.0 exactly across
+the 24→96 step. (The box is the arrow's opaque shape, not the nominal square —
+real theme art is not a pure scale of itself, which is why the widths are not
+in the same exact ratio.)
+
+**2. Refusals, not clamps.**
+
+```
+size=40      -> {"ok":false,"error":"invalid_cursor_size"}
+size=0       -> {"ok":false,"error":"invalid_cursor_size"}
+size=-5      -> {"ok":false,"error":"invalid_cursor_size"}
+size=512     -> {"ok":false,"error":"invalid_cursor_size"}
+size=100000  -> {"ok":false,"error":"invalid_cursor_size"}
+size=3.5     -> {"ok":false,"error":"parse_error"}        (documented split)
+```
+
+Re-asserting the live size is a no-op: 96 sent twice audits `changed=true` then
+`changed=false`, and `grep -c 'size switched live'` counts 4 for the four real
+changes above, not 5.
+
+**3. Persistence, and the two keys not evicting each other.**
+
+```
+after the switches      : cursor.json = {"size":96}
+restart comp, get       : "size":96 — bbox 54x84 (identical to the live 96)
+then set_cursor_source  : cursor.json = {"source":"brand","size":96}
+```
+
+That last line is the regression guard for the read-modify-write change, proven
+live: the source write preserved the size key.
+
+**4. `XCURSOR_SIZE` outranks the file, and says so.** File says 96:
+
+```
+XCURSOR_SIZE=48 -> "size":48,"size_env_pinned":true   bbox 28x43
+XCURSOR_SIZE=40 -> "size":40,"effective_size":48
+```
+
+The second line is an incidental bonus proof: 40 is not a step, the operator
+gets it anyway, and Adwaita's nearest image (48, tie-break to larger) is
+reported honestly rather than as 40. A pre-CUR-3 `{"source":"brand"}` file
+loads unchanged and yields `"size":24,"requested":"brand"`.
+
+**5. The 96-on-a-64-max-theme question, on real pixels.** A synthetic XCursor
+theme carrying **only** 24 and 64 px images, each a solid opaque white square
+so the drawn bounding box *is* the chosen image (built in-container by a
+throwaway script; **not** added to the repo):
+
+```
+set 24 -> "size":24,"effective_size":24   bbox 24x24, 576 px
+set 64 -> "size":64,"effective_size":64   bbox 64x64, 4096 px
+set 96 -> "size":96,"effective_size":64   bbox 64x64, 4096 px   <-- THE ANSWER
+```
+
+Pixel-identical to the 64 case. The 64 image is drawn at its own 64 px — not
+stretched to 96, and not silently reported as 96. comp's own log for it:
+
+```
+INFO cursor: size switched live, but the loaded cursor theme has no image at that
+     size — its nearest image is drawn at its own size, nothing is upscaled
+     size=96 effective_size=64 theme=SparseTheme
+```
+
+**6. No theme at all — the built-in arrow's quantisation, reported honestly.**
+
+```
+size=24 effective_size=24   bbox 15x24,  179 px
+size=32 effective_size=24   bbox 15x24,  179 px   <- identical: 32 draws 24
+size=48 effective_size=48   bbox 30x48,  716 px
+size=64 effective_size=48   bbox 30x48,  716 px   <- identical: 64 draws 48
+size=96 effective_size=96   bbox 60x96, 2864 px
+```
+
+Every box is exactly `15×scale` by `24×scale` for the `ARROW` mask's own
+15×24 cells, and 179 px at scale 1 is exactly CUR-1's `117 + 62` fill/outline
+cell counts. Two of the five steps genuinely draw smaller than they ask for —
+which is the whole reason `effective_size` exists.
+
+**7. Audit trail**, `duduclaw-shell-control-audit.jsonl`, actions only (queries
+still unaudited, per this module's standing rule):
+
+```
+{"ts_ms":…,"kind":"set_cursor_size","detail":"size=32 effective_size=32 theme=\"Adwaita\" changed=true persisted=true"}
+{"ts_ms":…,"kind":"set_cursor_size","detail":"size=96 effective_size=96 theme=\"Adwaita\" changed=false persisted=true"}
+{"ts_ms":…,"kind":"set_cursor_size","detail":"size=96 effective_size=64 theme=\"SparseTheme\" changed=true persisted=true"}
+{"ts_ms":…,"kind":"set_cursor_size","detail":"size=64 effective_size=48 theme=\"duduclaw-no-such-theme-cur3\" changed=true persisted=true"}
+```
+
+`effective_size` is in the line on purpose: "the user asked for 96 and the theme
+drew 64" must be recoverable from the trail, not only from a live socket query.
+
+### Honest stub / limitation list (this round)
+
+- **Not verified on real hardware** (udev/DRM backend, real libinput pointer,
+  the appliance's own Adwaita install) — the VM is the operator's. Recipe below.
+- **Not verified against the shell's settings page** — the UI half is a
+  concurrent work package in `crates/duduclaw-shell`; this round verified the
+  op with a raw socket client only.
+- **`effective_size` is measured on `CursorIcon::Default`.** A theme could in
+  principle ship different size sets per icon; none in practice does, and this
+  is the one icon a theme is effectively guaranteed to have (the same probe
+  `load_theme` already uses). A per-icon divergence would go unreported.
+- **An unknown top-level key in `cursor.json` is dropped on write**, not
+  round-tripped — see "What changed". Pinned by a test so it is a decision, not
+  a surprise.
+- **No HiDPI / fractional scaling**, unchanged from CUR-1: everything composites
+  at scale 1.0, so these are physical pixels.
+- **The `size` field in the startup `XCursor theme loaded` INFO line is the
+  boot-time value** and does not update on a live switch; the per-switch INFO
+  line in `cursor/mod.rs` is the live one.
+- **Not committed**, per this task's instructions, same as every prior round.
+
+### How to check this on the appliance VM
+
+1. Boot normally and confirm the startup resolution:
+   ```
+   journalctl -u duduclaw-kiosk -b | grep -E 'cursor: (resolved|XCursor theme loaded)'
+   ```
+   Expect `size=24 size_origin=default` on a fresh machine.
+2. Drive the op directly, as the kiosk user (the socket is same-uid only).
+   `python3` is in the image's `mkosi.conf` `Packages=` and was confirmed
+   present by the CD-0 VM round, so use it rather than assuming `nc -U`/`socat`
+   are installed:
+   ```
+   python3 - <<'EOF'
+   import json, os, socket
+   s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+   s.connect(os.environ["XDG_RUNTIME_DIR"] + "/duduclaw-shell.sock")
+   s.sendall(json.dumps({"op": "set_cursor_size", "params": {"size": 96}}).encode() + b"\n")
+   print(s.recv(4096).decode())
+   EOF
+   ```
+   (swap the body for `{"op":"get_cursor_source"}` to read the current state —
+   one request per connection, per this socket's protocol.)
+   **Expected:** the pointer grows *immediately*, with no restart and without
+   having to move the mouse first (that last part is what `queue_redraw` is
+   for — on the udev backend nothing else would schedule a frame).
+3. Check `effective_size` in the reply equals `size` at all five steps. On the
+   appliance's Adwaita it must; if it does not, the image is shipping a
+   different cursor theme than expected — `grep 'XCursor theme loaded'` names it.
+4. Restart the compositor and confirm the size stuck:
+   ```
+   cat "$HOME/.local/state/duduclaw-comp/cursor.json"   # -> {"size":96}
+   ```
+5. Refusal check: `{"size":40}` must answer `invalid_cursor_size` and the
+   pointer must not change.
+
+Triage table:
+
+| Symptom | Most likely cause | Check / fix |
+|---|---|---|
+| Op returns ok but the pointer does not change | The value equalled the live size (`changed=false` in the audit line), or an old comp binary | `grep 'cursor: size switched live'` — absent means no change was applied |
+| Pointer only changes after moving the mouse | A `queue_redraw` was lost | Should be impossible; `set_cursor_size` calls it unconditionally on a real change |
+| `effective_size` < `size` | The loaded theme has no image at that size — correct, not a bug | `grep 'no image at that size'` names the theme; install a fuller one (`adwaita-icon-theme`) or pick a step it carries |
+| `effective_size` is 24 or 48 no matter what | No XCursor theme found at all — the built-in arrow is drawing | `grep 'no XCursor theme found'`; install a cursor theme |
+| Size reverts after every restart | `XCURSOR_SIZE` is pinned in comp's environment | The reply's `size_env_pinned: true` says so; unset it in `/etc/duduclaw/kiosk.env` |
+| Size reverts and `size_env_pinned` is false | The preference file could not be written | The `set` reply carries `persisted: false` + `persist_error`; check `$HOME` ownership on `/data/duduclaw-kiosk` |
+
+---
+
+## WM-2 (2026-08-23): server-side decorations + floating windows
+
+User decision for this round: **B — 浮動視窗＋完整窗感**. WM-1 was explicitly
+transitional (fill the work area, answer `ClientSide` to every decoration
+request because comp drew none). WM-2 replaces both halves.
+
+### What changed
+
+| | WM-1 | WM-2 |
+|---|---|---|
+| new non-shell toplevel | fills the work area | **floats**: 80 % of the work area, centred, cascaded +24,+24 (wraps) |
+| `zxdg_decoration_manager_v1` | always `ClientSide` | **negotiated per window**, preference `ServerSide` |
+| decoration drawing | none | 32 px title bar (live `xdg_toplevel.title`), close ✕, 1 px `stone-300` border, 8 px stepped drop shadow |
+| title bar drag | — | clamped move grab (the bar can never leave the work area) |
+| maximize | client filled the work area | the **frame** fills the work area; the client gets that minus its decoration |
+| unmaximize | "comp keeps no restore geometry" | restores the remembered floating frame |
+| session shell | full output, undecorated | **unchanged** |
+
+New module `src/decor/` (`mod.rs` geometry, `placement.rs`, `mode.rs`,
+`text.rs`, `xmark.rs`, `paint.rs`); `Cargo.toml` gains `ab_glyph`;
+`assets/fonts/{Inter-500,NotoSansTC-500}.ttf` are vendored from
+`crates/duduclaw-native-gui/assets/fonts/static/` and `include_bytes!`-embedded.
+
+### The geometry model (read this before touching anything here)
+
+**`Space` still maps the CONTENT rectangle.** The decoration is drawn *around*
+it and appears nowhere in `Space`'s bookkeeping, so every existing caller of
+`element_location` / `element_geometry` / `element_under` / `surface_under`
+keeps meaning exactly what it meant before — which is why WM-2 does not touch
+`codrive/`, `shell_control/`, or the resize grab. The alternative (wrap
+`Window` in a decorated `SpaceElement` so `Space` maps the frame) is the more
+idiomatic smithay shape and was rejected for exactly that blast radius.
+
+Cost: `Space::element_under` cannot see a title bar. That is handled
+explicitly by `decor::hit_frame` (pure, unit-tested) plus
+`DuduclawComp::frame_hit_at`, which runs **before** the ordinary surface
+routing in `input.rs`'s pointer-button arm and returns `None` for a press in a
+window's content area.
+
+`DecorInsets::SSD` = `{top: 33, left: 1, right: 1, bottom: 1}` (32 px bar +
+1 px border). Asserted by `decor::tests::ssd_insets_are_the_title_bar_plus_the_border`.
+
+### Why `desktop::space::render_output` is no longer called
+
+It builds `[all custom elements…, all windows…]` — every overlay above every
+window. Correct for the cursors / codrive highlight / shadow PiP, wrong for a
+per-window title bar the moment windows overlap (which floating placement
+makes immediate). `decor::paint::build_output_elements` assembles the same list
+interleaved per window and ends in the identical
+`OutputDamageTracker::render_output` call upstream makes, so damage tracking,
+the output transform, and the udev backend's "no damage ⇒ no page flip" idle
+property are unchanged. Two formulas are copied verbatim from smithay 0.7.0
+(read, not remembered) and must stay that way:
+
+* render location = `element_location − element.geometry().loc − output.loc`
+  (dropping the middle term shifts every client with CSD shadows);
+* a window is skipped unless its bbox overlaps this output — **this is what
+  keeps CD-2's shadow workspace off the real screen**, widened only to include
+  the 8 px drop shadow.
+
+Per-window z-order is `[popups] [decoration] [toplevel surface] [shadow]`:
+popups above the title bar (an xdg-positioner may legitimately place one at a
+negative offset), decoration above the client surface (so a client whose
+surface overruns its declared geometry cannot hide its own close button).
+
+### Why every decoration buffer is cached per window
+
+`SolidColorBuffer::new` and `MemoryRenderBuffer::from_slice` each mint a fresh
+element `Id`, and an element whose id changes every frame reads as a brand-new
+element to `OutputDamageTracker` — so a rebuilt-per-frame title bar would
+report damage every composite and the udev backend would page-flip at 60 Hz on
+a completely idle desktop. Cached buffers are mutated with
+`SolidColorBuffer::update` (id-stable, commit bumps only on a real change);
+the two rasters are rebuilt only when their inputs change — `(title, available
+width)` for the text, hover state for the ✕. `MemoryRenderBufferRenderElement::
+from_buffer` reuses `buffer.id`, verified in smithay's source.
+
+Live evidence that this holds: `decor: title raster rebuilt` fires **once per
+window**, never per frame.
+
+### Verification (2026-08-23, container `rust:bookworm` aarch64)
+
+Standard volumes (`duduclaw-comp-cargo`, `-cargo-git`, `-target`).
+
+```
+cargo build                              -> Finished dev profile, 0 warnings
+cargo clippy --all-targets -- -D warnings -> Finished, no warnings
+cargo test                               -> ok. 320 passed; 0 failed
+```
+
+**320 = 253 pre-existing (all still green) + 67 new**: 20 in `decor` (frame /
+content / title bar / close button / hit test / clamp / refit / shadow bounds),
+11 in `decor::placement` (80 % floor, centring, 24 px cascade, wrap, "every
+cascade position stays inside the work area", tiny work area), 7 in
+`decor::mode` (the anti-double-title-bar rule, shell/shadow refusals), 4 in
+`decor::paint`, 14 in `decor::text` (both fonts parse, CJK falls back to Noto,
+CJK truncation on char boundaries, premultiplied pixels, width caps, absurd
+title cap), 5 in `decor::xmark`, 6 in `grabs::move_grab` (clamped drag).
+
+Live rounds, three-layer stack (`weston --backend=headless-backend.so` →
+`duduclaw-comp` → `foot`), same recipe as earlier sections:
+
+1. **Four clients, decorated.** All four alive, comp alive, **0 panics, 0
+   renderer refusals**. Cascade observed exactly as unit-tested:
+
+   ```
+   frame (128, 98, 1024, 544)  -> content (129, 131, 1022, 510)
+   frame (152,122, 1024, 544)  -> content (153, 155, 1022, 510)
+   frame (176,146, 1024, 544)  -> content (177, 179, 1022, 510)
+   ```
+
+   (work area 1280×800 − 30 − 90 = `(0, 30, 1280, 680)`; 80 % = 1024×544;
+   centred base x = (1280−1024)/2 = 128.)
+
+2. **CJK title rasterised through the Noto fallback**:
+   `title=視窗標題 B — DuDuClaw 值班機 raster=(147, 13) avail_w=956`.
+   `avail_w` = 1022 (bar) − 46 (close) − 12 (pad) − 8 (gap) = 956 ✓.
+
+3. **`title_changed` reaches the compositor** — `foot -T` produced
+   `xdg_shell: title changed — repainting the title bar`.
+
+4. **Demotion race** (`DUDUCLAW_COMP_SHELL_APP_ID=foot-shell`, a `foot` mapped
+   *before* the shell stand-in): the early window was provisionally the shell
+   (full output, decoration overridden to client-side), then demoted when
+   `foot-shell` claimed the role by app_id — and **got its title bar back**
+   (`title raster rebuilt … avail_w=956`) at the floating placement
+   `(129, 131, 1022, 510)`. This is the case the "never overwrite what the
+   client negotiated" rule in `window_policy::sync_decoration_mode` exists for;
+   an earlier draft stored the downgrade and left such a window permanently
+   undecorated.
+
+### Not verified in the container (needs the VM / real hardware)
+
+* **Anything visual.** The container is headless — there is no screenshot. What
+  is drawn (colours, the ✕ shape, shadow gradient, text position inside the
+  bar) is verified only by unit tests over the buffers, not by looking.
+* **Hover, click-to-close, drag.** Weston's headless backend has no pointer
+  device, so `frame_hit_at` / `update_close_hover` / `begin_titlebar_move` have
+  never run against a real seat. Their geometry is unit-tested; their wiring is
+  not.
+* **Maximize / unmaximize.** `foot` under SSD has no maximize affordance to
+  click. The geometry is unit-tested and the handler is straight-line code, but
+  no client has driven it.
+* **The udev backend's idle behaviour with decorations.** The reasoning (cached
+  ids) is verified in smithay's source and by the once-per-window raster log,
+  not by measuring flips on real hardware.
+* **Chromium specifically.** The one first-hand fact this round leans on —
+  Chromium 151 draws its own CSD tab strip in normal mode — comes from WM-1's
+  notes, not from a run in this round.
+
+### Known limitations (deliberate, this round)
+
+* **No rounded corners** — the task brief excluded them explicitly.
+* **No dark mode.** Comp has no theme mechanism; `decor::Palette` is the single
+  place to switch when one lands (`TODO(theme)` marks it).
+* **No resize by dragging the border.** A 1 px border is not a resize target;
+  clients keep their own resize edges via `xdg_toplevel.resize`, which is
+  unchanged.
+* **No double-click-to-maximize on the title bar**, no window menu, no
+  minimize/maximize buttons — only the close button was in scope.
+* **`fullscreen_request` is still upstream's no-op.** Untouched by this round.
+* **Title text is unshaped** (glyph-per-char + advances). Correct for Latin and
+  CJK; Arabic/Devanagari titles will render unshaped. Adding HarfBuzz for a
+  32 px strip was judged not worth the C dependency.
+* **A client that never creates a `zxdg_toplevel_decoration_v1` gets no server
+  decoration.** That is the conservative half of the negotiation table
+  (`decor::mode`) and it is deliberate: such a client has, by convention, opted
+  into drawing its own, and giving it a second title bar would be worse.
+  Super+Q still closes it.
+* **The shadow is a 4-ring stepped ramp, not a real gradient** — a gradient
+  needs a per-window texture (allocation on every resize) or a shader this
+  crate does not have.
+
+### Nothing the shell has to do
+
+No `duduclaw-shell` change is required or was made. Two things are worth
+knowing on the shell side, though, and neither is a bug today:
+
+* The shell keeps being announced `ClientSide`, so gpui's
+  `WindowDecorations::Client` state is unchanged from WM-1.
+* The reserved bands (30 / 90) are still the contract between the two crates.
+  If the shell's menu bar or dock height ever changes, `window_policy`'s
+  constants must move with it — floating placement is computed against the work
+  area those bands define, so a stale value now misplaces every window rather
+  than just clipping the dock.

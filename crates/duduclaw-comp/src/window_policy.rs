@@ -176,10 +176,16 @@ pub fn work_area(output: Rectangle<i32, Logical>, bands: ReservedBands) -> Recta
     )
 }
 
-/// Where a toplevel should be placed and how big it should be.
+/// Where a toplevel should be placed and how big it should be — **WM-1's**
+/// rule, kept only for the session shell.
 ///
-/// The session shell gets the whole output (it paints the bands itself);
-/// everything else gets the work area.
+/// The session shell gets the whole output (it paints the bands itself).
+///
+/// WM-2 (2026-08-23) replaced the `else` branch: an ordinary application
+/// window is no longer *filled* into the work area, it is **floated** inside
+/// it — see `DuduclawComp::floating_content_rect` and `crate::decor::
+/// placement`. This function survives because the shell half of the rule is
+/// unchanged and is asserted by this module's own tests.
 pub fn window_rect(
     output: Rectangle<i32, Logical>,
     bands: ReservedBands,
@@ -326,10 +332,20 @@ impl DuduclawComp {
         } else {
             self.classify_shell_window(window)
         };
+        // WM-2: a window that will never be server-decorated must not have been
+        // told otherwise. Runs before the geometry is computed so the corrected
+        // insets are what `floating_content_rect` sees.
+        self.sync_decoration_mode(window, is_shell, in_shadow);
+        // WM-2: the shell (and a shadow-workspace window) still gets the whole
+        // output; everything else is floated inside the work area instead of
+        // filling it. `floating_content_rect` is `&mut self` because a
+        // first-time placement consumes a cascade slot.
         let rect = if in_shadow {
             Rectangle::new(output_geo.loc, output_geo.size)
+        } else if is_shell {
+            window_rect(output_geo, self.reserved_bands, true)
         } else {
-            window_rect(output_geo, self.reserved_bands, is_shell)
+            self.floating_content_rect(window, output_geo)
         };
 
         toplevel.with_pending_state(|state| {
@@ -363,7 +379,7 @@ impl DuduclawComp {
         self.queue_redraw();
     }
 
-    fn window_is_in_shadow(&self, window: &Window) -> bool {
+    pub(crate) fn window_is_in_shadow(&self, window: &Window) -> bool {
         let Some(loc) = self.space.element_location(window) else {
             return false;
         };
@@ -371,6 +387,150 @@ impl DuduclawComp {
             return false;
         };
         shadow_geo.contains(loc)
+    }
+
+    /// WM-2 alias used from `decor::paint` (which needs the same answer while
+    /// deciding whether a window may be decorated at all). Separate name
+    /// rather than a second implementation.
+    pub(crate) fn window_is_in_shadow_public(&self, window: &Window) -> bool {
+        self.window_is_in_shadow(window)
+    }
+
+    /// WM-2: the work area of the layout output — the region a floating window
+    /// lives inside, and the region every drag is clamped to.
+    ///
+    /// `None` when no real output is mapped yet, exactly like
+    /// [`Self::layout_output_geometry`].
+    pub fn layout_work_area(&self) -> Option<Rectangle<i32, Logical>> {
+        Some(work_area(self.layout_output_geometry()?, self.reserved_bands))
+    }
+
+    /// WM-2: where a **floating** (non-shell, non-shadow) toplevel's CONTENT
+    /// rectangle belongs.
+    ///
+    /// Three cases, in order:
+    ///
+    /// 1. **Maximized** — fill the work area (the frame is the work area, so
+    ///    the content is the work area minus this window's decoration).
+    /// 2. **Already placed** — keep the remembered floating frame, refitted
+    ///    into the (possibly changed) work area. This is the path a re-apply
+    ///    takes: `app_id_changed`, a decoration-mode change, an output resize.
+    ///    Note it reads the REMEMBERED frame, not the live geometry — see
+    ///    `DecorState::frames` for why.
+    /// 3. **New** — take the next cascade slot.
+    fn floating_content_rect(
+        &mut self,
+        window: &Window,
+        output_geo: Rectangle<i32, Logical>,
+    ) -> Rectangle<i32, Logical> {
+        let work = work_area(output_geo, self.reserved_bands);
+        let insets = self.window_insets(window);
+        let id = window.toplevel().unwrap().wl_surface().id();
+
+        if self.decor.maximized.contains(&id) {
+            return crate::decor::content_rect(work, insets);
+        }
+
+        let frame = match self.decor.frames.get(&id).copied() {
+            Some(remembered) => crate::decor::refit_frame(remembered, work, insets),
+            None => {
+                let index = self.decor.cascade_next;
+                self.decor.cascade_next = self.decor.cascade_next.wrapping_add(1);
+                crate::decor::cascade_frame_rect(work, insets, index)
+            }
+        };
+        self.decor.frames.insert(id, frame);
+        crate::decor::content_rect(frame, insets)
+    }
+
+    /// WM-2: brings the remembered floating frame back in line with where the
+    /// window actually is.
+    ///
+    /// Two callers, both of which move or resize a window behind the layout
+    /// policy's back:
+    ///
+    /// * `grabs::MoveSurfaceGrab` — the human dragging the title bar;
+    /// * `handlers::xdg_shell::handle_commit` — a client committing a size it
+    ///   picked itself (xdg-shell lets a client answer a configure with a
+    ///   smaller size).
+    ///
+    /// Without it, an output-mode change would refit the window to where it
+    /// was *born* rather than where the user left it.
+    ///
+    /// Deliberately a no-op for a window that has never been placed (no entry
+    /// to keep in step) and for a maximized one (its `frames` entry IS the
+    /// restore geometry and must not be overwritten with the maximized rect),
+    /// and it ignores a degenerate geometry — a client between buffers can
+    /// briefly report 0×0, and storing that would restore a 1×1 window later.
+    pub fn decor_sync_frame(&mut self, window: &Window) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        let id = toplevel.wl_surface().id();
+        if self.decor.maximized.contains(&id) || !self.decor.frames.contains_key(&id) {
+            return;
+        }
+        let Some(current) = self.space.element_geometry(window) else {
+            return;
+        };
+        if current.size.w <= 1 || current.size.h <= 1 {
+            return;
+        }
+        let insets = self.window_insets(window);
+        self.decor
+            .frames
+            .insert(id, crate::decor::frame_rect(current, insets));
+    }
+
+    /// WM-2: keeps the decoration mode comp **announces** identical to the one
+    /// it actually **draws**.
+    ///
+    /// A client can legitimately ask for (and be granted) `ServerSide` before
+    /// comp knows this window is the session shell: `new_decoration` fires
+    /// before the first commit, and the shell role is only decided *on* that
+    /// commit. `decor::mode::negotiated_ssd` then refuses to draw a title bar
+    /// for it. Without this the client would have been told "the compositor
+    /// decorates you" while nothing was drawn — the WM-1 bug (a window with no
+    /// decoration at all) inverted.
+    ///
+    /// Crucially this **does not overwrite what the client negotiated**. The
+    /// map keeps the client's own request forever; only the wire answer is
+    /// recomputed from it plus the window's current role. That distinction is
+    /// load-bearing rather than pedantic: the first toplevel to map is taken as
+    /// the shell *provisionally* (`classify_shell_window` rule 2), so if a
+    /// third-party window happens to map before `duduclaw-shell` does, it is
+    /// briefly the shell and then demoted. Overwriting its stored mode during
+    /// that window would have left it permanently undecorated with no way back.
+    fn sync_decoration_mode(&mut self, window: &Window, is_shell: bool, in_shadow: bool) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        let id = toplevel.wl_surface().id();
+        // A client that never created a decoration object gets no answer —
+        // "no entry" is a third state and must not be turned into one.
+        let Some(negotiated) = self.decor.modes.get(&id).copied() else {
+            return;
+        };
+        let effective = if crate::decor::negotiated_ssd(is_shell, in_shadow, Some(negotiated)) {
+            crate::decor::DecorMode::ServerSide
+        } else {
+            crate::decor::DecorMode::ClientSide
+        };
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(effective.wire());
+        });
+        if effective != negotiated {
+            tracing::info!(
+                surface_id = ?toplevel.wl_surface().id(),
+                is_shell,
+                in_shadow,
+                negotiated = negotiated.as_str(),
+                announced = effective.as_str(),
+                "xdg_decoration: overriding the negotiated mode — comp never decorates the \
+                 session shell or a shadow-workspace window (the client's own request is kept, \
+                 so a demoted window gets its decoration back)"
+            );
+        }
     }
 
     /// [`DuduclawComp::apply_window_policy`] addressed by surface rather than
@@ -459,25 +619,46 @@ impl DuduclawComp {
             return;
         };
 
-        let toplevel = window.toplevel().unwrap();
+        self.close_window_politely(&window, "super+q");
+    }
+
+    /// The single "politely ask this window to close" path.
+    ///
+    /// WM-2 gave the compositor a second way to reach it (the title bar's ✕),
+    /// so the shell refusal, the audit line and the `xdg_toplevel.close`
+    /// semantics live here once rather than being duplicated per entry point.
+    /// Both callers are human-only: Super+Q comes from the human seat's
+    /// keyboard filter closure, the ✕ from the human pointer's button arm in
+    /// `input.rs`. Neither is reachable from agent-injected input (see
+    /// `codrive/mod.rs`'s separate seat), so the agent still cannot forge a
+    /// window close.
+    ///
+    /// The session shell is **never** a target: closing it leaves a black
+    /// screen with no way back.
+    pub fn close_window_politely(&mut self, window: &Window, reason: &'static str) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
         let surface = toplevel.wl_surface().clone();
         if self.is_session_shell_surface(&surface) {
             tracing::warn!(
                 surface_id = ?surface.id(),
-                "window_policy: Super+Q refused — that window is the session shell (closing it would leave a black screen)"
+                reason,
+                "window_policy: close refused — that window is the session shell (closing it would leave a black screen)"
             );
             return;
         }
 
         tracing::info!(
             surface_id = ?surface.id(),
-            app_id = ?Self::window_app_id(&window),
-            "window_policy: Super+Q — sending xdg_toplevel.close to the focused window"
+            reason,
+            app_id = ?Self::window_app_id(window),
+            "window_policy: sending xdg_toplevel.close"
         );
         toplevel.send_close();
     }
 
-    fn toplevel_window_for(&self, surface: &WlSurface) -> Option<Window> {
+    pub(crate) fn toplevel_window_for(&self, surface: &WlSurface) -> Option<Window> {
         self.space
             .elements()
             .find(|w| w.toplevel().unwrap().wl_surface() == surface)

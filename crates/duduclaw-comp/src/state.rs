@@ -174,6 +174,14 @@ pub struct DuduclawComp {
     /// `app_id` rather than by the first-mapped fallback. A confirmed role is
     /// never handed to a later window.
     pub shell_confirmed: bool,
+    /// WM-2 (2026-08-23): everything the server-side decorations and the
+    /// floating-window layout need that `Space` does not already hold — the
+    /// embedded title fonts, the per-toplevel decoration-mode negotiation, the
+    /// cached (id-stable) decoration buffers, the pre-maximize restore
+    /// geometry, and the cascade counter. See `crate::decor`'s module doc for
+    /// the geometry model, and `decor::paint`'s for why the buffers are
+    /// cached rather than rebuilt per frame.
+    pub decor: crate::decor::paint::DecorState,
     /// A4-1 (udev/DRM backend): "something that can change a pixel happened
     /// since the last composite". Set by [`DuduclawComp::queue_redraw`],
     /// consumed (and cleared) by `udev_backend::dispatch_render`.
@@ -352,6 +360,7 @@ impl DuduclawComp {
             shell_app_id,
             shell_surface: None,
             shell_confirmed: false,
+            decor: crate::decor::paint::DecorState::new(),
             pending_redraw: true,
         }
     }

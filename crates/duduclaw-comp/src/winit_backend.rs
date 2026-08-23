@@ -225,23 +225,23 @@ pub fn init_winit(
 
                 {
                     let (renderer, mut framebuffer) = backend.bind().unwrap();
-                    smithay::desktop::space::render_output::<
-                        _,
-                        CodriveElement,
-                        _,
-                        _,
-                    >(
-                        &output,
-                        renderer,
-                        &mut framebuffer,
-                        1.0,
-                        0,
-                        [&state.space],
-                        &cursor_elements,
-                        &mut damage_tracker,
-                        [0.1, 0.1, 0.1, 1.0],
-                    )
-                    .unwrap();
+                    // WM-2: `desktop::space::render_output` is no longer used.
+                    // It puts ALL custom elements above ALL windows, which is
+                    // right for the overlays built above and wrong for a
+                    // per-window title bar. `build_output_elements` builds the
+                    // same list interleaved per window and ends in the exact
+                    // `OutputDamageTracker::render_output` call upstream makes
+                    // — see `decor/paint.rs`'s module doc.
+                    let elements = state.build_output_elements(renderer, &output, cursor_elements);
+                    damage_tracker
+                        .render_output(
+                            renderer,
+                            &mut framebuffer,
+                            0,
+                            &elements,
+                            [0.1, 0.1, 0.1, 1.0],
+                        )
+                        .unwrap();
                 }
                 backend.submit(Some(&[damage])).unwrap();
 

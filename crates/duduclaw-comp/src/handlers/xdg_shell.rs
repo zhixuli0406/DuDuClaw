@@ -120,6 +120,10 @@ impl XdgShellHandler for DuduclawComp {
                 start_data,
                 window,
                 initial_window_location,
+                // WM-2: deliberately unclamped. This is a CLIENT asking to be
+                // moved (tear-off tab, drag-to-attach); the compositor's own
+                // title-bar drag is the clamped one. See `grabs::MoveClamp`.
+                clamp: None,
             };
 
             // WP-A1 multi-window round: greppable evidence that a client's
@@ -317,6 +321,10 @@ impl XdgShellHandler for DuduclawComp {
         // restarted shell can claim it again (and so nothing keeps comparing
         // against a dead surface).
         self.forget_shell_window(&wl_surface);
+        // WM-2: drop the decoration buffers, the negotiated mode, the restore
+        // geometry and the hover state for this toplevel. `ObjectId`s are
+        // never reused, so nothing else would ever evict these.
+        self.forget_window_decor(&wl_surface.id());
 
         self.reassign_focus_on_window_removed(&wl_surface);
     }
@@ -351,7 +359,19 @@ impl XdgShellHandler for DuduclawComp {
     /// (upstream's default sends a configure carrying no state change) a
     /// Chromium/GTK maximize button was simply inert.
     ///
-    /// This is the one place `xdg_toplevel.State::Maximized` is set. The
+    /// WM-2 changed two things about it:
+    ///
+    /// 1. The work area is now the **frame**, not the content — a maximized
+    ///    server-decorated window still has its 32 px title bar, so the client
+    ///    is configured to the work area *minus* its decoration. Without this
+    ///    the bottom of a maximized window would hang past the work area and
+    ///    over the shell's dock by exactly the decoration's height.
+    /// 2. Comp now remembers where the window was, so [`Self::
+    ///    unmaximize_request`] has somewhere to go back to. That memory is
+    ///    `DecorState::frames` — the same restore rectangle the floating
+    ///    placement already maintains, not a second store.
+    ///
+    /// This is still the one place `xdg_toplevel.State::Maximized` is set. The
     /// initial configure deliberately still does not set it — see
     /// `handle_commit` below for why (it changes CSD for every GTK/Qt app we
     /// host, which is only ever appropriate when the client itself asked).
@@ -360,102 +380,181 @@ impl XdgShellHandler for DuduclawComp {
             surface.send_configure();
             return;
         };
+        let wl_surface = surface.wl_surface().clone();
+        let window = self.toplevel_window_for(&wl_surface);
         let area = crate::window_policy::work_area(output_geo, self.reserved_bands);
+        let insets = window
+            .as_ref()
+            .map(|w| self.window_insets(w))
+            .unwrap_or(crate::decor::DecorInsets::NONE);
+        let content = crate::decor::content_rect(area, insets);
+
+        // Snapshot where the window currently is BEFORE marking it maximized:
+        // `decor_sync_frame` deliberately does nothing once the `maximized`
+        // flag is set, so that the restore geometry cannot be overwritten with
+        // the maximized rectangle.
+        if let Some(window) = window.as_ref() {
+            self.decor_sync_frame(window);
+        }
+        self.decor.maximized.insert(wl_surface.id());
+
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
-            state.size = Some(area.size);
+            state.size = Some(content.size);
         });
-        let wl_surface = surface.wl_surface().clone();
-        let window = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == &wl_surface)
-            .cloned();
         if let Some(window) = window {
-            if self.space.element_location(&window) != Some(area.loc) {
-                self.space.map_element(window, area.loc, false);
+            if self.space.element_location(&window) != Some(content.loc) {
+                self.space.map_element(window, content.loc, false);
             }
         }
         tracing::info!(
             surface_id = ?wl_surface.id(),
-            area = ?(area.loc.x, area.loc.y, area.size.w, area.size.h),
-            "xdg_shell: maximize_request — configured to the work area (output minus the shell's reserved bands)"
+            frame = ?(area.loc.x, area.loc.y, area.size.w, area.size.h),
+            content = ?(content.loc.x, content.loc.y, content.size.w, content.size.h),
+            decorated = insets.is_decorated(),
+            "xdg_shell: maximize_request — the FRAME fills the work area; the client gets that minus its decoration"
         );
         self.queue_redraw();
         surface.send_configure();
     }
 
-    /// WM-1 counterpart to [`Self::maximize_request`]. Comp keeps no restore
-    /// geometry (that is window-management state A5 owns), so this clears the
-    /// `Maximized` state — which is what the client needs to redraw its
-    /// titlebar correctly — and leaves the size where it is rather than
-    /// inventing a "previous" size the compositor never recorded.
+    /// WM-1 counterpart to [`Self::maximize_request`], **rewritten in WM-2**.
+    ///
+    /// WM-1's version cleared the `Maximized` state and left the size where it
+    /// was, with an explicit note that comp kept no restore geometry. WM-2
+    /// keeps one (`DecorState::frames`, the floating placement's own
+    /// rectangle), so this genuinely restores the window — refitted into the
+    /// current work area, which may have changed while it was maximized.
+    ///
+    /// A client that opened maximized has no remembered frame; it falls back
+    /// to a fresh cascade slot rather than to nothing at all.
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface().clone();
+        let id = wl_surface.id();
+        self.decor.maximized.remove(&id);
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
         });
+
+        let restored = match (self.toplevel_window_for(&wl_surface), self.layout_work_area()) {
+            (Some(window), Some(work)) => {
+                let insets = self.window_insets(&window);
+                let frame = match self.decor.frames.get(&id).copied() {
+                    Some(remembered) => crate::decor::refit_frame(remembered, work, insets),
+                    None => {
+                        let index = self.decor.cascade_next;
+                        self.decor.cascade_next = self.decor.cascade_next.wrapping_add(1);
+                        crate::decor::cascade_frame_rect(work, insets, index)
+                    }
+                };
+                self.decor.frames.insert(id.clone(), frame);
+                let content = crate::decor::content_rect(frame, insets);
+                surface.with_pending_state(|state| {
+                    state.size = Some(content.size);
+                });
+                self.space.map_element(window, content.loc, false);
+                Some(content)
+            }
+            _ => None,
+        };
+
         tracing::info!(
-            surface_id = ?surface.wl_surface().id(),
-            "xdg_shell: unmaximize_request — clearing the maximized state (comp keeps no restore geometry; A5 owns that)"
+            surface_id = ?id,
+            restored = ?restored.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h)),
+            "xdg_shell: unmaximize_request — restoring the remembered floating geometry"
         );
         self.queue_redraw();
         surface.send_configure();
     }
+
+    /// WM-2: the title bar draws `xdg_toplevel.title`, so a title change is
+    /// now a visual change.
+    ///
+    /// Nothing is invalidated by hand: `decor::paint` keys its cached glyph
+    /// raster on `(title, available width)`, so the next composite picks the
+    /// new string up by itself. All this has to do is make sure there *is* a
+    /// next composite — on the udev backend nothing else would schedule one,
+    /// and a renamed tab would sit stale until some unrelated damage happened.
+    /// Upstream's default is a no-op, so nothing was listening before.
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        tracing::debug!(
+            surface_id = ?surface.wl_surface().id(),
+            "xdg_shell: title changed — repainting the title bar"
+        );
+        self.queue_redraw();
+    }
 }
 
-/// WM-1: `zxdg_decoration_manager_v1`, answered **always** `ClientSide`.
+/// `zxdg_decoration_manager_v1` — **WM-2: negotiated per window**.
 ///
-/// The live report was that a Chromium window had no way to be closed. Comp
-/// draws no server-side decorations and did not advertise this protocol at
-/// all, so a client had no negotiated answer to "who draws the title bar" and
-/// was free to draw none. Advertising the global and replying `ClientSide`
-/// makes the contract explicit: the client owns its own title bar, close
-/// button, and drag/resize affordances.
+/// WM-1 answered a flat `ClientSide` for one honest reason: comp drew no
+/// decorations, so claiming `ServerSide` would have given every window *no*
+/// decoration at all. WM-2 draws them (`crate::decor`), so the preference
+/// flips to `ServerSide` — but not unconditionally. The rule, its table, and
+/// the first-hand Chromium observation behind it live in `decor::mode`; this
+/// impl is only the protocol plumbing around
+/// [`crate::decor::mode::answer_request`].
 ///
-/// Why not `ServerSide`: comp has no decoration renderer, and inventing one is
-/// explicitly A5's work package, not this transitional one. Claiming
-/// `ServerSide` while drawing nothing would give every window *no* decoration
-/// at all — the exact bug being fixed.
-///
-/// Effect on `duduclaw-shell`: none. gpui's Wayland backend initialises
-/// `decorations: WindowDecorations::Client` regardless
-/// (`gpui_linux/src/linux/wayland/window.rs:610`) and only leaves that state
-/// on an explicit `ServerSide` configure, and `duduclaw-shell` never reads
-/// `Window::window_decorations()` anyway — verified by grep over the shell
-/// crate, not assumed. It creates the decoration object as soon as the global
-/// exists (`window.rs:278`), which is *before* its first commit, so the
-/// `ClientSide` mode rides along on the same initial configure that carries
-/// the size.
+/// Effect on `duduclaw-shell`: still none. It creates its decoration object
+/// before its first commit (gpui `gpui_linux/src/linux/wayland/window.rs:278`)
+/// and would therefore be recorded as `ServerSide` here — but the shell role
+/// is settled a moment later on that first commit, and
+/// `window_policy::sync_decoration_mode` downgrades it to `ClientSide` on the
+/// same configure that carries its size, so what the shell is *told* always
+/// matches what comp actually *draws* for it (nothing).
 impl XdgDecorationHandler for DuduclawComp {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        self.set_client_side_decoration(&toplevel, "new_decoration");
+        // The client created the object but has not asked for anything: it
+        // gets our preference.
+        self.set_decoration_mode(&toplevel, crate::decor::mode::PREFERRED, "new_decoration");
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: zxdg_toplevel_decoration_v1::Mode) {
-        // A client asking for `ServerSide` gets `ClientSide` anyway — which
-        // the protocol explicitly allows ("the compositor can decide not to
-        // use the client's mode"), and which is the honest answer while comp
-        // draws no decorations. Logged rather than silently overridden so a
-        // "my title bar looks wrong" report is answerable from the log.
-        if mode == zxdg_toplevel_decoration_v1::Mode::ServerSide {
-            tracing::debug!(
-                surface_id = ?toplevel.wl_surface().id(),
-                "xdg_decoration: client asked for server-side decorations — answering client-side (comp draws none)"
-            );
-        }
-        self.set_client_side_decoration(&toplevel, "request_mode");
+        self.set_decoration_mode(
+            &toplevel,
+            crate::decor::mode::answer_request(mode),
+            "request_mode",
+        );
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        self.set_client_side_decoration(&toplevel, "unset_mode");
+        // "I withdraw my preference" — back to ours.
+        self.set_decoration_mode(&toplevel, crate::decor::mode::PREFERRED, "unset_mode");
     }
 }
 
 impl DuduclawComp {
-    fn set_client_side_decoration(&mut self, toplevel: &ToplevelSurface, reason: &'static str) {
+    fn set_decoration_mode(
+        &mut self,
+        toplevel: &ToplevelSurface,
+        mode: crate::decor::DecorMode,
+        reason: &'static str,
+    ) {
+        let surface = toplevel.wl_surface().clone();
+        let previous = self.decor.modes.insert(surface.id(), mode);
+
+        // What we ANSWER is what we will actually DRAW, which for an already
+        // mapped window depends on its role as well as on its request (the
+        // shell and shadow-workspace windows are never server-decorated). For
+        // a window that has not mapped yet the role is not decided, so the
+        // raw negotiated mode goes out and the initial configure's
+        // `window_policy::sync_decoration_mode` corrects it a moment later.
+        let effective = match self.toplevel_window_for(&surface) {
+            Some(window) if self.window_uses_ssd(&window) => crate::decor::DecorMode::ServerSide,
+            Some(_) => crate::decor::DecorMode::ClientSide,
+            None => mode,
+        };
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+            state.decoration_mode = Some(effective.wire());
         });
+        tracing::debug!(
+            surface_id = ?surface.id(),
+            reason,
+            requested = mode.as_str(),
+            answered = effective.as_str(),
+            "xdg_decoration: negotiated"
+        );
+
         // Sending a configure here BEFORE the initial one would be a
         // correctness bug, not just noise: `ToplevelSurface::send_configure`
         // sets `initial_configure_sent` (smithay 0.7.0
@@ -463,15 +562,22 @@ impl DuduclawComp {
         // branch — the only thing that gives a window its size and position —
         // would never run and the client would fall back to picking its own
         // geometry. Both gpui and Chromium create their decoration object
-        // before their first commit, so this branch is the normal path.
-        if toplevel.is_initial_configure_sent() {
-            toplevel.send_pending_configure();
+        // before their first commit, so that branch is the normal path.
+        if !toplevel.is_initial_configure_sent() {
+            return;
         }
-        tracing::debug!(
-            surface_id = ?toplevel.wl_surface().id(),
-            reason,
-            "xdg_decoration: client-side decorations"
-        );
+
+        // WM-2: a mode change on an ALREADY MAPPED window changes the frame
+        // insets, which changes how big the client may be inside a frame that
+        // must stay put. Re-running the layout policy is what recomputes that;
+        // it sends the configure itself.
+        if previous != Some(mode) {
+            if let Some(window) = self.toplevel_window_for(&surface) {
+                self.apply_window_policy(&window);
+                return;
+            }
+        }
+        toplevel.send_pending_configure();
     }
 }
 
@@ -585,6 +691,12 @@ pub fn handle_commit(state: &mut DuduclawComp, surface: &WlSurface) {
             // (needed to target a CSD resize hotspot for a live multi-
             // client resize-grab test) was to guess blindly with no
             // screenshot available in this headless container.
+            //
+            // WM-2: a client may answer a configure with a size it picked
+            // itself, so the remembered floating frame is brought back in step
+            // here. No-op for an unplaced, maximized or degenerate window —
+            // see `DuduclawComp::decor_sync_frame`.
+            state.decor_sync_frame(&window);
             tracing::debug!(
                 surface_id = ?surface.id(),
                 geometry = ?window.geometry(),
