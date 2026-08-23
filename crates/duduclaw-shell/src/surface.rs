@@ -32,6 +32,21 @@ pub enum Overlay {
     /// back to ControlCenter. That is the existing model applied
     /// consistently, not a special case.
     PointerSettings,
+    /// D4b (2026-08-23) — 系統設定, the settings application
+    /// (`crate::settings`), reached from a row inside ControlCenter.
+    ///
+    /// A fifth overlay for the same reason `PointerSettings` is a fourth:
+    /// this shell draws its own surfaces in its own gpui tree, and a
+    /// 1180×744 panel with a seven-row sidebar does not fit inside
+    /// ControlCenter's 372px column. The non-stacking rule applies here too —
+    /// opening it CLOSES ControlCenter, and Escape returns to Home rather
+    /// than back to it.
+    ///
+    /// `PointerSettings` deliberately stays its own overlay rather than
+    /// becoming an eighth settings category: it is 協助工具, not a system
+    /// setting, its board is a different screen, and folding it in would mean
+    /// rewriting a page that already shipped and works.
+    Settings,
 }
 
 impl Overlay {
@@ -47,6 +62,7 @@ impl Overlay {
             "notifications" => Some(Overlay::Notifications),
             "controlcenter" => Some(Overlay::ControlCenter),
             "pointer" => Some(Overlay::PointerSettings),
+            "settings" => Some(Overlay::Settings),
             _ => None,
         }
     }
@@ -161,6 +177,20 @@ mod tests {
         assert_eq!(Overlay::from_debug_env("notifications"), Some(Overlay::Notifications));
         assert_eq!(Overlay::from_debug_env("controlcenter"), Some(Overlay::ControlCenter));
         assert_eq!(Overlay::from_debug_env("pointer"), Some(Overlay::PointerSettings));
+        assert_eq!(Overlay::from_debug_env("settings"), Some(Overlay::Settings));
+    }
+
+    /// D4b: 系統設定 obeys the same non-stacking rule as every other overlay —
+    /// opening it from ControlCenter replaces that panel rather than layering
+    /// on top of it, and Escape goes to Home.
+    #[test]
+    fn opening_settings_replaces_control_center_and_escape_returns_to_home() {
+        let mut s = SurfaceState::default();
+        s.open(Overlay::ControlCenter);
+        s.open(Overlay::Settings);
+        assert_eq!(s.overlay(), Some(Overlay::Settings));
+        s.close();
+        assert_eq!(s.overlay(), None);
     }
 
     #[test]

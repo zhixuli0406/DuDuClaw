@@ -749,3 +749,365 @@ own background poll, and the separate test process) without interference.
   unconfirmed (only that the underlying `is_app_running` state driving it
   is correct — `home/running_windows.rs`'s own test module).
 - **Not committed** — per this task's instructions.
+
+## WM-3 shell-side migration: menu bar / dock / desktop / overlay onto layer-shell (2026-08-23)
+
+`duduclaw-comp`'s own WM-3 round (`crates/duduclaw-comp/BUILD.md`) shipped a
+real `zwlr_layer_shell_v1` compositor implementation and explicitly left this
+crate's migration as a documented gap: *"The shell still does not use
+layer-shell... What the shell has to do later: create one
+`zwlr_layer_surface_v1` per chrome element on the `top` layer, anchor it,
+`set_exclusive_zone(30)` / `(90)`..."* This section is that migration
+(`src/chrome/`), plus what is spike-verified vs. what still needs a live
+compositor round to confirm.
+
+### Spike findings (verified by reading the pinned gpui rev's own source,
+### `~/.cargo/git/checkouts/zed-a70e2ad075855582/7a7c3e1` — not yet exercised
+### against a real compositor by THIS round)
+
+1. **`gpui::WindowKind::LayerShell(LayerShellOptions)` exists and is real** —
+   `crates/gpui/src/platform.rs`, gated
+   `#[cfg(all(target_os = "linux", feature = "wayland"))]`. `LayerShellOptions`
+   (`namespace`/`layer`/`anchor`/`exclusive_zone`/`exclusive_edge`/`margin`/
+   `keyboard_interactivity`) and its enums (`Layer`, `Anchor` — a bitflags
+   type — `KeyboardInteractivity`) live in `crates/gpui/src/platform/
+   layer_shell.rs` and are **not** cfg-gated themselves (only the `WindowKind`
+   *variant* that carries them is), so `chrome/params.rs` still defines its
+   OWN gpui-free mirror types (`ChromeLayer`/`ChromeAnchor`/
+   `ChromeKeyboardInteractivity`) rather than reusing gpui's directly — the
+   task brief for this round asked for the pure/testable half to stay
+   gpui-free so it compiles and unit-tests on macOS too, and only
+   `chrome/gpui_bridge.rs` (Linux-only) converts one into the other.
+   `crates/gpui_linux/src/linux/wayland/window.rs:151` onward really calls
+   `zwlr_layer_shell_v1.get_layer_surface` + `set_size`/`set_anchor`/
+   `set_keyboard_interactivity`/`set_margin`/`set_exclusive_zone`, matching
+   the earlier spike round's own finding.
+2. **`exclusive_zone: Some(px(-1.))` is safe and means what the protocol says
+   it means.** `gpui_linux/src/linux/wayland/window.rs:184`:
+   `layer_surface.set_exclusive_zone(f32::from(exclusive_zone) as i32)` — a
+   plain `as i32` cast, no clamp, no `.max(0)`. `px(-1.)` therefore reaches
+   the compositor as a literal `-1`, the wlr-layer-shell protocol's own
+   escape hatch ("give me the whole output, don't shrink me for other
+   surfaces' exclusive zones"). Used by the `Home` background surface's
+   `LayerParams::exclusive_zone` (`chrome/params.rs`) — the desktop must
+   always fill the entire output regardless of what the menu bar/dock/
+   overlay are doing.
+3. **A runtime setter exists for exclusive zone, and it's safe on every
+   platform.** `gpui::Window::set_exclusive_zone(&self, zone: Pixels)`
+   (`crates/gpui/src/window.rs:2124`) calls through to
+   `PlatformWindow::set_exclusive_zone`, whose TRAIT DEFAULT is an empty
+   no-op body (`crates/gpui/src/platform.rs:903`) — so calling it
+   unconditionally, on macOS or on a `SingleFullscreen` fallback window, is a
+   silent no-op, never a panic, never needs a `#[cfg]` guard. This is what
+   lets the menu bar/dock windows stay OPEN through OOBE and the lock screen
+   rather than being destroyed and recreated — see `chrome/mod.rs`'s own
+   header comment for the full reasoning (`should_hide_chrome_bars` in
+   `chrome/windows.rs` toggles this at render time instead).
+4. **`cx.open_window(...)` returns `Err(LayerShellNotSupportedError)`** when
+   the compositor doesn't advertise `zwlr_layer_shell_v1` at all
+   (`crates/gpui/src/platform/layer_shell.rs`'s own doc comment). This
+   crate's B-② round above already recorded that **weston's headless
+   backend** (`weston --backend=headless-backend.so`, the exact host this
+   file's earlier verification rounds used) does not implement
+   wlr-layer-shell — so the degrade path this round adds
+   (`chrome::windows::boot_windows`, falling all the way back to the
+   original `SingleFullscreen` single-toplevel window) is not a
+   theoretical/paranoid branch, it is the CONFIRMED behavior the very next
+   `cargo test`/live-run round against this file's existing weston harness
+   will exercise for real.
+
+### What changed
+
+- **`src/chrome/params.rs`** (new, cross-platform, unit-tested) —
+  `ChromeSurface` (`MenuBar`/`Dock`/`Home`/`Overlay(crate::surface::
+  Overlay)`), the gpui-free `ChromeLayer`/`ChromeAnchor`/
+  `ChromeKeyboardInteractivity` mirror types, `LayerParams` +
+  `layer_params_for(surface)` (the one place that knows every surface's
+  namespace/layer/anchor/exclusive-zone/keyboard-interactivity), `ChromeMode`
+  (`LayerSurfaces`/`SingleFullscreen`) + `desired_chrome_mode(is_linux,
+  env)` (pure — takes `cfg!(target_os = "linux")` and the raw
+  `DUDUCLAW_SHELL_NO_LAYER_SHELL` env value as plain parameters, same
+  "read the env once at the call site, decide in a pure fn" convention
+  `Overlay::from_debug_env` already established). 10 unit tests.
+- **`src/chrome/mod.rs`** (new, cross-platform) — module doc for the whole
+  design, `SHELL_APP_ID` constant (single source for the `app_id` string
+  every window this crate opens declares — was a literal at each call site
+  before), `active_mode()`/`set_active_mode()` (a `OnceLock<ChromeMode>` —
+  read by `main.rs`'s `settle_launcher_query` to decide whether it can
+  focus the Launcher's search field directly).
+- **`src/chrome/gpui_bridge.rs`** (new, `#[cfg(target_os = "linux")]`) —
+  converts `LayerParams` → real `gpui::WindowOptions` carrying a
+  `WindowKind::LayerShell(_)`. 1 unit test (structural: every
+  `ChromeSurface` converts to the right `WindowKind`/`app_id`/
+  `window_background`; no compositor involved).
+- **`src/chrome/windows.rs`** (new, `#[cfg(target_os = "linux")]`) — the
+  actual gpui window orchestration:
+  - `SurfaceView`: the thin per-window root view for `ChromeMode::
+    LayerSurfaces`. Holds `kind: ChromeSurface` + `shared: Entity<ShellView>`
+    (the SAME entity every window shares — see below); its `Render::render`
+    dispatches to `render_surface_content`, which reads/renders a SLICE of
+    the shared state via `shared.update(cx, |shell, shell_cx| ...)`.
+  - `boot_windows(cx, shared)`: the one entry point `main.rs` calls on
+    Linux. Attempts `try_open_layer_surfaces` (menu bar → dock → desktop,
+    all-or-nothing: any failure tears down whatever already opened and
+    falls back), records the final mode via `chrome::set_active_mode`
+    exactly once.
+  - `SurfaceView::reconcile_overlay_window` (called from the `Home`
+    instance's own render pass only): compares the shared `SurfaceState::
+    overlay()` against whichever overlay window (if any) is currently open
+    and opens/closes a window to match — see "Overlay window reconciliation"
+    below for why this is reactive rather than wired into every
+    `SurfaceState::open()` call site.
+  - `should_hide_chrome_bars`: `true` while OOBE is active or the lock
+    screen is up — the menu bar/dock windows render nothing and zero their
+    exclusive zone in that state (see spike finding 3 above).
+
+### Sharing one `ShellView` across up to four windows
+
+`main.rs`'s `fn main()` now builds `shared_state: Entity<ShellView>` ONCE,
+before any window opens (moved out of `cx.open_window`'s builder closure,
+where it used to live — every `::new(cx)` call that used to run there only
+ever needed `&mut App`, never a live `Window`, so this is behavior-preserving
+on the `SingleFullscreen` path). `ChromeMode::SingleFullscreen` then uses
+this SAME entity directly as its one window's root view
+(`cx.open_window(options, move |_window, _cx| shared_state.clone())`);
+`ChromeMode::LayerSurfaces` wraps it with up to four `SurfaceView`s instead —
+never a second copy of the state either way.
+
+This is safe specifically because `gpui::Context<T>::listener(...)` (used
+throughout `ShellView`'s existing click/action handlers, none of which this
+round modified) produces a closure that captures only a WEAK reference to
+the `ShellView` ENTITY, not any particular window — verified by reading its
+definition (`crates/gpui/src/app/context.rs:252`): at invocation time it is
+handed whichever `Window`/`App` the triggering event actually arrived on. An
+action listener built while `chrome::windows::render_overlay_content` is
+rendering the Overlay window works identically when it fires from a click
+inside THAT window; the same listener-construction code, if it ran while
+rendering the Home window instead, would work identically there. No listener
+needs to "know" which window it will run in.
+
+Every `SurfaceView` observes the shared entity once at construction
+(`cx.observe(&shared, |_, _, cx| cx.notify()).detach()`), so a `cx.notify()`
+anywhere in `ShellView`'s existing methods (locking, completing OOBE,
+opening/closing an overlay, toggling a ControlCenter switch, ...) schedules a
+re-render of EVERY open chrome window, not just whichever one happens to
+also be the window the triggering event arrived on.
+
+### Overlay window reconciliation — why reactive, not wired into every call site
+
+`crate::surface::SurfaceState` (`src/surface.rs`, untouched by this round)
+already tracks "which overlay, if any, is open," and its handful of mutation
+call sites are scattered across `home.rs`/`home_dock.rs`/`overlay/*.rs` —
+most of which are out of this round's editing scope (a SEPARATE agent owns
+`overlay/**` on this task). Rather than teach every `view.surface.open(...)`
+call site to also open/close a gpui window, `SurfaceView::render`
+reconciles the overlay window reactively — but only from the `Home`
+instance's own render pass, since Home is the one window guaranteed to
+exist for the whole `LayerSurfaces` session and to re-render on every
+shared-state change. This mirrors an existing convention in this crate:
+`home_dock::dock()` already dispatches a background poll
+(`schedule_running_windows_poll`) as a side effect of its own render
+pass — side-effecting work from inside `render()` is not new here.
+
+One real consequence: `ShellView::settle_launcher_query` (`main.rs`) can no
+longer unconditionally focus the Launcher's search field on the OPEN path.
+In `LayerSurfaces` mode the overlay window is created ASYNCHRONOUSLY by the
+reconciler above, AFTER `settle_launcher_query` returns — so at the moment
+it runs, `window` names whichever OTHER window the click/keystroke that
+opened the Launcher actually arrived on (typically Home), and focusing the
+search field's handle against that window would silently do nothing (no
+matching dispatch node there). `settle_launcher_query` now checks
+`chrome::active_mode()` and, on the open path in `LayerSurfaces` mode,
+leaves the focus call to the overlay window's own construction
+(`chrome::windows::open_overlay_window`, which focuses the Launcher's search
+field or the shared root handle depending on which overlay was opened) —
+`SingleFullscreen` mode is completely unaffected (there is only ever one
+window, so the original direct-focus behavior is unchanged).
+
+### Menu bar / dock parameters actually written into code
+
+| Surface | namespace | layer | anchor | exclusive_zone | keyboard_interactivity | height |
+|---|---|---|---|---|---|---|
+| Menu bar | `duduclaw-shell-menubar` | `Top` | `TOP\|LEFT\|RIGHT` | `Some(30.0)` (`0.0` while hidden) | `None` | 30.0 |
+| Dock | `duduclaw-shell-dock` | `Top` | `BOTTOM\|LEFT\|RIGHT` | `Some(90.0)` (`0.0` while hidden) | `None` | 90.0 |
+| Home (desktop) | `duduclaw-shell-home` | `Background` | `TOP\|BOTTOM\|LEFT\|RIGHT` | `Some(-1.0)` | `OnDemand` | 900.0 (placeholder) |
+| Overlay (any) | `duduclaw-shell-overlay` | `Overlay` | `TOP\|BOTTOM\|LEFT\|RIGHT` | `None` | `Exclusive` | 900.0 (placeholder) |
+
+30/90 match comp's own WM-1 `DEFAULT_RESERVED_TOP`/`_BOTTOM` exactly (see
+comp's BUILD.md WM-3 section, "90 bottom / 30 top, the unmigrated shell's own
+chrome"). No `exclusive_edge` is ever set (`None` in every case) — every
+surface above anchors either one edge plus both perpendicular edges (never a
+bare corner), so the exclusive edge is unambiguous from `anchor` alone per
+the wlr-layer-shell protocol. No `margin` is ever set either — this crate's
+chrome sits flush against its anchored edges. `window_background` is
+`Transparent` on every layer-shell window (matches gpui's own
+`examples/layer_shell.rs`).
+
+**`keyboard_interactivity: Exclusive` on the overlay is a forward
+declaration, not yet honoured end-to-end**: comp's own WM-3 "Known
+limitations" section states it currently treats `Exclusive` the same as
+`OnDemand` ("gets focus when clicked, does not lock keyboard away from
+windows"). Requesting the protocol-correct value costs nothing today and is
+what comp should honour once it implements real exclusive semantics —
+recorded here so nobody mistakes today's degraded behavior for a shell-side
+bug.
+
+### Degradation path — and how to verify it
+
+`chrome::windows::boot_windows` always attempts `try_open_layer_surfaces`
+first on Linux (unless `DUDUCLAW_SHELL_NO_LAYER_SHELL=1`), and on ANY
+failure — the realistic one being the very first `cx.open_window` call
+returning `Err(LayerShellNotSupportedError)` — tears down whatever already
+opened and calls the exact same `SingleFullscreen`-path code the
+`#[cfg(not(target_os = "linux"))]` branch in `main.rs` uses (same
+`WindowOptions`, same `Entity<ShellView>` reused as root view directly, same
+post-open focus call), so the fallback is this crate's ORIGINAL, unmodified
+single-window behavior — zero visual regression by construction, not by
+inspection.
+
+**How to verify** (next round, not yet run by this one): re-run this file's
+own weston harness (`weston --backend=headless-backend.so`, B-② section
+above) — since that backend does not implement wlr-layer-shell, `duduclaw-
+shell` should log `[chrome] layer-shell unavailable (...); degrading to a
+single fullscreen window` and then behave EXACTLY as B-②'s existing evidence
+already shows (one window, `overlay=None`/`Some(Launcher)` toggling on
+cmd-k, etc.). Separately, `DUDUCLAW_SHELL_NO_LAYER_SHELL=1` against a
+compositor that DOES support layer-shell (the four-layer stack this file's
+WP-comp-shell-ipc section already used — `duduclaw-comp` on top of weston)
+should produce the identical single-window log/behavior, proving the env
+override works independently of compositor support.
+
+### Honest limitations (this round)
+
+- **Nothing in this section has been run against a real (or headless)
+  Wayland compositor yet.** Every claim above is either (a) read directly
+  from the pinned gpui rev's own source (cited with exact file:line), or
+  (b) a `cargo test`-level unit test of pure logic (`chrome/params.rs`,
+  `chrome/gpui_bridge.rs`) — no `cx.open_window(WindowKind::LayerShell(_))`
+  call in this crate has actually executed. The very next round should run
+  this file's existing weston/`duduclaw-comp` harnesses against the new
+  code, exactly as the "how to verify" subsection above describes.
+- **Compile/clippy/test have NOT been run for this round** — per this
+  task's instructions (verification is done centrally, serially, by the
+  orchestrating session, specifically because several agents are editing
+  `crates/duduclaw-shell` concurrently this round and a background `cargo
+  build` from one agent would race another's). The field list in `main.rs`'s
+  `cx.new(|cx| ShellView { ... })` construction (moved, not rewritten, by
+  this round) was hand-matched against the struct definition at the moment
+  this round finished, but at least two OTHER concurrent rounds were adding
+  fields to `ShellView` (`FocusNext`/`FocusPrev` + `on_focus_next`/
+  `on_focus_prev`/`cycle_oobe_focus`/`oobe_focus_handle`; a `settings_ui`/
+  `settings_fields` pair for a new 系統設定 overlay) while this round was in
+  progress — a real risk of the construction site and the struct definition
+  having drifted again by the time this file is actually compiled.
+- **The overlay window's focus-on-open path is unverified.**
+  `chrome::windows::open_overlay_window` focuses the Launcher's search field
+  (or the shared root handle for every other overlay) at window-construction
+  time — reasoned through against gpui's own `Context::listener`/
+  `Entity::update`/`WindowHandle::update` signatures (all cited above with
+  exact file:line), never run.
+- **What happens to Wayland-level (not just gpui-internal) keyboard focus
+  when the overlay window closes is unverified and possibly a real gap.**
+  `SurfaceView::reconcile_overlay_window` destroys the overlay window and
+  the Home window's own `boot_windows`-time focus call is never repeated —
+  whether the compositor automatically hands keyboard focus back to Home
+  after an on-demand layer surface with `Exclusive` (degraded to `OnDemand`
+  on comp today, see above) is destroyed is a COMPOSITOR policy question
+  this round has no evidence for either way.
+- **DPI scaling, HiDPI, and multi-output behavior are untested** for every
+  new window kind — same gap this file's existing sections already flag for
+  the pre-WM-3 single window.
+- **The `DUDUCLAW_SHELL_DEBUG_SURFACE=launcher` headless-smoke hook's
+  behavior differs slightly by mode, by design**: in `SingleFullscreen` mode
+  it still calls `settle_launcher_query` directly (byte-identical to
+  before); in `LayerSurfaces` mode it opens the overlay via `shared_state.
+  update(...)` and relies on the reconciler + `open_overlay_window`'s own
+  focus call to finish the job on Home's next render pass — untested end to
+  end (see "Overlay window reconciliation" above).
+- **Not committed** — per this task's instructions.
+
+## gpui upstream finding: destroying a layer-shell window kills the keyboard
+
+**Status: confirmed defect in the pinned rev's source; exact trigger in our
+sequence NOT proven.** Recorded here so the workaround below is never
+"cleaned up" by someone who has not hit it.
+
+### Symptom (appliance VM, real udev compositor)
+
+After this client destroys **any** `zwlr_layer_shell_v1` window, it stops
+dispatching key events entirely — until a mouse click, which restores them.
+Not lock-screen specific: opening the Launcher and closing it again with
+Escape is enough.
+
+Measured with `DUDUCLAW_SHELL_DIAG=1`:
+
+* before the teardown, keys dispatch normally (`[action] LockScreenNow fired`);
+* after it, the root element's key probe logs **nothing at all** for further
+  keypresses (probe count frozen);
+* `duduclaw-comp` meanwhile logs keyboard focus **unchanged and correct**
+  (`focus already held … held_id=wl_surface@18`, the desktop surface — the
+  destroyed surfaces were `@77`/`@111`/`@164`). So the compositor keeps
+  delivering to a surface the client has stopped listening on.
+
+Ruled out first, each by direct experiment: the layer migration itself
+(`DUDUCLAW_SHELL_NO_LAYER_SHELL=1` behaves identically), the compositor's
+focus bookkeeping (above), the IME (`pkill fcitx5` changes nothing), and the
+keymap (the probe shows `Keystroke { key: "a", key_char: Some("a") }`
+arriving intact while it still worked).
+
+### Source reading (`~/.cargo/git/checkouts/zed-a70e2ad075855582/7a7c3e1`)
+
+`crates/gpui_linux/src/linux/wayland/client.rs`:
+
+* **`wl_keyboard::Event::Leave` (line ~1739)** clears focus
+  **unconditionally**:
+  ```rust
+  wl_keyboard::Event::Leave { surface, .. } => {
+      let keyboard_focused_window = get_window(&mut state, &surface.id());
+      state.keyboard_focused_window = None;   // <-- no check that `surface`
+                                              //     is the focused one
+  ```
+  A `leave` for *any* surface therefore drops the client's keyboard focus,
+  including when a different surface still legitimately holds it. This is a
+  real defect independent of our usage.
+* **`wl_keyboard::Event::Enter` (line ~1730)** sets
+  `keyboard_focused_window = get_window(&surface.id())`, so focus can only be
+  restored by a fresh `enter` naming a surface still present in
+  `state.windows`.
+* **`drop_window` (line ~571)** looks correct on its own: it preserves
+  `keyboard_focused_window` unless the closed window *is* the focused one
+  (`ptr_eq` guard).
+
+### Honest gap
+
+The `Leave` defect is confirmed by reading; what is **not** proven is that
+our teardown actually produces such a `leave` (the destroyed bars carry
+`KeyboardInteractivity::None` and never held focus). Two compositor-side
+fixes aimed at that theory were tried and did **not** help — re-asserting
+focus with an explicit `leave`+`enter` pair, and re-focusing the surviving
+window from the client — so the mechanism may be a third thing in the same
+teardown path. Both attempts were reverted rather than left in as inert
+churn.
+
+### Minimal reproduction (for an upstream report)
+
+1. Wayland compositor supporting `zwlr_layer_shell_v1`.
+2. gpui client opens two layer-shell windows, A (`OnDemand`, holds keyboard
+   focus) and B (`None`, never focused).
+3. Type into A — key events dispatch.
+4. `remove_window()` on **B**.
+5. Type into A again — no key events dispatch. A mouse click restores them.
+
+### What we do instead
+
+`chrome/windows.rs` never destroys a chrome bar. Hiding is
+`apply_bar_visibility`: empty input region + 1×1 + zero exclusive zone. See
+that function and `reconcile_chrome_bars` for why the two earlier approaches
+(full-size-but-empty, and destroy) each failed.
+
+The Launcher overlay is still destroyed on close and therefore still hits
+this bug — it is created with `KeyboardInteractivity::Exclusive`, and gpui
+exposes no runtime setter for that (`set_keyboard_interactivity` is
+creation-only, `gpui_linux/.../window.rs:170`), so keeping it mapped would
+steal the keyboard permanently. Fixing that needs either an upstream gpui
+change or a different overlay design; tracked as D9-bug.

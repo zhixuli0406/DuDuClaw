@@ -84,38 +84,194 @@
 
 mod apps;
 mod audio;
+// WM-3 layer-shell migration (2026-08-23) — see this module's own header
+// comment for the whole design; `chrome::windows` (Linux-only) is what
+// `main()` calls into below instead of opening a single window directly.
+mod chrome;
 mod comp_client;
 mod fake_data;
 mod gateway_client;
+/// A1 (2026-08-23) — the Super+K global-task-bar trigger feed. Pure state
+/// machine; the compositor owns the hotkey and this polls for what it saw.
+mod global_task;
 mod home;
 mod i18n;
 mod icons;
 mod lockscreen;
+/// D6 (2026-08-23): the shell's own `org.freedesktop.Notifications` daemon —
+/// see its module doc for why the shell serves this itself rather than the
+/// image shipping mako/dunst.
+mod notifyd;
 mod oobe;
 mod overlay;
 mod palette;
+/// D4b (2026-08-23) — 系統設定, the settings application. A crate-root
+/// module with its own directory (one file per page) rather than a fifth
+/// file under `overlay/`: it is an app, not a panel. It renders AS an
+/// overlay (`surface::Overlay::Settings`), which is the whole of its
+/// relationship to that module.
+mod settings;
 mod surface;
 
 use gpui::{
-    actions, div, prelude::*, px, size, App, Bounds, Context, FocusHandle, Focusable, KeyBinding, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, Render, Window, WindowBounds, WindowOptions,
+    actions, div, prelude::*, App, Context, FocusHandle, Focusable, KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, Render,
+    Window,
 };
+// WM-3: `px`/`size`/`Bounds`/`WindowBounds`/`WindowOptions` are now used
+// ONLY by the `ChromeMode::SingleFullscreen` fallback window (`fn main`'s
+// `#[cfg(not(target_os = "linux"))]` block) — every layer-shell window's
+// own `WindowOptions`/bounds are built in `chrome::gpui_bridge` instead.
+// Split into their own `#[cfg]`-gated `use` so a Linux build (which never
+// compiles that block) doesn't warn on five unused imports.
+#[cfg(not(target_os = "linux"))]
+use gpui::{px, size, Bounds, WindowBounds, WindowOptions};
 use gpui_platform::application;
 
 use duduclaw_native_gui::theme;
 
 use surface::{Overlay, SurfaceState};
 
-actions!(duduclaw_shell, [ToggleLauncher, CloseOverlay, OobeNext, LockScreenNow]);
+// `FocusNext`/`FocusPrev` (WP-oobe-tab, 2026-08-23): Tab/Shift-Tab focus
+// cycling between an OOBE step's own text fields (see `oobe/focus_order.rs`'s
+// own header comment for the pure decision behind them) — bound globally,
+// same shape `OobeNext` already establishes, with the OOBE-only guard living
+// in the handler body (`on_focus_next`/`on_focus_prev` below), not in the
+// binding itself. Harmless outside OOBE: nothing else in this crate's
+// `ImeTextInput::on_key_down` match arms does anything with a raw "tab"
+// keystroke today (see that file's own match list), so claiming the
+// keybinding globally removes no existing behavior.
+actions!(duduclaw_shell, [ToggleLauncher, CloseOverlay, OobeNext, LockScreenNow, FocusNext, FocusPrev]);
 
 /// Diagnostic gate (`DUDUCLAW_SHELL_DIAG=1`). Kept permanently: this
 /// layer-splitting toolkit (in-app keystroke dispatch, raw OS input probes,
 /// bounds probes, hit/action/render logs) is what root-caused the
 /// "overlay laid out one window-height offscreen" bug after three
 /// screen-never-changes reports — cheap to keep, expensive to rebuild.
+/// A1 (2026-08-23): the ONE long-lived loop that drains comp's global-hotkey
+/// intent queue. Started exactly once per process, from `run`.
+///
+/// ## Why not on the render pass (the P0 this replaced)
+///
+/// The first cut called this from `ShellView::render_root`, following the
+/// convention `home_dock.rs` established for the dock's own comp poll. That
+/// works there and does NOT work here, and the difference is the whole
+/// point of the chrome migration: before it, ONE window drew everything, and
+/// the menu bar's live clock guaranteed a repaint every second, so a
+/// render-gated poll effectively ran on a timer. Now the clock lives in its
+/// OWN window — an idle Home surface can go arbitrarily long without a
+/// single render pass, so the poll simply stopped running.
+///
+/// Measured on the appliance VM: two Super+K presses left
+/// `{"ok":true,"intents":["global_task_bar","global_task_bar"]}` sitting
+/// unread in comp's queue. Compositor side perfect, shell side never asked.
+///
+/// This loop is started once and re-arms itself, which is exactly the shape
+/// `home_dock.rs` warns against — but that warning is about spawning a timer
+/// *per render pass* (the WP-A4-4 CPU-burn incident), where the count grows
+/// without bound. One loop for the process's lifetime is the intended
+/// alternative, not a violation of it.
+///
+/// Acting on an intent still happens on the render pass
+/// (`settle_global_task_intents`), because opening the task bar needs a real
+/// `&mut Window`. This loop only fills the queue and calls `cx.notify()`,
+/// which wakes every chrome window — including Home — so the settle runs.
+fn spawn_global_task_poll_loop(shared: gpui::Entity<ShellView>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            // `read_with`/`update` on an `AsyncApp` return the closure's value
+            // directly at this gpui rev (they are infallible here — `shared`
+            // is the process-lifetime shell entity, created in `run` and
+            // never dropped while this loop exists).
+            let wait = shared.read_with(cx, |view, _| view.global_task.interval());
+            cx.background_executor().timer(wait).await;
+
+            // Not due yet / already in flight — neither can happen with a
+            // single loop, but `begin_poll` is the single-flight authority
+            // and this defers to it rather than assuming.
+            if !shared.update(cx, |view, _| view.global_task.begin_poll()) {
+                continue;
+            }
+
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { comp_client::take_shell_intents() })
+                .await;
+
+            let updated = shared.update(cx, |view, view_cx| match outcome {
+                Ok(intents) => {
+                    let got = !intents.is_empty();
+                    view.global_task.apply_ok(intents);
+                    if got {
+                        // Wake every chrome window so Home's render pass runs
+                        // `settle_global_task_intents`. Deliberately NOT
+                        // called on the (overwhelmingly common) empty answer:
+                        // nothing drawn changed, and notifying on every poll
+                        // would repaint the whole shell five times a second.
+                        view_cx.notify();
+                    }
+                    true
+                }
+                // `Comp(_)` means the call REACHED comp and comp refused it —
+                // a build without this op. Asking again cannot change that,
+                // so stop asking for the rest of the session. Every other
+                // error is "comp isn't reachable right now", which is
+                // recoverable and only backs the cadence off.
+                Err(comp_client::CompClientError::Comp(e)) => {
+                    eprintln!("[global_task] comp has no take_shell_intents op ({e}) — Super+K disabled for this session");
+                    view.global_task.give_up();
+                    false
+                }
+                Err(e) => {
+                    if diag_enabled() {
+                        eprintln!("[global_task] poll failed: {e}");
+                    }
+                    view.global_task.apply_err();
+                    true
+                }
+            });
+
+            // `give_up` fired: this loop has nothing left to do and must not
+            // spin for the rest of the session.
+            if !updated {
+                return;
+            }
+        }
+    })
+    .detach();
+}
+
 pub(crate) fn diag_enabled() -> bool {
     static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DIAG.get_or_init(|| std::env::var("DUDUCLAW_SHELL_DIAG").is_ok_and(|v| v == "1"))
+}
+
+/// D2 (2026-08-23): tell the compositor which palette to draw its
+/// server-side window decorations in.
+///
+/// Fire-and-forget on a detached thread, for the reason `comp_client`'s own
+/// module doc spells out: every call in that client is PLAIN BLOCKING, and
+/// this one is invoked from gpui's main thread at boot and at OOBE
+/// completion. A 3-second socket timeout on the UI thread would be a
+/// visible stall; a theme that fails to propagate is a cosmetic mismatch on
+/// window frames. The failure is logged, never surfaced — the operator
+/// cannot act on "the compositor isn't listening", and on the macOS dev
+/// loop there is no compositor by design.
+///
+/// Deliberately NOT retried: comp keeps the value once it lands, and the
+/// next theme change (or the next shell start) sends it again anyway.
+pub(crate) fn notify_comp_theme(theme: oobe::ThemeChoice) {
+    let wire = match theme {
+        oobe::ThemeChoice::Dark => comp_client::THEME_DARK,
+        oobe::ThemeChoice::Light => comp_client::THEME_LIGHT,
+    };
+    std::thread::spawn(move || match comp_client::set_theme(wire) {
+        Ok(()) => {
+            if diag_enabled() {
+                eprintln!("[theme] comp accepted set_theme({wire})");
+            }
+        }
+        Err(e) => eprintln!("[theme] comp set_theme({wire}) failed (decorations keep their previous palette): {e}"),
+    });
 }
 
 /// DIAG-gated absolute full-size canvas that logs its laid-out bounds at
@@ -160,6 +316,19 @@ pub struct ShellView {
     /// away from fields other work packages own. See
     /// `overlay::pointer_settings::PointerUiState`'s own doc comment.
     pub(crate) pointer_ui: overlay::pointer_settings::PointerUiState,
+    /// D4b (2026-08-23) — the 系統設定 app's seven pages' state (selected
+    /// category plus each page's own `Load`/in-flight machinery). A sibling
+    /// field for exactly the reason `audio_ui`/`pointer_ui` above are: it is
+    /// this work package's own state, and keeping it out of
+    /// `OverlayUiState`'s body keeps the diff away from fields other
+    /// packages own. See `settings::SettingsUiState`'s doc comment.
+    pub(crate) settings_ui: settings::SettingsUiState,
+    /// D4b — the settings app's eight `Entity<OobeTextField>`s, created once
+    /// at window-open time, same precedent `oobe_account_fields`/
+    /// `lockscreen_password_field` establish. Reached through
+    /// `oobe::SettingsFields` purely because `OobeTextField::new` is private
+    /// to that module; nothing here is part of the OOBE flow.
+    pub(crate) settings_fields: oobe::SettingsFields,
     /// Shell-S4-lock (2026-08-22) — the lock-screen surface's own runtime
     /// state (locked?/since-when/idle clock). `Some(&self.lockscreen)` never
     /// exists standalone the way `oobe: Option<...>` does: locking is a
@@ -181,6 +350,13 @@ pub struct ShellView {
     /// establishes for approvals — see `home::running_windows::
     /// RunningWindowsFeed`'s own header comment.
     pub(crate) running_windows: home::running_windows::RunningWindowsFeed,
+    /// A1 (2026-08-23) — Super+K's trigger queue, polled from comp.
+    ///
+    /// Not rendered by anything: this feed's entire output is "did the
+    /// operator ask for the task bar", consumed and cleared in the same
+    /// render pass that observes it. See `global_task` for why the trigger
+    /// is a poll rather than a push, and for the latency that costs.
+    pub(crate) global_task: global_task::GlobalTaskIntentFeed,
     /// APP-1 (2026-08-22) — the REAL list of applications installed on this
     /// machine (`flatpak list` + the XDG `.desktop` directories, merged),
     /// scanned on a cadence off the render thread. Read by BOTH the dock
@@ -192,6 +368,20 @@ pub struct ShellView {
     /// surfaces used to render (five of whose entries had no app behind
     /// them at all).
     pub(crate) installed_apps: apps::feed::InstalledAppsFeed,
+    /// D6 (2026-08-23) — the transport half of this shell's own
+    /// `org.freedesktop.Notifications` daemon: the shared inbox the D-Bus
+    /// handlers write into, plus the handle to the thread that owns the bus
+    /// name. See `notifyd`'s module doc for the whole design, and
+    /// `notifyd::NotifyRuntime` for why this field carries no `#[cfg]`
+    /// despite being a no-op on the macOS dev loop.
+    pub(crate) notify_runtime: notifyd::NotifyRuntime,
+    /// D6 (2026-08-23) — the notification-center store the 通知中心 panel
+    /// renders (third-party app notifications, as opposed to `overlay_ui.
+    /// notifications`, which is the gateway's approval feed). Deliberately a
+    /// SEPARATE field from `notify_runtime` rather than a member of it:
+    /// draining takes `&mut` on both at once, and disjoint fields is what
+    /// makes that a plain borrow instead of a dance.
+    pub(crate) notify_center: notifyd::center::NotificationCenter,
     /// WP-lock-pw (2026-08-22) — the lockscreen's real password-entry
     /// `Entity<OobeTextField>`, same "created once, unconditionally, at
     /// window-open time" precedent `oobe_account_fields`/`oobe_network_fields`
@@ -299,7 +489,27 @@ impl ShellView {
     pub(crate) fn settle_launcher_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.launcher_query_field.field.update(cx, |field, cx| field.clear(cx));
         self.overlay_ui.close_launcher_query();
-        if self.surface.overlay() == Some(Overlay::Launcher) {
+        let opening_launcher = self.surface.overlay() == Some(Overlay::Launcher);
+        // WM-3: in `ChromeMode::LayerSurfaces` the Launcher's search box
+        // renders inside a SEPARATE `duduclaw-shell-overlay` window that
+        // `chrome::windows::SurfaceView::reconcile_overlay_window` creates
+        // ASYNCHRONOUSLY, after this method returns (see that fn's own doc
+        // comment) — so on the OPEN path, `window` here is whichever window
+        // the click/keystroke that opened it actually arrived on (e.g.
+        // Home), not the not-yet-existing overlay window. Focusing the
+        // search field's handle against the WRONG window would silently do
+        // nothing (no matching dispatch node there), so this method leaves
+        // that half to the overlay window's own construction-time focus
+        // call in that case (`chrome::windows::open_overlay_window`) and
+        // only handles it directly — as it always has — in
+        // `SingleFullscreen` mode, where there is only ever one window. The
+        // CLOSE path (`opening_launcher == false`) is unaffected either
+        // way: refocusing `self.focus_handle` on the window this call
+        // actually ran in is correct in both modes.
+        if opening_launcher && chrome::active_mode() == chrome::ChromeMode::LayerSurfaces {
+            return;
+        }
+        if opening_launcher {
             let handle = self.launcher_query_field.field.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
         } else {
@@ -348,6 +558,12 @@ impl ShellView {
         // between, and showing a stale selection would be a claim this
         // surface never verified. Cheap: a no-op when it was never loaded.
         self.pointer_ui.reset();
+        // D4b (2026-08-23): same reasoning, one surface further — closing
+        // ANY overlay drops the settings app's cached backend reads AND
+        // every one of its typed fields, two of which hold passwords. See
+        // `SettingsUiState::reset` / `SettingsFields::clear_all`.
+        self.settings_ui.reset();
+        self.settings_fields.clear_all(cx);
         cx.notify();
     }
 
@@ -385,6 +601,12 @@ impl ShellView {
         // between, and showing a stale selection would be a claim this
         // surface never verified. Cheap: a no-op when it was never loaded.
         self.pointer_ui.reset();
+        // D4b (2026-08-23): same reasoning, one surface further — closing
+        // ANY overlay drops the settings app's cached backend reads AND
+        // every one of its typed fields, two of which hold passwords. See
+        // `SettingsUiState::reset` / `SettingsFields::clear_all`.
+        self.settings_ui.reset();
+        self.settings_fields.clear_all(cx);
         cx.notify();
     }
 
@@ -407,30 +629,67 @@ impl ShellView {
             return;
         }
         self.lockscreen.note_input();
-        // D4a-5 (2026-08-23): read BEFORE the mutable borrow of `self.oobe`
+        // WP-oobe-enter (2026-08-23): the three signals `OobeFlow::enter_
+        // outcome` needs, read BEFORE the mutable borrow of `self.oobe`
         // below — a disjoint-field borrow of `self.oobe_ui`, not a
-        // conflict. Keeps this keyboard path in agreement with `render.rs`'s
-        // Continue-button click handler (same `next_with_wired` call, same
-        // `OobeFlow::can_advance_with_wired` doc comment for why the wired
-        // signal is a separate parameter rather than folded into `can_
-        // advance()`/`next()` themselves).
+        // conflict (same shape the pre-existing `wired_online` read already
+        // used here). See `OobeFlow::enter_outcome`'s own doc comment
+        // (`oobe/state.rs`) for why Enter can no longer just call `next_
+        // with_wired` unconditionally: `AccountCreate`/`Network` gate their
+        // own precondition behind an async submit (帳號建立 / Wi-Fi 連線)
+        // that ONLY their own button used to trigger — Enter reaching just
+        // the generic advance was a silent, indefinite no-op on both steps
+        // whenever that submit hadn't happened yet.
         let wired_online = self.oobe_ui.wired_online();
-        let Some(flow) = self.oobe.as_mut() else {
+        let account_claim_in_flight = self.oobe_ui.account_claim == oobe::AccountClaimState::InFlight;
+        let net_connect_submittable = self.oobe_ui.net_connect.submittable();
+        let Some(outcome) =
+            self.oobe.as_ref().map(|flow| flow.enter_outcome(wired_online, account_claim_in_flight, net_connect_submittable))
+        else {
             return;
         };
-        flow.next_with_wired(wired_online);
-        oobe::save_state(flow.state());
-        if flow.completed() {
-            // Carry the Theme step's pick (if any was made) onto Home in
-            // this SAME process — see `ShellView.theme`'s own doc comment.
-            // Reading `flow.state().selections.theme` here (not `oobe::
-            // boot_theme` again) is deliberate: `boot_theme` is specifically
-            // about the PERSISTED file at boot, whereas this is reading the
-            // in-memory flow's live selection at the exact moment it
-            // transitions to completed — same source `save_state` just
-            // wrote to disk two lines up, so the two never disagree.
-            self.theme = flow.state().selections.theme;
-            self.oobe = None;
+        match outcome {
+            oobe::EnterOutcome::Advance => {
+                let Some(flow) = self.oobe.as_mut() else {
+                    return;
+                };
+                flow.next_with_wired(wired_online);
+                oobe::save_state(flow.state());
+                if flow.completed() {
+                    // Carry the Theme step's pick (if any was made) onto
+                    // Home in this SAME process — see `ShellView.theme`'s
+                    // own doc comment. Reading `flow.state().selections.
+                    // theme` here (not `oobe::boot_theme` again) is
+                    // deliberate: `boot_theme` is specifically about the
+                    // PERSISTED file at boot, whereas this is reading the
+                    // in-memory flow's live selection at the exact moment
+                    // it transitions to completed — same source `save_
+                    // state` just wrote to disk two lines up, so the two
+                    // never disagree.
+                    self.theme = flow.state().selections.theme;
+                    // D2 (2026-08-23): the compositor draws the SERVER-SIDE
+                    // decorations around application windows (title bars,
+                    // borders, shadows, the Alt-Tab switcher). It has no way
+                    // to learn the operator's theme pick on its own, so the
+                    // shell — which is the half that persists it — tells it.
+                    // Fire-and-forget: comp not running (macOS dev loop, or
+                    // a shell started before the compositor) must never
+                    // block or fail OOBE completion.
+                    notify_comp_theme(self.theme);
+                    self.oobe = None;
+                }
+            }
+            // `AccountCreate`/`Network`: trigger that step's own submit
+            // instead — mirrors its button's click exactly (`oobe::
+            // handle_enter_submit` dispatches to `steps::account::
+            // try_submit`/`steps::network::try_submit`, the SAME functions
+            // each button's own `on_click` now calls).
+            oobe::EnterOutcome::SubmitAccount | oobe::EnterOutcome::SubmitNetworkConnect => {
+                oobe::handle_enter_submit(outcome, self, cx);
+            }
+            // Precondition unmet and nothing to submit yet (e.g. no Wi-Fi
+            // row picked) — a legitimate no-op, not a bug.
+            oobe::EnterOutcome::Blocked => {}
         }
         cx.notify();
     }
@@ -452,13 +711,251 @@ impl ShellView {
         }
         lockscreen::render::lock_and_refresh(self, cx);
     }
+
+    /// `tab`'s action handler — see `FocusNext`'s own doc comment (next to
+    /// its `actions!` declaration) for why this is bound globally with the
+    /// OOBE guard living HERE, in the handler, rather than in the binding
+    /// itself — same "always-registered action, self-contained guard" shape
+    /// `on_toggle_launcher`'s own lockscreen check already establishes.
+    /// WP-oobe-tab (2026-08-23): task brief "OOBE 完成後（Home/overlay 狀
+    /// 態）Tab 不該被殼搶走" — `cycle_oobe_focus` below no-ops immediately
+    /// whenever `self.oobe` is `None`.
+    ///
+    /// Wired in **two** places, and both are required: `render_root`'s
+    /// `.on_action(...)` chain (the `SingleFullscreen` chrome mode, and the
+    /// macOS dev loop) and `chrome/windows.rs`'s overlay root (the
+    /// `LayerSurfaces` mode). Binding the keymap in `bind_keys` is
+    /// independent of registering the action LISTENER on the focused root —
+    /// miss the listener and the keystroke is swallowed with no handler,
+    /// which is exactly the failure shape this file's header comment
+    /// documents from an earlier round.
+    fn on_focus_next(&mut self, _action: &FocusNext, window: &mut Window, cx: &mut Context<Self>) {
+        if diag_enabled() {
+            eprintln!("[action] FocusNext fired");
+        }
+        self.cycle_oobe_focus(window, cx, oobe::focus_next);
+    }
+
+    /// `shift-tab`'s action handler — the mirror image of `on_focus_next`.
+    fn on_focus_prev(&mut self, _action: &FocusPrev, window: &mut Window, cx: &mut Context<Self>) {
+        if diag_enabled() {
+            eprintln!("[action] FocusPrev fired");
+        }
+        self.cycle_oobe_focus(window, cx, oobe::focus_prev);
+    }
+
+    /// Shared body for `on_focus_next`/`on_focus_prev` — `step_fn` is
+    /// `oobe::focus_next`/`oobe::focus_prev`, the one pure difference
+    /// between the two directions (see `oobe/focus_order.rs`'s own header
+    /// comment for that pure logic, independently unit-tested there without
+    /// any gpui window). This method is the gpui-facing half: it reads the
+    /// CURRENT step's own focus order, figures out which (if any) of its
+    /// fields presently has keyboard focus by checking each candidate's own
+    /// `FocusHandle::is_focused(window)` directly — no separate "which
+    /// field is focused" bookkeeping on `ShellView` to keep in sync, gpui's
+    /// own focus state IS the source of truth, same principle `render.rs`'s
+    /// own `focused = handle.is_focused(window)` reads already rely on for
+    /// painting the focus ring — then moves focus to whatever `step_fn`
+    /// returns. A step with no focusable field (`oobe::focus_order` empty,
+    /// or `self.oobe` is `None` entirely) is a no-op.
+    fn cycle_oobe_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        step_fn: fn(oobe::OobeStep, Option<oobe::OobeFocusTarget>) -> Option<oobe::OobeFocusTarget>,
+    ) {
+        let Some(step) = self.oobe.as_ref().map(|flow| flow.current()) else {
+            return;
+        };
+        let order = oobe::focus_order(step);
+        if order.is_empty() {
+            return;
+        }
+        let mut current = None;
+        for target in order {
+            if self.oobe_focus_handle(*target, cx).is_focused(window) {
+                current = Some(*target);
+                break;
+            }
+        }
+        let Some(next) = step_fn(step, current) else {
+            return;
+        };
+        let handle = self.oobe_focus_handle(next, cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Resolves one `OobeFocusTarget` to the real `FocusHandle` behind it —
+    /// the ONE place that knows which `ShellView` field owns which target,
+    /// so `cycle_oobe_focus` above never has to. `AccountName`/
+    /// `AccountPassword` come from `self.oobe_account_fields` (created once
+    /// at window-open time, see that field's own doc comment), `NetworkPsk`
+    /// from `self.oobe_network_fields` the same way.
+    fn oobe_focus_handle(&self, target: oobe::OobeFocusTarget, cx: &App) -> FocusHandle {
+        match target {
+            oobe::OobeFocusTarget::AccountName => self.oobe_account_fields.name.read(cx).focus_handle(cx),
+            oobe::OobeFocusTarget::AccountPassword => self.oobe_account_fields.password.read(cx).focus_handle(cx),
+            oobe::OobeFocusTarget::NetworkPsk => self.oobe_network_fields.psk.read(cx).focus_handle(cx),
+        }
+    }
 }
 
-impl Render for ShellView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl ShellView {
+    /// Builds the root element for whichever window is showing OOBE / the
+    /// lock screen / the Home desktop — this is `Render::render`'s ENTIRE
+    /// pre-WM-3 body, extracted so `ChromeMode::SingleFullscreen` (`Render::
+    /// render` below, `single_window: true`) and `ChromeMode::LayerSurfaces`'
+    /// dedicated `duduclaw-shell-home` window (`chrome::windows::
+    /// render_surface_content`'s `ChromeSurface::Home` arm, `single_window:
+    /// false`) share EXACTLY one implementation — see `crate::chrome`'s
+    /// module doc for why visual/behavioral drift between the two modes is
+    /// the one outcome this migration cannot afford.
+    ///
+    /// `single_window: false` skips exactly two things: `home::render`'s
+    /// menu-bar/dock children (separate `duduclaw-shell-menubar`/`-dock`
+    /// layer surfaces in that mode instead — see `home::render_desktop`'s
+    /// own doc comment) and the trailing overlay-render block (the active
+    /// overlay, if any, is a separate `duduclaw-shell-overlay` layer
+    /// surface window instead — see `chrome::windows::SurfaceView::
+    /// reconcile_overlay_window`). Everything else — the diag probes, the
+    /// OOBE branch, the lock-screen branch, every action/key/mouse
+    /// listener, focus tracking, the `theme::app_font()` call — is
+    /// byte-identical in both modes.
+    /// A1 (2026-08-23): act on whatever comp has queued for us.
+    ///
+    /// Reuses `on_toggle_launcher` wholesale rather than re-implementing
+    /// "open the task bar": that handler already carries the lockscreen
+    /// reveal, the OOBE no-op, the query-field focus move and the three
+    /// overlay-state resets, and a second copy of those guards would be a
+    /// place for the two paths to drift. Super+K and ⌘K therefore do
+    /// exactly the same thing by construction — which is also what
+    /// `docs/features/51-os-keyboard-shortcuts.md` tells the operator.
+    fn settle_global_task_intents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.global_task.take_task_bar_request() {
+            return;
+        }
+        if diag_enabled() {
+            eprintln!("[global_task] comp reported Super+K — raising the task bar");
+        }
+        self.on_toggle_launcher(&ToggleLauncher, window, cx);
+    }
+
+    /// D6 (2026-08-23): the ONE task that starts the notification daemon and
+    /// then keeps the notification centre in step with it.
+    ///
+    /// ## Why a self-re-arming loop and not a per-render one-shot
+    ///
+    /// This crate has already paid for the other shape once. WP-A4-4's
+    /// appliance-VM incident (`overlay::notifications::schedule_stale_check`
+    /// carries the full post-mortem) was a timer pile-up: every render armed
+    /// a fresh timer, each firing timer caused a repaint, each repaint armed
+    /// another — pending timers grew for the machine's whole uptime until
+    /// `cage` sat at ~100% CPU on a static screen. So this follows the shape
+    /// that fixed it: claim a single slot (`NotificationCenter::
+    /// try_arm_drain`), then loop internally. Callers may call this from a
+    /// render body as often as they like; every call after the first fails
+    /// the claim and returns immediately.
+    ///
+    /// ## Why it is armed from `render_root` and not from the panel
+    ///
+    /// A notification that only arrives while the operator happens to have
+    /// the panel open is not a notification. `render_root` is the one place
+    /// that renders in every chrome mode and every surface state, so arming
+    /// here means the daemon is up (and the centre is being fed) from the
+    /// first frame, whether or not anything is looking at it.
+    ///
+    /// ## Cost when nothing is happening
+    ///
+    /// One uncontended mutex acquire per `DRAIN_INTERVAL` (250ms) and an
+    /// `Instant` comparison. `cx.notify()` is called ONLY when the data
+    /// actually moved, so an idle machine does zero extra repaints — the
+    /// exact rule WP-A4-4 established ("無變化不 notify").
+    fn schedule_notification_drain(&mut self, cx: &mut Context<Self>) {
+        if !self.notify_center.try_arm_drain() {
+            return;
+        }
+        cx.spawn(async move |weak, cx| {
+            loop {
+                let keep_going = weak.update(cx, |view, cx| {
+                    // Starting is idempotent (see `NotifyRuntime::start`) but
+                    // the first call is what actually spawns the thread —
+                    // deliberately done INSIDE the task, not at construction,
+                    // so a hung session bus can never delay window creation.
+                    let mut changed = if view.notify_runtime.is_started() {
+                        view.notify_center.set_daemon(view.notify_runtime.status())
+                    } else {
+                        let state = view.notify_runtime.start();
+                        view.notify_center.set_daemon(state)
+                    };
+
+                    let now = std::time::Instant::now();
+                    let drained = view.notify_runtime.inbox.drain();
+                    changed |= view.notify_center.apply(drained, now);
+                    changed |= view.notify_center.expire_due(now);
+
+                    // Hand back whatever the last tick's operator actions —
+                    // and this tick's expiries/evictions — owe the bus.
+                    // Emitting is an `mpsc::send`, never a socket write: the
+                    // notifyd thread does the I/O.
+                    let emits = view.notify_center.take_emits();
+                    if !emits.is_empty() {
+                        view.notify_runtime.emit(emits);
+                    }
+
+                    if changed {
+                        // DIAG-gated, because this prints third-party
+                        // content into the operator's own journal: it is the
+                        // one probe that proves a `Notify` call reached the
+                        // UI data model (the live-fire evidence D6's brief
+                        // asks for), and it costs nothing when DIAG is off.
+                        if diag_enabled() {
+                            let cards: Vec<String> = view
+                                .notify_center
+                                .items()
+                                .iter()
+                                .map(|c| {
+                                    let merged = if c.merged > 0 { format!(" (+{} merged)", c.merged) } else { String::new() };
+                                    let acts = if c.actions.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" [{}]", c.actions.iter().map(|a| a.key.as_str()).collect::<Vec<_>>().join(","))
+                                    };
+                                    format!("#{} {}: {}{merged}{acts}", c.id, c.app_name, c.summary)
+                                })
+                                .collect();
+                            eprintln!("[notifyd] centre now holds {} card(s): {}", view.notify_center.len(), cards.join(" | "));
+                        }
+                        cx.notify();
+                    }
+                    true
+                });
+                if keep_going.is_err() {
+                    // The view is gone (window closed) — the slot went with
+                    // it, and dropping `ShellView` drops the daemon handle,
+                    // which releases the bus name.
+                    return;
+                }
+                cx.background_executor().timer(notifyd::center::DRAIN_INTERVAL).await;
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn render_root(&mut self, window: &mut Window, cx: &mut Context<Self>, single_window: bool) -> impl IntoElement {
         if self.diag {
             eprintln!("[render] overlay={:?}", self.surface.overlay());
         }
+        // A1 (2026-08-23): act on anything comp has queued for us. The
+        // POLLING that fills that queue is NOT driven from here — see
+        // `spawn_global_task_poll_loop` for why a render-pass-gated poll was
+        // wrong. This half stays on the render pass because opening the task
+        // bar needs a real `&mut Window`, which only a render pass has.
+        self.settle_global_task_intents(window, cx);
+        // D6 (2026-08-23): starts the `org.freedesktop.Notifications` daemon
+        // on the first pass and keeps the notification centre fed thereafter.
+        // Idempotent by construction — see its own doc comment.
+        self.schedule_notification_drain(cx);
         if self.diag && !self.diag_scheduled {
             self.diag_scheduled = true;
             let handle = self.focus_handle.clone();
@@ -499,6 +996,16 @@ impl Render for ShellView {
             .on_action(cx.listener(Self::on_close_overlay))
             .on_action(cx.listener(Self::on_oobe_next))
             .on_action(cx.listener(Self::on_lock_now))
+            // D9 (2026-08-23): Tab/Shift-Tab field traversal. Registered on
+            // the SAME root element as the four above, for the same reason
+            // this file's header comment gives — and registered in BOTH
+            // chrome modes, so the shortcut does not silently depend on
+            // whether layer surfaces came up (`chrome/windows.rs` carries
+            // the identical pair for the `LayerSurfaces` overlay root).
+            // The handlers self-guard on "is OOBE active", so having them
+            // bound outside OOBE costs nothing and steals no Tab.
+            .on_action(cx.listener(Self::on_focus_next))
+            .on_action(cx.listener(Self::on_focus_prev))
             // Shell-S4-lock: always-on (NOT `self.diag`-gated, unlike the
             // pre-existing raw-input PROBE pair further down — these are
             // two SEPARATE listener registrations on the same element;
@@ -582,13 +1089,24 @@ impl Render for ShellView {
                 self.operator_name.as_deref(),
                 cx,
             ))
-        } else {
+        } else if single_window {
             // WP-comp-shell-ipc: `&self.running_windows` threaded down the
             // same way `&self.overlay_ui.notifications` already is just
             // above — an immutable borrow of one `self` field alongside
             // `cx` (a separate parameter, not a second borrow of `self`),
             // same shape, no conflict.
             root.child(home::render(home_palette, &self.overlay_ui.notifications, &self.running_windows, &self.installed_apps, cx))
+        } else {
+            // WM-3, `ChromeMode::LayerSurfaces`: the menu bar and dock are
+            // separate `duduclaw-shell-menubar`/`-dock` layer surfaces (see
+            // `chrome::windows::render_surface_content`), so this window's
+            // OWN content is everything else — `home::render_desktop`, not
+            // `home::render`. See `home::render_desktop`'s own doc comment.
+            // The function is `home::desktop_content` (its doc comment is
+            // the one this note points at); the call site said
+            // `render_desktop`, which never existed. Corrected 2026-08-23
+            // while wiring D4b — the crate did not compile until it was.
+            root.child(home::desktop_content(home_palette, cx))
         };
         if self.diag {
             root = root
@@ -614,7 +1132,13 @@ impl Render for ShellView {
         // locked()` — `lockscreen::render::lock_and_refresh` already calls
         // `self.surface.close()` on every lock, so in practice this is the
         // same belt-and-suspenders redundancy, not a load-bearing check.
-        if self.oobe.is_none() && !self.lockscreen.is_locked() {
+        //
+        // WM-3: also guarded on `single_window` — in `ChromeMode::
+        // LayerSurfaces` the active overlay (if any) is a separate
+        // `duduclaw-shell-overlay` layer surface window, reconciled by
+        // `chrome::windows::SurfaceView::reconcile_overlay_window`, not a
+        // child appended here.
+        if single_window && self.oobe.is_none() && !self.lockscreen.is_locked() {
             if let Some(active) = self.surface.overlay() {
                 // Backdrop click-to-close — now a real `cx.listener` (round
                 // 1's stub only logged, see that commit's own doc comment
@@ -629,8 +1153,10 @@ impl Render for ShellView {
                     }
                     view.surface.close();
                     view.settle_launcher_query(window, cx);
-                    // See `on_toggle_launcher`'s own note on this call.
+                    // See `on_toggle_launcher`'s own note on these three.
                     view.pointer_ui.reset();
+                    view.settings_ui.reset();
+                    view.settings_fields.clear_all(cx);
                     cx.notify();
                 });
                 root = root.child(overlay::render(
@@ -640,6 +1166,13 @@ impl Render for ShellView {
                     &self.installed_apps,
                     &self.pointer_ui,
                     &self.launcher_query_field,
+                    &self.settings_ui,
+                    &self.settings_fields,
+                    // D6 (2026-08-23): third-party app notifications, drawn
+                    // by the Notifications panel alongside the gateway's
+                    // approval cards. Threaded through exactly the way
+                    // `audio_ui`/`installed_apps` already are.
+                    &self.notify_center,
                     home_palette,
                     on_close,
                     cx,
@@ -647,6 +1180,18 @@ impl Render for ShellView {
             }
         }
         root
+    }
+}
+
+/// WM-3: the `SingleFullscreen` entry point — `ChromeMode::SingleFullscreen`
+/// (macOS always; Linux on `DUDUCLAW_SHELL_NO_LAYER_SHELL=1` or when the
+/// `LayerSurfaces` attempt fails at runtime, see `chrome::windows::
+/// boot_windows`) opens exactly one window with `Entity<ShellView>` as its
+/// root view directly, which is what makes THIS impl the one gpui actually
+/// calls — see `render_root`'s own doc comment for what it does.
+impl Render for ShellView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_root(window, cx, true)
     }
 }
 
@@ -748,7 +1293,14 @@ fn main() {
             Err(e) => eprintln!("[main] add_fonts FAILED (falling back to system font): {e}"),
         }
 
-        let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
+        // WM-3: this crate's fixed dev-mode window size used to be computed
+        // here unconditionally; it is now computed only where it's actually
+        // used (`fallback_window`'s `#[cfg(not(target_os = "linux"))]`
+        // block, further down) — on Linux in `ChromeMode::LayerSurfaces`
+        // there is no single "the window bounds" to speak of (each layer
+        // surface has its own, computed in `chrome::gpui_bridge`), so
+        // keeping this binding unconditional would be a dead, unused `let`
+        // on that path.
 
         // OOBE boot-entry resolution — see `oobe::resolve_boot_flow`'s own
         // doc comment for the exact priority rules (task brief: FORCE_OOBE
@@ -780,65 +1332,128 @@ fn main() {
             None => eprintln!("[main] OOBE boot resolution: Home (OOBE already completed or skipped)"),
         }
         eprintln!("[main] Home/overlay boot theme: {initial_theme:?}");
+        // D2 (2026-08-23): push the boot theme to comp too, so an
+        // application window mapped before the operator ever opens a
+        // settings surface already gets a matching frame. Comp defaults to
+        // `light` and `ThemeChoice` defaults to `Light`, so this is a no-op
+        // in the common case — it matters for a machine whose persisted
+        // pick is Dark, where without it every window frame would stay
+        // light until the next theme change. Non-blocking; see
+        // `notify_comp_theme`.
+        notify_comp_theme(initial_theme);
 
-        let window = cx
-            .open_window(
-                // WM-1 (2026-08-23): `app_id` is how `duduclaw-comp` tells the
-                // session shell apart from an ordinary application window.
-                // The shell paints the menu bar and the dock inside its own
-                // full-screen toplevel, so it is the ONE window comp exempts
-                // from the reserved top/bottom bands (and from Super+Q). Comp
-                // has a first-mapped-toplevel fallback for the boot path —
-                // gpui sends `set_app_id` after its first commit, so the
-                // initial configure necessarily arrives without it — but this
-                // is the authoritative signal, and it is also what makes the
-                // shell identifiable to `list_windows` / `activate_window` /
-                // `window_geometry`. Keep it in sync with
-                // `crates/duduclaw-comp/src/window_policy.rs`'s
-                // `SHELL_APP_ID`.
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    app_id: Some("duduclaw-shell".to_string()),
-                    ..Default::default()
-                },
-                |_window, cx| {
-                    // `AccountFields::new` needs `&mut App` (creating the two
-                    // `OobeTextField` entities), available here — same call
-                    // site `duduclaw-native-gui/src/main.rs` creates its own
-                    // `email_field`/`password_field` at, right before the
-                    // `cx.new(|cx| ...)` call below shadows `cx` with
-                    // `&mut Context<ShellView>`.
-                    let oobe_account_fields = oobe::AccountFields::new(cx);
-                    let oobe_network_fields = oobe::NetworkFields::new(cx);
-                    // WP-lock-pw: same "create once, unconditionally, at
-                    // window-open time" call site as the two `AccountFields`/
-                    // `NetworkFields` entities just above.
-                    let lockscreen_password_field = oobe::LockPasswordField::new(cx);
-                    let launcher_query_field = oobe::LauncherQueryField::new(cx);
-                    cx.new(|cx| ShellView {
-                        surface: SurfaceState::default(),
-                        overlay_ui: overlay::OverlayUiState::default(),
-                        audio_ui: audio::AudioUiState::default(),
-                        pointer_ui: overlay::pointer_settings::PointerUiState::default(),
-                        lockscreen: lockscreen::LockScreenState::default(),
-                        running_windows: home::running_windows::RunningWindowsFeed::default(),
-                        installed_apps: apps::feed::InstalledAppsFeed::default(),
-                        lockscreen_password_field,
-                        launcher_query_field,
-                        operator_name: initial_operator_name,
-                        oobe: initial_oobe,
-                        oobe_ui: oobe::OobeUiState::default(),
-                        oobe_account_fields,
-                        oobe_network_fields,
-                        theme: initial_theme,
-                        focus_handle: cx.focus_handle(),
-                        diag: std::env::var("DUDUCLAW_SHELL_DIAG").is_ok_and(|v| v == "1"),
-                        diag_scheduled: false,
-                    })
-                },
-            )
-            .expect("failed to open window");
-        eprintln!("[main] window opened");
+        // WM-3 (2026-08-23): `shared_state` replaces the single window's
+        // root-view construction that used to happen inline inside `cx.
+        // open_window`'s builder closure — see `crate::chrome`'s module doc
+        // for why this now happens BEFORE any window opens. The SAME
+        // `Entity<ShellView>` is reused EITHER as `ChromeMode::
+        // SingleFullscreen`'s one window's root view directly, OR wrapped by
+        // N `chrome::windows::SurfaceView`s in `ChromeMode::LayerSurfaces` —
+        // never duplicated. Every `::new(cx)` call below only ever needed
+        // `&mut App` (never a live `Window` — confirmed by reading each
+        // one's own signature in `oobe/widgets.rs`), so moving them to here,
+        // before any window exists, changes nothing about what they do.
+        let oobe_account_fields = oobe::AccountFields::new(cx);
+        let oobe_network_fields = oobe::NetworkFields::new(cx);
+        let lockscreen_password_field = oobe::LockPasswordField::new(cx);
+        let launcher_query_field = oobe::LauncherQueryField::new(cx);
+        // D4b: the settings app's eight fields, same call site and same
+        // "create once, unconditionally" reasoning as every bundle above it.
+        let settings_fields = oobe::SettingsFields::new(cx);
+        let shared_state = cx.new(|cx| ShellView {
+            surface: SurfaceState::default(),
+            overlay_ui: overlay::OverlayUiState::default(),
+            audio_ui: audio::AudioUiState::default(),
+            pointer_ui: overlay::pointer_settings::PointerUiState::default(),
+            settings_ui: settings::SettingsUiState::default(),
+            settings_fields,
+            lockscreen: lockscreen::LockScreenState::default(),
+            running_windows: home::running_windows::RunningWindowsFeed::default(),
+            global_task: global_task::GlobalTaskIntentFeed::default(),
+            installed_apps: apps::feed::InstalledAppsFeed::default(),
+            // D6: constructed idle — the bus connection is not made here.
+            // `ShellView::schedule_notification_drain` starts the daemon
+            // thread from the first render pass, so a failing/absent session
+            // bus can never delay or break window creation.
+            notify_runtime: notifyd::NotifyRuntime::default(),
+            notify_center: notifyd::center::NotificationCenter::default(),
+            lockscreen_password_field,
+            launcher_query_field,
+            operator_name: initial_operator_name,
+            oobe: initial_oobe,
+            oobe_ui: oobe::OobeUiState::default(),
+            oobe_account_fields,
+            oobe_network_fields,
+            theme: initial_theme,
+            focus_handle: cx.focus_handle(),
+            diag: std::env::var("DUDUCLAW_SHELL_DIAG").is_ok_and(|v| v == "1"),
+            diag_scheduled: false,
+        });
+
+        // WM-1 (2026-08-23): `app_id` is how `duduclaw-comp` tells the
+        // session shell apart from an ordinary application window — see
+        // `chrome::SHELL_APP_ID`'s own doc comment (now the one place this
+        // string is spelled; every window this crate opens, layer-shell or
+        // fallback alike, declares it). Comp has a first-mapped-toplevel
+        // fallback for the boot path — gpui sends `set_app_id` after its
+        // first commit, so the initial configure necessarily arrives
+        // without it — but this is the authoritative signal, and it is also
+        // what makes the shell identifiable to `list_windows` /
+        // `activate_window` / `window_geometry`. Keep it in sync with
+        // `crates/duduclaw-comp/src/window_policy.rs`'s `SHELL_APP_ID`.
+        //
+        // `ChromeMode::LayerSurfaces` (Linux, the default) opens the menu
+        // bar / dock / desktop as three separate wlr-layer-shell windows
+        // (plus a fourth, on-demand, for whichever overlay is open) — see
+        // `crate::chrome`'s module doc for the whole design and
+        // `chrome::windows::boot_windows` for the fallback-on-failure
+        // dance. Every other platform, and Linux with
+        // `DUDUCLAW_SHELL_NO_LAYER_SHELL=1` set, keeps this crate's
+        // original single fullscreen window — byte-identical to before this
+        // round — via the `#[cfg(not(target_os = "linux"))]` arm below.
+        // `fallback_window` is `Some` only in that single-window case; the
+        // one remaining call site below that needs it (the `DUDUCLAW_SHELL_
+        // DEBUG_SURFACE` overlay hook, further down) branches on it.
+        #[cfg(target_os = "linux")]
+        chrome::windows::boot_windows(cx, shared_state.clone());
+        #[cfg(target_os = "linux")]
+        let fallback_window: Option<gpui::WindowHandle<ShellView>> = None;
+        // A1 (2026-08-23): one process-wide loop that drains comp's global
+        // hotkey queue. Started here — once — rather than from a render
+        // pass; see `spawn_global_task_poll_loop` for the P0 that taught us
+        // the difference. Harmless on a host with no compositor (macOS dev
+        // loop): the first poll fails, the loop backs off to its slow
+        // cadence, and `give_up` retires it entirely against a comp that
+        // does not implement the op.
+        spawn_global_task_poll_loop(shared_state.clone(), cx);
+        #[cfg(not(target_os = "linux"))]
+        let fallback_window: Option<gpui::WindowHandle<ShellView>> = {
+            let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        app_id: Some(chrome::SHELL_APP_ID.to_string()),
+                        ..Default::default()
+                    },
+                    {
+                        let shared_state = shared_state.clone();
+                        move |_window, _cx| shared_state.clone()
+                    },
+                )
+                .expect("failed to open window");
+            eprintln!("[main] window opened");
+            // Give the root element real keyboard focus — see this file's
+            // header comment ("Keyboard dispatch needs a focused element,
+            // full stop.") for why this call is not optional. Same call
+            // site as zed's own `crates/gpui/examples/input.rs`
+            // `run_example()`: right after the window+view are created,
+            // before `cx.activate(true)`.
+            let _ = window.update(cx, |view, window, cx| {
+                window.focus(&view.focus_handle, cx);
+            });
+            Some(window)
+        };
 
         // `cmd-k`/`escape`/`enter` are dispatched via `ShellView::on_
         // toggle_launcher` / `::on_close_overlay` / `::on_oobe_next`, wired
@@ -858,27 +1473,26 @@ fn main() {
             // 捷鍵"), the keyboard twin of ControlCenter's own lock button.
             // Not previously bound to anything in this crate.
             KeyBinding::new("cmd-l", LockScreenNow, None),
+            // WP-oobe-tab (2026-08-23): OOBE-only field-to-field navigation
+            // — see `FocusNext`/`FocusPrev`'s own doc comment just above
+            // their `actions!` declaration for why these are bound globally
+            // with the OOBE guard inside the handler instead.
+            KeyBinding::new("tab", FocusNext, None),
+            KeyBinding::new("shift-tab", FocusPrev, None),
         ]);
 
-        // Give the root element real keyboard focus — see this file's header
-        // comment ("Keyboard dispatch needs a focused element, full stop.")
-        // for why this call is not optional. Same call site as zed's own
-        // `crates/gpui/examples/input.rs` `run_example()`: right after the
-        // window+view are created, before `cx.activate(true)`.
-        let _ = window.update(cx, |view, window, cx| {
-            window.focus(&view.focus_handle, cx);
-        });
-
         // Shell-S4-lock: the idle-auto-lock watchdog — started exactly ONCE
-        // here, not from `Render::render` (unlike this surface's own
+        // here, not from `render_root` (unlike this surface's own
         // clock-tick/stale-check timers, which self-re-arm only while
         // ALREADY locked — see `lockscreen::render::spawn_idle_watchdog`'s
         // own doc comment for why THIS one has to run continuously from
-        // boot instead). Needs a `Context<ShellView>`, hence the same
-        // `window.update(cx, |view, _window, cx| ...)` call shape the
-        // `DUDUCLAW_SHELL_DEBUG_SURFACE` override below already uses to get
-        // one post-window-open.
-        let _ = window.update(cx, |_view, _window, cx| {
+        // boot instead). WM-3: routed through `shared_state.update(...)`
+        // rather than a specific window's `WindowHandle::update` — `spawn_
+        // idle_watchdog` only ever needed a `Context<ShellView>`, never a
+        // `Window`, so this is identical in both chrome modes (there may be
+        // zero, one, or four windows open by this point depending on mode;
+        // none of that matters here).
+        let _ = shared_state.update(cx, |_view, cx| {
             lockscreen::render::spawn_idle_watchdog(cx);
         });
 
@@ -901,25 +1515,49 @@ fn main() {
         // from_debug_env`, not added as a fourth `Overlay` variant — see
         // `ShellView.lockscreen`'s own doc comment for why locking is a
         // flag on always-present state, not another `SurfaceState` overlay.
+        //
+        // WM-3: the "lockscreen" arm and `spawn_idle_watchdog` above route
+        // through `shared_state.update(...)` (no `Window` ever needed —
+        // both `lockscreen::render::lock_and_refresh` and `::spawn_idle_
+        // watchdog` only take `&mut ShellView`/`&mut Context<ShellView>`),
+        // identical in both chrome modes. The overlay-opening arm is the ONE
+        // place here that genuinely differs: in `SingleFullscreen` mode
+        // (`fallback_window: Some(_)`) it calls `settle_launcher_query`
+        // directly through that window, exactly as before this round; in
+        // `LayerSurfaces` mode (`fallback_window: None`) `settle_launcher_
+        // query` cannot correctly focus the search field from here anyway
+        // (see that method's own doc comment), so this arm just opens the
+        // overlay and lets `chrome::windows::SurfaceView::
+        // reconcile_overlay_window` pick it up — and focus it correctly
+        // itself — on Home's next render pass.
         match std::env::var("DUDUCLAW_SHELL_DEBUG_SURFACE") {
             Ok(raw) if raw.is_empty() => {}
             Ok(raw) if raw == "lockscreen" => {
-                let _ = window.update(cx, |view, _window, cx| {
+                let _ = shared_state.update(cx, |view, cx| {
                     lockscreen::render::lock_and_refresh(view, cx);
                 });
                 eprintln!("[main] DUDUCLAW_SHELL_DEBUG_SURFACE=lockscreen -> locked");
             }
             Ok(raw) => match Overlay::from_debug_env(&raw) {
                 Some(overlay) => {
-                    let _ = window.update(cx, |view, window, cx| {
-                        view.surface.open(overlay);
-                        // D3-b: `DUDUCLAW_SHELL_DEBUG_SURFACE=launcher` must
-                        // land in the same focused state a real cmd-k does,
-                        // or the headless smoke run would exercise a state
-                        // the operator can never reach.
-                        view.settle_launcher_query(window, cx);
-                        cx.notify();
-                    });
+                    if let Some(window) = fallback_window {
+                        let _ = window.update(cx, |view, window, cx| {
+                            view.surface.open(overlay);
+                            // D3-b: `DUDUCLAW_SHELL_DEBUG_SURFACE=launcher`
+                            // must land in the same focused state a real
+                            // cmd-k does, or the headless smoke run would
+                            // exercise a state the operator can never reach.
+                            view.settle_launcher_query(window, cx);
+                            cx.notify();
+                        });
+                    } else {
+                        let _ = shared_state.update(cx, |view, cx| {
+                            view.surface.open(overlay);
+                            view.overlay_ui.close_launcher_query();
+                            view.launcher_query_field.field.update(cx, |field, cx| field.clear(cx));
+                            cx.notify();
+                        });
+                    }
                     eprintln!("[main] DUDUCLAW_SHELL_DEBUG_SURFACE={raw} -> opened {overlay:?}");
                 }
                 None => {

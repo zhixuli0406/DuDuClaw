@@ -30,6 +30,7 @@ pub(crate) use language::A11yCategory;
 
 use gpui::{Context, Div};
 
+use super::state::EnterOutcome;
 use super::widgets::{AccountFields, NetworkFields};
 use super::{OobeFlow, OobeStep, OobeUiState};
 use crate::ShellView;
@@ -59,5 +60,26 @@ pub(super) fn render(
         OobeStep::Templates => templates::render(flow, cx),
         OobeStep::Theme => theme::render(flow, cx),
         OobeStep::Finish => finish::render(flow),
+    }
+}
+
+/// Routes an `EnterOutcome::Submit*` decision (see `OobeFlow::enter_
+/// outcome`'s own doc comment in `state.rs`) to whichever step actually
+/// owns that submit action — `main.rs`'s `on_oobe_next` (Enter's handler)
+/// is the one caller, re-exported as `oobe::handle_enter_submit`. `Advance`/
+/// `Blocked` never reach here (the caller handles `Advance` itself via
+/// `OobeFlow::next_with_wired`, and `Blocked` is a plain no-op) — the match
+/// stays exhaustive anyway so a THIRD submit-shaped step added later can't
+/// silently fall through unhandled.
+// `pub(crate)`, not `pub(super)`: `oobe/mod.rs` re-exports this as
+// `oobe::handle_enter_submit` for `main.rs`'s Enter handler (exactly what
+// this fn's own doc comment above says), and a `pub(super)` item cannot be
+// re-exported that widely — E0364. Corrected 2026-08-23 while wiring D4b,
+// which could not compile the crate until this resolved.
+pub(crate) fn handle_enter_submit(outcome: EnterOutcome, view: &mut ShellView, cx: &mut Context<ShellView>) {
+    match outcome {
+        EnterOutcome::SubmitAccount => account::try_submit(view, cx),
+        EnterOutcome::SubmitNetworkConnect => network::try_submit(view, cx),
+        EnterOutcome::Advance | EnterOutcome::Blocked => {}
     }
 }

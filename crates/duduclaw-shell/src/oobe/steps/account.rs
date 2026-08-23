@@ -68,92 +68,7 @@ pub(super) fn render(flow: &OobeFlow, ui: &OobeUiState, fields: &AccountFields, 
     let palette = flow.palette();
     let in_flight = ui.account_claim == AccountClaimState::InFlight;
 
-    let name_entity = fields.name.clone();
-    let password_entity = fields.password.clone();
-    let create_click = cx.listener(move |view, _ev, _window, cx| {
-        if view.oobe_ui.account_claim == AccountClaimState::InFlight {
-            // A click landing mid-flight is a no-op. The button is ALSO
-            // visually disabled while `InFlight` (see `disabled` below), so
-            // in practice this only matters for the brief window between a
-            // click event firing and gpui re-painting the disabled state —
-            // this guard is the authoritative one either way.
-            return;
-        }
-        let name = name_entity.read(cx).content(cx).trim().to_string();
-        let password = password_entity.read(cx).content(cx);
-        if name.is_empty() || password.is_empty() {
-            view.oobe_ui.set_account_validation_error(true);
-            view.oobe_ui.reset_account_claim();
-            cx.notify();
-            return;
-        }
-        view.oobe_ui.set_account_validation_error(false);
-
-        // Dev escape — see this file's header comment and `main.rs`'s
-        // env-var list. Skips the network entirely and reproduces round 2's
-        // original local-only click verbatim (no password-length gate
-        // either — matching that behavior exactly, not the real gateway
-        // rule below).
-        if std::env::var("DUDUCLAW_SHELL_OOBE_LOCAL_ACCOUNT").is_ok_and(|v| v == "1") {
-            if let Some(flow) = view.oobe.as_mut() {
-                flow.set_operator_name(&name);
-                flow.set_account_created(true);
-                crate::oobe::save_state(flow.state());
-            }
-            view.oobe_ui.reset_account_claim();
-            cx.notify();
-            return;
-        }
-
-        if password.chars().count() < 8 {
-            // Mirrors `handle_first_run_claim`'s own `< 8 chars` rule
-            // (`duduclaw-gateway/src/server.rs`) so the operator learns this
-            // without a round trip. Caught here BEFORE `set_operator_name`/
-            // `save_state`/`InFlight` — nothing has changed yet, so this is
-            // a pure no-network branch.
-            view.oobe_ui.set_account_claim_failed(AccountClaimFailureKind::PasswordTooShort);
-            cx.notify();
-            return;
-        }
-
-        if let Some(flow) = view.oobe.as_mut() {
-            flow.set_operator_name(&name);
-            crate::oobe::save_state(flow.state());
-        }
-        view.oobe_ui.set_account_claim_in_flight();
-        cx.notify();
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = claim::create_account(&password);
-            // The receiver only goes away if `ShellView` itself was torn
-            // down mid-flight (window closed) — nothing actionable there,
-            // same "best effort, never panic" contract `oobe::save_state`
-            // already follows for its own I/O failures.
-            let _ = tx.send(result);
-        });
-
-        // One-shot poll: `try_recv` + a paced background-executor timer,
-        // same mechanics as `duduclaw-native-gui/src/main.rs`'s own
-        // persistent bridge loop (see this file's header comment) but this
-        // task exits itself the moment a result arrives (or the sender is
-        // dropped) rather than running for the window's whole lifetime.
-        cx.spawn(async move |weak, cx| loop {
-            match rx.try_recv() {
-                Ok(result) => {
-                    let _ = weak.update(cx, |view, cx| {
-                        apply_claim_result(view, result);
-                        cx.notify();
-                    });
-                    break;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-            cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
-        })
-        .detach();
-    });
+    let create_click = cx.listener(move |view, _ev, _window, cx| try_submit(view, cx));
 
     let mut body = div()
         .flex()
@@ -197,6 +112,105 @@ pub(super) fn render(flow: &OobeFlow, ui: &OobeUiState, fields: &AccountFields, 
         .child(widgets::title(t(locale, Key::AccountTitle), palette))
         .child(widgets::subtitle(t(locale, Key::AccountSubtitle), palette))
         .child(widgets::card(body, palette))
+}
+
+/// The "建立帳號" submit — validates both fields, then dispatches the
+/// gateway claim on a background thread. Extracted out of `render`'s
+/// `create_click` closure (WP-oobe-enter, 2026-08-23) so it has exactly ONE
+/// body reachable from TWO triggers: the button's own click, and
+/// `main.rs`'s `on_oobe_next` (bound to Enter) via `super::handle_enter_
+/// submit` — see `OobeFlow::enter_outcome`'s own doc comment in `state.rs`
+/// for why Enter needs this at all: without it, Enter on this step was a
+/// silent no-op for as long as the account hadn't been created yet, since
+/// `next_with_wired` alone can never satisfy `AccountCreate`'s own
+/// precondition (`account_created` only flips on a server-confirmed
+/// outcome). Reads `view.oobe_account_fields` fresh at call time — same
+/// "re-borrow at invocation, not at render time" discipline `render.rs`'s
+/// `button_row` closures already establish — rather than taking pre-cloned
+/// `Entity<OobeTextField>` handles as parameters, so a keyboard-triggered
+/// call needs nothing beyond `&mut ShellView`.
+pub(super) fn try_submit(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    if view.oobe_ui.account_claim == AccountClaimState::InFlight {
+        // A trigger landing mid-flight is a no-op. The button is ALSO
+        // visually disabled while `InFlight` (see `render`'s own `disabled`
+        // arg), and `OobeFlow::enter_outcome` refuses to route Enter here at
+        // all while in flight — this guard is the authoritative one
+        // regardless of which of the two callers reached it.
+        return;
+    }
+    let name = view.oobe_account_fields.name.read(cx).content(cx).trim().to_string();
+    let password = view.oobe_account_fields.password.read(cx).content(cx);
+    if name.is_empty() || password.is_empty() {
+        view.oobe_ui.set_account_validation_error(true);
+        view.oobe_ui.reset_account_claim();
+        cx.notify();
+        return;
+    }
+    view.oobe_ui.set_account_validation_error(false);
+
+    // Dev escape — see this file's header comment and `main.rs`'s env-var
+    // list. Skips the network entirely and reproduces round 2's original
+    // local-only click verbatim (no password-length gate either — matching
+    // that behavior exactly, not the real gateway rule below).
+    if std::env::var("DUDUCLAW_SHELL_OOBE_LOCAL_ACCOUNT").is_ok_and(|v| v == "1") {
+        if let Some(flow) = view.oobe.as_mut() {
+            flow.set_operator_name(&name);
+            flow.set_account_created(true);
+            crate::oobe::save_state(flow.state());
+        }
+        view.oobe_ui.reset_account_claim();
+        cx.notify();
+        return;
+    }
+
+    if password.chars().count() < 8 {
+        // Mirrors `handle_first_run_claim`'s own `< 8 chars` rule
+        // (`duduclaw-gateway/src/server.rs`) so the operator learns this
+        // without a round trip. Caught here BEFORE `set_operator_name`/
+        // `save_state`/`InFlight` — nothing has changed yet, so this is a
+        // pure no-network branch.
+        view.oobe_ui.set_account_claim_failed(AccountClaimFailureKind::PasswordTooShort);
+        cx.notify();
+        return;
+    }
+
+    if let Some(flow) = view.oobe.as_mut() {
+        flow.set_operator_name(&name);
+        crate::oobe::save_state(flow.state());
+    }
+    view.oobe_ui.set_account_claim_in_flight();
+    cx.notify();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = claim::create_account(&password);
+        // The receiver only goes away if `ShellView` itself was torn down
+        // mid-flight (window closed) — nothing actionable there, same "best
+        // effort, never panic" contract `oobe::save_state` already follows
+        // for its own I/O failures.
+        let _ = tx.send(result);
+    });
+
+    // One-shot poll: `try_recv` + a paced background-executor timer, same
+    // mechanics as `duduclaw-native-gui/src/main.rs`'s own persistent
+    // bridge loop (see this file's header comment) but this task exits
+    // itself the moment a result arrives (or the sender is dropped) rather
+    // than running for the window's whole lifetime.
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(result) => {
+                let _ = weak.update(cx, |view, cx| {
+                    apply_claim_result(view, result);
+                    cx.notify();
+                });
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
+    })
+    .detach();
 }
 
 /// Applies a settled `claim::create_account` result to `ShellView` — the

@@ -263,7 +263,18 @@ fn apply_fetch_outcome(feed: &mut NotificationsFeed, outcome: Result<(Option<Str
     }
 }
 
-pub(super) fn render(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+pub(super) fn render(
+    ui: &OverlayUiState,
+    // D6 (2026-08-23): third-party app notifications delivered over
+    // `org.freedesktop.Notifications` (`crate::notifyd`). A SECOND feed in
+    // this one panel, deliberately: the whole reason the shell serves that
+    // bus name itself rather than shipping mako/dunst is that a browser's
+    // notification and an agent's approval must land in the same place, in
+    // the same visual language — see `notifyd`'s own module doc.
+    notify_center: &crate::notifyd::center::NotificationCenter,
+    palette: ShellPalette,
+    cx: &mut Context<ShellView>,
+) -> Stateful<Div> {
     // Notifications.dc.html: bg `rgba(255,255,255,0.96)` light / `rgba(30,
     // 30,33,0.96)` dark — `surface_raised` in both. Border: opaque
     // `border()` light / `rgba(255,255,255,0.12)` dark.
@@ -297,7 +308,11 @@ pub(super) fn render(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Contex
         // See this file's header comment on why this is dark-only.
         panel = panel.text_color(theme::alpha(palette.foreground, 1.0));
     }
-    panel.child(header(palette, ui.notifications.is_busy())).child(tabs(palette)).child(content(&ui.notifications, palette, cx)).child(footer(palette))
+    panel
+        .child(header(palette, ui.notifications.is_busy()))
+        .child(tabs(palette))
+        .child(content(&ui.notifications, notify_center, palette, cx))
+        .child(footer(palette))
 }
 
 /// The ONE periodic stale-check timer — WP-A4-4 (2026-08-22).
@@ -445,34 +460,45 @@ fn tabs(palette: ShellPalette) -> Div {
     row
 }
 
-fn content(feed: &NotificationsFeed, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+fn content(
+    feed: &NotificationsFeed,
+    notify_center: &crate::notifyd::center::NotificationCenter,
+    palette: ShellPalette,
+    cx: &mut Context<ShellView>,
+) -> Div {
     let body = div().flex_1().overflow_hidden().flex().flex_col().gap(px(10.)).px(px(14.));
 
-    match feed.status {
-        FeedStatus::Offline => return body.child(status_banner(t(Locale::ZhTw, Key::NotifOfflineBanner), palette, true)),
+    // D6: the approval feed's three non-Ready states are about the GATEWAY,
+    // and say nothing about whether third-party app notifications work. They
+    // used to `return` the whole body; now they render their banner and then
+    // fall through to the app-notification section, so a gateway outage can
+    // never also hide a LINE message that arrived perfectly well.
+    let (body, show_approvals) = match feed.status {
+        FeedStatus::Offline => (body.child(status_banner(t(Locale::ZhTw, Key::NotifOfflineBanner), palette, true)), false),
+        FeedStatus::Idle => (body.child(status_banner(t(Locale::ZhTw, Key::NotifLoadingLabel), palette, false)), false),
         FeedStatus::Loading if feed.rows().is_empty() && feed.decided().is_empty() => {
-            return body.child(status_banner(t(Locale::ZhTw, Key::NotifLoadingLabel), palette, false));
+            (body.child(status_banner(t(Locale::ZhTw, Key::NotifLoadingLabel), palette, false)), false)
         }
-        FeedStatus::Idle => {
-            return body.child(status_banner(t(Locale::ZhTw, Key::NotifLoadingLabel), palette, false));
-        }
-        FeedStatus::Loading | FeedStatus::Ready => {}
-    }
-
-    let mut cards = Vec::with_capacity(feed.rows().len() + feed.decided().len());
-    for row in feed.rows() {
-        cards.push(approval_card(row, palette, cx));
-    }
-    for row in feed.decided() {
-        cards.push(approval_card(row, palette, cx));
-    }
+        FeedStatus::Loading | FeedStatus::Ready => (body, true),
+    };
 
     let mut body = body;
-    if cards.is_empty() {
-        body = body.child(status_banner(t(Locale::ZhTw, Key::NotifEmptyLabel), palette, false));
-    } else {
-        body = body.children(cards);
+    if show_approvals {
+        let mut cards = Vec::with_capacity(feed.rows().len() + feed.decided().len());
+        for row in feed.rows() {
+            cards.push(approval_card(row, palette, cx));
+        }
+        for row in feed.decided() {
+            cards.push(approval_card(row, palette, cx));
+        }
+        if cards.is_empty() {
+            body = body.child(status_banner(t(Locale::ZhTw, Key::NotifEmptyLabel), palette, false));
+        } else {
+            body = body.children(cards);
+        }
     }
+
+    body = super::notifications_apps::app_notifications_section(body, notify_center, palette, cx);
 
     body.child(
         div()
@@ -490,7 +516,7 @@ fn content(feed: &NotificationsFeed, palette: ShellPalette, cx: &mut Context<She
 /// `oobe::steps::network`'s own `NetworkScanFailedStatus` line gets);
 /// loading/empty use plain muted text, no alarming color (task brief's own
 /// "誠實橫幅" only asks for honesty, not alarm, on the non-error states).
-fn status_banner(text: &str, palette: ShellPalette, is_error: bool) -> Div {
+pub(super) fn status_banner(text: &str, palette: ShellPalette, is_error: bool) -> Div {
     let mut el = div().px(px(4.)).py(px(10.)).text_size(px(12.)).text_color(theme::alpha(if is_error { palette.destructive } else { palette.text_faint }, 1.0));
     if is_error {
         el = el.bg(theme::alpha(palette.destructive, if palette.is_dark() { 0.12 } else { 0.08 })).rounded(px(8.)).px(px(10.));
@@ -580,7 +606,7 @@ fn approval_card(row: &ApprovalRow, palette: ShellPalette, cx: &mut Context<Shel
 /// this shell's two example agents, plus one more from the goal-card badge
 /// family, so a real agent id never introduces a brand-new, uncoordinated
 /// hue.
-fn agent_color_for(agent_id: &str) -> u32 {
+pub(super) fn agent_color_for(agent_id: &str) -> u32 {
     const PALETTE: [u32; 3] = [0x2171cc, 0x0f766e, 0x8b5cf6];
     let sum: u32 = agent_id.bytes().map(u32::from).sum();
     PALETTE[(sum as usize) % PALETTE.len()]
@@ -722,7 +748,7 @@ fn dispatch_decide(id: String, approve: bool, view: &mut ShellView, cx: &mut Con
     .detach();
 }
 
-fn action_button(
+pub(super) fn action_button(
     label: &str,
     id: impl Into<gpui::ElementId>,
     primary: bool,
@@ -793,11 +819,11 @@ fn decision_badge(label: &'static str, text: Rgba, bg: Rgba) -> Div {
     decision_badge_owned(label.to_string(), text, bg)
 }
 
-fn decision_badge_owned(label: String, text: Rgba, bg: Rgba) -> Div {
+pub(super) fn decision_badge_owned(label: String, text: Rgba, bg: Rgba) -> Div {
     div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(text).bg(bg).rounded(px(999.)).px(px(8.)).py(px(2.)).child(label)
 }
 
-fn avatar(initial: String, bg_hex: u32, palette: ShellPalette) -> Div {
+pub(super) fn avatar(initial: String, bg_hex: u32, palette: ShellPalette) -> Div {
     div()
         .w(px(26.))
         .h(px(26.))

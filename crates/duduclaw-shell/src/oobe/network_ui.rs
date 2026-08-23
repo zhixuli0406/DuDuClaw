@@ -63,6 +63,19 @@ pub enum NetConnectState {
     Failed(NetConnectFailureKind),
 }
 
+impl NetConnectState {
+    /// Whether `steps::network`'s own "連線" submit is meaningfully
+    /// re-triggerable right now — a row has been picked (`AwaitingPsk`) or a
+    /// previous attempt on it just failed and can be retried (`Failed(_)`),
+    /// and nothing is already in flight. The one caller is `OobeFlow::
+    /// enter_outcome` (`state.rs`), which takes this as a plain `bool`
+    /// rather than depending on this type directly — see that method's own
+    /// doc comment for why.
+    pub(crate) fn submittable(&self) -> bool {
+        matches!(self, NetConnectState::AwaitingPsk | NetConnectState::Failed(_))
+    }
+}
+
 /// Which message `steps::network` shows for a `Failed` connect attempt.
 ///
 /// Two sources feed this enum, side by side:
@@ -148,5 +161,13 @@ mod tests {
     #[test]
     fn from_code_collapses_unknown_to_unreachable() {
         assert_eq!(NetConnectFailureKind::from_code(network::WifiFailureCode::Unknown), NetConnectFailureKind::Unreachable);
+    }
+
+    #[test]
+    fn submittable_is_true_only_for_awaiting_psk_and_failed() {
+        assert!(!NetConnectState::Idle.submittable());
+        assert!(NetConnectState::AwaitingPsk.submittable());
+        assert!(!NetConnectState::Connecting.submittable(), "already in flight — must not double-submit");
+        assert!(NetConnectState::Failed(NetConnectFailureKind::WrongPassword).submittable(), "a failure must stay retryable");
     }
 }

@@ -210,6 +210,16 @@ struct CompResponse {
     matched_title_prefix: Option<String>,
     #[serde(default)]
     cursor: Option<CursorState>,
+    /// A1 (2026-08-23) — `take_shell_intents`' drained queue. `Option` for
+    /// the same reason every other op-specific field here is: a comp build
+    /// that predates the op does not send the key at all, and that must
+    /// parse as "nothing pending", not as a protocol error.
+    #[serde(default)]
+    intents: Option<Vec<String>>,
+    /// D4b (2026-08-23) — `get_outputs`' screen list, for the settings app's
+    /// 顯示 page. `Option` for the same reason as every sibling above.
+    #[serde(default)]
+    outputs: Option<Vec<CompOutput>>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -373,6 +383,311 @@ pub const CURSOR_SOURCE_BRAND: &str = "brand";
 /// no consumer here: the style control has no "disable it" state to protect,
 /// so every style refusal renders the same way regardless of code.)
 pub const CURSOR_ERR_INVALID_SIZE: &str = "invalid_cursor_size";
+
+// ── Outputs / screens (D4b, 2026-08-23) ─────────────────────────────────
+// Three ops behind the settings app's 顯示 page. The compositor is the ONLY
+// process that manages outputs, so this is the only way a settings surface
+// can know what screens exist or change one.
+//
+//   {"op":"get_outputs"}                                        -> {"ok":true,"outputs":[…]}
+//   {"op":"set_output_mode","params":{"output":…,"width":…,…}}   -> {"ok":true[,"outputs":[…]]}
+//   {"op":"set_output_scale","params":{"output":…,"scale_pct":…}}-> {"ok":true[,"outputs":[…]]}
+//
+// Same degradation discipline the cursor ops above document: every field on
+// `CompOutput` except `name` is optional, so a comp build that predates any
+// one of them parses fine and the page renders that fact rather than a
+// guess. A comp that predates the whole op answers `{"ok":false,…}`, which
+// arrives as `CompClientError::Comp` — the page's cue to say the display
+// settings are unavailable, not to show an error dialog.
+
+/// One mode a screen reports it can drive.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CompOutputMode {
+    pub width: u32,
+    pub height: u32,
+    /// Millihertz, comp's own unit (60000 = 60 Hz), passed through
+    /// unconverted so no rounding happens on this side of the socket.
+    #[serde(default)]
+    pub refresh_mhz: Option<u32>,
+    #[serde(default)]
+    pub preferred: bool,
+    #[serde(default)]
+    pub current: bool,
+}
+
+impl CompOutputMode {
+    /// `1920 × 1080 · 60 Hz`, with the refresh clause dropped when comp did
+    /// not report one — never a fabricated "60 Hz".
+    pub fn label(&self) -> String {
+        match self.refresh_mhz {
+            Some(mhz) => format!("{} × {} · {}", self.width, self.height, format_refresh(mhz)),
+            None => format!("{} × {}", self.width, self.height),
+        }
+    }
+}
+
+/// One screen.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CompOutput {
+    /// The connector name (`eDP-1`, `Virtual-1`). The stable identity every
+    /// setter addresses a screen by.
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub make: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub refresh_mhz: Option<u32>,
+    /// Current scale × 100. Integer on the wire on purpose — same reasoning
+    /// `set_cursor_size` uses `i64`: a settings page must never be handed a
+    /// value none of its segments can represent.
+    #[serde(default)]
+    pub scale_pct: Option<u32>,
+    #[serde(default)]
+    pub physical_width_mm: Option<u32>,
+    #[serde(default)]
+    pub physical_height_mm: Option<u32>,
+    /// Whatever comp's own mode list holds. An EMPTY list is a real and
+    /// expected answer (a virtio screen under QEMU reports none), and means
+    /// "this screen offers no choices" — it is never padded with a synthetic
+    /// entry built from the current resolution.
+    #[serde(default)]
+    pub modes: Vec<CompOutputMode>,
+    /// Whether `set_output_mode` will actually do something on this build.
+    /// Absent ⇒ `false`: a comp that does not say so must not be assumed
+    /// capable, or the page would offer a control that always refuses.
+    #[serde(default)]
+    pub mode_switch_supported: bool,
+}
+
+impl CompOutput {
+    /// The human-facing screen name: comp's description if it has one, else
+    /// make+model, else the connector name. Never empty.
+    pub fn display_name(&self) -> String {
+        if let Some(desc) = self.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+            return desc.to_string();
+        }
+        let make = self.make.as_deref().map(str::trim).unwrap_or_default();
+        let model = self.model.as_deref().map(str::trim).unwrap_or_default();
+        match (make.is_empty(), model.is_empty()) {
+            (false, false) => format!("{make} {model}"),
+            (false, true) => make.to_string(),
+            (true, false) => model.to_string(),
+            (true, true) => self.name.clone(),
+        }
+    }
+
+    /// The current resolution line, or `None` when comp reported no size at
+    /// all (an older build) — the page then says so rather than showing 0×0.
+    pub fn current_mode_label(&self) -> Option<String> {
+        let (w, h) = (self.width?, self.height?);
+        Some(match self.refresh_mhz {
+            Some(mhz) => format!("{w} × {h} · {}", format_refresh(mhz)),
+            None => format!("{w} × {h}"),
+        })
+    }
+}
+
+/// Millihertz -> a human refresh string. `60000` -> `60 Hz`, `59940` ->
+/// `59.94 Hz` (trailing zeros trimmed, so real CVT/EDID rates read correctly
+/// instead of all collapsing to the same integer).
+pub fn format_refresh(mhz: u32) -> String {
+    if mhz.is_multiple_of(1000) {
+        return format!("{} Hz", mhz / 1000);
+    }
+    let text = format!("{:.2}", mhz as f64 / 1000.0);
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    format!("{trimmed} Hz")
+}
+
+/// The scale steps the settings page offers, as percentages. A closed set,
+/// exactly like the cursor's five sizes — comp refuses anything else with
+/// `OUTPUT_ERR_INVALID_SCALE` rather than clamping.
+pub const OUTPUT_SCALE_STEPS: [u32; 5] = [100, 125, 150, 175, 200];
+
+/// comp's refusal codes for the three output ops. Named so the one place
+/// these literals live is greppable against comp's own listener.
+pub const OUTPUT_ERR_UNKNOWN_OUTPUT: &str = "unknown_output";
+pub const OUTPUT_ERR_MODE_UNSUPPORTED: &str = "mode_switch_unsupported";
+pub const OUTPUT_ERR_SCALE_UNSUPPORTED: &str = "scale_change_unsupported";
+
+/// `{"op":"get_outputs"}`. Blocking; see this file's module doc.
+///
+/// An `ok:true` response with no `outputs` key is a `Protocol` error, not an
+/// empty screen list — same reasoning `get_cursor_source` gives: "no answer"
+/// and "an answer that is empty" are different facts, and a machine with
+/// zero screens is not a state this shell can be running in.
+pub fn get_outputs() -> Result<Vec<CompOutput>, CompClientError> {
+    let resp = call(r#"{"op":"get_outputs"}"#)?;
+    if !resp.ok {
+        return Err(CompClientError::Comp(resp.error.unwrap_or_else(|| "unknown error".to_string())));
+    }
+    resp.outputs.ok_or_else(|| CompClientError::Protocol("ok response carried no outputs list".to_string()))
+}
+
+/// `{"op":"set_output_mode","params":{…}}`. Returns the refreshed screen
+/// list when comp echoed one; `None` means "accepted, but told us nothing"
+/// and the caller re-reads — the same contract the cursor setters have, and
+/// for the same reason (this client must never assert a state it did not
+/// observe).
+pub fn set_output_mode(output: &str, width: u32, height: u32, refresh_mhz: u32) -> Result<Option<Vec<CompOutput>>, CompClientError> {
+    let req = serde_json::json!({
+        "op": "set_output_mode",
+        "params": { "output": output, "width": width, "height": height, "refresh_mhz": refresh_mhz }
+    })
+    .to_string();
+    let resp = call(&req)?;
+    if !resp.ok {
+        return Err(CompClientError::Comp(resp.error.unwrap_or_else(|| "unknown error".to_string())));
+    }
+    Ok(resp.outputs)
+}
+
+/// `{"op":"set_output_scale","params":{"output":…,"scale_pct":…}}`.
+pub fn set_output_scale(output: &str, scale_pct: u32) -> Result<Option<Vec<CompOutput>>, CompClientError> {
+    let req = serde_json::json!({ "op": "set_output_scale", "params": { "output": output, "scale_pct": scale_pct } }).to_string();
+    let resp = call(&req)?;
+    if !resp.ok {
+        return Err(CompClientError::Comp(resp.error.unwrap_or_else(|| "unknown error".to_string())));
+    }
+    Ok(resp.outputs)
+}
+
+// ── Theme (D2) and global intents (A1) — both 2026-08-23 ────────────────
+// Two ops added by the same round that migrated this shell's chrome onto
+// real layer surfaces. Comp side lives in `duduclaw-comp/src/shell_control/`.
+//
+//   {"op":"set_theme","params":{"theme":"dark"|"light"}} -> {"ok":true}
+//   {"op":"take_shell_intents"}                          -> {"ok":true,"intents":[…]}
+//
+// Both degrade the same way every op above does: a comp build that predates
+// them answers `{"ok":false,"error":…}`, which arrives as
+// `CompClientError::Comp` and is the caller's cue to stop asking — NOT to
+// show the operator an error for something they cannot fix.
+
+/// The two `theme` values comp accepts. Consts rather than an enum, for the
+/// same reason [`CURSOR_SOURCE_SYSTEM`]/[`CURSOR_SOURCE_BRAND`] are: comp
+/// owns this vocabulary, and the two spellings should exist in exactly one
+/// place on this side of the wire.
+pub const THEME_DARK: &str = "dark";
+/// See [`THEME_DARK`].
+pub const THEME_LIGHT: &str = "light";
+
+/// `{"op":"set_theme","params":{"theme":"dark"|"light"}}` — tells comp which
+/// palette to draw its SERVER-SIDE decorations in (title bars, borders,
+/// shadows, the Alt-Tab switcher), so an application window's frame matches
+/// the shell around it.
+///
+/// One-way on purpose: the shell is the authority on which theme the
+/// operator chose (it is the half that persists the choice — `oobe`'s theme
+/// step), so there is no `get_theme`. Comp is told, it does not vote.
+///
+/// Returns `Ok(())` rather than any state object: comp's answer to this op
+/// is a bare ack, and inventing a returned "current theme" from the value we
+/// just sent would be this client asserting something it never observed
+/// (same reasoning the cursor setters' doc comments give for returning
+/// `Option<CursorState>` instead of a fabricated one).
+///
+/// Blocking; see this file's module doc for the threading contract.
+pub fn set_theme(theme: &str) -> Result<(), CompClientError> {
+    let req = serde_json::json!({ "op": "set_theme", "params": { "theme": theme } }).to_string();
+    let resp = call(&req)?;
+    if !resp.ok {
+        return Err(CompClientError::Comp(resp.error.unwrap_or_else(|| "unknown error".to_string())));
+    }
+    Ok(())
+}
+
+/// One thing comp is asking this shell to do, because comp saw a global
+/// hotkey the shell could not have seen itself.
+///
+/// The vocabulary is comp's (same convention as `CursorState::source`), but
+/// unlike a cursor style — which is only ever *rendered* — an intent
+/// *triggers an action*. So this is a CLOSED enum and an unrecognized wire
+/// value is DROPPED rather than surfaced: a shell that acts on a token it
+/// does not understand is strictly worse than one that ignores it. See
+/// [`take_shell_intents`] for where the drop is counted and reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntent {
+    /// Super+K was pressed. Comp intercepts it (an application window
+    /// normally holds keyboard focus, so this shell's own `cmd-k` binding
+    /// never sees it — the compositor owning global hotkeys is the standard
+    /// wlroots-ecosystem split) and queues this for the shell to act on by
+    /// raising the global task bar.
+    GlobalTaskBar,
+}
+
+impl ShellIntent {
+    /// Every intent this build understands. Exists so the unrecognized-token
+    /// log below can say what the vocabulary IS, not just that something was
+    /// dropped — the whole point of that log is diagnosing a comp/shell
+    /// version mismatch, and "dropped `foo`" without the known set makes the
+    /// reader go read the source.
+    pub const ALL: [ShellIntent; 1] = [ShellIntent::GlobalTaskBar];
+
+    /// Comp's wire spelling for this intent.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            ShellIntent::GlobalTaskBar => "global_task_bar",
+        }
+    }
+
+    /// Parses one wire token. `None` for anything this build does not know —
+    /// see this type's own doc comment for why that is a drop and not an
+    /// error.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "global_task_bar" => Some(ShellIntent::GlobalTaskBar),
+            _ => None,
+        }
+    }
+}
+
+/// `{"op":"take_shell_intents"}` — **drains** comp's pending global-hotkey
+/// queue (taking them clears them, so two pollers would steal from each
+/// other; there is exactly one caller by construction).
+///
+/// Polled rather than pushed: comp's shell-control socket is a one-shot
+/// connect/request/response/close channel with a single sequential listener
+/// thread (see comp's own `shell_control/listener.rs` module doc), so a
+/// long-poll would wedge every other caller behind it. The cost is polling
+/// latency on the ⌘K path, which is a known, recorded tradeoff rather than
+/// an oversight.
+///
+/// Unrecognized intent tokens are dropped and reported on stderr once per
+/// batch — never acted on, never turned into an `Err` that would also throw
+/// away the intents alongside them that this build DOES understand.
+///
+/// Blocking; see this file's module doc for the threading contract.
+pub fn take_shell_intents() -> Result<Vec<ShellIntent>, CompClientError> {
+    let resp = call(r#"{"op":"take_shell_intents"}"#)?;
+    if !resp.ok {
+        return Err(CompClientError::Comp(resp.error.unwrap_or_else(|| "unknown error".to_string())));
+    }
+    let raw = resp.intents.unwrap_or_default();
+    let mut known: Vec<ShellIntent> = Vec::with_capacity(raw.len());
+    let mut unknown: Vec<&str> = Vec::new();
+    for token in &raw {
+        match ShellIntent::from_wire(token.as_str()) {
+            Some(intent) => known.push(intent),
+            None => unknown.push(token.as_str()),
+        }
+    }
+    if !unknown.is_empty() {
+        let known: Vec<&str> = ShellIntent::ALL.iter().map(|i| i.wire_name()).collect();
+        eprintln!(
+            "[comp_client] take_shell_intents: dropped {} unrecognized intent(s) {unknown:?}; this build understands {known:?}",
+            unknown.len()
+        );
+    }
+    Ok(known)
+}
 
 #[cfg(test)]
 mod tests {
@@ -659,5 +974,80 @@ mod tests {
             }
             other => panic!("expected Comp(\"not_found\") for a bogus query, got {other:?}"),
         }
+    }
+
+    // ── Theme (D2) + intents (A1), 2026-08-23 ───────────────────────────
+    // Pure wire-shape tests only. The two ops' round trips need a live comp
+    // and are covered by the `#[ignore]`d live-fire tests' own convention
+    // above, not simulated here.
+
+    #[test]
+    fn theme_consts_are_comps_two_spellings() {
+        assert_eq!(THEME_DARK, "dark");
+        assert_eq!(THEME_LIGHT, "light");
+    }
+
+    #[test]
+    fn set_theme_request_serializes_to_the_agreed_wire_shape() {
+        let req = serde_json::json!({ "op": "set_theme", "params": { "theme": THEME_DARK } }).to_string();
+        assert_eq!(req, r#"{"op":"set_theme","params":{"theme":"dark"}}"#);
+    }
+
+    #[test]
+    fn every_known_intent_round_trips_through_its_wire_name() {
+        // Iterating `ALL` (rather than a hand-written list) is what makes
+        // this test keep covering a SECOND intent the day one is added.
+        for intent in ShellIntent::ALL {
+            assert_eq!(ShellIntent::from_wire(intent.wire_name()), Some(intent));
+        }
+    }
+
+    #[test]
+    fn the_known_intent_vocabulary_has_no_duplicate_wire_names() {
+        let mut names: Vec<&str> = ShellIntent::ALL.iter().map(|i| i.wire_name()).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), before, "two intents share a wire name: {names:?}");
+    }
+
+    #[test]
+    fn shell_intent_rejects_unknown_tokens() {
+        // Deliberately includes near-misses: a closed vocabulary must not be
+        // matched by prefix, case-insensitively, or with surrounding space.
+        for raw in ["", "GLOBAL_TASK_BAR", "global_task", "global_task_bar ", "reboot", "global-task-bar"] {
+            assert_eq!(ShellIntent::from_wire(raw), None, "unexpectedly accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn response_without_an_intents_key_parses_as_nothing_pending() {
+        // The compatibility case: a comp build predating `take_shell_intents`
+        // sends no `intents` key at all. That must be "nothing pending", not
+        // a parse failure.
+        let resp: CompResponse = serde_json::from_str(r#"{"ok":true}"#).expect("must parse");
+        assert!(resp.ok);
+        assert_eq!(resp.intents, None);
+        assert!(resp.intents.unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn response_carries_an_intent_list_when_present() {
+        let resp: CompResponse =
+            serde_json::from_str(r#"{"ok":true,"intents":["global_task_bar"]}"#).expect("must parse");
+        assert_eq!(resp.intents.as_deref(), Some(["global_task_bar".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn an_unknown_intent_is_dropped_without_discarding_the_known_ones_beside_it() {
+        // Mirrors what `take_shell_intents` does with a mixed batch — the
+        // partition/filter_map logic, exercised without a socket.
+        let raw = vec![
+            "global_task_bar".to_string(),
+            "some_future_intent".to_string(),
+            "global_task_bar".to_string(),
+        ];
+        let known: Vec<ShellIntent> = raw.iter().filter_map(|s| ShellIntent::from_wire(s.as_str())).collect();
+        assert_eq!(known, vec![ShellIntent::GlobalTaskBar, ShellIntent::GlobalTaskBar]);
     }
 }

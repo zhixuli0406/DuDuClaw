@@ -43,6 +43,12 @@ pub(crate) use login::{verify_password, LoginError};
 pub(crate) use power::{power_local, PowerAction, PowerError};
 pub use session::{bootstrap_local_session, SessionError};
 pub use ws_rpc::RpcError;
+/// D4b (2026-08-23): `crate::settings::client` drives the whole `device.*` /
+/// `network.*` / `users.*` admin surface through the SAME one-shot round trip
+/// the approvals feed uses. Re-exported under a name that says what it is at
+/// the call site rather than widening `ws_rpc`'s own visibility — there is
+/// still exactly one WS client in this crate, and this is it.
+pub(crate) use ws_rpc::call_once as call_settings_rpc;
 
 /// Unifies every failure this module tree can produce — the shape
 /// `overlay::notifications_feed`'s state machine actually stores, since its

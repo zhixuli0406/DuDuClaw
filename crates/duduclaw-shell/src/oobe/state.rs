@@ -218,6 +218,32 @@ pub struct OobeFlow {
     state: OobeState,
 }
 
+/// What pressing Enter should do on the CURRENT step — see `OobeFlow::
+/// enter_outcome`'s own doc comment for the full decision table this backs.
+/// A dedicated type (not an inlined `bool`/match at the call site) so the
+/// decision is one pure, independently testable unit; `main.rs`'s `on_oobe_
+/// next` (the only production caller) does nothing but match on this and
+/// act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnterOutcome {
+    /// Advance the flow (`next_with_wired`) — the step's own precondition
+    /// (if any) is already satisfied.
+    Advance,
+    /// `AccountCreate`, not yet created, no claim in flight: trigger the
+    /// step's own "建立帳號" submit instead of a doomed `next_with_wired`
+    /// (which would be a guaranteed no-op — `account_created` only ever
+    /// flips on a server-confirmed outcome, never on Enter itself).
+    SubmitAccount,
+    /// `Network`, a row is selected and the connect flow is awaiting a PSK
+    /// or retrying a failure: trigger the step's own "連線" submit, same
+    /// reasoning as `SubmitAccount`.
+    SubmitNetworkConnect,
+    /// Neither advance nor a local submit applies right now (precondition
+    /// unmet AND no submit target — e.g. no network row picked yet, or a
+    /// submit is already in flight) — a legitimate no-op, not a bug.
+    Blocked,
+}
+
 impl OobeFlow {
     pub fn new() -> Self {
         Self { state: OobeState::default() }
@@ -332,6 +358,45 @@ impl OobeFlow {
             None => self.state.completed = true,
         }
         true
+    }
+
+    /// Pure decision for what pressing Enter should do on the CURRENT step
+    /// — see `EnterOutcome`'s own doc comment for what each variant means.
+    ///
+    /// `AccountCreate` and `Network` are the two steps whose `can_advance`
+    /// precondition is satisfied by an ASYNC action gated behind its own
+    /// explicit button (`steps::account`'s "建立帳號", `steps::network`'s
+    /// "連線" — see `oobe/render.rs`'s `button_row`, whose Continue button
+    /// is itself `disabled` until that precondition is met, by design).
+    /// Before this method existed, `main.rs`'s `on_oobe_next` called `next_
+    /// with_wired` unconditionally on every step — exactly right everywhere
+    /// EXCEPT these two, where it was a silent, indefinite no-op: an
+    /// operator could type a full name+password (or a full Wi-Fi
+    /// passphrase) and press Enter, and NOTHING would happen, because Enter
+    /// never triggered the submit those steps require before `can_advance`
+    /// can ever become true. This method restores parity with the mouse:
+    /// Enter now reaches the SAME submit action the step's own button does.
+    ///
+    /// `wired_online`/`account_claim_in_flight`/`net_connect_submittable`
+    /// are all plain `bool`s, not `OobeUiState`/`NetConnectState` directly
+    /// — this file stays free of any dependency on `ui_state.rs`/
+    /// `network_ui.rs` (a one-directional edge that doesn't exist today),
+    /// and the caller (`main.rs`'s `on_oobe_next`) is a one-line read of
+    /// each source field either way.
+    pub(crate) fn enter_outcome(
+        &self,
+        wired_online: bool,
+        account_claim_in_flight: bool,
+        net_connect_submittable: bool,
+    ) -> EnterOutcome {
+        if self.can_advance_with_wired(wired_online) {
+            return EnterOutcome::Advance;
+        }
+        match self.state.current_step {
+            OobeStep::AccountCreate if !account_claim_in_flight => EnterOutcome::SubmitAccount,
+            OobeStep::Network if net_connect_submittable => EnterOutcome::SubmitNetworkConnect,
+            _ => EnterOutcome::Blocked,
+        }
     }
 
     /// Escape's handler within OOBE (task brief: "Escape=返回（第一步不可
@@ -882,6 +947,122 @@ mod tests {
             flow2.next();
         }
         assert!(!flow2.next_with_wired(true), "AccountCreate's own precondition is untouched by the wired signal");
+    }
+
+    // ── EnterOutcome: what pressing Enter should do per step ──────────
+
+    #[test]
+    fn enter_outcome_advances_on_every_step_with_no_blocking_precondition() {
+        let flow = OobeFlow::new(); // LanguageAccessibility
+        assert_eq!(flow.enter_outcome(false, false, false), EnterOutcome::Advance);
+    }
+
+    #[test]
+    fn enter_outcome_is_blocked_on_network_with_nothing_selected_to_submit() {
+        let mut flow = OobeFlow::new();
+        flow.next(); // -> InputDetection
+        flow.next(); // -> Network
+        assert_eq!(flow.current(), OobeStep::Network);
+        assert_eq!(flow.enter_outcome(false, false, false), EnterOutcome::Blocked);
+    }
+
+    #[test]
+    fn enter_outcome_submits_network_connect_when_a_row_is_awaiting_submit() {
+        let mut flow = OobeFlow::new();
+        flow.next();
+        flow.next();
+        assert_eq!(flow.current(), OobeStep::Network);
+        assert_eq!(flow.enter_outcome(false, false, true), EnterOutcome::SubmitNetworkConnect);
+    }
+
+    #[test]
+    fn enter_outcome_advances_past_network_on_a_wired_signal_even_with_a_submittable_row() {
+        // A wired connection wins outright — `can_advance_with_wired` is
+        // checked FIRST, so a stale `AwaitingPsk` panel never blocks Enter
+        // once the machine is already online another way.
+        let mut flow = OobeFlow::new();
+        flow.next();
+        flow.next();
+        assert_eq!(flow.enter_outcome(true, false, true), EnterOutcome::Advance);
+    }
+
+    #[test]
+    fn enter_outcome_advances_past_network_once_persisted_as_connected() {
+        let mut flow = OobeFlow::new();
+        flow.next();
+        flow.next();
+        flow.set_network("DuDu-Office", true);
+        assert_eq!(flow.enter_outcome(false, false, false), EnterOutcome::Advance);
+    }
+
+    #[test]
+    fn enter_outcome_submits_account_when_not_yet_created_and_no_claim_in_flight() {
+        let mut flow = OobeFlow::new();
+        while flow.current() != OobeStep::AccountCreate {
+            if flow.current() == OobeStep::Network {
+                flow.set_network("DuDu-Office", true);
+            }
+            flow.next();
+        }
+        assert_eq!(flow.enter_outcome(false, false, false), EnterOutcome::SubmitAccount);
+    }
+
+    #[test]
+    fn enter_outcome_is_blocked_on_account_create_while_a_claim_is_already_in_flight() {
+        let mut flow = OobeFlow::new();
+        while flow.current() != OobeStep::AccountCreate {
+            if flow.current() == OobeStep::Network {
+                flow.set_network("DuDu-Office", true);
+            }
+            flow.next();
+        }
+        assert_eq!(
+            flow.enter_outcome(false, true, false),
+            EnterOutcome::Blocked,
+            "must not double-submit while a claim is already in flight"
+        );
+    }
+
+    #[test]
+    fn enter_outcome_advances_past_account_create_once_created() {
+        let mut flow = OobeFlow::new();
+        while flow.current() != OobeStep::AccountCreate {
+            if flow.current() == OobeStep::Network {
+                flow.set_network("DuDu-Office", true);
+            }
+            flow.next();
+        }
+        flow.set_account_created(true);
+        assert_eq!(flow.enter_outcome(false, false, false), EnterOutcome::Advance);
+    }
+
+    #[test]
+    fn enter_outcome_advances_on_every_precondition_free_step() {
+        // Update / RuntimeAuth / Privacy / Templates / Theme / Finish all
+        // have no `can_advance` precondition of their own (see each
+        // `OobeStep` variant's own doc comment) — Enter must always Advance
+        // on every one of them, regardless of the three signal params.
+        for step in [
+            OobeStep::Update,
+            OobeStep::RuntimeAuth,
+            OobeStep::Privacy,
+            OobeStep::Templates,
+            OobeStep::Theme,
+            OobeStep::Finish,
+        ] {
+            let flow = OobeFlow::from_state(OobeState { current_step: step, ..OobeState::default() });
+            assert_eq!(flow.enter_outcome(false, false, false), EnterOutcome::Advance, "{step:?}");
+        }
+    }
+
+    #[test]
+    fn enter_outcome_from_finish_is_what_completes_the_flow() {
+        // `main.rs`'s Advance arm calls `next_with_wired`, which is what
+        // actually flips `completed` from the `Finish` step — this test
+        // locks that `enter_outcome` reports `Advance` there too, so Enter
+        // on the Finish step really does finish OOBE end to end.
+        let flow = finish_flow();
+        assert_eq!(flow.enter_outcome(false, false, false), EnterOutcome::Advance);
     }
 
     // ── helpers: walk to a given step, satisfying preconditions ──────

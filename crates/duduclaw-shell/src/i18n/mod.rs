@@ -278,6 +278,30 @@ pub enum Key {
     NotifDecideFailedLabel,
     NotifRetryButton,
 
+    /// D6 (2026-08-23) — the third-party app notification section of the same
+    /// panel (`crate::notifyd`). Same boundary rule the block above states:
+    /// this is process CHROME (a section heading, a button, the honest
+    /// daemon-status banners, relative timestamps), so it is i18n'd; the
+    /// notification CONTENT itself (`app_name`/`summary`/`body`, which
+    /// arrives from an arbitrary third-party application) is DATA and is
+    /// rendered verbatim — translating an app's own message would be both
+    /// impossible and wrong.
+    NotifAppSectionLabel,
+    NotifDismissButton,
+    NotifClearAllButton,
+    /// Honest daemon status. `NotifDaemonNameTakenBanner` is deliberately
+    /// NOT phrased as an error: another daemon owning the name means those
+    /// notifications are being shown SOMEWHERE, just not here.
+    NotifDaemonNameTakenBanner,
+    NotifDaemonFailedBanner,
+    NotifDaemonUnsupportedBanner,
+    /// "+N 則" on a card the flood guard merged others onto.
+    NotifMergedCount,
+    NotifAgeJustNow,
+    NotifAgeMinutes,
+    NotifAgeHours,
+    NotifAgeDays,
+
     /// Shell-S4-lock lockscreen chrome — see `lockscreen/render.rs`'s header.
     LockAwaySummaryTitle,
     LockPendingCountLabel,
@@ -590,6 +614,18 @@ fn zh_tw(key: Key) -> &'static str {
         Key::NotifDecideFailedLabel => "送出失敗，請重試",
         Key::NotifRetryButton => "重試",
 
+        Key::NotifAppSectionLabel => "應用程式通知",
+        Key::NotifDismissButton => "關閉",
+        Key::NotifClearAllButton => "全部清除",
+        Key::NotifDaemonNameTakenBanner => "系統通知由另一個服務接手，應用程式通知不會顯示在這裡",
+        Key::NotifDaemonFailedBanner => "無法接收應用程式通知：{}",
+        Key::NotifDaemonUnsupportedBanner => "此平台不支援應用程式通知",
+        Key::NotifMergedCount => "另有 {} 則",
+        Key::NotifAgeJustNow => "剛剛",
+        Key::NotifAgeMinutes => "{} 分鐘前",
+        Key::NotifAgeHours => "{} 小時前",
+        Key::NotifAgeDays => "{} 天前",
+
         Key::LockAwaySummaryTitle => "你離開的 {}",
         Key::LockPendingCountLabel => "{} 件等你決定",
         Key::LockUnlockHint => "按任意鍵或點擊以輸入密碼",
@@ -794,6 +830,18 @@ fn en(key: Key) -> &'static str {
         Key::NotifDecideFailedLabel => "Failed to submit. Please retry.",
         Key::NotifRetryButton => "Retry",
 
+        Key::NotifAppSectionLabel => "App notifications",
+        Key::NotifDismissButton => "Dismiss",
+        Key::NotifClearAllButton => "Clear all",
+        Key::NotifDaemonNameTakenBanner => "Another service is handling system notifications, so app notifications won't appear here",
+        Key::NotifDaemonFailedBanner => "Can't receive app notifications: {}",
+        Key::NotifDaemonUnsupportedBanner => "App notifications aren't supported on this platform",
+        Key::NotifMergedCount => "{} more",
+        Key::NotifAgeJustNow => "Just now",
+        Key::NotifAgeMinutes => "{} min ago",
+        Key::NotifAgeHours => "{} h ago",
+        Key::NotifAgeDays => "{} d ago",
+
         Key::LockAwaySummaryTitle => "Away for {}",
         Key::LockPendingCountLabel => "{} awaiting your decision",
         Key::LockUnlockHint => "Press any key or click to enter your password",
@@ -997,6 +1045,18 @@ fn ja_jp(key: Key) -> &'static str {
         Key::NotifDecidingLabel => "処理中…",
         Key::NotifDecideFailedLabel => "送信に失敗しました。再試行してください。",
         Key::NotifRetryButton => "再試行",
+
+        Key::NotifAppSectionLabel => "アプリの通知",
+        Key::NotifDismissButton => "閉じる",
+        Key::NotifClearAllButton => "すべて消去",
+        Key::NotifDaemonNameTakenBanner => "システム通知は別のサービスが処理しているため、アプリの通知はここには表示されません",
+        Key::NotifDaemonFailedBanner => "アプリの通知を受信できません：{}",
+        Key::NotifDaemonUnsupportedBanner => "このプラットフォームではアプリの通知に対応していません",
+        Key::NotifMergedCount => "他 {} 件",
+        Key::NotifAgeJustNow => "たった今",
+        Key::NotifAgeMinutes => "{} 分前",
+        Key::NotifAgeHours => "{} 時間前",
+        Key::NotifAgeDays => "{} 日前",
 
         Key::LockAwaySummaryTitle => "離席していた時間：{}",
         Key::LockPendingCountLabel => "{} 件があなたの判断を待っています",

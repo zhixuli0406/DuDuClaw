@@ -486,30 +486,7 @@ fn connect_panel(ssid: &str, flow: &OobeFlow, ui: &OobeUiState, fields: &Network
         NetConnectState::AwaitingPsk | NetConnectState::Idle => {}
     }
 
-    let ssid_owned = ssid.to_string();
-    let psk_entity = fields.psk.clone();
-    let connect_click = cx.listener(move |view, _ev, _window, cx| {
-        if view.oobe_ui.net_connect == NetConnectState::Connecting {
-            return;
-        }
-        let secured = view.oobe_ui.net_selected_secured;
-        let psk = if secured { Some(psk_entity.read(cx).content(cx)) } else { None };
-        if secured {
-            let len = psk.as_ref().map(|p| p.chars().count()).unwrap_or(0);
-            // Mirrors the real WPA-PSK passphrase length rule (8..=63
-            // ASCII characters) — same "catch it before ever dispatching a
-            // request" shape `oobe::claim`'s own password-length gate
-            // uses. Also re-checked, defense-in-depth, inside
-            // `network::FakeNetworkBackend::connect` and effectively
-            // enforced by NetworkManager itself for the real backend.
-            if !(8..=63).contains(&len) {
-                view.oobe_ui.set_net_connect_failed(NetConnectFailureKind::PasswordTooShort);
-                cx.notify();
-                return;
-            }
-        }
-        kick_off_connect(view, cx, ssid_owned.clone(), psk, secured);
-    });
+    let connect_click = cx.listener(move |view, _ev, _window, cx| try_submit(view, cx));
 
     let psk_entity_for_cancel = fields.psk.clone();
     let cancel_click = cx.listener(move |view, _ev, _window, cx| {
@@ -538,6 +515,51 @@ fn connect_panel(ssid: &str, flow: &OobeFlow, ui: &OobeUiState, fields: &Network
     );
 
     widgets::card(body, palette)
+}
+
+/// The "連線" submit for whichever row is currently selected
+/// (`ui.net_selected_ssid`) — validates the PSK (if the row is secured),
+/// then dispatches the connect attempt on a background thread. Extracted
+/// out of `connect_panel`'s `connect_click` closure (WP-oobe-enter,
+/// 2026-08-23) so it has exactly ONE body reachable from TWO triggers: the
+/// button's own click, and `main.rs`'s `on_oobe_next` (bound to Enter) via
+/// `super::handle_enter_submit` — see `OobeFlow::enter_outcome`'s own doc
+/// comment in `state.rs` for why Enter needs this at all: without it,
+/// Enter while typing a Wi-Fi passphrase was a silent no-op, since `next_
+/// with_wired` alone can never satisfy `Network`'s own precondition before
+/// a connect attempt has actually settled. Reads `view.oobe_ui`/`view.
+/// oobe_network_fields` fresh at call time rather than taking pre-cloned
+/// entity handles as parameters — same reasoning `steps::account::try_
+/// submit`'s own doc comment gives.
+pub(super) fn try_submit(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    if view.oobe_ui.net_connect == NetConnectState::Connecting {
+        return;
+    }
+    let Some(ssid) = view.oobe_ui.net_selected_ssid.clone() else {
+        // Nothing selected — there is no row for this submit to act on.
+        // Not normally reachable (the connect panel that owns this action
+        // only ever renders once a row is picked, and `OobeFlow::enter_
+        // outcome` only routes here when `net_connect != Idle`, which
+        // implies a selection), a defensive no-op either way.
+        return;
+    };
+    let secured = view.oobe_ui.net_selected_secured;
+    let psk = if secured { Some(view.oobe_network_fields.psk.read(cx).content(cx)) } else { None };
+    if secured {
+        let len = psk.as_ref().map(|p| p.chars().count()).unwrap_or(0);
+        // Mirrors the real WPA-PSK passphrase length rule (8..=63 ASCII
+        // characters) — same "catch it before ever dispatching a request"
+        // shape `oobe::claim`'s own password-length gate uses. Also
+        // re-checked, defense-in-depth, inside `network::
+        // FakeNetworkBackend::connect` and effectively enforced by
+        // NetworkManager itself for the real backend.
+        if !(8..=63).contains(&len) {
+            view.oobe_ui.set_net_connect_failed(NetConnectFailureKind::PasswordTooShort);
+            cx.notify();
+            return;
+        }
+    }
+    kick_off_connect(view, cx, ssid, psk, secured);
 }
 
 fn labeled_field(label: &'static str, field: gpui::Entity<widgets::OobeTextField>, palette: ShellPalette) -> Div {

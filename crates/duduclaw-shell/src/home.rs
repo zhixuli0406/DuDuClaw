@@ -131,8 +131,19 @@ pub(crate) fn png(bytes: &'static [u8]) -> Arc<Image> {
 
 /// The whole Home surface: wallpaper, menu bar, AI workspace, goal cards,
 /// activity shelf, and dock — absolutely positioned to match the design
-/// board 1:1, same paint order as the board's own HTML source (background
-/// layers first, chrome last). `palette` is resolved ONCE per render pass by
+/// board 1:1. WM-3 (2026-08-23) refactored this into `desktop_content(...)`
+/// (everything except menu bar/dock) plus `.child(menu_bar(...))`/`.child
+/// (home_dock::dock(...))` appended here, so `chrome::windows`' separate
+/// `duduclaw-shell-menubar`/`-dock`/`-home` layer surfaces can reuse the
+/// SAME three pieces without a second copy — see `desktop_content`'s own
+/// doc comment. Paint order is no longer byte-identical to the design
+/// board's own HTML source (the menu bar moved from 4th child to 2nd-to-
+/// last) — deliberately accepted as safe, not missed: every one of these
+/// children is `.absolute()`-positioned and the menu bar's own band (y: 0
+/// -30px) never spatially overlaps `workspace`/`goal_cards_row`/
+/// `activity_shelf` (which start no higher than y:150px), so paint order
+/// between them cannot change a single visible pixel. `palette` is resolved
+/// ONCE per render pass by
 /// the caller (`ShellView::render` in `main.rs`, from `ShellView.theme`) and
 /// threaded down through every fn in this module — same "recompute fresh,
 /// never cache" convention `OobeFlow::palette()` already established for
@@ -159,6 +170,24 @@ pub fn render(
     installed_apps: &crate::apps::feed::InstalledAppsFeed,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
+    desktop_content(palette, cx).child(menu_bar(palette, notifications, cx)).child(home_dock::dock(palette, running_windows, installed_apps, cx))
+}
+
+/// WM-3 layer-shell migration (`crate::chrome`, 2026-08-23): everything
+/// `render` above draws EXCEPT the menu bar and the dock — those two are
+/// now separate `duduclaw-shell-menubar`/`-dock` layer surfaces of their
+/// own in `ChromeMode::LayerSurfaces` (see `render_menu_bar`/`render_dock`
+/// below), so `chrome::windows`' dedicated `duduclaw-shell-home` background
+/// surface renders THIS instead of `render` — same wallpaper/blobs/mascot/
+/// workspace/goal-cards/activity-shelf, laid out identically (this fn's
+/// root, like `render`'s own, is a full `size_full()` canvas starting at
+/// this window's own (0,0), which for the Home surface IS the whole
+/// 1440×900 output — see `chrome::params::LayerParams` for that surface's
+/// `ChromeAnchor::FILL`). `render` itself is refactored to call this PLUS
+/// its own menu_bar/dock children, so the two entry points can never
+/// visually drift apart — see `ShellView::render_root`'s own doc comment
+/// (`main.rs`) for the matching split on that side.
+pub(crate) fn desktop_content(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     div()
         .id("shell-home")
         .relative()
@@ -192,11 +221,44 @@ pub fn render(
             theme::alpha(0x788cc8, if palette.is_dark() { 0.08 } else { 0.12 }),
         ))
         .child(cat_hero())
-        .child(menu_bar(palette, notifications, cx))
         .child(workspace(palette, cx))
         .child(home_dock::goal_cards_row(palette))
         .child(home_dock::activity_shelf(palette))
-        .child(home_dock::dock(palette, running_windows, installed_apps, cx))
+}
+
+/// WM-3: the menu bar, wrapped for its own dedicated `duduclaw-shell-
+/// menubar` layer surface — a thin `size_full()` root around the SAME
+/// `menu_bar()` fn `render`/`desktop_content` above compose inline, so the
+/// two chrome modes can never render a different menu bar. `.h(px(30.))`
+/// on `menu_bar()` itself matches `chrome::MENU_BAR_HEIGHT` — see that
+/// constant's own doc comment.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn render_menu_bar(palette: ShellPalette, notifications: &NotificationsFeed, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    div().id("shell-menu-bar-surface").relative().size_full().child(menu_bar(palette, notifications, cx))
+}
+
+/// WM-3: the dock, wrapped for its own dedicated `duduclaw-shell-dock`
+/// layer surface — same "thin `size_full()` root around the SAME fn"
+/// shape as `render_menu_bar` above, wrapping `home_dock::dock_surface`
+/// instead.
+///
+/// D9-bug (2026-08-24): `dock_surface`, not `dock`. The two build the same
+/// container; the surface variant additionally restricts this surface's
+/// pointer input to the pill it actually paints, so the transparent rest of
+/// the full-width dock band stops swallowing clicks meant for the window
+/// underneath. See that fn's own doc comment.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn render_dock(
+    palette: ShellPalette,
+    running_windows: &RunningWindowsFeed,
+    installed_apps: &crate::apps::feed::InstalledAppsFeed,
+    cx: &mut Context<ShellView>,
+) -> Stateful<Div> {
+    div()
+        .id("shell-dock-surface")
+        .relative()
+        .size_full()
+        .child(home_dock::dock_surface(palette, running_windows, installed_apps, cx))
 }
 
 fn blob_top_left(top: f32, left: f32, size: f32, color: gpui::Rgba) -> Div {
@@ -245,7 +307,12 @@ fn menu_bar(palette: ShellPalette, notifications: &NotificationsFeed, cx: &mut C
         .top(px(0.))
         .left(px(0.))
         .right(px(0.))
-        .h(px(30.))
+        // WM-3: `crate::chrome::MENU_BAR_HEIGHT` — kept as ONE literal
+        // (formerly a bare `px(30.)`) so this band's height and the
+        // `duduclaw-shell-menubar` layer surface's own `exclusive_zone` /
+        // window height (`chrome::windows::render_surface_content`) can
+        // never drift apart.
+        .h(px(crate::chrome::MENU_BAR_HEIGHT))
         .flex()
         .items_center()
         .justify_between()

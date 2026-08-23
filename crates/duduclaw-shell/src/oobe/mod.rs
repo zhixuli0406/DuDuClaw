@@ -72,6 +72,7 @@
 
 mod claim;
 mod fake_data;
+mod focus_order;
 mod network;
 mod network_ui;
 mod persistence;
@@ -107,6 +108,21 @@ pub(crate) use widgets::LockPasswordField;
 /// IME-capable field instead of a `String` appended to by a root key
 /// listener. See that type's own doc comment in `widgets.rs`.
 pub(crate) use widgets::LauncherQueryField;
+/// `crate::settings` needs `SettingsFields` for the same reason again (D4b,
+/// 2026-08-23) — the 系統設定 app's eight typed fields (a timezone, three
+/// password halves, a Wi-Fi passphrase and a three-part static-IP form). See
+/// that type's own doc comment in `widgets.rs` for why one bundle rather
+/// than three, and why it is defined under `oobe` despite having nothing to
+/// do with the OOBE flow.
+pub(crate) use widgets::SettingsFields;
+/// The widget type itself, under the name its non-OOBE consumers use. The
+/// settings pages build their own labelled rows around individual fields
+/// (`Entity<SettingsTextField>` in a helper signature), which `AccountFields`'
+/// consumers do too — they just happen to sit inside `oobe` and can name
+/// `widgets::OobeTextField` directly. An alias, not a second type: it IS the
+/// same widget, and calling it `OobeTextField` at a settings call site would
+/// wrongly imply otherwise.
+pub(crate) use widgets::OobeTextField as SettingsTextField;
 /// `NetScanState`/`NetConnectState`/`NetConnectFailureKind` live in their
 /// own file (`network_ui.rs` — see that file's own header comment for why)
 /// but are re-exported here so every call site keeps addressing them as
@@ -121,6 +137,21 @@ pub use render::render;
 /// header comment for why it's a separate file from the persisted data
 /// shape it mutates.
 pub use state::{OobeFlow, OobeStep};
+/// WP-oobe-enter (2026-08-23): the pure "what should Enter do on this
+/// step" decision (`OobeFlow::enter_outcome`, `state.rs`) plus the one
+/// function that ACTS on its two `Submit*` variants (`steps::
+/// handle_enter_submit`, itself dispatching to `steps::account`/`steps::
+/// network`'s own submit fns) — `main.rs`'s `on_oobe_next` (Enter's
+/// action handler) is the only caller of either. `handle_enter_submit`
+/// re-exported from the otherwise-private `steps` module the same way
+/// `AccountFields`/`NetworkFields` above are re-exported from the
+/// otherwise-private `widgets` module.
+pub(crate) use state::EnterOutcome;
+pub(crate) use steps::handle_enter_submit;
+/// WP-oobe-tab (2026-08-23): per-step Tab/Shift-Tab focus order — see
+/// `focus_order.rs`'s own header comment. `main.rs`'s `on_focus_next`/`on_
+/// focus_prev` action handlers are the only callers.
+pub(crate) use focus_order::{focus_next, focus_order, focus_prev, OobeFocusTarget};
 /// The persisted selection shape + its four value enums — see
 /// `selections.rs`'s own header comment. `OobeSelections`/`OobeState`
 /// themselves have no direct call site outside `oobe`'s own files (every

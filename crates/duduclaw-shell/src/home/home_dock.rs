@@ -217,7 +217,56 @@ pub(super) fn activity_shelf(palette: ShellPalette) -> Div {
 
 // ── Dock ─────────────────────────────────────────────────────────────────
 
+/// The dock as `ChromeMode::SingleFullscreen` composes it — one child of the
+/// one full-output window (`home::render`). No input region is involved on
+/// this path: the window it lives in paints the whole screen, so there are no
+/// unpainted pixels for it to wrongly claim.
 pub(super) fn dock(
+    palette: ShellPalette,
+    running_windows: &RunningWindowsFeed,
+    installed: &InstalledAppsFeed,
+    cx: &mut Context<ShellView>,
+) -> Div {
+    dock_container(palette, running_windows, installed, cx)
+}
+
+/// D9-bug (2026-08-24): the dock as `ChromeMode::LayerSurfaces` composes it —
+/// the SAME container, plus the one thing that only makes sense when the dock
+/// owns a surface of its own: restricting that surface's pointer input to the
+/// pill it actually paints.
+///
+/// The dock's layer surface is anchored `bottom+left+right`, so it is as wide
+/// as the output (1280 px on the appliance) and `DOCK_HEIGHT` tall, while the
+/// pill inside it is roughly a third that wide. Wayland's default input region
+/// is the whole surface, so before this the dock silently ate every click that
+/// landed in the transparent band either side of the pill — Chromium's
+/// first-run ToS "Accept" button among them. `on_children_prepainted` hands
+/// over the pill's REAL laid-out bounds (this container's only child) in
+/// window coordinates, which is exactly what `Window::set_input_region` wants,
+/// so the region tracks the pill widening and narrowing as apps come and go
+/// with no second copy of the layout arithmetic to keep in sync. See
+/// `crate::chrome::input_region`'s header comment for why this is applied from
+/// prepaint and why it is cached.
+///
+/// Only ever called for the dedicated `duduclaw-shell-dock` surface
+/// (`home::render_dock` is its one caller, and that is only reached from
+/// `chrome::windows::render_surface_content`'s `ChromeSurface::Dock` arm), so
+/// this can never narrow the input region of a window that paints more than
+/// the pill.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn dock_surface(
+    palette: ShellPalette,
+    running_windows: &RunningWindowsFeed,
+    installed: &InstalledAppsFeed,
+    cx: &mut Context<ShellView>,
+) -> Div {
+    dock_container(palette, running_windows, installed, cx).on_children_prepainted(|children, window, _cx| {
+        let wanted = crate::chrome::input_region::shown_region_for(&children);
+        crate::chrome::input_region::apply(window, crate::chrome::input_region::RegionSlot::Dock, wanted);
+    })
+}
+
+fn dock_container(
     palette: ShellPalette,
     running_windows: &RunningWindowsFeed,
     installed: &InstalledAppsFeed,

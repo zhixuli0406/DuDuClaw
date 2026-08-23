@@ -852,7 +852,50 @@ fn reveal_and_focus(view: &mut ShellView, window: &mut Window, cx: &mut Context<
         return;
     }
     let handle = view.lockscreen_password_field.field.read(cx).focus_handle(cx);
-    window.focus(&handle, cx);
+    // D9-bug FIX (2026-08-23, root-caused on the appliance VM): the focus call
+    // is DEFERRED to the next frame, and that deferral is the entire fix.
+    //
+    // `reveal_prompt()` above is what makes the password field render at all.
+    // Until the frame that follows it, the field's element is NOT in this
+    // window's element tree — and gpui silently drops `Window::focus` for a
+    // handle no live element is tracking. So the direct call that used to be
+    // here looked correct, logged nothing, and left focus on the root.
+    //
+    // Measured, not guessed: with `DUDUCLAW_SHELL_DIAG=1`, typing after the
+    // reveal produced three `[probe] os key_down: Keystroke { key: "a",
+    // key_char: Some("a") }` lines on the ROOT element's handler — i.e. the
+    // keystrokes arrived intact and bubbled straight past the field, which is
+    // exactly what an unfocused field looks like. Clicking the field directly
+    // (its own element, by then mounted) made typing work immediately,
+    // confirming the element-not-yet-mounted timing rather than anything
+    // about the compositor, the keymap, or fcitx5 — all three were ruled out
+    // first (comp delivered the keys; killing fcitx5 changed nothing).
+    //
+    // `on_next_frame` runs after the frame `cx.notify()` below schedules, so
+    // the element is guaranteed to exist by then. The keystroke that caused
+    // the reveal is still not inserted — that is the intended "press any key
+    // to wake" behaviour, unchanged.
+    //
+    // CORRECTION to the mechanism above (D9-bug2, 2026-08-23) — the deferral
+    // stays, the EXPLANATION was wrong. gpui does NOT drop a `Window::focus`
+    // for an unmounted element: `Window::focus` only assigns `self.focus`
+    // (`gpui/src/window.rs`, pinned rev), `FocusHandle::is_focused` is a plain
+    // `window.focus == Some(id)` comparison, and the next frame's paint pass
+    // installs the field's `EntityInputHandler` because that comparison is
+    // already true by then. Measured on macOS with an in-app keystroke driver
+    // (`Window::dispatch_keystroke`, which reproduces the platform's own
+    // text-insert fallback): focus-then-mount types correctly on the very
+    // first keystroke after the mount, with NO deferral. So whatever the
+    // appliance measurement above caught, it was not this — the likeliest
+    // candidate is the compositor-side keyboard-focus hole D9-bug2 fixed
+    // (`duduclaw-comp::settle_layer_keyboard_focus`), which could leave the
+    // whole client unfocused regardless of which element gpui believed was
+    // focused. Left in place because it is harmless, cheap and verified
+    // working end-to-end; do not "restore" the direct call on the strength of
+    // the corrected reading alone.
+    window.on_next_frame(move |window, cx| {
+        window.focus(&handle, cx);
+    });
     cx.notify();
 }
 

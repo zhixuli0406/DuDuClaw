@@ -147,6 +147,17 @@ const ALL_KEYS: &[Key] = &[
     Key::NotifDecidingLabel,
     Key::NotifDecideFailedLabel,
     Key::NotifRetryButton,
+    Key::NotifAppSectionLabel,
+    Key::NotifDismissButton,
+    Key::NotifClearAllButton,
+    Key::NotifDaemonNameTakenBanner,
+    Key::NotifDaemonFailedBanner,
+    Key::NotifDaemonUnsupportedBanner,
+    Key::NotifMergedCount,
+    Key::NotifAgeJustNow,
+    Key::NotifAgeMinutes,
+    Key::NotifAgeHours,
+    Key::NotifAgeDays,
     Key::LockAwaySummaryTitle,
     Key::LockPendingCountLabel,
     Key::LockUnlockHint,
@@ -218,9 +229,11 @@ fn all_keys_has_the_expected_count_and_no_duplicates() {
     // `ALL_KEYS` silently drifting out of sync with a newly added `Key`
     // variant (the compiler won't catch THAT half; only the per-locale
     // match arms are compiler-enforced).
-    // 183 as of D4a §6 (2026-08-23), which added
+    // 194 as of D6 (2026-08-23), which added the eleven
+    // `org.freedesktop.Notifications` panel keys (`NotifAppSectionLabel` …
+    // `NotifAgeDays`); 183 before that, from D4a §6's
     // `NetworkPortalOpenButton`.
-    assert_eq!(ALL_KEYS.len(), 183);
+    assert_eq!(ALL_KEYS.len(), 194);
     let mut seen = std::collections::HashSet::new();
     for key in ALL_KEYS {
         assert!(seen.insert(key), "duplicate key in ALL_KEYS: {key:?}");

@@ -71,6 +71,11 @@ mod launcher;
 // descendant) calls `notifications::open_and_refresh` directly from its two
 // "open Notifications" click sites — see that fn's own doc comment.
 pub(crate) mod notifications;
+/// D6 (2026-08-23): the SAME panel's third-party app notification section
+/// (`org.freedesktop.Notifications`, see `crate::notifyd`). Its own file
+/// rather than more lines in `notifications.rs` — that file was already at
+/// this crate's 800-line ceiling; see `notifications_apps`'s own header.
+mod notifications_apps;
 /// WP-A4-4 (2026-08-22): retry spacing + log denoise for the feed's gateway
 /// poll. Its own module rather than more methods on `notifications_feed`
 /// because it is a self-contained, clock-injected policy with a test suite
@@ -218,6 +223,20 @@ pub fn render(
     // exactly the way `audio_ui`/`installed_apps` already are. Every other
     // overlay ignores it.
     launcher_query: &crate::oobe::LauncherQueryField,
+    // D4b (2026-08-23): the 系統設定 app's own state and its eight text
+    // fields (`crate::settings::SettingsUiState` / `crate::oobe::
+    // SettingsFields`, both living on `ShellView`), threaded through exactly
+    // the way `audio_ui`/`installed_apps`/`pointer_ui` already are. Every
+    // other overlay ignores them; the settings surface also reads `audio_ui`
+    // for its 聲音 page, which is why that parameter now has two consumers.
+    settings_ui: &crate::settings::SettingsUiState,
+    settings_fields: &crate::oobe::SettingsFields,
+    // D6 (2026-08-23): third-party app notifications delivered over
+    // `org.freedesktop.Notifications` (see `crate::notifyd`), rendered by the
+    // Notifications panel BELOW the gateway approval cards. Threaded through
+    // exactly the way `audio_ui`/`installed_apps` already are; every other
+    // overlay ignores it.
+    notify_center: &crate::notifyd::center::NotificationCenter,
     palette: ShellPalette,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &mut Context<ShellView>,
@@ -240,9 +259,14 @@ pub fn render(
 
     let panel: Stateful<Div> = match overlay {
         Overlay::Launcher => launcher::render(ui, installed_apps, launcher_query, palette, cx),
-        Overlay::Notifications => notifications::render(ui, palette, cx),
+        Overlay::Notifications => notifications::render(ui, notify_center, palette, cx),
         Overlay::ControlCenter => controlcenter::render(ui, audio_ui, palette, cx),
         Overlay::PointerSettings => pointer_settings::render(pointer_ui, palette, cx),
+        // Lives at the crate root (`crate::settings`), not under `overlay/`:
+        // it is an application with its own seven-page directory, not a
+        // panel, and putting a nine-file module inside `overlay/` would
+        // misfile it. This arm is the only thing that makes it an overlay.
+        Overlay::Settings => crate::settings::render(settings_ui, settings_fields, audio_ui, palette, cx),
     };
 
     // The wrapper MUST be absolutely positioned (`absolute().inset_0()`),

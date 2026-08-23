@@ -486,3 +486,81 @@ impl LauncherQueryField {
         }
     }
 }
+
+/// The 系統設定 app's eight text fields (D4b, 2026-08-23) — same "bundle the
+/// per-surface `Entity<OobeTextField>`s so `main.rs` only needs one field on
+/// `ShellView`" shape `AccountFields`/`NetworkFields`/`LockPasswordField`/
+/// `LauncherQueryField` establish above, and defined HERE for the identical
+/// reason the last two are (`OobeTextField::new` is private to this module,
+/// and `crate::settings` is a crate-root SIBLING of `oobe`, not a descendant
+/// of it). Not a sign the settings app is part of the OOBE flow.
+///
+/// One bundle rather than three (`SettingsTimeFields` / `SettingsUserFields`
+/// / `SettingsNetworkFields`) because the settings surface opens and closes
+/// as ONE panel and every field's lifecycle is that panel's — unlike
+/// `AccountFields` vs `NetworkFields`, which that type's own doc comment
+/// splits precisely because their two OOBE steps have unrelated lifecycles.
+///
+/// Placeholders are literal zh-TW / example values, not `crate::i18n` keys —
+/// `cx: &mut App` at window-open has no operator locale to read (the same
+/// limitation every bundle above documents), and `crate::settings` hardcodes
+/// zh-TW throughout for the reasons its own header comment gives.
+pub(crate) struct SettingsFields {
+    /// 日期與時間 — a free-typed IANA zone for anything outside the shortcuts.
+    pub(crate) timezone: Entity<OobeTextField>,
+    /// 使用者 — the three halves of a password rotation. All masked.
+    pub(crate) current_password: Entity<OobeTextField>,
+    pub(crate) new_password: Entity<OobeTextField>,
+    pub(crate) confirm_password: Entity<OobeTextField>,
+    /// 網路 — the Wi-Fi passphrase prompt. Masked.
+    pub(crate) wifi_psk: Entity<OobeTextField>,
+    /// 網路 — the static-IP form.
+    pub(crate) ip_address: Entity<OobeTextField>,
+    pub(crate) ip_gateway: Entity<OobeTextField>,
+    pub(crate) ip_dns: Entity<OobeTextField>,
+}
+
+impl SettingsFields {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        Self {
+            timezone: OobeTextField::new(cx, "Asia/Taipei", false, FieldChrome::Boxed),
+            current_password: OobeTextField::new(cx, "••••••••", true, FieldChrome::Boxed),
+            new_password: OobeTextField::new(cx, "••••••••", true, FieldChrome::Boxed),
+            confirm_password: OobeTextField::new(cx, "••••••••", true, FieldChrome::Boxed),
+            wifi_psk: OobeTextField::new(cx, "••••••••", true, FieldChrome::Boxed),
+            ip_address: OobeTextField::new(cx, "192.168.1.50/24", false, FieldChrome::Boxed),
+            ip_gateway: OobeTextField::new(cx, "192.168.1.1", false, FieldChrome::Boxed),
+            ip_dns: OobeTextField::new(cx, "1.1.1.1, 8.8.8.8", false, FieldChrome::Boxed),
+        }
+    }
+
+    /// Drops the three password fields' plaintext. Called on a SUCCESSFUL
+    /// rotation and whenever the settings panel closes — the same "do not
+    /// leave the plaintext sitting in the widget" discipline the lockscreen's
+    /// own password field applies.
+    pub(crate) fn clear_passwords(&self, cx: &mut App) {
+        for field in [&self.current_password, &self.new_password, &self.confirm_password] {
+            field.update(cx, |f, cx| f.clear(cx));
+        }
+    }
+
+    /// Drops the Wi-Fi passphrase. Called on a successful join, on cancel,
+    /// and on panel close — so re-picking a secured network never shows a
+    /// password from a previous attempt (exactly what `steps::network`'s own
+    /// cancel handler does).
+    pub(crate) fn clear_wifi_psk(&self, cx: &mut App) {
+        self.wifi_psk.update(cx, |f, cx| f.clear(cx));
+    }
+
+    /// Everything a panel close must not leave behind: both secrets, plus
+    /// the static-IP form (a half-typed address surviving a close would be
+    /// re-submitted by a later 套用 click that the operator did not mean for
+    /// it).
+    pub(crate) fn clear_all(&self, cx: &mut App) {
+        self.clear_passwords(cx);
+        self.clear_wifi_psk(cx);
+        for field in [&self.timezone, &self.ip_address, &self.ip_gateway, &self.ip_dns] {
+            field.update(cx, |f, cx| f.clear(cx));
+        }
+    }
+}

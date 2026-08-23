@@ -123,8 +123,87 @@ pub(super) fn render(ui: &OverlayUiState, audio_ui: &audio::AudioUiState, palett
         .child(quick_tiles_row(palette))
         .child(sliders_card(audio_ui, palette, cx))
         .child(ai_team_card(ui, palette, cx))
+        .child(system_settings_card(palette, cx))
         .child(accessibility_card(palette, cx))
         .child(footer_row(palette, cx))
+}
+
+/// D4b (2026-08-23): the entry point for 系統設定 (`crate::settings`).
+///
+/// It sits HERE, not on the dock's gear, for the reason macOS puts
+/// 「系統設定…」 at the bottom of Control Centre: the gear opens the quick
+/// panel (that is what `home/home_dock.rs::dock_settings` has always done,
+/// and changing it would take the quick toggles away from a one-click
+/// reach), and the full application is one row deeper. Same shape and same
+/// geometry as `accessibility_card` below — that row is the precedent this
+/// one copies, so the two entries in this panel look like siblings.
+///
+/// Its strings are literals rather than `crate::i18n` keys, matching this
+/// file's own convention for its own copy (see the `AUDIO_DEMO_MODE_NOTICE`
+/// comment above) and `crate::settings`' own header comment for why that
+/// whole directory is hardcoded zh-TW.
+fn system_settings_card(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.12).into() } else { palette.border() };
+    let label_divider = if palette.is_dark() { theme::alpha(0xffffff, 0.08) } else { theme::alpha(0xf0f0f2, 1.0) };
+
+    let open_click = cx.listener(|view, _ev, _window, cx| {
+        if crate::diag_enabled() {
+            eprintln!("[hit] control centre -> open Settings");
+        }
+        view.surface.open(crate::surface::Overlay::Settings);
+        cx.notify();
+    });
+
+    div()
+        .bg(theme::alpha(palette.surface_raised, 1.0))
+        .border_1()
+        .border_color(border_color)
+        .rounded(px(13.))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .text_size(px(11.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::alpha(palette.text_faint, 1.0))
+                .px(px(14.))
+                .pt(px(11.))
+                .pb(px(9.))
+                .border_b_1()
+                .border_color(label_divider)
+                .child("這台機器"),
+        )
+        .child(
+            div()
+                .id("cc-settings-entry")
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(14.))
+                .py(px(11.))
+                .hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0)))
+                .child(icons::icon_or_none(&[(icons::SETTINGS, palette.icon_control())], 18.).unwrap_or_else(|| div().into_any_element()))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::alpha(palette.foreground, 1.0))
+                                .child("系統設定"),
+                        )
+                        // `#9f9fa9` in BOTH themes, the same non-inverting
+                        // literal every sibling row here uses.
+                        .child(div().text_size(px(11.)).text_color(theme::alpha(0x9f9fa9, 1.0)).child("網路、螢幕、時間、帳號與更新")),
+                )
+                .child(icons::icon_or_none(&[(icons::CHEVRON_RIGHT, palette.text_faint)], 14.).unwrap_or_else(|| div().into_any_element()))
+                .on_click(open_click),
+        )
 }
 
 /// ICON-3 (2026-08-23): the entry point for 「協助工具 › 指向與點按」.
