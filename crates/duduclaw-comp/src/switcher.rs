@@ -54,7 +54,7 @@ use crate::{
         initial_selection, label_width, max_rows_for, next_selection, panel_rect, row_rect,
         switch_order, visible_range, LABEL_FONT_PX, ROW_H, ROW_PAD_LEFT,
     },
-    decor::{text::RasterizedText, Palette, BORDER_PX},
+    decor::{text::RasterizedText, BORDER_PX},
     render::CodriveElement,
     state::DuduclawComp,
 };
@@ -84,8 +84,11 @@ pub struct SwitcherState {
 
 impl SwitcherState {
     /// Drops the cached buffers. Called when the session ends so a switcher
-    /// that is not on screen holds no textures.
-    fn invalidate(&mut self) {
+    /// that is not on screen holds no textures — and, since D2, also called
+    /// from `DuduclawComp::set_theme` (`decor::mod`), which reuses this same
+    /// drop-and-rebuild for the different reason of a stale theme rather than
+    /// an ended session. `pub(crate)` for that second, cross-module caller.
+    pub(crate) fn invalidate(&mut self) {
         self.rows.clear();
         self.labels.clear();
         self.label_sizes.clear();
@@ -317,6 +320,10 @@ impl DuduclawComp {
         if total == 0 {
             return Vec::new();
         }
+        // D2: one palette lookup for this whole call — see
+        // `DuduclawComp::palette`'s doc for why this is cheap enough to just
+        // recompute rather than cache.
+        let palette = self.palette();
 
         // The panel is centred on the output, so everything below is computed
         // in output-local coordinates from the start — no global-to-local
@@ -345,15 +352,15 @@ impl DuduclawComp {
                 bg.update(
                     (row.size.w, row.size.h),
                     if i == selected_row {
-                        Palette::SWITCHER_ROW_SELECTED
+                        palette.switcher_row_selected
                     } else {
-                        Palette::SWITCHER_ROW_IDLE
+                        palette.switcher_row_idle
                     },
                 );
                 self.switcher.rows.push(bg);
 
                 let raster = fonts.as_ref().and_then(|f| {
-                    f.rasterize(label, LABEL_FONT_PX, Palette::SWITCHER_TEXT, label_width(row))
+                    f.rasterize(label, LABEL_FONT_PX, palette.switcher_text, label_width(row))
                 });
                 match raster {
                     Some(r) => {
@@ -378,7 +385,7 @@ impl DuduclawComp {
 
         {
             let bg = self.switcher.panel_bg.get_or_insert_with(SolidColorBuffer::default);
-            bg.update((panel.size.w, panel.size.h), Palette::SWITCHER_BG);
+            bg.update((panel.size.w, panel.size.h), palette.switcher_bg);
         }
         let border_geo: [(Point<i32, Logical>, Size<i32, Logical>); 4] = [
             (panel.loc, Size::from((panel.size.w, BORDER_PX))),
@@ -401,7 +408,7 @@ impl DuduclawComp {
                 .border
                 .get_or_insert_with(|| std::array::from_fn(|_| SolidColorBuffer::default()));
             for (i, (_, size)) in border_geo.iter().enumerate() {
-                border[i].update(*size, Palette::SWITCHER_BORDER);
+                border[i].update(*size, palette.switcher_border);
             }
         }
 

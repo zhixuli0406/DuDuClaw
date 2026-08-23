@@ -34,6 +34,7 @@
 // wire_shape_has_no_extra_fields` test below.
 
 use serde::{Deserialize, Serialize};
+use smithay::output::Mode;
 
 use crate::cursor::CursorSourceInfo;
 
@@ -66,6 +67,64 @@ pub const MAX_QUERY_BYTES: usize = 255;
 /// this bound is already a bug or an attack, and rejecting it here means the
 /// strict parser never sees a pathological string.
 pub const MAX_CURSOR_SOURCE_BYTES: usize = 32;
+
+/// WP-comp-shell-display: hard cap on `set_output_mode`/`set_output_scale`'s
+/// `output` field, bytes. Same "reject, don't truncate" reasoning as
+/// [`MAX_QUERY_BYTES`] — real connector names this crate ever produces
+/// (`udev_backend::build_surfaces`'s `"{interface}-{interface_id}"`, or
+/// winit's fixed `"winit"`) are well under 32 bytes; 128 leaves generous
+/// headroom for an exotic real-world connector name without coming anywhere
+/// near [`MAX_REQUEST_LINE_BYTES`].
+pub const MAX_OUTPUT_NAME_BYTES: usize = 128;
+
+/// WP-comp-shell-display: the closed set `set_output_scale` accepts,
+/// matching the shell's own five-segment 顯示 › 縮放 control. Same
+/// "closed set, refuse rather than coerce" policy CUR-3's
+/// `crate::cursor::source::CURSOR_SIZE_STEPS` established for pointer size —
+/// see that constant's doc for why a settings page must never be handed a
+/// value none of its buttons can represent.
+pub const OUTPUT_SCALE_STEPS: [i64; 5] = [100, 125, 150, 175, 200];
+
+/// D2: hard cap on `set_theme`'s `theme` field, bytes. The only legal values
+/// are `"light"`/`"dark"`; same "reject before the strict parser ever sees a
+/// pathological string" reasoning as [`MAX_CURSOR_SOURCE_BYTES`], just a
+/// smaller bound because this field's whole vocabulary is two five-byte
+/// words.
+pub const MAX_THEME_BYTES: usize = 16;
+
+/// A1: bound on [`crate::state::DuduclawComp::pending_shell_intents`]. A
+/// shell that stops polling `take_shell_intents` (crashed, restarting) must
+/// not let the human's own global-hotkey presses accumulate without limit —
+/// see `DuduclawComp::push_shell_intent`'s doc for the drop-oldest-and-warn
+/// policy this bounds.
+pub const MAX_PENDING_SHELL_INTENTS: usize = 8;
+
+/// A1: the closed set of "the compositor is telling the shell something
+/// happened" signals `take_shell_intents` can drain. One value today —
+/// [`ShellIntent::GlobalTaskBar`] — but a closed `enum` rather than a bare
+/// `&'static str` so a second signal (if one is ever added) cannot silently
+/// diverge in spelling between the push side (`input.rs`) and the drain side
+/// (`shell_control::mod`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntent {
+    /// Super+K was pressed with real human-keyboard provenance anywhere in
+    /// the session (the compositor holds the only global hotkey — an
+    /// individual client with keyboard focus never sees this combo at all).
+    /// The shell should open its global task-bar / 交辦欄 overlay.
+    GlobalTaskBar,
+}
+
+impl ShellIntent {
+    /// The exact wire token — also what a `take_shell_intents` audit line
+    /// records. Lower-snake-case, matching every other op-name/enum-string
+    /// convention on this socket (`ShellControlRequest::op_name`,
+    /// `crate::cursor::source::CursorSource::as_str`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GlobalTaskBar => "global_task_bar",
+        }
+    }
+}
 
 /// The closed op set this socket accepts. See this file's module doc for
 /// the wire shape convention (mirrors `duduclaw-sysd::protocol::SysdRequest`).
@@ -160,6 +219,95 @@ pub enum ShellControlRequest {
     /// and routing it through the agent's injection channel would attribute a
     /// person's settings change to the agent.
     SetCursorSize { size: i64 },
+    /// WP-comp-shell-display (2026-08-23). `{"op":"get_outputs"}` — every
+    /// real output's current mode/scale/physical properties, for the
+    /// shell's 顯示 (display) settings page. Read-only: never touches
+    /// `self.space` mutably, never audited (same "queries aren't audited,
+    /// actions are" rule as `list_windows`/`get_cursor_source`).
+    ///
+    /// The CD-2 shadow workspace's headless output (`DuduclawComp::
+    /// shadow_output`) is always excluded — it is not a screen a human can
+    /// see, same exclusion `state.rs::primary_output` already applies. See
+    /// `mod.rs`'s module doc for the full wire shape and for why
+    /// `mode_switch_supported` is always `false` on this build.
+    GetOutputs,
+    /// `{"op":"set_output_mode","params":{"output":"Virtual-1","width":1920,
+    /// "height":1080,"refresh_mhz":60000}}` — switch an output to one of its
+    /// own already-known modes.
+    ///
+    /// `width`/`height`/`refresh_mhz` are typed `i64`, not `u32`, so an
+    /// out-of-range or negative value comes back as `invalid_mode` — an
+    /// honest statement about the *value* — instead of `parse_error`, which
+    /// would blame the JSON. Same reasoning CUR-3's `SetCursorSize` doc
+    /// comment gives for its own `size: i64` field. A non-integer
+    /// (`{"width":3.5}`, `{"width":"1920"}`) is still `parse_error`: that
+    /// genuinely IS a schema violation, not an out-of-range mode.
+    ///
+    /// This ACTION is always audited — but on this build it always answers
+    /// `mode_switch_unsupported` for an otherwise-valid request. See
+    /// `mod.rs`'s module doc for exactly why (a real modeset would need
+    /// backend-lifecycle restructuring out of scope for this socket) and
+    /// why that is the honest answer rather than a coerced success.
+    SetOutputMode { output: String, width: i64, height: i64, refresh_mhz: i64 },
+    /// `{"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":125}}`
+    /// — switch an output's UI scale factor.
+    ///
+    /// `scale_pct` must be one of [`OUTPUT_SCALE_STEPS`] (100 / 125 / 150 /
+    /// 175 / 200); anything else is REFUSED with `invalid_scale`, never
+    /// clamped to the nearest step — same "closed set, refuse rather than
+    /// coerce" policy `SetCursorSize` established for pointer size. Typed
+    /// `i64` for the same `invalid_scale`-not-`parse_error` reason
+    /// `SetOutputMode`'s fields are.
+    ///
+    /// Always audited, and — like `SetOutputMode` — always answers
+    /// `scale_change_unsupported` on this build. See `mod.rs`'s module doc:
+    /// this crate composites at a hardcoded scale of 1.0 in the cursor and
+    /// highlight render paths (`cursor/mod.rs`, `codrive/cursor.rs`,
+    /// `codrive/highlight.rs`), so a live output-scale change would desync
+    /// those from decoration rendering (the one path that already reads
+    /// `Output::current_scale()`, `decor/paint.rs`) rather than actually
+    /// rescaling the desktop.
+    SetOutputScale { output: String, scale_pct: i64 },
+    /// D2. `{"op":"set_theme","params":{"theme":"dark"}}` — switch comp's own
+    /// server-side decorations (title bar / border / shadow / Alt-Tab
+    /// switcher) between light and dark **live**, no compositor restart.
+    ///
+    /// `theme` is `"light"` / `"dark"` (trim + case-insensitive, same
+    /// leniency as `SetCursorSource`'s `source`). Anything else is REFUSED
+    /// with `invalid_theme` rather than defaulted to either side — see
+    /// `crate::decor::Theme::parse_strict`'s doc.
+    ///
+    /// This is an ACTION, so it is audited. Unlike the cursor preferences
+    /// this socket also carries, there is **no persistence** on comp's side:
+    /// `duduclaw-shell` is the single source of truth for the theme choice
+    /// and re-announces it at every boot, so comp only tracks the live value
+    /// for this process's lifetime — see `crate::decor::Theme`'s own doc.
+    ///
+    /// Why this socket and not `codrive`'s: same reasoning as every other
+    /// appearance preference here — a person's own theme choice must not be
+    /// attributed to the agent in the codrive audit trail.
+    SetTheme { theme: String },
+    /// A1. `{"op":"take_shell_intents"}` — **drains** (read-and-clear, not a
+    /// re-readable snapshot) the queue of global compositor-level gestures
+    /// the shell has not yet been told about (today: Super+K, i.e.
+    /// [`ShellIntent::GlobalTaskBar`]).
+    ///
+    /// Read-only in the sense that it never touches `self.space`/`self.seat`,
+    /// but it DOES mutate `DuduclawComp::pending_shell_intents` (drain, not a
+    /// re-readable snapshot). Audited only when it actually drains something:
+    /// the shell polls this every ~200ms (task brief's contract), and the
+    /// overwhelming majority of polls find the queue empty — auditing every
+    /// one would be exactly the noise `list_windows`/`get_cursor_source` stay
+    /// unaudited to avoid. A poll that DOES drain ≥1 intent is, by
+    /// construction, reporting a real human gesture (Super+K has real-keyboard
+    /// provenance — see `input.rs`'s `is_task_bar_keysym` call site), so that
+    /// one line still leaves a genuine trace despite the frequent-poll shape
+    /// of this op. See `shell_control::mod`'s handler for the exact rule.
+    ///
+    /// Answers `{"ok":true,"intents":[...]}`, `intents` always present (an
+    /// empty array on a quiet poll, never omitted) — see
+    /// [`ShellControlResponse::intents`].
+    TakeShellIntents,
 }
 
 impl ShellControlRequest {
@@ -172,8 +320,91 @@ impl ShellControlRequest {
             ShellControlRequest::GetCursorSource => "get_cursor_source",
             ShellControlRequest::SetCursorSource { .. } => "set_cursor_source",
             ShellControlRequest::SetCursorSize { .. } => "set_cursor_size",
+            ShellControlRequest::GetOutputs => "get_outputs",
+            ShellControlRequest::SetOutputMode { .. } => "set_output_mode",
+            ShellControlRequest::SetOutputScale { .. } => "set_output_scale",
+            ShellControlRequest::SetTheme { .. } => "set_theme",
+            ShellControlRequest::TakeShellIntents => "take_shell_intents",
         }
     }
+}
+
+/// WP-comp-shell-display: one entry in a `get_outputs` output's `modes`
+/// list — a mode that output has actually reported (via
+/// `smithay::output::Output::modes()`), never a synthesized one. See
+/// `mod.rs`'s module doc for what the two backends actually populate this
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ShellOutputMode {
+    pub width: i64,
+    pub height: i64,
+    pub refresh_mhz: i64,
+    /// True iff this is the output's `Output::preferred_mode()`.
+    pub preferred: bool,
+    /// True iff this is the output's `Output::current_mode()` — the one
+    /// actually being scanned out right now.
+    pub current: bool,
+}
+
+/// WP-comp-shell-display: one `get_outputs` row. `make`/`model`/
+/// `description`/`physical_*_mm` come straight from `Output::
+/// physical_properties()` — real hardware reports real values, the winit
+/// backend's synthetic output reports `0`/`0` and the fixed strings
+/// `winit_backend.rs::init_winit` sets, honestly.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ShellOutputInfo {
+    pub name: String,
+    pub description: String,
+    pub make: String,
+    pub model: String,
+    /// The output's *current* mode's dimensions/refresh — mirrors the
+    /// matching entry in `modes` (the one with `current: true`), duplicated
+    /// at the top level so a settings page doesn't have to search the list
+    /// just to show "what is this screen doing right now".
+    pub width: i64,
+    pub height: i64,
+    pub refresh_mhz: i64,
+    /// `Output::current_scale()`'s fractional scale × 100, rounded to the
+    /// nearest integer — never a float on the wire, same reasoning
+    /// `SetCursorSize` gives for using `i64` throughout this socket.
+    pub scale_pct: i64,
+    pub physical_width_mm: i64,
+    pub physical_height_mm: i64,
+    /// Exactly `Output::modes()`, mapped field-for-field. Empty if and only
+    /// if the real `Output::modes()` was empty — see `mod.rs`'s module doc
+    /// for what this crate's two backends actually populate it with (found
+    /// by reading `Output::change_current_state`/`set_preferred`'s own
+    /// source, not assumed).
+    pub modes: Vec<ShellOutputMode>,
+    /// Whether `set_output_mode` can actually apply a mode change to this
+    /// output on this build. **Always `false`** today — see `mod.rs`'s
+    /// module doc for the concrete reason. Per-output (not a global
+    /// constant) so a future round that lands real modesetting for one
+    /// backend does not have to lie about the other.
+    pub mode_switch_supported: bool,
+}
+
+/// True iff `(width, height, refresh_mhz)` exactly matches one of `modes` —
+/// the "is this a real, known mode for this output" check `set_output_mode`
+/// needs before it can even consider a switch. Pure and typed against
+/// `smithay::output::Mode` directly (a plain, GPU-free struct — both
+/// backends construct it the same way, e.g. `winit_backend.rs`'s
+/// `Mode { size: backend.window_size(), refresh: 60_000 }`), so this is
+/// testable with no real backend, same reasoning `codrive::window_target`'s
+/// pure matching functions already established for this crate.
+///
+/// `i64 -> i32` uses `try_from`, never `as`: a caller-sent value outside
+/// `i32`'s range (only pre-filtered to `> 0` by `listener::validate`, which
+/// has no access to the real output and so cannot bound the top) must read
+/// as "not a match" — never wrap into a bogus in-range value via a lossy
+/// cast, which could otherwise coincide with a real mode by accident.
+pub(crate) fn mode_request_matches(width: i64, height: i64, refresh_mhz: i64, modes: &[Mode]) -> bool {
+    let (Ok(w), Ok(h), Ok(refresh)) =
+        (i32::try_from(width), i32::try_from(height), i32::try_from(refresh_mhz))
+    else {
+        return false;
+    };
+    modes.iter().any(|m| m.size.w == w && m.size.h == h && m.refresh == refresh)
 }
 
 /// One `list_windows` row. `app_id`/`title` mirror
@@ -223,33 +454,68 @@ pub struct ShellControlResponse {
     /// CUR-2: populated by `get_cursor_source` / `set_cursor_source` only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<CursorSourceInfo>,
+    /// WP-comp-shell-display: populated by `get_outputs` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<ShellOutputInfo>>,
+    /// A1: populated by `take_shell_intents` only. Always `Some` (even
+    /// `Some(vec![])`) on that op's response — see [`Self::intents`]'s own
+    /// doc for why the empty case must serialize as `"intents":[]` rather
+    /// than being skipped like every other `Option` field here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intents: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl ShellControlResponse {
     pub fn windows(windows: Vec<ShellWindowInfo>) -> Self {
-        Self { ok: true, windows: Some(windows), matched_app_id: None, matched_title_prefix: None, cursor: None, error: None }
+        Self { ok: true, windows: Some(windows), matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, error: None }
     }
 
     /// CUR-2: the `get_cursor_source` / `set_cursor_source` success shape.
     pub fn cursor(info: CursorSourceInfo) -> Self {
-        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: Some(info), error: None }
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: Some(info), outputs: None, intents: None, error: None }
     }
 
     /// A `focus_window` hit — exactly one of `matched_app_id`/
     /// `matched_title_prefix` is `Some`, mirroring `codrive::window_target::
     /// WindowMatch`'s own two variants (never both, never neither).
     pub fn focused_by_app_id(app_id: String) -> Self {
-        Self { ok: true, windows: None, matched_app_id: Some(app_id), matched_title_prefix: None, cursor: None, error: None }
+        Self { ok: true, windows: None, matched_app_id: Some(app_id), matched_title_prefix: None, cursor: None, outputs: None, intents: None, error: None }
     }
 
     pub fn focused_by_title_prefix(title: String) -> Self {
-        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: Some(title), cursor: None, error: None }
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: Some(title), cursor: None, outputs: None, intents: None, error: None }
+    }
+
+    /// WP-comp-shell-display: the `get_outputs` success shape.
+    pub fn outputs(outputs: Vec<ShellOutputInfo>) -> Self {
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: Some(outputs), intents: None, error: None }
+    }
+
+    /// D2: the bare `set_theme` success shape — `{"ok":true}` and nothing
+    /// else. `duduclaw-shell`'s own client (`comp_client.rs`) only reads
+    /// `ok`, so there is nothing this op needs to echo back; keeping the
+    /// response minimal is the exact wire contract the shell side was
+    /// written against.
+    pub fn ok() -> Self {
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, error: None }
+    }
+
+    /// A1: the `take_shell_intents` success shape. Always `Some(intents)`,
+    /// even when `intents` is empty — an EMPTY vec still serializes as
+    /// `"intents":[]` because the field type is `Option<Vec<_>>` with
+    /// `skip_serializing_if = "Option::is_none"` (which only checks the
+    /// outer `Option`, never the inner `Vec`'s length). That distinction is
+    /// load-bearing: the shell's short-poll contract expects the key to
+    /// always be present on this op's response, unlike every other optional
+    /// field on this envelope.
+    pub fn intents(intents: Vec<String>) -> Self {
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: Some(intents), error: None }
     }
 
     pub fn err(error: impl Into<String>) -> Self {
-        Self { ok: false, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, error: Some(error.into()) }
+        Self { ok: false, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, error: Some(error.into()) }
     }
 }
 
@@ -554,5 +820,345 @@ mod tests {
         assert!(s.contains(r#""size":24"#), "unexpected: {s}");
         assert!(s.contains(r#""effective_size":24"#), "unexpected: {s}");
         assert!(s.contains(r#""size_env_pinned":false"#), "unexpected: {s}");
+    }
+
+    // ── WP-comp-shell-display: get_outputs / set_output_mode / set_output_scale ──
+
+    #[test]
+    fn get_outputs_wire_shape_has_no_params() {
+        let s = serde_json::to_string(&ShellControlRequest::GetOutputs).unwrap();
+        assert_eq!(s, r#"{"op":"get_outputs"}"#);
+        let back: ShellControlRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ShellControlRequest::GetOutputs);
+    }
+
+    #[test]
+    fn set_output_mode_wire_shape_round_trips() {
+        let req = ShellControlRequest::SetOutputMode {
+            output: "Virtual-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60000,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            s,
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":1920,"height":1080,"refresh_mhz":60000}}"#
+        );
+        let back: ShellControlRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn set_output_scale_wire_shape_round_trips() {
+        let req = ShellControlRequest::SetOutputScale { output: "Virtual-1".to_string(), scale_pct: 125 };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(s, r#"{"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":125}}"#);
+        let back: ShellControlRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn output_ops_reject_stray_fields_and_missing_params_like_every_other_op() {
+        let bad: Result<ShellControlRequest, _> =
+            serde_json::from_str(r#"{"op":"get_outputs","params":{}}"#);
+        assert!(bad.is_err(), "a unit variant must not accept a params object");
+
+        for raw in [
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":1920,"height":1080,"refresh_mhz":60000,"extra":1}}"#,
+            r#"{"op":"set_output_mode","params":{"width":1920,"height":1080,"refresh_mhz":60000}}"#,
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","height":1080,"refresh_mhz":60000}}"#,
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":1920,"refresh_mhz":60000}}"#,
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":1920,"height":1080}}"#,
+            r#"{"op":"set_output_mode","params":{}}"#,
+            r#"{"op":"set_output_mode"}"#,
+            r#"{"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":125,"extra":1}}"#,
+            r#"{"op":"set_output_scale","params":{"scale_pct":125}}"#,
+            r#"{"op":"set_output_scale","params":{"output":"Virtual-1"}}"#,
+            r#"{"op":"set_output_scale","params":{}}"#,
+            r#"{"op":"set_output_scale"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ShellControlRequest>(raw).is_err(),
+                "{raw} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn set_output_mode_parses_out_of_range_numbers_so_the_validator_can_refuse_them() {
+        // Same reasoning as `set_cursor_size`'s equivalent test: these are
+        // schema-valid JSON, so `invalid_mode` (not `parse_error`) must be
+        // the eventual answer, which means the parse itself must succeed.
+        for raw in [
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":-1,"height":1080,"refresh_mhz":60000}}"#,
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":1920,"height":0,"refresh_mhz":60000}}"#,
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":1920,"height":1080,"refresh_mhz":0}}"#,
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":9999999999999,"height":1080,"refresh_mhz":60000}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ShellControlRequest>(raw).is_ok(),
+                "{raw} must parse so the validator can refuse it as a mode"
+            );
+        }
+        for raw in [
+            r#"{"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":0}}"#,
+            r#"{"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":-100}}"#,
+            r#"{"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":999}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ShellControlRequest>(raw).is_ok(),
+                "{raw} must parse so the validator can refuse it as a scale"
+            );
+        }
+    }
+
+    #[test]
+    fn set_output_mode_and_scale_reject_non_integer_numbers() {
+        // A float or a string genuinely IS a schema violation — same split
+        // `set_cursor_size` makes for its own numeric field.
+        for raw in [
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":1920.5,"height":1080,"refresh_mhz":60000}}"#,
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":"1920","height":1080,"refresh_mhz":60000}}"#,
+            r#"{"op":"set_output_mode","params":{"output":"Virtual-1","width":1920,"height":null,"refresh_mhz":60000}}"#,
+            r#"{"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":100.0}}"#,
+            r#"{"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":"100"}}"#,
+            r#"{"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":null}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ShellControlRequest>(raw).is_err(),
+                "{raw} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn output_op_names_are_stable_and_do_not_leak_values() {
+        assert_eq!(ShellControlRequest::GetOutputs.op_name(), "get_outputs");
+        assert_eq!(
+            ShellControlRequest::SetOutputMode {
+                output: "secret-panel-name".into(),
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60000
+            }
+            .op_name(),
+            "set_output_mode"
+        );
+        assert_eq!(
+            ShellControlRequest::SetOutputScale { output: "secret-panel-name".into(), scale_pct: 125 }
+                .op_name(),
+            "set_output_scale"
+        );
+    }
+
+    #[test]
+    fn outputs_response_carries_the_wire_shape_the_shell_was_written_against() {
+        let resp = ShellControlResponse::outputs(vec![ShellOutputInfo {
+            name: "Virtual-1".into(),
+            description: "DuDuClaw - duduclaw-comp (winit) - Virtual-1".into(),
+            make: "DuDuClaw".into(),
+            model: "duduclaw-comp (winit)".into(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60000,
+            scale_pct: 100,
+            physical_width_mm: 0,
+            physical_height_mm: 0,
+            modes: vec![ShellOutputMode {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60000,
+                preferred: true,
+                current: true,
+            }],
+            mode_switch_supported: false,
+        }]);
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains(r#""ok":true"#));
+        assert!(s.contains(r#""name":"Virtual-1""#));
+        assert!(s.contains(r#""width":1920"#));
+        assert!(s.contains(r#""height":1080"#));
+        assert!(s.contains(r#""refresh_mhz":60000"#));
+        assert!(s.contains(r#""scale_pct":100"#));
+        assert!(s.contains(r#""physical_width_mm":0"#));
+        assert!(s.contains(r#""physical_height_mm":0"#));
+        assert!(s.contains(r#""preferred":true"#));
+        assert!(s.contains(r#""current":true"#));
+        assert!(s.contains(r#""mode_switch_supported":false"#));
+        // Envelope discipline: the other ops' fields must not leak in.
+        assert!(!s.contains("\"windows\""));
+        assert!(!s.contains("matched_app_id"));
+        assert!(!s.contains("matched_title_prefix"));
+        assert!(!s.contains("\"cursor\""));
+        assert!(!s.contains("\"error\""));
+    }
+
+    #[test]
+    fn an_empty_modes_list_is_emitted_honestly_not_padded() {
+        // See mod.rs's module doc: `Output::modes()` returning empty is the
+        // honest answer for a not-yet-configured output, never synthesized.
+        let resp = ShellControlResponse::outputs(vec![ShellOutputInfo {
+            name: "Virtual-1".into(),
+            description: String::new(),
+            make: String::new(),
+            model: String::new(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60000,
+            scale_pct: 100,
+            physical_width_mm: 0,
+            physical_height_mm: 0,
+            modes: vec![],
+            mode_switch_supported: false,
+        }]);
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains(r#""modes":[]"#), "unexpected: {s}");
+    }
+
+    #[test]
+    fn non_output_responses_omit_the_outputs_field() {
+        // Regression guard for the additive field: every other constructor
+        // must still omit `outputs` entirely, never emit `"outputs":null`.
+        for s in [
+            serde_json::to_string(&ShellControlResponse::windows(vec![])).unwrap(),
+            serde_json::to_string(&ShellControlResponse::focused_by_app_id("x".into())).unwrap(),
+            serde_json::to_string(&ShellControlResponse::err("not_found")).unwrap(),
+        ] {
+            assert!(!s.contains("outputs"), "unexpected: {s}");
+        }
+    }
+
+    // ── D2 set_theme ─────────────────────────────────────────────────────
+
+    #[test]
+    fn set_theme_wire_shape_round_trips() {
+        let req = ShellControlRequest::SetTheme { theme: "dark".to_string() };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(s, r#"{"op":"set_theme","params":{"theme":"dark"}}"#);
+        let back: ShellControlRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn set_theme_rejects_stray_fields_and_a_missing_theme() {
+        for raw in [
+            r#"{"op":"set_theme","params":{"theme":"dark","persist":false}}"#,
+            r#"{"op":"set_theme","params":{}}"#,
+            r#"{"op":"set_theme"}"#,
+            r#"{"op":"set_theme","params":{"theme":123}}"#,
+            r#"{"op":"set_theme","params":{"theme":null}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ShellControlRequest>(raw).is_err(),
+                "{raw} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn set_theme_op_name_is_stable_and_does_not_leak_the_value() {
+        assert_eq!(
+            ShellControlRequest::SetTheme { theme: "dark".into() }.op_name(),
+            "set_theme"
+        );
+    }
+
+    #[test]
+    fn ok_response_is_the_bare_wire_shape_the_shell_was_written_against() {
+        let s = serde_json::to_string(&ShellControlResponse::ok()).unwrap();
+        assert_eq!(s, r#"{"ok":true}"#);
+    }
+
+    // ── A1 take_shell_intents ───────────────────────────────────────────
+
+    #[test]
+    fn take_shell_intents_wire_shape_has_no_params() {
+        let s = serde_json::to_string(&ShellControlRequest::TakeShellIntents).unwrap();
+        assert_eq!(s, r#"{"op":"take_shell_intents"}"#);
+        let back: ShellControlRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ShellControlRequest::TakeShellIntents);
+    }
+
+    #[test]
+    fn take_shell_intents_rejects_a_stray_params_object() {
+        let bad: Result<ShellControlRequest, _> =
+            serde_json::from_str(r#"{"op":"take_shell_intents","params":{}}"#);
+        assert!(bad.is_err(), "a unit variant must not accept a params object");
+    }
+
+    #[test]
+    fn take_shell_intents_op_name_is_stable() {
+        assert_eq!(ShellControlRequest::TakeShellIntents.op_name(), "take_shell_intents");
+    }
+
+    #[test]
+    fn shell_intent_wire_token_is_the_documented_spelling() {
+        assert_eq!(ShellIntent::GlobalTaskBar.as_str(), "global_task_bar");
+    }
+
+    #[test]
+    fn an_empty_drain_serializes_the_key_as_an_empty_array_not_omitted() {
+        // The whole point of `intents` being `Option<Vec<_>>` rather than a
+        // plain `Vec<_>` with `skip_serializing_if = "Vec::is_empty"`: the
+        // shell's short-poll contract wants `"intents":[]` on every quiet
+        // poll, never a response with no `intents` key at all.
+        let s = serde_json::to_string(&ShellControlResponse::intents(vec![])).unwrap();
+        assert_eq!(s, r#"{"ok":true,"intents":[]}"#);
+    }
+
+    #[test]
+    fn a_non_empty_drain_carries_the_intent_tokens() {
+        let s = serde_json::to_string(&ShellControlResponse::intents(vec![
+            ShellIntent::GlobalTaskBar.as_str().to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(s, r#"{"ok":true,"intents":["global_task_bar"]}"#);
+    }
+
+    #[test]
+    fn non_intents_responses_omit_the_intents_field() {
+        for s in [
+            serde_json::to_string(&ShellControlResponse::windows(vec![])).unwrap(),
+            serde_json::to_string(&ShellControlResponse::ok()).unwrap(),
+            serde_json::to_string(&ShellControlResponse::err("not_found")).unwrap(),
+        ] {
+            assert!(!s.contains("intents"), "unexpected: {s}");
+        }
+    }
+
+    // ── `mode_request_matches` — pure, no real backend needed ──────────────
+
+    #[test]
+    fn mode_request_matches_an_exact_known_mode() {
+        let modes = [Mode { size: (1920, 1080).into(), refresh: 60000 }];
+        assert!(mode_request_matches(1920, 1080, 60000, &modes));
+    }
+
+    #[test]
+    fn mode_request_rejects_a_size_only_match_with_a_different_refresh() {
+        // All three fields must match — a mode is the whole triple, not
+        // just its resolution.
+        let modes = [Mode { size: (1920, 1080).into(), refresh: 60000 }];
+        assert!(!mode_request_matches(1920, 1080, 144000, &modes));
+    }
+
+    #[test]
+    fn mode_request_rejects_anything_not_in_the_list() {
+        let modes = [Mode { size: (1920, 1080).into(), refresh: 60000 }];
+        assert!(!mode_request_matches(1280, 720, 60000, &modes));
+    }
+
+    #[test]
+    fn mode_request_against_an_empty_list_never_matches() {
+        assert!(!mode_request_matches(1920, 1080, 60000, &[]));
+    }
+
+    #[test]
+    fn mode_request_out_of_i32_range_never_panics_and_never_matches() {
+        let modes = [Mode { size: (1920, 1080).into(), refresh: 60000 }];
+        assert!(!mode_request_matches(9_999_999_999_999, 1080, 60000, &modes));
+        assert!(!mode_request_matches(1920, i64::MIN, 60000, &modes));
+        assert!(!mode_request_matches(1920, 1080, i64::MAX, &modes));
     }
 }

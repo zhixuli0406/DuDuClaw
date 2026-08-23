@@ -61,13 +61,24 @@
 //!
 //! ## Palette
 //!
-//! Calm Glass / brand light surfaces from the root `CLAUDE.md` "Aesthetic
-//! Direction" table: `stone-100` title bar, `stone-900` title text,
-//! `stone-300` border, amber only where the brand already uses it. There is
-//! deliberately **no dark mode**: comp has no theme mechanism at all today
-//! (the cursor's `source`/`size` preferences are the only visual settings it
-//! carries, and they are per-property, not a theme). Wiring one is a
-//! standalone piece of work — see the `TODO(theme)` note on [`Palette`].
+//! Calm Glass / brand surfaces from the root `CLAUDE.md` "Aesthetic
+//! Direction" table: `stone-*` neutrals, amber only where the brand already
+//! uses it.
+//!
+//! ## D2 (2026-08-2x): theme-aware decoration
+//!
+//! [`Palette`] is now two swatches, not one: [`Palette::light()`] is the
+//! original appearance this crate always drew — unchanged, byte for byte, so
+//! nothing already live-verified regresses — and [`Palette::dark()`] is new.
+//! Which one is active is [`Theme`], a plain field on `DuduclawComp`
+//! (`DuduclawComp::theme`) that `duduclaw-shell` drives entirely through the
+//! `shell_control` `set_theme` op — see [`Theme`]'s own doc for why comp has
+//! no env var or persisted preference for this (unlike the cursor
+//! `source`/`size` settings, which are comp-owned; the appearance theme is
+//! shell-owned and comp just follows it live). `DuduclawComp::palette()`
+//! (`decor::mod`'s own `impl DuduclawComp` block) is the one place every
+//! caller gets the CURRENT palette from — never `Palette::light()`/
+//! `Palette::dark()` directly outside this module.
 
 pub mod edges;
 pub mod minus;
@@ -164,60 +175,221 @@ pub const DOUBLE_CLICK_MS: u64 = 400;
 /// slow drag-click-drag-click across the bar would maximize the window.
 pub const DOUBLE_CLICK_SLOP_PX: f64 = 8.0;
 
+/// D2: which appearance the session currently uses.
+///
+/// Comp does not decide this on its own — `duduclaw-shell` is the single
+/// source of truth for the user's theme choice (its own `ThemeChoice`,
+/// `duduclaw-shell/src/oobe/selections.rs`) and pushes the live value to comp
+/// via the `shell_control` `set_theme` op, both at shell boot and on every
+/// user toggle (see `shell_control::protocol`'s own doc on that op for the
+/// wire shape). There is deliberately **no** comp-side persistence for this
+/// (unlike the cursor `source`/`size` preferences in `crate::cursor::
+/// persist`): the shell is authoritative and re-announces its value every
+/// time it starts, so comp only ever needs to hold the LIVE value for the
+/// rest of this process's lifetime, never a durable one of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    /// The appearance this crate always drew, before D2 — kept as the
+    /// default so a comp process that starts before the shell's first
+    /// `set_theme` call still matches what the shell's own default
+    /// (`ThemeChoice::default() == Light`) is about to show, with zero
+    /// visible flash-of-wrong-theme.
+    #[default]
+    Light,
+    Dark,
+}
+
+impl Theme {
+    /// Same trim + case-insensitive leniency as
+    /// [`crate::cursor::source::CursorSource::parse_strict`], for the same
+    /// reason: this is the CONTROL SOCKET's parser. An unrecognised spelling
+    /// is refused, never coerced to a default — see `shell_control::listener`'s
+    /// `validate` for where this is called.
+    pub fn parse_strict(raw: &str) -> Option<Self> {
+        let v = raw.trim();
+        if v.eq_ignore_ascii_case("light") {
+            Some(Self::Light)
+        } else if v.eq_ignore_ascii_case("dark") {
+            Some(Self::Dark)
+        } else {
+            None
+        }
+    }
+
+    /// Stable short name for tracing/audit fields and the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
 /// RGBA colours used by the decoration, as premultiplied-irrelevant opaque
 /// `f32` quadruples (`SolidColorBuffer` takes `Color32F`).
 ///
-/// TODO(theme): comp has no theme mechanism, so these are the light-surface
-/// values only. When one lands (a `shell_control` op plus a persisted
-/// preference, mirroring `cursor/source.rs` + `cursor/persist.rs`), this
-/// struct is the single place to switch — nothing else in the crate hard-codes
-/// a decoration colour.
-pub struct Palette;
+/// D2: an instance, not a bag of associated consts — the values now depend on
+/// the live [`Theme`], so there has to be a real value to hold them. Built
+/// exclusively via [`Palette::light`] / [`Palette::dark`] (or
+/// [`Palette::for_theme`], which picks between them) — never constructed
+/// field-by-field outside this module, so this struct stays the single place
+/// a decoration colour is decided.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Palette {
+    /// The focused title bar.
+    pub title_bar_active: [f32; 4],
+    /// An unfocused window's title bar. Only the background changes with
+    /// focus; the text colour stays put so the cached glyph raster (see
+    /// [`paint`]) does not have to be re-rasterised every time focus moves.
+    pub title_bar_inactive: [f32; 4],
+    /// Title text and the resting close glyph.
+    pub title_text: [u8; 3],
+    /// The 1 px border.
+    pub border: [f32; 4],
+    /// Close button hover fill (the one place this palette leaves the warm
+    /// neutrals in either theme, because "this destroys work" is the one
+    /// affordance that must not read as neutral).
+    pub close_hover_bg: [f32; 4],
+    /// The close glyph while hovered.
+    pub close_hover_glyph: [u8; 3],
+    /// Shadow colour (alpha comes from [`SHADOW_ALPHAS`]).
+    pub shadow_rgb: [f32; 3],
+    /// WM-3 — the minimize button's hover fill. Neutral on purpose: unlike
+    /// close, minimizing destroys nothing, so it must not borrow the "this is
+    /// dangerous" red.
+    pub minimize_hover_bg: [f32; 4],
+    /// WM-3 — the Alt-Tab panel's background. Opaque: the panel is read at a
+    /// glance while a key is held, and a translucent list over an arbitrary
+    /// desktop is exactly the thing that stops being readable at the moment
+    /// it matters.
+    pub switcher_bg: [f32; 4],
+    /// WM-3 — the switcher panel's 1 px border.
+    pub switcher_border: [f32; 4],
+    /// WM-3 — the selected row, the brand's amber primary. Kept identical
+    /// across both themes — a brand accent, not a surface colour.
+    pub switcher_row_selected: [f32; 4],
+    /// WM-3 — an unselected row draws no fill at all (the panel shows
+    /// through); the buffer still exists so its size tracks a resize. See
+    /// `decor::paint`'s "why every buffer is cached" note.
+    pub switcher_row_idle: [f32; 4],
+    /// WM-3 — switcher label text. Deliberately the same colour on the
+    /// selected row in both themes: the brand amber clears WCAG AA against
+    /// both `title_text` values at this size, and keeping one colour means
+    /// the glyph raster survives a selection change instead of being rebuilt
+    /// on every keypress.
+    pub switcher_text: [u8; 3],
+}
 
 impl Palette {
-    /// `stone-100` (`#f5f5f4`) — the focused title bar.
-    pub const TITLE_BAR_ACTIVE: [f32; 4] = [0.961, 0.961, 0.957, 1.0];
-    /// `stone-200` (`#e7e5e4`) — an unfocused window's title bar. Only the
-    /// background changes with focus; the text colour stays put so the cached
-    /// glyph raster (see [`paint`]) does not have to be re-rasterised every
-    /// time focus moves.
-    pub const TITLE_BAR_INACTIVE: [f32; 4] = [0.906, 0.898, 0.894, 1.0];
-    /// `stone-900` (`#1c1917`) — title text and the resting close glyph.
-    pub const TITLE_TEXT: [u8; 3] = [0x1c, 0x19, 0x17];
-    /// `stone-300` (`#d6d3d1`) — the 1 px border.
-    pub const BORDER: [f32; 4] = [0.839, 0.827, 0.820, 1.0];
-    /// `rose-600` (`#e11d48`) — close button hover fill (the one place this
-    /// palette leaves the warm neutrals, because "this destroys work" is the
-    /// one affordance that must not read as neutral).
-    pub const CLOSE_HOVER_BG: [f32; 4] = [0.882, 0.114, 0.282, 1.0];
-    /// White — the close glyph while hovered.
-    pub const CLOSE_HOVER_GLYPH: [u8; 3] = [0xff, 0xff, 0xff];
-    /// Shadow colour (alpha comes from [`SHADOW_ALPHAS`]).
-    pub const SHADOW_RGB: [f32; 3] = [0.0, 0.0, 0.0];
+    /// The original appearance this crate shipped with, unchanged. Calm
+    /// Glass / brand light surfaces from the root `CLAUDE.md` "Aesthetic
+    /// Direction" table: `stone-100` title bar, `stone-900` title text,
+    /// `stone-300` border, amber only where the brand already uses it.
+    pub fn light() -> Self {
+        Self {
+            title_bar_active: [0.961, 0.961, 0.957, 1.0], // stone-100 #f5f5f4
+            title_bar_inactive: [0.906, 0.898, 0.894, 1.0], // stone-200 #e7e5e4
+            title_text: [0x1c, 0x19, 0x17],               // stone-900 #1c1917
+            border: [0.839, 0.827, 0.820, 1.0],           // stone-300 #d6d3d1
+            close_hover_bg: [0.882, 0.114, 0.282, 1.0],   // rose-600 #e11d48
+            close_hover_glyph: [0xff, 0xff, 0xff],
+            shadow_rgb: [0.0, 0.0, 0.0],
+            minimize_hover_bg: [0.906, 0.898, 0.894, 1.0], // stone-200, == title_bar_inactive
+            switcher_bg: [0.980, 0.980, 0.976, 1.0],       // stone-50 #fafaf9
+            switcher_border: [0.839, 0.827, 0.820, 1.0],   // stone-300, == border
+            switcher_row_selected: [0.961, 0.620, 0.043, 1.0], // amber-500 #f59e0b
+            switcher_row_idle: [0.0, 0.0, 0.0, 0.0],
+            switcher_text: [0x1c, 0x19, 0x17], // stone-900, == title_text
+        }
+    }
 
-    /// WM-3 — `stone-200` (`#e7e5e4`), the minimize button's hover fill. Neutral
-    /// on purpose: unlike close, minimizing destroys nothing, so it must not
-    /// borrow the "this is dangerous" red.
-    pub const MINIMIZE_HOVER_BG: [f32; 4] = [0.906, 0.898, 0.894, 1.0];
+    /// D2: the dark surface — root `CLAUDE.md`'s "Surface dark: deep stone
+    /// (`stone-900` / `#1c1917`) — warm dark, not cold blue-black" applied to
+    /// every surface a window's own decoration draws, plus a matching
+    /// `stone-100` light-on-dark text colour. The brand accents (close-hover
+    /// rose, switcher-selected amber) and the shadow colour are deliberately
+    /// unchanged from [`Self::light`] — they are semantic/overlay colours,
+    /// not surface neutrals, so they read correctly against either theme's
+    /// wallpaper without needing a second swatch.
+    pub fn dark() -> Self {
+        Self {
+            title_bar_active: [0.161, 0.145, 0.141, 1.0], // stone-800 #292524 — focused reads lighter, same rule as light()
+            title_bar_inactive: [0.110, 0.098, 0.090, 1.0], // stone-900 #1c1917
+            title_text: [0xf5, 0xf5, 0xf4],               // stone-100 #f5f5f4 — light text on dark
+            border: [0.267, 0.251, 0.235, 1.0],           // stone-700 #44403c
+            close_hover_bg: [0.882, 0.114, 0.282, 1.0],   // rose-600, unchanged — see doc above
+            close_hover_glyph: [0xff, 0xff, 0xff],
+            shadow_rgb: [0.0, 0.0, 0.0], // unchanged — the shadow reads against the wallpaper, not the title bar
+            minimize_hover_bg: [0.267, 0.251, 0.235, 1.0], // stone-700, == border
+            switcher_bg: [0.110, 0.098, 0.090, 1.0],       // stone-900 #1c1917
+            switcher_border: [0.267, 0.251, 0.235, 1.0],   // stone-700, == border
+            switcher_row_selected: [0.961, 0.620, 0.043, 1.0], // amber-500, unchanged — see doc above
+            switcher_row_idle: [0.0, 0.0, 0.0, 0.0],
+            switcher_text: [0xf5, 0xf5, 0xf4], // stone-100, == title_text
+        }
+    }
 
-    /// WM-3 — the Alt-Tab panel's background, `stone-50` (`#fafaf9`). Opaque:
-    /// the panel is read at a glance while a key is held, and a translucent
-    /// list over an arbitrary desktop is exactly the thing that stops being
-    /// readable at the moment it matters.
-    pub const SWITCHER_BG: [f32; 4] = [0.980, 0.980, 0.976, 1.0];
-    /// WM-3 — the switcher panel's 1 px border, `stone-300`.
-    pub const SWITCHER_BORDER: [f32; 4] = Self::BORDER;
-    /// WM-3 — the selected row, `amber-500` (`#f59e0b`), the brand's primary.
-    pub const SWITCHER_ROW_SELECTED: [f32; 4] = [0.961, 0.620, 0.043, 1.0];
-    /// WM-3 — an unselected row draws no fill at all (the panel shows through);
-    /// the buffer still exists so its size tracks a resize. See
-    /// `decor::paint`'s "why every buffer is cached" note.
-    pub const SWITCHER_ROW_IDLE: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
-    /// WM-3 — switcher label text, `stone-900`. Deliberately the same colour on
-    /// the selected row: amber-500 against stone-900 clears WCAG AA at this
-    /// size, and keeping one colour means the glyph raster survives a selection
-    /// change instead of being rebuilt on every keypress.
-    pub const SWITCHER_TEXT: [u8; 3] = Self::TITLE_TEXT;
+    /// The palette for a given [`Theme`] — the one entry point every caller
+    /// outside this module should use (via `DuduclawComp::palette()`, not
+    /// this directly, so the theme lookup stays in one place).
+    pub fn for_theme(theme: Theme) -> Self {
+        match theme {
+            Theme::Light => Self::light(),
+            Theme::Dark => Self::dark(),
+        }
+    }
+}
+
+impl crate::state::DuduclawComp {
+    /// D2: which [`Palette`] the decoration renderer (and the switcher panel)
+    /// should draw with right now. Freshly computed from `self.theme` every
+    /// call — [`Palette`] is `Copy` and holds no heap data, so there is
+    /// nothing to cache and nothing that could drift out of sync with the
+    /// live theme.
+    pub(crate) fn palette(&self) -> Palette {
+        Palette::for_theme(self.theme)
+    }
+
+    /// D2: switch the session's appearance **live** — see [`Theme`]'s own doc
+    /// for why this is driven entirely by `shell_control`'s `set_theme` op
+    /// rather than an env var or a comp-side preference file.
+    ///
+    /// Every SOLID-colour decoration buffer (title bar fill, border, shadow,
+    /// close/minimize hover fills) is re-`update`d unconditionally on every
+    /// frame already (`decor::paint::build_frame_elements`), so those pick up
+    /// the new palette on the very next composite for free. The three
+    /// RASTERISED glyph buffers (title text, close ✕, minimize `－`) and the
+    /// switcher panel's row labels are cached and keyed on things that do
+    /// NOT include the theme (text/hover/selection — see
+    /// `decor::paint::WindowDecorBuffers` and `switcher::SwitcherState`'s own
+    /// `key` field), so without an explicit invalidation here they would keep
+    /// showing the OLD theme's text colour until their key next happened to
+    /// change for an unrelated reason. `DecorState::invalidate_theme_cache`
+    /// and clearing the switcher's cache key force a one-off full rebuild —
+    /// simpler and less error-prone than threading `Theme` into every one of
+    /// those cache keys, and cheap: a theme switch is a rare, deliberate user
+    /// action, not a per-frame event, so the extra rasterisation work costs
+    /// nothing that matters.
+    ///
+    /// Same `queue_redraw` requirement as `cursor::mod::set_cursor_source`: on
+    /// the udev backend nothing else would schedule a frame until some
+    /// unrelated damage happened, so a switch made while nothing else changes
+    /// would appear to do nothing until then.
+    ///
+    /// Returns `true` when the live theme actually changed.
+    pub(crate) fn set_theme(&mut self, theme: Theme) -> bool {
+        if self.theme == theme {
+            return false;
+        }
+        self.theme = theme;
+        self.decor.invalidate_theme_cache();
+        // Reuses the switcher's own "session ended" cache-drop — the effect
+        // (drop the stale rasters, key included) is exactly what a theme
+        // change also needs, even though the switcher is not closing.
+        self.switcher.invalidate();
+        self.queue_redraw();
+        true
+    }
 }
 
 /// How much bigger the frame is than the content, on each side.
@@ -517,6 +689,109 @@ mod tests {
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
         Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+    }
+
+    // ── D2 theme ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn theme_default_is_light() {
+        // Must match `duduclaw-shell`'s own `ThemeChoice::default()` — a comp
+        // process that boots before the shell's first `set_theme` call has to
+        // already look right.
+        assert_eq!(Theme::default(), Theme::Light);
+    }
+
+    #[test]
+    fn theme_parse_strict_accepts_the_two_documented_spellings() {
+        for raw in ["light", "LIGHT", "  Light  "] {
+            assert_eq!(Theme::parse_strict(raw), Some(Theme::Light), "{raw:?}");
+        }
+        for raw in ["dark", "DARK", " Dark "] {
+            assert_eq!(Theme::parse_strict(raw), Some(Theme::Dark), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn theme_parse_strict_rejects_anything_else_instead_of_defaulting() {
+        for raw in ["", "   ", "blue", "1", "yes", "auto", "system", "🐾", "lightdark"] {
+            assert_eq!(Theme::parse_strict(raw), None, "{raw:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn theme_as_str_round_trips_through_parse_strict() {
+        for theme in [Theme::Light, Theme::Dark] {
+            assert_eq!(Theme::parse_strict(theme.as_str()), Some(theme));
+        }
+    }
+
+    #[test]
+    fn palette_for_theme_dispatches_to_the_matching_constructor() {
+        assert_eq!(Palette::for_theme(Theme::Light), Palette::light());
+        assert_eq!(Palette::for_theme(Theme::Dark), Palette::dark());
+    }
+
+    #[test]
+    fn light_is_the_original_appearance_this_crate_shipped_with() {
+        // Byte-for-byte the values `Palette` used to hold as associated
+        // consts, before D2 — the exact "no regression" guarantee the task
+        // brief asked for.
+        let p = Palette::light();
+        assert_eq!(p.title_bar_active, [0.961, 0.961, 0.957, 1.0]);
+        assert_eq!(p.title_bar_inactive, [0.906, 0.898, 0.894, 1.0]);
+        assert_eq!(p.title_text, [0x1c, 0x19, 0x17]);
+        assert_eq!(p.border, [0.839, 0.827, 0.820, 1.0]);
+        assert_eq!(p.close_hover_bg, [0.882, 0.114, 0.282, 1.0]);
+        assert_eq!(p.close_hover_glyph, [0xff, 0xff, 0xff]);
+        assert_eq!(p.shadow_rgb, [0.0, 0.0, 0.0]);
+        assert_eq!(p.minimize_hover_bg, [0.906, 0.898, 0.894, 1.0]);
+        assert_eq!(p.switcher_bg, [0.980, 0.980, 0.976, 1.0]);
+        assert_eq!(p.switcher_border, [0.839, 0.827, 0.820, 1.0]);
+        assert_eq!(p.switcher_row_selected, [0.961, 0.620, 0.043, 1.0]);
+        assert_eq!(p.switcher_row_idle, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(p.switcher_text, [0x1c, 0x19, 0x17]);
+    }
+
+    #[test]
+    fn dark_actually_differs_from_light_on_every_surface_neutral() {
+        // The whole point of D2: a caller reading `title_bar_active`/
+        // `title_text`/`border`/`switcher_bg`/`switcher_border` after a
+        // `set_theme("dark")` must see DIFFERENT bytes, not the light theme
+        // silently reused.
+        let l = Palette::light();
+        let d = Palette::dark();
+        assert_ne!(l.title_bar_active, d.title_bar_active);
+        assert_ne!(l.title_bar_inactive, d.title_bar_inactive);
+        assert_ne!(l.title_text, d.title_text);
+        assert_ne!(l.border, d.border);
+        assert_ne!(l.minimize_hover_bg, d.minimize_hover_bg);
+        assert_ne!(l.switcher_bg, d.switcher_bg);
+        assert_ne!(l.switcher_border, d.switcher_border);
+        assert_ne!(l.switcher_text, d.switcher_text);
+    }
+
+    #[test]
+    fn dark_keeps_the_semantic_brand_colours_unchanged() {
+        // Danger red and the brand amber are overlay/semantic colours, not
+        // surface neutrals — they must read correctly against either theme's
+        // wallpaper, so they are deliberately identical in both.
+        let l = Palette::light();
+        let d = Palette::dark();
+        assert_eq!(l.close_hover_bg, d.close_hover_bg);
+        assert_eq!(l.close_hover_glyph, d.close_hover_glyph);
+        assert_eq!(l.switcher_row_selected, d.switcher_row_selected);
+        assert_eq!(l.shadow_rgb, d.shadow_rgb);
+    }
+
+    #[test]
+    fn dark_titles_read_as_light_text_on_a_dark_surface() {
+        // A sanity check on the actual swatch choice: dark title text on a
+        // dark bar would be unreadable, which a byte inequality alone (the
+        // test above) cannot catch.
+        let d = Palette::dark();
+        let text_luma: f32 = d.title_text.iter().map(|&b| b as f32).sum();
+        let bar_luma: f32 = d.title_bar_active[..3].iter().sum::<f32>() * 255.0;
+        assert!(text_luma > bar_luma * 2.0, "text {text_luma} vs bar {bar_luma}");
     }
 
     fn p(x: f64, y: f64) -> Point<f64, Logical> {

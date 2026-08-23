@@ -32,25 +32,36 @@
 //! semantics. A5 owns the layout policy when it lands and this module is
 //! expected to be replaced by it, not extended into it.
 //!
-//! ## Where the band heights come from
+//! ## Where the band heights come from — WM-3 migration (2026-08-23)
 //!
-//! The source of truth is `duduclaw-shell`'s own layout:
+//! **Both bands are now zero by default.** `duduclaw-shell` is migrating its
+//! menu bar and dock to real `zwlr_layer_shell_v1` surfaces, each declaring
+//! its own `set_exclusive_zone` (30 for the menu bar, 90 for the dock — the
+//! same two numbers this table used to hard-code). Once a layer surface
+//! claims a zone, `layer_shell::geometry::effective_work_area` computes the
+//! work area as `banded ∩ zone`; with `bands = {0, 0}`, `banded` is the whole
+//! output, so the intersection collapses to exactly `zone` — the layer
+//! surface's own exclusive-zone claim is now the *entire* source of truth for
+//! how much of the screen an ordinary application window may occupy. See
+//! `layer_shell::geometry`'s own module doc for the full "intersection, not
+//! replacement" reasoning this depends on, and its doc comment's own line
+//! predicting this exact migration: *"The migration package should still
+//! zero the constants … so the two cannot drift apart later."* This module is
+//! that migration package.
 //!
-//! | band | shell source | value |
-//! |---|---|---|
-//! | top | `crates/duduclaw-shell/src/home.rs` `menu_bar()` — `.absolute().top(0).left(0).right(0).h(px(30.))` | 30 |
-//! | bottom | `crates/duduclaw-shell/src/home/home_dock.rs` `dock()` — the row is `.absolute().bottom(px(24.))` and is `TILE_DOCK_PX` (44, `apps/icon_theme.rs`) tall plus `.py(px(10.))` and `.border_1()` ⇒ 44 + 20 + 2 = 66 | 24 + 66 = 90 |
+//! [`RESERVED_TOP_ENV`] / [`RESERVED_BOTTOM_ENV`] are **not removed** — they
+//! are kept as an explicit compatibility fallback for a shell build that
+//! predates the layer-shell migration (one that still paints its menu bar and
+//! dock inside its own full-output toplevel, the way WM-1/WM-2 assumed, and
+//! therefore claims no exclusive zone at all). Pointing them at the old 30/90
+//! values restores the pre-migration hard-banding behaviour for exactly that
+//! case; on a migrated shell they are redundant with (and, per the
+//! intersection rule above, can only ever *shrink further than*) the layer
+//! surfaces' own zones.
 //!
-//! Those are **logical** pixels at scale 1.0, which is what comp composites at
-//! (`render_output(…, 1.0, …)` in both backends) and what `Space` coordinates
-//! are in, so no conversion is involved. They live here as constants — one
-//! place, per the task brief — with `DUDUCLAW_COMP_RESERVED_TOP` /
-//! `DUDUCLAW_COMP_RESERVED_BOTTOM` as tuning overrides (env vars are this
-//! crate's only configuration mechanism; see `cursor/source.rs`'s module doc
-//! for the full reasoning on why comp has no config file).
-//!
-//! If the shell's chrome ever changes height, *this table and these constants*
-//! are what has to move with it.
+//! Both bands are still **logical** pixels at scale 1.0, which is what comp
+//! composites at (`render_output(…, 1.0, …)` in both backends) and what
+//! `Space` coordinates are in, so no conversion is involved.
 
 use smithay::{
     desktop::Window,
@@ -76,11 +87,14 @@ pub const RESERVED_TOP_ENV: &str = "DUDUCLAW_COMP_RESERVED_TOP";
 /// Tuning override for [`ReservedBands::bottom`].
 pub const RESERVED_BOTTOM_ENV: &str = "DUDUCLAW_COMP_RESERVED_BOTTOM";
 
-/// Height of `duduclaw-shell`'s menu bar (module doc's table).
-pub const DEFAULT_RESERVED_TOP: i32 = 30;
-/// Height of `duduclaw-shell`'s dock *including* its bottom margin (module
-/// doc's table).
-pub const DEFAULT_RESERVED_BOTTOM: i32 = 90;
+/// WM-3: zeroed — the shell's menu bar now claims its own 30px exclusive
+/// zone via layer-shell, so this constant no longer needs to duplicate that
+/// number. See this module's doc for the migration and for
+/// [`RESERVED_TOP_ENV`]'s compatibility-fallback role.
+pub const DEFAULT_RESERVED_TOP: i32 = 0;
+/// WM-3: zeroed — the shell's dock now claims its own 90px exclusive zone via
+/// layer-shell. See [`DEFAULT_RESERVED_TOP`] and this module's doc.
+pub const DEFAULT_RESERVED_BOTTOM: i32 = 0;
 
 /// Largest band value accepted from the environment. Anything above this is
 /// a typo (or an attempt to make every app window invisible), not a
@@ -717,33 +731,57 @@ mod tests {
     }
 
     #[test]
-    fn the_default_bands_are_the_shells_real_menu_bar_and_dock() {
-        // If these ever change, `duduclaw-shell`'s own layout changed and this
-        // module's doc table has to move with it — that is the whole point of
-        // asserting the numbers here.
+    fn the_default_bands_are_zero_now_that_the_shell_owns_its_own_chrome() {
+        // WM-3 migration: the shell claims its 30px menu bar / 90px dock as
+        // layer-shell exclusive zones now, so the compositor no longer
+        // hard-codes those numbers — see this module's doc for the full
+        // "intersection collapses to the zone when bands are zero" argument.
         let b = ReservedBands::default();
-        assert_eq!(b.top, 30, "shell home.rs menu_bar(): .h(px(30.))");
-        assert_eq!(b.bottom, 90, "shell home_dock.rs dock(): bottom 24 + row (44 + 2*10 + 2*1) = 90");
+        assert_eq!(b.top, 0);
+        assert_eq!(b.bottom, 0);
+    }
+
+    #[test]
+    fn the_default_bands_reserve_nothing_at_all() {
+        // The direct behavioural consequence of the assertion above: with no
+        // env override and no layer surface in the picture, an ordinary
+        // window now gets the WHOLE output — WM-1/WM-2's hard reservation is
+        // gone, and whatever protects the shell's chrome from here on is
+        // `layer_shell::geometry::effective_work_area`'s exclusive-zone
+        // intersection, not this function.
+        let full = rect(0, 0, 1280, 800);
+        assert_eq!(work_area(full, ReservedBands::default()), full);
     }
 
     #[test]
     fn an_app_window_gets_the_output_minus_both_bands() {
-        let area = work_area(rect(0, 0, 1280, 800), ReservedBands::default());
+        // Explicit (non-default) bands, matching the shell's own chrome
+        // heights — this is what a legacy, unmigrated shell would configure
+        // via DUDUCLAW_COMP_RESERVED_TOP/_BOTTOM. `work_area`'s own
+        // arithmetic is what is under test here, independent of what the
+        // production DEFAULT happens to be.
+        let bands = ReservedBands { top: 30, bottom: 90 };
+        let area = work_area(rect(0, 0, 1280, 800), bands);
         assert_eq!((area.loc.x, area.loc.y), (0, 30));
         assert_eq!((area.size.w, area.size.h), (1280, 680));
     }
 
     #[test]
     fn the_shell_itself_is_never_banded() {
+        // Non-zero bands on purpose: with the zeroed default this assertion
+        // would hold trivially even if the shell-exemption branch of
+        // `window_rect` were broken, which would defeat the point of the test.
+        let bands = ReservedBands { top: 30, bottom: 90 };
         let full = rect(0, 0, 1280, 800);
-        let r = window_rect(full, ReservedBands::default(), true);
+        let r = window_rect(full, bands, true);
         assert_eq!(r, full);
     }
 
     #[test]
     fn a_non_app_window_on_a_second_output_keeps_that_outputs_origin() {
         // udev maps additional connectors side by side at (w, 0).
-        let area = work_area(rect(1280, 0, 1920, 1080), ReservedBands::default());
+        let bands = ReservedBands { top: 30, bottom: 90 };
+        let area = work_area(rect(1280, 0, 1920, 1080), bands);
         assert_eq!((area.loc.x, area.loc.y), (1280, 30));
         assert_eq!((area.size.w, area.size.h), (1920, 960));
     }
@@ -752,18 +790,20 @@ mod tests {
     fn an_output_too_short_for_the_bands_falls_back_to_the_whole_output() {
         // 100px tall: 100 - 30 - 90 is negative. A negative-sized configure
         // would be worse than a covered dock.
+        let bands = ReservedBands { top: 30, bottom: 90 };
         let tiny = rect(0, 0, 640, 100);
-        assert_eq!(work_area(tiny, ReservedBands::default()), tiny);
+        assert_eq!(work_area(tiny, bands), tiny);
     }
 
     #[test]
     fn an_output_that_would_leave_a_sliver_falls_back_to_the_whole_output() {
         // 200 - 120 = 80 usable, below MIN_APP_HEIGHT.
+        let bands = ReservedBands { top: 30, bottom: 90 };
         let short = rect(0, 0, 640, 200);
-        assert_eq!(work_area(short, ReservedBands::default()), short);
+        assert_eq!(work_area(short, bands), short);
         // One pixel over the threshold is honoured.
         let ok = rect(0, 0, 640, 240);
-        assert_eq!(work_area(ok, ReservedBands::default()).size.h, 120);
+        assert_eq!(work_area(ok, bands).size.h, 120);
     }
 
     #[test]

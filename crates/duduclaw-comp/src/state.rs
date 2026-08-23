@@ -167,6 +167,16 @@ pub struct DuduclawComp {
     /// doc comment for why. Just the audit log today (no freeze/token
     /// state — this channel has neither).
     pub shell_control: std::sync::Arc<shell_control::ShellControlShared>,
+    /// A1 (2026-08-2x): global compositor-level gestures (today just
+    /// Super+K) that the shell has not yet been told about, oldest first.
+    /// Pushed by the human keyboard's filter closure (`input.rs`), drained by
+    /// the `shell_control` `take_shell_intents` op (`shell_control::mod`'s
+    /// short-poll contract with the shell — see that op's own doc). Bounded
+    /// at [`shell_control::MAX_PENDING_SHELL_INTENTS`]: a shell that stops
+    /// polling (crashed, restarting) must not turn this into an unbounded
+    /// leak — see `DuduclawComp::push_shell_intent`'s own doc for the
+    /// drop-oldest-and-warn policy that enforces the bound.
+    pub pending_shell_intents: std::collections::VecDeque<shell_control::ShellIntent>,
     /// WM-1 (2026-08-23): how much of the output `duduclaw-shell`'s own menu
     /// bar and dock occupy, and therefore how much an ordinary application
     /// window must stay out of. Read once at startup; see
@@ -195,6 +205,18 @@ pub struct DuduclawComp {
     /// the geometry model, and `decor::paint`'s for why the buffers are
     /// cached rather than rebuilt per frame.
     pub decor: crate::decor::paint::DecorState,
+    /// D2 (2026-08-2x): which appearance the session's server-side
+    /// decorations (and the Alt-Tab switcher panel) currently draw with.
+    /// `duduclaw-shell` is the single source of truth for this — it pushes
+    /// the live value via `shell_control`'s `set_theme` op, both at its own
+    /// boot and on every user toggle — so this field starts at
+    /// [`crate::decor::Theme::default`] (`Light`, matching the shell's own
+    /// `ThemeChoice::default()`) purely so a comp process that starts before
+    /// the shell's first `set_theme` call already looks right, not as a
+    /// comp-owned preference. See `crate::decor::Theme`'s own doc for the
+    /// full reasoning, including why (unlike the cursor `source`/`size`
+    /// settings) there is no persistence or env var for this on comp's side.
+    pub theme: crate::decor::Theme,
     /// WM-3: windows that are minimized — unmapped from [`Self::space`] but
     /// still alive, still switchable, still listed by `shell_control`.
     ///
@@ -385,14 +407,15 @@ impl DuduclawComp {
         // strictly before `init_wayland_listener` opens the socket.
         let ime = crate::ime::ImeState::new(&dh);
 
-        // D3-c: arm the per-client agent-seat filter, now that both seats
-        // exist. Runs its own self-check and stays OFF if that fails — see
-        // `ime::seat_filter`'s module doc for what "off" then costs and what
-        // still catches it (codrive's `paused_by_ime` guard).
+        // D3-c / E1a-1: arm the per-client agent-seat filter, now that both
+        // seats exist. Runs its own self-check and stays OFF if that fails —
+        // see `ime::seat_filter`'s module doc for what "off" then costs (the
+        // measured Chromium input blackout comes back) and what still catches
+        // the IME half (codrive's `paused_by_ime` guard).
         let seat_filter = crate::ime::seat_filter::arm(&seat, &agent_seat);
         tracing::info!(
             status = seat_filter.as_str(),
-            "comp: codrive×IME seat isolation (D3-c)"
+            "comp: per-client agent-seat visibility (E1a-1 + D3-c)"
         );
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
@@ -432,6 +455,8 @@ impl DuduclawComp {
             codrive_watch_paused: false,
             codrive_last_human_activity: start_time,
             shell_control,
+            pending_shell_intents: std::collections::VecDeque::new(),
+            theme: crate::decor::Theme::default(),
             reserved_bands,
             shell_app_id,
             shell_surface: None,
@@ -508,19 +533,20 @@ impl DuduclawComp {
                     .display_handle
                     .insert_client(client_stream, data.clone())
                     .unwrap();
-                // D3-c: classify the peer ONCE, here. `can_view` runs on the
-                // registry path for every global × every client and gets no
-                // `DisplayHandle` to ask for credentials, so it reads this
-                // cached flag instead of touching `/proc` per advertisement.
+                // D3-c / E1a-1: classify the peer ONCE, here. `can_view` runs
+                // on the registry path for every global × every client and
+                // gets no `DisplayHandle` to ask for credentials, so it reads
+                // these cached flags instead of touching `/proc` per
+                // advertisement.
                 //
-                // Setting it after `insert_client` is safe: client requests
+                // Setting them after `insert_client` is safe: client requests
                 // are dispatched from a different calloop source (the
                 // `Display` generic source below), never re-entrantly from
                 // inside this accept callback, so no `can_view` can observe
                 // the pre-classification value.
-                if crate::ime::seat_filter::classify_client(&client, &state.display_handle) {
-                    data.mark_input_method();
-                }
+                let (class, comm) =
+                    crate::ime::seat_filter::classify_client(&client, &state.display_handle);
+                data.set_seat_class(class, comm);
             })
             .expect("Failed to init the wayland event source.");
 
@@ -683,28 +709,56 @@ impl DuduclawComp {
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
     /// D3-c: was this connection's peer process recognised as an input
-    /// method at accept time? Decided once, in `init_wayland_listener`; read
-    /// by `ime::seat_filter`'s `can_view` to decide whether this client gets
-    /// to see the agent seat. See that module's doc for why the check lives
-    /// on the connection rather than in the filter.
+    /// method at accept time?
     ///
     /// Atomic because `ClientData` is handed to wayland-server as a shared
-    /// `Arc` — the flag is written once, immediately after `insert_client`
+    /// `Arc` — the flags are written once, immediately after `insert_client`
     /// returns the `Client` the credentials come from, and read-only after
     /// that.
     is_input_method: std::sync::atomic::AtomicBool,
+    /// E1a-1: was this connection's peer process on the agent-seat allow
+    /// list at accept time?
+    ///
+    /// **Defaults to `false`**, which is the fail-closed direction: a
+    /// connection we could not classify (or, defensively, one that somehow
+    /// carries no classification at all) is treated as an ordinary app and
+    /// sees the human seat only. See `ime::seat_filter`'s module doc for why
+    /// both checks live on the connection rather than in the filter, and why
+    /// this direction is the safe one.
+    agent_seat_allow_listed: std::sync::atomic::AtomicBool,
+    /// The peer's `/proc/<pid>/comm`, when it could be read. Purely for
+    /// naming the client in the codrive audit trail when an injection is
+    /// dropped because that client cannot see the agent seat — a dropped
+    /// injection that does not say *which* app it could not reach is not
+    /// actionable. `OnceLock` rather than a `Mutex<Option<String>>`: written
+    /// once at accept time, read-only afterwards.
+    comm: std::sync::OnceLock<String>,
 }
 
 impl ClientState {
-    /// D3-c: records that this connection's peer is an input method.
-    pub fn mark_input_method(&self) {
-        self.is_input_method
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    /// Records the accept-time classification (`ime::seat_filter`).
+    pub fn set_seat_class(&self, class: crate::ime::seat_filter::ClientClass, comm: Option<String>) {
+        use std::sync::atomic::Ordering;
+        self.is_input_method.store(class.is_input_method, Ordering::SeqCst);
+        self.agent_seat_allow_listed
+            .store(class.allow_listed, Ordering::SeqCst);
+        if let Some(comm) = comm {
+            let _ = self.comm.set(comm);
+        }
     }
 
-    /// D3-c: see [`Self::mark_input_method`].
-    pub fn is_input_method(&self) -> bool {
-        self.is_input_method.load(std::sync::atomic::Ordering::SeqCst)
+    /// Reads the accept-time classification back.
+    pub fn seat_class(&self) -> crate::ime::seat_filter::ClientClass {
+        use std::sync::atomic::Ordering;
+        crate::ime::seat_filter::ClientClass {
+            is_input_method: self.is_input_method.load(Ordering::SeqCst),
+            allow_listed: self.agent_seat_allow_listed.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The peer's process name, if it was readable at accept time.
+    pub fn comm(&self) -> Option<&str> {
+        self.comm.get().map(String::as_str)
     }
 }
 

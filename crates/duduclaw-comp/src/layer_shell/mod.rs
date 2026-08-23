@@ -53,13 +53,13 @@ use smithay::{
         protocol::{wl_output::WlOutput, wl_surface::WlSurface},
         Resource,
     },
-    utils::{Logical, Point, Rectangle, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER},
     wayland::{
         compositor::with_states,
         shell::{
             wlr_layer::{
-                Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
-                WlrLayerShellState,
+                KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData,
+                WlrLayerShellHandler, WlrLayerShellState,
             },
             xdg::PopupSurface,
         },
@@ -199,6 +199,18 @@ impl WlrLayerShellHandler for DuduclawComp {
         // an output-aware layer client starts.
         if found {
             self.reapply_window_policy_all();
+            // D9-bug: the destroyed surface may have been the one holding
+            // keyboard focus (the Launcher overlay is `Exclusive`), or its
+            // teardown may otherwise have left the seat with no focus at all
+            // — which is how "lock the screen, press a key, nothing happens"
+            // was reachable.
+            //
+            // D9-bug2: the surface being destroyed is passed explicitly.
+            // smithay leaves it sitting in `KeyboardHandle::focus` after it
+            // dies, so without naming it here the settle below would conclude
+            // "someone already holds focus" and leave the keyboard dead. See
+            // `settle_layer_keyboard_focus`.
+            self.settle_layer_keyboard_focus("layer_destroyed", Some(surface.wl_surface()));
             self.queue_redraw();
         }
     }
@@ -235,6 +247,14 @@ pub fn handle_commit(state: &mut DuduclawComp, surface: &WlSurface) -> bool {
             .unwrap_or(false)
     });
 
+    // Set when this commit is the one that maps the surface AND the surface
+    // asked for keyboard input — see the `adopt_keyboard_focus` block below.
+    // Computed inside the `map` scope because that is where the `LayerSurface`
+    // is reachable, but acted on outside it: `focus_layer_surface` walks
+    // `self.space`, and `layer_map_for_output` holds a lock this would
+    // otherwise still be inside.
+    let mut wants_keyboard = false;
+
     let zone_changed = {
         let mut map = layer_map_for_output(&output);
         let before = map.non_exclusive_zone();
@@ -243,15 +263,48 @@ pub fn handle_commit(state: &mut DuduclawComp, surface: &WlSurface) -> bool {
         if !initial_configure_sent {
             if let Some(layer) = map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL) {
                 layer.layer_surface().send_configure();
+                wants_keyboard = layer.can_receive_keyboard_focus();
                 tracing::info!(
                     surface_id = ?surface.id(),
                     namespace = %layer.namespace(),
+                    wants_keyboard,
                     "layer_shell: sending initial configure to layer surface"
                 );
             }
         }
         before != after
     };
+
+    // P0 fix (2026-08-23, real-hardware round): a freshly mapped layer
+    // surface that wants keyboard input takes it **if nothing else holds
+    // it**.
+    //
+    // Without this, an `on_demand` layer surface only ever gets keyboard
+    // focus by being CLICKED (`input.rs`'s pointer-button arm). That is the
+    // right rule once a session is running — it is what stops a panel from
+    // stealing focus from the window you are typing into — but it is wrong
+    // for the very first surface on an otherwise empty screen: the shell
+    // would come up showing OOBE with a perfectly good keyboard that does
+    // nothing until the operator happens to click somewhere. Measured on the
+    // appliance VM: Enter on the OOBE language step did nothing until an
+    // unrelated click landed first.
+    //
+    // Deliberately conditional on `current_focus().is_none()` rather than
+    // unconditional: a layer surface mapping later in the session (a
+    // notification panel, a third-party panel) must NOT yank focus away from
+    // whatever the operator is using.
+    //
+    // D9-bug2 (2026-08-23): the ONE case that is not a policy choice is
+    // `exclusive`, which the protocol says the top-most Top/Overlay claimant
+    // always gets — `settle_layer_keyboard_focus` applies that first and only
+    // then falls through to the conditional adopt above. The shell's ⌘K
+    // palette is exactly such a surface, and without this it opened with the
+    // keyboard still pointed at the desktop surface (a DIFFERENT gpui window),
+    // so its search box could never receive a keystroke. See that function's
+    // own doc comment.
+    if wants_keyboard {
+        state.settle_layer_keyboard_focus("layer_mapped", None);
+    }
 
     if zone_changed {
         tracing::info!(
@@ -336,12 +389,183 @@ impl DuduclawComp {
             .find_map(|layer| map.layer_under(layer, local).cloned())
     }
 
-    /// Gives keyboard focus to a layer surface and deactivates every window.
+    /// Every layer-surface front-to-back, paired with what it asked for on the
+    /// keyboard. The order is [`LAYERS_FRONT_TO_BACK`]'s, and within one layer
+    /// it is smithay's own `layers_on` order — the same order
+    /// [`DuduclawComp::layer_under_pointer`] hit-tests in, so "top-most" means
+    /// the same thing to the keyboard rule and to the pointer router.
     ///
-    /// Separate from [`DuduclawComp::focus_window`] rather than an extra arm on
-    /// it, because the two differ in what they raise: a layer surface's
-    /// stacking comes from its layer, never from click order, so there is
-    /// nothing to raise here — only focus to move and windows to deactivate.
+    /// Returns surfaces alongside their interactivity so the pure decision
+    /// functions in [`geometry`] can work on plain values and this function
+    /// stays the only place that holds a `LayerMap` guard.
+    fn layer_focus_candidates(&self) -> Vec<(WlSurface, Layer, KeyboardInteractivity)> {
+        let Some(output) = self.layout_output() else {
+            return Vec::new();
+        };
+        let map = layer_map_for_output(&output);
+        let mut out = Vec::new();
+        for layer in LAYERS_FRONT_TO_BACK {
+            for surface in map.layers_on(layer) {
+                out.push((
+                    surface.wl_surface().clone(),
+                    layer,
+                    surface.cached_state().keyboard_interactivity,
+                ));
+            }
+        }
+        out
+    }
+
+    /// Re-applies the whole layer-shell keyboard-focus rule after any
+    /// layer-surface lifecycle change (map, unmap, destroy).
+    ///
+    /// Fixing this here rather than in the shell is deliberate: keyboard focus
+    /// is the compositor's to own, a client cannot ask for it back, and any
+    /// layer client (not just our shell) would hit the same holes.
+    ///
+    /// D9-bug (2026-08-23, root-caused on the appliance VM) is the first half:
+    /// the session could end up with **no** keyboard focus at all — the shell
+    /// tears surfaces down when the lock screen takes over, and again when the
+    /// Launcher closes — and the keyboard was then simply dead until the
+    /// operator happened to click something. Measured symptom: lock the screen,
+    /// press a key, nothing happens, and a machine with no mouse looks bricked.
+    /// D9-bug2 is the second half, below.
+    ///
+    /// `vacating` is the surface whose teardown triggered this call, if any. It
+    /// is treated as "no longer holding focus" even when its `wl_surface` is
+    /// still technically alive at this point in the teardown — the layer-shell
+    /// role object is gone, the surface is already out of the layer map, and
+    /// smithay never clears `KeyboardHandle::focus` by itself (read, not
+    /// assumed: `input/keyboard/mod.rs` only checks liveness for an active
+    /// GRAB, never for the focus itself). Without that, `current_focus()` keeps
+    /// answering with a dead surface forever, every later repair sees "someone
+    /// already holds focus", and the keyboard stays dead until the operator
+    /// clicks something — which is exactly the reported "close the Launcher
+    /// with Escape and the whole shell stops responding to keys" symptom.
+    ///
+    /// Three outcomes, in the protocol's own priority order:
+    ///
+    /// 1. a `Top`/`Overlay` surface asked for `exclusive` → it gets focus (see
+    ///    [`geometry::topmost_exclusive`] for the spec sentence this is);
+    /// 2. otherwise, whoever legitimately holds focus keeps it — this branch is
+    ///    load-bearing: a panel mapping mid-session must never yank the
+    ///    keyboard away from the window the operator is typing into;
+    /// 3. otherwise (focus empty, dead, or just vacated) → hand it to the
+    ///    top-most focusable LAYER surface, then (only if none wants it) the
+    ///    top-most window, else clear it explicitly so the NEXT call is not
+    ///    blocked by a corpse. The layer-before-window order is a safety
+    ///    property — see the comment on that branch for the locked-screen
+    ///    failure that taught it.
+    ///
+    /// Only the human seat: the agent seat's focus is co-drive's to manage
+    /// (`codrive/`), and the shell's layer surfaces are human-facing by
+    /// definition.
+    pub(crate) fn settle_layer_keyboard_focus(
+        &mut self,
+        reason: &'static str,
+        vacating: Option<&WlSurface>,
+    ) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            tracing::warn!(reason, "layer_shell: focus settle skipped — seat has no keyboard");
+            return;
+        };
+        let held = keyboard
+            .current_focus()
+            .filter(|s| s.alive() && Some(s) != vacating);
+
+        let candidates = self.layer_focus_candidates();
+        let plain: Vec<(Layer, KeyboardInteractivity)> =
+            candidates.iter().map(|(_, layer, k)| (*layer, *k)).collect();
+
+        if let Some(index) = geometry::topmost_exclusive(&plain) {
+            let surface = candidates[index].0.clone();
+            if held.as_ref() == Some(&surface) {
+                return;
+            }
+            tracing::info!(
+                reason,
+                surface_id = ?surface.id(),
+                "layer_shell: exclusive keyboard interactivity — moving focus to the top-most claimant"
+            );
+            self.focus_layer_surface(&surface);
+            return;
+        }
+
+        if held.is_some() {
+            tracing::debug!(
+                reason,
+                held_id = ?held.as_ref().map(|s| s.id()),
+                "layer_shell: focus settle — nothing exclusive, live holder keeps it"
+            );
+            return;
+        }
+
+        // Layer surfaces FIRST, ordinary windows only as a last resort. That
+        // ordering is a safety property, not a preference, and this round's VM
+        // run is why it is spelled out: the first draft handed focus to the
+        // top-most WINDOW here ("closing the Launcher over a browser should
+        // give the keyboard back to the browser", which is what a plain
+        // desktop wants) — and locking the screen destroys the Launcher
+        // overlay, so this settle also runs *while the shell is locked*. The
+        // draft therefore handed the keyboard straight to Chromium on a
+        // machine the operator had just locked, and it accepted typed text
+        // (measured: "abc" landed in its URL bar).
+        //
+        // The compositor cannot ask the shell whether it is locked, and
+        // inventing a protocol for that would be answering the wrong question:
+        // the shell's own surfaces ARE layer surfaces, so preferring them is
+        // both the safe answer and the pre-D9-bug2 behaviour (the adopt path
+        // this replaced never considered windows at all). The cost is real and
+        // accepted deliberately: after closing the Launcher over an
+        // application window the keyboard goes to the desktop rather than back
+        // to that application, and the operator clicks the window to resume
+        // typing. Before this round, that same case left the keyboard dead
+        // outright.
+        if let Some(index) = geometry::topmost_focusable(&plain) {
+            let surface = candidates[index].0.clone();
+            tracing::info!(
+                reason,
+                surface_id = ?surface.id(),
+                "layer_shell: keyboard focus vacated — adopting the top-most focusable layer surface"
+            );
+            self.focus_layer_surface(&surface);
+            return;
+        }
+
+        // No layer surface wants the keyboard at all — a session with no shell
+        // of ours running. `elements()` is bottom-to-top, so `next_back()` is
+        // the top-most window: the same "Z 序次高者" rule
+        // `DuduclawComp::reassign_focus_on_window_removed` applies when a
+        // toplevel closes.
+        //
+        // Bound to a local first: holding the `elements()` iterator across the
+        // `focus_window` call below would keep `self` immutably borrowed.
+        let topmost_window = self.space.elements().next_back().cloned();
+        if let Some(window) = topmost_window {
+            tracing::info!(
+                reason,
+                "layer_shell: keyboard focus vacated with no focusable layer surface — handing it to the top-most window"
+            );
+            let seat = self.seat.clone();
+            let serial = SERIAL_COUNTER.next_serial();
+            self.focus_window(&seat, Some(&window), serial);
+            return;
+        }
+
+        // Nothing at all can take it. Clearing is not cosmetic: leaving a dead
+        // surface in `KeyboardHandle::focus` makes every future settle take the
+        // "someone already holds it" branch above and the keyboard never comes
+        // back.
+        if keyboard.current_focus().is_some() {
+            tracing::info!(
+                reason,
+                "layer_shell: keyboard focus vacated with nothing to hand it to — clearing"
+            );
+            let serial = SERIAL_COUNTER.next_serial();
+            keyboard.set_focus(self, None, serial);
+        }
+    }
+
     pub(crate) fn focus_layer_surface(&mut self, surface: &WlSurface) {
         self.queue_redraw();
         for element in self.space.elements() {

@@ -9,7 +9,7 @@
 
 use smithay::{
     utils::{Logical, Point, Rectangle, Size},
-    wayland::shell::wlr_layer::Layer,
+    wayland::shell::wlr_layer::{KeyboardInteractivity, Layer},
 };
 
 use crate::window_policy::{work_area, ReservedBands, MIN_APP_HEIGHT};
@@ -68,6 +68,59 @@ pub const LAYERS_FRONT_TO_BACK: [Layer; 4] = [
     Layer::Background,
 ];
 
+/// The protocol's keyboard-focus rule for layer surfaces, as a pure decision
+/// over an already-ordered (front-to-back) candidate list.
+///
+/// `zwlr_layer_shell_v1` is explicit about this and it is **not** a
+/// "compositor policy" choice:
+///
+/// > `exclusive`: … For the top and overlay layers, the seat will always give
+/// > exclusive keyboard focus to the top-most layer which has exclusive
+/// > keyboard interactivity set.
+///
+/// D9-bug2 (2026-08-23): comp did not implement that sentence at all, and the
+/// whole "Launcher search box will not accept typing" report is downstream of
+/// it. The shell's ⌘K overlay is created with `KeyboardInteractivity::
+/// Exclusive` precisely so that opening it from the keyboard lands the caret in
+/// its search box — but comp only ever moved keyboard focus to a layer surface
+/// when the surface was *clicked*, or when nothing held focus at all. Opening
+/// the palette with Super+K therefore left keyboard focus on the desktop
+/// surface, in a **different gpui window**, so every keystroke was delivered to
+/// the wrong surface and the search field (correctly focused inside its own
+/// window) never saw a single one.
+///
+/// Only `Top`/`Overlay` are eligible, exactly as quoted: an exclusive request
+/// from `bottom`/`background` is deliberately ignored here (the spec leaves it
+/// to the compositor, and honouring it would let a wallpaper client hold the
+/// keyboard hostage).
+///
+/// Returns the index into `candidates` — indices, not surfaces, so this stays a
+/// plain data function with no smithay `Space`/`LayerMap` state in it (the
+/// crate's standing pure-vs-live split, see this module's own doc comment).
+pub fn topmost_exclusive(candidates: &[(Layer, KeyboardInteractivity)]) -> Option<usize> {
+    candidates
+        .iter()
+        .position(|(layer, interactivity)| {
+            is_above_windows(*layer) && matches!(interactivity, KeyboardInteractivity::Exclusive)
+        })
+}
+
+/// The fallback used when no exclusive claim exists: the front-most surface
+/// that is willing to take keyboard focus at all. Same ordering contract as
+/// [`topmost_exclusive`] — `candidates` is already front-to-back.
+///
+/// Unlike the exclusive rule this one accepts every layer, including
+/// `background`: the shell's own desktop surface lives there and is the
+/// legitimate keyboard target on an otherwise empty screen.
+pub fn topmost_focusable(candidates: &[(Layer, KeyboardInteractivity)]) -> Option<usize> {
+    candidates.iter().position(|(_, interactivity)| {
+        matches!(
+            interactivity,
+            KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand
+        )
+    })
+}
+
 /// The part of `output` an ordinary application window may occupy, given what
 /// layer surfaces have claimed.
 ///
@@ -99,9 +152,16 @@ pub const LAYERS_FRONT_TO_BACK: [Layer; 4] = [
 ///
 /// Double-counting is the theoretical cost, and it does not bite in practice:
 /// when the shell migrates, its layer surfaces claim *the same* 30 px and 90 px
-/// the constants describe, and `A ∩ A = A`. The migration package should still
-/// zero the constants (they document the shell's own chrome — see
+/// the constants used to describe, and `A ∩ A = A`. The migration package should
+/// still zero the constants (they document the shell's own chrome — see
 /// [`ReservedBands`]) so the two cannot drift apart later.
+///
+/// **Done, WM-3 (2026-08-23):** [`ReservedBands::default()`] is now `{top: 0,
+/// bottom: 0}` — see `window_policy`'s own module doc for the migration and
+/// [`window_policy::RESERVED_TOP_ENV`]/[`window_policy::RESERVED_BOTTOM_ENV`]
+/// for the compatibility fallback that keeps this file's intersection tests
+/// meaningful (they pass **explicit** non-zero bands rather than relying on a
+/// default that no longer reserves anything).
 ///
 /// A zone that would leave less than [`MIN_APP_HEIGHT`] falls back to the
 /// banded area rather than to a sliver, for the same reason [`work_area`]
@@ -199,23 +259,33 @@ mod tests {
 
     #[test]
     fn a_zone_equal_to_the_whole_output_means_nothing_claimed() {
-        // This is the live case until `duduclaw-shell` migrates: comp
-        // advertises layer-shell, nobody uses it, the reserved bands still rule.
+        // Explicit, non-zero bands here (rather than `ReservedBands::default()`,
+        // which WM-3 zeroed — see `window_policy`'s module doc): this test is
+        // about the intersection rule ("an unclaimed zone falls back to the
+        // banded area"), not about the production default, so it stands in for
+        // a legacy shell that still configures DUDUCLAW_COMP_RESERVED_TOP/
+        // _BOTTOM instead of migrating to layer-shell.
+        let bands = ReservedBands { top: 30, bottom: 90 };
         let out = rect(0, 0, 1280, 800);
         let untouched = rect(0, 0, 1280, 800);
-        let got = effective_work_area(out, Some(untouched), ReservedBands::default());
-        assert_eq!(got, work_area(out, ReservedBands::default()));
+        let got = effective_work_area(out, Some(untouched), bands);
+        assert_eq!(got, work_area(out, bands));
         assert_eq!((got.loc.y, got.size.h), (30, 680));
     }
 
     #[test]
-    fn a_migrated_shells_own_zones_do_not_double_count_against_the_constants() {
+    fn a_migrated_shells_own_zones_do_not_double_count_against_a_legacy_bands_override() {
         // A migrated shell: 30px menu bar on top, 90px dock at the bottom, both
-        // as exclusive zones, matching the constants exactly. Intersection of
-        // two identical rectangles is that rectangle — 680px, NOT 680 - 120.
+        // as exclusive zones. Intersection of two identical rectangles is that
+        // rectangle — 680px, NOT 680 - 120 — even when a legacy operator
+        // override still sets non-zero bands (WM-3's production DEFAULT is
+        // zero, in which case this is trivially true; this explicit-bands
+        // version is what proves the INTERSECTION rule itself, not just the
+        // zeroed default).
+        let bands = ReservedBands { top: 30, bottom: 90 };
         let out = rect(0, 0, 1280, 800);
         let zone = rect(0, 30, 1280, 680);
-        let got = effective_work_area(out, Some(zone), ReservedBands::default());
+        let got = effective_work_area(out, Some(zone), bands);
         assert_eq!((got.loc.x, got.loc.y), (0, 30));
         assert_eq!((got.size.w, got.size.h), (1280, 680));
     }
@@ -225,10 +295,14 @@ mod tests {
         // THE live-run regression this rule exists for (WM-3, 2026-08-23):
         // `waybar` claiming 30px at the top used to REPLACE the bands, which
         // silently gave back the shell's 90px dock reservation and would have
-        // placed windows straight over the dock.
+        // placed windows straight over the dock. Explicit bands, standing in
+        // for a legacy (unmigrated) shell — WM-3 zeroed the production
+        // default, so this scenario only still arises via the
+        // DUDUCLAW_COMP_RESERVED_TOP/_BOTTOM compatibility override.
+        let bands = ReservedBands { top: 30, bottom: 90 };
         let out = rect(0, 0, 1280, 800);
         let waybar_zone = rect(0, 30, 1280, 770);
-        let got = effective_work_area(out, Some(waybar_zone), ReservedBands::default());
+        let got = effective_work_area(out, Some(waybar_zone), bands);
         assert_eq!(
             (got.loc.y, got.size.h),
             (30, 680),
@@ -239,19 +313,22 @@ mod tests {
     #[test]
     fn a_panel_below_the_menu_bar_shrinks_the_work_area_further() {
         // A second 40px panel under the shell's own menu bar: 30 + 40 = 70 gone
-        // at the top, dock unchanged.
+        // at the top, dock unchanged. Explicit bands — see the tests above for
+        // why `ReservedBands::default()` (now zero) would not exercise this.
+        let bands = ReservedBands { top: 30, bottom: 90 };
         let out = rect(0, 0, 1280, 800);
-        let got = effective_work_area(out, Some(rect(0, 70, 1280, 730)), ReservedBands::default());
+        let got = effective_work_area(out, Some(rect(0, 70, 1280, 730)), bands);
         assert_eq!((got.loc.y, got.size.h), (70, 640));
     }
 
     #[test]
     fn the_zone_is_output_local_and_is_translated_onto_the_outputs_origin() {
         // udev maps additional connectors side by side at (w, 0); a LayerMap
-        // always arranges from (0, 0).
+        // always arranges from (0, 0). Explicit bands — see the tests above.
+        let bands = ReservedBands { top: 30, bottom: 90 };
         let out = rect(1280, 0, 1920, 1080);
         let zone = rect(0, 40, 1920, 1040);
-        let got = effective_work_area(out, Some(zone), ReservedBands::default());
+        let got = effective_work_area(out, Some(zone), bands);
         assert_eq!(got.loc.x, 1280, "the zone must land on THIS output, not the first one");
         assert_eq!(got.loc.y, 40, "40 > the 30px band, so the zone wins on the top edge");
         assert_eq!(got.size.h, 1080 - 40 - 90);
@@ -259,9 +336,10 @@ mod tests {
 
     #[test]
     fn a_left_anchored_exclusive_zone_shifts_the_work_areas_origin() {
+        let bands = ReservedBands { top: 30, bottom: 90 };
         let out = rect(0, 0, 1280, 800);
         let zone = rect(64, 0, 1216, 800);
-        let got = effective_work_area(out, Some(zone), ReservedBands::default());
+        let got = effective_work_area(out, Some(zone), bands);
         assert_eq!((got.loc.x, got.loc.y), (64, 30));
         assert_eq!((got.size.w, got.size.h), (1216, 680));
     }
@@ -306,5 +384,76 @@ mod tests {
     fn a_degenerate_output_is_returned_unchanged_whatever_the_zone_says() {
         let zero = rect(0, 0, 0, 0);
         assert_eq!(effective_work_area(zero, Some(rect(0, 0, 10, 10)), ReservedBands::default()), zero);
+    }
+
+    // ── D9-bug2: the keyboard-focus rule ────────────────────────────────────
+    // The candidate list is always front-to-back, which is what makes
+    // "top-most" mean `position(...)` (the FIRST match) in both functions.
+
+    /// The shell's real layout the moment ⌘K opens the palette: overlay
+    /// (exclusive) over menu bar + dock (none) over the desktop (on-demand).
+    fn shell_with_palette() -> Vec<(Layer, KeyboardInteractivity)> {
+        vec![
+            (Layer::Overlay, KeyboardInteractivity::Exclusive),
+            (Layer::Top, KeyboardInteractivity::None),
+            (Layer::Top, KeyboardInteractivity::None),
+            (Layer::Background, KeyboardInteractivity::OnDemand),
+        ]
+    }
+
+    /// The same shell one frame after Escape: the palette is gone.
+    fn shell_without_palette() -> Vec<(Layer, KeyboardInteractivity)> {
+        vec![
+            (Layer::Top, KeyboardInteractivity::None),
+            (Layer::Top, KeyboardInteractivity::None),
+            (Layer::Background, KeyboardInteractivity::OnDemand),
+        ]
+    }
+
+    #[test]
+    fn an_exclusive_overlay_claims_the_keyboard_over_every_non_exclusive_surface() {
+        assert_eq!(topmost_exclusive(&shell_with_palette()), Some(0));
+    }
+
+    #[test]
+    fn without_an_exclusive_claim_nothing_is_forced_and_the_live_holder_keeps_focus() {
+        assert_eq!(topmost_exclusive(&shell_without_palette()), None);
+    }
+
+    #[test]
+    fn an_exclusive_claim_from_bottom_or_background_is_ignored() {
+        // The spec grants the always-wins rule to the top and overlay layers
+        // only. A wallpaper or desktop-icon client asking for `exclusive` must
+        // not be able to hold the keyboard hostage.
+        let candidates = vec![
+            (Layer::Background, KeyboardInteractivity::Exclusive),
+            (Layer::Bottom, KeyboardInteractivity::Exclusive),
+        ];
+        assert_eq!(topmost_exclusive(&candidates), None);
+        // …but it is still a perfectly good FALLBACK target once focus is
+        // genuinely vacant.
+        assert_eq!(topmost_focusable(&candidates), Some(0));
+    }
+
+    #[test]
+    fn two_exclusive_claimants_resolve_to_the_front_most_one() {
+        let candidates = vec![
+            (Layer::Overlay, KeyboardInteractivity::Exclusive),
+            (Layer::Top, KeyboardInteractivity::Exclusive),
+        ];
+        assert_eq!(topmost_exclusive(&candidates), Some(0));
+    }
+
+    #[test]
+    fn the_fallback_skips_surfaces_that_refused_the_keyboard() {
+        // The menu bar and dock are `None`: after the palette closes, focus
+        // must land on the desktop surface, never on a bar that cannot use it.
+        assert_eq!(topmost_focusable(&shell_without_palette()), Some(2));
+    }
+
+    #[test]
+    fn an_empty_screen_yields_no_target_at_all_rather_than_a_default() {
+        assert_eq!(topmost_exclusive(&[]), None);
+        assert_eq!(topmost_focusable(&[]), None);
     }
 }

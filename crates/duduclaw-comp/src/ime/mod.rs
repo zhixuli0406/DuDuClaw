@@ -37,8 +37,11 @@
 //!
 //! ## Seat isolation
 //!
-//! See [`seat_filter`]'s module doc for D3-c — why the agent seat is hidden
-//! from input-method clients, and what happens when that filter cannot arm.
+//! See [`seat_filter`]'s module doc. It started here as D3-c (hide the agent
+//! seat from input-method clients) and, since E1a-1, owns the compositor's
+//! whole per-client `wl_seat` visibility policy — the agent seat is now
+//! hidden from every client except the allow-listed session shell. That
+//! module also documents what breaks when the filter cannot arm.
 
 pub mod popup;
 pub mod seat_filter;

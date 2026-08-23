@@ -87,7 +87,7 @@ use crate::{render::CodriveElement, state::DuduclawComp};
 
 use super::{
     close_button_rect, frame_rect, minimize_button_rect, minus, mode::DecorMode, shadow_bounds,
-    text::FontSet, title_bar_rect, title_text_rect, xmark, DecorInsets, Palette, BORDER_PX,
+    text::FontSet, title_bar_rect, title_text_rect, xmark, DecorInsets, BORDER_PX,
     SHADOW_ALPHAS, SHADOW_RING_PX, TITLE_BAR_H, TITLE_FONT_PX,
 };
 
@@ -163,6 +163,25 @@ impl DecorState {
 impl Default for DecorState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl DecorState {
+    /// D2: drops every cached per-window decoration buffer, forcing a full
+    /// rebuild (fresh `SolidColorBuffer`s, and — because `title_key`/
+    /// `close_key`/`minimize_key` live on the dropped `WindowDecorBuffers`
+    /// too — a fresh rasterisation of every glyph) on the next
+    /// `build_frame_elements` call for each window.
+    ///
+    /// Called from `DuduclawComp::set_theme` (`decor::mod`) ONLY — a theme
+    /// switch is the one event where every cached colour genuinely needs to
+    /// change, and it is a rare, deliberate user action, not a per-frame one,
+    /// so paying for a full re-rasterisation here is cheap. `modes` / `frames`
+    /// / `maximized` / `hovered_close` / `hovered_minimize` / `cascade_next`
+    /// are untouched: none of them describe a colour, so none of them are
+    /// stale after a theme change.
+    pub(crate) fn invalidate_theme_cache(&mut self) {
+        self.buffers.clear();
     }
 }
 
@@ -536,6 +555,10 @@ impl DuduclawComp {
         let Some(bar) = title_bar_rect(frame, insets) else {
             return (Vec::new(), Vec::new());
         };
+        // D2: the one palette lookup for this whole call — see
+        // `DuduclawComp::palette`'s doc for why this is cheap enough to just
+        // recompute rather than cache.
+        let palette = self.palette();
 
         let (app_id, title) = crate::codrive::window_target::window_identity(window);
         // A window with no title yet falls back to its app_id, then to a
@@ -565,9 +588,9 @@ impl DuduclawComp {
 
         // --- title bar background -------------------------------------------
         let bar_color = if is_focused {
-            Palette::TITLE_BAR_ACTIVE
+            palette.title_bar_active
         } else {
-            Palette::TITLE_BAR_INACTIVE
+            palette.title_bar_inactive
         };
         entry.title_bg.update((bar.size.w, bar.size.h), bar_color);
 
@@ -577,7 +600,7 @@ impl DuduclawComp {
         // tracks a resized window, and a fully transparent colour costs one
         // element that draws nothing rather than a branch in the element list.
         let close_color = if hovered {
-            Palette::CLOSE_HOVER_BG
+            palette.close_hover_bg
         } else {
             [0.0, 0.0, 0.0, 0.0]
         };
@@ -585,9 +608,9 @@ impl DuduclawComp {
 
         if entry.close_key != Some(hovered) {
             let color = if hovered {
-                Palette::CLOSE_HOVER_GLYPH
+                palette.close_hover_glyph
             } else {
-                Palette::TITLE_TEXT
+                palette.title_text
             };
             entry.close_tex = Some(upload(xmark::rasterize(CLOSE_GLYPH_PX, color)));
             entry.close_key = Some(hovered);
@@ -596,13 +619,16 @@ impl DuduclawComp {
         // --- minimize button (WM-3) ---------------------------------------
         // Same resting-state-draws-nothing rule as the close button; the fill
         // colour is neutral rather than red, because minimizing destroys
-        // nothing. The `－` glyph colour never changes, so unlike the ✕ its
-        // raster is built exactly once per window.
+        // nothing. The `－` glyph colour never changes for a GIVEN theme, so
+        // unlike the ✕ its raster is built exactly once per window per theme
+        // (`DuduclawComp::set_theme` drops this whole cache entry on a theme
+        // switch, so "once" really does mean "once since the last theme
+        // change", not "once ever").
         if let Some(minimize) = minimize {
             entry.minimize_bg.update(
                 (minimize.size.w, minimize.size.h),
                 if hovered_min {
-                    Palette::MINIMIZE_HOVER_BG
+                    palette.minimize_hover_bg
                 } else {
                     [0.0, 0.0, 0.0, 0.0]
                 },
@@ -611,7 +637,7 @@ impl DuduclawComp {
         if entry.minimize_key.is_none() {
             entry.minimize_tex = Some(upload(minus::rasterize(
                 CLOSE_GLYPH_PX,
-                Palette::TITLE_TEXT,
+                palette.title_text,
             )));
             entry.minimize_key = Some(true);
         }
@@ -620,7 +646,7 @@ impl DuduclawComp {
         let text_key = (label.clone(), text_rect.size.w);
         if entry.title_key.as_ref() != Some(&text_key) {
             let raster = fonts.as_ref().and_then(|f| {
-                f.rasterize(&label, TITLE_FONT_PX, Palette::TITLE_TEXT, text_rect.size.w)
+                f.rasterize(&label, TITLE_FONT_PX, palette.title_text, text_rect.size.w)
             });
             match raster {
                 Some(r) => {
@@ -666,7 +692,7 @@ impl DuduclawComp {
             ),
         ];
         for (i, (_, size)) in border_geo.iter().enumerate() {
-            entry.border[i].update(*size, Palette::BORDER);
+            entry.border[i].update(*size, palette.border);
         }
 
         // --- shadow -------------------------------------------------------------
@@ -695,9 +721,9 @@ impl DuduclawComp {
             entry.shadow[i].update(
                 *size,
                 [
-                    Palette::SHADOW_RGB[0],
-                    Palette::SHADOW_RGB[1],
-                    Palette::SHADOW_RGB[2],
+                    palette.shadow_rgb[0],
+                    palette.shadow_rgb[1],
+                    palette.shadow_rgb[2],
                     alpha,
                 ],
             );

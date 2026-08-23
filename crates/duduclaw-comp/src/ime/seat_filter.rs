@@ -1,9 +1,61 @@
-//! D3-c: keeping an input method off the **agent** seat.
+//! Per-client `wl_seat` visibility — who is allowed to see the **agent** seat.
 //!
-//! ## The problem this exists to solve
+//! Despite living under `ime/` (where D3-c, the first rule below, was born),
+//! this module is no longer input-method-specific: it owns the compositor's
+//! whole answer to "which `wl_seat` globals does this client get to see".
+//! Two rules run through it.
 //!
-//! `duduclaw-comp` runs two `wl_seat`s — the human `"winit"` seat and the
+//! ## Rule 1 (E1a-1, 2026-08-23): only the session shell sees the agent seat
+//!
+//! `duduclaw-comp` runs **two** `wl_seat`s — the human `"winit"` seat and the
 //! agent `"duduclaw-agent"` seat codrive injects through (`crate::codrive`).
+//! A Wayland client is free to bind both. Real ones frequently do not:
+//!
+//! * `duduclaw-shell` is a gpui client, and gpui keeps exactly one seat —
+//!   the **last** one the registry advertised (`crate::seat_order`'s module
+//!   doc has the line numbers). That is why the compositor advertises the
+//!   agent seat first: "last wins" then lands on the human seat.
+//! * Chromium keeps exactly one seat too — the **first** one. Measured on the
+//!   real appliance VM (E1a, 2026-08-23, three reproductions): under the
+//!   `AgentFirst` order Chromium binds the *agent* seat, and the human gets no
+//!   pointer, no keyboard, no clicks. Nothing about the app is broken; it is
+//!   simply listening to a seat the human never drives.
+//!
+//! The two behaviours are mutually exclusive under any single advertisement
+//! order, which is what made this a ship-blocker. Ordering cannot fix it —
+//! **visibility** can. Wayland already has the right primitive: a global can
+//! be filtered per client, so each client can be handed exactly the seats it
+//! should be reasoning about. Non-shell clients are handed the human seat and
+//! nothing else, so there is no second seat for a single-seat client to pick
+//! wrongly, whichever end of the list it picks from.
+//!
+//! ### What this costs, stated plainly
+//!
+//! **codrive cannot drive a client that cannot see the agent seat.** This is
+//! not a guess — smithay routes seat events through the client's own
+//! resources: `KeyboardTarget::key` for a `WlSurface` calls
+//! `for_each_focused_kbds`, which walks `KeyboardHandle::known_kbds` (the
+//! `wl_keyboard` objects created from *that* seat) and keeps the ones whose
+//! client matches the focused surface (`smithay-0.7.0/src/wayland/seat/
+//! keyboard.rs:143`); `PointerTarget` does the same through
+//! `for_each_focused_pointer` / `known_pointers` (`pointer.rs:222`). A client
+//! that never received the agent seat's `wl_registry.global` event never
+//! created either object, so an injected key or click reaches **nobody**.
+//!
+//! There is no compositor-side synthesis path that routes around this today.
+//! So the rule is deliberately paired with an explicit, audited failure in
+//! `DuduclawComp::handle_agent_inject` — the same doctrine as the
+//! `paused_by_ime` guard below: an injection that cannot land is *reported*,
+//! never silently swallowed while the audit trail records `inject_applied`.
+//!
+//! [`AGENT_SEAT_PROCS_ENV`] is the escape hatch: add a process name to it and
+//! that client sees the agent seat again (and can be co-driven again, at the
+//! cost of re-exposing it to the single-seat hazard above). Note that a
+//! single-seat client cannot have it both ways in any configuration — it can
+//! only ever be driven by whichever one seat it picked.
+//!
+//! ## Rule 2 (D3-c): an input method never sees the agent seat
+//!
 //! fcitx5's `WaylandIMServerV2::refreshSeat()` walks **every** `wl_seat` the
 //! registry advertises and creates one input-method context per seat, each of
 //! which immediately calls `grab_keyboard()`. smithay's
@@ -16,22 +68,20 @@
 //! Both facts were read out of the sources, not assumed; the full chain is in
 //! `research/native-os-2026-08/ime-fcitx5-gpui-2026-08.md` §5.3.
 //!
-//! ## The fix: the agent seat is invisible to input-method clients
+//! Rule 1 already denies fcitx5 the agent seat (it is not the shell), so rule
+//! 2 is now defence in depth — and it is the half that must stay
+//! **un-weakenable**: allow-listing a process via [`AGENT_SEAT_PROCS_ENV`]
+//! grants the agent seat, but an input method is refused anyway. Getting rule
+//! 2 wrong costs silent keystroke loss; getting rule 1 wrong costs a loudly
+//! reported dropped injection.
 //!
-//! Wayland already has the right primitive — a global can be filtered
-//! per-client, which is exactly the granularity we need: fcitx5 must not see
-//! the agent seat, everyone else must. A client that never receives the
-//! `wl_registry.global` event for a seat cannot bind it, so fcitx5's
-//! `refreshSeat()` loop runs exactly once, over the human seat.
+//! ## How the filter reaches `can_view`
 //!
-//! ## What the D3-c probe found (2026-08-23)
-//!
-//! The spike report proposed reaching that filter through
-//! `create_global_with_filter`. **That literal route is closed**: smithay's
-//! `SeatState::new_wl_seat` uses plain `create_global`, and its
-//! `SeatGlobalData<D>` has a private `arc` field with no constructor — so this
-//! crate cannot build the global data and therefore cannot create the seat
-//! global itself. What *is* open, and is what this module does:
+//! The D3-c probe proposed `create_global_with_filter`. **That literal route
+//! is closed**: smithay's `SeatState::new_wl_seat` uses plain `create_global`,
+//! and its `SeatGlobalData<D>` has a private `arc` field with no constructor —
+//! so this crate cannot build the global data and therefore cannot create the
+//! seat global itself. What *is* open, and is what this module does:
 //!
 //! 1. **`delegate_seat!` splits.** It is one `delegate_global_dispatch!` plus
 //!    four `delegate_dispatch!` invocations over public types. Writing the
@@ -53,24 +103,32 @@
 //!   `Seat` handles whose names this crate itself chose. A smithay upgrade
 //!   that changes the rendering fails that check on the next boot, loudly.
 //! * When the check fails the filter **disarms** — every seat stays visible to
-//!   everyone, exactly as before this module existed — and codrive's own
-//!   backstop (`crate::codrive`'s `paused_by_ime` guard) turns the resulting
-//!   grab into a reported error instead of silently swallowed keystrokes.
-//!   Degradation is visible, never silent.
+//!   everyone, exactly as before this module existed. That restores the
+//!   pre-E1a-1 state, which means the measured Chromium breakage comes back;
+//!   the disarm log says so in as many words, because a compositor that
+//!   quietly returns to a known-broken configuration is the worst outcome
+//!   available. codrive's own backstop (`crate::codrive`'s `paused_by_ime`
+//!   guard) still turns a resulting IME grab into a reported error instead of
+//!   silently swallowed keystrokes. Degradation is visible, never silent.
 //!
-//! ## Identifying an input-method client
+//! ## Identifying a client
 //!
 //! Classification happens **once per connection**, at accept time in
 //! `state::DuduclawComp::init_wayland_listener`, from the socket's
 //! `SO_PEERCRED` pid (via `Client::get_credentials`, the same route
 //! `codrive::window_geometry::window_pid` already uses) → `/proc/<pid>/comm`,
 //! and is cached on [`crate::state::ClientState`]. `can_view` then costs one
-//! atomic read.
+//! atomic read plus, for a client that is not allow-listed, one short bounded
+//! `Debug` sniff per seat global.
 //!
 //! `/proc/<pid>/comm` is settable by the process itself, so it is not an
-//! authentication mechanism — but note which way the failure leans: a client
+//! authentication mechanism — but note which way each failure leans. A client
 //! that lies its way into "I am an input method" only loses sight of the agent
-//! seat. There is no privilege on this side of the check to steal.
+//! seat. A client that lies its way into "I am the shell" gains sight of a
+//! seat whose injection socket is separately token-authenticated
+//! (`crate::codrive`'s `write_token_file`), so there is still no authority to
+//! steal here — only the single-seat hazard rule 1 exists to avoid, taken on
+//! by a process that asked for it.
 
 use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,7 +148,8 @@ use crate::{codrive::AGENT_SEAT_NAME, state::ClientState, DuduclawComp};
 
 /// Env override for the process names treated as input methods, comma
 /// separated. Empty entries are ignored; an entirely empty value disables
-/// input-method detection (and therefore the filter) altogether.
+/// input-method detection altogether (rule 1 still hides the agent seat from
+/// them, because an input method is not the shell).
 pub const IME_PROCS_ENV: &str = "DUDUCLAW_COMP_IME_PROCS";
 
 /// Env flag: when set to `1`, only clients classified as input methods may
@@ -98,10 +157,43 @@ pub const IME_PROCS_ENV: &str = "DUDUCLAW_COMP_IME_PROCS";
 /// Default is off — see [`client_may_use_input_method`].
 pub const IME_STRICT_ENV: &str = "DUDUCLAW_COMP_IME_STRICT";
 
+/// E1a-1 env override for the process names allowed to see the **agent**
+/// seat, comma separated. **Replaces** [`DEFAULT_AGENT_SEAT_PROCS`] rather
+/// than extending it (same semantics as [`IME_PROCS_ENV`]), and the resolved
+/// list is logged at startup so the effective value is never a guess.
+///
+/// Adding a process here restores codrive's reach into that client at the
+/// cost of re-exposing it to the single-seat hazard in this module's doc.
+/// An entirely empty value hides the agent seat from *every* client —
+/// maximum isolation, and legal: the shell does not need the agent seat, it
+/// only needs the human one.
+pub const AGENT_SEAT_PROCS_ENV: &str = "DUDUCLAW_COMP_AGENT_SEAT_PROCS";
+
+/// Env kill switch for the whole per-client filter: `0` / `off` / `false`
+/// turns it off and every client sees every seat again (the pre-E1a-1
+/// behaviour, i.e. the measured-broken one — for debugging only).
+pub const SEAT_FILTER_ENV: &str = "DUDUCLAW_COMP_SEAT_FILTER";
+
 /// Process names (as reported by `/proc/<pid>/comm`, which the kernel
 /// truncates to 15 characters) treated as input methods when
 /// [`IME_PROCS_ENV`] is unset.
 const DEFAULT_IME_PROCS: &[&str] = &["fcitx5", "fcitx", "ibus-daemon", "kimpanel"];
+
+/// Process names allowed to see the agent seat when [`AGENT_SEAT_PROCS_ENV`]
+/// is unset.
+///
+/// Exactly one entry: the session shell. It is here — rather than being
+/// filtered like everything else — because it is the one client whose
+/// single-seat behaviour the `AgentFirst` advertisement order is built
+/// around, and that pairing is the configuration Shell-S0…S3 verified on
+/// real hardware. `"duduclaw-shell"` is 14 bytes, comfortably inside the
+/// kernel's 15-byte `comm` truncation.
+///
+/// Spelled out rather than reusing `window_policy::SHELL_APP_ID`: that
+/// constant is an `xdg_toplevel.app_id`, a different namespace that merely
+/// happens to carry the same string today. Overriding one must not silently
+/// move the other.
+const DEFAULT_AGENT_SEAT_PROCS: &[&str] = &["duduclaw-shell"];
 
 /// Upper bound on how much of a `Debug` rendering [`sniff_seat_name`] will
 /// materialise. The prefix it needs is `SeatGlobalData { arc: SeatRc { name:
@@ -115,14 +207,32 @@ const SNIFF_CAP: usize = 192;
 /// rather than a field on `DuduclawComp`.
 static FILTER_ARMED: AtomicBool = AtomicBool::new(false);
 
+/// What a connection's peer process was recognised as, decided once at accept
+/// time. Both fields are questions about the *client*, deliberately kept
+/// separate rather than collapsed into one enum: they gate different things
+/// (`allow_listed` gates the agent seat, `is_input_method` gates both the
+/// agent seat and — under [`IME_STRICT_ENV`] — the IME manager globals), and
+/// a client can legitimately be neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClientClass {
+    /// The peer's process name is on the input-method list ([`IME_PROCS_ENV`]).
+    pub is_input_method: bool,
+    /// The peer's process name is on the agent-seat allow list
+    /// ([`AGENT_SEAT_PROCS_ENV`]).
+    pub allow_listed: bool,
+}
+
 /// Outcome of the startup self-check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterStatus {
-    /// The filter is live: input-method clients will not see the agent seat.
+    /// The filter is live: only allow-listed, non-input-method clients see
+    /// the agent seat.
     Armed,
     /// The filter could not be trusted and is off. Every client sees every
-    /// seat, and codrive's `paused_by_ime` backstop is the remaining defence.
+    /// seat — including the single-seat clients rule 1 exists to protect.
     Disarmed(&'static str),
+    /// The filter was turned off deliberately via [`SEAT_FILTER_ENV`].
+    Off,
 }
 
 impl FilterStatus {
@@ -130,6 +240,7 @@ impl FilterStatus {
         match self {
             FilterStatus::Armed => "armed",
             FilterStatus::Disarmed(_) => "disarmed",
+            FilterStatus::Off => "off",
         }
     }
 }
@@ -142,31 +253,53 @@ impl FilterStatus {
 /// short of that is evidence that a `SeatGlobalData` will be classified
 /// correctly later.
 pub fn arm(human: &Seat<DuduclawComp>, agent: &Seat<DuduclawComp>) -> FilterStatus {
+    if !filter_enabled() {
+        tracing::warn!(
+            "comp/seat: per-client seat filter turned OFF by {}. Every client now sees BOTH \
+             seats, which is the configuration measured to leave first-seat-wins clients \
+             (Chromium) with no human input at all (E1a). Debugging only",
+            SEAT_FILTER_ENV
+        );
+        return FilterStatus::Off;
+    }
     let status = evaluate(sniff_seat_name(human), sniff_seat_name(agent));
     match &status {
         FilterStatus::Armed => {
             FILTER_ARMED.store(true, Ordering::SeqCst);
             tracing::info!(
                 agent_seat = AGENT_SEAT_NAME,
+                agent_seat_procs = ?agent_seat_proc_names(),
                 ime_procs = ?ime_proc_names(),
                 strict = strict_mode(),
-                "comp/ime: agent seat is hidden from input-method clients (D3-c). \
-                 Override the process-name list with {}, restrict who may bind the IME \
-                 managers with {}=1",
+                "comp/seat: the agent seat is visible ONLY to the allow-listed process names \
+                 above, and never to an input method (E1a-1 + D3-c). codrive cannot drive a \
+                 client that cannot see it — injections at such a client are dropped and \
+                 audited, never silently lost. Override the allow list with {}, the \
+                 input-method list with {}, restrict who may bind the IME managers with \
+                 {}=1, or turn the whole filter off with {}=off",
+                AGENT_SEAT_PROCS_ENV,
                 IME_PROCS_ENV,
-                IME_STRICT_ENV
+                IME_STRICT_ENV,
+                SEAT_FILTER_ENV
             );
         }
         FilterStatus::Disarmed(reason) => {
             tracing::error!(
                 reason,
-                "comp/ime: agent-seat filter DISARMED — an input method will be able to \
-                 grab the agent seat's keyboard, which stops codrive typing. codrive will \
-                 report `paused_by_ime` instead of losing keystrokes silently. This almost \
-                 always means smithay's Seat Debug rendering changed; see \
-                 `ime::seat_filter`'s module doc"
+                "comp/seat: per-client seat filter DISARMED — every client can see the agent \
+                 seat again. Two known consequences, both measured: a first-seat-wins client \
+                 (Chromium) binds the agent seat and the human loses pointer/keyboard in it \
+                 entirely (E1a), and an input method can grab the agent seat's keyboard, which \
+                 stops codrive typing (D3-c; codrive reports `paused_by_ime` rather than losing \
+                 keystrokes silently). This almost always means smithay's Seat Debug rendering \
+                 changed; see `ime::seat_filter`'s module doc"
             );
         }
+        // Unreachable: the `filter_enabled` early return above owns this
+        // variant. Matched rather than `unreachable!()` so a future change
+        // that starts producing it here fails quietly instead of panicking a
+        // compositor at boot.
+        FilterStatus::Off => {}
     }
     status
 }
@@ -186,27 +319,47 @@ fn evaluate(human: Option<String>, agent: Option<String>) -> FilterStatus {
     FilterStatus::Armed
 }
 
+/// May a client of this class see the agent seat?
+///
+/// The whole policy, as one pure function. Allow-listing grants; being an
+/// input method refuses regardless (rule 2 is not weakenable by rule 1's
+/// knob — see this module's doc).
+pub fn agent_seat_visible_to(class: ClientClass) -> bool {
+    class.allow_listed && !class.is_input_method
+}
+
 /// Is this seat global visible to this client?
 ///
 /// Everything is visible to everyone except one case: the agent seat, to a
-/// client we identified as an input method.
+/// client the policy above does not grant it to.
 fn seat_visible(client: &Client, global_data: &SeatGlobalData<DuduclawComp>) -> bool {
     if !FILTER_ARMED.load(Ordering::SeqCst) {
         return true;
     }
-    if !client_is_input_method(client) {
+    if agent_seat_visible_to(client_class(client)) {
         return true;
     }
-    // Only pay for the Debug sniff for clients that could actually be
-    // affected, i.e. after the cheap cached-flag check above.
+    // Only pay for the Debug sniff once the cheap cached-flag check above has
+    // established that this client is actually subject to the filter.
     match sniff_seat_name(global_data) {
         // Unreadable name: fail OPEN on this axis. Hiding a seat we cannot
-        // identify could hide the *human* seat from the input method, which
-        // would break Chinese input outright — a worse and much more
-        // confusing failure than the one codrive's backstop already reports.
+        // identify could hide the *human* seat from every client, which would
+        // leave the whole desktop input-dead — a far worse and much more
+        // confusing failure than the ones this filter exists to prevent.
         None => true,
         Some(name) => name != AGENT_SEAT_NAME,
     }
+}
+
+/// E1a-1: is the agent seat hidden from this client by this filter?
+///
+/// The read `crate::codrive` uses to turn "this injection will reach nobody"
+/// into a reported drop instead of a silent no-op. Deliberately phrased as
+/// *hidden-by-us*, not *reachable*: it answers only for the half this
+/// compositor controls. A client that can see the agent seat but simply never
+/// bound it is not distinguishable here, and is not this predicate's claim.
+pub fn agent_seat_hidden_from(client: &Client) -> bool {
+    FILTER_ARMED.load(Ordering::SeqCst) && !agent_seat_visible_to(client_class(client))
 }
 
 /// May this client bind `zwp_input_method_manager_v2` /
@@ -219,45 +372,77 @@ fn seat_visible(client: &Client, global_data: &SeatGlobalData<DuduclawComp>) -> 
 /// detected input methods only, for deployments that would rather lose the
 /// IME than leave a key-injection protocol open to every client.
 pub fn client_may_use_input_method(client: &Client) -> bool {
-    !strict_mode() || client_is_input_method(client)
+    !strict_mode() || client_class(client).is_input_method
 }
 
 fn strict_mode() -> bool {
     std::env::var(IME_STRICT_ENV).map(|v| v == "1").unwrap_or(false)
 }
 
+/// Pure half of [`filter_enabled`]. Anything that is not an explicit "off"
+/// leaves the filter on, including a typo: the filter is what keeps
+/// third-party apps usable, so an unrecognised value must never be the thing
+/// that quietly ships a known-broken desktop.
+pub fn filter_enabled_from_env_value(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(str::trim),
+        Some(v) if v.eq_ignore_ascii_case("off")
+            || v.eq_ignore_ascii_case("0")
+            || v.eq_ignore_ascii_case("false")
+    )
+}
+
+fn filter_enabled() -> bool {
+    filter_enabled_from_env_value(std::env::var(SEAT_FILTER_ENV).ok().as_deref())
+}
+
 /// Reads back the classification made at accept time.
-fn client_is_input_method(client: &Client) -> bool {
+fn client_class(client: &Client) -> ClientClass {
     client
         .get_data::<ClientState>()
-        .is_some_and(ClientState::is_input_method)
+        .map(ClientState::seat_class)
+        .unwrap_or_default()
 }
 
 /// Classifies a freshly accepted connection. Called once per client, from
 /// `state::DuduclawComp::init_wayland_listener`, immediately after
 /// `insert_client` — which is the earliest moment a `Client` exists and still
 /// strictly before any of its requests are dispatched, so nothing can read
-/// the flag before it is written.
-pub fn classify_client(client: &Client, dh: &DisplayHandle) -> bool {
-    let names = ime_proc_names();
-    if names.is_empty() {
-        return false;
-    }
+/// the flags before they are written.
+///
+/// Fails **closed on the agent-seat axis**: a peer whose credentials or
+/// `/proc/<pid>/comm` cannot be read is not the shell as far as we can prove,
+/// so it gets the human seat only. That direction costs codrive's reach into
+/// an unidentifiable client; the other direction would cost that client its
+/// human input, which is the ship-blocker this rule exists to close.
+pub fn classify_client(client: &Client, dh: &DisplayHandle) -> (ClientClass, Option<String>) {
     let Some(pid) = client.get_credentials(dh).ok().map(|c| c.pid) else {
-        return false;
+        tracing::warn!(
+            "comp/seat: could not read a new client's peer credentials — treating it as an \
+             ordinary app (human seat only, no codrive reach)"
+        );
+        return (ClientClass::default(), None);
     };
     let Some(comm) = read_proc_comm(pid) else {
-        return false;
-    };
-    let hit = proc_name_is_input_method(&comm, &names);
-    if hit {
-        tracing::info!(
+        tracing::warn!(
             pid,
-            comm = %comm,
-            "comp/ime: client identified as an input method — the agent seat is hidden from it"
+            "comp/seat: could not read /proc/<pid>/comm for a new client — treating it as an \
+             ordinary app (human seat only, no codrive reach)"
         );
-    }
-    hit
+        return (ClientClass::default(), None);
+    };
+    let class = ClientClass {
+        is_input_method: proc_name_matches(&comm, &ime_proc_names()),
+        allow_listed: proc_name_matches(&comm, &agent_seat_proc_names()),
+    };
+    tracing::info!(
+        pid,
+        comm = %comm,
+        input_method = class.is_input_method,
+        sees_agent_seat = agent_seat_visible_to(class),
+        "comp/seat: client classified"
+    );
+    (class, Some(comm))
 }
 
 fn read_proc_comm(pid: i32) -> Option<String> {
@@ -269,15 +454,26 @@ fn read_proc_comm(pid: i32) -> Option<String> {
 /// The configured input-method process names.
 fn ime_proc_names() -> Vec<String> {
     match std::env::var(IME_PROCS_ENV) {
-        Ok(raw) => parse_ime_procs(&raw),
+        Ok(raw) => parse_proc_list(&raw),
         Err(_) => DEFAULT_IME_PROCS.iter().map(|s| (*s).to_string()).collect(),
     }
 }
 
-/// Splits the [`IME_PROCS_ENV`] value. Whitespace is trimmed and empty entries
-/// dropped, so `"fcitx5,,  ibus-daemon "` is two names and `""` / `" , "` is
-/// none (which turns detection, and therefore the filter, off).
-pub fn parse_ime_procs(raw: &str) -> Vec<String> {
+/// The configured agent-seat allow list.
+fn agent_seat_proc_names() -> Vec<String> {
+    match std::env::var(AGENT_SEAT_PROCS_ENV) {
+        Ok(raw) => parse_proc_list(&raw),
+        Err(_) => DEFAULT_AGENT_SEAT_PROCS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    }
+}
+
+/// Splits a comma-separated process-name list. Whitespace is trimmed and
+/// empty entries dropped, so `"fcitx5,,  ibus-daemon "` is two names and
+/// `""` / `" , "` is none (an empty list matches nothing).
+pub fn parse_proc_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -285,12 +481,12 @@ pub fn parse_ime_procs(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Exact, case-sensitive match against the configured names.
+/// Exact, case-sensitive match against a configured name list.
 ///
 /// Deliberately NOT a substring test (repo coding convention 2): `contains`
 /// would let a process called `not-fcitx5-at-all` pass, and process names are
 /// an exact-match namespace to begin with.
-pub fn proc_name_is_input_method(comm: &str, names: &[String]) -> bool {
+pub fn proc_name_matches(comm: &str, names: &[String]) -> bool {
     names.iter().any(|n| n == comm)
 }
 
@@ -540,27 +736,94 @@ mod tests {
         ));
     }
 
+    // -- the visibility policy ----------------------------------------------
+
+    #[test]
+    fn only_an_allow_listed_non_ime_client_sees_the_agent_seat() {
+        // The whole of E1a-1 + D3-c, as a truth table.
+        assert!(agent_seat_visible_to(ClientClass {
+            allow_listed: true,
+            is_input_method: false
+        }));
+        // An ordinary third-party app — the E1a ship-blocker case.
+        assert!(!agent_seat_visible_to(ClientClass {
+            allow_listed: false,
+            is_input_method: false
+        }));
+        // D3-c, and the reason rule 2 is not weakenable by rule 1's knob:
+        // even allow-listing an input method must not grant it the seat.
+        assert!(!agent_seat_visible_to(ClientClass {
+            allow_listed: true,
+            is_input_method: true
+        }));
+        assert!(!agent_seat_visible_to(ClientClass {
+            allow_listed: false,
+            is_input_method: true
+        }));
+    }
+
+    #[test]
+    fn an_unclassifiable_client_defaults_to_human_seat_only() {
+        // `ClientClass::default()` is what a client whose credentials or
+        // /proc entry could not be read gets, and what `client_class` falls
+        // back to when a connection somehow carries no `ClientState`. It must
+        // fail closed on the agent-seat axis.
+        assert!(!agent_seat_visible_to(ClientClass::default()));
+    }
+
+    #[test]
+    fn the_shell_is_the_only_default_agent_seat_client() {
+        assert_eq!(DEFAULT_AGENT_SEAT_PROCS, &["duduclaw-shell"]);
+        // The kernel truncates /proc/<pid>/comm at 15 bytes; a default that
+        // could never match would silently disable the shell's exemption.
+        for name in DEFAULT_AGENT_SEAT_PROCS {
+            assert!(name.len() <= 15, "{name} would be truncated in /proc/<pid>/comm");
+        }
+    }
+
     // -- process-name matching ----------------------------------------------
 
     #[test]
     fn the_proc_list_is_split_trimmed_and_compacted() {
-        assert_eq!(parse_ime_procs("fcitx5,,  ibus-daemon "), vec!["fcitx5", "ibus-daemon"]);
-        assert!(parse_ime_procs("").is_empty());
-        assert!(parse_ime_procs(" , ").is_empty());
+        assert_eq!(parse_proc_list("fcitx5,,  ibus-daemon "), vec!["fcitx5", "ibus-daemon"]);
+        assert!(parse_proc_list("").is_empty());
+        assert!(parse_proc_list(" , ").is_empty());
     }
 
     #[test]
     fn proc_names_match_exactly_never_by_substring() {
         let names = vec!["fcitx5".to_string()];
-        assert!(proc_name_is_input_method("fcitx5", &names));
-        assert!(!proc_name_is_input_method("not-fcitx5-at-all", &names));
-        assert!(!proc_name_is_input_method("fcitx5-extra", &names));
-        assert!(!proc_name_is_input_method("FCITX5", &names));
-        assert!(!proc_name_is_input_method("", &names));
+        assert!(proc_name_matches("fcitx5", &names));
+        assert!(!proc_name_matches("not-fcitx5-at-all", &names));
+        assert!(!proc_name_matches("fcitx5-extra", &names));
+        assert!(!proc_name_matches("FCITX5", &names));
+        assert!(!proc_name_matches("", &names));
     }
 
     #[test]
     fn an_empty_name_list_matches_nothing() {
-        assert!(!proc_name_is_input_method("fcitx5", &[]));
+        assert!(!proc_name_matches("fcitx5", &[]));
+        // Which is exactly what makes `DUDUCLAW_COMP_AGENT_SEAT_PROCS=""` the
+        // documented "hide the agent seat from everyone" setting.
+        assert!(!proc_name_matches("duduclaw-shell", &[]));
+    }
+
+    // -- the kill switch ----------------------------------------------------
+
+    #[test]
+    fn the_filter_is_on_unless_explicitly_turned_off() {
+        for raw in [None, Some(""), Some("  "), Some("on"), Some("1"), Some("yes"), Some("🐾")] {
+            assert!(
+                filter_enabled_from_env_value(raw),
+                "{raw:?} must leave the filter ON — an unrecognised value must never ship a \
+                 known-broken desktop"
+            );
+        }
+        for raw in ["off", "OFF", " Off ", "0", "false", "FALSE"] {
+            assert!(
+                !filter_enabled_from_env_value(Some(raw)),
+                "{raw:?} should turn the filter off"
+            );
+        }
     }
 }

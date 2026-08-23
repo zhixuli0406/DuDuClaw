@@ -36,6 +36,51 @@ Linux container, not via `cargo build` at the repo root.
 
 ## Reproducible build command (verified 2026-08-19)
 
+> ### ⚠️ STALE as of A4-1 — do not copy the command in this section
+>
+> **The three-package list below stopped being sufficient when the A4-1
+> `udev`/DRM/KMS backend landed** (see "A4-1: udev/DRM backend" at the
+> bottom of this file). That backend is compiled into the *same* binary and
+> selected at runtime, so its system libraries are linked
+> **unconditionally** — there is no feature flag that keeps them out of an
+> ordinary `cargo build`/`cargo test`. Running the command below today
+> fails at link time with:
+>
+> ```
+> /usr/bin/ld: cannot find -lgbm / -lseat / -ludev / -linput
+> ```
+>
+> (Reproduced 2026-08-23 while verifying the WM-3 shell-migration package —
+> this note exists because the stale command cost a real build cycle.)
+>
+> **Use this instead** — the current minimum for `cargo build` and
+> `cargo test`:
+>
+> ```bash
+> docker run --rm \
+>   -v /Users/lizhixu/Project/DuDuClaw:/work \
+>   -v duduclaw-comp-cargo:/usr/local/cargo/registry \
+>   -v duduclaw-comp-cargo-git:/usr/local/cargo/git \
+>   -v duduclaw-comp-target:/target \
+>   -e CARGO_TARGET_DIR=/target \
+>   -w /work/crates/duduclaw-comp \
+>   rust:bookworm bash -c '
+>     set -e
+>     apt-get update -qq
+>     apt-get install -y -qq --no-install-recommends \
+>       pkg-config libwayland-dev libxkbcommon-dev \
+>       libinput-dev libudev-dev libseat-dev libgbm-dev libdrm-dev
+>     cargo test
+>   '
+> ```
+>
+> Add `libegl1 libgl1-mesa-dri libgles2 weston foot` on top of that only for
+> the **live-run** sections further down (headless weston needs a software
+> GL stack and a test client; a plain build/test does not).
+>
+> The rest of this section is kept as the historical record of the original
+> spike, when the winit backend really was the only one.
+
 ```bash
 docker run --rm \
   -v /Users/lizhixu/Project/DuDuClaw:/work \
@@ -48,8 +93,10 @@ docker run --rm \
   '
 ```
 
-That's the **entire** system dependency list — just `pkg-config`,
-`libwayland-dev`, `libxkbcommon-dev`. No mesa/EGL headers were needed: the
+That was the **entire** system dependency list **at the time of the original
+spike** — just `pkg-config`, `libwayland-dev`, `libxkbcommon-dev` (see the
+stale-warning box above for what it is now). No mesa/EGL headers were
+needed: the
 `backend_egl`/`renderer_gl` smithay features (pulled in transitively by
 `backend_winit`) only codegen GL bindings at build time and `dlopen()` the
 actual GL/EGL libraries at run time via `libloading`, so there's nothing to
@@ -5615,3 +5662,144 @@ the **old** comp binary: it happens there too, so it is a shell-side DIAG
 behaviour, not a D3-f2 regression. It only shows up with DIAG on — a
 DIAG-off boot lands on a clean Home (`d3f2-NEW-1-boot.png`). Left alone;
 noted because it will confuse the next person staging a click round.
+
+---
+
+## E1a-1 (2026-08-23): the agent seat is invisible to every client except the shell
+
+Fixes the E1a ship-blocker — **a third-party app receives no input at all** —
+by generalising D3-c's per-client global filter. Design decision on record:
+「seat 修法＝複用 D3-c per-client filter（對非殼 client 隱藏 agent seat）」.
+
+### The defect, and why ordering could never fix it
+
+`duduclaw-comp` advertises two `wl_seat` globals. Two real clients keep
+exactly one seat each, and they disagree about which:
+
+| client | keeps | under `AgentFirst` (default) | under `HumanFirst` |
+|---|---|---|---|
+| `duduclaw-shell` (gpui) | the **last** seat | human seat — works | agent seat — Enter dead |
+| Chromium 151 | the **first** seat | agent seat — **all input dead** | human seat — works |
+
+Measured on the appliance VM (E1a, three reproductions, fcitx5 excluded as a
+cause): under the shipped `AgentFirst` order Chromium's hamburger menu did
+nothing, text fields never focused, Ctrl+T was inert. `seat_order.rs` called
+the first-seat-wins hazard *theoretical*; it is not, and that module's doc
+now says so.
+
+No value of `DUDUCLAW_COMP_SEAT_ORDER` satisfies both clients. Visibility
+does: a client that only ever sees **one** seat cannot pick the wrong one,
+whichever end of the registry list it picks from.
+
+### What landed
+
+`src/ime/seat_filter.rs` (still in `ime/` — it also owns the IME-manager
+gate) now owns the whole per-client `wl_seat` visibility policy, as one pure
+function over an accept-time classification:
+
+```rust
+pub fn agent_seat_visible_to(class: ClientClass) -> bool {
+    class.allow_listed && !class.is_input_method
+}
+```
+
+* **Allow list** — `/proc/<pid>/comm` exact match (never substring, repo
+  convention 2) against `DUDUCLAW_COMP_AGENT_SEAT_PROCS`, default
+  `duduclaw-shell`. The shell keeps both seats because `AgentFirst` exists
+  for it and that pairing is what Shell-S0…S3 verified on hardware.
+* **D3-c stays un-weakenable** — allow-listing an input method still refuses
+  it the agent seat. Getting D3-c wrong costs silent keystroke loss; getting
+  the new rule wrong costs a loudly reported dropped injection.
+* **Fail-closed on the agent-seat axis** — unreadable credentials or
+  `/proc/<pid>/comm` ⇒ human seat only. That direction costs codrive's reach
+  into an unidentifiable client; the other direction costs that client its
+  human input, i.e. the blocker itself.
+* **Knobs** — `DUDUCLAW_COMP_AGENT_SEAT_PROCS` (allow list; empty value hides
+  the agent seat from everyone), `DUDUCLAW_COMP_SEAT_FILTER=off` (whole
+  filter off, restoring the measured-broken exposure — debugging only).
+  Anything not an explicit "off" leaves the filter on, including a typo.
+* **Disarm** — the startup self-check is unchanged (it re-runs the `Debug`
+  seat-name extraction over the two real seats). On failure the filter
+  disarms to "everyone sees everything" and the error log now names *both*
+  consequences, the Chromium blackout and the fcitx5 grab.
+
+### The cost, verified rather than assumed
+
+The task brief hypothesised that agent input is synthesised compositor-side
+and does not depend on the client binding the agent seat. **That is false.**
+smithay routes seat events through the client's own resources —
+`KeyboardTarget::key` → `for_each_focused_kbds` → `KeyboardHandle::known_kbds`
+(`smithay-0.7.0/src/wayland/seat/keyboard.rs:143`), `PointerTarget` →
+`for_each_focused_pointer` → `known_pointers` (`pointer.rs:222`) — so a client
+that never received the agent seat's `wl_registry.global` never created a
+`wl_keyboard`/`wl_pointer` on it and an injected key reaches **nobody**.
+
+So the filter is paired with an explicit failure in `handle_agent_inject`
+(same doctrine as `paused_by_ime`): `agent_delivery_target` resolves the
+client a `text` / `key` / `key_name` / `button` op would deliver to, and if
+the filter hides the agent seat from it the op is **dropped and audited**
+(`inject_dropped`, `detail: "unreachable_client: <comm> …"`) instead of being
+recorded as `inject_applied` while going nowhere. `move` is deliberately
+exempt (the compositor-drawn agent cursor still moves — a real effect), and
+an unresolvable target fails open, i.e. behaves exactly as before.
+
+### Live verification (2026-08-23, nested container stack)
+
+Same three-layer stack as the D3-c round — `weston --backend=headless` →
+`duduclaw-comp` → real clients — with `wayland-info` copied to differently
+**named** binaries so `/proc/<pid>/comm` drives the classification, and
+`foot` under `WAYLAND_DEBUG=1` as the protocol witness. Script kept out of
+the repo (scratchpad); reproduce with `wayland-utils` + `foot` + `python3`
+added to the live-run apt list. **10/10 PASS**:
+
+| # | check | evidence |
+|---|---|---|
+| 1 | a general client sees one seat | `genericapp` → `[winit]` |
+| 2 | the shell sees both, agent first | `duduclaw-shell` → `[duduclaw-agent, winit]` (order intact) |
+| 3 | an input method sees one seat | `fcitx5` → `[winit]` |
+| 4 | codrive into a hidden-seat client is dropped, not lost | `inject_dropped … "unreachable_client: foot does not see the agent seat (E1a-1 seat filter)"` |
+| 5 | …and that client really got nothing | foot's own trace: `0` `wl_keyboard.key` events |
+| 6 | an allow-listed client sees both seats | `DUDUCLAW_COMP_AGENT_SEAT_PROCS=…,genericapp` → `[duduclaw-agent, winit]` |
+| 7 | …binds both | `wl_seat@11.name("duduclaw-agent")` → `get_keyboard(wl_keyboard@22)`; `wl_seat@13.name("winit")` → `get_keyboard(wl_keyboard@25)` |
+| 8 | …and agent keys really land on it | `wl_keyboard@22.enter(…)` then `.key(…,35,1) .key(…,35,0) .key(…,23,1) .key(…,23,0)` — evdev 35/23 = `h`/`i`, i.e. the injected `"hi"`, on the **agent** seat's keyboard |
+| 9 | D3-c is not weakenable | `DUDUCLAW_COMP_AGENT_SEAT_PROCS=…,fcitx5` → `fcitx5` still `[winit]` |
+| 10 | the kill switch works | `DUDUCLAW_COMP_SEAT_FILTER=off` → `genericapp` sees both, with the warn log |
+
+Row 7+8 are the load-bearing pair: `foot` is multi-seat-aware and binds
+*both* seats, which is precisely why hiding one from it is what makes codrive
+unreachable — and why the drop in row 4 is a real behaviour change, not a
+theoretical one.
+
+Container: `cargo test` **491 passed** (487 + 4: the visibility truth table
+including the un-weakenable-D3-c row, the fail-closed default, the
+allow-list default's 15-byte `comm` budget, and the kill-switch parser),
+`cargo clippy --all-targets -- -D warnings` clean.
+
+### Not verified here (needs the VM / real hardware)
+
+* **Chromium under the armed filter** — the actual blocker. The container has
+  no Chromium; row 1 proves the registry now advertises one seat to a
+  non-allow-listed client, which is the mechanism, but the end-to-end "the
+  hamburger menu responds" observation is a VM step.
+* **The shell under the armed filter** — row 2 proves the shell still gets
+  both seats in the same order, so nothing about its configuration changed;
+  a gpui boot round on hardware is still the honest confirmation.
+* **Real fcitx5** — row 3/9 use a binary *named* `fcitx5`, which exercises the
+  classification and the visibility decision but not fcitx5's own
+  `refreshSeat()` loop.
+
+### Open decision this round surfaced
+
+With the filter armed, **codrive can no longer drive any third-party app**
+(only the shell, which it does not drive anyway). Three ways out, none taken
+here because all three are policy calls:
+
+1. Ship an allow list of known co-drive targets (`chromium`, …) — restores
+   codrive there, and re-exposes exactly those apps to the single-seat
+   hazard. Free today: it is an env var.
+2. Synthesise agent input through the **human** seat when the target cannot
+   see the agent seat — the mechanism the brief assumed already existed.
+   Works for every client, but breaks DESIGN §6's red line that agent input
+   travels through a seat object distinct from the human's.
+3. Accept the loss until gpui gains multi-seat support upstream, at which
+   point the shell needs no exemption and no ordering workaround either.

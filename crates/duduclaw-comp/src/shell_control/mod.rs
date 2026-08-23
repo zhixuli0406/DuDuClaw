@@ -149,16 +149,182 @@
 //! that `XCURSOR_SIZE` accepts any 8–512 value while this op accepts only the
 //! five steps — a deliberate operator-vs-UI split documented in
 //! `crate::cursor::source`'s own module doc.
+//!
+//! ## WP-comp-shell-display (2026-08-23): outputs, for the shell's 顯示 page
+//! `get_outputs` / `set_output_mode` / `set_output_scale` let a new
+//! system-settings app answer "what screens exist, at what resolution/scale"
+//! and attempt to change either. Same socket, same trust boundary, same
+//! "queries aren't audited, actions are" split as everything else in this
+//! module — `get_outputs` is read-only and unaudited, the two `set_*` ops
+//! are audited regardless of outcome (this crate is the only process that
+//! owns `Output`, so this is structurally the only place these ops can live).
+//!
+//! ### Wire shape
+//! ```text
+//! -> {"op":"get_outputs"}
+//! <- {"ok":true,"outputs":[
+//!      {"name":"Virtual-1","description":"DuDuClaw - duduclaw-comp (winit) - Virtual-1",
+//!       "make":"DuDuClaw","model":"duduclaw-comp (winit)",
+//!       "width":1920,"height":1080,"refresh_mhz":60000,"scale_pct":100,
+//!       "physical_width_mm":0,"physical_height_mm":0,
+//!       "modes":[{"width":1920,"height":1080,"refresh_mhz":60000,
+//!                 "preferred":true,"current":true}],
+//!       "mode_switch_supported":false}
+//!    ]}
+//!
+//! -> {"op":"set_output_mode","params":{"output":"Virtual-1","width":1920,
+//!                                       "height":1080,"refresh_mhz":60000}}
+//! <- {"ok":false,"error":"mode_switch_unsupported"}
+//!
+//! -> {"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":125}}
+//! <- {"ok":false,"error":"scale_change_unsupported"}
+//! ```
+//! The CD-2 shadow workspace's headless output never appears in `outputs` —
+//! same exclusion `state.rs::primary_output` already applies, for the same
+//! reason: it is not a screen a human can see.
+//!
+//! ### `modes` is `Output::modes()`, verbatim — checked, not assumed
+//! Read against smithay 0.7.0's actual `src/output.rs`: `Output::
+//! change_current_state(Some(mode), …)` and `Output::set_preferred(mode)`
+//! both push their argument onto the output's internal `modes` list if it
+//! isn't already there. Both `winit_backend.rs::init_winit` and
+//! `udev_backend.rs::build_surfaces` call exactly that pair before an output
+//! is ever mapped into `space` — so in practice `modes()` is **not** empty
+//! on either backend; it holds at least the one mode the output was created
+//! with, reported as both `current` and `preferred`. Two things this crate
+//! deliberately does NOT do, which is why the list stays that short:
+//! - `Output::add_mode` is never called anywhere in this crate, so no
+//!   backend ever advertises modes it cannot already produce.
+//! - The udev/DRM backend never calls `change_current_state` again after
+//!   `build_surfaces` — a real monitor's other EDID modes (`connector::
+//!   Info::modes()`, plural, already read by `pick_mode` to choose the ONE
+//!   mode a surface is created with) are simply never surfaced here.
+//!
+//! The one path that can genuinely grow this list at runtime is the winit
+//! backend's `WinitEvent::Resized` handler, which calls `change_current_state`
+//! again with the host window's new size — each distinct size the nested
+//! window has ever been resized to accumulates as its own entry (nothing
+//! is ever removed; `Output::delete_mode` is never called either). This is
+//! real smithay behaviour, not a bug introduced here, and is reported
+//! honestly rather than papered over. `get_outputs` does not synthesize,
+//! pad, or deduplicate beyond what `Output::modes()` itself already
+//! deduplicates (by exact `Mode` equality) — an empty `modes` array is left
+//! as the correct answer for the (currently unreached, but not assumed
+//! impossible) case of an output with no current mode at all.
+//!
+//! ### Why `mode_switch_supported` is always `false`, and `set_output_mode`
+//! ### always answers `mode_switch_unsupported`
+//! The op parses and validates fully — `unknown_output` for a name that
+//! doesn't match any real output, `invalid_mode` for a triple that isn't
+//! one of that output's own known modes (`protocol::mode_request_matches`)
+//! — before ever reaching the refusal. But actually applying a different
+//! mode is out of reach of a contained change to this module on **either**
+//! backend, checked by reading both:
+//! - **winit** (`winit_backend.rs`): the only handle to the host `winit::
+//!   window::Window` lives inside the `move` closure `init_winit` builds
+//!   for the event source, captured by value — it is not stored on
+//!   `DuduclawComp` or reachable from anywhere `shell_control` can see.
+//!   Threading it through would mean hoisting that closure's state out
+//!   (exactly the "on-demand winit" refactor `winit_backend.rs`'s own doc
+//!   comment records as attempted and reverted this round, for an unrelated
+//!   reason) — real restructuring, not a bounded addition.
+//! - **udev/DRM** (`udev_backend.rs`): the surface's mode is fixed at
+//!   `DrmDevice::create_surface(crtc, drm_mode, …)` and baked into the
+//!   `GbmBufferedSurface` swapchain's buffer size (`build_surfaces`). A
+//!   different mode means a new `DrmSurface` and a new, differently-sized
+//!   `GbmBufferedSurface` — i.e. rebuilding the `SurfaceData` this backend's
+//!   whole render/vblank/damage-tracking lifecycle is built around, while
+//!   `UdevBackendState` (in `CalloopData::udev`) is not even reachable from
+//!   `DuduclawComp`, which is all `shell_control`'s handlers ever get.
+//!
+//! Given that, `get_outputs`'s `mode_switch_supported` is always `false` —
+//! the one thing the task's own instructions call out as unacceptable is a
+//! `true` here that a real request would then refuse, so this errs the
+//! other way. A future round that actually threads a mode-change request
+//! into one backend can flip this per-output without lying about the other.
+//!
+//! ### Why `set_output_scale` always answers `scale_change_unsupported`
+//! `Output::change_current_state` *can* set a new `Scale` live — smithay
+//! sends the wire update itself (`wl_change_current_state`, gated on
+//! `wayland_frontend`). The reason this op still refuses is NOT a missing
+//! smithay feature; it is that this crate's own render pipeline does not
+//! consistently read the output's scale at all. Checked by grep, not
+//! assumed: `cursor/mod.rs`, `codrive/cursor.rs`, and `codrive/highlight.rs`
+//! each hardcode `Scale::from(1.0)` when building their render elements, and
+//! `codrive/shadow.rs`'s own `SHADOW_SIZE` comment already states it plainly
+//! — "this crate has never used a compositor scale other than 1.0". The
+//! **only** place that reads `Output::current_scale()` today is
+//! `decor/paint.rs`'s decoration-buffer rendering. Flipping the output's
+//! live scale would make decorations resize while the human/agent cursors,
+//! the codrive highlight box, and (per CUR-3's own "no HiDPI" limitation
+//! note) every other composited pixel stayed physical-pixel-for-logical-
+//! pixel — a real desync, not a hypothetical one. Fixing that is a
+//! render-pipeline change, not a `shell_control` change, so this op is
+//! validated fully (`unknown_output`, `invalid_scale` — the closed
+//! `protocol::OUTPUT_SCALE_STEPS` set) and then honestly refused.
+//!
+//! ## D2: `set_theme` — comp's own appearance, driven by the shell
+//! ```text
+//! -> {"op":"set_theme","params":{"theme":"dark"}}
+//! <- {"ok":true}
+//!
+//! -> {"op":"set_theme","params":{"theme":"brnad"}}
+//! <- {"ok":false,"error":"invalid_theme"}
+//! ```
+//! Switches comp's OWN server-side decorations (title bar, border, shadow,
+//! Alt-Tab switcher panel — `crate::decor::Palette`) between light and dark,
+//! live, no restart. Lives on this socket for the same reason every other
+//! appearance preference here does: the shell drives the theme choice from
+//! its own `ThemeChoice` (both at its own boot and on every user toggle), and
+//! routing that through `codrive`'s agent-injection socket would misattribute
+//! a person's own choice to the agent seat in that trail. Audited (an
+//! ACTION), never persisted on comp's side — the shell is the durable source
+//! of truth and re-announces its value every time IT starts, so comp only
+//! ever needs the live value. See `crate::decor::Theme`'s own doc for the
+//! full reasoning.
+//!
+//! ## A1: `take_shell_intents` — the compositor tells the shell something
+//! happened
+//! ```text
+//! -> {"op":"take_shell_intents"}
+//! <- {"ok":true,"intents":[]}
+//! ```
+//! or, after a human presses Super+K anywhere in the session:
+//! ```text
+//! -> {"op":"take_shell_intents"}
+//! <- {"ok":true,"intents":["global_task_bar"]}
+//! ```
+//! The compositor is the only thing that can see a global keyboard shortcut
+//! while an unrelated client holds keyboard focus — the standard wlroots-
+//! ecosystem division of labour — so Super+K interception has to live in
+//! `input.rs`'s human keyboard filter closure, same structural place (and
+//! same "an agent-injected key event structurally cannot reach this closure"
+//! guarantee) as Super+Q/Super+Esc/Super+Enter/Alt-Tab. The intercepted press
+//! pushes one [`ShellIntent`] onto `DuduclawComp::pending_shell_intents`
+//! (`DuduclawComp::push_shell_intent`); this op DRAINS that queue (read and
+//! clear in one step, never a re-readable snapshot), which is the shape a
+//! ~200ms short-poll loop (the shell's own contract) wants: whatever this
+//! call returns is delivered exactly once. `intents` is always present on the
+//! wire, even as `[]` — see [`ShellControlResponse::intents`]'s own doc for
+//! why that field is NOT skipped the way every other optional field on this
+//! envelope is. The queue itself is bounded
+//! ([`protocol::MAX_PENDING_SHELL_INTENTS`]) with a drop-oldest-and-warn
+//! policy, so a shell that stops polling cannot turn it into an unbounded
+//! leak — see `DuduclawComp::push_shell_intent`'s own doc.
 
 mod audit;
 mod listener;
 mod protocol;
 
-pub(crate) use protocol::{ShellControlRequest, ShellControlResponse, ShellWindowInfo};
+pub(crate) use protocol::{
+    ShellControlRequest, ShellControlResponse, ShellIntent, ShellOutputInfo, ShellOutputMode,
+    ShellWindowInfo, MAX_PENDING_SHELL_INTENTS,
+};
 
 use std::{path::PathBuf, sync::Arc};
 
 use smithay::{
+    output::Output,
     reexports::calloop::{self, EventLoop},
     utils::SERIAL_COUNTER,
 };
@@ -290,6 +456,15 @@ impl DuduclawComp {
             ShellControlRequest::GetCursorSource => ShellControlResponse::cursor(self.cursor_source_info()),
             ShellControlRequest::SetCursorSource { source } => self.shell_control_set_cursor_source(&source),
             ShellControlRequest::SetCursorSize { size } => self.shell_control_set_cursor_size(size),
+            ShellControlRequest::GetOutputs => ShellControlResponse::outputs(self.shell_control_get_outputs()),
+            ShellControlRequest::SetOutputMode { output, width, height, refresh_mhz } => {
+                self.shell_control_set_output_mode(&output, width, height, refresh_mhz)
+            }
+            ShellControlRequest::SetOutputScale { output, scale_pct } => {
+                self.shell_control_set_output_scale(&output, scale_pct)
+            }
+            ShellControlRequest::SetTheme { theme } => self.shell_control_set_theme(&theme),
+            ShellControlRequest::TakeShellIntents => self.shell_control_take_shell_intents(),
         }
     }
 
@@ -502,4 +677,223 @@ impl DuduclawComp {
             }
         }
     }
+
+    /// WP-comp-shell-display: every real output (CD-2's shadow workspace
+    /// excluded — see this module's own doc). Read-only, never audited —
+    /// same "queries aren't audited, actions are" rule as `list_windows`/
+    /// `get_cursor_source`.
+    fn shell_control_get_outputs(&self) -> Vec<ShellOutputInfo> {
+        self.space
+            .outputs()
+            .filter(|o| *o != &self.shadow_output)
+            .filter_map(shell_output_info)
+            .collect()
+    }
+
+    /// WP-comp-shell-display: an output matching `name` among the real
+    /// (non-shadow) outputs — exact equality, never a substring/prefix
+    /// match (coding convention #2: no unanchored matching for a routing
+    /// decision).
+    fn shell_control_find_output(&self, name: &str) -> Option<&Output> {
+        self.space.outputs().find(|o| *o != &self.shadow_output && o.name() == name)
+    }
+
+    /// WP-comp-shell-display: `set_output_mode` — validates fully
+    /// (`unknown_output` / `invalid_mode`) but never actually switches a
+    /// mode on this build. See this module's own doc for the concrete,
+    /// checked-not-assumed reason on each backend. Audited regardless of
+    /// outcome: this is an ACTION (an attempted mutation), like
+    /// `set_cursor_source`/`set_cursor_size`/`focus_window` above, even
+    /// though every path today ends in a refusal — the trail is what will
+    /// tell a later round how often this is actually requested.
+    fn shell_control_set_output_mode(
+        &mut self,
+        output_name: &str,
+        width: i64,
+        height: i64,
+        refresh_mhz: i64,
+    ) -> ShellControlResponse {
+        let Some(output) = self.shell_control_find_output(output_name) else {
+            self.shell_control.record(
+                "set_output_mode_failed",
+                Some(format!("output={output_name:?} error=unknown_output")),
+            );
+            return ShellControlResponse::err("unknown_output");
+        };
+
+        let modes = output.modes();
+        let detail = format!("output={output_name:?} width={width} height={height} refresh_mhz={refresh_mhz}");
+
+        if !protocol::mode_request_matches(width, height, refresh_mhz, &modes) {
+            self.shell_control.record("set_output_mode_failed", Some(format!("{detail} error=invalid_mode")));
+            return ShellControlResponse::err("invalid_mode");
+        }
+
+        // A real, known mode of a real output — and still refused. See this
+        // module's own doc ("Why `mode_switch_supported` is always `false`")
+        // for exactly why neither backend can apply this from here today.
+        self.shell_control.record(
+            "set_output_mode_failed",
+            Some(format!("{detail} error=mode_switch_unsupported")),
+        );
+        ShellControlResponse::err("mode_switch_unsupported")
+    }
+
+    /// WP-comp-shell-display: `set_output_scale` — validates fully
+    /// (`unknown_output` / `invalid_scale`) but never actually switches a
+    /// scale on this build. See this module's own doc ("Why
+    /// `set_output_scale` always answers `scale_change_unsupported`") for
+    /// the grep-checked reason (this crate's cursor/highlight render
+    /// elements hardcode scale 1.0). Audited regardless of outcome, same
+    /// reasoning as `shell_control_set_output_mode` above.
+    fn shell_control_set_output_scale(&mut self, output_name: &str, scale_pct: i64) -> ShellControlResponse {
+        if self.shell_control_find_output(output_name).is_none() {
+            self.shell_control.record(
+                "set_output_scale_failed",
+                Some(format!("output={output_name:?} error=unknown_output")),
+            );
+            return ShellControlResponse::err("unknown_output");
+        }
+
+        if !protocol::OUTPUT_SCALE_STEPS.contains(&scale_pct) {
+            // Reached the main thread with a value `listener::validate`
+            // should have refused — same defensive re-check shape as
+            // `shell_control_set_cursor_size`'s re-parse of the size.
+            tracing::error!(
+                "shell_control: set_output_scale reached the main thread with an \
+                 out-of-set value — refusing here too"
+            );
+            self.shell_control.record(
+                "set_output_scale_failed",
+                Some(format!("output={output_name:?} scale_pct={scale_pct} error=invalid_scale")),
+            );
+            return ShellControlResponse::err("invalid_scale");
+        }
+
+        self.shell_control.record(
+            "set_output_scale_failed",
+            Some(format!("output={output_name:?} scale_pct={scale_pct} error=scale_change_unsupported")),
+        );
+        ShellControlResponse::err("scale_change_unsupported")
+    }
+
+    /// D2: switch comp's own decoration appearance live, then audit the
+    /// outcome. `theme` has already been through `listener::validate`, so
+    /// `Theme::parse_strict` here cannot fail; it is re-parsed rather than
+    /// passed as an enum for the same reason `shell_control_set_cursor_source`
+    /// re-parses `source` — the wire type is a string and the parse is the
+    /// boundary, so a validation gap lands on a real error response, not a
+    /// panic. Unlike the cursor `set_*` ops there is nothing to persist (see
+    /// `crate::decor::Theme`'s doc), and the success reply is deliberately the
+    /// bare `{"ok":true}` shape (`ShellControlResponse::ok`) — the shell's own
+    /// client only reads `ok`.
+    fn shell_control_set_theme(&mut self, theme: &str) -> ShellControlResponse {
+        let Some(requested) = crate::decor::Theme::parse_strict(theme) else {
+            tracing::error!(
+                "shell_control: set_theme reached the main thread with a value \
+                 listener::validate should have refused — refusing here too"
+            );
+            self.shell_control.record("set_theme_failed", Some("invalid_theme".to_string()));
+            return ShellControlResponse::err("invalid_theme");
+        };
+
+        let changed = self.set_theme(requested);
+
+        // Audited: an ACTION with a real, user-visible effect, same as
+        // `set_cursor_source`/`set_cursor_size` above.
+        self.shell_control.record(
+            "set_theme",
+            Some(format!("requested={} changed={changed}", requested.as_str())),
+        );
+
+        ShellControlResponse::ok()
+    }
+
+    /// A1: drains [`DuduclawComp::pending_shell_intents`] — read-and-clear,
+    /// never a re-readable snapshot, matching the op's own "the shell pulls
+    /// each gesture exactly once" contract.
+    ///
+    /// Only audited when the drain is non-empty — see
+    /// [`ShellControlRequest::TakeShellIntents`]'s own doc for why an empty
+    /// poll (the overwhelming majority, at a ~200ms poll interval) must NOT
+    /// leave a line, while a genuine drained gesture still does.
+    fn shell_control_take_shell_intents(&mut self) -> ShellControlResponse {
+        let drained: Vec<ShellIntent> = self.pending_shell_intents.drain(..).collect();
+        if !drained.is_empty() {
+            let names: Vec<&str> = drained.iter().map(|i| i.as_str()).collect();
+            self.shell_control.record("take_shell_intents", Some(format!("intents={names:?}")));
+        }
+        ShellControlResponse::intents(drained.iter().map(|i| i.as_str().to_string()).collect())
+    }
+
+    /// A1: pushes one [`ShellIntent`] onto the pending queue, enforcing
+    /// [`MAX_PENDING_SHELL_INTENTS`] by dropping the OLDEST entry rather than
+    /// refusing the new one — a global hotkey the human just pressed is the
+    /// freshest signal and the one most likely to still matter; a queue this
+    /// deep only ever fills up when the shell has stopped polling entirely
+    /// (crashed, restarting), and in that case every queued entry is already
+    /// stale.
+    ///
+    /// Called from `input.rs`'s human keyboard filter closure ONLY — see that
+    /// call site's own comment for why an agent-injected key event can never
+    /// reach this method (the codrive agent seat's keyboard filter is a
+    /// separate, unconditional-forward closure that never routes through
+    /// `process_input_event` at all).
+    pub(crate) fn push_shell_intent(&mut self, intent: ShellIntent) {
+        if self.pending_shell_intents.len() >= MAX_PENDING_SHELL_INTENTS {
+            let dropped = self.pending_shell_intents.pop_front();
+            tracing::warn!(
+                dropped = ?dropped.map(ShellIntent::as_str),
+                pushed = intent.as_str(),
+                cap = MAX_PENDING_SHELL_INTENTS,
+                "shell_control: pending shell-intent queue full — the shell has stopped polling \
+                 take_shell_intents; dropping the OLDEST entry to make room"
+            );
+        }
+        self.pending_shell_intents.push_back(intent);
+    }
+}
+
+/// WP-comp-shell-display: converts one real `Output` into its
+/// `get_outputs` wire row. `None` only when the output has no
+/// `current_mode()` yet — both backends always call `change_current_state`
+/// with a mode before mapping the output into `space` (this module's own
+/// doc traces exactly where), so this is not reachable in practice; skipping
+/// rather than reporting fabricated `0×0` data is the honest choice if it
+/// ever is.
+fn shell_output_info(output: &Output) -> Option<ShellOutputInfo> {
+    let current = output.current_mode()?;
+    let preferred = output.preferred_mode();
+    let physical = output.physical_properties();
+
+    let modes = output
+        .modes()
+        .into_iter()
+        .map(|m| ShellOutputMode {
+            width: m.size.w as i64,
+            height: m.size.h as i64,
+            refresh_mhz: m.refresh as i64,
+            preferred: Some(m) == preferred,
+            current: m == current,
+        })
+        .collect();
+
+    Some(ShellOutputInfo {
+        name: output.name(),
+        description: output.description(),
+        make: physical.make,
+        model: physical.model,
+        width: current.size.w as i64,
+        height: current.size.h as i64,
+        refresh_mhz: current.refresh as i64,
+        // Never a float on the wire — same reasoning `SetCursorSize` gives
+        // for using `i64` throughout this socket.
+        scale_pct: (output.current_scale().fractional_scale() * 100.0).round() as i64,
+        physical_width_mm: physical.size.w as i64,
+        physical_height_mm: physical.size.h as i64,
+        modes,
+        // Always false — see this module's own doc for the concrete,
+        // checked-not-assumed reason on each backend.
+        mode_switch_supported: false,
+    })
 }

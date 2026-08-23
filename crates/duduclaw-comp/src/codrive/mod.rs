@@ -150,7 +150,7 @@ use smithay::{
     },
     reexports::{
         calloop::{self, EventLoop},
-        wayland_server::DisplayHandle,
+        wayland_server::{self, DisplayHandle},
     },
     utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
 };
@@ -479,6 +479,43 @@ impl DuduclawComp {
             return;
         }
 
+        // E1a-1 backstop: would this command deliver to a client the seat
+        // filter hides the agent seat from? smithay routes seat events through
+        // the client's OWN `wl_keyboard`/`wl_pointer` objects, which only
+        // exist if the client bound that seat (`for_each_focused_kbds` /
+        // `for_each_focused_pointer`) — so such a command reaches nobody. Same
+        // doctrine as the `paused_by_ime` guard above: report it, never let
+        // `inject_applied` claim a keystroke that went nowhere. See
+        // `crate::ime::seat_filter`.
+        if let Some(target) = self.agent_delivery_target(&cmd) {
+            if crate::ime::seat_filter::agent_seat_hidden_from(&target) {
+                let (op, x, y) = cmd.describe();
+                let app = target
+                    .get_data::<crate::state::ClientState>()
+                    .and_then(|d| d.comm().map(str::to_string))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                tracing::warn!(
+                    op,
+                    app = %app,
+                    "codrive: dropping a command — the target client cannot see the agent seat, \
+                     so it holds no wl_keyboard/wl_pointer on it and the event would reach \
+                     nobody. Allow-list the process with {} to make it co-drivable (see \
+                     crate::ime::seat_filter for the tradeoff)",
+                    crate::ime::seat_filter::AGENT_SEAT_PROCS_ENV
+                );
+                self.codrive.record(
+                    "inject_dropped",
+                    Some(op),
+                    x,
+                    y,
+                    Some(format!(
+                        "unreachable_client: {app} does not see the agent seat (E1a-1 seat filter)"
+                    )),
+                );
+                return;
+            }
+        }
+
         let (op, x, y) = cmd.describe();
 
         match cmd {
@@ -666,6 +703,34 @@ impl DuduclawComp {
             y,
             if shadow_bypass { Some("scope:shadow".to_string()) } else { None },
         );
+    }
+
+    /// E1a-1: which client, if any, would this command actually deliver to?
+    ///
+    /// Only the ops whose entire purpose is client delivery are answered.
+    /// `Move` is deliberately absent: an agent pointer motion that no client
+    /// hears still moves the compositor-drawn amber cursor, which is a real
+    /// effect and not a failure. `Highlight` / `Shadow` / `Watch` /
+    /// `TakeOver` / `ActivateWindow` are compositor-side by construction.
+    ///
+    /// `None` means "cannot tell" — no keyboard focus, nothing under the
+    /// pointer, or a surface whose client already went away — and is treated
+    /// as "do not drop", i.e. the check fails open. The command then behaves
+    /// exactly as it did before this guard existed.
+    fn agent_delivery_target(&self, cmd: &InjectCmd) -> Option<wayland_server::Client> {
+        use wayland_server::Resource as _;
+        match cmd {
+            InjectCmd::Key { .. } | InjectCmd::KeyName { .. } | InjectCmd::Text { .. } => self
+                .agent_seat
+                .get_keyboard()?
+                .current_focus()?
+                .client(),
+            InjectCmd::Button { .. } => {
+                let pos = self.agent_seat.get_pointer()?.current_location();
+                self.surface_under(pos).and_then(|(surface, _)| surface.client())
+            }
+            _ => None,
+        }
     }
 
     /// D3-c backstop: is an input method holding a keyboard grab on the

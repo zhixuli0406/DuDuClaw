@@ -156,6 +156,45 @@ impl DuduclawComp {
                             // `DuduclawComp::close_focused_window`
                             // (`window_policy.rs`).
                             data.close_focused_window();
+                        } else if key_state == KeyState::Pressed
+                            && modifiers.logo
+                            && is_task_bar_keysym(handle.modified_sym())
+                        {
+                            // A1: Super+K — global "open the交辦欄" gesture,
+                            // reachable from on top of ANY app, not just the
+                            // shell's own window. The compositor is the only
+                            // thing that can see this: once a third-party
+                            // client holds keyboard focus, the shell's own
+                            // window never receives another key event at all
+                            // (standard wlroots-ecosystem division of labour
+                            // — the COMPOSITOR owns global hotkeys, a client
+                            // only ever sees keys while it has focus). So the
+                            // trigger has to live here, exactly like Super+Q/
+                            // Super+Esc/Super+Enter/Alt-Tab above, and for the
+                            // identical structural reason those are safe from
+                            // agent forgery: this is the human seat's OWN
+                            // keyboard filter closure, and an agent-injected
+                            // key event is applied through a completely
+                            // separate path (`codrive::handle_agent_inject` →
+                            // `DuduclawComp::agent_key`, `codrive/mod.rs`),
+                            // whose own filter closure is an unconditional
+                            // `FilterResult::Forward` that never runs any of
+                            // this matching at all — see that method's own
+                            // doc comment. `is_system_gesture_tail` below
+                            // already exempts any key held with Logo from
+                            // re-freezing the seat, so K's chord tail needs no
+                            // changes there either.
+                            //
+                            // Intercepted (never forwarded to the focused
+                            // client) and queued rather than acted on
+                            // directly: this compositor does not own the
+                            // task-bar UI itself — `duduclaw-shell` does, as
+                            // an Overlay-layer layer-shell surface — so all
+                            // comp can honestly do is record that the gesture
+                            // happened and let the shell's short poll
+                            // (`take_shell_intents`) pick it up.
+                            data.push_shell_intent(crate::shell_control::ShellIntent::GlobalTaskBar);
+                            return FilterResult::Intercept(());
                         } else if key_state == KeyState::Released
                             && data.switcher.session.is_some()
                             && is_switcher_keysym(handle.modified_sym())
@@ -925,9 +964,25 @@ pub(crate) fn is_switcher_keysym(sym: Keysym) -> bool {
     sym == Keysym::new(keysyms::KEY_Tab) || sym == Keysym::new(keysyms::KEY_ISO_Left_Tab)
 }
 
+/// A1: does this keysym mean "K" for the Super+K global task-bar binding?
+///
+/// Both cases are accepted, for the identical reason [`is_close_window_keysym`]
+/// accepts both `Q`/`q`: `modified_sym()` is the keysym *after* modifiers are
+/// applied, so a user with Caps Lock on — or one who happens to hold Shift
+/// while reaching for Super — reports `K` rather than `k`. Refusing the
+/// uppercase form would make the compositor's global task-bar gesture
+/// intermittently dead. Pure and unit-testable, like the decision functions
+/// above.
+pub(crate) fn is_task_bar_keysym(sym: Keysym) -> bool {
+    sym == Keysym::new(keysyms::KEY_k) || sym == Keysym::new(keysyms::KEY_K)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{clamp_to, is_close_window_keysym, is_switcher_keysym, is_system_gesture_tail};
+    use super::{
+        clamp_to, is_close_window_keysym, is_switcher_keysym, is_system_gesture_tail,
+        is_task_bar_keysym,
+    };
     use smithay::input::keyboard::{keysyms, Keysym};
     use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -1033,6 +1088,29 @@ mod tests {
             assert!(
                 !is_switcher_keysym(Keysym::new(other)),
                 "keysym {other:#x} must not open the switcher"
+            );
+        }
+    }
+
+    #[test]
+    fn super_k_accepts_both_cases_of_k() {
+        assert!(is_task_bar_keysym(Keysym::new(keysyms::KEY_k)));
+        assert!(is_task_bar_keysym(Keysym::new(keysyms::KEY_K)));
+    }
+
+    #[test]
+    fn super_k_does_not_fire_on_neighbouring_or_similar_keys() {
+        for other in [
+            keysyms::KEY_j,
+            keysyms::KEY_l,
+            keysyms::KEY_q,
+            keysyms::KEY_Tab,
+            keysyms::KEY_Escape,
+            keysyms::KEY_Return,
+        ] {
+            assert!(
+                !is_task_bar_keysym(Keysym::new(other)),
+                "keysym {other:#x} must not be treated as the global task-bar binding"
             );
         }
     }

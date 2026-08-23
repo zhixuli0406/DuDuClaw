@@ -44,11 +44,12 @@ use std::{
 use smithay::reexports::calloop;
 
 use super::protocol::{
-    ShellControlRequest, ShellControlResponse, MAX_CURSOR_SOURCE_BYTES, MAX_QUERY_BYTES,
-    MAX_REQUEST_LINE_BYTES,
+    ShellControlRequest, ShellControlResponse, MAX_CURSOR_SOURCE_BYTES, MAX_OUTPUT_NAME_BYTES,
+    MAX_QUERY_BYTES, MAX_REQUEST_LINE_BYTES, MAX_THEME_BYTES, OUTPUT_SCALE_STEPS,
 };
 use super::{ShellControlMsg, ShellControlShared};
 use crate::cursor::source::{cursor_size_from_wire, CursorSource};
+use crate::decor::Theme;
 
 /// Bounds how long `handle_connection` will block waiting for a request
 /// line from an already-accepted (and already peer-cred-authorized) peer.
@@ -293,6 +294,64 @@ pub(super) fn validate(req: &ShellControlRequest) -> Result<(), String> {
             }
             Ok(())
         }
+        // WP-comp-shell-display: read-only, never touches `self.space`.
+        ShellControlRequest::GetOutputs => Ok(()),
+        // WP-comp-shell-display: this socket thread has no access to
+        // `self.space`, so it cannot know which modes a real output
+        // actually has — that full check (`protocol::mode_request_matches`)
+        // runs on the main thread, in `mod.rs`'s handler. What CAN be
+        // checked here without any state is the `output` field's shape
+        // (same length discipline as `focus_window`'s `query`) and that
+        // width/height/refresh_mhz are even *positive* — no real mode has
+        // ever had a non-positive dimension or refresh rate, so this is a
+        // real, unconditional rejection, not a partial guess.
+        ShellControlRequest::SetOutputMode { output, width, height, refresh_mhz } => {
+            if output.is_empty() {
+                return Err("set_output_mode output must not be empty".into());
+            }
+            if output.len() > MAX_OUTPUT_NAME_BYTES {
+                return Err(format!("set_output_mode output exceeds {MAX_OUTPUT_NAME_BYTES} bytes"));
+            }
+            if *width <= 0 || *height <= 0 || *refresh_mhz <= 0 {
+                // Fixed token, same no-echo reasoning as `set_cursor_size`
+                // above — a caller-controlled number never reaches a log
+                // line or a UI string verbatim.
+                return Err("invalid_mode".into());
+            }
+            Ok(())
+        }
+        ShellControlRequest::SetOutputScale { output, scale_pct } => {
+            if output.is_empty() {
+                return Err("set_output_scale output must not be empty".into());
+            }
+            if output.len() > MAX_OUTPUT_NAME_BYTES {
+                return Err(format!("set_output_scale output exceeds {MAX_OUTPUT_NAME_BYTES} bytes"));
+            }
+            if !OUTPUT_SCALE_STEPS.contains(scale_pct) {
+                // Fixed token, no echo — same discipline as `set_cursor_size`.
+                // This IS the full check (the set is static, unlike a mode's
+                // per-output set), so nothing further runs on the main thread
+                // except a defensive re-check (see `mod.rs`'s handler).
+                return Err("invalid_scale".into());
+            }
+            Ok(())
+        }
+        // D2. Length first (same ordering as `set_cursor_source`), then the
+        // strict, closed-set parse — a value the socket thread can already
+        // refuse without touching `self.space`.
+        ShellControlRequest::SetTheme { theme } => {
+            if theme.len() > MAX_THEME_BYTES {
+                return Err(format!("set_theme theme exceeds {MAX_THEME_BYTES} bytes"));
+            }
+            if Theme::parse_strict(theme).is_none() {
+                // Fixed token, same no-echo reasoning as every other op here.
+                return Err("invalid_theme".into());
+            }
+            Ok(())
+        }
+        // A1: no params at all — same shape as `list_windows`/
+        // `get_cursor_source`.
+        ShellControlRequest::TakeShellIntents => Ok(()),
     }
 }
 
@@ -416,6 +475,165 @@ mod tests {
         let err = validate(&req).unwrap_err();
         assert_eq!(err, "invalid_cursor_source");
         assert!(!err.contains("script"));
+    }
+
+    // ── WP-comp-shell-display: get_outputs / set_output_mode / set_output_scale ──
+
+    #[test]
+    fn validate_accepts_get_outputs() {
+        assert!(validate(&ShellControlRequest::GetOutputs).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_a_reasonable_set_output_mode_request() {
+        let req = ShellControlRequest::SetOutputMode {
+            output: "Virtual-1".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60000,
+        };
+        assert!(validate(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_output_name() {
+        let req = ShellControlRequest::SetOutputMode {
+            output: String::new(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60000,
+        };
+        assert!(validate(&req).is_err());
+        let req = ShellControlRequest::SetOutputScale { output: String::new(), scale_pct: 100 };
+        assert!(validate(&req).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_an_oversized_output_name() {
+        let req = ShellControlRequest::SetOutputMode {
+            output: "x".repeat(MAX_OUTPUT_NAME_BYTES + 1),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60000,
+        };
+        let err = validate(&req).unwrap_err();
+        assert!(err.contains(&MAX_OUTPUT_NAME_BYTES.to_string()), "{err}");
+        let req = ShellControlRequest::SetOutputScale {
+            output: "x".repeat(MAX_OUTPUT_NAME_BYTES + 1),
+            scale_pct: 100,
+        };
+        let err = validate(&req).unwrap_err();
+        assert!(err.contains(&MAX_OUTPUT_NAME_BYTES.to_string()), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_mode_dimensions_or_refresh() {
+        for (w, h, r) in [(0, 1080, 60000), (-1, 1080, 60000), (1920, 0, 60000), (1920, -1, 60000), (1920, 1080, 0), (1920, 1080, -1)] {
+            let req = ShellControlRequest::SetOutputMode {
+                output: "Virtual-1".to_string(),
+                width: w,
+                height: h,
+                refresh_mhz: r,
+            };
+            assert_eq!(validate(&req).unwrap_err(), "invalid_mode", "(w={w}, h={h}, r={r}) should be refused");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_an_implausibly_large_but_positive_mode_without_knowing_if_it_is_real() {
+        // The socket thread has no access to `self.space`, so it cannot know
+        // whether a specific (width, height, refresh_mhz) triple is a REAL
+        // mode of a REAL output — only the main thread's
+        // `protocol::mode_request_matches` can answer that. This is the
+        // deliberate split, not an oversight: a huge-but-positive value must
+        // still reach the main thread to be told `invalid_mode` there.
+        let req = ShellControlRequest::SetOutputMode {
+            output: "Virtual-1".to_string(),
+            width: 999_999_999,
+            height: 999_999_999,
+            refresh_mhz: 999_999_999,
+        };
+        assert!(validate(&req).is_ok());
+    }
+
+    #[test]
+    fn an_invalid_mode_error_does_not_echo_the_callers_values() {
+        let req = ShellControlRequest::SetOutputMode {
+            output: "Virtual-1".to_string(),
+            width: -133713,
+            height: 1080,
+            refresh_mhz: 60000,
+        };
+        let err = validate(&req).unwrap_err();
+        assert_eq!(err, "invalid_mode");
+        assert!(!err.contains("1337"));
+    }
+
+    #[test]
+    fn validate_accepts_exactly_the_five_offered_output_scales() {
+        for pct in OUTPUT_SCALE_STEPS {
+            let req = ShellControlRequest::SetOutputScale { output: "Virtual-1".to_string(), scale_pct: pct };
+            assert!(validate(&req).is_ok(), "{pct} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_refuses_an_off_step_output_scale_instead_of_clamping_it() {
+        for bad in [-1_i64, 0, 1, 50, 99, 101, 110, 199, 201, 300, 1000, i64::MAX, i64::MIN] {
+            let req = ShellControlRequest::SetOutputScale { output: "Virtual-1".to_string(), scale_pct: bad };
+            assert_eq!(validate(&req).unwrap_err(), "invalid_scale", "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn an_invalid_output_scale_error_does_not_echo_the_callers_value() {
+        let req = ShellControlRequest::SetOutputScale { output: "Virtual-1".to_string(), scale_pct: 133_713_371 };
+        let err = validate(&req).unwrap_err();
+        assert_eq!(err, "invalid_scale");
+        assert!(!err.contains("1337"));
+    }
+
+    // ── D2 set_theme ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_the_two_legal_themes() {
+        for v in ["light", "dark", "LIGHT", "Dark", "  dark  "] {
+            let req = ShellControlRequest::SetTheme { theme: v.to_string() };
+            assert!(validate(&req).is_ok(), "{v:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_unknown_theme_instead_of_defaulting_to_either_side() {
+        for v in ["", "   ", "blue", "1", "auto", "system", "🐾", "lightdark"] {
+            let req = ShellControlRequest::SetTheme { theme: v.to_string() };
+            assert_eq!(validate(&req).unwrap_err(), "invalid_theme", "{v:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_oversized_theme() {
+        let req = ShellControlRequest::SetTheme { theme: "d".repeat(MAX_THEME_BYTES + 1) };
+        let err = validate(&req).unwrap_err();
+        assert!(err.contains(&MAX_THEME_BYTES.to_string()), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_theme_error_does_not_echo_the_callers_value() {
+        // Short enough to clear MAX_THEME_BYTES (16) and reach the parser —
+        // this is testing the no-echo discipline of `parse_strict`'s
+        // rejection, not the separate oversized-length rejection above.
+        let req = ShellControlRequest::SetTheme { theme: "<script>".to_string() };
+        let err = validate(&req).unwrap_err();
+        assert_eq!(err, "invalid_theme");
+        assert!(!err.contains("script"));
+    }
+
+    // ── A1 take_shell_intents ───────────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_take_shell_intents() {
+        assert!(validate(&ShellControlRequest::TakeShellIntents).is_ok());
     }
 
     // ── Pure auth predicate — the "agent cannot reach this socket" proof ──

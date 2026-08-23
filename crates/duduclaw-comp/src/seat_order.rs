@@ -52,26 +52,54 @@
 //! still carry their own keyboard/pointer, and freeze / emergency stop /
 //! audit are untouched. Agent input is *not* merged into the human seat.
 //!
-//! # The tradeoff, stated plainly
+//! # The mirrored bug — measured, not theoretical (E1a, 2026-08-23)
 //!
-//! This is a coin flip, not a cure. A client that naively keeps the
-//! **first** seat (rather than the last) would be pushed onto the agent
-//! seat by `AgentFirst`, which is the same bug mirrored. We take that
-//! trade because:
+//! This module used to say that a client which naively keeps the **first**
+//! seat (rather than the last) "would be" pushed onto the agent seat by
+//! `AgentFirst`, and called that hazard *theoretical* on the grounds that
+//! every appliance client except the shell is multi-seat-aware.
 //!
-//! * every client that actually runs on the appliance except the shell is
-//!   multi-seat-aware (`foot`, GTK/Qt apps, Chromium/Firefox), so the
-//!   first-seat-wins hazard is theoretical here while the last-seat-wins
-//!   breakage is observed;
-//! * the cost of `AgentFirst` is narrow and known: a gpui client can no
-//!   longer be *driven* by the agent (it releases the agent seat's
-//!   keyboard). Human input to the shell is non-negotiable; agent-driving
-//!   the shell's own UI is not a current requirement, and every other
-//!   codrive target keeps working on both seats.
+//! **That was wrong, and it cost a ship-blocker.** On the appliance VM,
+//! Chromium 151 keeps exactly one seat and keeps the **first** one: under
+//! `AgentFirst` it binds the *agent* seat and the human gets no pointer, no
+//! keyboard and no clicks in it at all — hamburger menu dead, text fields
+//! never focus, Ctrl+T inert, reproduced three times, with fcitx5 excluded
+//! as a cause. The decisive control: `DUDUCLAW_COMP_SEAT_ORDER=human-first`
+//! made Chromium work completely and broke the shell's Enter key. The two
+//! clients are mutually exclusive under **any** single advertisement order,
+//! so no value of this enum is a fix.
 //!
-//! `DUDUCLAW_COMP_SEAT_ORDER=human-first` restores the pre-A4-5 order in
-//! one step if a future client needs it (or once gpui is fixed and the
-//! workaround becomes pointless).
+//! # What actually fixes it: per-client visibility, not order
+//!
+//! E1a-1 generalised D3-c's per-client global filter
+//! (`crate::ime::seat_filter`): the agent seat's `wl_seat` global is now
+//! advertised **only** to allow-listed processes — by default just
+//! `duduclaw-shell` — and never to an input method. A single-seat client
+//! that only ever sees one seat cannot pick the wrong one, whichever end of
+//! the registry list it picks from.
+//!
+//! That leaves this module with a much smaller job than it had: ordering now
+//! matters **only** for clients that see both seats, which by default is the
+//! shell alone. `AgentFirst` stays the default because that is precisely the
+//! client it was built for, and it is the configuration Shell-S0…S3 verified
+//! on real hardware.
+//!
+//! Two consequences worth stating plainly:
+//!
+//! * If the filter **disarms** (its startup self-check failing — see that
+//!   module's doc), every client sees both seats again and the Chromium
+//!   blackout above comes straight back. The disarm log says so in as many
+//!   words; this is not a silent degradation.
+//! * The cost of `AgentFirst` is unchanged and still narrow: a gpui client
+//!   cannot be *driven* by the agent (it releases the agent seat's
+//!   keyboard). With the filter armed the shell is not merely un-driveable
+//!   but structurally so, which is fine — human input to the shell is
+//!   non-negotiable, agent-driving the shell's own UI is not a requirement.
+//!
+//! `DUDUCLAW_COMP_SEAT_ORDER=human-first` still restores the pre-A4-5 order
+//! in one step (useful once gpui is fixed upstream and the workaround
+//! becomes pointless), and would now be harmless to every non-shell client
+//! for the same reason `AgentFirst` is: they only see one seat either way.
 
 /// Which `wl_seat` global `DuduclawComp::new` creates — and therefore
 /// advertises — first.
@@ -79,12 +107,16 @@
 pub enum SeatAdvertiseOrder {
     /// Agent seat global first, human seat global second. **Default.**
     /// Makes a last-seat-wins client (gpui) settle on the human seat.
+    ///
+    /// Since E1a-1 this is only observable by clients allow-listed to see
+    /// both seats — by default the shell, the one client it exists for.
     #[default]
     AgentFirst,
     /// Human seat global first, agent seat second — the order this
     /// compositor used before A4-5, and the conventional one ("the first
     /// advertised seat is the primary seat"). Correct in the abstract,
-    /// but leaves gpui clients keyboard-dead against this compositor.
+    /// but leaves gpui clients keyboard-dead against this compositor
+    /// (measured: the shell's Enter key stops working).
     HumanFirst,
 }
 
