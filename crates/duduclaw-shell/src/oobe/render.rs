@@ -80,11 +80,16 @@ pub fn render(flow: &OobeFlow, ui: &OobeUiState, account_fields: &AccountFields,
                 // own `.items_center()`, not this wrapper's job.
                 .child(div().w(px(640.)).flex().flex_col().gap(px(20.)).child(steps::render(step, flow, ui, account_fields, network_fields, cx))),
         )
-        .child(button_row(step, flow, cx))
+        .child(button_row(step, flow, ui, cx))
 }
 
-fn button_row(step: OobeStep, flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
-    let can_advance = flow.can_advance();
+/// D4a-5 (2026-08-23): `ui` is threaded in only so this fn can read
+/// `ui.wired_online()` for the `Network` step's Continue-button gate — see
+/// `OobeFlow::can_advance_with_wired`'s own doc comment for why that check
+/// lives on a SEPARATE method from `can_advance()` rather than widening
+/// this fn's existing `flow.can_advance()` call silently.
+fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Context<ShellView>) -> Div {
+    let can_advance = flow.can_advance_with_wired(ui.wired_online());
     // Task brief item 1: language is now the first step, so IT is the one
     // with no Back — see `OobeFlow::back()`'s own guard in `oobe/mod.rs`.
     let can_back = step != OobeStep::LanguageAccessibility;
@@ -116,8 +121,13 @@ fn button_row(step: OobeStep, flow: &OobeFlow, cx: &mut Context<ShellView>) -> D
         cx.notify();
     });
     let continue_click = cx.listener(|view, _ev, _window, cx| {
+        // D4a-5: read fresh at click time (not captured at render time) —
+        // same "re-borrow `view.oobe`/`view.oobe_ui` at invocation" pattern
+        // this closure already follows for `view.oobe`, see this fn's own
+        // header comment.
+        let wired_online = view.oobe_ui.wired_online();
         if let Some(flow) = view.oobe.as_mut() {
-            flow.next();
+            flow.next_with_wired(wired_online);
             super::save_state(flow.state());
             if flow.completed() {
                 view.oobe = None;

@@ -364,9 +364,12 @@ fn menu_bar_right(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
     // `.open(...)`, not `.toggle_launcher()` — see `composer()`'s own doc
     // comment for why every mouse click target here opens rather than
     // toggles (only the cmd-k keyboard binding itself toggles).
-    let cmdk_click = cx.listener(|view, _ev, _window, cx| {
+    let cmdk_click = cx.listener(|view, _ev, window, cx| {
         if crate::diag_enabled() { eprintln!("[hit] cmd-k pill -> open Launcher"); }
         view.surface.open(Overlay::Launcher);
+        // D3-b: same focus hand-off the composer click does — see
+        // `ShellView::settle_launcher_query`.
+        view.settle_launcher_query(window, cx);
         cx.notify();
     });
     let status_click = cx.listener(|view, _ev, _window, cx| {
@@ -459,9 +462,12 @@ fn workspace(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
 /// (toggle); every mouse click target's own wording is "開" (open), so a
 /// second click can't accidentally CLOSE an already-open Launcher here.
 fn composer(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
-    let on_click = cx.listener(|view, _ev, _window, cx| {
+    let on_click = cx.listener(|view, _ev, window, cx| {
         if crate::diag_enabled() { eprintln!("[hit] composer -> open Launcher"); }
         view.surface.open(Overlay::Launcher);
+        // D3-b: focus the (now real) search field so typing goes straight
+        // into it — see `ShellView::settle_launcher_query`.
+        view.settle_launcher_query(window, cx);
         cx.notify();
     });
 

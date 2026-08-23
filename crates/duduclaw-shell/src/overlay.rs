@@ -104,13 +104,6 @@ pub struct OverlayUiState {
     automation_on: bool,
     proactive_on: bool,
     pause_all_on: bool,
-    /// WP-A3 (2026-08-22): the Launcher's live search box text — see
-    /// `overlay/launcher.rs`'s header comment for why round 2's static
-    /// predisplay became real typing this round. Typed via `main.rs`'s root
-    /// `on_key_down` listener (gated on the Launcher actually being the
-    /// open overlay), cleared by `close_launcher_query` below whenever the
-    /// overlay closes so a fresh open never shows a stale search.
-    pub(crate) launcher_query: String,
     /// WP-A4-4 (2026-08-22): `Some` while the Launcher is showing the
     /// flatpak install confirmation sheet. `None` — including after a
     /// cancel — means no install is pending or running; see
@@ -130,7 +123,6 @@ impl Default for OverlayUiState {
             automation_on: true,
             proactive_on: true,
             pause_all_on: false,
-            launcher_query: String::new(),
             install_gate: None,
         }
     }
@@ -161,17 +153,15 @@ impl OverlayUiState {
         self.pause_all_on = !self.pause_all_on;
     }
 
-    /// Clears the Launcher search box — called from every path that closes
-    /// an overlay (`main.rs`'s `on_close_overlay`/`on_toggle_launcher`, and
-    /// the backdrop-click listener in `render` below) so reopening the
-    /// Launcher always starts from its empty/pre-typing state rather than
-    /// showing whatever was typed last time. A no-op when it's already
-    /// empty (closing Notifications/ControlCenter calls this too, same as
-    /// every other overlay-close path — cheaper than threading an
-    /// `Overlay`-specific branch through three call sites for a plain
-    /// `String::clear()`).
+    /// Drops the state an overlay close must not leave behind.
+    ///
+    /// D3-b (2026-08-23): the Launcher's typed search no longer lives here —
+    /// it is a real `Entity<OobeTextField>` on `ShellView` (see
+    /// `oobe::LauncherQueryField`), because a plain `String` fed by a root
+    /// key listener can never receive IME composition. Clearing it is
+    /// `ShellView::settle_launcher_query`'s job, which calls this too; the
+    /// name is kept so the three existing close paths read unchanged.
     pub(crate) fn close_launcher_query(&mut self) {
-        self.launcher_query.clear();
         // WP-A4-4: closing the Launcher also dismisses any pending install
         // confirmation. Dropping the gate is exactly what "取消" does — an
         // unconfirmed gate never handed out an install command (see
@@ -222,6 +212,12 @@ pub fn render(
     // `ShellView` as `pointer_ui`), threaded through exactly the way
     // `audio_ui` already is. Every other overlay ignores it.
     pointer_ui: &pointer_settings::PointerUiState,
+    // D3-b (2026-08-23): the Launcher's search box is a real IME-capable
+    // text-input entity now (`oobe::LauncherQueryField`, lives on `ShellView`
+    // as `launcher_query_field`), not a `String` on `ui` — threaded through
+    // exactly the way `audio_ui`/`installed_apps` already are. Every other
+    // overlay ignores it.
+    launcher_query: &crate::oobe::LauncherQueryField,
     palette: ShellPalette,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &mut Context<ShellView>,
@@ -243,7 +239,7 @@ pub fn render(
         .on_click(on_close);
 
     let panel: Stateful<Div> = match overlay {
-        Overlay::Launcher => launcher::render(ui, installed_apps, palette, cx),
+        Overlay::Launcher => launcher::render(ui, installed_apps, launcher_query, palette, cx),
         Overlay::Notifications => notifications::render(ui, palette, cx),
         Overlay::ControlCenter => controlcenter::render(ui, audio_ui, palette, cx),
         Overlay::PointerSettings => pointer_settings::render(pointer_ui, palette, cx),
@@ -284,17 +280,6 @@ mod tests {
         assert!(ui.automation_on());
         assert!(ui.proactive_on());
         assert!(!ui.pause_all_on());
-        assert!(ui.launcher_query.is_empty());
-    }
-
-    #[test]
-    fn close_launcher_query_clears_a_typed_search_and_is_a_noop_when_already_empty() {
-        let mut ui = OverlayUiState::default();
-        ui.launcher_query.push_str("chrome");
-        ui.close_launcher_query();
-        assert!(ui.launcher_query.is_empty());
-        ui.close_launcher_query();
-        assert!(ui.launcher_query.is_empty());
     }
 
     /// WP-A4-4: closing the Launcher by ANY route (Escape, cmd-k, a

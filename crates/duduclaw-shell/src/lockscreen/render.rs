@@ -775,6 +775,13 @@ fn dispatch_power_action(view: &mut ShellView, action: crate::gateway_client::Po
 pub(crate) fn lock_and_refresh(view: &mut ShellView, cx: &mut Context<ShellView>) {
     view.lockscreen.lock();
     view.surface.close();
+    // D3-b (2026-08-23): closing the Launcher this way must also drop
+    // whatever was typed into its search box, exactly as every other close
+    // path does (`ShellView::settle_launcher_query`). Only the CLEAR half is
+    // possible here — `lock_and_refresh` has no `&mut Window`, and the focus
+    // half is handled anyway: `reveal_and_focus` moves focus onto the
+    // password field on the first keystroke after locking.
+    view.launcher_query_field.field.update(cx, |field, cx| field.clear(cx));
     crate::overlay::notifications::trigger_refresh_if_stale(view, cx);
     cx.notify();
 }
@@ -897,7 +904,7 @@ fn dispatch_unlock_attempt(view: &mut ShellView, cx: &mut Context<ShellView>) {
         // to retype during the cooldown (task brief: "不鎖死").
         return;
     }
-    let password = view.lockscreen_password_field.field.read(cx).content.clone();
+    let password = view.lockscreen_password_field.field.read(cx).content(cx);
     if password.is_empty() {
         // Enter on an empty field is a no-op, not a wasted round trip or a
         // spurious "wrong password" flash.

@@ -63,24 +63,90 @@ pub enum NetConnectState {
     Failed(NetConnectFailureKind),
 }
 
-/// Which message `steps::network` shows for a `Failed` connect attempt —
-/// collapses `network::NetError`'s backend-layer variants down to the three
-/// an operator actually needs to act on differently, same split
-/// `AccountClaimFailureKind` (`oobe/mod.rs`) already establishes for the
-/// claim flow. `PasswordTooShort` is a pure client-side pre-check (mirrors
-/// the real WPA-PSK 8–63 character rule, same "catch it before ever
-/// dispatching a request" shape `oobe::claim`'s own password-length gate
-/// uses) and never reaches a backend at all. Which of `ConnectFailed`/
-/// `Timeout`/`Unavailable`/`NotFound` actually happened for the other two
-/// is diagnostic detail logged to stderr at the call site
-/// (`steps::network`'s own apply-result function), never rendered — see
-/// `network::NetError`'s own doc comment for why THIS classification (not
-/// the backend) is the one place that decides wrong-password vs.
-/// unreachable, using information only the UI layer has (whether the
-/// attempt carried a PSK at all).
+/// Which message `steps::network` shows for a `Failed` connect attempt.
+///
+/// Two sources feed this enum, side by side:
+///   - `PasswordTooShort` is a pure client-side pre-check (mirrors the real
+///     WPA-PSK 8–63 character rule, same "catch it before ever dispatching
+///     a request" shape `oobe::claim`'s own password-length gate uses) and
+///     never reaches a backend at all.
+///   - D4a-5 (2026-08-23): `WrongPassword` through `UnsupportedSecurity`
+///     mirror `network::WifiFailureCode`'s own nine D4a §5.3 codes 1:1 (see
+///     `from_code` below) — the gateway backend classifies failures
+///     server-side now, so this enum carries the SPECIFIC classification
+///     through instead of re-guessing it in the UI layer.
+///   - `Unreachable` is the fallback bucket for every LEGACY backend
+///     failure (`fake.rs`/`nm.rs`, neither of which classifies anything)
+///     AND for `WifiFailureCode::Unknown` (a code this build doesn't
+///     recognize) — same split `AccountClaimFailureKind` (`oobe/mod.rs`)
+///     already establishes for the claim flow: collapse what the operator
+///     can't act on differently into one generic "just retry" message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetConnectFailureKind {
     PasswordTooShort,
     WrongPassword,
+    NotFound,
+    OutOfRange,
+    NoAdapter,
+    DriverMissing,
+    NoIp,
+    Portal,
+    BackendUnavailable,
+    UnsupportedSecurity,
     Unreachable,
+}
+
+impl NetConnectFailureKind {
+    /// D4a §5.3: maps the gateway's own nine-code classification onto this
+    /// UI-facing enum, 1:1. `WifiFailureCode::Unknown` (a code this build
+    /// doesn't recognize) collapses to `Unreachable` — the same generic
+    /// "just retry" bucket every non-gateway backend's unclassified failure
+    /// already lands on (see `network::WifiFailureCode`'s own doc comment
+    /// for the fail-closed discipline behind `Unknown` in the first place:
+    /// never silently mapped onto an EXISTING code, which could understate
+    /// what actually went wrong).
+    pub(crate) fn from_code(code: network::WifiFailureCode) -> Self {
+        use network::WifiFailureCode;
+        match code {
+            WifiFailureCode::WrongPassword => Self::WrongPassword,
+            WifiFailureCode::NotFound => Self::NotFound,
+            WifiFailureCode::OutOfRange => Self::OutOfRange,
+            WifiFailureCode::NoAdapter => Self::NoAdapter,
+            WifiFailureCode::DriverMissing => Self::DriverMissing,
+            WifiFailureCode::NoIp => Self::NoIp,
+            WifiFailureCode::Portal => Self::Portal,
+            WifiFailureCode::BackendUnavailable => Self::BackendUnavailable,
+            WifiFailureCode::UnsupportedSecurity => Self::UnsupportedSecurity,
+            WifiFailureCode::Unknown => Self::Unreachable,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_code_maps_every_known_code_to_its_own_distinct_variant() {
+        use network::WifiFailureCode;
+        let cases: &[(WifiFailureCode, NetConnectFailureKind)] = &[
+            (WifiFailureCode::WrongPassword, NetConnectFailureKind::WrongPassword),
+            (WifiFailureCode::NotFound, NetConnectFailureKind::NotFound),
+            (WifiFailureCode::OutOfRange, NetConnectFailureKind::OutOfRange),
+            (WifiFailureCode::NoAdapter, NetConnectFailureKind::NoAdapter),
+            (WifiFailureCode::DriverMissing, NetConnectFailureKind::DriverMissing),
+            (WifiFailureCode::NoIp, NetConnectFailureKind::NoIp),
+            (WifiFailureCode::Portal, NetConnectFailureKind::Portal),
+            (WifiFailureCode::BackendUnavailable, NetConnectFailureKind::BackendUnavailable),
+            (WifiFailureCode::UnsupportedSecurity, NetConnectFailureKind::UnsupportedSecurity),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(NetConnectFailureKind::from_code(*code), *expected, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn from_code_collapses_unknown_to_unreachable() {
+        assert_eq!(NetConnectFailureKind::from_code(network::WifiFailureCode::Unknown), NetConnectFailureKind::Unreachable);
+    }
 }

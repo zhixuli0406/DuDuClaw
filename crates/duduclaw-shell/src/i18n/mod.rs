@@ -138,6 +138,40 @@ pub enum Key {
     NetworkPskLengthError,
     NetworkWrongPasswordError,
     NetworkConnectUnreachableError,
+    /// D4a §5.4-2 (2026-08-23): the wired/portal-only "已透過網路線連線"
+    /// status line — see `OobeUiState::wired_online`'s own doc comment.
+    NetworkWiredConnected,
+    /// D4a §5.3 (2026-08-23): the remaining eight of the gateway's own
+    /// nine-code Wi-Fi failure classification — `WrongPassword` reuses the
+    /// pre-existing `NetworkWrongPasswordError` key above, so only eight new
+    /// keys are needed here. See `network::WifiFailureCode`'s own doc
+    /// comment for the full nine-code list and
+    /// `network_ui::NetConnectFailureKind::from_code` for the mapping.
+    NetworkNotFoundError,
+    NetworkOutOfRangeError,
+    NetworkNoAdapterError,
+    NetworkDriverMissingError,
+    /// `{}` = the SSID the operator was joining.
+    NetworkNoIpError,
+    /// `{}` = the SSID (or, for a wired/portal-only connection, empty —
+    /// `steps::network::portal_notice` falls back to the empty string when
+    /// no SSID is known). Doubles as both the CONNECT-failure `portal` code
+    /// message and the standalone captive-portal banner (D4a §6) — same
+    /// wording either way, since both describe the identical situation
+    /// ("connected, but a browser login is required").
+    NetworkPortalNotice,
+    /// The button next to `NetworkPortalNotice` — D4a section 6's "開啟登入
+    /// 頁" affordance. Only rendered when the gateway actually reported a
+    /// `portal_url`; with no URL there is nothing honest to open, so the
+    /// notice stands alone rather than offering a button that does nothing.
+    NetworkPortalOpenButton,
+    NetworkBackendUnavailableError,
+    NetworkUnsupportedSecurityError,
+    /// D4a §5.4 (2026-08-23): shown in `failed_panel` (a Wi-Fi SCAN
+    /// failure, not a connect failure) specifically when the current
+    /// backend is `NetBackendKind::Unavailable` — a distinct, more specific
+    /// line than the generic `NetworkScanFailedStatus` retry message.
+    NetworkUnavailableHint,
 
     UpdateTitle,
     UpdateChecking,
@@ -468,6 +502,17 @@ fn zh_tw(key: Key) -> &'static str {
         Key::NetworkPskLengthError => "密碼長度需為 8–63 個字元",
         Key::NetworkWrongPasswordError => "密碼錯誤，請重新輸入",
         Key::NetworkConnectUnreachableError => "無法連線，請稍後重試",
+        Key::NetworkWiredConnected => "已透過網路線連線",
+        Key::NetworkNotFoundError => "找不到這個網路，可能已離開範圍",
+        Key::NetworkOutOfRangeError => "訊號太弱連不上，請靠近路由器再試",
+        Key::NetworkNoAdapterError => "這台機器沒有偵測到 Wi-Fi 硬體，請改用網路線",
+        Key::NetworkDriverMissingError => "Wi-Fi 硬體無法啟動（缺少驅動韌體），請改用網路線並回報型號",
+        Key::NetworkNoIpError => "已連上 {}，但沒有取得網路位址（可能是路由器 DHCP 問題）",
+        Key::NetworkPortalNotice => "已連上 {}，需要在瀏覽器完成登入",
+        Key::NetworkPortalOpenButton => "開啟登入頁",
+        Key::NetworkBackendUnavailableError => "網路服務未啟動，請重新開機或聯絡支援",
+        Key::NetworkUnsupportedSecurityError => "這個網路使用過舊的加密方式（WEP），系統不支援",
+        Key::NetworkUnavailableHint => "找不到網路服務，請改用網路線繼續設定，或重新開機後再試一次",
 
         Key::UpdateTitle => "系統更新",
         Key::UpdateChecking => "正在檢查更新…",
@@ -661,6 +706,17 @@ fn en(key: Key) -> &'static str {
         Key::NetworkPskLengthError => "Password must be 8–63 characters",
         Key::NetworkWrongPasswordError => "Incorrect password, please try again",
         Key::NetworkConnectUnreachableError => "Couldn't connect, please try again",
+        Key::NetworkWiredConnected => "Connected over a wired network",
+        Key::NetworkNotFoundError => "Couldn't find this network — it may be out of range",
+        Key::NetworkOutOfRangeError => "Signal too weak to connect. Move closer to the router and try again",
+        Key::NetworkNoAdapterError => "No Wi-Fi hardware detected on this machine. Please use a wired connection instead",
+        Key::NetworkDriverMissingError => "The Wi-Fi hardware couldn't start (missing driver firmware). Please use a wired connection and report the model",
+        Key::NetworkNoIpError => "Connected to {}, but didn't get a network address (the router's DHCP may be having trouble)",
+        Key::NetworkPortalNotice => "Connected to {} — sign in through a browser to finish",
+        Key::NetworkPortalOpenButton => "Open the sign-in page",
+        Key::NetworkBackendUnavailableError => "The network service isn't running. Please restart, or contact support",
+        Key::NetworkUnsupportedSecurityError => "This network uses an outdated encryption method (WEP), which isn't supported",
+        Key::NetworkUnavailableHint => "Couldn't reach the network service. Please use a wired connection to continue setup, or restart and try again",
 
         Key::UpdateTitle => "System update",
         Key::UpdateChecking => "Checking for updates…",
@@ -854,6 +910,17 @@ fn ja_jp(key: Key) -> &'static str {
         Key::NetworkPskLengthError => "パスワードは8〜63文字で入力してください",
         Key::NetworkWrongPasswordError => "パスワードが正しくありません。もう一度お試しください",
         Key::NetworkConnectUnreachableError => "接続できませんでした。もう一度お試しください",
+        Key::NetworkWiredConnected => "有線ネットワークで接続済み",
+        Key::NetworkNotFoundError => "このネットワークが見つかりません。電波の届く範囲外かもしれません",
+        Key::NetworkOutOfRangeError => "電波が弱くて接続できません。ルーターに近づいてもう一度お試しください",
+        Key::NetworkNoAdapterError => "この端末に Wi-Fi ハードウェアが検出されませんでした。有線接続をご利用ください",
+        Key::NetworkDriverMissingError => "Wi-Fi ハードウェアを起動できません（ドライバーファームウェアがありません）。有線接続をご利用のうえ、機種名をご報告ください",
+        Key::NetworkNoIpError => "{} に接続しましたが、ネットワークアドレスを取得できませんでした（ルーターの DHCP に問題がある可能性があります）",
+        Key::NetworkPortalNotice => "{} に接続しました。ブラウザでログインを完了してください",
+        Key::NetworkPortalOpenButton => "ログインページを開く",
+        Key::NetworkBackendUnavailableError => "ネットワークサービスが起動していません。再起動するか、サポートにご連絡ください",
+        Key::NetworkUnsupportedSecurityError => "このネットワークは古い暗号化方式（WEP）を使用しており、対応していません",
+        Key::NetworkUnavailableHint => "ネットワークサービスに接続できません。有線接続でセットアップを続けるか、再起動してもう一度お試しください",
 
         Key::UpdateTitle => "システムアップデート",
         Key::UpdateChecking => "アップデートを確認しています…",

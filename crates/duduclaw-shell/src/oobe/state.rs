@@ -270,8 +270,61 @@ impl OobeFlow {
     /// called from `Finish`. No-op (returns `false`, no mutation) if a
     /// blocking precondition isn't met, or if the flow is already
     /// completed.
+    ///
+    /// D4a-5 (2026-08-23): `#[allow(dead_code)]` — both PRODUCTION call
+    /// sites (`render.rs`'s Continue button, `main.rs`'s Enter-key handler)
+    /// switched to `next_with_wired`, which behaves identically to this
+    /// method on every step except `Network` (see that method's own doc
+    /// comment). This method is kept, not deleted or inlined into `next_
+    /// with_wired`: it is the simpler primitive `next_with_wired` builds on
+    /// top of, it is still what every test in this file's own `tests`
+    /// module below exercises for every non-Network-step scenario, and
+    /// `persistence.rs`'s boot-resume tests call it directly too — removing
+    /// it would just mean re-deriving the same logic under a different
+    /// name.
+    #[allow(dead_code)]
     pub fn next(&mut self) -> bool {
         if self.state.completed || !self.can_advance() {
+            return false;
+        }
+        match self.state.current_step.next() {
+            Some(step) => self.state.current_step = step,
+            None => self.state.completed = true,
+        }
+        true
+    }
+
+    /// D4a-5 (2026-08-23, D4a §5.4-2 "有線已連通時網路步應可通過"): same as
+    /// `can_advance()`, except the `Network` step ALSO accepts a live,
+    /// ephemeral "wired (or captive-portal-gated) connection is currently
+    /// up" signal — `wired_online`, sourced from `OobeUiState::
+    /// wired_online()`, which is itself derived from the last-fetched
+    /// `network::NetworkStatus` snapshot (see that method's own doc comment
+    /// for why it must never be persisted: a wired connection is an
+    /// environmental fact that can change the instant a cable is unplugged,
+    /// not a durable user selection like a completed Wi-Fi join).
+    ///
+    /// Deliberately a SEPARATE method from `can_advance()`, not a parameter
+    /// added to it — every existing caller that has no `OobeUiState` in
+    /// hand (`persistence.rs`'s own boot-resume tests, and every test in
+    /// THIS file's own `tests` module below) keeps compiling and behaving
+    /// unchanged; only `render.rs`'s Continue-button gate and `main.rs`'s
+    /// Enter-key handler, the two places that actually hold an
+    /// `OobeUiState`, call this one instead. Every step other than
+    /// `Network` behaves identically to `can_advance()`.
+    pub fn can_advance_with_wired(&self, wired_online: bool) -> bool {
+        match self.state.current_step {
+            OobeStep::Network => self.state.selections.network_connected || wired_online,
+            _ => self.can_advance(),
+        }
+    }
+
+    /// The `next()` twin of `can_advance_with_wired` — see that method's
+    /// own doc comment for why this is additive rather than a parameter on
+    /// `next()` itself. Identical body shape to `next()`, just gated on the
+    /// wired-aware precondition.
+    pub fn next_with_wired(&mut self, wired_online: bool) -> bool {
+        if self.state.completed || !self.can_advance_with_wired(wired_online) {
             return false;
         }
         match self.state.current_step.next() {
@@ -761,6 +814,74 @@ mod tests {
     fn theme_choice_serializes_kebab_case() {
         assert_eq!(serde_json::to_string(&ThemeChoice::Light).unwrap(), "\"light\"");
         assert_eq!(serde_json::to_string(&ThemeChoice::Dark).unwrap(), "\"dark\"");
+    }
+
+    // ── D4a-5: can_advance_with_wired / next_with_wired ─────────────────
+
+    #[test]
+    fn can_advance_with_wired_lets_a_wired_only_connection_through_the_network_step() {
+        let mut flow = OobeFlow::new();
+        flow.next(); // Language -> InputDetection
+        flow.next(); // InputDetection -> Network
+        assert_eq!(flow.current(), OobeStep::Network);
+        assert!(!flow.can_advance(), "no Wi-Fi join and no wired signal — still blocked via the ORIGINAL method");
+        assert!(!flow.can_advance_with_wired(false));
+        assert!(flow.can_advance_with_wired(true), "a wired-online signal alone must be enough");
+    }
+
+    #[test]
+    fn next_with_wired_advances_past_network_on_a_wired_signal_without_ever_persisting_a_wifi_join() {
+        let mut flow = OobeFlow::new();
+        flow.next();
+        flow.next();
+        assert_eq!(flow.current(), OobeStep::Network);
+        assert!(!flow.next_with_wired(false));
+        assert_eq!(flow.current(), OobeStep::Network);
+
+        assert!(flow.next_with_wired(true));
+        assert_eq!(flow.current(), OobeStep::Update);
+        // The whole point of D4a §5.4-2: wired connectivity is an
+        // environmental fact, never written into the persisted Wi-Fi join
+        // fields — unplugging the cable and reloading must not leave the
+        // flow believing it already joined a network.
+        assert!(!flow.selections().network_connected);
+        assert_eq!(flow.selections().network_ssid, None);
+    }
+
+    #[test]
+    fn can_advance_with_wired_behaves_identically_to_can_advance_on_every_other_step() {
+        // The wired-online parameter must ONLY change the Network step's
+        // gate — every other step's precondition (or lack of one) stays
+        // exactly what `can_advance()` already says, regardless of the
+        // (irrelevant, off-topic) wired flag passed in.
+        let mut flow = OobeFlow::new();
+        for wired in [false, true] {
+            assert_eq!(flow.can_advance_with_wired(wired), flow.can_advance(), "step={:?} wired={wired}", flow.current());
+        }
+        flow.next(); // -> InputDetection
+        for wired in [false, true] {
+            assert_eq!(flow.can_advance_with_wired(wired), flow.can_advance(), "step={:?} wired={wired}", flow.current());
+        }
+    }
+
+    #[test]
+    fn next_with_wired_still_respects_a_completed_flow_and_the_account_precondition() {
+        // Same no-op-once-completed / same AccountCreate gate as `next()` —
+        // the wired parameter is Network-step-specific, it must not loosen
+        // any OTHER precondition.
+        let mut flow = finish_flow();
+        assert!(flow.next_with_wired(true));
+        assert!(flow.completed());
+        assert!(!flow.next_with_wired(true), "no-op once completed, wired or not");
+
+        let mut flow2 = OobeFlow::new();
+        while flow2.current() != OobeStep::AccountCreate {
+            if flow2.current() == OobeStep::Network {
+                flow2.set_network("DuDu-Office", true);
+            }
+            flow2.next();
+        }
+        assert!(!flow2.next_with_wired(true), "AccountCreate's own precondition is untouched by the wired signal");
     }
 
     // ── helpers: walk to a given step, satisfying preconditions ──────

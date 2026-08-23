@@ -12,12 +12,15 @@
 //
 // ── Interaction scope, WP-A3 (2026-08-22, A-line S5 "殼整合") ──────────────
 // Round 2's "static predisplay" is gone for the query row and the app
-// section: `render()` takes a live `query: &str` (owned by `ShellView.
-// overlay_ui.launcher_query`, typed via `main.rs`'s root `on_key_down`
-// listener — the exact same "plain `on_key_down`, printable `key_char`
-// appends, `backspace` pops, no IME composition" pattern `duduclaw-native-
-// gui/src/text_field.rs`'s own header comment already documents and
-// accepts as an honest gap, not this file's own invention). The delegate
+// section: `render()` reads a live query out of a real text field. D3-b
+// (2026-08-23) replaced WP-A3's original mechanism — a `String` on
+// `OverlayUiState` appended to by a raw `on_key_down` listener on the shell
+// root, which that round documented as an honest "no IME composition" gap —
+// with `ShellView.launcher_query_field` (`oobe::LauncherQueryField`, an
+// `EntityInputHandler`-backed widget shared with the OOBE/lockscreen
+// fields). The gap is closed: a zh-TW operator can now search their apps by
+// typing Chinese, instead of only by an app's ASCII id or `Keywords=`
+// entry. The delegate
 // card and the files section stay untouched static DEMO content (task
 // brief: "既有交辦框並存、交辦優先序不變") — see `render()`'s own comment
 // below for why they only show in the EMPTY-query state rather than trying
@@ -114,8 +117,17 @@ const PANEL_WIDTH: f32 = 660.;
 const PANEL_LEFT: f32 = (1440. - PANEL_WIDTH) / 2.; // 390 — see header comment
 const PANEL_TOP: f32 = 170.;
 
-pub(super) fn render(ui: &OverlayUiState, installed: &InstalledAppsFeed, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
-    let query = ui.launcher_query.as_str();
+pub(super) fn render(
+    ui: &OverlayUiState,
+    installed: &InstalledAppsFeed,
+    query_field: &crate::oobe::LauncherQueryField,
+    palette: ShellPalette,
+    cx: &mut Context<ShellView>,
+) -> Stateful<Div> {
+    // Owned, not borrowed: reading it borrows `cx` immutably, and everything
+    // below (`apps_section`, `maybe_catalog_section`) needs `&mut Context`.
+    let query = query_field.field.read(cx).content(cx);
+    let query = query.as_str();
     // Launcher.dc.html: bg `rgba(255,255,255,0.97)` light / `rgba(30,30,33,
     // 0.97)` dark — `surface_raised` in both (see `home.rs`'s
     // `menu_bar_ticker` comment for why not `surface`). Border: opaque
@@ -154,7 +166,7 @@ pub(super) fn render(ui: &OverlayUiState, installed: &InstalledAppsFeed, palette
         // See this file's header comment on why this is dark-only.
         panel = panel.text_color(theme::alpha(palette.foreground, 1.0));
     }
-    panel = panel.child(query_row(query, palette));
+    panel = panel.child(query_row(query_field, palette));
     // WP-A4-4: an armed install confirmation REPLACES the result list. It is
     // a decision the operator has to answer before anything else in this
     // panel means much, and leaving the underlying rows clickable behind a
@@ -188,20 +200,15 @@ pub(super) fn render(ui: &OverlayUiState, installed: &InstalledAppsFeed, palette
     panel.child(footer(palette))
 }
 
-fn query_row(query: &str, palette: ShellPalette) -> Div {
+/// D3-b (2026-08-23): the row now hosts the REAL search field entity. It
+/// used to paint a `String` plus a hand-drawn 2px caret bar; both are gone —
+/// the widget draws its own caret (and its own IME preedit underline), and
+/// the placeholder is the field's, set at construction from the same
+/// `Key::LauncherSearchPlaceholder` string this fn used to read.
+fn query_row(query_field: &crate::oobe::LauncherQueryField, palette: ShellPalette) -> Div {
     // Launcher.dc.html: border-bottom `#f0f0f2` light / `rgba(255,255,255,
     // 0.08)` dark.
     let border_color = if palette.is_dark() { theme::alpha(0xffffff, 0.08) } else { theme::alpha(0xf0f0f2, 1.0) };
-    let text_color = if query.is_empty() { theme::alpha(palette.text_faint, 1.0) } else { theme::alpha(palette.foreground, 1.0) };
-    // Empty query shows the placeholder (new chrome — see this file's
-    // header comment on why it routes through `crate::i18n` rather than a
-    // plain literal, same boundary `home.rs::ticker_text` already draws).
-    // `Locale::ZhTw` is hardcoded, not read from a real preference — Home/
-    // overlay locale selection is still a documented future step (see
-    // `crate::i18n`'s own header comment), same as every other `t(Locale::
-    // ZhTw, ...)` call site in this crate today.
-    let display: String =
-        if query.is_empty() { t(Locale::ZhTw, Key::LauncherSearchPlaceholder).to_string() } else { query.to_string() };
     div()
         .flex()
         .items_center()
@@ -217,11 +224,7 @@ fn query_row(query: &str, palette: ShellPalette) -> Div {
         // it uses `icon_or_none`: a missing asset renders nothing rather
         // than an invented substitute.
         .children(icons::icon_or_none(&[(icons::SEARCH, palette.muted_foreground)], 19.))
-        .child(div().text_size(px(17.)).font_weight(FontWeight::MEDIUM).text_color(text_color).child(display))
-        // The blinking text cursor — static bar, no actual blink animation
-        // this round (unchanged limitation from before WP-A3; only the text
-        // beside it went live).
-        .child(div().w(px(2.)).h(px(22.)).bg(theme::alpha(palette.brand, 1.0)))
+        .child(query_field.field.clone())
 }
 
 fn section_label(label: &'static str, palette: ShellPalette) -> Div {

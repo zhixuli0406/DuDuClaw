@@ -201,6 +201,15 @@ pub struct ShellView {
     /// `OobeTextField::new` constructor is private to that module — this
     /// field has nothing conceptually to do with OOBE.
     pub(crate) lockscreen_password_field: oobe::LockPasswordField,
+    /// D3-b (2026-08-23) — the Launcher's real search-box entity, same
+    /// "created once at window-open time, reached through a bundle type
+    /// because `OobeTextField::new` is private to `oobe::widgets`" shape
+    /// `lockscreen_password_field` just above already establishes. Before
+    /// D3-b the Launcher's query was a `String` on `overlay_ui` appended to
+    /// by a raw key listener on this very root element, which meant gpui
+    /// never had an `EntityInputHandler` to deliver IME commits to and an
+    /// operator could not search their apps in Chinese at all.
+    pub(crate) launcher_query_field: oobe::LauncherQueryField,
     /// ICON-3 (2026-08-23) — the lockscreen identity row's display name.
     /// Read ONCE at window-open time from the persisted OOBE state
     /// (`oobe::boot_operator_name`), exactly like `theme` just below and for
@@ -271,6 +280,33 @@ impl Focusable for ShellView {
 }
 
 impl ShellView {
+    /// Re-settles everything that has to follow a Launcher open/close
+    /// transition, in ONE place so the four call sites (cmd-k toggle, Escape
+    /// close, backdrop click, Home's composer/dock click) cannot drift apart.
+    ///
+    /// D3-b (2026-08-23): the search box is a focusable entity now, so
+    /// "close the overlay" is no longer complete without handing keyboard
+    /// focus BACK to the shell root — leave it on a field that is no longer
+    /// rendered and the next keystroke has nowhere to go. Opening does the
+    /// mirror image: focus the field so the operator can just start typing,
+    /// which is also what installs its `EntityInputHandler` (gpui only
+    /// registers the handler of the FOCUSED element — `Window::handle_input`).
+    ///
+    /// The field is cleared on every transition, open included: reopening
+    /// the Launcher must never show the previous search, which is exactly
+    /// what `OverlayUiState::close_launcher_query` used to guarantee for the
+    /// old `String`.
+    pub(crate) fn settle_launcher_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.launcher_query_field.field.update(cx, |field, cx| field.clear(cx));
+        self.overlay_ui.close_launcher_query();
+        if self.surface.overlay() == Some(Overlay::Launcher) {
+            let handle = self.launcher_query_field.field.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        } else {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
     /// `cmd-k`'s action handler — see this file's header comment for why
     /// this lives on the root element (`.on_action(cx.listener(...))` in
     /// `Render::render`) rather than as an App-global `cx.on_action`
@@ -301,13 +337,11 @@ impl ShellView {
             return;
         }
         self.surface.toggle_launcher();
-        // WP-A3: `toggle_launcher` just as easily CLOSED the Launcher as
-        // opened it (that's the "toggle" in its name) — clearing
-        // unconditionally here is a no-op on the open path (the query is
-        // already empty for a fresh open) and the correct behavior on the
-        // close path, cheaper than branching on `self.surface.overlay()`'s
-        // new value to tell the two apart.
-        self.overlay_ui.close_launcher_query();
+        // WP-A3 / D3-b: clearing is unconditional (a no-op on the open path,
+        // the correct behavior on the close path); the focus half DOES read
+        // `self.surface.overlay()`'s new value, because open and close move
+        // focus in opposite directions. See `settle_launcher_query`.
+        self.settle_launcher_query(window, cx);
         // ICON-3 (2026-08-23): closing ANY overlay also forgets the
         // pointer surface's compositor snapshot, so the next open re-reads
         // it — the cursor can have been changed by something else in
@@ -344,7 +378,7 @@ impl ShellView {
             return;
         }
         self.surface.close();
-        self.overlay_ui.close_launcher_query();
+        self.settle_launcher_query(window, cx);
         // ICON-3 (2026-08-23): closing ANY overlay also forgets the
         // pointer surface's compositor snapshot, so the next open re-reads
         // it — the cursor can have been changed by something else in
@@ -373,10 +407,18 @@ impl ShellView {
             return;
         }
         self.lockscreen.note_input();
+        // D4a-5 (2026-08-23): read BEFORE the mutable borrow of `self.oobe`
+        // below — a disjoint-field borrow of `self.oobe_ui`, not a
+        // conflict. Keeps this keyboard path in agreement with `render.rs`'s
+        // Continue-button click handler (same `next_with_wired` call, same
+        // `OobeFlow::can_advance_with_wired` doc comment for why the wired
+        // signal is a separate parameter rather than folded into `can_
+        // advance()`/`next()` themselves).
+        let wired_online = self.oobe_ui.wired_online();
         let Some(flow) = self.oobe.as_mut() else {
             return;
         };
-        flow.next();
+        flow.next_with_wired(wired_online);
         oobe::save_state(flow.state());
         if flow.completed() {
             // Carry the Theme step's pick (if any was made) onto Home in
@@ -477,55 +519,18 @@ impl Render for ShellView {
             .on_key_down(cx.listener(|view, _ev, window, cx| {
                 lockscreen::render::note_input_or_reveal(view, window, cx);
             }))
-            // WP-A3 (2026-08-22): the Launcher's live search typing — a
-            // SECOND, separate `.on_key_down` registration on this same
-            // root element (gpui's `key_down_listeners` is a `Vec` that
-            // accumulates rather than overwrites, per this file's own
-            // comment just above), gated to only act while the Launcher is
-            // the open overlay so it never steals keystrokes meant for
-            // anything else. `cmd-k`/`escape`/`enter` are BOUND actions —
-            // they never reach a raw `on_key_down` listener at all (see
-            // this file's header comment), so this never needs to special-
-            // case them. Same minimal "printable `key_char` appends,
-            // `backspace` pops, no IME composition" pattern `duduclaw-
-            // native-gui/src/text_field.rs`'s own header comment documents
-            // and accepts as an honest gap — composing CJK text into this
-            // box will not work correctly, only ASCII search terms. APP-1
-            // (2026-08-22) softened that: `apps::installed::InstalledApp::
-            // search_key` folds each app's id, generic name and `Keywords=`
-            // into the haystack alongside its (possibly CJK) display name,
-            // so a zh-TW-named app is still reachable by typing its ASCII
-            // id or an English keyword — see that field's own doc comment.
-            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _window, cx| {
-                if view.oobe.is_some() || view.lockscreen.is_locked() {
-                    return;
-                }
-                if view.surface.overlay() != Some(Overlay::Launcher) {
-                    return;
-                }
-                let ks = &ev.keystroke;
-                // Let anything chorded with cmd/ctrl/function fall through
-                // instead of being swallowed as "typed text" — same guard
-                // `duduclaw-native-gui/src/text_field.rs::on_key_down`
-                // already applies for the identical reason.
-                if ks.modifiers.platform || ks.modifiers.control || ks.modifiers.function {
-                    return;
-                }
-                match ks.key.as_str() {
-                    "backspace" => {
-                        view.overlay_ui.launcher_query.pop();
-                        cx.notify();
-                    }
-                    _ => {
-                        if let Some(ch) = ks.key_char.as_deref() {
-                            if !ch.is_empty() && ch.chars().all(|c| !c.is_control()) {
-                                view.overlay_ui.launcher_query.push_str(ch);
-                                cx.notify();
-                            }
-                        }
-                    }
-                }
-            }))
+            // D3-b (2026-08-23): the Launcher's live search typing used to be a
+            // SECOND raw `.on_key_down` registration right here, appending
+            // `keystroke.key_char` into a `String`. It is gone: the search box
+            // is a real `EntityInputHandler`-backed field now
+            // (`launcher_query_field`, focused by `settle_launcher_query`
+            // whenever the Launcher opens), which is the only shape that can
+            // receive an IME commit at all — the old one could not compose
+            // Chinese by construction, and keeping it would additionally have
+            // DOUBLE-inserted every character, since gpui's platform layers
+            // hand an un-consumed printable key to the focused input handler
+            // themselves (see `duduclaw-native-gui/src/ime_input/
+            // input_state.rs`'s header comment for the two exact call sites).
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, _ev, window, cx| {
@@ -551,6 +556,17 @@ impl Render for ShellView {
         // comment) — and threaded into both `home::render` below and the
         // overlay-render call further down.
         let home_palette = palette::ShellPalette::for_choice(self.theme);
+        // D3-b (2026-08-23): publish it as the ambient `ShellPalette` global
+        // BEFORE any surface renders. `oobe::widgets::OobeTextField` (the
+        // shared text field used by OOBE, the lockscreen password prompt and
+        // the Launcher search box alike) reads its colors from this global
+        // rather than from a render parameter — see that type's own doc
+        // comment. Until now only `oobe::render::render` ever set it, so the
+        // lockscreen field was painted with whatever palette OOBE happened to
+        // leave behind (or the light default on a boot that skipped OOBE
+        // entirely). OOBE still overwrites this with the flow's own palette
+        // on the branch below, so its behavior is unchanged.
+        cx.set_global(home_palette);
         root = if let Some(flow) = &self.oobe {
             root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, &self.oobe_network_fields, cx))
         } else if self.lockscreen.is_locked() {
@@ -607,12 +623,12 @@ impl Render for ShellView {
                 // again into `overlay::render`, keeps the two borrows of
                 // `cx` sequential rather than interleaved in one
                 // expression.
-                let on_close = cx.listener(|view, _ev, _window, cx| {
+                let on_close = cx.listener(|view, _ev, window, cx| {
                     if diag_enabled() {
                         eprintln!("[hit] backdrop -> close overlay");
                     }
                     view.surface.close();
-                    view.overlay_ui.close_launcher_query();
+                    view.settle_launcher_query(window, cx);
                     // See `on_toggle_launcher`'s own note on this call.
                     view.pointer_ui.reset();
                     cx.notify();
@@ -623,6 +639,7 @@ impl Render for ShellView {
                     &self.audio_ui,
                     &self.installed_apps,
                     &self.pointer_ui,
+                    &self.launcher_query_field,
                     home_palette,
                     on_close,
                     cx,
@@ -667,6 +684,15 @@ impl Render for ShellView {
 // One more as of WP-lock-pw (2026-08-22, lockscreen PASSWORD unlock —
 // reverses the any-key-unlock MVP above, see `lockscreen/mod.rs`'s own
 // header comment for the full writeup):
+// One more as of D3-b (2026-08-23, IME wiring) — owned by
+// `duduclaw-native-gui`'s shared text widget rather than by this crate, but
+// listed here because it is read by THIS binary's process:
+//   - `DUDUCLAW_IME_TRACE=1` — logs one line per `EntityInputHandler`
+//     callback (preedit set/replaced, commit, unmark, backspace), so an
+//     fcitx5 bring-up can tell "the compositor never delivered the commit"
+//     apart from "the widget mishandled it". MASKED fields log lengths and
+//     cluster counts only, never their text. Default off; read live in
+//     `duduclaw_native_gui::ime_input`'s `trace_enabled()`.
 //   - `DUDUCLAW_SHELL_LOCK_NO_PASSWORD=1` — dev/headless escape hatch:
 //     reproduces the ORIGINAL any-key-unlock behavior verbatim, no password
 //     prompt, no gateway round trip. Any other value (including unset)
@@ -788,6 +814,7 @@ fn main() {
                     // window-open time" call site as the two `AccountFields`/
                     // `NetworkFields` entities just above.
                     let lockscreen_password_field = oobe::LockPasswordField::new(cx);
+                    let launcher_query_field = oobe::LauncherQueryField::new(cx);
                     cx.new(|cx| ShellView {
                         surface: SurfaceState::default(),
                         overlay_ui: overlay::OverlayUiState::default(),
@@ -797,6 +824,7 @@ fn main() {
                         running_windows: home::running_windows::RunningWindowsFeed::default(),
                         installed_apps: apps::feed::InstalledAppsFeed::default(),
                         lockscreen_password_field,
+                        launcher_query_field,
                         operator_name: initial_operator_name,
                         oobe: initial_oobe,
                         oobe_ui: oobe::OobeUiState::default(),
@@ -883,8 +911,13 @@ fn main() {
             }
             Ok(raw) => match Overlay::from_debug_env(&raw) {
                 Some(overlay) => {
-                    let _ = window.update(cx, |view, _window, cx| {
+                    let _ = window.update(cx, |view, window, cx| {
                         view.surface.open(overlay);
+                        // D3-b: `DUDUCLAW_SHELL_DEBUG_SURFACE=launcher` must
+                        // land in the same focused state a real cmd-k does,
+                        // or the headless smoke run would exercise a state
+                        // the operator can never reach.
+                        view.settle_launcher_query(window, cx);
                         cx.notify();
                     });
                     eprintln!("[main] DUDUCLAW_SHELL_DEBUG_SURFACE={raw} -> opened {overlay:?}");
@@ -920,6 +953,59 @@ mod tests {
     /// plain unit test, and standing up a `TestAppContext` to open a window
     /// for one assertion buys no more certainty than the visual check
     /// already gives.
+    /// D3-b (2026-08-23) — guards the regression that would silently kill
+    /// Chinese input on DuDuClaw OS.
+    ///
+    /// Every shell text surface must route typed characters through the
+    /// shared `EntityInputHandler` widget, NOT through a hand-rolled
+    /// `keystroke.key_char` append. Reintroducing such an append is silent
+    /// twice over: on a machine with no IME it looks like it works, and on a
+    /// machine WITH one it both fails to compose and double-inserts (gpui's
+    /// macOS and Wayland layers hand un-consumed printable keys to the
+    /// focused input handler themselves — see `duduclaw-native-gui/src/
+    /// ime_input/input_state.rs`'s header comment for the two call sites).
+    ///
+    /// A source-text assertion is a crude instrument, same caveat the font
+    /// test below states: it cannot prove composition works end to end (that
+    /// is what the fcitx5 live test is for). What it CAN do is fail loudly
+    /// the moment someone re-adds the shape that was just removed.
+    #[test]
+    fn no_shell_surface_hand_rolls_raw_character_text_entry() {
+        // Assembled at compile time so this test's own source does not
+        // contain the literal it searches for (it scans itself).
+        let needle = concat!("key", "_char");
+        for (name, source) in
+            [("main.rs", include_str!("main.rs")), ("oobe/widgets.rs", include_str!("oobe/widgets.rs"))]
+        {
+            for line in source.lines() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue; // the removal is DESCRIBED in comments on purpose
+                }
+                assert!(
+                    !code.contains(needle),
+                    "{name} reintroduced a hand-rolled per-keystroke text path: {line}"
+                );
+            }
+        }
+    }
+
+    /// The Launcher's search box must stay a real focusable field entity.
+    /// If it ever regresses to a plain `String` on `OverlayUiState`, IME
+    /// commits have nowhere to land again.
+    #[test]
+    fn the_launcher_search_box_is_a_focusable_field_entity() {
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains("launcher_query_field: oobe::LauncherQueryField"),
+            "ShellView no longer owns the Launcher's search-field entity"
+        );
+        assert!(
+            source.contains("fn settle_launcher_query"),
+            "the open/close focus hand-off for the Launcher search field is gone"
+        );
+    }
+
     #[test]
     fn the_root_element_applies_the_bundled_font() {
         let source = include_str!("main.rs");

@@ -75,6 +75,10 @@ mod fake_data;
 mod network;
 mod network_ui;
 mod persistence;
+// D4a §6 (2026-08-23): validates and opens a captive-portal sign-in URL.
+// Its own header comment explains why an attacker-supplied URL needs a
+// whole module rather than one `Command::new` call.
+mod portal_browser;
 mod render;
 mod selections;
 mod state;
@@ -98,6 +102,11 @@ pub(crate) use widgets::NetworkFields;
 /// `main.rs` needs `AccountFields`/`NetworkFields` above — see that type's
 /// own doc comment in `widgets.rs` (WP-lock-pw, 2026-08-22).
 pub(crate) use widgets::LockPasswordField;
+/// `crate::overlay::launcher` needs `LauncherQueryField` for the same reason
+/// again (D3-b, 2026-08-23) — the Launcher's search box became a real
+/// IME-capable field instead of a `String` appended to by a root key
+/// listener. See that type's own doc comment in `widgets.rs`.
+pub(crate) use widgets::LauncherQueryField;
 /// `NetScanState`/`NetConnectState`/`NetConnectFailureKind` live in their
 /// own file (`network_ui.rs` — see that file's own header comment for why)
 /// but are re-exported here so every call site keeps addressing them as

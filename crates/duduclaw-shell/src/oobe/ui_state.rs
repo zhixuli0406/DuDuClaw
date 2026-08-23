@@ -90,7 +90,7 @@ pub struct OobeUiState {
     /// entry is expanded — task brief: "無障礙入口（視覺入口，點開佔位）".
     pub accessibility_open: bool,
     /// `AccountCreate`'s "建立帳號" click validates both real `OobeTextField`
-    /// entries at CLICK time (`this.field.read(cx).content`, same pattern
+    /// entries at CLICK time (`this.field.read(cx).content(cx)`, same pattern
     /// `duduclaw-native-gui/src/screens/login.rs`'s own submit handler
     /// already uses for its email/password fields) rather than disabling
     /// the button ahead of time from live typed content — disabling would
@@ -129,6 +129,18 @@ pub struct OobeUiState {
     /// shows the PSK field at all.
     pub net_selected_secured: bool,
     pub net_connect: NetConnectState,
+    /// D4a-5 (2026-08-23): the last-fetched overall connectivity snapshot
+    /// (`GET /api/first-run/network/status`, `network::NetworkStatus`) —
+    /// fetched alongside a Wi-Fi scan (`kick_off_scan`, `steps::network`)
+    /// since it's the same background thread and the same gateway round
+    /// trip, not a separate click. `None` before the first scan attempt
+    /// settles, OR whenever the most recent fetch failed (see `kick_off_
+    /// scan`'s own comment on that call site for why a failed refresh
+    /// clears this rather than keeping a stale value — honesty over
+    /// continuity). Ephemeral like every other field here: a wired cable
+    /// being unplugged between renders must be re-observed on the next
+    /// scan, never remembered from an earlier point in this process's life.
+    pub net_status: Option<network::NetworkStatus>,
 }
 
 impl OobeUiState {
@@ -219,6 +231,29 @@ impl OobeUiState {
 
     pub fn clear_net_selected_ssid(&mut self) {
         self.net_selected_ssid = None;
+    }
+
+    /// D4a §5.4-2 (2026-08-23): whether the machine currently has SOME
+    /// non-Wi-Fi-join route to the internet (wired ethernet, most commonly)
+    /// that should let the operator past the `Network` step without ever
+    /// picking a Wi-Fi row. Derived from `net_status`, not a second stored
+    /// field — one source of truth (same reasoning `network::AccessPoint::
+    /// secured()` already applies to itself).
+    ///
+    /// Combines TWO signals from the same snapshot, deliberately: `internet.
+    /// counts_as_connected()` (online OR portal) AND `has_ip` non-empty —
+    /// belt-and-suspenders (D4a §5.4-2's own wording: "internet 欄位…＋
+    /// ip.addresses 非空"), since an `internet` verdict without an address
+    /// would itself be a contradiction worth not trusting blindly.
+    ///
+    /// See `OobeFlow::can_advance_with_wired`'s own doc comment for why this
+    /// lives on the EPHEMERAL side (`OobeUiState`) and is combined with the
+    /// PERSISTED `network_connected` flag only at the point of deciding,
+    /// never merged into it — a wired connection is an environmental fact,
+    /// not a user selection, and must not survive a restart with the cable
+    /// unplugged.
+    pub fn wired_online(&self) -> bool {
+        self.net_status.as_ref().is_some_and(|s| s.internet.counts_as_connected() && s.has_ip)
     }
 }
 
@@ -330,7 +365,7 @@ mod tests {
     fn set_net_scan_loaded_records_both_the_ap_list_and_the_backend_kind_together() {
         let mut ui = OobeUiState::default();
         ui.set_net_scanning();
-        let aps = vec![network::AccessPoint { ssid: "DuDu-Office".to_string(), signal_bars: 4, secured: true }];
+        let aps = vec![network::AccessPoint { ssid: "DuDu-Office".to_string(), signal_bars: 4, security: "psk".to_string(), known: false }];
         ui.set_net_scan_loaded(aps.clone(), network::NetBackendKind::Real);
         assert_eq!(ui.net_scan, NetScanState::Loaded(aps));
         assert_eq!(ui.net_backend_kind, Some(network::NetBackendKind::Real));
@@ -381,5 +416,36 @@ mod tests {
         ui.start_net_awaiting_psk("DuDu-Office");
         ui.clear_net_selected_ssid();
         assert_eq!(ui.net_selected_ssid, None);
+    }
+
+    // ── D4a-5: net_status / wired_online() ──────────────────────────────
+
+    #[test]
+    fn wired_online_is_false_with_no_status_fetched_yet() {
+        let ui = OobeUiState::default();
+        assert_eq!(ui.net_status, None);
+        assert!(!ui.wired_online());
+    }
+
+    #[test]
+    fn wired_online_is_true_only_when_internet_counts_as_connected_and_has_an_ip() {
+        // `..Default::default()` on the FIRST construction, then plain field
+        // reassignment for the rest — same shape avoids clippy's
+        // `field_reassign_with_default` on the first line without losing
+        // this test's own point (reusing one `ui` across four snapshots).
+        let mut ui = OobeUiState {
+            net_status: Some(network::NetworkStatus { internet: network::InternetState::Online, has_ip: true, wifi_ssid: None, portal_url: None }),
+            ..Default::default()
+        };
+        assert!(ui.wired_online());
+
+        ui.net_status = Some(network::NetworkStatus { internet: network::InternetState::Portal, has_ip: true, wifi_ssid: None, portal_url: Some("http://x/".to_string()) });
+        assert!(ui.wired_online(), "portal counts as connected — D4a §5.4-2");
+
+        ui.net_status = Some(network::NetworkStatus { internet: network::InternetState::Offline, has_ip: true, wifi_ssid: None, portal_url: None });
+        assert!(!ui.wired_online(), "offline must never count, even with an IP");
+
+        ui.net_status = Some(network::NetworkStatus { internet: network::InternetState::Online, has_ip: false, wifi_ssid: None, portal_url: None });
+        assert!(!ui.wired_online(), "online with no IP address is a contradiction, not trusted blindly");
     }
 }

@@ -40,6 +40,28 @@
 // network's own name is data (now real, scanned data on Linux, previously
 // `fake_data`'s literal table), the same category the task brief's own
 // item 4 exempts for Home/overlay.
+//
+// ── D4a-5 (2026-08-23): gateway backend + wired/portal awareness ─────────
+// `oobe::network::select_backend()`'s Linux/NetworkManager path is replaced
+// by a gateway-HTTP path (see that module's own header comment for the
+// D4a §1.2/§5.4 ship-blocker this fixes) — this file's own render logic
+// changes in three ways to go with it:
+//   1. Connect failures now carry the gateway's own nine-code classification
+//      (`network::WifiFailureCode` -> `NetConnectFailureKind::from_code`)
+//      instead of the coarser secured-network-implies-wrong-password
+//      heuristic; that heuristic is KEPT as the fallback for the two legacy
+//      backends (`fake.rs`/`nm.rs`), which never classify anything.
+//   2. `kick_off_scan` also fetches the overall connectivity snapshot
+//      (`NetworkBackend::network_status`) on the SAME background round
+//      trip, storing it on `OobeUiState::net_status` — this is what lets
+//      D4a §5.4-2 ("有線已連通時網路步應可通過") and §6 (captive-portal
+//      notice) work without a second click-triggered I/O path.
+//   3. A captive-portal notice (§6, M1: detect + tell only) renders
+//      whenever the last-fetched status says `internet == Portal` — no
+//      "open the login page" button is wired (see `portal_notice`'s own
+//      doc comment for why: this crate has no reusable "open an arbitrary
+//      URL" path today, and the task brief for this round explicitly says
+//      not to invent one).
 
 use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 
@@ -58,9 +80,16 @@ pub(super) fn render(flow: &OobeFlow, ui: &OobeUiState, fields: &NetworkFields, 
     let locale = flow.locale();
     let palette = flow.palette();
 
-    let status = match (&selected_ssid, connected) {
-        (Some(ssid), true) => widgets::subtitle_dynamic(t1(locale, Key::NetworkConnectedTo, ssid), palette),
-        _ => widgets::subtitle(t(locale, Key::NetworkSubtitlePrompt), palette),
+    // D4a §5.4-2 (2026-08-23): a wired (or portal-gated) connection gets its
+    // own status line — checked AFTER the persisted Wi-Fi join (a real
+    // completed join is always the more specific fact) and BEFORE the
+    // generic "choose a network" prompt.
+    let status = if let (Some(ssid), true) = (&selected_ssid, connected) {
+        widgets::subtitle_dynamic(t1(locale, Key::NetworkConnectedTo, ssid), palette)
+    } else if ui.wired_online() {
+        widgets::subtitle(t(locale, Key::NetworkWiredConnected), palette)
+    } else {
+        widgets::subtitle(t(locale, Key::NetworkSubtitlePrompt), palette)
     };
 
     // ICON-3 (2026-08-23): `OOBE-KeySteps.dc.html` puts a 32px
@@ -85,7 +114,73 @@ pub(super) fn render(flow: &OobeFlow, ui: &OobeUiState, fields: &NetworkFields, 
         column = column.child(demo_mode_notice(locale, palette));
     }
 
+    // D4a §6 (2026-08-23): captive-portal notice — independent of which row
+    // (if any) is selected, since a WIRED connection can be portal-gated
+    // too.
+    if let Some(status) = &ui.net_status {
+        if status.internet == network::InternetState::Portal {
+            column = column.child(portal_notice(locale, palette, status, &selected_ssid, cx));
+        }
+    }
+
     column.child(widgets::card(scan_body(flow, ui, fields, cx), palette))
+}
+
+/// D4a §6, M1 scope: detect and tell, plus the one affordance the decision
+/// list names ("captive portal M1 偵測＋開啟登入頁鈕").
+///
+/// The button appears ONLY when the gateway actually reported a
+/// `portal_url`. Many portals redirect without a usable `Location`, and a
+/// button that opens nothing is worse than no button — so the notice stands
+/// alone in that case rather than pretending there is somewhere to go.
+///
+/// The URL is attacker-supplied (it comes from an access point the operator
+/// has not authenticated to), which is why it goes through
+/// `oobe::portal_browser::open_portal` rather than straight into a
+/// `Command` — see that module's header comment for the full rule set.
+fn portal_notice(
+    locale: crate::i18n::Locale,
+    palette: ShellPalette,
+    status: &network::NetworkStatus,
+    selected_ssid: &Option<String>,
+    cx: &mut Context<ShellView>,
+) -> Div {
+    let label = status.wifi_ssid.clone().or_else(|| selected_ssid.clone()).unwrap_or_default();
+    let mut notice = div()
+        .w_full()
+        .px(px(12.))
+        .py(px(8.))
+        .rounded(px(theme::RADIUS_LG))
+        .bg(theme::alpha(palette.warning, 0.14))
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(
+            div()
+                .text_size(px(theme::TEXT_XS))
+                .text_color(theme::alpha(palette.warning, 1.0))
+                .child(t1(locale, Key::NetworkPortalNotice, &label)),
+        );
+
+    if let Some(url) = status.portal_url.clone() {
+        // Spawning a browser is real I/O, but it is fire-and-forget (no
+        // reply to wait for), so unlike scan/connect it needs no background
+        // thread + mpsc bridge — `open_portal` returns as soon as the child
+        // is spawned or refused.
+        let click = cx.listener(move |_view, _ev, _window, _cx| {
+            crate::oobe::portal_browser::open_portal(&url);
+        });
+        notice = notice.child(div().flex().justify_end().child(widgets::step_button(
+            "oobe-net-portal-open",
+            t(locale, Key::NetworkPortalOpenButton),
+            StepButtonVariant::Secondary,
+            false,
+            palette,
+            click,
+        )));
+    }
+
+    notice
 }
 
 /// The demo-mode disclosure — task brief: "Linux 偵測不到 NM...在 UI 誠實
@@ -111,7 +206,7 @@ fn scan_body(flow: &OobeFlow, ui: &OobeUiState, fields: &NetworkFields, cx: &mut
     match &ui.net_scan {
         NetScanState::NeverScanned => never_scanned_panel(locale, palette, cx),
         NetScanState::Scanning => scanning_panel(locale, palette),
-        NetScanState::Failed => failed_panel(locale, palette, cx),
+        NetScanState::Failed => failed_panel(locale, palette, ui, cx),
         NetScanState::Loaded(aps) if aps.is_empty() => empty_panel(locale, palette, cx),
         NetScanState::Loaded(aps) => loaded_panel(aps, flow, ui, fields, cx),
     }
@@ -135,16 +230,25 @@ fn scanning_panel(locale: crate::i18n::Locale, palette: ShellPalette) -> Div {
     )
 }
 
-fn failed_panel(locale: crate::i18n::Locale, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+/// D4a §5.4 (ship-blocker fix, 2026-08-23): when the CURRENT backend is
+/// `NetBackendKind::Unavailable` (an appliance whose gateway network
+/// backend didn't answer — see `network::select_backend`'s own doc
+/// comment), this panel adds a second, more specific line + a "use a wired
+/// connection" hint on top of the generic "scan failed, retry" message —
+/// never a fabricated SSID list, never a silent claim of success.
+fn failed_panel(locale: crate::i18n::Locale, palette: ShellPalette, ui: &OobeUiState, cx: &mut Context<ShellView>) -> Div {
     let click = cx.listener(|view, _ev, _window, cx| kick_off_scan(view, cx));
-    div()
+    let mut column = div()
         .flex()
         .flex_col()
         .items_center()
         .gap(px(12.))
         .py(px(8.))
-        .child(div().text_size(px(theme::TEXT_SM)).text_color(theme::alpha(palette.destructive, 1.0)).child(t(locale, Key::NetworkScanFailedStatus)))
-        .child(widgets::step_button("oobe-net-rescan", t(locale, Key::NetworkRescanButton), StepButtonVariant::Secondary, false, palette, click))
+        .child(div().text_size(px(theme::TEXT_SM)).text_color(theme::alpha(palette.destructive, 1.0)).child(t(locale, Key::NetworkScanFailedStatus)));
+    if ui.net_backend_kind == Some(network::NetBackendKind::Unavailable) {
+        column = column.child(div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(palette.destructive, 1.0)).child(t(locale, Key::NetworkUnavailableHint)));
+    }
+    column.child(widgets::step_button("oobe-net-rescan", t(locale, Key::NetworkRescanButton), StepButtonVariant::Secondary, false, palette, click))
 }
 
 fn empty_panel(locale: crate::i18n::Locale, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
@@ -202,7 +306,8 @@ fn wifi_row(ap: &network::AccessPoint, index: usize, flow: &OobeFlow, ui: &OobeU
     let busy = ui.net_connect == NetConnectState::Connecting;
 
     let ssid = ap.ssid.clone();
-    let secured = ap.secured;
+    let secured = ap.secured();
+    let known = ap.known;
     let psk_entity = fields.psk.clone();
     let on_click = cx.listener(move |view, _ev, _window, cx| {
         if view.oobe_ui.net_connect == NetConnectState::Connecting {
@@ -217,12 +322,18 @@ fn wifi_row(ap: &network::AccessPoint, index: usize, flow: &OobeFlow, ui: &OobeU
         if already_connected {
             return;
         }
-        if secured {
+        // D4a §5.2 (2026-08-23): a network with a saved credential
+        // (`known`) connects straight away, same as an open network — the
+        // gateway already has what it needs, and re-prompting for a
+        // password the operator would have to guess (they may never have
+        // typed it into THIS session at all) would be dishonest UX. Only a
+        // secured, NOT-yet-known network shows the PSK prompt.
+        if secured && !known {
             view.oobe_ui.start_net_awaiting_psk(&ssid);
             psk_entity.update(cx, |field, cx| field.clear(cx));
             cx.notify();
         } else {
-            kick_off_connect(view, cx, ssid.clone(), None, false);
+            kick_off_connect(view, cx, ssid.clone(), None, secured);
         }
     });
 
@@ -244,7 +355,7 @@ fn wifi_row(ap: &network::AccessPoint, index: usize, flow: &OobeFlow, ui: &OobeU
                 .gap(px(11.))
                 .child(signal_arcs(ap.signal_bars, palette))
                 .child(div().text_size(px(theme::TEXT_SM)).child(ap.ssid.clone()))
-                .when(ap.secured, |el| {
+                .when(ap.secured() && !ap.known, |el| {
                     // ICON-3 (2026-08-23): `network-wireless-encrypted`, a
                     // 14px padlock, replaces the "需密碼" text
                     // (`OOBE-KeySteps.dc.html`, and the assignment table's
@@ -252,7 +363,10 @@ fn wifi_row(ap: &network::AccessPoint, index: usize, flow: &OobeFlow, ui: &OobeU
                     // catalog as this icon's `icon_or_glyph` fallback, so a
                     // missing asset degrades to the pre-ICON-3 row rather
                     // than dropping the "you'll need a password" signal
-                    // entirely.
+                    // entirely. D4a §5.2 (2026-08-23): gated on `!ap.known`
+                    // too — a network the gateway already has a saved
+                    // credential for is not going to ask for a password, so
+                    // showing "需密碼" would be actively misleading.
                     el.child(
                         div()
                             .text_size(px(theme::TEXT_XS))
@@ -332,6 +446,40 @@ fn connect_panel(ssid: &str, flow: &OobeFlow, ui: &OobeUiState, fields: &Network
         NetConnectState::Failed(NetConnectFailureKind::WrongPassword) => {
             body = body.child(message_line(t(locale, Key::NetworkWrongPasswordError), palette.destructive));
         }
+        // D4a §5.3 (2026-08-23): the remaining eight arms mirror the
+        // gateway's own nine-code classification (`WifiFailureCode` ->
+        // `NetConnectFailureKind::from_code`) one message per code, per the
+        // design doc's own error table. `NoIp`/`Portal` interpolate the
+        // SSID (`t1`) — the other six are static.
+        NetConnectState::Failed(NetConnectFailureKind::NotFound) => {
+            body = body.child(message_line(t(locale, Key::NetworkNotFoundError), palette.destructive));
+        }
+        NetConnectState::Failed(NetConnectFailureKind::OutOfRange) => {
+            body = body.child(message_line(t(locale, Key::NetworkOutOfRangeError), palette.destructive));
+        }
+        NetConnectState::Failed(NetConnectFailureKind::NoAdapter) => {
+            body = body.child(message_line(t(locale, Key::NetworkNoAdapterError), palette.destructive));
+        }
+        NetConnectState::Failed(NetConnectFailureKind::DriverMissing) => {
+            body = body.child(message_line(t(locale, Key::NetworkDriverMissingError), palette.destructive));
+        }
+        NetConnectState::Failed(NetConnectFailureKind::NoIp) => {
+            body = body.child(message_line_dynamic(t1(locale, Key::NetworkNoIpError, ssid), palette.destructive));
+        }
+        NetConnectState::Failed(NetConnectFailureKind::Portal) => {
+            // Rendered as a WARNING, not a destructive/error color — D4a
+            // §5.4-2/§6: a portal classification is a soft success at the
+            // link layer (see `apply_connect_result`'s own comment on why
+            // it still records the join), not a failure the operator needs
+            // to retry.
+            body = body.child(message_line_dynamic(t1(locale, Key::NetworkPortalNotice, ssid), palette.warning));
+        }
+        NetConnectState::Failed(NetConnectFailureKind::BackendUnavailable) => {
+            body = body.child(message_line(t(locale, Key::NetworkBackendUnavailableError), palette.destructive));
+        }
+        NetConnectState::Failed(NetConnectFailureKind::UnsupportedSecurity) => {
+            body = body.child(message_line(t(locale, Key::NetworkUnsupportedSecurityError), palette.destructive));
+        }
         NetConnectState::Failed(NetConnectFailureKind::Unreachable) => {
             body = body.child(message_line(t(locale, Key::NetworkConnectUnreachableError), palette.destructive));
         }
@@ -345,7 +493,7 @@ fn connect_panel(ssid: &str, flow: &OobeFlow, ui: &OobeUiState, fields: &Network
             return;
         }
         let secured = view.oobe_ui.net_selected_secured;
-        let psk = if secured { Some(psk_entity.read(cx).content.clone()) } else { None };
+        let psk = if secured { Some(psk_entity.read(cx).content(cx)) } else { None };
         if secured {
             let len = psk.as_ref().map(|p| p.chars().count()).unwrap_or(0);
             // Mirrors the real WPA-PSK passphrase length rule (8..=63
@@ -405,6 +553,13 @@ fn message_line(text: &'static str, color: u32) -> Div {
     div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(color, 1.0)).child(text)
 }
 
+/// Same as `message_line`, for a runtime-computed string (e.g. `t1`'s SSID
+/// interpolation) — mirrors `widgets::subtitle_dynamic`'s relationship to
+/// `widgets::subtitle`.
+fn message_line_dynamic(text: String, color: u32) -> Div {
+    div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(color, 1.0)).child(text)
+}
+
 /// Kicks off a scan on a background thread and bridges its result back to
 /// `ShellView` — same background-thread -> `std::sync::mpsc` ->
 /// `cx.spawn` poll-loop pattern `steps::account`'s click handler already
@@ -416,6 +571,18 @@ fn message_line(text: &'static str, color: u32) -> Div {
 /// trait method the task brief requires but this round's UI flow never
 /// otherwise needed) a real purpose, rather than leaving it reachable only
 /// from `fake.rs`'s own unit tests.
+///
+/// D4a-5 (2026-08-23): ALSO fetches `NetworkBackend::network_status()` on
+/// this SAME round trip — this is the "順手取一次 status" D4a §5.4-2/§6
+/// call for, piggybacked on the operator's existing "掃描 Wi-Fi"/"重新整
+/// 理" click rather than a new click-triggered path, per this crate's own
+/// "I/O is always click-triggered, never a render-time side effect"
+/// discipline (see this file's own header comment). Deliberately does NOT
+/// auto-fire when the `Network` step is first rendered without a click —
+/// that would be exactly the render-time I/O this crate's convention rules
+/// out; a machine relying purely on a wired connection still needs one
+/// "掃描 Wi-Fi" click before `wired_online()`/the portal notice reflect
+/// reality (recorded as a known limitation, not silently worked around).
 fn kick_off_scan(view: &mut ShellView, cx: &mut Context<ShellView>) {
     view.oobe_ui.set_net_scanning();
     cx.notify();
@@ -425,13 +592,22 @@ fn kick_off_scan(view: &mut ShellView, cx: &mut Context<ShellView>) {
         let (backend, kind) = network::select_backend();
         let scan_result = backend.scan();
         let status = backend.status();
-        let _ = tx.send((kind, scan_result, status));
+        let net_status = backend.network_status();
+        let _ = tx.send((kind, scan_result, status, net_status));
     });
 
     cx.spawn(async move |weak, cx| loop {
         match rx.try_recv() {
-            Ok((kind, scan_result, status)) => {
+            Ok((kind, scan_result, status, net_status)) => {
                 let _ = weak.update(cx, |view, cx| {
+                    // `Err` (every backend but `GatewayNetworkBackend`, or a
+                    // gateway that itself failed this round) clears any
+                    // previous snapshot rather than keeping a stale one —
+                    // "空結果優於假結果": a wired cable that was unplugged
+                    // since the last successful scan must not keep showing
+                    // as connected just because the LATEST refresh happened
+                    // to fail.
+                    view.oobe_ui.net_status = net_status.ok();
                     match scan_result {
                         Ok(aps) => {
                             view.oobe_ui.set_net_scan_loaded(aps, kind);
@@ -512,10 +688,27 @@ fn kick_off_connect(view: &mut ShellView, cx: &mut Context<ShellView>, ssid: Str
 }
 
 /// Applies a settled `NetworkBackend::connect` result — the weak-entity
-/// update body run from `kick_off_connect`'s poll loop. `secured` decides
-/// which of the two backend-layer failure kinds to render (see
-/// `oobe::NetConnectFailureKind`'s own doc comment for why that
-/// classification lives here, not in `network::NetError` itself).
+/// update body run from `kick_off_connect`'s poll loop.
+///
+/// D4a-5 (2026-08-23): three cases, in order of specificity —
+///   1. `Classified(code)` — the gateway backend classified the failure
+///      itself (D4a §5.3); `NetConnectFailureKind::from_code` carries that
+///      through verbatim so `connect_panel` renders the SPECIFIC message.
+///      `Portal` is special-cased: D4a §5.4-2 treats a captive portal as a
+///      soft SUCCESS at the link layer ("portal 表示實體連通只是要登入"),
+///      so the join is still recorded (`flow.set_network`) even though the
+///      UI still surfaces the login-required notice via `NetConnectState::
+///      Failed` — the operator is not blocked on the OOBE Wi-Fi step by a
+///      network they DID successfully join.
+///   2. `NotFound` — the legacy backends' own unclassified "no such SSID"
+///      (`fake.rs`/`nm.rs`); maps straight onto the SAME UI variant a
+///      gateway `Classified(NotFound)` would, rather than falling into the
+///      coarser secured-network heuristic below.
+///   3. Everything else — the pre-D4a-5 heuristic (secured ⇒ probably wrong
+///      password, else probably unreachable), kept as-is for the two
+///      legacy backends' remaining unclassified failure variants (`network::
+///      NetError`'s own doc comment for why that classification lives here,
+///      not in the error type itself).
 fn apply_connect_result(view: &mut ShellView, ssid: &str, secured: bool, result: Result<(), network::NetError>) {
     match result {
         Ok(()) => {
@@ -524,6 +717,20 @@ fn apply_connect_result(view: &mut ShellView, ssid: &str, secured: bool, result:
                 crate::oobe::save_state(flow.state());
             }
             view.oobe_ui.reset_net_connect();
+        }
+        Err(network::NetError::Classified(code)) => {
+            eprintln!("[oobe/network] connect to {ssid:?} failed, gateway classified: {code:?}");
+            if code == network::WifiFailureCode::Portal {
+                if let Some(flow) = view.oobe.as_mut() {
+                    flow.set_network(ssid, true);
+                    crate::oobe::save_state(flow.state());
+                }
+            }
+            view.oobe_ui.set_net_connect_failed(NetConnectFailureKind::from_code(code));
+        }
+        Err(network::NetError::NotFound) => {
+            eprintln!("[oobe/network] connect to {ssid:?} failed: not found");
+            view.oobe_ui.set_net_connect_failed(NetConnectFailureKind::NotFound);
         }
         Err(e) => {
             eprintln!("[oobe/network] connect to {ssid:?} failed: {e:?}");

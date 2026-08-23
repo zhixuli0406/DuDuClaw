@@ -27,7 +27,26 @@ impl FakeNetworkBackend {
 
 impl NetworkBackend for FakeNetworkBackend {
     fn scan(&self) -> Result<Vec<AccessPoint>, NetError> {
-        Ok(FAKE_WIFI_NETWORKS.iter().map(|net| AccessPoint { ssid: net.ssid.to_string(), signal_bars: net.signal_bars, secured: net.secured }).collect())
+        Ok(FAKE_WIFI_NETWORKS
+            .iter()
+            .map(|net| AccessPoint {
+                ssid: net.ssid.to_string(),
+                signal_bars: net.signal_bars,
+                security: if net.secured { "psk" } else { "open" }.to_string(),
+                // D4a-5: this demo backend never claims a saved credential.
+                // `known: true` would make `steps::network`'s row click
+                // skip the PSK prompt entirely (see `AccessPoint::known`'s
+                // own doc comment) and go straight to `connect(ssid, None)`
+                // — but `FakeNetworkBackend::connect` below STILL enforces
+                // the 8..=63 PSK-length precondition for every `secured`
+                // entry, so a `None` psk against a secured fake network
+                // would just fail every time. Keeping `known: false` is
+                // what keeps the demo build exercising the same
+                // `AwaitingPsk` -> `Connecting` -> success/`Failed` states a
+                // real unknown network goes through.
+                known: false,
+            })
+            .collect())
     }
 
     fn connect(&self, ssid: &str, psk: Option<&str>) -> Result<(), NetError> {
@@ -81,7 +100,8 @@ mod tests {
         for (ap, net) in aps.iter().zip(FAKE_WIFI_NETWORKS.iter()) {
             assert_eq!(ap.ssid, net.ssid);
             assert_eq!(ap.signal_bars, net.signal_bars);
-            assert_eq!(ap.secured, net.secured);
+            assert_eq!(ap.secured(), net.secured);
+            assert!(!ap.known, "the demo backend never claims a saved credential — see this scan()'s own doc comment");
         }
     }
 

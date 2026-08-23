@@ -79,8 +79,8 @@ pub(super) fn render(flow: &OobeFlow, ui: &OobeUiState, fields: &AccountFields, 
             // this guard is the authoritative one either way.
             return;
         }
-        let name = name_entity.read(cx).content.trim().to_string();
-        let password = password_entity.read(cx).content.clone();
+        let name = name_entity.read(cx).content(cx).trim().to_string();
+        let password = password_entity.read(cx).content(cx);
         if name.is_empty() || password.is_empty() {
             view.oobe_ui.set_account_validation_error(true);
             view.oobe_ui.reset_account_claim();

@@ -2,6 +2,34 @@
 // (`org.freedesktop.NetworkManager`), `#[cfg(target_os = "linux")]` only.
 // Shell-S3 (2026-08-21).
 //
+// ── DISABLED as of D4a-5 (2026-08-23) — kept, not deleted ─────────────────
+// `select_backend()` (`mod.rs`) no longer constructs `NmNetworkBackend` at
+// all. Reason: the DuDuClaw OS appliance image never ships NetworkManager —
+// it ships iwd, driven by the GATEWAY over D-Bus, not by this shell process
+// (`commercial/docs/DESIGN-network-settings-2026-08.md` §1.2/§2/§3). On a
+// real appliance, `NmNetworkBackend::probe()` below ALWAYS failed (D-Bus was
+// up, but no `org.freedesktop.NetworkManager` service was ever registered on
+// it), and `select_backend`'s old fail-open policy silently substituted
+// `FakeNetworkBackend` — meaning a real machine showed four fabricated SSIDs
+// ("DuDu-Office" etc.) and any 8-character password "connected" the
+// operator. That was the D4a §5.4 ship-blocker; `network/gateway.rs` is the
+// fix (see `mod.rs`'s own header comment for the full story).
+//
+// This module is kept, not deleted, for one reason: the CODE here is
+// correct — the D-Bus wire protocol, the "don't trust `AddAndActivateConnection`'s
+// own reply, poll `Device.State` to a real terminal state" discipline, the
+// SSID byte-decoding — none of that was ever the bug; only the CHOICE of
+// backend (NetworkManager, which this image doesn't run) was wrong. A
+// future scenario this shell might reasonably need — running on someone's
+// EXISTING Linux desktop that already runs NetworkManager, rather than on a
+// DuDuClaw-built appliance image — would want exactly this backend back.
+// `mod nm;` in `mod.rs` carries `#[allow(dead_code)]` specifically so this
+// file keeps being type-checked against every future change to
+// `AccessPoint`/`ConnStatus`/`NetError`/`NetworkBackend` (all defined in
+// `mod.rs`), rather than silently bit-rotting into code that no longer even
+// compiles. Do NOT delete this file just because nothing calls it — that is
+// the intended state, not a bug to "clean up".
+//
 // ── Why the generic `zbus::blocking::Proxy`, not the `#[zbus::proxy]` macro ──
 // zbus's usual idiom is a trait annotated `#[zbus::proxy(interface = "...")]`
 // that code-generates a typed client. This module deliberately uses the
@@ -193,7 +221,22 @@ impl NetworkBackend for NmNetworkBackend {
             let wpa_flags: u32 = ap.get_property("WpaFlags").unwrap_or(0);
             let rsn_flags: u32 = ap.get_property("RsnFlags").unwrap_or(0);
             let secured = (flags & AP_FLAG_PRIVACY) != 0 || wpa_flags != 0 || rsn_flags != 0;
-            aps.push(AccessPoint { ssid, signal_bars: strength_to_bars(strength), secured });
+            // D4a-5: `AccessPoint` now stores a `security` string (the
+            // gateway backend's own `Network.Type` shape) instead of a
+            // `secured` bool — this legacy backend never distinguished
+            // WEP/802.1X from plain WPA/WPA2 in the first place, so
+            // collapsing back to a binary "psk"/"open" string is a faithful
+            // translation of what this code already knew, not a loss of
+            // information. `known: false`: this backend never queried NM's
+            // Settings service during a scan (only `forget()` does, and
+            // only by SSID lookup), so it has no saved-credential signal to
+            // report here.
+            aps.push(AccessPoint {
+                ssid,
+                signal_bars: strength_to_bars(strength),
+                security: if secured { "psk" } else { "open" }.to_string(),
+                known: false,
+            });
         }
         aps.sort_by(|a, b| b.signal_bars.cmp(&a.signal_bars).then_with(|| a.ssid.cmp(&b.ssid)));
         Ok(aps)

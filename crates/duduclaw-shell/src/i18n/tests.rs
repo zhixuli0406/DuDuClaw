@@ -68,6 +68,17 @@ const ALL_KEYS: &[Key] = &[
     Key::NetworkPskLengthError,
     Key::NetworkWrongPasswordError,
     Key::NetworkConnectUnreachableError,
+    Key::NetworkWiredConnected,
+    Key::NetworkNotFoundError,
+    Key::NetworkOutOfRangeError,
+    Key::NetworkNoAdapterError,
+    Key::NetworkDriverMissingError,
+    Key::NetworkNoIpError,
+    Key::NetworkPortalNotice,
+    Key::NetworkPortalOpenButton,
+    Key::NetworkBackendUnavailableError,
+    Key::NetworkUnsupportedSecurityError,
+    Key::NetworkUnavailableHint,
     Key::UpdateTitle,
     Key::UpdateChecking,
     Key::UpdateUpToDate,
@@ -207,7 +218,9 @@ fn all_keys_has_the_expected_count_and_no_duplicates() {
     // `ALL_KEYS` silently drifting out of sync with a newly added `Key`
     // variant (the compiler won't catch THAT half; only the per-locale
     // match arms are compiler-enforced).
-    assert_eq!(ALL_KEYS.len(), 172);
+    // 183 as of D4a §6 (2026-08-23), which added
+    // `NetworkPortalOpenButton`.
+    assert_eq!(ALL_KEYS.len(), 183);
     let mut seen = std::collections::HashSet::new();
     for key in ALL_KEYS {
         assert!(seen.insert(key), "duplicate key in ALL_KEYS: {key:?}");

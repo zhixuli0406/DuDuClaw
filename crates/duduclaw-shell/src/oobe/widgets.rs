@@ -26,10 +26,11 @@
 // ambient `ShellPalette` global instead — see its own doc comment for why.
 
 use gpui::{
-    div, prelude::*, px, App, ClickEvent, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton,
-    Render, SharedString, Stateful, Window,
+    div, prelude::*, px, App, ClickEvent, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, FontWeight, MouseButton, Render,
+    SharedString, Stateful, Window,
 };
 
+use duduclaw_native_gui::ime_input::{ImeTextInput, TextInputStyle};
 use duduclaw_native_gui::theme;
 
 use crate::palette::ShellPalette;
@@ -189,132 +190,181 @@ pub(super) fn toggle_pill(on: bool, palette: ShellPalette) -> Div {
     div().relative().w(px(40.)).h(px(23.)).rounded(px(23.)).bg(track).child(handle)
 }
 
-/// Minimal single-line editable text field entity — the `AccountCreate`
-/// step's real replacement for round 1's static `fake_field` values (task
-/// brief §B). Deliberately NOT the full zed `crates/gpui/examples/input.rs`
-/// pattern (~780 lines: `EntityInputHandler` for OS-level IME composition,
-/// drag-to-select, a hand-rolled `Element` for cursor/selection painting —
-/// real scope for a later round, not this one). This is instead a re-
-/// derivation of `duduclaw-native-gui/src/text_field.rs`'s own "deliberately
-/// smaller alternative" (plain `on_key_down` capture: printable `key_char`
-/// appends, `backspace` pops, no selection, no IME composition) — proven
-/// already shipping in that crate's own login screen at ~130 lines, well
-/// under the "~300 lines of EntityInputHandler" threshold the task brief
-/// names as the bar for falling back to a static stub. Re-derived HERE
-/// rather than reused from that crate because `duduclaw-native-gui/src/
-/// lib.rs` only exposes `theme` and `mds_gpui` to this crate (task brief:
-/// "不要改 native-gui") — `TextField`/`text_field` itself stays private to
-/// that crate's own binary.
+/// Single-line editable text field entity — the chrome (rounded surface,
+/// focus ring, masking policy) around ONE shared
+/// `duduclaw_native_gui::ime_input::ImeTextInput`, which owns the actual
+/// text buffer, caret/selection painting and — the point of D3-b — the
+/// `gpui::EntityInputHandler` implementation that makes OS-level IME
+/// composition reach this widget at all.
 ///
-/// IME/CJK composition is out of scope by design (task brief: "IME/中文組字
-/// 不需要") — account name/password are ASCII-shaped in practice, same
-/// judgment call `text_field.rs`'s own header comment makes for its login
-/// fields. Tab-between-fields is also out of scope (task brief: "可省
-/// 略") — click-to-focus (`on_mouse_down` below) is the only way to move
-/// focus between the two fields this round.
+/// ── What changed in D3-b (2026-08-23) and why ─────────────────────────────
+/// Until now this type held a bare `content: String` and appended
+/// `keystroke.key_char` from its own `on_key_down`. That is the exact shape
+/// `research/native-os-2026-08/ime-fcitx5-gpui-2026-08.md` §2.3 predicted
+/// would fail on DuDuClaw OS: with no `EntityInputHandler` installed, gpui's
+/// Wayland backend drops every `zwp_text_input_v3` commit on the floor
+/// (`WaylandWindow::handle_ime` early-returns when `input_handler` is
+/// `None`), so an operator with fcitx5 running would see English type fine
+/// and Chinese do nothing at all. The buffer/composition/hit-test machinery
+/// now comes from the shared widget instead of being re-derived here; this
+/// file keeps only what is genuinely shell-specific — the palette-driven
+/// chrome and the masked/plain decision.
+///
+/// The inner entity is NOT exposed: callers keep using `Entity<
+/// OobeTextField>` exactly as before, so `AccountFields`/`NetworkFields`/
+/// `LockPasswordField` and every render call site are unchanged apart from
+/// `content` becoming a method (it has to read the inner entity, which needs
+/// `&App`).
+/// Which surface this field paints around itself. The text machinery is
+/// identical either way — only the chrome differs, which is why this is one
+/// enum on one widget rather than two near-duplicate entity types.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldChrome {
+    /// OOBE account/PSK and the lockscreen password: a 36px rounded input
+    /// surface with its own background, border and focus ring.
+    Boxed,
+    /// The Launcher's search row: no surface of its own (the panel already
+    /// provides one) and larger text, matching `Launcher.dc.html`'s 17px
+    /// medium query line.
+    Bare,
+}
+
+impl FieldChrome {
+    fn text_size(self) -> f32 {
+        match self {
+            FieldChrome::Boxed => theme::TEXT_SM,
+            FieldChrome::Bare => 17.,
+        }
+    }
+}
+
 pub(crate) struct OobeTextField {
-    pub(crate) content: String,
-    placeholder: SharedString,
+    inner: Entity<ImeTextInput>,
     masked: bool,
-    focus_handle: FocusHandle,
+    chrome: FieldChrome,
 }
 
 impl OobeTextField {
-    fn new(cx: &mut App, placeholder: impl Into<SharedString>, masked: bool) -> Entity<Self> {
-        cx.new(|cx| Self { content: String::new(), placeholder: placeholder.into(), masked, focus_handle: cx.focus_handle() })
+    fn new(
+        cx: &mut App,
+        placeholder: impl Into<SharedString>,
+        masked: bool,
+        chrome: FieldChrome,
+    ) -> Entity<Self> {
+        // Colors are pushed per render pass (see `Render` below) — the style
+        // handed in here only needs to carry the shape decisions that never
+        // change for this field: single line, no submit-on-Enter (`enter` is
+        // a globally bound `OobeNext` action in this crate, so it never
+        // reaches a raw key listener), and whether it masks.
+        let inner = ImeTextInput::with_style(cx, placeholder, TextInputStyle::single_line().masked(masked));
+        cx.new(|_cx| Self { inner, masked, chrome })
+    }
+
+    /// Everything typed so far. Returns an owned `String` rather than a
+    /// borrow because reaching it means reading a second entity out of `cx`,
+    /// and because every caller (password submit, account claim, PSK
+    /// connect) needs an owned value anyway.
+    pub(crate) fn content(&self, cx: &App) -> String {
+        self.inner.read(cx).content().to_string()
     }
 
     /// Resets typed content back to empty — `steps::network`'s "取消"
     /// (cancel) handler on the PSK prompt, so re-picking a secured network
     /// after backing out never shows a stale password from a previous
-    /// attempt. `AccountFields`'s two fields have no equivalent call site
-    /// (see `NetworkFields`'s own doc comment for why): the `AccountCreate`
-    /// step has no "cancel and start over" affordance.
+    /// attempt; also every path that closes the Launcher, so a reopen starts
+    /// from an empty search box.
     pub(crate) fn clear(&mut self, cx: &mut Context<Self>) {
-        self.content.clear();
+        self.inner.update(cx, |input, cx| input.clear(cx));
         cx.notify();
-    }
-
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let ks = &event.keystroke;
-        // Let anything chorded with cmd/ctrl/function fall through — same
-        // guard `text_field.rs`'s own `on_key_down` uses, so cmd-k/Escape/
-        // Enter (this crate's own global OOBE keybindings, bound on the
-        // `ShellView` root — see `main.rs`'s header comment) keep reaching
-        // their action handlers instead of being swallowed as "typed text"
-        // here. Plain `enter`/`escape` (no modifier) DO reach this match,
-        // but neither has a `key_char`, so the `_ =>` arm below is a no-op
-        // for them — nothing here calls `cx.stop_propagation()`, so gpui's
-        // action-dispatch pass over the SAME keystroke still fires
-        // regardless (this field's `.track_focus`ed div is a DESCENDANT of
-        // `ShellView`'s own focused root, and gpui walks actions along the
-        // whole ancestor path, not just the exact focused leaf).
-        if ks.modifiers.platform || ks.modifiers.control || ks.modifiers.function {
-            return;
-        }
-        match ks.key.as_str() {
-            "backspace" => {
-                self.content.pop();
-                cx.notify();
-            }
-            _ => {
-                if let Some(ch) = ks.key_char.as_deref() {
-                    if !ch.is_empty() && ch.chars().all(|c| !c.is_control()) {
-                        self.content.push_str(ch);
-                        cx.notify();
-                    }
-                }
-            }
-        }
     }
 }
 
 impl Focusable for OobeTextField {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    /// The INNER entity's handle — that is the element carrying
+    /// `.track_focus(...)` and the one `Window::handle_input` checks before
+    /// installing the IME input handler. Returning this type's own handle
+    /// instead would focus a div that neither types nor composes.
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.inner.read(cx).focus_handle(cx)
     }
 }
 
 impl Render for OobeTextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let focused = self.focus_handle.is_focused(window);
-        let is_empty = self.content.is_empty();
         // Ambient theme — see this module's header comment ("Global") for
         // why this entity reads it from `cx` instead of taking it as a
-        // render parameter like every other OOBE widget helper. `oobe::
-        // render::render` always sets this before this entity's own render
-        // pass runs (it's the OOBE frame's top-level fn); `unwrap_or_default`
-        // is a defensive fail-open (light), never a panic, on the
-        // theoretical chance nothing has set it yet.
+        // render parameter like every other OOBE widget helper. `main.rs`'s
+        // `ShellView::render` sets it once per pass before any surface
+        // renders, and `oobe::render::render` overwrites it with the OOBE
+        // flow's own palette; `unwrap_or_default` is a defensive fail-open
+        // (light), never a panic, on the theoretical chance nothing has set
+        // it yet.
         let palette = cx.try_global::<ShellPalette>().copied().unwrap_or_default();
+        let handle = self.inner.read(cx).focus_handle(cx);
+        let focused = handle.is_focused(window);
+        let is_empty = self.inner.read(cx).is_empty();
 
-        let display: SharedString = if is_empty {
-            self.placeholder.clone()
-        } else if self.masked {
-            "•".repeat(self.content.chars().count()).into()
-        } else {
-            self.content.clone().into()
+        // `Bare` (the Launcher row) uses the faint text-ladder rank for its
+        // placeholder, exactly the color the pre-D3-b static query line
+        // painted; `Boxed` uses `muted_foreground`, likewise unchanged.
+        let placeholder_color = match self.chrome {
+            FieldChrome::Boxed => theme::alpha(palette.muted_foreground, 1.0),
+            FieldChrome::Bare => theme::alpha(palette.text_faint, 1.0),
         };
+        let text_size = self.chrome.text_size();
+        let style = TextInputStyle::single_line()
+            .masked(self.masked)
+            .with_colors(
+                theme::alpha(palette.foreground, 1.0).into(),
+                placeholder_color.into(),
+                theme::alpha(palette.brand, 1.0).into(),
+                theme::alpha(palette.brand, 0.20).into(),
+            )
+            .with_metrics(px(text_size), px(text_size * 1.4));
+        // Re-pushed every pass so an operator flipping the OOBE theme step
+        // restyles the caret/selection on the very next frame — `set_style`
+        // no-ops (no `cx.notify()`) when nothing actually changed, so this
+        // cannot spin the render loop.
+        self.inner.update(cx, |input, cx| input.set_style(style, cx));
 
-        div()
+        let base = div()
             .id("oobe-text-field")
-            .track_focus(&self.focus_handle)
-            .key_context("OobeTextField")
-            .on_key_down(cx.listener(Self::on_key_down))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| window.focus(&this.focus_handle, cx)))
-            .w_full()
-            .h(px(36.))
-            .px(px(12.))
+            // Click anywhere on the chrome (including padding the inner
+            // element does not cover) focuses the field. The inner widget
+            // focuses itself on a direct hit; this covers the rest.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, window, cx| {
+                    let handle = this.inner.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                }),
+            )
             .flex()
             .items_center()
-            .rounded(px(theme::RADIUS_LG))
-            .bg(palette.input_bg())
-            .border_1()
-            .border_color(if focused { theme::alpha(palette.ring, 1.0).into() } else { palette.input_border() })
             .cursor(CursorStyle::IBeam)
-            .text_size(px(theme::TEXT_SM))
-            .text_color(if is_empty { theme::alpha(palette.muted_foreground, 1.0) } else { theme::alpha(palette.foreground, 1.0) })
-            .child(display)
+            .text_size(px(text_size))
+            .text_color(if is_empty { placeholder_color } else { theme::alpha(palette.foreground, 1.0) });
+
+        match self.chrome {
+            FieldChrome::Boxed => base
+                .w_full()
+                .h(px(36.))
+                .px(px(12.))
+                .rounded(px(theme::RADIUS_LG))
+                .bg(palette.input_bg())
+                .border_1()
+                .border_color(if focused { theme::alpha(palette.ring, 1.0).into() } else { palette.input_border() })
+                .child(self.inner.clone()),
+            // No focus ring here on purpose: the Launcher row is the only
+            // focusable thing in an overlay that opens focused, so a ring
+            // would be permanent decoration rather than information — the
+            // live caret already says where typing goes. `flex_1` lets it
+            // take the row's remaining width beside the magnifier icon.
+            FieldChrome::Bare => {
+                let _ = focused;
+                base.flex_1().font_weight(FontWeight::MEDIUM).child(self.inner.clone())
+            }
+        }
     }
 }
 
@@ -343,8 +393,8 @@ impl AccountFields {
         // longer typed in for the operator (task brief: replace the static
         // fake VALUES with real typing, not invent new placeholder copy).
         Self {
-            name: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_NAME, false),
-            password: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true),
+            name: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_NAME, false, FieldChrome::Boxed),
+            password: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true, FieldChrome::Boxed),
         }
     }
 }
@@ -369,7 +419,7 @@ impl NetworkFields {
         // uses — a generic "this field is masked" shape hint, not a
         // localized string (see that field's own construction above for
         // why `fake_data`'s constants stay unlocalized placeholders).
-        Self { psk: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true) }
+        Self { psk: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true, FieldChrome::Boxed) }
     }
 }
 
@@ -400,6 +450,39 @@ pub(crate) struct LockPasswordField {
 
 impl LockPasswordField {
     pub(crate) fn new(cx: &mut App) -> Self {
-        Self { field: OobeTextField::new(cx, crate::i18n::t(crate::i18n::Locale::ZhTw, crate::i18n::Key::LockPasswordPlaceholder), true) }
+        Self { field: OobeTextField::new(cx, crate::i18n::t(crate::i18n::Locale::ZhTw, crate::i18n::Key::LockPasswordPlaceholder), true, FieldChrome::Boxed) }
+    }
+}
+
+/// The Launcher overlay's search field (D3-b, 2026-08-23) — same "bundle the
+/// one-per-surface `Entity<OobeTextField>` so `main.rs` only needs one field
+/// on `ShellView`" shape `AccountFields`/`NetworkFields`/`LockPasswordField`
+/// establish above, and defined HERE for the identical reason
+/// `LockPasswordField` is (`OobeTextField::new` is private to this module).
+/// Not a sign the Launcher is part of the OOBE flow.
+///
+/// Before D3-b the Launcher's query was a plain `String` on
+/// `OverlayUiState`, appended to by a raw `on_key_down` listener on the
+/// shell root — which meant no `EntityInputHandler` was ever installed and a
+/// zh-TW operator could not search their apps in Chinese at all (only by an
+/// app's ASCII id or `Keywords=` entry). It is a real field now.
+pub(crate) struct LauncherQueryField {
+    pub(crate) field: Entity<OobeTextField>,
+}
+
+impl LauncherQueryField {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        // Same `Locale::ZhTw`-at-construction-time limitation every other
+        // field bundle here documents: `cx: &mut App` at window-open has no
+        // operator locale selection to read yet, and this crate hardcodes
+        // that locale everywhere outside OOBE anyway.
+        Self {
+            field: OobeTextField::new(
+                cx,
+                crate::i18n::t(crate::i18n::Locale::ZhTw, crate::i18n::Key::LauncherSearchPlaceholder),
+                false,
+                FieldChrome::Bare,
+            ),
+        }
     }
 }
