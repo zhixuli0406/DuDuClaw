@@ -20,8 +20,8 @@ use smithay::{
 };
 
 use crate::{
-    decor::FrameHit,
-    grabs::{MoveClamp, MoveSurfaceGrab},
+    decor::{FrameEdge, FrameHit},
+    grabs::{MoveClamp, MoveSurfaceGrab, ResizeClamp, ResizeSurfaceGrab},
     state::DuduclawComp,
 };
 
@@ -46,6 +46,10 @@ impl DuduclawComp {
                 let time = Event::time_msec(&event);
                 let key_state = event.state();
                 let mut logo_held_now = false;
+                // WM-3: Alt-Tab needs to know when the modifier is RELEASED,
+                // which is the one thing a per-press binding cannot observe.
+                // Captured here for the same reason `logo_held_now` already is.
+                let mut alt_held_now = false;
 
                 self.seat.get_keyboard().unwrap().input::<(), _>(
                     self,
@@ -55,6 +59,7 @@ impl DuduclawComp {
                     time,
                     |data, modifiers, handle| {
                         logo_held_now = modifiers.logo;
+                        alt_held_now = modifiers.alt;
                         // Super+Esc global emergency stop (DESIGN
                         // §3.3.3/§6.3): the human keyboard's filter
                         // closure is the only code path that can ever
@@ -88,8 +93,8 @@ impl DuduclawComp {
                             // container-level state-machine coverage.
                             data.human_resume();
                         } else if key_state == KeyState::Pressed
-                            && modifiers.logo
-                            && handle.modified_sym() == Keysym::new(keysyms::KEY_Tab)
+                            && (modifiers.logo || modifiers.alt)
+                            && is_switcher_keysym(handle.modified_sym())
                         {
                             // WP-A1 multi-window round (task brief req 3):
                             // window cycling, same human-only keyboard
@@ -100,10 +105,33 @@ impl DuduclawComp {
                             // below already exempts ANY key while Logo is
                             // (or was just) held from re-freezing the
                             // seat, so Tab's chord tail needed no changes
-                            // there. See `DuduclawComp::cycle_focus`'s doc
-                            // comment (`state.rs`) for the rotation
-                            // strategy.
-                            data.cycle_focus();
+                            // there.
+                            //
+                            // **WM-3 replaced `cycle_focus`** with a real MRU
+                            // switcher, and widened the binding to Alt+Tab —
+                            // Super+Tab stays as a synonym, per the task
+                            // brief. Intercepted rather than forwarded: a
+                            // stray Tab arriving in the focused client in the
+                            // middle of a window switch is exactly the kind of
+                            // "my form jumped a field" bug nobody traces back
+                            // to the compositor. See the NOTE at the end of
+                            // `state.rs`'s `impl DuduclawComp` for why MRU
+                            // replaced z-order rotation.
+                            if data.switcher_press(modifiers.shift) {
+                                return FilterResult::Intercept(());
+                            }
+                        } else if key_state == KeyState::Pressed
+                            && !modifiers.logo
+                            && handle.modified_sym() == Keysym::new(keysyms::KEY_Escape)
+                            && data.switcher.session.is_some()
+                        {
+                            // WM-3: Escape abandons an open switcher, changing
+                            // nothing. Guarded on `!modifiers.logo` so it can
+                            // never shadow the Super+Esc emergency stop above —
+                            // that binding wins unconditionally, which is the
+                            // entire point of an emergency stop.
+                            data.switcher_cancel();
+                            return FilterResult::Intercept(());
                         } else if key_state == KeyState::Pressed
                             && modifiers.logo
                             && is_close_window_keysym(handle.modified_sym())
@@ -127,6 +155,17 @@ impl DuduclawComp {
                             // `DuduclawComp::close_focused_window`
                             // (`window_policy.rs`).
                             data.close_focused_window();
+                        } else if key_state == KeyState::Released
+                            && data.switcher.session.is_some()
+                            && is_switcher_keysym(handle.modified_sym())
+                        {
+                            // WM-3: the matching RELEASE for a Tab press this
+                            // closure intercepted. Forwarding it would hand the
+                            // focused client a key-up with no key-down — an
+                            // unbalanced pair that most toolkits tolerate but
+                            // none should have to. Only while a session is open,
+                            // so an ordinary Tab is completely unaffected.
+                            return FilterResult::Intercept(());
                         }
                         FilterResult::Forward
                     },
@@ -153,6 +192,15 @@ impl DuduclawComp {
                 self.codrive_logo_held_prev = logo_held_now;
                 if !system_gesture {
                     self.on_human_input("keyboard");
+                }
+
+                // WM-3: hold-to-preview, release-to-commit. The filter closure
+                // above sees presses; only this — running after every keyboard
+                // event, with the post-event modifier state — can see the
+                // moment BOTH modifiers are gone. `switcher_commit` is a no-op
+                // when no session is open, so this costs one boolean per key.
+                if !(logo_held_now || alt_held_now) {
+                    self.switcher_commit();
                 }
             }
             InputEvent::PointerMotion { event, .. } => {
@@ -247,14 +295,34 @@ impl DuduclawComp {
                 // `focus_window` sets it for every window on every call.
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
                     let pos = pointer.current_location();
-                    // WM-2: the compositor's own decoration gets first refusal
-                    // on a press. It has to, because a title bar is not a
-                    // surface and `Space::element_under` cannot see it — see
-                    // `crate::decor`'s module doc on the geometry model.
-                    // `frame_hit_at` returns `None` for a press in a window's
-                    // CONTENT area, which is what makes this an interception
-                    // rather than a replacement of the ordinary routing below.
-                    if let Some((window, hit)) = self.frame_hit_at(pos) {
+
+                    // WM-3: a layer surface on the `overlay`/`top` layers is
+                    // drawn above every window, so it must also take the click
+                    // that visibly lands on it — before the decoration hit test
+                    // below, or a panel over a title bar would start a window
+                    // drag. The press itself is still forwarded to the client
+                    // through the ordinary `pointer.button` call further down;
+                    // only keyboard focus is handled here, and only for a
+                    // surface that said it wants it.
+                    if let Some(layer) = self.layer_under_pointer(pos, true) {
+                        if layer.can_receive_keyboard_focus() {
+                            let surface = layer.wl_surface().clone();
+                            tracing::debug!(
+                                namespace = %layer.namespace(),
+                                "input: press on a layer surface — moving keyboard focus to it"
+                            );
+                            self.focus_layer_surface(&surface);
+                        }
+                    } else if let Some((window, hit)) = self.frame_hit_at(pos) {
+                        // WM-2: the compositor's own decoration gets first
+                        // refusal on a press. It has to, because a title bar is
+                        // not a surface and `Space::element_under` cannot see
+                        // it — see `crate::decor`'s module doc on the geometry
+                        // model. `frame_hit_at` returns `None` for a press in a
+                        // window's CONTENT area, which is what makes this an
+                        // interception rather than a replacement of the
+                        // ordinary routing below.
+                        //
                         // Clicking any part of the decoration raises and
                         // focuses the window first — including the close
                         // button, so a mis-click still leaves the window you
@@ -263,10 +331,26 @@ impl DuduclawComp {
                         self.focus_window(&seat, Some(&window), serial);
                         match hit {
                             FrameHit::Close => {
+                                self.last_titlebar_click = None;
                                 self.close_window_politely(&window, "titlebar_close_button");
                             }
+                            FrameHit::Minimize => {
+                                self.last_titlebar_click = None;
+                                self.minimize_window(&window, "titlebar_minimize_button");
+                            }
+                            FrameHit::Edge(edge) => {
+                                self.last_titlebar_click = None;
+                                self.begin_edge_resize(&window, edge, pos, serial, button);
+                            }
                             FrameHit::TitleBar => {
-                                self.begin_titlebar_move(&window, pos, serial, button);
+                                // WM-3: second click in time and place on the
+                                // same bar toggles maximize instead of starting
+                                // a second drag.
+                                if self.take_titlebar_double_click(&window, pos) {
+                                    self.toggle_maximized(&window, "titlebar_double_click");
+                                } else {
+                                    self.begin_titlebar_move(&window, pos, serial, button);
+                                }
                             }
                         }
                         // Deliberately NOT forwarded to any client: the press
@@ -275,11 +359,29 @@ impl DuduclawComp {
                         // but "the compositor consumed this" should be
                         // explicit rather than incidental.)
                         return;
+                    } else {
+                        let window = self.space.element_under(pos).map(|(w, _)| w.clone());
+                        // WM-3: with no window under the pointer, a `bottom`/
+                        // `background` layer surface may still want the click
+                        // (a desktop-icon layer, say). Checked only here, after
+                        // windows, which is exactly where it sits in the
+                        // z-order.
+                        let below = window
+                            .is_none()
+                            .then(|| self.layer_under_pointer(pos, false))
+                            .flatten()
+                            .filter(|l| l.can_receive_keyboard_focus());
+                        match below {
+                            Some(layer) => {
+                                let surface = layer.wl_surface().clone();
+                                self.focus_layer_surface(&surface);
+                            }
+                            None => {
+                                let seat = self.seat.clone();
+                                self.focus_window(&seat, window.as_ref(), serial);
+                            }
+                        }
                     }
-
-                    let window = self.space.element_under(pos).map(|(w, _)| w.clone());
-                    let seat = self.seat.clone();
-                    self.focus_window(&seat, window.as_ref(), serial);
                 }
 
                 let pointer = self.seat.get_pointer().unwrap();
@@ -352,16 +454,27 @@ impl DuduclawComp {
     /// inside a decorated window's content area. All three cases mean the same
     /// thing to the caller: "carry on with the ordinary surface routing".
     pub(crate) fn frame_hit_at(&self, pos: Point<f64, Logical>) -> Option<(Window, FrameHit)> {
+        // WM-3: the resize ring lives OUTSIDE the frame, so it must be clipped
+        // to the work area or a window near the top of it would put an 8 px
+        // resize strip over the shell's menu bar. See `decor::edges`.
+        let work = self.layout_work_area();
         for window in self.space.elements().rev() {
             let insets = self.window_insets(window);
             let Some(content) = self.space.element_geometry(window) else {
                 continue;
             };
             let frame = crate::decor::frame_rect(content, insets);
-            if !frame.to_f64().contains(pos) {
-                continue;
+            if frame.to_f64().contains(pos) {
+                return crate::decor::hit_frame(frame, insets, pos).map(|hit| (window.clone(), hit));
             }
-            return crate::decor::hit_frame(frame, insets, pos).map(|hit| (window.clone(), hit));
+            // WM-3: not inside the frame — but possibly on this window's resize
+            // ring. Unlike the frame test above, a miss here falls through to
+            // the next window down rather than ending the walk: the ring is
+            // mostly empty space, and stopping at it would make every window
+            // shadow an 8 px dead zone over whatever is beneath it.
+            if let Some(edge) = crate::decor::hit_frame_edge_in_work(frame, insets, work, pos) {
+                return Some((window.clone(), FrameHit::Edge(edge)));
+            }
         }
         None
     }
@@ -375,16 +488,106 @@ impl DuduclawComp {
     /// flip" idle behaviour for the entire time a pointer is moving over a
     /// title bar.
     pub(crate) fn update_close_hover(&mut self, pos: Point<f64, Logical>) {
-        let hovered = self.frame_hit_at(pos).and_then(|(window, hit)| {
-            if hit != FrameHit::Close {
-                return None;
-            }
-            Some(window.toplevel()?.wl_surface().id())
-        });
-        if self.decor.hovered_close != hovered {
-            self.decor.hovered_close = hovered;
+        let hit = self.frame_hit_at(pos);
+        let button_id = |want: FrameHit| {
+            hit.as_ref().and_then(|(window, got)| {
+                (*got == want)
+                    .then(|| window.toplevel().map(|t| t.wl_surface().id()))
+                    .flatten()
+            })
+        };
+        let hovered_close = button_id(FrameHit::Close);
+        // WM-3: the minimize button lights up the same way.
+        let hovered_minimize = button_id(FrameHit::Minimize);
+        if self.decor.hovered_close != hovered_close
+            || self.decor.hovered_minimize != hovered_minimize
+        {
+            self.decor.hovered_close = hovered_close;
+            self.decor.hovered_minimize = hovered_minimize;
             self.queue_redraw();
         }
+    }
+
+    /// WM-3: is this title-bar press the second half of a double click?
+    ///
+    /// Consumes the remembered press either way — so a **third** rapid click
+    /// starts a fresh pair rather than toggling maximize again, which is what
+    /// every desktop does and what stops a drumroll on the title bar from
+    /// flapping a window between states.
+    fn take_titlebar_double_click(&mut self, window: &Window, pos: Point<f64, Logical>) -> bool {
+        let Some(toplevel) = window.toplevel() else {
+            return false;
+        };
+        let id = toplevel.wl_surface().id();
+        let now = self.start_time.elapsed();
+        let previous = self
+            .last_titlebar_click
+            .take()
+            .and_then(|(prev_id, when, at)| (prev_id == id).then_some((when, at)));
+        if crate::decor::is_double_click(previous, now, pos) {
+            self.last_titlebar_click = None;
+            true
+        } else {
+            self.last_titlebar_click = Some((id, now, pos));
+            false
+        }
+    }
+
+    /// WM-3: starts a compositor-driven, **clamped** resize from a press on the
+    /// window's own resize ring.
+    ///
+    /// The grab is the same `ResizeSurfaceGrab` a client-initiated
+    /// `xdg_toplevel.resize` uses (`handlers/xdg_shell.rs`); the difference is
+    /// the [`ResizeClamp`], which keeps the resulting frame inside the work
+    /// area — the "縮放結果 clamp 不得讓標題列離開工作區" half of this work
+    /// package's third item — and applies the 320×240 floor.
+    ///
+    /// `start_data.focus` is `None` for the same reason
+    /// [`Self::begin_titlebar_move`] uses `None`: the press landed on
+    /// compositor-owned pixels, so no client surface can honestly be named as
+    /// the grab's origin.
+    fn begin_edge_resize(
+        &mut self,
+        window: &Window,
+        edge: FrameEdge,
+        pos: Point<f64, Logical>,
+        serial: Serial,
+        button: u32,
+    ) {
+        let Some(content) = self.space.element_geometry(window) else {
+            return;
+        };
+        let insets = self.window_insets(window);
+        let clamp = self
+            .layout_work_area()
+            .map(|work| ResizeClamp { work, insets });
+
+        let grab = ResizeSurfaceGrab::start(
+            PointerGrabStartData {
+                focus: None,
+                button,
+                location: pos,
+            },
+            window.clone(),
+            edge.into(),
+            content,
+            clamp,
+        );
+        tracing::info!(
+            surface_id = ?window.toplevel().map(|t| t.wl_surface().id()),
+            edge = edge.as_str(),
+            initial = ?(content.loc.x, content.loc.y, content.size.w, content.size.h),
+            clamped = clamp.is_some(),
+            // A drag on TOP/LEFT moves the window's ORIGIN as well as its size
+            // (`resize_grab::handle_commit` compensates on the following
+            // commit). Which of the two shapes a live drag took is the first
+            // thing worth knowing when a window walks sideways, and it is
+            // otherwise invisible in the log.
+            moves_origin = edge.moves_top() || edge.moves_left(),
+            "input: resize ring pressed — resize grab armed"
+        );
+        let pointer = self.seat.get_pointer().unwrap();
+        pointer.set_grab(self, grab, serial, Focus::Clear);
     }
 
     /// WM-2: starts a compositor-driven, **clamped** move grab from a title
@@ -527,9 +730,22 @@ pub(crate) fn is_close_window_keysym(sym: Keysym) -> bool {
     sym == Keysym::new(keysyms::KEY_q) || sym == Keysym::new(keysyms::KEY_Q)
 }
 
+/// WM-3: does this keysym mean "Tab" for the Alt-Tab / Super-Tab switcher?
+///
+/// `ISO_Left_Tab` is the second half of the answer and the part that is easy
+/// to miss: xkb maps **Shift+Tab** to `ISO_Left_Tab`, not to `Tab`, and
+/// `modified_sym()` reports the keysym *after* modifiers are applied. Matching
+/// only `Tab` would leave the backwards direction silently dead — a bug that
+/// looks like "Shift+Tab does nothing" and is invisible in any test that only
+/// exercises the forward direction. Pure and unit-testable, like the two
+/// decision functions above.
+pub(crate) fn is_switcher_keysym(sym: Keysym) -> bool {
+    sym == Keysym::new(keysyms::KEY_Tab) || sym == Keysym::new(keysyms::KEY_ISO_Left_Tab)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{clamp_to, is_close_window_keysym, is_system_gesture_tail};
+    use super::{clamp_to, is_close_window_keysym, is_switcher_keysym, is_system_gesture_tail};
     use smithay::input::keyboard::{keysyms, Keysym};
     use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -611,6 +827,30 @@ mod tests {
             assert!(
                 !is_close_window_keysym(Keysym::new(other)),
                 "keysym {other:#x} must not be treated as the close binding"
+            );
+        }
+    }
+
+    #[test]
+    fn the_switcher_binding_accepts_both_tab_and_shift_tab() {
+        // xkb reports Shift+Tab as ISO_Left_Tab; matching only Tab would leave
+        // the backwards direction silently dead.
+        assert!(is_switcher_keysym(Keysym::new(keysyms::KEY_Tab)));
+        assert!(is_switcher_keysym(Keysym::new(keysyms::KEY_ISO_Left_Tab)));
+    }
+
+    #[test]
+    fn the_switcher_binding_does_not_fire_on_other_keys() {
+        for other in [
+            keysyms::KEY_q,
+            keysyms::KEY_Escape,
+            keysyms::KEY_Return,
+            keysyms::KEY_space,
+            keysyms::KEY_grave,
+        ] {
+            assert!(
+                !is_switcher_keysym(Keysym::new(other)),
+                "keysym {other:#x} must not open the switcher"
             );
         }
     }

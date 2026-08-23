@@ -15,13 +15,16 @@
 //! context (D11: smithay self-built compositor, MIT, closed-source-capable).
 //!
 //! What this spike deliberately does NOT carry over from smallvil/anvil:
-//! - No layer-shell server side yet (DESIGN §13.5 calls for it on L1
-//!   eventually; smallvil doesn't implement it either, so this spike stays
-//!   at parity with upstream rather than adding scope).
+//! - ~~No layer-shell server side yet~~ — **WM-3 (2026-08-23) added it**
+//!   (`crate::layer_shell`): `zwlr_layer_shell_v1`, the four-band z-order,
+//!   exclusive zones feeding the window work area, and pointer routing on both
+//!   sides of the window stack. `duduclaw-shell` does not use it yet; see that
+//!   module's scope note.
 //! - No XWayland support.
 //! - No screen-copy protocols.
 //!
-//! **A4-1 (2026-08-22) removed the first item on that list.** There are now
+//! **A4-1 (2026-08-22) ended the "nested backend only" limitation** stated in
+//! the paragraph above. There are now
 //! two backends in this one binary, picked at runtime by
 //! `backend_choice::choose_backend`:
 //! - `winit_backend.rs` — nested inside a host Wayland/X11 session
@@ -32,16 +35,20 @@
 
 mod handlers;
 
+mod alt_tab;
 mod backend_choice;
 mod codrive;
 mod cursor;
 mod decor;
 mod grabs;
 mod input;
+mod layer_shell;
+mod minimize;
 mod render;
 mod seat_order;
 mod shell_control;
 mod state;
+mod switcher;
 mod udev_backend;
 mod window_policy;
 mod winit_backend;

@@ -131,6 +131,11 @@ pub fn init_winit(
                     None,
                     None,
                 );
+                // WM-3: layer surfaces are arranged against the output's MODE,
+                // so a resize leaves every anchored one at the old geometry
+                // (and the exclusive zone stale) unless the map is re-arranged
+                // FIRST — the window policy below reads that zone.
+                state.rearrange_layers();
                 // WM-1: the reserved bands are computed against the output, so
                 // a changed output has to re-drive the policy or every already
                 // mapped window keeps the old work area (an app window would
@@ -255,6 +260,10 @@ pub fn init_winit(
                 // so it needs its own frame callback or a client that
                 // double-buffers its cursor stalls after one commit.
                 state.send_cursor_frames(&output, elapsed);
+                // WM-3: layer surfaces are not in `space` either — same
+                // consequence (a double-buffering panel stalls after one
+                // commit), plus this is where dead layers are reaped.
+                state.send_layer_frames_and_cleanup(&output, elapsed);
 
                 state.space.refresh();
                 state.popups.cleanup();

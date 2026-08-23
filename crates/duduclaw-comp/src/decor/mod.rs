@@ -69,6 +69,8 @@
 //! carries, and they are per-property, not a theme). Wiring one is a
 //! standalone piece of work — see the `TODO(theme)` note on [`Palette`].
 
+pub mod edges;
+pub mod minus;
 pub mod mode;
 pub mod paint;
 pub mod placement;
@@ -77,6 +79,10 @@ pub mod xmark;
 
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
+// `hit_frame_edge` itself is deliberately not re-exported: the only live
+// caller must go through the work-area-clipped wrapper, and a convenience
+// re-export of the unclipped one is an invitation to skip that clip.
+pub use edges::{hit_frame_edge_in_work, FrameEdge};
 pub use mode::{negotiated_ssd, DecorMode};
 pub use placement::cascade_frame_rect;
 
@@ -111,6 +117,10 @@ pub const SHADOW_PX: i32 = SHADOW_RING_PX * SHADOW_ALPHAS.len() as i32;
 /// the difference between "closes the window" and "starts dragging it".
 pub const CLOSE_BTN_W: i32 = 46;
 
+/// Width of the WM-3 minimize button, immediately left of the close button.
+/// Same box as the close button so the two read as one control group.
+pub const MINIMIZE_BTN_W: i32 = CLOSE_BTN_W;
+
 /// Left padding before the title text starts.
 pub const TITLE_PAD_LEFT: i32 = 12;
 
@@ -130,6 +140,29 @@ pub const MIN_ON_SCREEN_PX: i32 = 64;
 pub const MIN_CONTENT_W: i32 = 240;
 /// See [`MIN_CONTENT_W`].
 pub const MIN_CONTENT_H: i32 = 160;
+
+/// WM-3: smallest **content** size an interactive edge resize will ever
+/// configure — the task brief's "最小尺寸 320×240".
+///
+/// Deliberately larger than [`MIN_CONTENT_W`]/[`MIN_CONTENT_H`] (which govern
+/// automatic placement, where the compositor is choosing on the client's
+/// behalf): this floor exists so a human dragging fast cannot collapse a window
+/// into a strip that has no visible content left to grab.
+///
+/// It is a floor on top of the client's own `min_size`, never a replacement:
+/// `clamp_resize_size` takes the larger of the two, so a client that declares a
+/// bigger minimum still wins.
+pub const MIN_RESIZE_W: i32 = 320;
+/// See [`MIN_RESIZE_W`].
+pub const MIN_RESIZE_H: i32 = 240;
+
+/// WM-3: how close two clicks on the same title bar must be, in milliseconds,
+/// to count as a double click. The de-facto desktop default.
+pub const DOUBLE_CLICK_MS: u64 = 400;
+
+/// WM-3: and how close together, in logical pixels. Without a distance test a
+/// slow drag-click-drag-click across the bar would maximize the window.
+pub const DOUBLE_CLICK_SLOP_PX: f64 = 8.0;
 
 /// RGBA colours used by the decoration, as premultiplied-irrelevant opaque
 /// `f32` quadruples (`SolidColorBuffer` takes `Color32F`).
@@ -161,6 +194,30 @@ impl Palette {
     pub const CLOSE_HOVER_GLYPH: [u8; 3] = [0xff, 0xff, 0xff];
     /// Shadow colour (alpha comes from [`SHADOW_ALPHAS`]).
     pub const SHADOW_RGB: [f32; 3] = [0.0, 0.0, 0.0];
+
+    /// WM-3 — `stone-200` (`#e7e5e4`), the minimize button's hover fill. Neutral
+    /// on purpose: unlike close, minimizing destroys nothing, so it must not
+    /// borrow the "this is dangerous" red.
+    pub const MINIMIZE_HOVER_BG: [f32; 4] = [0.906, 0.898, 0.894, 1.0];
+
+    /// WM-3 — the Alt-Tab panel's background, `stone-50` (`#fafaf9`). Opaque:
+    /// the panel is read at a glance while a key is held, and a translucent
+    /// list over an arbitrary desktop is exactly the thing that stops being
+    /// readable at the moment it matters.
+    pub const SWITCHER_BG: [f32; 4] = [0.980, 0.980, 0.976, 1.0];
+    /// WM-3 — the switcher panel's 1 px border, `stone-300`.
+    pub const SWITCHER_BORDER: [f32; 4] = Self::BORDER;
+    /// WM-3 — the selected row, `amber-500` (`#f59e0b`), the brand's primary.
+    pub const SWITCHER_ROW_SELECTED: [f32; 4] = [0.961, 0.620, 0.043, 1.0];
+    /// WM-3 — an unselected row draws no fill at all (the panel shows through);
+    /// the buffer still exists so its size tracks a resize. See
+    /// `decor::paint`'s "why every buffer is cached" note.
+    pub const SWITCHER_ROW_IDLE: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+    /// WM-3 — switcher label text, `stone-900`. Deliberately the same colour on
+    /// the selected row: amber-500 against stone-900 clears WCAG AA at this
+    /// size, and keeping one colour means the glyph raster survives a selection
+    /// change instead of being rebuilt on every keypress.
+    pub const SWITCHER_TEXT: [u8; 3] = Self::TITLE_TEXT;
 }
 
 /// How much bigger the frame is than the content, on each side.
@@ -300,13 +357,37 @@ pub fn close_button_rect(title_bar: Rectangle<i32, Logical>) -> Rectangle<i32, L
     )
 }
 
-/// The rectangle the title text may occupy: from the left padding up to the
-/// close button, minus a gap. Width can legitimately come back `0` on a very
-/// narrow window, in which case no text is rasterised at all.
-pub fn title_text_rect(title_bar: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+/// WM-3: the minimize button's rectangle, immediately left of the close
+/// button.
+///
+/// `None` when the title bar is too narrow to hold both buttons — a
+/// pathological 60 px window keeps its close button (the affordance that must
+/// never disappear, or the window becomes a trap) and simply has no minimize
+/// button. Deliberately not "shrink both": two 20 px buttons side by side are
+/// two mis-clicks waiting to happen, and one of them destroys work.
+pub fn minimize_button_rect(title_bar: Rectangle<i32, Logical>) -> Option<Rectangle<i32, Logical>> {
     let close = close_button_rect(title_bar);
+    let x = close.loc.x - MINIMIZE_BTN_W;
+    if x < title_bar.loc.x {
+        return None;
+    }
+    Some(Rectangle::new(
+        Point::from((x, title_bar.loc.y)),
+        Size::from((MINIMIZE_BTN_W, title_bar.size.h)),
+    ))
+}
+
+/// The rectangle the title text may occupy: from the left padding up to the
+/// left-most button, minus a gap. Width can legitimately come back `0` on a
+/// very narrow window, in which case no text is rasterised at all.
+pub fn title_text_rect(title_bar: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    // WM-3: the minimize button, when there is room for one, is what the text
+    // now stops before — not the close button.
+    let buttons_left = minimize_button_rect(title_bar)
+        .map(|r| r.loc.x)
+        .unwrap_or_else(|| close_button_rect(title_bar).loc.x);
     let x = title_bar.loc.x + TITLE_PAD_LEFT;
-    let right = close.loc.x - TITLE_GAP_RIGHT;
+    let right = buttons_left - TITLE_GAP_RIGHT;
     Rectangle::new(
         Point::from((x, title_bar.loc.y)),
         Size::from(((right - x).max(0), title_bar.size.h)),
@@ -318,8 +399,13 @@ pub fn title_text_rect(title_bar: Rectangle<i32, Logical>) -> Rectangle<i32, Log
 pub enum FrameHit {
     /// The close button — send `xdg_toplevel.close`.
     Close,
-    /// Anywhere else on the title bar — start a move grab.
+    /// WM-3: the minimize button — unmap the window, keep it switchable.
+    Minimize,
+    /// Anywhere else on the title bar — start a move grab (or, on a double
+    /// click, toggle maximize).
     TitleBar,
+    /// WM-3: the resize ring outside the frame. See [`edges`].
+    Edge(FrameEdge),
 }
 
 /// Classifies a pointer position against one window's frame.
@@ -337,10 +423,39 @@ pub fn hit_frame(
         return None;
     }
     if close_button_rect(bar).to_f64().contains(pos) {
-        Some(FrameHit::Close)
-    } else {
-        Some(FrameHit::TitleBar)
+        return Some(FrameHit::Close);
     }
+    if let Some(minimize) = minimize_button_rect(bar) {
+        if minimize.to_f64().contains(pos) {
+            return Some(FrameHit::Minimize);
+        }
+    }
+    Some(FrameHit::TitleBar)
+}
+
+/// WM-3: whether two title-bar presses count as one double click.
+///
+/// Pure so the rule is testable without a clock or a seat. `previous` is the
+/// last press this compositor saw on **the same window's** title bar (the
+/// caller owns that comparison — an id match is not a geometry question).
+pub fn is_double_click(
+    previous: Option<(std::time::Duration, Point<f64, Logical>)>,
+    now: std::time::Duration,
+    pos: Point<f64, Logical>,
+) -> bool {
+    let Some((then, where_)) = previous else {
+        return false;
+    };
+    // Saturating: a monotonic clock cannot go backwards, but a caller feeding
+    // two independently-sourced timestamps could, and an underflow panic must
+    // not be one mis-ordered event away.
+    let elapsed = now.saturating_sub(then);
+    if elapsed > std::time::Duration::from_millis(DOUBLE_CLICK_MS) {
+        return false;
+    }
+    let dx = pos.x - where_.x;
+    let dy = pos.y - where_.y;
+    (dx * dx + dy * dy).sqrt() <= DOUBLE_CLICK_SLOP_PX
 }
 
 /// Clamps a proposed frame origin so the window stays recoverable.
@@ -519,14 +634,88 @@ mod tests {
         let bar = title_bar_rect(frame, DecorInsets::SSD).unwrap();
         let close = close_button_rect(bar);
         let y = bar.loc.y as f64 + 1.0;
+        // WM-3: the minimize button now abuts the close button, so the pixel
+        // immediately left of ✕ is －, not drag area. That the boundary is
+        // exact — no dead pixel, no overlap — is what this asserts.
         assert_eq!(
             hit_frame(frame, DecorInsets::SSD, p(close.loc.x as f64 - 0.5, y)),
-            Some(FrameHit::TitleBar)
+            Some(FrameHit::Minimize)
         );
         assert_eq!(
             hit_frame(frame, DecorInsets::SSD, p(close.loc.x as f64, y)),
             Some(FrameHit::Close)
         );
+    }
+
+    #[test]
+    fn the_minimize_button_sits_immediately_left_of_the_close_button() {
+        let bar = rect(0, 0, 800, TITLE_BAR_H);
+        let close = close_button_rect(bar);
+        let minimize = minimize_button_rect(bar).expect("a full-width bar has room for both");
+        assert_eq!(minimize.loc.x + minimize.size.w, close.loc.x, "no gap, no overlap");
+        assert_eq!(minimize.size.w, MINIMIZE_BTN_W);
+        assert_eq!(minimize.size.h, TITLE_BAR_H);
+        assert_eq!(minimize.loc.y, bar.loc.y);
+    }
+
+    #[test]
+    fn a_bar_too_narrow_for_both_buttons_keeps_the_close_button_and_drops_minimize() {
+        // Losing ✕ would make the window a trap; losing － loses nothing.
+        let bar = rect(0, 0, 60, TITLE_BAR_H);
+        assert_eq!(minimize_button_rect(bar), None);
+        assert_eq!(close_button_rect(bar).size.w, CLOSE_BTN_W);
+        // A 62px-wide frame gives a 60px bar: ✕ takes x 14..60, so 0..14 is
+        // all the drag area there is — and it must still be drag area, not a
+        // second button.
+        let frame = rect(-1, -1, 62, 200);
+        assert_eq!(
+            hit_frame(frame, DecorInsets::SSD, p(5.0, 5.0)),
+            Some(FrameHit::TitleBar),
+            "with no minimize button the left of the bar is still draggable"
+        );
+        assert_eq!(hit_frame(frame, DecorInsets::SSD, p(30.0, 5.0)), Some(FrameHit::Close));
+    }
+
+    #[test]
+    fn the_title_text_stops_before_the_left_most_button() {
+        let bar = rect(0, 0, 800, TITLE_BAR_H);
+        let text = title_text_rect(bar);
+        let minimize = minimize_button_rect(bar).unwrap();
+        assert_eq!(text.loc.x, TITLE_PAD_LEFT);
+        assert_eq!(text.loc.x + text.size.w, minimize.loc.x - TITLE_GAP_RIGHT);
+        // Two 46px buttons + 12 left pad + 8 gap = 692 of an 800px bar.
+        assert_eq!(text.size.w, 800 - CLOSE_BTN_W - MINIMIZE_BTN_W - TITLE_PAD_LEFT - TITLE_GAP_RIGHT);
+    }
+
+    #[test]
+    fn a_second_click_soon_and_near_is_a_double_click() {
+        let then = std::time::Duration::from_millis(1_000);
+        let prev = Some((then, p(100.0, 50.0)));
+        assert!(is_double_click(prev, std::time::Duration::from_millis(1_200), p(102.0, 51.0)));
+    }
+
+    #[test]
+    fn a_slow_or_distant_second_click_is_not_a_double_click() {
+        let then = std::time::Duration::from_millis(1_000);
+        let prev = Some((then, p(100.0, 50.0)));
+        // Too slow.
+        assert!(!is_double_click(prev, std::time::Duration::from_millis(1_600), p(100.0, 50.0)));
+        // Far enough that it is a drag, not a double click.
+        assert!(!is_double_click(prev, std::time::Duration::from_millis(1_100), p(140.0, 50.0)));
+        // Exactly on the slop boundary counts; one pixel past does not.
+        assert!(is_double_click(prev, std::time::Duration::from_millis(1_100), p(108.0, 50.0)));
+        assert!(!is_double_click(prev, std::time::Duration::from_millis(1_100), p(109.0, 50.0)));
+    }
+
+    #[test]
+    fn the_first_ever_click_is_never_a_double_click() {
+        assert!(!is_double_click(None, std::time::Duration::from_millis(5), p(0.0, 0.0)));
+    }
+
+    #[test]
+    fn a_backwards_timestamp_does_not_panic() {
+        let prev = Some((std::time::Duration::from_millis(9_000), p(0.0, 0.0)));
+        assert!(is_double_click(prev, std::time::Duration::from_millis(10), p(0.0, 0.0)));
     }
 
     #[test]

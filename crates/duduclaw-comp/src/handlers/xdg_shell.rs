@@ -5,8 +5,8 @@
 use smithay::{
     delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
-        find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind,
-        PopupPointerGrab, PopupUngrabStrategy, Window,
+        find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output, PopupKeyboardGrab,
+        PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window, WindowSurfaceType,
     },
     input::{
         pointer::{Focus, GrabStartData as PointerGrabStartData},
@@ -170,6 +170,11 @@ impl XdgShellHandler for DuduclawComp {
                 window,
                 edges.into(),
                 Rectangle::new(initial_window_location, initial_window_size),
+                // WM-3: deliberately unclamped. This is a CLIENT asking to be
+                // resized (its own resize edges, its own toolkit); the
+                // compositor's edge-ring drag is the clamped one. See
+                // `grabs::resize_grab::ResizeClamp`.
+                None,
             );
 
             // WP-A1 multi-window round: same "previously silent" gap as
@@ -232,15 +237,17 @@ impl XdgShellHandler for DuduclawComp {
             tracing::debug!("xdg_shell: grab request for a popup with no resolvable root surface — ignoring");
             return;
         };
-        if !self
+        let root_is_toplevel = self
             .space
             .elements()
-            .any(|w| w.toplevel().unwrap().wl_surface() == &root)
-        {
-            // Root isn't a currently-mapped toplevel (already closed, or —
-            // this crate has no layer-shell — some other kind of surface
-            // entirely). Nothing to grab against.
-            tracing::debug!("xdg_shell: grab request whose root isn't a mapped toplevel — ignoring");
+            .any(|w| w.toplevel().unwrap().wl_surface() == &root);
+        // WM-3: a layer surface is a legitimate popup root now (a panel's own
+        // menu). Before layer-shell existed this branch could only ever mean
+        // "already closed", which is why the original comment said so.
+        if !root_is_toplevel && !self.is_mapped_layer_surface(&root) {
+            tracing::debug!(
+                "xdg_shell: grab request whose root isn't a mapped toplevel or layer surface — ignoring"
+            );
             return;
         }
 
@@ -313,6 +320,19 @@ impl XdgShellHandler for DuduclawComp {
             .elements()
             .find(|w| w.toplevel().unwrap().wl_surface() == &wl_surface)
             .cloned();
+        // WM-3: a MINIMIZED window is not in the space, so the lookup above
+        // misses it — but the switcher may well be pointing at it. Resolve
+        // against both sets before anything is unmapped.
+        let window_for_switcher = window_to_remove.clone().or_else(|| {
+            self.minimized
+                .iter()
+                .find(|w| {
+                    w.toplevel()
+                        .map(|t| t.wl_surface() == &wl_surface)
+                        .unwrap_or(false)
+                })
+                .cloned()
+        });
         if let Some(window) = window_to_remove {
             self.space.unmap_elem(&window);
         }
@@ -325,6 +345,14 @@ impl XdgShellHandler for DuduclawComp {
         // geometry and the hover state for this toplevel. `ObjectId`s are
         // never reused, so nothing else would ever evict these.
         self.forget_window_decor(&wl_surface.id());
+        // WM-3: and everything else keyed on this window — the minimized park,
+        // the MRU order the switcher reads, and an open switcher session that
+        // may be pointing at it right now.
+        self.forget_minimized(&wl_surface);
+        crate::alt_tab::mru_forget(&mut self.focus_mru, &wl_surface.id());
+        if let Some(window) = window_for_switcher {
+            self.switcher_forget(&window);
+        }
 
         self.reassign_focus_on_window_removed(&wl_surface);
     }
@@ -376,46 +404,10 @@ impl XdgShellHandler for DuduclawComp {
     /// `handle_commit` below for why (it changes CSD for every GTK/Qt app we
     /// host, which is only ever appropriate when the client itself asked).
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        let Some(output_geo) = self.layout_output_geometry() else {
-            surface.send_configure();
-            return;
-        };
-        let wl_surface = surface.wl_surface().clone();
-        let window = self.toplevel_window_for(&wl_surface);
-        let area = crate::window_policy::work_area(output_geo, self.reserved_bands);
-        let insets = window
-            .as_ref()
-            .map(|w| self.window_insets(w))
-            .unwrap_or(crate::decor::DecorInsets::NONE);
-        let content = crate::decor::content_rect(area, insets);
-
-        // Snapshot where the window currently is BEFORE marking it maximized:
-        // `decor_sync_frame` deliberately does nothing once the `maximized`
-        // flag is set, so that the restore geometry cannot be overwritten with
-        // the maximized rectangle.
-        if let Some(window) = window.as_ref() {
-            self.decor_sync_frame(window);
-        }
-        self.decor.maximized.insert(wl_surface.id());
-
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Maximized);
-            state.size = Some(content.size);
-        });
-        if let Some(window) = window {
-            if self.space.element_location(&window) != Some(content.loc) {
-                self.space.map_element(window, content.loc, false);
-            }
-        }
-        tracing::info!(
-            surface_id = ?wl_surface.id(),
-            frame = ?(area.loc.x, area.loc.y, area.size.w, area.size.h),
-            content = ?(content.loc.x, content.loc.y, content.size.w, content.size.h),
-            decorated = insets.is_decorated(),
-            "xdg_shell: maximize_request — the FRAME fills the work area; the client gets that minus its decoration"
-        );
-        self.queue_redraw();
-        surface.send_configure();
+        // WM-3 moved the body into `DuduclawComp::set_maximized` so the
+        // double-click-the-title-bar path (`input.rs`) drives exactly the same
+        // code rather than a second, drifting copy.
+        self.set_maximized(&surface, true, "maximize_request");
     }
 
     /// WM-1 counterpart to [`Self::maximize_request`], **rewritten in WM-2**.
@@ -429,42 +421,7 @@ impl XdgShellHandler for DuduclawComp {
     /// A client that opened maximized has no remembered frame; it falls back
     /// to a fresh cascade slot rather than to nothing at all.
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        let wl_surface = surface.wl_surface().clone();
-        let id = wl_surface.id();
-        self.decor.maximized.remove(&id);
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Maximized);
-        });
-
-        let restored = match (self.toplevel_window_for(&wl_surface), self.layout_work_area()) {
-            (Some(window), Some(work)) => {
-                let insets = self.window_insets(&window);
-                let frame = match self.decor.frames.get(&id).copied() {
-                    Some(remembered) => crate::decor::refit_frame(remembered, work, insets),
-                    None => {
-                        let index = self.decor.cascade_next;
-                        self.decor.cascade_next = self.decor.cascade_next.wrapping_add(1);
-                        crate::decor::cascade_frame_rect(work, insets, index)
-                    }
-                };
-                self.decor.frames.insert(id.clone(), frame);
-                let content = crate::decor::content_rect(frame, insets);
-                surface.with_pending_state(|state| {
-                    state.size = Some(content.size);
-                });
-                self.space.map_element(window, content.loc, false);
-                Some(content)
-            }
-            _ => None,
-        };
-
-        tracing::info!(
-            surface_id = ?id,
-            restored = ?restored.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h)),
-            "xdg_shell: unmaximize_request — restoring the remembered floating geometry"
-        );
-        self.queue_redraw();
-        surface.send_configure();
+        self.set_maximized(&surface, false, "unmaximize_request");
     }
 
     /// WM-2: the title bar draws `xdg_toplevel.title`, so a title change is
@@ -524,6 +481,107 @@ impl XdgDecorationHandler for DuduclawComp {
 }
 
 impl DuduclawComp {
+    /// WM-3: the one implementation of maximize/restore.
+    ///
+    /// Three callers drive it: `maximize_request`, `unmaximize_request`, and
+    /// the WM-3 double-click on the title bar (`input.rs`). Having them share
+    /// this is not tidiness — a second copy would be a second place for the
+    /// "the FRAME fills the work area, the client gets that minus its
+    /// decoration" rule and the restore-geometry snapshot ordering to drift,
+    /// and both are subtle enough that the drift would be silent.
+    ///
+    /// Maximizing:
+    /// * the **frame** fills the work area, so a maximized server-decorated
+    ///   window still shows its 32 px title bar and its bottom edge lands on
+    ///   the work area's bottom rather than hanging over the dock;
+    /// * where the window was is snapshotted **before** the `maximized` flag is
+    ///   set, because `decor_sync_frame` deliberately does nothing once it is —
+    ///   that is what stops the restore rectangle being overwritten with the
+    ///   maximized one.
+    ///
+    /// Restoring goes back to the remembered floating frame, refitted into the
+    /// work area as it is *now* (it may have changed while the window was
+    /// maximized). A client that opened maximized has no remembered frame and
+    /// gets a fresh cascade slot rather than nothing at all.
+    pub(crate) fn set_maximized(
+        &mut self,
+        surface: &ToplevelSurface,
+        maximized: bool,
+        reason: &'static str,
+    ) {
+        let wl_surface = surface.wl_surface().clone();
+        let id = wl_surface.id();
+        let window = self.toplevel_window_for(&wl_surface);
+        let Some(work) = self.layout_work_area() else {
+            // No real output: nothing to maximize against. The configure still
+            // goes out so the client is not left waiting on one.
+            surface.send_configure();
+            return;
+        };
+        let insets = window
+            .as_ref()
+            .map(|w| self.window_insets(w))
+            .unwrap_or(crate::decor::DecorInsets::NONE);
+
+        let frame = if maximized {
+            if let Some(window) = window.as_ref() {
+                self.decor_sync_frame(window);
+            }
+            self.decor.maximized.insert(id.clone());
+            work
+        } else {
+            self.decor.maximized.remove(&id);
+            let frame = match self.decor.frames.get(&id).copied() {
+                Some(remembered) => crate::decor::refit_frame(remembered, work, insets),
+                None => {
+                    let index = self.decor.cascade_next;
+                    self.decor.cascade_next = self.decor.cascade_next.wrapping_add(1);
+                    crate::decor::cascade_frame_rect(work, insets, index)
+                }
+            };
+            self.decor.frames.insert(id.clone(), frame);
+            frame
+        };
+        let content = crate::decor::content_rect(frame, insets);
+
+        surface.with_pending_state(|state| {
+            if maximized {
+                state.states.set(xdg_toplevel::State::Maximized);
+            } else {
+                state.states.unset(xdg_toplevel::State::Maximized);
+            }
+            state.size = Some(content.size);
+        });
+        if let Some(window) = window {
+            if self.space.element_location(&window) != Some(content.loc) {
+                self.space.map_element(window, content.loc, false);
+            }
+        }
+
+        tracing::info!(
+            surface_id = ?id,
+            reason,
+            maximized,
+            frame = ?(frame.loc.x, frame.loc.y, frame.size.w, frame.size.h),
+            content = ?(content.loc.x, content.loc.y, content.size.w, content.size.h),
+            decorated = insets.is_decorated(),
+            "xdg_shell: maximize state changed — the FRAME fills the work area; \
+             the client gets that minus its decoration"
+        );
+        self.queue_redraw();
+        surface.send_configure();
+    }
+
+    /// WM-3: toggles the maximize state of a mapped window, used by the
+    /// double-click-the-title-bar path. No-op for a window with no toplevel.
+    pub(crate) fn toggle_maximized(&mut self, window: &Window, reason: &'static str) {
+        let Some(toplevel) = window.toplevel().cloned() else {
+            return;
+        };
+        let maximized = self.decor.maximized.contains(&toplevel.wl_surface().id());
+        self.set_maximized(&toplevel, !maximized, reason);
+    }
+
     fn set_decoration_mode(
         &mut self,
         toplevel: &ToplevelSurface,
@@ -723,30 +781,69 @@ pub fn handle_commit(state: &mut DuduclawComp, surface: &WlSurface) {
 }
 
 impl DuduclawComp {
-    fn unconstrain_popup(&self, popup: &PopupSurface) {
+    /// WM-3 changed three things here, none of them cosmetic:
+    ///
+    /// 1. `pub(crate)` — `crate::layer_shell`'s `new_popup` calls it too.
+    /// 2. **A layer surface can be a popup's root.** A panel's own menu is an
+    ///    `xdg_popup` whose parent is a `zwlr_layer_surface_v1`, so the
+    ///    toplevel-only lookup would have bailed and left the menu placed by
+    ///    the client's raw positioner, i.e. free to run off the screen.
+    /// 3. **`space.outputs().next()` was the CD-2 shadow-output bug** (see
+    ///    `state::primary_output`'s note): it returns the headless shadow
+    ///    output at `(0, 100_000)`, so every popup was being unconstrained
+    ///    against a rectangle 100 000 px below the screen. Now it asks
+    ///    `layout_output`. The `unwrap()`s went with it — a popup arriving
+    ///    before any output is mapped is a real ordering, not a panic.
+    pub(crate) fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        let Some(window) = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == &root)
-        else {
+        let Some(output) = self.layout_output() else {
+            return;
+        };
+        let Some(output_geo) = self.space.output_geometry(&output) else {
             return;
         };
 
-        let output = self.space.outputs().next().unwrap();
-        let output_geo = self.space.output_geometry(output).unwrap();
-        let window_geo = self.space.element_geometry(window).unwrap();
+        // The parent's geometry, in GLOBAL coordinates — a layer map's own
+        // geometry is output-local, hence the `+ output_geo.loc`.
+        let parent_geo = match self
+            .space
+            .elements()
+            .find(|w| w.toplevel().unwrap().wl_surface() == &root)
+        {
+            Some(window) => self.space.element_geometry(window),
+            None => {
+                let map = layer_map_for_output(&output);
+                map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+                    .and_then(|l| map.layer_geometry(l))
+                    .map(|g| Rectangle::new(g.loc + output_geo.loc, g.size))
+            }
+        };
+        let Some(parent_geo) = parent_geo else {
+            return;
+        };
 
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.
         let mut target = output_geo;
         target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
-        target.loc -= window_geo.loc;
+        target.loc -= parent_geo.loc;
 
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
+    }
+
+    /// Is `surface` a currently-mapped layer surface? Used by the popup-grab
+    /// gate, which must accept a panel's menu as readily as an application's.
+    fn is_mapped_layer_surface(&self, surface: &WlSurface) -> bool {
+        self.layout_output()
+            .map(|output| {
+                layer_map_for_output(&output)
+                    .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                    .is_some()
+            })
+            .unwrap_or(false)
     }
 }

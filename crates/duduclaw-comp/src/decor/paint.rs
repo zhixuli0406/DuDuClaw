@@ -86,9 +86,9 @@ use smithay::{
 use crate::{render::CodriveElement, state::DuduclawComp};
 
 use super::{
-    close_button_rect, frame_rect, mode::DecorMode, shadow_bounds, text::FontSet, title_bar_rect,
-    title_text_rect, xmark, DecorInsets, Palette, BORDER_PX, SHADOW_ALPHAS, SHADOW_RING_PX,
-    TITLE_BAR_H, TITLE_FONT_PX,
+    close_button_rect, frame_rect, minimize_button_rect, minus, mode::DecorMode, shadow_bounds,
+    text::FontSet, title_bar_rect, title_text_rect, xmark, DecorInsets, Palette, BORDER_PX,
+    SHADOW_ALPHAS, SHADOW_RING_PX, TITLE_BAR_H, TITLE_FONT_PX,
 };
 
 /// Side length of the close ✕, in logical pixels.
@@ -124,6 +124,13 @@ pub struct DecorState {
     pub maximized: std::collections::HashSet<ObjectId>,
     /// The close button the human pointer is currently over, if any.
     pub hovered_close: Option<ObjectId>,
+    /// WM-3: the same, for the minimize button. Two fields rather than one
+    /// `Option<(ObjectId, Button)>` because the two are independent by
+    /// construction (a pointer is over at most one, but the render path asks
+    /// about each separately) and because a single field would make "the
+    /// pointer left the close button onto the minimize button" a two-step
+    /// update with an inconsistent frame in between.
+    pub hovered_minimize: Option<ObjectId>,
     /// Monotonic cascade counter. Deliberately never reset — see
     /// [`super::placement::cascade_frame_rect`].
     pub cascade_next: u32,
@@ -147,6 +154,7 @@ impl DecorState {
             frames: HashMap::new(),
             maximized: std::collections::HashSet::new(),
             hovered_close: None,
+            hovered_minimize: None,
             cascade_next: 0,
         }
     }
@@ -162,6 +170,8 @@ impl Default for DecorState {
 struct WindowDecorBuffers {
     title_bg: SolidColorBuffer,
     close_bg: SolidColorBuffer,
+    /// WM-3: the minimize button's hover fill.
+    minimize_bg: SolidColorBuffer,
     /// top, bottom, left, right.
     border: [SolidColorBuffer; 4],
     /// Innermost ring first, four bars each (top, bottom, left, right).
@@ -173,6 +183,9 @@ struct WindowDecorBuffers {
     close_tex: Option<MemoryRenderBuffer>,
     /// Hover state the cached ✕ was rasterised for.
     close_key: Option<bool>,
+    /// WM-3: the `－` glyph and the hover state it was rasterised for.
+    minimize_tex: Option<MemoryRenderBuffer>,
+    minimize_key: Option<bool>,
 }
 
 impl WindowDecorBuffers {
@@ -180,6 +193,7 @@ impl WindowDecorBuffers {
         Self {
             title_bg: SolidColorBuffer::default(),
             close_bg: SolidColorBuffer::default(),
+            minimize_bg: SolidColorBuffer::default(),
             border: std::array::from_fn(|_| SolidColorBuffer::default()),
             shadow: std::array::from_fn(|_| SolidColorBuffer::default()),
             title_tex: None,
@@ -187,6 +201,8 @@ impl WindowDecorBuffers {
             title_size: (0, 0),
             close_tex: None,
             close_key: None,
+            minimize_tex: None,
+            minimize_key: None,
         }
     }
 }
@@ -346,6 +362,9 @@ impl DuduclawComp {
         if self.decor.hovered_close.as_ref() == Some(surface_id) {
             self.decor.hovered_close = None;
         }
+        if self.decor.hovered_minimize.as_ref() == Some(surface_id) {
+            self.decor.hovered_minimize = None;
+        }
     }
 
     /// Every render element for one output, in front-to-back order.
@@ -371,6 +390,18 @@ impl DuduclawComp {
             .seat
             .get_keyboard()
             .and_then(|k| k.current_focus());
+
+        // WM-3: the Alt-Tab panel. Below the cursors (which stay on top of
+        // everything, as they must) and above every surface — it is a modal
+        // affordance for as long as it is on screen. Empty and cheap when no
+        // switcher session is open, which is almost always.
+        let switcher = self.build_switcher_elements(renderer, output_geo, scale);
+        overlays.extend(switcher);
+
+        // WM-3: layer surfaces on the `overlay` and `top` layers, in that
+        // order. See `layer_shell::geometry` for why this crate ranks the four
+        // bands explicitly instead of using smithay's two-way split.
+        overlays.extend(self.layer_elements(renderer, output, scale, true));
 
         // Top of the stack first: `Space::elements()` yields back-to-front.
         let windows: Vec<Window> = self.space.elements().rev().cloned().collect();
@@ -431,7 +462,49 @@ impl DuduclawComp {
             overlays.extend(below);
         }
 
+        // WM-3: `bottom` then `background`, under every window.
+        overlays.extend(self.layer_elements(renderer, output, scale, false));
+
         overlays
+    }
+
+    /// WM-3: the render elements of one output's layer surfaces, for the
+    /// layers on the requested side of the window stack, front-most first.
+    ///
+    /// A layer's geometry is **output-local** (smithay's `LayerMap` arranges
+    /// against `Rectangle::from_size(mode)`), which is why — unlike the window
+    /// loop above — nothing here subtracts `output_geo.loc`. Same formula
+    /// smithay's own `space_render_elements` uses, read rather than
+    /// remembered.
+    fn layer_elements(
+        &self,
+        renderer: &mut GlesRenderer,
+        output: &Output,
+        scale: Scale<f64>,
+        above_windows: bool,
+    ) -> Vec<CodriveElement> {
+        use crate::layer_shell::geometry::{is_above_windows, LAYERS_FRONT_TO_BACK};
+        use smithay::{backend::renderer::element::AsRenderElements, desktop::layer_map_for_output};
+
+        let map = layer_map_for_output(output);
+        let mut out: Vec<CodriveElement> = Vec::new();
+        for layer in LAYERS_FRONT_TO_BACK
+            .into_iter()
+            .filter(|l| is_above_windows(*l) == above_windows)
+        {
+            // Within one layer the most recently mapped surface is front-most,
+            // matching upstream's `.rev()` over insertion order.
+            for surface in map.layers_on(layer).rev() {
+                let Some(geo) = map.layer_geometry(surface) else {
+                    continue;
+                };
+                let loc: Point<i32, Physical> = geo.loc.to_physical_precise_round(scale);
+                out.extend(AsRenderElements::<GlesRenderer>::render_elements::<CodriveElement>(
+                    surface, renderer, loc, scale, 1.0,
+                ));
+            }
+        }
+        out
     }
 
     /// Builds one window's decoration, returning `(above the content, below
@@ -465,8 +538,10 @@ impl DuduclawComp {
             .unwrap_or_else(|| "未命名視窗".to_string());
 
         let hovered = self.decor.hovered_close.as_ref() == Some(&surface_id);
+        let hovered_min = self.decor.hovered_minimize.as_ref() == Some(&surface_id);
         let text_rect = title_text_rect(bar);
         let close = close_button_rect(bar);
+        let minimize = minimize_button_rect(bar);
 
         // The font set is read-only here but lives next to the mutable buffer
         // map, so it is taken out for the duration of the borrow and put back.
@@ -507,6 +582,29 @@ impl DuduclawComp {
             };
             entry.close_tex = Some(upload(xmark::rasterize(CLOSE_GLYPH_PX, color)));
             entry.close_key = Some(hovered);
+        }
+
+        // --- minimize button (WM-3) ---------------------------------------
+        // Same resting-state-draws-nothing rule as the close button; the fill
+        // colour is neutral rather than red, because minimizing destroys
+        // nothing. The `－` glyph colour never changes, so unlike the ✕ its
+        // raster is built exactly once per window.
+        if let Some(minimize) = minimize {
+            entry.minimize_bg.update(
+                (minimize.size.w, minimize.size.h),
+                if hovered_min {
+                    Palette::MINIMIZE_HOVER_BG
+                } else {
+                    [0.0, 0.0, 0.0, 0.0]
+                },
+            );
+        }
+        if entry.minimize_key.is_none() {
+            entry.minimize_tex = Some(upload(minus::rasterize(
+                CLOSE_GLYPH_PX,
+                Palette::TITLE_TEXT,
+            )));
+            entry.minimize_key = Some(true);
         }
 
         // --- title text -------------------------------------------------------
@@ -614,6 +712,23 @@ impl DuduclawComp {
             }
         }
         above.push(solid(&entry.close_bg, off(close.loc), scale));
+
+        // WM-3: minimize `－`, centred in its own box by the identical
+        // arithmetic (both glyph buffers are square and the boxes are the same
+        // size, so the two marks cannot drift apart vertically).
+        if let Some(minimize) = minimize {
+            if let Some(tex) = entry.minimize_tex.as_ref() {
+                let g = CLOSE_GLYPH_PX as i32;
+                let loc = Point::from((
+                    minimize.loc.x + (minimize.size.w - g) / 2,
+                    minimize.loc.y + (minimize.size.h - g) / 2,
+                ));
+                if let Some(e) = memory(renderer, tex, off(loc), scale) {
+                    above.push(e);
+                }
+            }
+            above.push(solid(&entry.minimize_bg, off(minimize.loc), scale));
+        }
 
         // Title text, left-aligned and vertically centred on the bar.
         if let Some(tex) = entry.title_tex.as_ref() {

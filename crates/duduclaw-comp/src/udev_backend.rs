@@ -864,6 +864,8 @@ fn render_surface(
     // CUR-1: see the identical call in `winit_backend.rs` — a client-provided
     // cursor surface lives outside `space` and needs its own frame callback.
     state.send_cursor_frames(&output, elapsed);
+    // WM-3: and so do layer surfaces (`crate::layer_shell`).
+    state.send_layer_frames_and_cleanup(&output, elapsed);
     state.space.refresh();
     state.popups.cleanup();
     let _ = display_handle.flush_clients();

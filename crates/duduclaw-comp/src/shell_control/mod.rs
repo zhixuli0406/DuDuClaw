@@ -434,12 +434,21 @@ impl DuduclawComp {
     /// question.
     fn shell_control_list_windows(&self) -> Vec<ShellWindowInfo> {
         let focused_surface = self.seat.get_keyboard().and_then(|k| k.current_focus());
-        self.space
-            .elements()
+        // WM-3: minimized windows are included (`DuduclawComp::all_windows`).
+        // A dock that cannot see them cannot bring them back, and this
+        // compositor has no other task bar — see `crate::minimize`'s module doc
+        // on the recoverability invariant.
+        self.all_windows()
+            .iter()
             .map(|w| {
                 let (app_id, title) = codrive::window_target::window_identity(w);
                 let focused = focused_surface.as_ref() == Some(w.toplevel().unwrap().wl_surface());
-                ShellWindowInfo { app_id, title, focused }
+                ShellWindowInfo {
+                    app_id,
+                    title,
+                    focused,
+                    minimized: self.is_minimized(w),
+                }
             })
             .collect()
     }
@@ -452,8 +461,17 @@ impl DuduclawComp {
     /// `self.agent_seat`) and audits to THIS module's own log, not
     /// `codrive`'s (see this module's own doc comment for both reasons).
     fn shell_control_focus_window(&mut self, query: String) -> ShellControlResponse {
-        match codrive::window_target::find_target_window(&self.space, &query) {
+        // WM-3: resolved against mapped AND minimized windows. `activate` on a
+        // minimized window means restore-and-raise — the op's semantics are
+        // unchanged ("bring this window to the front"), it is the set of
+        // windows that can honestly answer it that grew.
+        let candidates = self.all_windows();
+        match codrive::window_target::find_target_in(&candidates, &query) {
             Some((window, matched)) => {
+                let restored = self.is_minimized(&window);
+                if restored {
+                    self.unminimize_window(&window);
+                }
                 let seat = self.seat.clone();
                 let serial = SERIAL_COUNTER.next_serial();
                 self.focus_window(&seat, Some(&window), serial);
@@ -468,7 +486,12 @@ impl DuduclawComp {
                         format!("query={query:?} matched_via=title_prefix matched_title={title:?}"),
                     ),
                 };
-                tracing::info!(query = %query, detail = %detail, "shell_control: focus_window — window focused");
+                // WM-3: `restored` is in the audit detail because "the dock
+                // un-minimized a window" and "the dock raised an already-visible
+                // window" are different user actions with the same op name, and
+                // the trail has to be able to tell them apart.
+                let detail = format!("{detail} restored={restored}");
+                tracing::info!(query = %query, detail = %detail, restored, "shell_control: focus_window — window focused");
                 self.shell_control.record("focus_window", Some(detail));
                 resp
             }

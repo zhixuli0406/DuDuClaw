@@ -10,7 +10,7 @@ use smithay::{
     reexports::{
         calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
         wayland_server::{
-            backend::{ClientData, ClientId, DisconnectReason},
+            backend::{ClientData, ClientId, DisconnectReason, ObjectId},
             protocol::wl_surface::WlSurface,
             Display, DisplayHandle, Resource,
         },
@@ -21,7 +21,10 @@ use smithay::{
         cursor_shape::CursorShapeManagerState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
-        shell::xdg::{decoration::XdgDecorationState, XdgShellState},
+        shell::{
+            wlr_layer::WlrLayerShellState,
+            xdg::{decoration::XdgDecorationState, XdgShellState},
+        },
         shm::ShmState,
         socket::ListeningSocketSource,
     },
@@ -64,6 +67,12 @@ pub struct DuduclawComp {
     /// `handlers/xdg_shell.rs`, so nothing in this crate reads the field.
     /// Same shape (and same reason) as `cursor_shape_manager_state` above.
     pub xdg_decoration_state: XdgDecorationState,
+    /// WM-3: the `zwlr_layer_shell_v1` global. Unlike the two above this field
+    /// IS read — `WlrLayerShellHandler::shell_state` (`crate::layer_shell`)
+    /// hands it back to smithay on every request. Layer surfaces themselves do
+    /// not live here: smithay keeps one `LayerMap` per `Output`, in that
+    /// output's own `UserDataMap`. See `crate::layer_shell`'s module doc.
+    pub layer_shell_state: WlrLayerShellState,
     pub popups: PopupManager,
 
     /// The real human seat — every hardware/winit-forwarded input event
@@ -182,6 +191,28 @@ pub struct DuduclawComp {
     /// the geometry model, and `decor::paint`'s for why the buffers are
     /// cached rather than rebuilt per frame.
     pub decor: crate::decor::paint::DecorState,
+    /// WM-3: windows that are minimized — unmapped from [`Self::space`] but
+    /// still alive, still switchable, still listed by `shell_control`.
+    ///
+    /// A `Window` is an `Arc` handle, so holding one here is what keeps the
+    /// toplevel from being reaped while it is off screen. Entries leave on
+    /// restore ([`DuduclawComp::unminimize_window`]) and on destruction
+    /// (`XdgShellHandler::toplevel_destroyed`) — those are the only two exits,
+    /// which is what makes "minimized ⇒ recoverable" a real invariant rather
+    /// than a hope.
+    pub minimized: Vec<Window>,
+    /// WM-3: most-recently-focused order, front = most recent. Maintained by
+    /// [`DuduclawComp::focus_window`] (every focus path in the crate funnels
+    /// through it) and drained by `crate::switcher`. Ids, not `Window`s, so a
+    /// stale entry cannot keep a dead toplevel alive.
+    pub focus_mru: Vec<ObjectId>,
+    /// WM-3: the Alt-Tab switcher — an open session plus its cached panel
+    /// buffers. See `crate::switcher`.
+    pub switcher: crate::switcher::SwitcherState,
+    /// WM-3: the previous title-bar press — `(window, when, where)` — used to
+    /// recognise a double click. `when` is measured from
+    /// [`Self::start_time`], so it is monotonic and needs no wall clock.
+    pub last_titlebar_click: Option<(ObjectId, std::time::Duration, Point<f64, Logical>)>,
     /// A4-1 (udev/DRM backend): "something that can change a pixel happened
     /// since the last composite". Set by [`DuduclawComp::queue_redraw`],
     /// consumed (and cleared) by `udev_backend::dispatch_render`.
@@ -216,6 +247,11 @@ impl DuduclawComp {
         // `handlers/xdg_shell.rs`'s `XdgDecorationHandler` impl for why comp
         // always answers `ClientSide`.
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
+        // WM-3: advertise `zwlr_layer_shell_v1`. Same "must exist before any
+        // client binds" constraint as the two globals above. Advertising it is
+        // safe with no client using it — nothing changes until something binds
+        // (see `crate::layer_shell`'s scope note).
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let popups = PopupManager::default();
 
         // A4-5: the ORDER these two `wl_seat` globals are created in is the
@@ -340,6 +376,7 @@ impl DuduclawComp {
             data_device_state,
             cursor_shape_manager_state,
             xdg_decoration_state,
+            layer_shell_state,
             popups,
             seat,
             cursor,
@@ -361,6 +398,10 @@ impl DuduclawComp {
             shell_surface: None,
             shell_confirmed: false,
             decor: crate::decor::paint::DecorState::new(),
+            minimized: Vec::new(),
+            focus_mru: Vec::new(),
+            switcher: crate::switcher::SwitcherState::default(),
+            last_titlebar_click: None,
             pending_redraw: true,
         }
     }
@@ -446,12 +487,26 @@ impl DuduclawComp {
         socket_name
     }
 
+    /// What client surface is under `pos`, and where that surface's origin is.
+    ///
+    /// WM-3 put layer surfaces on both sides of the window stack, in the exact
+    /// order [`crate::layer_shell::geometry`] ranks them: overlay and top
+    /// layers get first refusal, then ordinary windows, then bottom and
+    /// background. Routing has to agree with rendering or a panel drawn over a
+    /// window would not receive the clicks that visibly land on it.
     pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space.element_under(pos).and_then(|(window, location)| {
+        if let Some(hit) = self.layer_surface_under(pos, true) {
+            return Some(hit);
+        }
+        let window_hit = self.space.element_under(pos).and_then(|(window, location)| {
             window
                 .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p + location).to_f64()))
-        })
+        });
+        if window_hit.is_some() {
+            return window_hit;
+        }
+        self.layer_surface_under(pos, false)
     }
 
     /// WP-A1 multi-window round: raises `window` (if given) to the top of
@@ -489,6 +544,15 @@ impl DuduclawComp {
         self.queue_redraw();
         if let Some(w) = window {
             self.space.raise_element(w, true);
+            // WM-3: every focus path funnels through here, so this one line is
+            // what keeps the Alt-Tab order honest for click-to-focus, agent
+            // activation, dock activation, close-time handoff and the switcher
+            // itself. Deliberately NOT updated on `window == None` (a click on
+            // empty space): "the last window you used" is still the last window
+            // you used after you click the desktop.
+            if let Some(toplevel) = w.toplevel() {
+                crate::alt_tab::mru_promote(&mut self.focus_mru, toplevel.wl_surface().id());
+            }
         }
         let mut activated_count = 0u32;
         for element in self.space.elements() {
@@ -551,42 +615,13 @@ impl DuduclawComp {
         }
     }
 
-    /// WP-A1 multi-window round (task brief req 3, "Super+Tab 視窗循環切
-    /// 換"): called from `input.rs`'s human keyboard filter closure,
-    /// alongside the existing Super+Esc/Super+Enter global bindings. No
-    /// MRU list is tracked — instead every press promotes the CURRENT
-    /// BOTTOM of the z-order stack to the top via `focus_window` (which
-    /// raises it, per `Space::raise_element`'s remove-then-push-to-end
-    /// behavior). That is a genuine full rotation through every mapped
-    /// window, not a two-window oscillation: with a 3-window stack
-    /// (bottom→top) `[A, B, C]`, press 1 raises the bottom (`A`) to
-    /// `[B, C, A]`; press 2 raises the new bottom (`B`) to `[C, A, B]`;
-    /// press 3 raises `C` to `[A, B, C]` — back to the start, having
-    /// visited A, B, and C exactly once each. (An earlier, rejected design
-    /// — "raise whichever window is one position below the current top" —
-    /// only ever swaps the top two elements and can never reach a window
-    /// three or more presses down; verified wrong by hand before writing
-    /// this version, not assumed.) No new persistent state is needed
-    /// beyond the space's own z-order, which every click-to-focus call
-    /// already maintains. No-op with zero or one mapped windows (nothing
-    /// meaningful to cycle to).
-    pub fn cycle_focus(&mut self) {
-        if self.space.elements().len() < 2 {
-            // Nothing to rotate with 0 or 1 mapped windows.
-            return;
-        }
-        let Some(next) = self.space.elements().next().cloned() else {
-            return;
-        };
-        tracing::info!(
-            surface_id = ?next.toplevel().unwrap().wl_surface().id(),
-            window_count = self.space.elements().len(),
-            "focus: Super+Tab cycling"
-        );
-        let seat = self.seat.clone();
-        let serial = SERIAL_COUNTER.next_serial();
-        self.focus_window(&seat, Some(&next), serial);
-    }
+    // NOTE (WM-3): the WP-A1 round's `cycle_focus` used to live here. It
+    // promoted the bottom of the z-order to the top on every Super+Tab press —
+    // a genuine full rotation, but with the one property a task switcher must
+    // not have: pressing it twice does not return you to where you started,
+    // because each press permanently reorders the stack. WM-3 replaced it with
+    // a real MRU switcher (`crate::switcher`, pure logic in `crate::alt_tab`),
+    // bound to both Alt+Tab and Super+Tab.
 }
 
 #[derive(Default)]

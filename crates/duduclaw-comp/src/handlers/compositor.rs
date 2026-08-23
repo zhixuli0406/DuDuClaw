@@ -50,11 +50,28 @@ impl CompositorHandler for DuduclawComp {
             }
         };
 
+        // WM-3: a layer surface is never also a toplevel, so this short-circuits
+        // rather than running both paths. It owns its own arrangement +
+        // initial-configure sequence (`LayerMap::arrange` deliberately refuses
+        // to send the initial configure itself — see that function).
+        if crate::layer_shell::handle_commit(self, surface) {
+            return;
+        }
+
         // WM-1: takes the whole state now (was `&mut popups, &space`) — the
         // initial-configure branch applies the window layout policy, which
         // moves the element and reads the session-shell identity.
         xdg_shell::handle_commit(self, surface);
-        resize_grab::handle_commit(&mut self.space, surface);
+        if resize_grab::handle_commit(&mut self.space, surface) {
+            // WM-3: a TOP/LEFT resize moved the element's origin, and it did so
+            // AFTER `xdg_shell::handle_commit` already ran its own
+            // `decor_sync_frame`. Without this second sync the remembered
+            // floating frame keeps the pre-resize rectangle, so an output-mode
+            // change would snap the window back to where it was before the drag.
+            if let Some(window) = self.toplevel_window_for(surface) {
+                self.decor_sync_frame(&window);
+            }
+        }
     }
 }
 

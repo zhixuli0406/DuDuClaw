@@ -4853,3 +4853,329 @@ knowing on the shell side, though, and neither is a bug today:
   constants must move with it — floating placement is computed against the work
   area those bands define, so a stale value now misplaces every window rather
   than just clipping the dock.
+
+## WM-3 (2026-08-23): layer-shell, Alt-Tab, edge resize, minimize, double-click maximize
+
+D1 in `commercial/docs/ROADMAP-agent-first-os-2026-08.md`. Five items, in the
+order the task brief listed them, all compositor-side — **`duduclaw-shell` is
+not touched and does not have to change for any of it to work.**
+
+### 1. `zwlr_layer_shell_v1` (the A1 prerequisite)
+
+New module `src/layer_shell/` (`mod.rs` protocol + runtime, `geometry.rs`
+pure). Comp now advertises the global, maps layer surfaces into smithay's
+per-`Output` `LayerMap`, and honours the four layers as a real z-order:
+
+```
+[ human cursor, agent cursor, codrive highlight, shadow PiP ]   ← unchanged
+[ Alt-Tab switcher panel ]                                      ← WM-3
+[ overlay layer ][ top layer ]                                  ← WM-3
+  per window, top of the z-order first:
+      [ popups ][ decoration ][ the window's surfaces ][ shadow ]
+[ bottom layer ][ background layer ]                            ← WM-3
+```
+
+Two deliberate departures from smithay's own `space_render_elements`, both
+recorded because they are the kind of thing that silently regresses:
+
+* upstream splits layers **two** ways (`Background|Bottom` under, `Top|Overlay`
+  over) and does not order `Overlay` above `Top` — it emits them in reverse
+  map-insertion order. This crate ranks all four explicitly
+  (`layer_shell::geometry::layer_rank`), because a lock screen or a global
+  palette on `overlay` must cover a panel on `top` regardless of which mapped
+  first — and A1's ⌘K palette is exactly that case.
+* **pointer routing follows the same ranking.** `DuduclawComp::surface_under`
+  asks overlay/top first, then windows, then bottom/background; the
+  pointer-button arm gives an above-windows layer surface first refusal ahead
+  of the decoration hit test, so a panel over a title bar takes the click
+  instead of starting a window drag. Coordinate chain copied from
+  `anvil/src/input_handler.rs::surface_under` (v0.7.0, MIT, same repo as the
+  `smallvil` this crate is adapted from): layer geometry is **output-local**,
+  window geometry is global, so every crossing adds or subtracts
+  `output_geometry().loc` explicitly.
+
+Also wired: layer-surface frame callbacks + `LayerMap::cleanup` in both
+backends (a layer surface is not in `Space`, so without this a double-buffering
+panel stalls after one commit); `LayerMap::arrange` on output resize, **before**
+the window policy re-runs, since the policy reads the zone that pass computes;
+xdg-popups whose root is a layer surface (a panel's own menu) are tracked,
+unconstrained and grabbable.
+
+### Exclusive zone → work area: **intersection**, and the live run that decided it
+
+`layer_shell::geometry::effective_work_area` combines WM-1's hard-coded
+`ReservedBands` (30 top / 90 bottom, the unmigrated shell's own chrome) with the
+layer map's `non_exclusive_zone()`. The first draft made the zone **replace** the
+bands, which reads naturally from the brief's "exclusive zone 取代 hardcode
+reserved band". The very first live run showed why that is wrong:
+
+```
+# zone-replaces-bands (rejected):
+waybar maps a 30px top panel
+  -> work area (0, 30, 1280, 680)  becomes  (0, 30, 1280, 770)
+  -> foot placed at frame (128, 107, 1024, 616)
+```
+
+The panel's own 30 px claim was honoured and **the shell's 90 px dock
+reservation silently vanished** — any third-party layer client would have put
+windows straight over the dock. Intersection cannot do that: a layer surface may
+only ever shrink the work area further. Re-run with the same waybar:
+
+```
+# intersection (shipped):
+foot placed at frame (128, 98, 1024, 544) -> content (129, 131, 1022, 510)
+```
+
+which is **byte-identical to the WM-2 numbers recorded in the section above** —
+"殼還沒遷移前行為逐位不變" holds literally, not approximately.
+
+Double-counting is the theoretical cost and it does not bite: when the shell
+migrates, its layer surfaces claim *the same* 30/90 the constants describe, and
+`A ∩ A = A`. Proven live by running comp with
+`DUDUCLAW_COMP_RESERVED_TOP=0 DUDUCLAW_COMP_RESERVED_BOTTOM=0` so the zone is the
+only constraint:
+
+```
+window_policy: applied … rect=(128, 107, 1024, 616) reserved=(0, 0)
+```
+
+i.e. 80 % of the zone's 770 px height, centred inside it — the exclusive zone
+genuinely drives the layout, it is not being ignored.
+
+### Bug found live: layer surfaces were landing on the CD-2 shadow workspace
+
+`codrive::create_shadow_output` advertises the shadow output as a real
+`wl_output` global, so an output-aware layer client treats it as a second
+monitor. The first live run had **both** `swaybg` and `waybar` creating a second
+surface on `duduclaw-shadow-0`:
+
+```
+layer_shell: new layer surface namespace=wallpaper layer=Background output=duduclaw-shadow-0
+layer_shell: new layer surface namespace=waybar    layer=Top        output=duduclaw-shadow-0
+```
+
+Those surfaces can never be composited (the shadow output is only ever rendered
+offscreen for the PiP preview) and would therefore never receive a frame
+callback — that half of the client stalls forever. `new_layer_surface` now
+refuses them with the protocol's own `closed` event, which is the standard
+output-hotplug path every layer client already handles (verified: both clients
+stayed alive and kept their real-output surface). Deliberately **not** fixed by
+un-advertising the shadow output: clients rely on `wl_surface.enter` to learn
+their scale, so revoking that global would change CD-2's own verified behaviour
+— a separate decision with its own verification, not a side effect of this work
+package.
+
+### 2. Alt-Tab (and Super-Tab) — MRU switcher
+
+`src/alt_tab.rs` (pure: MRU list, selection wrap, panel geometry, scrolling) +
+`src/switcher.rs` (live: session, key handling, cached panel buffers).
+
+`state::cycle_focus` is **gone**. It promoted the bottom of the z-order on every
+press — a real rotation, but pressing it twice never returned you to where you
+started, because each press permanently reordered the stack. WM-3 keeps a
+most-recently-focused list (updated in the one place every focus path already
+funnels through, `focus_window`) so one tap flips between the two windows you
+are actually working in and holding walks further back.
+
+* `Alt+Tab` **and** `Super+Tab` open it; `Shift` reverses; `Escape` cancels;
+  releasing both modifiers commits. Tab is **intercepted**, not forwarded — a
+  stray Tab landing in the focused client mid-switch is the sort of "my form
+  jumped a field" bug nobody traces back to the compositor.
+* `Escape` is guarded on `!modifiers.logo` so it can never shadow the Super+Esc
+  emergency stop.
+* `is_switcher_keysym` accepts `ISO_Left_Tab` as well as `Tab` — xkb reports
+  Shift+Tab as the former, and matching only `Tab` would have left the backwards
+  direction silently dead.
+* The candidate list is snapshotted at open, so a window mapping or dying
+  mid-switch cannot renumber it under the user's fingers; `commit` re-checks
+  liveness and does nothing rather than focusing whatever slid into that index.
+* **Minimized windows are candidates**, and committing to one restores it.
+* The session shell is excluded (it is the desktop, not a window you switch to).
+* Panel buffers are cached on `(labels, selected, panel width)` for the same
+  reason the decoration's are — see the WM-2 section's "why every decoration
+  buffer is cached per window". Holding Alt without pressing Tab rebuilds
+  nothing.
+
+Thumbnails were considered and rejected for this round: they need a per-window
+offscreen render pass (the machinery `codrive/shadow.rs` has for the PiP) for a
+panel that is on screen for a fraction of a second. The brief allowed
+"視窗標題列縮圖可簡化為標題文字列表".
+
+### 3. Edge resize — the ring is the drop shadow
+
+`src/decor/edges.rs`. The obvious implementation ("the outer 8 px **inside** the
+frame") is wrong: on a server-decorated window those pixels are the client's own
+surface, so a scrollbar or a list item flush against the edge would stop
+receiving clicks. So the hot zone sits **outside** the frame instead, filling
+exactly the 8 px drop-shadow ring WM-2 already draws — the standard
+invisible/extended resize border, and `hit_frame_edge` returns `None` for any
+point inside the frame, so it steals nothing.
+
+Two consequences, both deliberate:
+
+* a window's ring overlaps whatever is beneath it (`frame_hit_at` walks
+  top-down, so the ring belongs to the window above — the same trade every
+  extended border makes);
+* the ring is **clipped to the work area**, or a window near the top of it would
+  put a resize strip over the shell's menu bar. That also means a **maximized**
+  window — whose frame *is* the work area, so whose ring lies entirely outside
+  it — cannot be edge-resized, which is correct and costs no extra code.
+
+Corners get a 24 px zone along each axis. The A5 debt the brief named is paid by
+`grabs::resize_grab::clamp_resize_size` (pure, 13 tests): the client's own
+`min_size`/`max_size`, then a 320×240 floor **layered on top of** (never
+replacing) the client's minimum, then a cap so the resulting **frame** cannot
+leave the work area on the edge being dragged — the `TOP` arm is the one that
+keeps the title bar on screen. With `clamp = None` the function is byte-identical
+to the pre-WM-3 expression, which is what keeps client-initiated
+`xdg_toplevel.resize` (a client asking to be resized, e.g. its own toolkit resize
+edges) behaving exactly as it did.
+
+`resize_grab::handle_commit` now returns "did this commit move the window" (it
+used to return `Some(())` for any commit of a mapped window, i.e. told the caller
+nothing) so `decor_sync_frame` can run again *after* a TOP/LEFT drag moves the
+origin.
+
+### 4. Minimize
+
+`src/minimize.rs`. A `－` button left of the ✕ (same 46 px box, neutral hover
+fill — minimizing destroys nothing, so it must not borrow the "this is
+dangerous" red). Minimized means **unmapped from `Space`, still alive**: the
+`Window` handle moves into `DuduclawComp::minimized`. The client is told
+nothing, because xdg-shell has no minimized state to tell it; what it observes
+is that its frame callbacks stop, which is right for an off-screen window.
+
+The invariant that makes this safe is **a minimized window is always
+recoverable**, and it is enforced by there being exactly two ways out of the
+list (restore, destruction) and three ways back in:
+
+* Alt-Tab;
+* `shell_control`'s `focus_window` op — `list_windows` now includes minimized
+  windows and carries an additive `"minimized": bool` field. The op's semantics
+  are unchanged ("bring this window to the front"); what grew is the set of
+  windows that can honestly answer it. Safe without touching `duduclaw-shell`:
+  its `comp_client::CompWindow` derives a plain `Deserialize`, which ignores
+  unknown fields, so the shipped shell simply shows a minimized window in its
+  dock as it shows any other. Rendering it *differently* is a shell-side change
+  for a later round.
+* codrive's `activate_window` — same widening, for the same reason. There is no
+  case for the human being able to recover a window and the agent not.
+
+The session shell and shadow-workspace windows are refused outright (a
+minimized desktop is a black screen; a shadow window's geometry is owned by
+`codrive/shadow.rs`). Focus handoff reuses the close-time path, so minimizing a
+background window never steals focus from what you were using.
+
+`codrive::window_target::find_target_window(&Space, …)` became
+`find_target_in(&[Window], …)` — resolving against the space alone would answer
+"no toplevel matched" for exactly the windows a dock exists to bring back. The
+matching *policy* is unchanged and still lives in one place.
+
+### 5. Double-click the title bar = maximize / restore
+
+`decor::is_double_click` (400 ms, 8 px slop, both pure and tested). The
+remembered press is consumed either way, so a third rapid click starts a fresh
+pair rather than flapping the window.
+
+`maximize_request` / `unmaximize_request` were refactored into one
+`DuduclawComp::set_maximized`, which the double-click path drives too. That is
+not tidiness: a second copy would be a second place for the "the FRAME fills the
+work area, the client gets that minus its decoration" rule and the
+restore-geometry snapshot ordering to drift, and both are subtle enough that the
+drift would be silent.
+
+### Other fixes carried in this round
+
+* `unconstrain_popup` used `space.outputs().next()`, which since CD-2 returns the
+  **headless shadow output** at `(0, 100_000)` — every popup was being
+  unconstrained against a rectangle 100 000 px below the screen. Now
+  `layout_output()`, and its `unwrap()`s are gone with it.
+* `xdg_decoration: overriding the negotiated mode` fired on every layout
+  re-apply. The policy re-runs far more often now (every layer surface
+  map/unmap), so it is gated on the announced value actually changing.
+* A layer surface this compositor refused no longer triggers a pointless
+  `reapply_window_policy_all` when its client destroys it.
+
+### Verification (2026-08-23, container `rust:bookworm` aarch64)
+
+Standard volumes (`duduclaw-comp-cargo`, `-cargo-git`, `-target`).
+
+```
+cargo build                               -> Finished dev profile, 0 warnings
+cargo clippy --all-targets -- -D warnings -> Finished, no warnings
+cargo test                                -> ok. 398 passed; 0 failed
+```
+
+**398 = 320 pre-existing (all still green) + 78 new**: 22 in `alt_tab` (MRU
+promote/forget, candidate order incl. never-focused windows and stale entries,
+one-tap-goes-to-the-previous-window, wrap in both directions, "holding walks
+every candidate exactly once", panel centring/shrinking/tiny-output, row
+stacking, scrolling keeps the selection visible for every index), 15 in
+`layer_shell::geometry` (the four-band ranking, overlay-above-top, the
+intersection rule incl. the third-party-panel regression above, output-local
+translation, degenerate zones), 13 in `grabs::resize_grab` (`FrameEdge` →
+`ResizeEdge` incl. "corners set two bits", the unclamped path being byte-identical,
+the 320×240 floor, client min/max, each edge's work-area cap replayed against
+`handle_commit`'s own move formula), 12 in `decor::edges` (ring == shadow width,
+"a point inside the frame is never a resize target", four sides, four corners,
+the work-area clip, "a maximized window cannot be edge-resized"), 6 in
+`decor::minus`, 7 more in `decor` (minimize button placement, the narrow-bar
+fallback, title text stopping before the left-most button, double-click timing
+and slop), 2 in `input` (`ISO_Left_Tab`), 1 in `shell_control::protocol` (the
+`minimized` flag on the wire).
+
+Live rounds, four-layer stack (`weston --backend=headless-backend.so` →
+`duduclaw-comp` → `foot` + `swaybg` + `waybar`), two scenarios (bands at 30/90,
+and bands forced to 0/0). Both: **all six processes alive at the end, 0 panics,
+0 renderer refusals.** Evidence quoted in the sections above —
+`swaybg` (background layer) and `waybar` (top layer + exclusive zone) both bind
+the global, get an initial configure, survive the shadow-workspace refusal, and
+`waybar`'s zone reaches the window layout policy.
+
+### Not verified in the container (needs the VM / real hardware)
+
+The headless weston backend has **no keyboard and no pointer device** (the same
+limitation every earlier round of this crate records), and this work package is
+mostly input:
+
+* **Alt-Tab end to end.** The pure selection logic and the panel geometry are
+  unit-tested; the key handling, the intercept, the hold-to-preview overlay and
+  the release-commit have never run against a real seat.
+* **Edge resize, the minimize button, the close/minimize hover, and
+  double-click-to-maximize.** Geometry unit-tested, wiring not exercised.
+* **Anything visual**: the switcher panel's colours and layout, the `－` glyph
+  next to the ✕, layer surfaces actually appearing above/below windows. There is
+  no screenshot in a headless container; the z-order is verified as an element
+  *ordering*, not as pixels.
+* **A layer surface receiving a click.** Routing is implemented and ordered;
+  with no pointer device nothing has clicked one.
+* **The udev backend's idle behaviour with a layer surface mapped.** Reasoning
+  (cached ids, "no damage ⇒ no page flip") is unchanged from WM-2, not measured.
+
+### Known limitations (deliberate, this round)
+
+* **The shell still does not use layer-shell.** Its dock and menu bar remain
+  inside its own full-output toplevel and the reserved bands remain the
+  contract. What the shell has to do later: create one `zwlr_layer_surface_v1`
+  per chrome element on the `top` layer, anchor it, `set_exclusive_zone(30)` /
+  `(90)`, and — in the same change — zero `window_policy`'s
+  `DEFAULT_RESERVED_TOP`/`_BOTTOM` so the two descriptions of the same chrome
+  cannot drift apart.
+* **No cursor shape change over the resize ring.** Comp has the cursor plumbing
+  (`crate::cursor`) but nothing drives a per-region shape; the ring is
+  discoverable only by the shadow it coincides with.
+* **No minimize animation, and no dock "minimized" affordance** — the shell
+  renders a minimized window like any other until it consumes the new flag.
+* **No keyboard-interactivity `exclusive` handling.** A layer surface that asks
+  for exclusive keyboard focus is treated as `on_demand`: it gets focus when
+  clicked, and does not lock the keyboard away from windows. A lock screen would
+  need the exclusive semantics; nothing needs them yet.
+* **Dragging a maximized window's title bar moves it** rather than restoring and
+  dragging. Edge-resizing it is impossible (above), so it cannot be left in a
+  broken geometry, but the interaction is unfinished.
+* **The switcher is title-text only** (no thumbnails), and it does not respond to
+  the pointer.
+* **On a multi-monitor udev setup the switcher panel is drawn on every output**
+  (it is centred per output, and `build_output_elements` runs per output). One
+  panel on the focused monitor would be the refined behaviour; nothing on the
+  appliance has two monitors yet.

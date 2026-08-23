@@ -189,6 +189,19 @@ pub struct ShellWindowInfo {
     /// human-facing surface, so "which window is focused" must answer the
     /// human's own question, not report the agent's).
     pub focused: bool,
+    /// WM-3: true iff this window is minimized (`crate::minimize`) — alive and
+    /// switchable, but not on screen.
+    ///
+    /// **Additive, and deliberately so.** Minimized windows are now *in* the
+    /// `list_windows` answer, because a dock that cannot see them cannot bring
+    /// them back and this compositor has no other task bar. The op's semantics
+    /// are otherwise unchanged, and the field is safe to add without touching
+    /// `duduclaw-shell`: its `comp_client::CompWindow` derives a plain
+    /// `Deserialize`, which ignores unknown fields — so the shipped shell
+    /// simply does not see this yet, and shows a minimized window in its dock
+    /// exactly as it shows a mapped one. Rendering it *differently* is a
+    /// shell-side change for a later round.
+    pub minimized: bool,
 }
 
 /// Response envelope — one flat struct with `Option` fields
@@ -295,6 +308,7 @@ mod tests {
             app_id: Some("foot-A".into()),
             title: Some("foot".into()),
             focused: true,
+            minimized: false,
         }]);
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains(r#""ok":true"#));
@@ -302,6 +316,30 @@ mod tests {
         assert!(!s.contains("matched_app_id"));
         assert!(!s.contains("matched_title_prefix"));
         assert!(!s.contains("\"error\""));
+    }
+
+    #[test]
+    fn a_window_row_carries_the_wm3_minimized_flag_on_the_wire() {
+        // The dock resolves `focus_window` against this list, so a minimized
+        // window has to be IN it — and has to be distinguishable, or a dock can
+        // never render the two states differently.
+        let resp = ShellControlResponse::windows(vec![
+            ShellWindowInfo {
+                app_id: Some("foot-A".into()),
+                title: Some("visible".into()),
+                focused: true,
+                minimized: false,
+            },
+            ShellWindowInfo {
+                app_id: Some("foot-B".into()),
+                title: Some("parked".into()),
+                focused: false,
+                minimized: true,
+            },
+        ]);
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains(r#""minimized":false"#));
+        assert!(s.contains(r#""minimized":true"#));
     }
 
     #[test]

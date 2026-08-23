@@ -54,6 +54,7 @@
 
 use smithay::{
     desktop::Window,
+    output::Output,
     reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
     utils::{Logical, Point, Rectangle, Size},
 };
@@ -213,6 +214,19 @@ impl DuduclawComp {
         self.space.output_geometry(output)
     }
 
+    /// The first **real** output itself, cloned.
+    ///
+    /// WM-3 needs the `Output` and not just its geometry: a layer map is
+    /// keyed by output (`layer_map_for_output`), so every layer-shell path has
+    /// to name the output rather than describe it. Same shadow-workspace guard
+    /// as [`Self::layout_output_geometry`], for the same reason.
+    pub fn layout_output(&self) -> Option<Output> {
+        self.space
+            .outputs()
+            .find(|o| *o != &self.shadow_output)
+            .cloned()
+    }
+
     /// Is `surface` the toplevel comp currently treats as the session shell?
     ///
     /// Read-only — never promotes. Used by the Super+Q close path, which must
@@ -340,12 +354,21 @@ impl DuduclawComp {
         // output; everything else is floated inside the work area instead of
         // filling it. `floating_content_rect` is `&mut self` because a
         // first-time placement consumes a cascade slot.
+        // WM-3: the work area may now come from a layer surface's exclusive
+        // zone instead of the hard-coded bands. Computed here, once, and passed
+        // down — `floating_content_rect` used to derive it itself from
+        // `output_geo`, which would have silently kept using the bands.
+        let work = self
+            .layout_work_area()
+            .unwrap_or_else(|| work_area(output_geo, self.reserved_bands));
         let rect = if in_shadow {
             Rectangle::new(output_geo.loc, output_geo.size)
         } else if is_shell {
+            // The shell still gets the whole output: it paints the chrome that
+            // defines the work area, whichever mechanism defines it.
             window_rect(output_geo, self.reserved_bands, true)
         } else {
-            self.floating_content_rect(window, output_geo)
+            self.floating_content_rect(window, work)
         };
 
         toplevel.with_pending_state(|state| {
@@ -401,8 +424,21 @@ impl DuduclawComp {
     ///
     /// `None` when no real output is mapped yet, exactly like
     /// [`Self::layout_output_geometry`].
+    ///
+    /// **WM-3** routed it through
+    /// [`layer_shell::geometry::effective_work_area`](crate::layer_shell::geometry::effective_work_area):
+    /// a layer surface that claims an exclusive zone now decides the work area,
+    /// and the hard-coded [`ReservedBands`] are the fallback for as long as
+    /// nothing claims one — which is the live case until `duduclaw-shell`
+    /// migrates its dock and menu bar. See that function for why the two are
+    /// alternatives rather than cumulative.
     pub fn layout_work_area(&self) -> Option<Rectangle<i32, Logical>> {
-        Some(work_area(self.layout_output_geometry()?, self.reserved_bands))
+        let output_geo = self.layout_output_geometry()?;
+        Some(crate::layer_shell::geometry::effective_work_area(
+            output_geo,
+            self.layer_non_exclusive_zone(),
+            self.reserved_bands,
+        ))
     }
 
     /// WM-2: where a **floating** (non-shell, non-shadow) toplevel's CONTENT
@@ -421,9 +457,8 @@ impl DuduclawComp {
     fn floating_content_rect(
         &mut self,
         window: &Window,
-        output_geo: Rectangle<i32, Logical>,
+        work: Rectangle<i32, Logical>,
     ) -> Rectangle<i32, Logical> {
-        let work = work_area(output_geo, self.reserved_bands);
         let insets = self.window_insets(window);
         let id = window.toplevel().unwrap().wl_surface().id();
 
@@ -516,10 +551,17 @@ impl DuduclawComp {
         } else {
             crate::decor::DecorMode::ClientSide
         };
+        // WM-3: capture what was already pending so the log below can fire on a
+        // real CHANGE rather than on every re-apply. The policy re-runs far more
+        // often now (every layer surface map/unmap moves the work area), and an
+        // unconditional info! line turned "comp overrode the shell's decoration
+        // mode" — a genuinely notable event — into background noise.
+        let previously_announced =
+            toplevel.with_pending_state(|state| state.decoration_mode);
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(effective.wire());
         });
-        if effective != negotiated {
+        if effective != negotiated && previously_announced != Some(effective.wire()) {
             tracing::info!(
                 surface_id = ?toplevel.wl_surface().id(),
                 is_shell,

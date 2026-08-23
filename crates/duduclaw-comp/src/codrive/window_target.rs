@@ -63,7 +63,7 @@
 //! half of this same widening.
 
 use smithay::{
-    desktop::{Space, Window},
+    desktop::Window,
     utils::SERIAL_COUNTER,
     wayland::{compositor::with_states, shell::xdg::XdgToplevelSurfaceData},
 };
@@ -137,8 +137,16 @@ pub(crate) fn window_identity(window: &Window) -> (Option<String>, Option<String
 /// file's own `codrive_activate_window` is still one caller;
 /// `crate::shell_control`'s `focus_window` op is the other (WP-comp-
 /// shell-ipc, see this file's module doc).
-pub(crate) fn find_target_window(space: &Space<Window>, query: &str) -> Option<(Window, WindowMatch)> {
-    let windows: Vec<Window> = space.elements().cloned().collect();
+/// **WM-3** replaced the previous `find_target_window(&Space, query)` with this
+/// explicit-candidate-list form.
+///
+/// A **minimized** window is not in `Space` at all (`crate::minimize`), so
+/// resolving against the space alone would answer "no toplevel matched" for
+/// exactly the windows a dock (or an agent) most needs to bring back — the
+/// failure `crate::minimize`'s recoverability invariant exists to prevent. Both
+/// callers now pass `DuduclawComp::all_windows()`, and the matching POLICY
+/// below is unchanged and still lives in one place.
+pub(crate) fn find_target_in(windows: &[Window], query: &str) -> Option<(Window, WindowMatch)> {
     let identities: Vec<(Option<String>, Option<String>)> = windows.iter().map(window_identity).collect();
     let candidates = identities
         .iter()
@@ -165,19 +173,34 @@ impl DuduclawComp {
         // anywhere else in this crate.
         tracing::debug!(
             query = %query,
-            known = ?self.space.elements().map(window_identity).collect::<Vec<_>>(),
-            "codrive: activate_window — resolving against currently mapped windows"
+            known = ?self.all_windows().iter().map(window_identity).collect::<Vec<_>>(),
+            "codrive: activate_window — resolving against every known window (mapped + minimized)"
         );
-        match find_target_window(&self.space, &query) {
+        // WM-3: resolved against mapped AND minimized windows, the same set
+        // `shell_control`'s own `focus_window` op uses. Without this the agent
+        // would get an honest-but-useless "no toplevel matched" for a window
+        // that exists and is one restore away — the exact failure
+        // `crate::minimize`'s recoverability invariant exists to prevent, and
+        // there is no reason it should hold for the human but not the agent.
+        let candidates = self.all_windows();
+        match find_target_in(&candidates, &query) {
             Some((window, matched)) => {
+                let restored = self.is_minimized(&window);
+                if restored {
+                    self.unminimize_window(&window);
+                }
                 let seat = self.agent_seat.clone();
                 let serial = SERIAL_COUNTER.next_serial();
                 self.focus_window(&seat, Some(&window), serial);
 
                 let detail = match &matched {
-                    WindowMatch::AppId(id) => format!("query={query:?} matched_app_id={id:?}"),
+                    WindowMatch::AppId(id) => {
+                        format!("query={query:?} matched_app_id={id:?} restored={restored}")
+                    }
                     WindowMatch::TitlePrefix(title) => {
-                        format!("query={query:?} matched_via=title_prefix matched_title={title:?}")
+                        format!(
+                            "query={query:?} matched_via=title_prefix matched_title={title:?} restored={restored}"
+                        )
                     }
                 };
                 tracing::info!(query = %query, detail = %detail, "codrive: activate_window — window focused");
