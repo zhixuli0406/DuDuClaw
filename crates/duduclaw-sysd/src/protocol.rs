@@ -10,18 +10,44 @@
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
 //! the same adjacently-tagged shape `duduclaw-cli-worker`'s protocol uses)
-//! — the entire caller-reachable surface is six fixed verbs, wire-encoded
+//! — the entire caller-reachable surface is nine fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
-//! `{"verb":"hostname","params":{"set":"..."}}` for the one verb that
-//! carries data. `deny_unknown_fields` means a stray extra top-level key
-//! fails to parse rather than being silently ignored. Every variant except
-//! [`SysdRequest::Hostname`] carries zero fields on purpose: the server
-//! never builds a command line by concatenating caller-supplied strings, it
-//! only ever runs a hardcoded argv literal per verb (see `dispatch.rs`).
-//! `Hostname { set }` is the one verb that carries caller data, and that
-//! data is passed to the target command via `Command::arg()` (never
-//! shell-interpreted), so its content cannot redirect *which* command runs
-//! — only what value that one fixed command is given.
+//! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
+//! data. `deny_unknown_fields` means a stray extra top-level key fails to
+//! parse rather than being silently ignored.
+//!
+//! Five variants ([`SysdRequest::Reboot`], [`SysdRequest::Poweroff`],
+//! [`SysdRequest::SysupdateStatus`], [`SysdRequest::SysupdateApply`],
+//! [`SysdRequest::FactoryReset`]) carry zero fields on purpose: for these
+//! the server never builds a command line by concatenating caller-supplied
+//! strings, it only ever runs a hardcoded argv literal per verb (see
+//! `dispatch.rs`). The remaining four carry caller data, and each keeps
+//! that data out of the argv-concatenation hazard via one of three
+//! disciplines, depending on shape:
+//! - [`SysdRequest::Hostname`] `{ set }` and [`SysdRequest::SetTimezone`]
+//!   `{ timezone }` pass their one string straight to `Command::arg()`
+//!   (never shell-interpreted, so the value can only ever be *the
+//!   argument*, never *which command runs*). `Hostname` is accepted after
+//!   only a length check; `SetTimezone` additionally passes a syntax check
+//!   AND a whitelist containment check against the real
+//!   `/usr/share/zoneinfo` database (`dispatch::validate_timezone_syntax` /
+//!   `dispatch::timezone_exists`) before ever reaching `timedatectl
+//!   set-timezone` — a directory-traversal payload there is a risk
+//!   `Command::arg()`'s injection-safety alone does not close (it stops
+//!   shell interpretation, not a value like `../../etc/passwd` reaching the
+//!   argument itself).
+//! - [`SysdRequest::SetNtp`] `{ enabled }` never lets caller text near argv
+//!   at all: the bool selects between two `&'static str` literals
+//!   (`"true"` / `"false"`).
+//! - [`SysdRequest::NetworkWiredConfig`] is the one verb with a real
+//!   multi-field payload, and it uses a third discipline: every field is
+//!   parsed into a typed Rust value first (`std::net::Ipv4Addr`, a prefix
+//!   `u8`, a closed `WiredMode` enum, …), and the `.network` file the
+//!   server writes is *regenerated* from those typed values
+//!   (`dispatch::render_wired_network`) rather than ever having a
+//!   caller-supplied string written to disk verbatim — so there is no
+//!   string to escape or sanitize in the first place, only typed values to
+//!   re-serialize.
 //!
 //! An unrecognized `verb` string, or any malformed JSON, fails
 //! `serde_json::from_str` and the server responds with a structured
@@ -71,6 +97,13 @@ pub const MAX_REQUEST_LINE_BYTES: usize = 4096;
 /// `Command::arg()`.
 pub const MAX_HOSTNAME_LEN: usize = 253;
 
+/// Maximum accepted length (bytes) of a `SetTimezone { timezone }` value.
+/// IANA tz database identifiers (e.g. `"America/Argentina/Buenos_Aires"`,
+/// 30 bytes) are comfortably under this; 64 leaves headroom without
+/// admitting an obviously-wrong multi-kilobyte payload before the
+/// zoneinfo whitelist check in `dispatch.rs` even runs.
+pub const MAX_TIMEZONE_LEN: usize = 64;
+
 /// The closed verb set. See module docs for the "why no free-form
 /// command" reasoning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +130,43 @@ pub enum SysdRequest {
     /// rejects empty values and values over [`MAX_HOSTNAME_LEN`] as a
     /// structured `bad_request` before spawning anything.
     Hostname { set: String },
+    /// `timedatectl set-timezone <timezone>`. `timezone` is passed to
+    /// `Command::arg()`, never shell-interpreted, but ALSO gated by a
+    /// syntax check plus a whitelist containment check against the real
+    /// `/usr/share/zoneinfo` database before ever reaching that argv slot
+    /// — see `dispatch::validate_timezone_syntax` and
+    /// `dispatch::timezone_exists`. Rejected as `bad_request` on any
+    /// syntax/whitelist failure; if the zoneinfo database itself is
+    /// missing on this host, rejected as `unsupported` rather than
+    /// silently skipping the whitelist.
+    SetTimezone { timezone: String },
+    /// `timedatectl set-ntp true` / `timedatectl set-ntp false`. `enabled`
+    /// only ever selects one of two `&'static str` literals — no
+    /// caller-supplied text reaches argv for this verb at all.
+    SetNtp { enabled: bool },
+    /// Write (or remove) the appliance's static wired-network override at
+    /// `/run/systemd/network/10-duduclaw-wired.network` and ask
+    /// `systemd-networkd` to pick it up. `mode == "dhcp"` removes any
+    /// existing override file (missing file ⇒ success, not an error);
+    /// `mode == "static"` requires `address` and validates every field
+    /// into a typed value (`std::net::Ipv4Addr` + prefix, `IpAddr` for
+    /// `dns`) before the `.network` file content is *regenerated* from
+    /// those typed values — no caller string is ever written to disk
+    /// verbatim. `address`/`gateway`/`dns` are meaningful only when
+    /// `mode == "static"`; IPv6 is not supported yet for `address` /
+    /// `gateway` (a distinct, honestly-labeled `bad_request`, not lumped
+    /// in with "not a valid address"). See `dispatch::render_wired_network`
+    /// for the exact file shape.
+    NetworkWiredConfig {
+        interface: String,
+        mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dns: Vec<String>,
+    },
 }
 
 impl SysdRequest {
@@ -111,6 +181,9 @@ impl SysdRequest {
             SysdRequest::SysupdateApply => "sysupdate_apply",
             SysdRequest::FactoryReset => "factory_reset",
             SysdRequest::Hostname { .. } => "hostname",
+            SysdRequest::SetTimezone { .. } => "set_timezone",
+            SysdRequest::SetNtp { .. } => "set_ntp",
+            SysdRequest::NetworkWiredConfig { .. } => "network_wired_config",
         }
     }
 }
@@ -274,5 +347,117 @@ mod tests {
             SysdRequest::Hostname { set: "secret-ish-name".into() }.verb_name(),
             "hostname"
         );
+    }
+
+    #[test]
+    fn set_timezone_round_trips_with_exact_wire_shape() {
+        let req = SysdRequest::SetTimezone { timezone: "Asia/Taipei".to_string() };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(s, r#"{"verb":"set_timezone","params":{"timezone":"Asia/Taipei"}}"#);
+        let back: SysdRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn set_ntp_round_trips_both_bool_values_with_exact_wire_shape() {
+        for enabled in [true, false] {
+            let req = SysdRequest::SetNtp { enabled };
+            let s = serde_json::to_string(&req).unwrap();
+            assert_eq!(s, format!(r#"{{"verb":"set_ntp","params":{{"enabled":{enabled}}}}}"#));
+            let back: SysdRequest = serde_json::from_str(&s).unwrap();
+            assert_eq!(req, back);
+        }
+    }
+
+    #[test]
+    fn network_wired_config_dhcp_omits_static_only_fields_on_the_wire() {
+        let req = SysdRequest::NetworkWiredConfig {
+            interface: "enp1s0".to_string(),
+            mode: "dhcp".to_string(),
+            address: None,
+            gateway: None,
+            dns: Vec::new(),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            s,
+            r#"{"verb":"network_wired_config","params":{"interface":"enp1s0","mode":"dhcp"}}"#
+        );
+        let back: SysdRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn network_wired_config_static_round_trips_with_exact_wire_shape() {
+        let req = SysdRequest::NetworkWiredConfig {
+            interface: "enp1s0".to_string(),
+            mode: "static".to_string(),
+            address: Some("192.168.1.50/24".to_string()),
+            gateway: Some("192.168.1.1".to_string()),
+            dns: vec!["192.168.1.1".to_string(), "1.1.1.1".to_string()],
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            s,
+            r#"{"verb":"network_wired_config","params":{"interface":"enp1s0","mode":"static","address":"192.168.1.50/24","gateway":"192.168.1.1","dns":["192.168.1.1","1.1.1.1"]}}"#
+        );
+        let back: SysdRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn network_wired_config_parses_without_optional_fields_present_on_the_wire() {
+        // A dhcp request need not send address/gateway/dns at all —
+        // `#[serde(default)]` makes them optional to RECEIVE, not just
+        // optional to emit.
+        let raw = r#"{"verb":"network_wired_config","params":{"interface":"enp1s0","mode":"dhcp"}}"#;
+        let req: SysdRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            req,
+            SysdRequest::NetworkWiredConfig {
+                interface: "enp1s0".to_string(),
+                mode: "dhcp".to_string(),
+                address: None,
+                gateway: None,
+                dns: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn new_verbs_have_the_documented_stable_names() {
+        assert_eq!(
+            SysdRequest::SetTimezone { timezone: "Asia/Taipei".into() }.verb_name(),
+            "set_timezone"
+        );
+        assert_eq!(SysdRequest::SetNtp { enabled: true }.verb_name(), "set_ntp");
+        assert_eq!(
+            SysdRequest::NetworkWiredConfig {
+                interface: "enp1s0".into(),
+                mode: "dhcp".into(),
+                address: None,
+                gateway: None,
+                dns: Vec::new(),
+            }
+            .verb_name(),
+            "network_wired_config"
+        );
+    }
+
+    #[test]
+    fn network_wired_config_rejects_unknown_param_field() {
+        // Mirrors `unknown_field_is_rejected` but for a struct-variant's
+        // OWN fields, not just the top-level {verb, params} envelope —
+        // confirms `deny_unknown_fields` reaches into a verb's params.
+        let raw = r#"{"verb":"network_wired_config","params":{"interface":"enp1s0","mode":"dhcp","extra":"x"}}"#;
+        let r: Result<SysdRequest, _> = serde_json::from_str(raw);
+        assert!(r.is_err(), "unexpected param field must be rejected");
+    }
+
+    #[test]
+    fn set_timezone_rejects_unknown_param_field() {
+        let raw = r#"{"verb":"set_timezone","params":{"timezone":"Asia/Taipei","extra":"x"}}"#;
+        let r: Result<SysdRequest, _> = serde_json::from_str(raw);
+        assert!(r.is_err(), "unexpected param field must be rejected");
     }
 }
