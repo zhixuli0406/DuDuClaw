@@ -188,6 +188,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // ── System-settings app: re-apply a persisted static wired-network
+    // config, if any (see `network::wired::reapply_wired_config_on_boot`'s
+    // own doc for WHY — the sysd verb's effect lives on tmpfs, so it does
+    // not survive a reboot on its own). Spawned rather than awaited so a
+    // slow/unresponsive `duduclaw-sysd` can never delay the rest of boot;
+    // the function itself no-ops instantly off-appliance or with nothing
+    // persisted, and every failure is logged, never propagated.
+    {
+        let home_dir = home_dir.clone();
+        tokio::spawn(async move {
+            crate::network::wired::reapply_wired_config_on_boot(&home_dir).await;
+        });
+    }
+
     // ── Memory-db split self-heal (2026-08-20 關鍵洞察 incident) ─────────
     // Merge any per-agent `agents/<id>/[state/]memory.db` back into the
     // shared `<home>/memory.db` and archive the source file, restoring the

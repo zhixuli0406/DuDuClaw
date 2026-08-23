@@ -1183,6 +1183,33 @@ fn network_error_frame(err: &crate::network::WifiError) -> WsFrame {
     }
 }
 
+/// System-settings app: `device.timedate_set`'s closed 3-code taxonomy
+/// (`invalid_timezone` / `backend_unavailable` / `apply_failed`) — kept as
+/// a simple code+message pair rather than a full enum type (unlike
+/// `WifiErrorCode`/`crate::network::wired::WiredConfigErrorCode`, nothing
+/// outside this one handler needs to match on it).
+fn timedate_set_error_frame(code: &str, message: &str) -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({ "code": code, "message": message })),
+    }
+}
+
+/// System-settings app: render a
+/// [`crate::network::wired::WiredConfigErrorCode`] as the standard
+/// error-frame envelope — `network.wired_config`'s twin of
+/// [`network_error_frame`].
+fn network_wired_config_error_frame(code: crate::network::wired::WiredConfigErrorCode) -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({ "code": code.code(), "message": code.message() })),
+    }
+}
+
 /// `device.power_local`'s own result-frame mapping. UNLIKE the generic
 /// [`device_op_result_frame`] (whose dashboard callers render the
 /// stdout/stderr payload, so `ok:true` + `success:false` is legible there),
@@ -7185,6 +7212,39 @@ impl MethodHandler {
                 self.handle_network_status().await
             }
 
+            // ── System-settings app: device.about / device.timedate* /
+            // network.wired_* — same admin + appliance gate as the rest of
+            // the `device.*`/`network.*` family above. See `device_about.rs`
+            // (device.about, device.timedate/timedate_set) and
+            // `network/wired.rs` (network.wired_status/wired_config) for the
+            // data/orchestration half; these five arms are dispatch glue
+            // only.
+            "device.about" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_about().await
+            }
+            "device.timedate" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_timedate().await
+            }
+            "device.timedate_set" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_timedate_set(params).await
+            }
+            "network.wired_status" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_network_wired_status().await
+            }
+            "network.wired_config" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_network_wired_config(params).await
+            }
+
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
     }
@@ -7458,6 +7518,11 @@ impl MethodHandler {
                     { "name": "network.wifi_connect", "description": "Connect to a Wi-Fi network by SSID, with an optional passphrase (admin, appliance-only, audited)" },
                     { "name": "network.wifi_forget", "description": "Delete a stored Wi-Fi credential by SSID (admin, appliance-only, audited)" },
                     { "name": "network.status", "description": "Wi-Fi link state, IP info, and internet/captive-portal connectivity (admin, appliance-only)" },
+                    { "name": "device.about", "description": "OS/kernel/hostname/gateway-version identity snapshot for the system-settings app (admin, appliance-only)" },
+                    { "name": "device.timedate", "description": "Timezone, local/UTC clock, and NTP sync status (admin, appliance-only)" },
+                    { "name": "device.timedate_set", "description": "Set timezone and/or enable/disable NTP (admin, appliance-only, audited)" },
+                    { "name": "network.wired_status", "description": "Wired (Ethernet) link state, IP info, and the persisted desired static config, if any (admin, appliance-only)" },
+                    { "name": "network.wired_config", "description": "Set the wired interface to DHCP or a static IPv4 config (admin, appliance-only, audited)" },
                 ]
             }),
         )
@@ -44585,6 +44650,278 @@ impl MethodHandler {
             }),
         )
     }
+
+    // ── System-settings app: device.about / device.timedate* /
+    // network.wired_* ────────────────────────────────────────────────
+    // Dispatch (admin + `require_appliance!()`) is in `dispatch()`'s method
+    // match above, alongside the rest of the `device.*`/`network.*` family.
+    // Data gathering + pure parsing/validation live in `device_about.rs`
+    // and `network/wired.rs`; these five handlers are thin glue, same
+    // discipline as the WP-B/D4a handlers above.
+
+    /// `device.about` — OS/kernel/hostname/gateway-version identity
+    /// snapshot. Always succeeds (every field individually degrades to
+    /// `null` off-Linux or when unreadable — see `device_about::
+    /// collect_device_about`'s own doc); the `Err` arm below only guards
+    /// JSON serialization, which cannot itself fail for this type.
+    async fn handle_device_about(&self) -> WsFrame {
+        let about = crate::device_about::collect_device_about(crate::updater::current_version());
+        match serde_json::to_value(&about) {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &format!("device about serialize failed: {e}")),
+        }
+    }
+
+    /// `device.timedate` — read-only timezone/clock/NTP snapshot. Always
+    /// succeeds (see `device_about::collect_timedate`'s own doc: an
+    /// unreachable `timedatectl` degrades to `available: false`, never a
+    /// failed RPC).
+    async fn handle_device_timedate(&self) -> WsFrame {
+        let status = crate::device_about::collect_timedate().await;
+        match serde_json::to_value(&status) {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &format!("timedate status serialize failed: {e}")),
+        }
+    }
+
+    /// `device.timedate_set` — `{timezone?, ntp?}`, at least one required.
+    /// Each provided field is applied (and audited) independently via
+    /// `duduclaw-sysd`'s `SetTimezone`/`SetNtp` verbs; a failure on either
+    /// stops before attempting the next one and reports `apply_failed`
+    /// (whatever already succeeded stays applied — and audited — even
+    /// though the overall RPC reports failure).
+    async fn handle_device_timedate_set(&self, params: Value) -> WsFrame {
+        let timezone = params.get("timezone").and_then(Value::as_str);
+        let ntp = params.get("ntp").and_then(Value::as_bool);
+        if timezone.is_none() && ntp.is_none() {
+            return timedate_set_error_frame(
+                "invalid_timezone",
+                "至少需要提供 timezone 或 ntp 其中一項。",
+            );
+        }
+        if let Some(tz) = timezone
+            && !crate::device_about::validate_timezone_shape(tz)
+        {
+            return timedate_set_error_frame("invalid_timezone", "timezone 格式不正確。");
+        }
+        let Some(ops) = crate::device_ops::select_sysd_ops() else {
+            return timedate_set_error_frame(
+                "backend_unavailable",
+                "網路設定服務未啟動，請重新開機或聯絡支援。",
+            );
+        };
+
+        let mut applied_timezone: Option<String> = None;
+        let mut applied_ntp: Option<bool> = None;
+
+        if let Some(tz) = timezone {
+            let result = ops.set_timezone(tz).await;
+            match result {
+                Ok(out) if out.success => {
+                    self.audit_timedate_event(Some(tz), None, true, None);
+                    applied_timezone = Some(tz.to_string());
+                }
+                Ok(out) => {
+                    self.audit_timedate_event(Some(tz), None, false, Some("apply_failed"));
+                    warn!(
+                        stderr = %duduclaw_core::truncate_chars(&out.stderr, 200),
+                        "device.timedate_set: set_timezone ran but reported failure"
+                    );
+                    return timedate_set_error_frame("apply_failed", "套用時區失敗，請稍後再試。");
+                }
+                Err(e) => {
+                    self.audit_timedate_event(Some(tz), None, false, Some("apply_failed"));
+                    warn!(error = %e, "device.timedate_set: set_timezone call failed");
+                    return timedate_set_error_frame("apply_failed", "套用時區失敗，請稍後再試。");
+                }
+            }
+        }
+
+        if let Some(enabled) = ntp {
+            let result = ops.set_ntp(enabled).await;
+            match result {
+                Ok(out) if out.success => {
+                    self.audit_timedate_event(None, Some(enabled), true, None);
+                    applied_ntp = Some(enabled);
+                }
+                Ok(out) => {
+                    self.audit_timedate_event(None, Some(enabled), false, Some("apply_failed"));
+                    warn!(
+                        stderr = %duduclaw_core::truncate_chars(&out.stderr, 200),
+                        "device.timedate_set: set_ntp ran but reported failure"
+                    );
+                    return timedate_set_error_frame("apply_failed", "套用 NTP 設定失敗，請稍後再試。");
+                }
+                Err(e) => {
+                    self.audit_timedate_event(None, Some(enabled), false, Some("apply_failed"));
+                    warn!(error = %e, "device.timedate_set: set_ntp call failed");
+                    return timedate_set_error_frame("apply_failed", "套用 NTP 設定失敗，請稍後再試。");
+                }
+            }
+        }
+
+        WsFrame::ok_response(
+            "",
+            json!({ "applied": true, "timezone": applied_timezone, "ntp": applied_ntp }),
+        )
+    }
+
+    /// Append one audit row per `device.timedate_set` sub-change
+    /// (timezone and/or ntp), success or failure — mirrors
+    /// `audit_wifi_event`'s one-row-per-attempt shape. No secrets involved
+    /// (timezone/ntp are not password-shaped), so unlike `audit_wifi_event`
+    /// the actual values ARE included in the audit payload.
+    fn audit_timedate_event(&self, timezone: Option<&str>, ntp: Option<bool>, ok: bool, code: Option<&str>) {
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "timedate_set",
+                "device",
+                duduclaw_security::audit::Severity::Info,
+                json!({ "timezone": timezone, "ntp": ntp, "ok": ok, "code": code }),
+            ),
+        );
+    }
+
+    /// `network.wired_status` — read-only. Always succeeds (every
+    /// sub-source degrades honestly — see `network::wired::
+    /// collect_wired_status`'s own doc); the `Err` arm below only guards
+    /// JSON serialization.
+    async fn handle_network_wired_status(&self) -> WsFrame {
+        let status = crate::network::wired::collect_wired_status(self.home_dir());
+        match serde_json::to_value(&status) {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &format!("wired status serialize failed: {e}")),
+        }
+    }
+
+    /// `network.wired_config` — `{interface?, mode, address?, gateway?,
+    /// dns?}`. Validates gateway-side first (`network::wired::
+    /// validate_wired_config_request` — defense in depth; `duduclaw-sysd`
+    /// validates again independently), resolves the interface when omitted,
+    /// calls the sysd verb, audits success AND failure, then — only on
+    /// success — persists (or clears, for `mode: "dhcp"`) the desired
+    /// config so [`crate::network::wired::reapply_wired_config_on_boot`]
+    /// can restore it across a reboot (the sysd verb's effect lives on
+    /// tmpfs, see that function's doc).
+    async fn handle_network_wired_config(&self, params: Value) -> WsFrame {
+        let mode = params.get("mode").and_then(Value::as_str).unwrap_or("");
+        let address = params.get("address").and_then(Value::as_str);
+        let gateway = params.get("gateway").and_then(Value::as_str);
+        let dns: Vec<String> = params
+            .get("dns")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+
+        if let Err(code) =
+            crate::network::wired::validate_wired_config_request(mode, address, gateway, &dns)
+        {
+            return network_wired_config_error_frame(code);
+        }
+
+        let interface = match params.get("interface").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => s.to_string(),
+            _ => match crate::network::wired::detect_wired_interface() {
+                Some(i) => i,
+                None => {
+                    return network_wired_config_error_frame(
+                        crate::network::wired::WiredConfigErrorCode::NoInterface,
+                    );
+                }
+            },
+        };
+
+        let Some(ops) = crate::device_ops::select_sysd_ops() else {
+            return network_wired_config_error_frame(
+                crate::network::wired::WiredConfigErrorCode::BackendUnavailable,
+            );
+        };
+
+        let result = ops
+            .network_wired_config(&interface, mode, address, gateway, &dns)
+            .await;
+        let ok = matches!(&result, Ok(out) if out.success);
+        self.audit_wired_config_event(
+            &interface,
+            mode,
+            address,
+            gateway,
+            &dns,
+            ok,
+            if ok { None } else { Some("apply_failed") },
+        );
+
+        match result {
+            Ok(out) if out.success => {
+                if mode == "dhcp" {
+                    if let Err(e) = crate::network::wired::delete_wired_config(self.home_dir()) {
+                        warn!(
+                            error = %e,
+                            "network.wired_config: failed to clear persisted desired config after switching to dhcp"
+                        );
+                    }
+                } else {
+                    let cfg = crate::network::wired::WiredConfig {
+                        interface: interface.clone(),
+                        mode: mode.to_string(),
+                        address: address.map(str::to_string),
+                        gateway: gateway.map(str::to_string),
+                        dns: dns.clone(),
+                        updated_at: Utc::now().to_rfc3339(),
+                    };
+                    if let Err(e) = crate::network::wired::save_wired_config(self.home_dir(), &cfg) {
+                        warn!(error = %e, "network.wired_config: failed to persist desired config");
+                    }
+                }
+                WsFrame::ok_response("", json!({ "applied": true, "interface": interface, "mode": mode }))
+            }
+            Ok(out) => {
+                warn!(
+                    stderr = %duduclaw_core::truncate_chars(&out.stderr, 200),
+                    "network.wired_config ran but reported failure"
+                );
+                network_wired_config_error_frame(crate::network::wired::WiredConfigErrorCode::ApplyFailed)
+            }
+            Err(e) => {
+                warn!(error = %e, "network.wired_config call failed");
+                network_wired_config_error_frame(crate::network::wired::WiredConfigErrorCode::ApplyFailed)
+            }
+        }
+    }
+
+    /// Append one audit row per `network.wired_config` attempt, success or
+    /// failure — mirrors `audit_wifi_event`'s shape. Address/gateway/DNS
+    /// are not secrets (unlike a Wi-Fi PSK), so they're included verbatim.
+    #[allow(clippy::too_many_arguments)]
+    fn audit_wired_config_event(
+        &self,
+        interface: &str,
+        mode: &str,
+        address: Option<&str>,
+        gateway: Option<&str>,
+        dns: &[String],
+        ok: bool,
+        code: Option<&str>,
+    ) {
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "network_wired_config",
+                interface,
+                duduclaw_security::audit::Severity::Info,
+                json!({
+                    "interface": interface,
+                    "mode": mode,
+                    "address": address,
+                    "gateway": gateway,
+                    "dns": dns,
+                    "ok": ok,
+                    "code": code,
+                }),
+            ),
+        );
+    }
 }
 
 /// Outcome of [`create_device_backup_archive`] — every branch the original
@@ -44897,6 +45234,88 @@ mod device_rpc_tests {
     fn network_write_detection_gates_static_ip_params() {
         assert!(crate::device::is_network_write_request(&json!({"static_ip": "10.0.0.5"})));
         assert!(!crate::device::is_network_write_request(&json!({})));
+    }
+}
+
+/// System-settings app — dispatch-level coverage for the five new
+/// `device.about` / `device.timedate` / `device.timedate_set` /
+/// `network.wired_status` / `network.wired_config` RPCs. A separate module
+/// (rather than extending `device_rpc_tests`'s own tables) so this
+/// system-settings work stays a pure ADDITION to `handlers.rs` — no
+/// existing test literal is edited, only new ones appended.
+#[cfg(test)]
+mod system_settings_rpc_tests {
+    use super::*;
+
+    fn admin_ctx() -> UserContext {
+        UserContext::admin_fallback()
+    }
+
+    fn frame_error_code(f: &WsFrame) -> Option<String> {
+        match f {
+            WsFrame::Response { error: Some(e), .. } => {
+                e.get("code").and_then(|c| c.as_str()).map(str::to_string)
+            }
+            _ => None,
+        }
+    }
+
+    /// Same fail-closed contract as `device_rpc_tests::
+    /// all_device_methods_fail_closed_off_appliance` — the five new methods
+    /// share the exact same `require_admin!() + require_appliance!()` gate,
+    /// so on this off-appliance test host every one of them must refuse
+    /// with `not_appliance`, admin or not.
+    #[tokio::test]
+    async fn all_system_settings_methods_fail_closed_off_appliance() {
+        assert!(
+            std::env::var(duduclaw_core::APPLIANCE_ENV).is_err(),
+            "precondition: DUDUCLAW_APPLIANCE must be unset in the test process"
+        );
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = admin_ctx();
+
+        for (method, params) in [
+            ("device.about", json!({})),
+            ("device.timedate", json!({})),
+            ("device.timedate_set", json!({"timezone": "Asia/Taipei"})),
+            ("network.wired_status", json!({})),
+            ("network.wired_config", json!({"mode": "dhcp"})),
+        ] {
+            let frame = handler.handle(method, params, &ctx).await;
+            assert_eq!(
+                frame_error_code(&frame).as_deref(),
+                Some(DEVICE_NOT_APPLIANCE_ERROR_CODE),
+                "{method} must refuse off-appliance: {frame:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn timedate_set_error_frame_carries_given_code_and_message() {
+        let frame = timedate_set_error_frame("invalid_timezone", "測試訊息");
+        assert_eq!(frame_error_code(&frame).as_deref(), Some("invalid_timezone"));
+        match &frame {
+            WsFrame::Response { error: Some(e), .. } => {
+                assert_eq!(e.get("message").and_then(|m| m.as_str()), Some("測試訊息"));
+            }
+            other => panic!("expected an error response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn network_wired_config_error_frame_carries_the_closed_taxonomy() {
+        for code in [
+            crate::network::wired::WiredConfigErrorCode::NoInterface,
+            crate::network::wired::WiredConfigErrorCode::InvalidMode,
+            crate::network::wired::WiredConfigErrorCode::InvalidAddress,
+            crate::network::wired::WiredConfigErrorCode::InvalidDns,
+            crate::network::wired::WiredConfigErrorCode::BackendUnavailable,
+            crate::network::wired::WiredConfigErrorCode::ApplyFailed,
+        ] {
+            let frame = network_wired_config_error_frame(code);
+            assert_eq!(frame_error_code(&frame).as_deref(), Some(code.code()));
+        }
     }
 }
 

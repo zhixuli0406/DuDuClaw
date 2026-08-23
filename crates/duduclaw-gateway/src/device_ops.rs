@@ -267,6 +267,47 @@ impl SysdDeviceOps {
     pub async fn set_hostname(&self, name: &str) -> OpResult {
         sysd_call(&self.client, duduclaw_sysd::SysdRequest::Hostname { set: name.to_string() }).await
     }
+
+    /// System-settings app: `device.timedate_set`'s `timezone` half. Not
+    /// part of the `DeviceOps` trait — same reasoning as `set_hostname`
+    /// above (a verb specific to one narrow RPC surface, not a shape every
+    /// `DeviceOps` implementor needs to answer for).
+    pub async fn set_timezone(&self, timezone: &str) -> OpResult {
+        sysd_call(
+            &self.client,
+            duduclaw_sysd::SysdRequest::SetTimezone { timezone: timezone.to_string() },
+        )
+        .await
+    }
+
+    /// System-settings app: `device.timedate_set`'s `ntp` half.
+    pub async fn set_ntp(&self, enabled: bool) -> OpResult {
+        sysd_call(&self.client, duduclaw_sysd::SysdRequest::SetNtp { enabled }).await
+    }
+
+    /// System-settings app: `network.wired_config`. `dns` is cloned into the
+    /// request as owned `String`s — the wire shape (`SysdRequest::
+    /// NetworkWiredConfig`) takes `Vec<String>`, not a borrowed slice.
+    pub async fn network_wired_config(
+        &self,
+        interface: &str,
+        mode: &str,
+        address: Option<&str>,
+        gateway: Option<&str>,
+        dns: &[String],
+    ) -> OpResult {
+        sysd_call(
+            &self.client,
+            duduclaw_sysd::SysdRequest::NetworkWiredConfig {
+                interface: interface.to_string(),
+                mode: mode.to_string(),
+                address: address.map(str::to_string),
+                gateway: gateway.map(str::to_string),
+                dns: dns.to_vec(),
+            },
+        )
+        .await
+    }
 }
 
 /// Translate a `duduclaw-sysd` call into the same [`OpResult`] shape every
@@ -343,6 +384,21 @@ pub fn select_device_ops() -> Box<dyn DeviceOps> {
         Box::new(SysdDeviceOps::default())
     } else {
         Box::new(SystemDeviceOps)
+    }
+}
+
+/// Same condition [`select_device_ops`] uses, but for the system-settings
+/// app's timedate/network-config verbs — those only exist as
+/// `SysdDeviceOps` inherent methods (see `set_hostname`'s doc comment for
+/// why they're not on the `DeviceOps` trait), so there is no `SystemDeviceOps`
+/// fallback to erase into a trait object: `None` means "no privileged
+/// backend reachable", which callers map to a `backend_unavailable` refusal
+/// rather than attempting a local shell-out that would need root anyway.
+pub fn select_sysd_ops() -> Option<SysdDeviceOps> {
+    if duduclaw_core::is_appliance() && duduclaw_sysd::resolve_socket_path().exists() {
+        Some(SysdDeviceOps::default())
+    } else {
+        None
     }
 }
 
@@ -637,6 +693,55 @@ mod tests {
             }
 
             server.stop().await;
+        }
+
+        /// System-settings app: `set_timezone`/`set_ntp`/`network_wired_config`
+        /// (the three new inherent `SysdDeviceOps` methods) all reach real
+        /// dispatch when authorized — same "authorization outcome, not
+        /// underlying-command success" assertion as
+        /// `authorized_calls_reach_real_dispatch_not_auth_rejection` above
+        /// (sysd itself may refuse a bogus timezone with `bad_request`, or
+        /// this host may not run `systemd-networkd` at all; what must never
+        /// happen for an authorized caller is an `unauthorized` rejection).
+        #[tokio::test]
+        async fn timedate_and_wired_config_verbs_reach_real_dispatch() {
+            let server = TestServer::spawn(Some(current_uid())).await;
+            let ops = server.device_ops();
+
+            for result in [
+                ops.set_timezone("Asia/Taipei").await,
+                ops.set_ntp(true).await,
+                ops.network_wired_config(
+                    "enp1s0",
+                    "static",
+                    Some("192.168.1.50/24"),
+                    Some("192.168.1.1"),
+                    &["1.1.1.1".to_string()],
+                )
+                .await,
+            ] {
+                match result {
+                    Ok(_) => {}
+                    Err(DeviceOpError::Unsupported(msg)) => {
+                        assert!(
+                            !msg.contains("unauthorized"),
+                            "authorized caller must not be rejected: {msg}"
+                        );
+                    }
+                    Err(e) => panic!("unexpected error variant: {e}"),
+                }
+            }
+
+            server.stop().await;
+        }
+
+        /// `select_sysd_ops()` mirrors `select_device_ops()`'s condition —
+        /// off-appliance (this test process's default state) it must be
+        /// `None` regardless of whether a real socket happens to exist.
+        #[test]
+        fn select_sysd_ops_is_none_off_appliance() {
+            assert!(!duduclaw_core::is_appliance());
+            assert!(select_sysd_ops().is_none());
         }
 
         /// The security property that matters most: a peer whose real uid

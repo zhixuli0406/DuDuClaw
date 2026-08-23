@@ -39,6 +39,9 @@
 pub mod ipinfo;
 pub mod portal;
 pub mod sysfs;
+// ── System-settings app: wired network (`network.wired_status` /
+// `network.wired_config`) — storage, boot re-apply, and pure validation. ──
+pub mod wired;
 
 #[cfg(target_os = "linux")]
 mod iwd;

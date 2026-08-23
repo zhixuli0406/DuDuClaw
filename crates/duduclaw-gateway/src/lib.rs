@@ -36,6 +36,8 @@ pub mod agent_hook_installer;
 pub mod auth;
 // ── WP-B: appliance-image device management (`device.*` dashboard RPCs) ──
 pub mod device;
+// ── System-settings app: `device.about` / `device.timedate*` data ─────────
+pub mod device_about;
 pub mod device_ops;
 // ── D4a: network settings (Wi-Fi over iwd D-Bus) — `network.*` RPCs +
 // `/api/first-run/network/*` OOBE pre-auth endpoints ─────────────────────
