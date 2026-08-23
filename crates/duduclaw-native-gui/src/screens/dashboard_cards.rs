@@ -89,7 +89,7 @@ pub(super) fn refresh_button(locale: Locale, cx: &mut Context<RootView>) -> Stat
 
 // ── Prompt bar + chips ────────────────────────────────────────────────
 
-/// Reuses `state.chat`'s own composer `Entity<ChatInputState>` — the SAME
+/// Reuses `state.chat`'s own composer `Entity<ImeTextInput>` — the SAME
 /// IME-capable entity `screens/chat.rs`'s composer renders, not a second
 /// input widget. Submitting from here calls the exact `ChatState::submit`
 /// the chat page's own send button calls, then navigates to `newChat` so
@@ -98,7 +98,7 @@ pub(super) fn refresh_button(locale: Locale, cx: &mut Context<RootView>) -> Stat
 /// 入文字" vs. wiring it for real): reusing the existing entity + existing
 /// `submit()` method made "for real" the cheaper option, not the harder
 /// one. Enter-to-submit gets the same navigation via a one-line addition to
-/// `main.rs`'s existing `ChatInputEvent::Submit` subscription (that
+/// `main.rs`'s existing `ImeTextInputEvent::Submit` subscription (that
 /// subscription is global — one listener on one entity — so extending it
 /// there covers both this page's Enter key and the chat page's own,
 /// without duplicating the emitter wiring).

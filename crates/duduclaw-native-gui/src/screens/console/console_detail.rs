@@ -248,7 +248,7 @@ fn approval_pane(
 /// The 附指示重試 inline note field — reuses `conversations.rs::search_box`'s
 /// exact manual key-capture pattern (a cached `FocusHandle` + `on_key_down`
 /// backspace/char handling), the crate's established substitute for real IME
-/// composition outside the dedicated `ChatInputState` entity (see that
+/// composition outside the dedicated `ImeTextInput` entity (see that
 /// file's own doc comment on the same documented CJK-composition gap).
 fn goal_note_field(task_id: String, note_value: String, busy: bool, locale: Locale, cx: &mut Context<RootView>) -> Div {
     let handle = super::ensure_focus_handle(cx);
@@ -449,7 +449,7 @@ fn detail_shell(
 }
 
 /// Bottom reply composer — reuses `state.chat`'s own composer `Entity<
-/// ChatInputState>` + `ChatState::submit`, the exact same "shared entity,
+/// ImeTextInput>` + `ChatState::submit`, the exact same "shared entity,
 /// navigate to `newChat` on send" pattern `dashboard_cards.rs::prompt_bar`
 /// already established (see that function's doc comment for the full
 /// rationale). Deliberately does NOT try to route the reply "back to the

@@ -16,7 +16,7 @@
 // gpui types at all (no `FocusHandle`, no `Context`, no `cx.notify()`) —
 // purely so it's unit-testable without a live `App`/`Window` (gpui's own
 // entity/window machinery needs a running application to construct even a
-// `FocusHandle`). `ime_input/chat_input.rs`'s `EntityInputHandler` impl is
+// `FocusHandle`). `ime_input/input_state.rs`'s `EntityInputHandler` impl is
 // thin glue that delegates to these methods and adds `cx.notify()`.
 //
 // One deliberate behavioral difference from the original: `content` may
@@ -25,9 +25,12 @@
 // whether or not it contains newlines — multi-line-ness is purely a layout
 // concern, handled in `element.rs`.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
+
+use super::style::MASK_CHAR;
 
 #[derive(Debug, Default)]
 pub struct TextEngine {
@@ -228,6 +231,89 @@ impl TextEngine {
         self.marked_range = None;
         taken
     }
+
+    /// Clear without handing the content back — the shell's "cancel and
+    /// start over" affordances (`OobeTextField::clear`'s original job:
+    /// dropping a half-typed Wi-Fi PSK, wiping a password after an unlock
+    /// attempt). Distinct from [`Self::take_content`] on purpose: a caller
+    /// that must not hold a password string even briefly has no reason to
+    /// receive one.
+    pub fn clear(&mut self) {
+        self.content.clear();
+        self.selected_range = 0..0;
+        self.selection_reversed = false;
+        self.marked_range = None;
+    }
+
+    // ── Masked (password) display arithmetic (D3-b) ───────────────────────
+    // A masked field paints one [`MASK_CHAR`] per GRAPHEME CLUSTER, so every
+    // screen-space question ("where does the caret go", "which character did
+    // the mouse land on", "where should the IME candidate window sit") has to
+    // be asked in the masked string's coordinate system, not the content's.
+    // These three functions are the whole conversion; `element.rs` and the
+    // `EntityInputHandler` impl do nothing cleverer than call them.
+    //
+    // Grapheme clusters (not chars, not bytes) are the unit because that is
+    // what the operator perceives as "one dot": a combining-mark sequence or
+    // a multi-codepoint emoji must not smear into three bullets.
+
+    pub fn grapheme_count(&self) -> usize {
+        self.content.graphemes(true).count()
+    }
+
+    /// The string a masked field actually shapes and paints.
+    pub fn masked_display(&self) -> String {
+        MASK_CHAR.to_string().repeat(self.grapheme_count())
+    }
+
+    /// Content byte offset → masked-string byte offset.
+    ///
+    /// Counts the grapheme clusters that END at or before `offset`, so an
+    /// offset landing mid-cluster (which an IME can produce while composing,
+    /// and which `previous_boundary`'s callers can also hand in) rounds DOWN
+    /// to that cluster's own start rather than claiming a bullet that isn't
+    /// finished yet.
+    pub fn mask_offset(&self, offset: usize) -> usize {
+        let clusters = self.content.grapheme_indices(true).filter(|(i, g)| i + g.len() <= offset).count();
+        clusters * MASK_CHAR.len_utf8()
+    }
+
+    /// The bullets standing in for the graphemes inside `range` — what a
+    /// masked field answers `EntityInputHandler::text_for_range` with, so an
+    /// external input-method process asking for surrounding context never
+    /// receives a plaintext password.
+    pub fn masked_slice(&self, range: &Range<usize>) -> String {
+        let clusters =
+            self.content.grapheme_indices(true).filter(|(i, _)| *i >= range.start && *i < range.end).count();
+        MASK_CHAR.to_string().repeat(clusters)
+    }
+
+    /// Masked-string byte offset → content byte offset (the inverse of
+    /// [`Self::mask_offset`], used for mouse hit-testing on a masked field).
+    /// An offset past the end saturates to `content.len()` rather than
+    /// panicking.
+    pub fn content_offset_from_mask(&self, mask_offset: usize) -> usize {
+        let nth = mask_offset / MASK_CHAR.len_utf8();
+        self.content.grapheme_indices(true).nth(nth).map(|(i, _)| i).unwrap_or(self.content.len())
+    }
+}
+
+/// Strip every line separator from text destined for a single-line field.
+///
+/// Single-line-ness cannot be enforced at the key-handling layer alone: on a
+/// masked/one-line field the newline can arrive through
+/// `replace_text_in_range` (an IME commit, a paste, the Wayland `key_char`
+/// fallback) without any keystroke this widget ever sees. Stripping at the
+/// buffer boundary is the only place that covers all of them.
+///
+/// Returns `Cow::Borrowed` when there is nothing to strip, so the common
+/// path allocates nothing.
+pub fn strip_line_breaks(text: &str) -> Cow<'_, str> {
+    if text.contains('\n') || text.contains('\r') {
+        Cow::Owned(text.chars().filter(|c| *c != '\n' && *c != '\r').collect())
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +485,106 @@ mod tests {
         assert_eq!(e.selected_range, 0..11);
         e.replace_text_in_range(None, "");
         assert_eq!(e.content, "");
+    }
+
+    // ── D3-b: masked-field arithmetic ────────────────────────────────────
+
+    #[test]
+    fn masked_display_paints_one_bullet_per_grapheme_not_per_byte() {
+        let mut e = TextEngine::new();
+        // 3 graphemes, 7 UTF-8 bytes ("你" and "好" are 3 bytes each).
+        e.content = "a你好".to_string();
+        assert_eq!(e.grapheme_count(), 3);
+        assert_eq!(e.masked_display(), "•••");
+        assert_eq!(e.masked_display().len(), 9, "3 bullets x 3 UTF-8 bytes");
+    }
+
+    #[test]
+    fn masked_display_of_a_combining_mark_cluster_is_one_bullet() {
+        let mut e = TextEngine::new();
+        e.content = "e\u{0301}".to_string(); // "é" as base + combining acute
+        assert_eq!(e.grapheme_count(), 1);
+        assert_eq!(e.masked_display(), "•");
+    }
+
+    #[test]
+    fn mask_offset_maps_content_bytes_onto_bullet_bytes() {
+        let mut e = TextEngine::new();
+        e.content = "a你好".to_string(); // byte boundaries: 0, 1, 4, 7
+        assert_eq!(e.mask_offset(0), 0);
+        assert_eq!(e.mask_offset(1), 3, "after 'a' -> after 1 bullet");
+        assert_eq!(e.mask_offset(4), 6, "after '你' -> after 2 bullets");
+        assert_eq!(e.mask_offset(7), 9, "end of content -> after 3 bullets");
+    }
+
+    /// The caret can sit mid-cluster while an IME composes; that must map to
+    /// the boundary BEFORE it, never to a fractional bullet.
+    #[test]
+    fn mask_offset_of_a_mid_cluster_byte_rounds_down_to_the_cluster_start() {
+        let mut e = TextEngine::new();
+        e.content = "你".to_string(); // one 3-byte cluster
+        assert_eq!(e.mask_offset(1), 0);
+        assert_eq!(e.mask_offset(2), 0);
+        assert_eq!(e.mask_offset(3), 3);
+    }
+
+    #[test]
+    fn content_offset_from_mask_is_the_inverse_of_mask_offset() {
+        let mut e = TextEngine::new();
+        e.content = "a你好".to_string();
+        for content_offset in [0usize, 1, 4, 7] {
+            let masked = e.mask_offset(content_offset);
+            assert_eq!(
+                e.content_offset_from_mask(masked),
+                content_offset,
+                "roundtrip failed at content byte {content_offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_offset_from_mask_saturates_past_the_end_instead_of_panicking() {
+        let mut e = TextEngine::new();
+        e.content = "ab".to_string();
+        assert_eq!(e.content_offset_from_mask(999), 2);
+    }
+
+    #[test]
+    fn masked_slice_answers_in_bullets_never_in_plaintext() {
+        let mut e = TextEngine::new();
+        e.content = "pa你ss".to_string(); // graphemes at bytes 0,1,2,5,6
+        assert_eq!(e.masked_slice(&(0..e.content.len())), "•••••");
+        assert_eq!(e.masked_slice(&(2..5)), "•", "just the CJK cluster");
+        assert_eq!(e.masked_slice(&(0..0)), "");
+        // The one property that actually matters: no source character ever
+        // survives into the answer.
+        assert!(e.masked_slice(&(0..e.content.len())).chars().all(|c| c == MASK_CHAR));
+    }
+
+    #[test]
+    fn empty_content_masks_to_an_empty_string() {
+        let e = TextEngine::new();
+        assert_eq!(e.masked_display(), "");
+        assert_eq!(e.mask_offset(0), 0);
+        assert_eq!(e.content_offset_from_mask(0), 0);
+    }
+
+    #[test]
+    fn clear_resets_everything_without_returning_the_content() {
+        let mut e = TextEngine::new();
+        e.replace_and_mark_text_in_range(None, "pw", None);
+        e.clear();
+        assert_eq!(e.content, "");
+        assert_eq!(e.selected_range, 0..0);
+        assert_eq!(e.marked_range, None);
+    }
+
+    #[test]
+    fn strip_line_breaks_removes_lf_and_cr_and_borrows_when_clean() {
+        assert!(matches!(strip_line_breaks("plain"), Cow::Borrowed("plain")));
+        assert_eq!(strip_line_breaks("a\nb\r\nc").as_ref(), "abc");
+        // CJK survives untouched — the filter is per-`char`, never per-byte.
+        assert_eq!(strip_line_breaks("你\n好").as_ref(), "你好");
     }
 
     #[test]

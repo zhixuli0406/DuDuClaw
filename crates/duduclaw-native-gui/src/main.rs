@@ -101,7 +101,6 @@ mod chat_ws;
 mod config;
 mod gateway_switch;
 mod i18n;
-mod ime_input;
 mod native_menu;
 mod nav;
 mod rpc;
@@ -117,10 +116,13 @@ mod ws_status;
 // `use` re-binds both names into THIS bin crate's root module namespace, so
 // every existing `crate::theme::...` / `crate::mds_gpui::...` reference
 // throughout `screens/`, `text_field.rs`, `native_menu.rs`, `nav.rs`,
-// `ws_status.rs`, and `ime_input/` keeps resolving unchanged (a private
+// `ws_status.rs` keeps resolving unchanged (a private
 // `use` at the crate root is visible to every descendant module in the same
 // crate — no signature/call-site changes needed anywhere else).
-use duduclaw_native_gui::{mds_gpui, theme};
+// D3-b (2026-08-23): `ime_input` joined them there for the same reason —
+// `duduclaw-shell` now drives the same widget. Its own `crate::theme`
+// references keep resolving because it is compiled as part of the lib now.
+use duduclaw_native_gui::{ime_input, mds_gpui, theme};
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -537,16 +539,16 @@ fn main() {
                     // S4: the chat composer entity is created here (needs
                     // `&mut App`, available at this point) and handed into
                     // `ChatState`; the subscription below is what turns its
-                    // `ChatInputEvent::Submit` (Enter-to-send) into an
+                    // `ImeTextInputEvent::Submit` (Enter-to-send) into an
                     // actual `chat_ws::Command::Send`.
                     let chat_input =
-                        ime_input::ChatInputState::new(cx, i18n::t(initial_locale, "native.chat.inputPlaceholder"));
+                        ime_input::ImeTextInput::new(cx, i18n::t(initial_locale, "native.chat.inputPlaceholder"));
                     let chat_input_for_sub = chat_input.clone();
                     cx.new(|cx| {
                         cx.subscribe(
                             &chat_input_for_sub,
-                            |this: &mut RootView, _emitter, event: &ime_input::ChatInputEvent, cx| {
-                                let ime_input::ChatInputEvent::Submit(content) = event;
+                            |this: &mut RootView, _emitter, event: &ime_input::ImeTextInputEvent, cx| {
+                                let ime_input::ImeTextInputEvent::Submit(content) = event;
                                 this.chat.submit(content.clone());
                                 // S4b: this listener is global (one
                                 // subscription on the one shared composer

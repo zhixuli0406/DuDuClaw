@@ -18,5 +18,12 @@
 // lib target automatically (the standard `src/lib.rs` + `src/main.rs`
 // pattern) — no extra `[dependencies]` entry needed in `Cargo.toml` for
 // that self-reference.
+// D3-b (2026-08-23): `ime_input` joins them. It was `main.rs`'s own private
+// `mod ime_input;` until now; the shell's text fields need the identical
+// `EntityInputHandler` composition path (see that module's own header
+// comment for why the code stays HERE rather than moving to a third crate or
+// being copied). Same one-compiled-copy rule as the two above: `main.rs`
+// reaches it through this lib target, not through a bin-local `mod`.
+pub mod ime_input;
 pub mod mds_gpui;
 pub mod theme;

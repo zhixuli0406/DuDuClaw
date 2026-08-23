@@ -114,7 +114,7 @@ fn steps_card(detail: &PlanDetail, locale: Locale, cx: &mut Context<RootView>) -
 /// The "下一步要做什麼？" input — reuses `console_detail.rs::goal_note_field`'s
 /// exact manual key-capture pattern (a cached `FocusHandle` + `on_key_down`
 /// backspace/char handling), this crate's established substitute for real
-/// IME composition outside the dedicated `ChatInputState` entity. A real,
+/// IME composition outside the dedicated `ImeTextInput` entity. A real,
 /// typeable field; the "新增步驟" button next to it stays inert — see
 /// `plans.rs`'s module doc comment.
 fn new_step_row(value: &str, locale: Locale, cx: &mut Context<RootView>) -> Div {

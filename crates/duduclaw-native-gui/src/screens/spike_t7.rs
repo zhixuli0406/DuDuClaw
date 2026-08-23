@@ -74,7 +74,7 @@ pub struct SpikeT7State {
     /// Mouse position (window space) at the start of the current drag —
     /// `pan` becomes `pan_at_drag_start + (current_position -
     /// drag_origin)`, the standard "anchor + delta" drag recipe (same shape
-    /// `ime_input/chat_input.rs`'s `on_mouse_move` uses for text selection).
+    /// `ime_input/input_state.rs`'s `on_mouse_move` uses for text selection).
     pub drag_origin: gpui::Point<gpui::Pixels>,
     pub pan_at_drag_start: gpui::Point<gpui::Pixels>,
     /// Primitive 4 (量級壓測): false = baseline count (50 nodes / 100

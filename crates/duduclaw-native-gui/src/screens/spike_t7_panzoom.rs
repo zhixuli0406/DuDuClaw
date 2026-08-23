@@ -9,7 +9,7 @@
 //
 // Interaction wiring is plain `Div` mouse/scroll listeners via
 // `cx.listener` (`RootView::spike_t7` mutation), the SAME recipe
-// `ime_input/chat_input.rs` uses for drag-to-select ("anchor position at
+// `ime_input/input_state.rs` uses for drag-to-select ("anchor position at
 // mouse-down, apply delta on every mouse-move while a flag is set, clear the
 // flag on mouse-up"). Known, documented simplification carried over from
 // that same precedent: `Div::on_mouse_move`/`on_mouse_up` only fire while

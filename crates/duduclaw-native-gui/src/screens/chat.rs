@@ -41,7 +41,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::chat_ws::{self, ConnState};
 use crate::i18n::{self, Locale};
-use crate::ime_input::ChatInputState;
+use crate::ime_input::ImeTextInput;
 use crate::mds_gpui::{empty_state, skeleton};
 use crate::theme;
 use crate::RootView;
@@ -82,7 +82,7 @@ pub struct ChatState {
     pub status: Option<String>,
     pub streaming: bool,
     conv_id: String,
-    pub input: gpui::Entity<ChatInputState>,
+    pub input: gpui::Entity<ImeTextInput>,
     pub scroll_handle: ScrollHandle,
     tx: tokio_mpsc::UnboundedSender<chat_ws::Command>,
     /// S4b: the left sidebar's conversation list (task item #2).
@@ -100,7 +100,7 @@ pub struct ChatState {
 }
 
 impl ChatState {
-    pub fn new(input: gpui::Entity<ChatInputState>, tx: tokio_mpsc::UnboundedSender<chat_ws::Command>) -> Self {
+    pub fn new(input: gpui::Entity<ImeTextInput>, tx: tokio_mpsc::UnboundedSender<chat_ws::Command>) -> Self {
         Self {
             messages: Vec::new(),
             conn_state: ConnState::Disconnected,

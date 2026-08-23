@@ -146,8 +146,8 @@ impl WidgetComposerState {
     /// `locale` is the session's locale AT THE MOMENT this page is first
     /// opened (same "baked into the placeholder at construction time, not
     /// re-read on locale change" limitation `main.rs`'s own
-    /// `ime_input::ChatInputState::new(cx, i18n::t(initial_locale, …))` call
-    /// already accepts for the chat composer — `TextField`/`ChatInputState`
+    /// `ime_input::ImeTextInput::new(cx, i18n::t(initial_locale, …))` call
+    /// already accepts for the chat composer — `TextField`/`ImeTextInput`
     /// neither expose a placeholder setter, so this is the same pre-existing
     /// gap, not a new one).
     fn new(cx: &mut gpui::App, locale: Locale) -> Self {

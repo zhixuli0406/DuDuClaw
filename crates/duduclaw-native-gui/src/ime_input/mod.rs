@@ -1,5 +1,9 @@
 // S4 — IME-composition-capable multi-line text input for the chat composer.
 //
+// (D3-b, 2026-08-23: no longer chat-only — see the "promoted to the library
+// surface" note further down. The history below is still the accurate
+// account of where the code came from.)
+//
 // ── Why this exists instead of `text_field.rs` ───────────────────────────
 // `text_field.rs` (S2, login screen) is explicitly scoped OUT of IME
 // support — plain `on_key_down` printable-char appends, "composing CJK text
@@ -56,9 +60,10 @@
 // multi-step pinyin marking→commit and single-step hiragana marking→unmark,
 // see `text_engine.rs`'s tests). `element.rs` extends the example's single-
 // line `TextElement` to multi-line (row-per-`\n`) layout/paint/hit-testing.
-// `chat_input.rs` is the `Entity`/glue layer — key handling follows this
-// CRATE's own `text_field.rs` convention (plain `on_key_down`), not the
-// zed example's global `actions!`/`KeyBinding` registration.
+// `input_state.rs` (named `chat_input.rs` before D3-b) is the `Entity`/glue
+// layer — key handling follows this CRATE's own `text_field.rs` convention
+// (plain `on_key_down`), not the zed example's global `actions!`/
+// `KeyBinding` registration.
 //
 // ── What is and isn't verified ────────────────────────────────────────────
 // The composition ARITHMETIC (UTF-8⇄UTF-16 offset conversion, marked-range
@@ -70,8 +75,40 @@
 // position. That is flagged explicitly in this crate's S4 report as
 // "待使用者親測" — not silently assumed to work.
 
-mod chat_input;
+// ── D3-b (2026-08-23): promoted from a `main.rs`-private module to this
+// crate's public library surface ─────────────────────────────────────────
+// `duduclaw-shell` (DuDuClaw OS's session shell) needs exactly this widget:
+// its OOBE fields, Wi-Fi PSK prompt, lockscreen password and Launcher query
+// were all plain `on_key_down` + `key_char` capture, which means gpui never
+// gets an `EntityInputHandler` installed and every `zwp_text_input_v3`
+// commit fcitx5 sends is silently dropped ("English types, Chinese does
+// nothing" — `research/native-os-2026-08/ime-fcitx5-gpui-2026-08.md` §2.3
+// predicted the exact symptom).
+//
+// Why this crate keeps ownership rather than the code moving to a third
+// shared crate or being copied into the shell:
+//   1. `duduclaw-shell` ALREADY depends on this crate by path, for `theme`
+//      and `mds_gpui`. A new crate would have to re-pin the same exact
+//      `gpui`/`gpui_platform`/`gpui_macros` rev (two revs = two
+//      incompatible `gpui` package instances — the D4 spike finding that
+//      `mds_gpui/mod.rs` documents), for zero benefit.
+//   2. This module's only non-gpui dependency is `crate::theme`, which is
+//      already `pub` here — so the export adds no coupling at all.
+//   3. The composition ARITHMETIC (`text_engine.rs`) is the hard,
+//      unit-tested part. A copy in the shell would fork it, and would have
+//      forked the double-insert fix D3-b had to make (see
+//      `input_state.rs`'s header comment) into two places — or, more
+//      likely, one.
+// The generalization needed to serve both consumers is confined to
+// `style.rs` (`TextInputStyle`: colors, metrics, masked, single-line,
+// submit-on-enter); `Default` reproduces the chat composer's original
+// values exactly, so this crate's own behaviour is unchanged apart from the
+// double-insert fix and click-to-focus.
+
 mod element;
+mod input_state;
+mod style;
 mod text_engine;
 
-pub use chat_input::{ChatInputEvent, ChatInputState};
+pub use input_state::{ImeTextInput, ImeTextInputEvent};
+pub use style::{TextInputStyle, MASK_CHAR};
