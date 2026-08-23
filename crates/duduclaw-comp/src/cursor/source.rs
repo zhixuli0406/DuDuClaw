@@ -71,6 +71,40 @@
 //! unchanged and still WINS — see [`resolve_startup_source`] for the full
 //! priority order and [`super::persist`]'s module doc for why an operator's
 //! explicit environment must outrank a stored user preference.
+//!
+//! # CUR-3 (2026-08-23): cursor SIZE gets the same treatment
+//!
+//! The shell's 協助工具 › 指向與點按 page offers five size steps
+//! ([`CURSOR_SIZE_STEPS`]) and drives them through a `set_cursor_size` op,
+//! with `XCURSOR_SIZE` keeping its existing operator-override priority
+//! ([`resolve_startup_size`]).
+//!
+//! ## Two size gates, deliberately different, and why
+//!
+//! | Surface | Accepts | Enforced by |
+//! |---|---|---|
+//! | `XCURSOR_SIZE` env var (OPERATOR) | any integer, clamped to 8–512 | [`resolve_size`] |
+//! | `set_cursor_size` op + stored preference (UI) | exactly [`CURSOR_SIZE_STEPS`] | [`cursor_size_from_wire`] |
+//!
+//! This asymmetry is intentional, not an oversight. The env var is the
+//! operator's machine-level channel — the same one that already accepts an
+//! arbitrary theme name — and an operator who wants a 40 px pointer for a
+//! specific panel has a legitimate reason a settings UI cannot anticipate.
+//! The op, by contrast, is the *UI's* channel: the five steps are what the
+//! design canvas settled on, they are the only values any button can produce,
+//! and accepting a sixth would immediately create the failure
+//! [`CursorSource::parse_strict`]'s own doc warns about — a settings page
+//! showing a state the compositor is not in, because no radio button matches
+//! the value that got stored. Same reasoning, applied to a number instead of
+//! an enum: the lenient parser guards boot, the strict parser guards the
+//! control channel.
+//!
+//! The stored preference is held to the *strict* rule rather than the lenient
+//! one because the only writer of that key is the strict op. A `size` outside
+//! the five steps in `cursor.json` is therefore corruption or a hand-edit that
+//! no UI could ever display, and it degrades to "no stored size" with a warning
+//! — while the operator who genuinely wants 40 px still has `XCURSOR_SIZE`,
+//! which outranks the file anyway.
 
 use std::fmt;
 
@@ -114,6 +148,38 @@ pub const DEFAULT_CURSOR_SIZE: u32 = 24;
 pub const MIN_CURSOR_SIZE: u32 = 8;
 /// See [`MIN_CURSOR_SIZE`].
 pub const MAX_CURSOR_SIZE: u32 = 512;
+
+/// CUR-3: the closed set of sizes the shell's 協助工具 › 指向與點按 page
+/// offers, in logical pixels, ascending.
+///
+/// These are the five steps the design canvas settled on — and, checked rather
+/// than assumed, they are **exactly** the five nominal sizes Debian's
+/// `adwaita-icon-theme` ships inside every one of its XCursor files (read
+/// straight out of the `Xcur` table of contents: `[24, 32, 48, 64, 96]`, each
+/// with matching `width`/`height`). So on the appliance's own theme every step
+/// resolves to a real, purpose-drawn image rather than to a neighbour — see
+/// [`super::theme::CursorThemeStore::effective_size`] for what happens on a
+/// theme that is less complete.
+pub const CURSOR_SIZE_STEPS: [u32; 5] = [24, 32, 48, 64, 96];
+
+/// CUR-3: strict parse for a size arriving over the `shell_control` socket.
+///
+/// Takes `i64` — the widest thing the wire can hand us — precisely so that a
+/// negative or absurd value is *refused as an invalid size* rather than dying
+/// earlier as a JSON type error. Deserializing straight into `u32` would make
+/// `{"size":-5}` a `parse_error`, which tells the caller the wrong thing about
+/// what is wrong with their request.
+///
+/// Deliberately NOT [`resolve_size`]'s behaviour, which clamps. Clamping is
+/// right for an env var (a boot must not fail over a typo); it is wrong here
+/// for the same reason [`CursorSource::parse_strict`] refuses `"brnad"` —
+/// silently storing 512 when the caller asked for 5000 leaves a settings page
+/// with no button to highlight. Repo convention #4: control surfaces fail
+/// closed.
+pub fn cursor_size_from_wire(raw: i64) -> Option<u32> {
+    let n = u32::try_from(raw).ok()?;
+    CURSOR_SIZE_STEPS.contains(&n).then_some(n)
+}
 
 impl CursorSource {
     /// Parses the [`CURSOR_SOURCE_ENV`] value.
@@ -293,6 +359,42 @@ pub fn resolve_size(xcursor_size: Option<&str>) -> u32 {
         .clamp(MIN_CURSOR_SIZE, MAX_CURSOR_SIZE)
 }
 
+/// CUR-3: startup size priority, highest first — the exact same shape (and the
+/// exact same reasoning) as [`resolve_startup_source`], one level down:
+///
+/// 1. `XCURSOR_SIZE` — the operator's explicit, machine-level statement, and
+///    a freedesktop standard the rest of the desktop already honours. A
+///    present-but-garbage value still counts as "the operator spoke" and lands
+///    on [`DEFAULT_CURSOR_SIZE`] via [`resolve_size`]'s lenient rule; it does
+///    NOT fall through to the stored preference, because "your typo quietly
+///    activated somebody else's saved setting" is the worse outcome.
+/// 2. The stored user preference ([`super::persist::load_size`]), which is held
+///    to the strict [`CURSOR_SIZE_STEPS`] rule — see this module's doc table.
+/// 3. [`DEFAULT_CURSOR_SIZE`].
+///
+/// Pure: both inputs are already-read values.
+pub fn resolve_startup_size(env_raw: Option<&str>, persisted: Option<u32>) -> (u32, SourceOrigin) {
+    // Blank/whitespace-only is UNSET, not "the operator spoke" — same rule and
+    // same reason as `resolve_startup_source`.
+    if let Some(raw) = env_raw.filter(|v| !v.trim().is_empty()) {
+        return (resolve_size(Some(raw)), SourceOrigin::Env);
+    }
+    match persisted {
+        Some(n) => (n, SourceOrigin::Persisted),
+        None => (DEFAULT_CURSOR_SIZE, SourceOrigin::Default),
+    }
+}
+
+/// True iff `XCURSOR_SIZE` is set to a non-blank value in this process's
+/// environment — i.e. iff a stored size preference will be ignored at the next
+/// start. Surfaced to callers as `size_env_pinned`, the size-side twin of
+/// [`env_pins_source`].
+pub fn env_pins_size() -> bool {
+    std::env::var("XCURSOR_SIZE")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +560,105 @@ mod tests {
         assert_eq!(SourceOrigin::Default.as_str(), "default");
         assert_eq!(SourceOrigin::Runtime.as_str(), "runtime");
         assert_eq!(SourceOrigin::Runtime.to_string(), "runtime");
+    }
+
+    // ── CUR-3: cursor size ───────────────────────────────────────────────
+
+    #[test]
+    fn the_five_steps_are_the_canvas_values_ascending_and_start_at_the_default() {
+        assert_eq!(CURSOR_SIZE_STEPS, [24, 32, 48, 64, 96]);
+        assert!(
+            CURSOR_SIZE_STEPS.windows(2).all(|w| w[0] < w[1]),
+            "the shell renders these as ordered segments; unsorted would ship a scrambled control"
+        );
+        assert_eq!(
+            CURSOR_SIZE_STEPS[0], DEFAULT_CURSOR_SIZE,
+            "the first step must be the value a fresh install already draws, or opening the \
+             settings page would highlight a button that is not in effect"
+        );
+        // Every step must also survive the env-side clamp, or an operator
+        // mirroring a UI choice into XCURSOR_SIZE would silently get a
+        // different number back.
+        for s in CURSOR_SIZE_STEPS {
+            assert_eq!(resolve_size(Some(&s.to_string())), s, "step {s} is not env-representable");
+        }
+    }
+
+    #[test]
+    fn the_wire_parser_accepts_exactly_the_five_steps() {
+        for s in CURSOR_SIZE_STEPS {
+            assert_eq!(cursor_size_from_wire(s as i64), Some(s), "step {s} must be accepted");
+        }
+    }
+
+    #[test]
+    fn the_wire_parser_refuses_everything_else_rather_than_clamping_it() {
+        // This is the whole reason it is not `resolve_size`: a value the UI
+        // cannot render as a selected button must come back as an error the
+        // caller can show, never as a silently substituted neighbour.
+        for bad in [-5_i64, -1, 0, 1, 8, 23, 25, 40, 63, 95, 97, 128, 512, 513, 100_000] {
+            assert_eq!(cursor_size_from_wire(bad), None, "{bad} must be refused");
+        }
+        // Beyond u32 entirely — must be an invalid SIZE, not a panic and not
+        // a wrapped-around small number.
+        assert_eq!(cursor_size_from_wire(i64::MAX), None);
+        assert_eq!(cursor_size_from_wire(i64::MIN), None);
+        assert_eq!(cursor_size_from_wire(u32::MAX as i64 + 1), None);
+    }
+
+    #[test]
+    fn a_clamped_env_value_is_not_automatically_a_legal_op_value() {
+        // The two gates are deliberately different (see the module doc table):
+        // `XCURSOR_SIZE=5000` boots at 512, but `set_cursor_size 512` is still
+        // refused because no button offers it.
+        assert_eq!(resolve_size(Some("5000")), MAX_CURSOR_SIZE);
+        assert_eq!(cursor_size_from_wire(MAX_CURSOR_SIZE as i64), None);
+        assert_eq!(resolve_size(Some("1")), MIN_CURSOR_SIZE);
+        assert_eq!(cursor_size_from_wire(MIN_CURSOR_SIZE as i64), None);
+    }
+
+    #[test]
+    fn startup_size_priority_env_beats_persisted_beats_default() {
+        assert_eq!(resolve_startup_size(Some("48"), Some(96)), (48, SourceOrigin::Env));
+        assert_eq!(resolve_startup_size(None, Some(96)), (96, SourceOrigin::Persisted));
+        assert_eq!(
+            resolve_startup_size(None, None),
+            (DEFAULT_CURSOR_SIZE, SourceOrigin::Default)
+        );
+    }
+
+    #[test]
+    fn a_blank_xcursor_size_counts_as_unset_so_the_preference_still_applies() {
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                resolve_startup_size(Some(blank), Some(64)),
+                (64, SourceOrigin::Persisted),
+                "{blank:?} should not count as an operator override"
+            );
+        }
+    }
+
+    #[test]
+    fn a_garbage_xcursor_size_does_not_fall_through_to_the_stored_preference() {
+        // Same deliberate rule as `resolve_startup_source`'s typo case: the
+        // operator DID speak, so they get the default rather than somebody's
+        // saved 96.
+        assert_eq!(
+            resolve_startup_size(Some("big"), Some(96)),
+            (DEFAULT_CURSOR_SIZE, SourceOrigin::Env)
+        );
+        assert_eq!(
+            resolve_startup_size(Some("0"), Some(96)),
+            (DEFAULT_CURSOR_SIZE, SourceOrigin::Env)
+        );
+    }
+
+    #[test]
+    fn an_operator_env_size_outside_the_five_steps_is_still_honoured() {
+        // The env var is the escape hatch the strict op deliberately does not
+        // provide — see the module doc table. 40 is not a step, but an
+        // operator asking for it must get it.
+        assert_eq!(resolve_startup_size(Some("40"), Some(96)), (40, SourceOrigin::Env));
+        assert_eq!(cursor_size_from_wire(40), None, "…while the op still refuses it");
     }
 }

@@ -48,7 +48,7 @@ use super::protocol::{
     MAX_REQUEST_LINE_BYTES,
 };
 use super::{ShellControlMsg, ShellControlShared};
-use crate::cursor::source::CursorSource;
+use crate::cursor::source::{cursor_size_from_wire, CursorSource};
 
 /// Bounds how long `handle_connection` will block waiting for a request
 /// line from an already-accepted (and already peer-cred-authorized) peer.
@@ -281,6 +281,18 @@ pub(super) fn validate(req: &ShellControlRequest) -> Result<(), String> {
             }
             Ok(())
         }
+        // CUR-3. No length pre-check to mirror `set_cursor_source`'s: the
+        // field is already a number by the time serde is done, so there is no
+        // pathological-string case to refuse before parsing — the
+        // `MAX_REQUEST_LINE_BYTES` cap upstream already bounds the whole line.
+        ShellControlRequest::SetCursorSize { size } => {
+            if cursor_size_from_wire(*size).is_none() {
+                // Fixed token, same no-echo reasoning as above. Note this is
+                // a REFUSAL, not a clamp — see `cursor_size_from_wire`'s doc.
+                return Err("invalid_cursor_size".into());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -359,6 +371,41 @@ mod tests {
         };
         let err = validate(&req).unwrap_err();
         assert!(err.contains(&MAX_CURSOR_SOURCE_BYTES.to_string()), "{err}");
+    }
+
+    // ── CUR-3 cursor size ────────────────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_exactly_the_five_offered_sizes() {
+        for n in crate::cursor::source::CURSOR_SIZE_STEPS {
+            let req = ShellControlRequest::SetCursorSize { size: n as i64 };
+            assert!(validate(&req).is_ok(), "{n} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_refuses_an_off_step_size_instead_of_clamping_it() {
+        // The op is the UI's channel, so an unrepresentable value is an error
+        // the caller can show — never a silently substituted neighbour. The
+        // operator escape hatch for an arbitrary size is XCURSOR_SIZE, which
+        // this op deliberately does not duplicate.
+        for bad in [-1_i64, 0, 1, 8, 25, 40, 63, 100, 512, 100_000, i64::MAX, i64::MIN] {
+            let req = ShellControlRequest::SetCursorSize { size: bad };
+            assert_eq!(
+                validate(&req).unwrap_err(),
+                "invalid_cursor_size",
+                "{bad} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_cursor_size_error_does_not_echo_the_callers_value() {
+        // Same no-echo discipline as the source op: the token is fixed, so a
+        // caller-controlled number never reaches a log line or a UI string.
+        let err = validate(&ShellControlRequest::SetCursorSize { size: 133_713_371 }).unwrap_err();
+        assert_eq!(err, "invalid_cursor_size");
+        assert!(!err.contains("1337"));
     }
 
     #[test]

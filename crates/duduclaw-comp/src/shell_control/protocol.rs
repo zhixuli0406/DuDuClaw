@@ -94,9 +94,16 @@ pub enum ShellControlRequest {
     /// call this on every open).
     ///
     /// Answers with the `cursor` block: effective source, requested source,
-    /// theme name, where the value came from, and whether an operator env
-    /// var pins it. See `crate::cursor::CursorSourceInfo` for the field
-    /// semantics — in particular why `source` and `requested` are separate.
+    /// theme name, where the value came from, whether an operator env var
+    /// pins it, and (CUR-3) the cursor size plus the size actually being
+    /// drawn. See `crate::cursor::CursorSourceInfo` for the field semantics —
+    /// in particular why `source`/`requested` and `size`/`effective_size` are
+    /// each two fields rather than one.
+    ///
+    /// The op name kept its CUR-2 spelling after CUR-3 widened the answer to
+    /// cover size: renaming it to something like `get_cursor_config` would
+    /// break every already-shipped caller for a cosmetic gain, and the reply
+    /// is additive (a CUR-2-era client ignores the new keys).
     GetCursorSource,
     /// CUR-2. `{"op":"set_cursor_source","params":{"source":"brand"}}` —
     /// switch the human pointer's artwork **live**, no compositor restart.
@@ -121,6 +128,38 @@ pub enum ShellControlRequest {
     /// boundary is also the right one: only a process running as this kiosk
     /// session's own user may change how that session looks.
     SetCursorSource { source: String },
+    /// CUR-3. `{"op":"set_cursor_size","params":{"size":32}}` — change the
+    /// human pointer's size **live**, no compositor restart.
+    ///
+    /// `size` must be one of `crate::cursor::source::CURSOR_SIZE_STEPS`
+    /// (24 / 32 / 48 / 64 / 96 — the five segments the design canvas settled
+    /// on for 協助工具 › 指向與點按). Anything else is REFUSED with
+    /// `invalid_cursor_size`; it is never clamped to the nearest step, for the
+    /// same reason `set_cursor_source` refuses `"brnad"` instead of coercing
+    /// it (`CursorSource::parse_strict`'s doc) — a settings page must never be
+    /// handed a value none of its buttons can represent.
+    ///
+    /// Typed `i64` rather than `u32` so that `{"size":-5}` and `{"size":9e18}`
+    /// come back as `invalid_cursor_size` — an honest statement about the
+    /// value — instead of `parse_error`, which would blame the JSON. A
+    /// non-integer (`{"size":3.5}`, `{"size":"32"}`) is still `parse_error`:
+    /// that genuinely IS a schema violation, not an out-of-range size.
+    ///
+    /// The reply is the same `cursor` block `get_cursor_source` returns, with
+    /// the new `size` — and, when the loaded theme has no image at that size,
+    /// an `effective_size` that differs from it. **This is a real outcome, not
+    /// an error**: nothing upscales, so a 96 request against a theme whose
+    /// largest image is 64 draws 64 px and says so. See
+    /// `crate::cursor::theme::CursorThemeStore::effective_size`.
+    ///
+    /// Like `set_cursor_source` this is an ACTION: audited, and written to the
+    /// stored preference so it survives a restart (a persistence failure is
+    /// reported as `cursor.persisted: false` + `cursor.persist_error`, never
+    /// swallowed). It lives on this socket for the same reason — pointer size
+    /// is an accessibility preference belonging to the HUMAN at the keyboard,
+    /// and routing it through the agent's injection channel would attribute a
+    /// person's settings change to the agent.
+    SetCursorSize { size: i64 },
 }
 
 impl ShellControlRequest {
@@ -132,6 +171,7 @@ impl ShellControlRequest {
             ShellControlRequest::FocusWindow { .. } => "focus_window",
             ShellControlRequest::GetCursorSource => "get_cursor_source",
             ShellControlRequest::SetCursorSource { .. } => "set_cursor_source",
+            ShellControlRequest::SetCursorSize { .. } => "set_cursor_size",
         }
     }
 }
@@ -329,6 +369,9 @@ mod tests {
             requested: "brand".into(),
             theme: "Adwaita".into(),
             origin: "runtime".into(),
+            size: 24,
+            effective_size: 24,
+            size_env_pinned: false,
             env_pinned: false,
             persisted: Some(true),
             persist_error: None,
@@ -356,6 +399,9 @@ mod tests {
             requested: "brand".into(),
             theme: "DuDuClaw".into(),
             origin: "persisted".into(),
+            size: 48,
+            effective_size: 48,
+            size_env_pinned: false,
             env_pinned: true,
             persisted: None,
             persist_error: None,
@@ -367,5 +413,108 @@ mod tests {
         assert!(!s.contains(r#""persist_error":"#), "unexpected: {s}");
         assert!(s.contains(r#""origin":"persisted""#));
         assert!(s.contains(r#""env_pinned":true"#));
+    }
+
+    // ── CUR-3 cursor size ────────────────────────────────────────────────
+
+    #[test]
+    fn set_cursor_size_wire_shape_round_trips() {
+        let req = ShellControlRequest::SetCursorSize { size: 32 };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(s, r#"{"op":"set_cursor_size","params":{"size":32}}"#);
+        let back: ShellControlRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn set_cursor_size_parses_the_shapes_the_shell_can_send() {
+        // The shell sends one of the five segment values. Each must reach the
+        // validator as a SIZE, not die at the JSON layer.
+        for n in [24, 32, 48, 64, 96] {
+            let raw = format!(r#"{{"op":"set_cursor_size","params":{{"size":{n}}}}}"#);
+            let parsed: ShellControlRequest = serde_json::from_str(&raw).unwrap();
+            assert_eq!(parsed, ShellControlRequest::SetCursorSize { size: n });
+        }
+        // An out-of-range or negative value must PARSE (so `validate` can
+        // answer `invalid_cursor_size`) rather than fail as a type error —
+        // this is exactly why the field is `i64`.
+        for raw in [
+            r#"{"op":"set_cursor_size","params":{"size":-5}}"#,
+            r#"{"op":"set_cursor_size","params":{"size":0}}"#,
+            r#"{"op":"set_cursor_size","params":{"size":100000}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ShellControlRequest>(raw).is_ok(),
+                "{raw} must parse so the validator can refuse it as a size"
+            );
+        }
+    }
+
+    #[test]
+    fn set_cursor_size_rejects_non_integer_and_stray_fields() {
+        // A float or a string genuinely IS a schema violation, not an
+        // out-of-range size — `parse_error` is the honest answer there.
+        for raw in [
+            r#"{"op":"set_cursor_size","params":{"size":3.5}}"#,
+            r#"{"op":"set_cursor_size","params":{"size":"32"}}"#,
+            r#"{"op":"set_cursor_size","params":{"size":null}}"#,
+            r#"{"op":"set_cursor_size","params":{"size":32,"persist":false}}"#,
+            r#"{"op":"set_cursor_size","params":{}}"#,
+            r#"{"op":"set_cursor_size"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ShellControlRequest>(raw).is_err(),
+                "{raw} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn set_cursor_size_op_name_is_stable_and_does_not_leak_the_value() {
+        assert_eq!(
+            ShellControlRequest::SetCursorSize { size: 96 }.op_name(),
+            "set_cursor_size"
+        );
+    }
+
+    #[test]
+    fn the_cursor_block_carries_size_and_effective_size_as_the_shell_expects() {
+        // The contract the shell was written against: `cursor.size` is an
+        // integer, and `effective_size` rides alongside it (the shell tolerates
+        // the extra key, and needs it to avoid claiming 96 px when 64 is drawn).
+        let resp = ShellControlResponse::cursor(CursorSourceInfo {
+            source: "system".into(),
+            requested: "system".into(),
+            theme: "SparseTheme".into(),
+            origin: "default".into(),
+            size: 96,
+            effective_size: 64,
+            size_env_pinned: true,
+            env_pinned: false,
+            persisted: Some(true),
+            persist_error: None,
+        });
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(s.contains(r#""size":96"#), "unexpected: {s}");
+        assert!(s.contains(r#""effective_size":64"#), "unexpected: {s}");
+        assert!(s.contains(r#""size_env_pinned":true"#), "unexpected: {s}");
+        // Never omitted, unlike `persisted`: a settings page reading a missing
+        // `size` would have nothing to highlight.
+        let always_present = ShellControlResponse::cursor(CursorSourceInfo {
+            source: "system".into(),
+            requested: "system".into(),
+            theme: "Adwaita".into(),
+            origin: "default".into(),
+            size: 24,
+            effective_size: 24,
+            size_env_pinned: false,
+            env_pinned: false,
+            persisted: None,
+            persist_error: None,
+        });
+        let s = serde_json::to_string(&always_present).unwrap();
+        assert!(s.contains(r#""size":24"#), "unexpected: {s}");
+        assert!(s.contains(r#""effective_size":24"#), "unexpected: {s}");
+        assert!(s.contains(r#""size_env_pinned":false"#), "unexpected: {s}");
     }
 }

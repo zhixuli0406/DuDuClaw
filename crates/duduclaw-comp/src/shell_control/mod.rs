@@ -95,12 +95,15 @@
 //! -> {"op":"get_cursor_source"}
 //! <- {"ok":true,"cursor":{"source":"system","requested":"system",
 //!                         "theme":"Adwaita","origin":"default",
-//!                         "env_pinned":false}}
+//!                         "size":24,"effective_size":24,
+//!                         "size_env_pinned":false,"env_pinned":false}}
 //!
 //! -> {"op":"set_cursor_source","params":{"source":"brand"}}
 //! <- {"ok":true,"cursor":{"source":"brand","requested":"brand",
 //!                         "theme":"DuDuClaw","origin":"runtime",
-//!                         "env_pinned":false,"persisted":true}}
+//!                         "size":24,"effective_size":24,
+//!                         "size_env_pinned":false,"env_pinned":false,
+//!                         "persisted":true}}
 //!
 //! -> {"op":"set_cursor_source","params":{"source":"brnad"}}
 //! <- {"ok":false,"error":"invalid_cursor_source"}
@@ -112,6 +115,40 @@
 //! `DUDUCLAW_COMP_CURSOR_SOURCE` in comp's spawn environment, so the stored
 //! preference will not apply at the next start. Building that page is
 //! deliberately NOT part of CUR-2 — the op shape is.
+//!
+//! ## CUR-3 (2026-08-23): pointer SIZE, on the same socket
+//! `set_cursor_size` is the third appearance-preference op, added for the
+//! shell's 協助工具 › 指向與點按 page (five segments: 24 / 32 / 48 / 64 / 96).
+//! It lives here for the same reason the two above do — pointer size is an
+//! accessibility preference belonging to the human at the keyboard, and
+//! attributing it to the agent in the codrive trail would be exactly the audit
+//! poisoning this module exists to prevent. Live (no restart), persisted, and
+//! audited, identical in shape to `set_cursor_source`:
+//!
+//! ```text
+//! -> {"op":"set_cursor_size","params":{"size":32}}
+//! <- {"ok":true,"cursor":{…,"size":32,"effective_size":32,"persisted":true}}
+//!
+//! -> {"op":"set_cursor_size","params":{"size":40}}
+//! <- {"ok":false,"error":"invalid_cursor_size"}
+//! ```
+//!
+//! The size axis carries one honest signal the source axis does not need:
+//! **`effective_size` may differ from `size`.** An XCursor theme holds a fixed
+//! set of image sizes and the nearest is drawn at its own size — nothing is
+//! upscaled — so a 96 request against a theme whose largest image is 64 really
+//! draws 64 px. That is a correct outcome, not an error, and the reply says so
+//! rather than claiming 96. On the appliance's own Adwaita the two are equal at
+//! every offered step (Adwaita ships exactly 24/32/48/64/96). See
+//! `crate::cursor::theme::CursorThemeStore::effective_size` for the full
+//! reasoning, including why upscaling-to-match was rejected.
+//!
+//! `size_env_pinned` is the size-side twin of `env_pinned`: an operator who set
+//! `XCURSOR_SIZE` outranks the stored preference at the next start, and a
+//! settings page should say so instead of promising the choice will stick. Note
+//! that `XCURSOR_SIZE` accepts any 8–512 value while this op accepts only the
+//! five steps — a deliberate operator-vs-UI split documented in
+//! `crate::cursor::source`'s own module doc.
 
 mod audit;
 mod listener;
@@ -252,7 +289,73 @@ impl DuduclawComp {
             ShellControlRequest::FocusWindow { query } => self.shell_control_focus_window(query),
             ShellControlRequest::GetCursorSource => ShellControlResponse::cursor(self.cursor_source_info()),
             ShellControlRequest::SetCursorSource { source } => self.shell_control_set_cursor_source(&source),
+            ShellControlRequest::SetCursorSize { size } => self.shell_control_set_cursor_size(size),
         }
+    }
+
+    /// CUR-3: change the human pointer's size live, then persist the choice.
+    ///
+    /// Same apply-first-persist-second ordering, and the same reasoning, as
+    /// [`Self::shell_control_set_cursor_source`] directly below: the switch is
+    /// what the caller asked for and it cannot fail, while writing the
+    /// preference file can. A write failure degrades to "live now, gone after
+    /// a restart" and is reported as `persisted: false` + `persist_error`,
+    /// never swallowed.
+    ///
+    /// `size` has already been through `listener::validate`, so
+    /// `cursor_size_from_wire` here cannot fail; it is re-parsed rather than
+    /// passed as a `u32` because the wire type is `i64` and the parse is the
+    /// boundary. A validation gap therefore lands on a real error response,
+    /// not a panic and not an unvalidated write.
+    fn shell_control_set_cursor_size(&mut self, size: i64) -> ShellControlResponse {
+        let Some(px) = crate::cursor::source::cursor_size_from_wire(size) else {
+            tracing::error!(
+                "shell_control: set_cursor_size reached the main thread with a value \
+                 listener::validate should have refused — refusing here too"
+            );
+            self.shell_control.record("set_cursor_size_failed", Some("invalid_cursor_size".to_string()));
+            return ShellControlResponse::err("invalid_cursor_size");
+        };
+
+        let changed = self.set_cursor_size(px);
+
+        let (persisted, persist_error) = match crate::cursor::persist::store_size(px) {
+            Ok(path) => {
+                tracing::debug!(path = %path.display(), "cursor: size preference stored");
+                (true, None)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cursor: the size switch is live but could not be persisted — it will \
+                     revert at the next compositor start"
+                );
+                (false, Some(e))
+            }
+        };
+
+        let mut info = self.cursor_source_info();
+        info.persisted = Some(persisted);
+        info.persist_error = persist_error.clone();
+
+        // Audited: an ACTION with a user-visible effect. `effective` is in the
+        // line on purpose — "the user asked for 96 and the theme drew 64" is a
+        // support answer that must be recoverable from the trail, not only
+        // from a live socket query.
+        self.shell_control.record(
+            "set_cursor_size",
+            Some(format!(
+                "size={px} effective_size={} theme={:?} changed={changed} persisted={persisted}{}",
+                info.effective_size,
+                info.theme,
+                match &persist_error {
+                    Some(e) => format!(" persist_error={e:?}"),
+                    None => String::new(),
+                }
+            )),
+        );
+
+        ShellControlResponse::cursor(info)
     }
 
     /// CUR-2: switch the human pointer's artwork source live, then persist

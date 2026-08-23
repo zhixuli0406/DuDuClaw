@@ -115,13 +115,15 @@ impl CursorState {
     }
 }
 
-/// CUR-2: everything a `shell_control` caller is told about the live cursor
-/// configuration. Assembled by [`DuduclawComp::cursor_source_info`].
+/// CUR-2/CUR-3: everything a `shell_control` caller is told about the live
+/// cursor configuration. Assembled by [`DuduclawComp::cursor_source_info`].
 ///
 /// Deliberately reports BOTH `requested` and `source`: they differ exactly
 /// when the brand theme was asked for and is not installed, and a settings UI
 /// that only saw one of them would either lose the user's choice or claim a
-/// paw is on screen when an Adwaita arrow is.
+/// paw is on screen when an Adwaita arrow is. CUR-3 adds the size axis with
+/// the same discipline — `size` is what was asked for, `effective_size` is
+/// what is drawn, and they are separate fields for exactly the same reason.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CursorSourceInfo {
     /// The source actually in effect, after the brand→system fail-safe.
@@ -130,8 +132,37 @@ pub struct CursorSourceInfo {
     pub requested: String,
     /// The XCursor theme name actually loaded.
     pub theme: String,
-    /// `env` / `persisted` / `default` / `runtime`.
+    /// `env` / `persisted` / `default` / `runtime`. Describes where the
+    /// **source** came from, not the size — see `size_env_pinned` for the one
+    /// size-provenance signal a settings page actually needs, and
+    /// `CursorSourceInfo`'s own note below on why there is no `size_origin`.
     pub origin: String,
+    /// CUR-3: the cursor size currently in effect, in logical pixels — one of
+    /// `source::CURSOR_SIZE_STEPS` unless an operator set `XCURSOR_SIZE` to
+    /// something else. This is what a settings page highlights.
+    pub size: u32,
+    /// CUR-3: the size actually being DRAWN, in pixels.
+    ///
+    /// Equal to `size` on any theme that carries the requested size — which,
+    /// on the appliance's own Adwaita, is every offered step. It differs when
+    /// the loaded theme has no image at that size (the nearest one is drawn at
+    /// its own size; nothing is upscaled) or when no theme was found at all
+    /// (the built-in arrow quantises to whole multiples of 24). A settings
+    /// page that showed only `size` in those cases would be claiming a pointer
+    /// size that is not on screen. See
+    /// [`theme::CursorThemeStore::effective_size`] for the full reasoning and
+    /// for why upscaling to match was rejected.
+    pub effective_size: u32,
+    /// CUR-3: true iff `XCURSOR_SIZE` is set in this compositor's environment
+    /// — i.e. iff a stored size preference will NOT be honoured at the next
+    /// start, no matter what a `set_cursor_size` op writes. The size-side twin
+    /// of `env_pinned`.
+    ///
+    /// There is deliberately no `size_origin` field to match `origin`. The
+    /// only thing a UI must not get wrong is "will my choice stick?", and this
+    /// boolean answers it; a second four-valued provenance string would be
+    /// state to keep in sync for no decision it enables.
+    pub size_env_pinned: bool,
     /// True iff `DUDUCLAW_COMP_CURSOR_SOURCE` is set in this compositor's
     /// environment — i.e. iff a stored preference will NOT be honoured at the
     /// next start, no matter what a `set_cursor_source` op writes.
@@ -170,14 +201,24 @@ impl DuduclawComp {
         self.queue_redraw();
     }
 
-    /// CUR-2: the live cursor configuration, for `shell_control`'s
-    /// `get_cursor_source` / `set_cursor_source` replies.
-    pub(crate) fn cursor_source_info(&self) -> CursorSourceInfo {
+    /// CUR-2/CUR-3: the live cursor configuration, for `shell_control`'s
+    /// `get_cursor_source` / `set_cursor_source` / `set_cursor_size` replies.
+    ///
+    /// `&mut self` since CUR-3: `effective_size` is answered through the same
+    /// `cursor_for` path that draws the frame (see
+    /// [`theme::CursorThemeStore::effective_size`] for why a second, read-only
+    /// size-probing rule was rejected), and that path fills a lazy cache. The
+    /// only side effect is a cache fill the next repaint would have done
+    /// anyway.
+    pub(crate) fn cursor_source_info(&mut self) -> CursorSourceInfo {
         CursorSourceInfo {
             source: self.cursor.theme.source().as_str().to_string(),
             requested: self.cursor.theme.requested().as_str().to_string(),
             theme: self.cursor.theme.theme_name().to_string(),
             origin: self.cursor.origin.as_str().to_string(),
+            size: self.cursor.theme.size(),
+            effective_size: self.cursor.theme.effective_size(),
+            size_env_pinned: source::env_pins_size(),
             env_pinned: source::env_pins_source(),
             persisted: None,
             persist_error: None,
@@ -213,6 +254,48 @@ impl DuduclawComp {
             theme = %self.cursor.theme.theme_name(),
             "cursor: source switched live (no restart)"
         );
+        self.queue_redraw();
+        true
+    }
+
+    /// CUR-3: change the human pointer's SIZE **live**.
+    ///
+    /// Same three-line shape (and the same `queue_redraw` requirement) as
+    /// [`Self::set_cursor_source`]: without the repaint, a size change made
+    /// while the pointer sits still would appear to do nothing on the udev
+    /// backend until the user moved the mouse.
+    ///
+    /// Deliberately does NOT touch `self.cursor.origin`, which describes where
+    /// the *source* came from. Size provenance is a separate axis and the only
+    /// part of it a caller needs is `size_env_pinned` — see
+    /// [`CursorSourceInfo`].
+    ///
+    /// `size` is expected to already be one of
+    /// [`source::CURSOR_SIZE_STEPS`]; the op validates at the socket boundary.
+    /// Nothing here re-clamps, because a value that got past validation and is
+    /// still wrong should be visible as a wrong cursor, not silently rounded.
+    ///
+    /// Returns `true` when the live size actually changed.
+    pub(crate) fn set_cursor_size(&mut self, size: u32) -> bool {
+        if !self.cursor.theme.set_size(size) {
+            return false;
+        }
+        let effective = self.cursor.theme.effective_size();
+        if effective == size {
+            tracing::info!(size, "cursor: size switched live (no restart)");
+        } else {
+            // Not a warning — this is a correct, expected outcome on a theme
+            // that does not carry every step (see `effective_size`'s doc). It
+            // is logged at info because "I asked for 96 and got 64" is exactly
+            // the question a support session needs answered from journalctl.
+            tracing::info!(
+                size,
+                effective_size = effective,
+                theme = %self.cursor.theme.theme_name(),
+                "cursor: size switched live, but the loaded cursor theme has no image at that \
+                 size — its nearest image is drawn at its own size, nothing is upscaled"
+            );
+        }
         self.queue_redraw();
         true
     }

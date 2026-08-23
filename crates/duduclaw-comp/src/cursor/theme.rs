@@ -57,6 +57,25 @@ pub struct LoadedCursor {
     /// Where inside the image the pointer's actual position sits, in logical
     /// pixels from the image's top-left.
     pub hotspot: Point<i32, Logical>,
+    /// CUR-3: the size this image is ACTUALLY drawn at, in pixels — which is
+    /// not necessarily the size that was requested.
+    ///
+    /// For a themed image it is the XCursor nominal size of the frame
+    /// [`pick_image`] chose (the `subtype` field of the file's table of
+    /// contents), which for every real theme also equals the image's
+    /// `width`/`height`. For the built-in arrow it is
+    /// [`fallback::rasterized_height`].
+    ///
+    /// This exists because nothing upscales: `build_from_images` wraps the
+    /// chosen image at its own `(width, height)` and
+    /// `MemoryRenderBufferRenderElement::from_buffer` is called with
+    /// `src: None, size: None`, which smithay resolves to
+    /// `mem.size().to_logical(scale, transform)` — the buffer's own pixel
+    /// dimensions (checked in smithay 0.7.0's `element/memory.rs`, not
+    /// assumed). So asking a theme for a size it does not carry gets you its
+    /// nearest image at that image's own size, and a settings page needs this
+    /// number to avoid claiming otherwise.
+    pub nominal_size: u32,
 }
 
 /// Loads and caches cursor images for one theme.
@@ -109,12 +128,20 @@ impl CursorThemeStore {
             source::resolve_startup_source(env_raw.as_deref(), super::persist::load());
         let explicit = std::env::var(source::CURSOR_THEME_ENV).ok();
         let xcursor_theme = std::env::var("XCURSOR_THEME").ok();
-        let size = source::resolve_size(std::env::var("XCURSOR_SIZE").ok().as_deref());
+        // CUR-3: the size follows the same three-level priority the source
+        // does — `XCURSOR_SIZE` (operator) > stored preference (user) >
+        // default. See `source::resolve_startup_size`.
+        let (size, size_origin) = source::resolve_startup_size(
+            std::env::var("XCURSOR_SIZE").ok().as_deref(),
+            super::persist::load_size(),
+        );
 
         tracing::debug!(
             requested = requested.as_str(),
             origin = origin.as_str(),
-            "cursor: resolved the startup cursor source"
+            size,
+            size_origin = size_origin.as_str(),
+            "cursor: resolved the startup cursor source and size"
         );
         Self::with_env_inputs(requested, explicit, xcursor_theme, size)
     }
@@ -167,6 +194,98 @@ impl CursorThemeStore {
     /// The theme name actually in effect. Exposed for the startup log.
     pub fn theme_name(&self) -> &str {
         &self.theme_name
+    }
+
+    /// CUR-3: the cursor size currently ASKED for, in logical pixels. What a
+    /// settings page highlights. See [`Self::effective_size`] for what is
+    /// actually on screen.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// CUR-3: the size actually being drawn, in pixels — the honest companion
+    /// to [`Self::size`].
+    ///
+    /// # Why these can differ, and why nothing is "fixed" when they do
+    ///
+    /// An XCursor file carries a fixed set of nominal sizes and
+    /// [`pick_image`] takes the nearest one; nothing rescales it (see
+    /// [`LoadedCursor::nominal_size`] for the sourced detail). So on a theme
+    /// whose largest image is 64, asking for 96 draws a **64 px cursor at
+    /// 64 px** — not a blurry 64-stretched-to-96. Checked, not assumed: this
+    /// crate's own `pick_image` chooses by `abs_diff` on the nominal size and
+    /// `build_from_images` then builds the buffer at that image's own
+    /// `(width, height)`.
+    ///
+    /// Leaving it un-upscaled is the deliberate choice. Forcing the requested
+    /// size by passing `size: Some(96)` to
+    /// `MemoryRenderBufferRenderElement::from_buffer` is possible and would
+    /// make the pointer visibly grow — by bilinear-stretching a 64 px bitmap,
+    /// which is exactly the "upscaled mush" [`pick_image`]'s own tie-break
+    /// comment already rejects, and which would wreck the dark outline the
+    /// whole CUR-1 work package exists to keep legible. A cursor that is
+    /// honestly 64 px beats a cursor that is nominally 96 px and unreadable.
+    ///
+    /// What must NOT happen is the third option — silently reporting 96 while
+    /// drawing 64. Hence this method, and hence `effective_size` on the wire.
+    ///
+    /// On the appliance's own theme the two are equal at every offered step:
+    /// Debian's `adwaita-icon-theme` ships nominal sizes `[24, 32, 48, 64, 96]`
+    /// in every cursor file, which is precisely
+    /// [`source::CURSOR_SIZE_STEPS`] (verified by reading the `Xcur` table of
+    /// contents, see that constant's doc). A divergence therefore signals a
+    /// sparse third-party theme or no theme at all, which is worth showing.
+    ///
+    /// Measured on [`CursorIcon::Default`] — the one icon a theme is
+    /// effectively guaranteed to have, and the same probe
+    /// [`load_theme`] already uses to decide whether a theme is usable at all.
+    /// A theme could in principle ship different size sets per icon; none in
+    /// practice does, and picking the guaranteed icon beats inventing an
+    /// aggregate over shapes that may never be drawn.
+    ///
+    /// Takes `&mut self` because it answers through the ordinary
+    /// [`Self::cursor_for`] path — deliberately, so the number reported is
+    /// produced by the SAME selection code that draws the frame rather than by
+    /// a second, subtly different rule (the bug-factory `load_theme`'s own doc
+    /// warns about). The cost is one lazy cache fill, which the first repaint
+    /// would have paid anyway.
+    pub fn effective_size(&mut self) -> u32 {
+        self.cursor_for(CursorIcon::Default).nominal_size
+    }
+
+    /// CUR-3: change the cursor size **without restarting the compositor**.
+    ///
+    /// Returns `true` when something actually changed (so the caller knows
+    /// whether a repaint is owed). Re-requesting the live size is a no-op, so a
+    /// settings UI re-asserting its own state costs nothing — same contract as
+    /// [`Self::set_source`].
+    ///
+    /// What a size switch has to do, and what it deliberately does not:
+    ///
+    /// 1. **Drop the per-icon cache.** Same reasoning as [`Self::set_source`]'s
+    ///    point 2, and the same silent half-failure if forgotten: the cache is
+    ///    keyed by icon name alone, with no size dimension, so every shape
+    ///    already drawn this session would keep its OLD size and only
+    ///    never-yet-hovered shapes would change.
+    /// 2. **Drop the built-in fallback.** It is rasterised at a fixed integer
+    ///    scale of the requested size (`fallback::build_buffer(self.size)`) and
+    ///    cached separately from `cache`, so a size switch on a themeless
+    ///    machine would otherwise change nothing at all.
+    /// 3. **Re-arm the degraded warning**, whose message quotes the size.
+    /// 4. It does NOT reload the theme. The theme NAME is a function of the
+    ///    source only (`resolve_theme_name` takes no size), and the loaded
+    ///    `xcursor::CursorTheme` is a path resolver, not a rasterised image
+    ///    set — size is applied per-icon at `pick_image` time. Reloading would
+    ///    re-walk the icon search path for a result that cannot differ.
+    pub fn set_size(&mut self, size: u32) -> bool {
+        if self.size == size {
+            return false;
+        }
+        self.size = size;
+        self.cache.clear();
+        self.fallback = None;
+        self.degraded_logged = false;
+        true
     }
 
     /// CUR-2: switch artwork source **without restarting the compositor**.
@@ -268,6 +387,10 @@ impl CursorThemeStore {
             self.fallback = Some(LoadedCursor {
                 buffer: fallback::build_buffer(self.size),
                 hotspot: Point::from((0, 0)),
+                // NOT `self.size`: the fallback quantises to whole multiples
+                // of the 24-cell mask, so a 32 px request really draws 24 px.
+                // See `fallback::rasterized_height`.
+                nominal_size: fallback::rasterized_height(self.size),
             });
         }
         self.fallback
@@ -413,6 +536,10 @@ fn build_from_images(images: &[xcursor::parser::Image], size: u32) -> Option<Loa
     Some(LoadedCursor {
         buffer,
         hotspot: Point::from((img.xhot as i32, img.yhot as i32)),
+        // The image's OWN nominal size, not the requested one — they differ
+        // whenever the theme does not carry the requested size, and reporting
+        // the request would be the lie `effective_size` exists to prevent.
+        nominal_size: img.size,
     })
 }
 
@@ -596,6 +723,137 @@ mod tests {
             "Bibata",
             "an explicit theme override outranks the brand source"
         );
+    }
+
+    // ── CUR-3: live size switching + honest effective size ───────────────
+
+    #[test]
+    fn build_from_images_records_the_chosen_images_own_size_not_the_request() {
+        // The honest-reporting primitive, and the empirical answer to "what
+        // does a 96 px request do on a theme whose largest image is 64?".
+        // A theme carrying only 24 and 64, asked for 96, hands back its 64 px
+        // image — and says 64, not 96.
+        //
+        // The buffer is built at `(img.width, img.height)` = 64x64 and drawn
+        // with `size: None`, so 64 px is also what lands on screen — nothing
+        // stretches it to 96. `MemoryRenderBuffer` exposes no public `size()`
+        // to assert that directly (its `size()` is on the private inner
+        // `MemoryBuffer`), so the picked image is identified by its unique
+        // hotspot instead — `pick_image`'s own tests already pin the selection
+        // rule, and `build_from_images` builds from whatever it returns.
+        let images = vec![img(24, 24, 24, 1, 1), img(64, 64, 64, 2, 2)];
+        let loaded = build_from_images(&images, 96).expect("should build");
+        assert_eq!(
+            loaded.nominal_size, 64,
+            "asking for 96 on a 64-max theme must report 64, not 96"
+        );
+        assert_eq!(
+            loaded.hotspot,
+            Point::<i32, Logical>::from((2, 2)),
+            "the 64 px image is the one that got built"
+        );
+        assert_eq!(pick_image(&images, 96).unwrap().width, 64, "…at its own 64 px width");
+
+        let exact = build_from_images(&images, 24).expect("should build");
+        assert_eq!(exact.nominal_size, 24);
+        assert_eq!(exact.hotspot, Point::<i32, Logical>::from((1, 1)));
+    }
+
+    #[test]
+    fn effective_size_on_a_themeless_machine_reports_the_fallbacks_real_height() {
+        // No theme anywhere (the container/CI case), so every size resolves
+        // through the built-in arrow — which quantises. A settings page must
+        // be told 24, not 32.
+        let mut store = CursorThemeStore::new(
+            CursorSource::System,
+            "duduclaw-no-such-theme-cur3-eff".to_string(),
+            32,
+        );
+        assert_eq!(store.size(), 32, "the REQUEST is unchanged");
+        assert_eq!(
+            store.effective_size(),
+            24,
+            "the fallback draws 24 px for a 32 px request — reporting 32 would be a lie"
+        );
+
+        assert!(store.set_size(96));
+        assert_eq!(store.size(), 96);
+        assert_eq!(store.effective_size(), 96, "96 is a whole multiple of the mask");
+
+        assert!(store.set_size(64));
+        assert_eq!(store.effective_size(), 48, "64 quantises down to 48");
+    }
+
+    #[test]
+    fn set_size_reports_change_and_is_a_no_op_for_the_live_value() {
+        let mut store =
+            CursorThemeStore::with_env_inputs(CursorSource::System, None, None, 24);
+        assert_eq!(store.size(), 24);
+        assert!(store.set_size(48), "a real change reports true");
+        assert_eq!(store.size(), 48);
+        assert!(
+            !store.set_size(48),
+            "re-requesting the live size must not report a change (a settings UI re-asserting \
+             its own state must not cost a rebuild or a repaint)"
+        );
+    }
+
+    #[test]
+    fn set_size_drops_both_the_per_icon_cache_and_the_fallback() {
+        // Two separate caches, two separate silent half-failures if either is
+        // forgotten — the per-icon cache has no size dimension, and the
+        // fallback arrow is rasterised once at the old size. On a themeless
+        // machine (this test) the fallback is the ONLY thing on screen, so
+        // missing it would make the whole op appear to do nothing.
+        let mut store = CursorThemeStore::with_env_inputs(
+            CursorSource::System,
+            Some("duduclaw-no-such-theme-cur3-cache".to_string()),
+            None,
+            24,
+        );
+        let before = store.cursor_for(CursorIcon::Default);
+        let _ = store.cursor_for(CursorIcon::Grab);
+        assert_eq!(store.cache.len(), 2, "both lookups should have been cached");
+        assert!(store.fallback.is_some(), "the fallback should have been built");
+        assert_eq!(before.nominal_size, 24);
+
+        assert!(store.set_size(96));
+        assert!(store.cache.is_empty(), "a size switch must invalidate every cached image");
+        assert!(store.fallback.is_none(), "a size switch must invalidate the fallback arrow");
+
+        let after = store.cursor_for(CursorIcon::Default);
+        assert_eq!(after.nominal_size, 96, "the rebuilt arrow must use the new size");
+        // Cross-check against the rasteriser itself: 96 px really is 4x the
+        // 15x24 mask, so the fallback genuinely got bigger rather than just
+        // reporting a bigger number.
+        assert_eq!(fallback::rasterize(96).height, 96);
+        assert_eq!(fallback::rasterize(24).height, 24);
+    }
+
+    #[test]
+    fn a_size_switch_leaves_the_source_and_theme_alone() {
+        // Size and source are independent axes; a size change must not
+        // re-resolve (or lose) the theme name.
+        let mut store = CursorThemeStore::with_env_inputs(
+            CursorSource::System,
+            None,
+            Some("Breeze".into()),
+            24,
+        );
+        assert_eq!(store.theme_name(), "Breeze");
+        assert!(store.set_size(48));
+        assert_eq!(store.theme_name(), "Breeze");
+        assert_eq!(store.requested(), CursorSource::System);
+    }
+
+    #[test]
+    fn a_source_switch_leaves_the_size_alone() {
+        // The mirror of the test above — `set_source` reloads the theme and
+        // must carry the live size through `load_theme` unchanged.
+        let mut store =
+            CursorThemeStore::with_env_inputs(CursorSource::System, None, None, 96);
+        assert!(store.set_source(CursorSource::Brand));
+        assert_eq!(store.size(), 96, "switching artwork must not reset the size");
     }
 
     #[test]

@@ -101,6 +101,20 @@ pub fn scale_for_size(size: u32) -> u32 {
     (size / ARROW_H).max(1)
 }
 
+/// CUR-3: the height, in pixels, the fallback arrow will ACTUALLY be drawn at
+/// for a requested `size` — i.e. `24 × scale_for_size(size)`.
+///
+/// Exists so [`crate::cursor::theme::CursorThemeStore::effective_size`] can
+/// report an honest number on a machine with no XCursor theme at all. Because
+/// the scale is integer-only (see [`scale_for_size`]), the fallback quantises
+/// hard: a 32 px request draws 24 px of arrow and a 64 px request draws 48. A
+/// settings page that showed "32" while 24 px of pixels were on screen would
+/// be lying, so the honest number is computed rather than assumed equal to the
+/// request.
+pub fn rasterized_height(size: u32) -> u32 {
+    ARROW_H * scale_for_size(size)
+}
+
 /// Rasterises [`ARROW`] at the integer scale appropriate for `size`.
 pub fn rasterize(size: u32) -> RasterizedArrow {
     let scale = scale_for_size(size);
@@ -194,6 +208,27 @@ mod tests {
         assert_eq!(scale_for_size(47), 1);
         assert_eq!(scale_for_size(48), 2);
         assert_eq!(scale_for_size(96), 4);
+    }
+
+    #[test]
+    fn rasterized_height_matches_what_rasterize_actually_produces() {
+        // CUR-3: this number is reported to a settings UI as `effective_size`,
+        // so it must be the real pixel height, derived the same way — not an
+        // independently-maintained table that could drift from the rasteriser.
+        for size in [0, 8, 24, 32, 47, 48, 64, 96, 512] {
+            assert_eq!(
+                rasterized_height(size),
+                rasterize(size).height,
+                "requested {size}"
+            );
+        }
+        // The quantisation a UI has to be honest about: two of the five
+        // offered steps draw at a smaller size than they ask for.
+        assert_eq!(rasterized_height(24), 24);
+        assert_eq!(rasterized_height(32), 24, "32 quantises down to one whole arrow");
+        assert_eq!(rasterized_height(48), 48);
+        assert_eq!(rasterized_height(64), 48, "64 quantises down to two whole arrows");
+        assert_eq!(rasterized_height(96), 96);
     }
 
     #[test]
