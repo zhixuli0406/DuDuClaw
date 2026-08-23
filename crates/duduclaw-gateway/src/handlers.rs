@@ -1169,6 +1169,20 @@ fn device_op_result_frame(result: crate::device_ops::OpResult) -> WsFrame {
     }
 }
 
+/// D4a: render a [`crate::network::WifiError`] as the standard error-frame
+/// envelope, via [`crate::network::error_to_json`] — `detail` never reaches
+/// this (see that function's own doc). Callers that know the attempted SSID
+/// (`network.wifi_connect`) use [`crate::network::error_to_json_with_ssid`]
+/// directly instead, so the `no_ip`/`portal` messages can name it.
+fn network_error_frame(err: &crate::network::WifiError) -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(crate::network::error_to_json(err)),
+    }
+}
+
 /// `device.power_local`'s own result-frame mapping. UNLIKE the generic
 /// [`device_op_result_frame`] (whose dashboard callers render the
 /// stdout/stderr payload, so `ok:true` + `success:false` is legible there),
@@ -7142,6 +7156,35 @@ impl MethodHandler {
             // loopback-peer AND a closed two-value action AND a rate limit.
             "device.power_local" => self.handle_device_power_local(params, conn).await,
 
+            // ── D4a: network settings (Wi-Fi over iwd D-Bus) ──────────
+            // Same admin + appliance gate as the `device.*` family above
+            // (design `DESIGN-network-settings-2026-08.md` §3.2: the
+            // authorization decision lives at the RPC front door, not just
+            // in the iwd D-Bus policy's `netdev` group membership). The
+            // OOBE pre-auth twin of these lives in `server.rs` as
+            // `/api/first-run/network/*` — see that module for why the
+            // WS-RPC path can't be used before an account exists.
+            "network.wifi_scan" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_network_wifi_scan(params).await
+            }
+            "network.wifi_connect" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_network_wifi_connect(params).await
+            }
+            "network.wifi_forget" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_network_wifi_forget(params).await
+            }
+            "network.status" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_network_status().await
+            }
+
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
     }
@@ -7411,6 +7454,10 @@ impl MethodHandler {
                     { "name": "device.factory_reset", "description": "Wipe device state and re-provision on next boot (admin, appliance-only, destructive: requires confirm)" },
                     { "name": "device.power", "description": "Restart or shut down the device (admin, appliance-only, destructive: requires confirm)" },
                     { "name": "device.power_local", "description": "Lock-screen power menu: restart or shut down the device (no login, appliance-only, loopback-only, rate limited)" },
+                    { "name": "network.wifi_scan", "description": "Scan for Wi-Fi networks via iwd D-Bus (admin, appliance-only)" },
+                    { "name": "network.wifi_connect", "description": "Connect to a Wi-Fi network by SSID, with an optional passphrase (admin, appliance-only, audited)" },
+                    { "name": "network.wifi_forget", "description": "Delete a stored Wi-Fi credential by SSID (admin, appliance-only, audited)" },
+                    { "name": "network.status", "description": "Wi-Fi link state, IP info, and internet/captive-portal connectivity (admin, appliance-only)" },
                 ]
             }),
         )
@@ -44118,6 +44165,100 @@ impl MethodHandler {
         }
     }
 
+    // ── D4a: network settings (Wi-Fi over iwd D-Bus) ──────────────────
+    // See `crate::network` for the type/error-taxonomy design and
+    // `crate::network::iwd` for the D-Bus call sequence. Dispatch gating
+    // (admin + appliance) lives with the other `device.*`/`network.*`
+    // macros in `dispatch` above; these four handlers only translate
+    // params <-> the module's own async facade.
+
+    /// `network.wifi_scan` — `rescan` defaults to `true` (a fresh scan)
+    /// when omitted, matching design §5.2's example payload.
+    async fn handle_network_wifi_scan(&self, params: Value) -> WsFrame {
+        let rescan = params.get("rescan").and_then(Value::as_bool).unwrap_or(true);
+        match crate::network::wifi_scan(rescan).await {
+            Ok(result) => WsFrame::ok_response("", crate::network::scan_result_to_json(&result)),
+            Err(err) => network_error_frame(&err),
+        }
+    }
+
+    /// `network.wifi_connect` — success AND failure are audited (design
+    /// §3.2); the psk itself, and even whether one was supplied, never
+    /// reaches the audit payload (password-shaped information).
+    async fn handle_network_wifi_connect(&self, params: Value) -> WsFrame {
+        let req: crate::network::WifiConnectRequest = match serde_json::from_value(params) {
+            Ok(r) => r,
+            Err(e) => return WsFrame::error_response("", &format!("invalid params: {e}")),
+        };
+        if req.ssid.trim().is_empty() {
+            return WsFrame::error_response("", "ssid 不可為空");
+        }
+
+        let result = crate::network::wifi_connect(&req.ssid, req.psk.as_deref()).await;
+        self.audit_wifi_event("wifi_connect", &req.ssid, &result);
+
+        match result {
+            Ok(()) => WsFrame::ok_response("", json!({ "state": "connected", "ssid": req.ssid })),
+            Err(err) => WsFrame::Response {
+                id: String::new(),
+                ok: false,
+                payload: None,
+                error: Some(crate::network::error_to_json_with_ssid(&err, &req.ssid)),
+            },
+        }
+    }
+
+    /// `network.wifi_forget` — success AND failure are audited.
+    async fn handle_network_wifi_forget(&self, params: Value) -> WsFrame {
+        let ssid = match params.get("ssid").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => s.to_string(),
+            _ => return WsFrame::error_response("", "ssid 不可為空"),
+        };
+
+        let result = crate::network::wifi_forget(&ssid).await;
+        self.audit_wifi_event("wifi_forget", &ssid, &result);
+
+        match result {
+            Ok(()) => WsFrame::ok_response("", json!({ "forgotten": true, "ssid": ssid })),
+            Err(err) => network_error_frame(&err),
+        }
+    }
+
+    /// `network.status` — the underlying facade always succeeds (every
+    /// sub-source degrades to an honest "unavailable"/"unknown" value
+    /// rather than failing the call — see `network::status`'s own doc);
+    /// the `Err` arm below only guards symmetry with the other three
+    /// handlers and JSON serialization, which cannot itself fail for this
+    /// type.
+    async fn handle_network_status(&self) -> WsFrame {
+        match crate::network::status().await {
+            Ok(status) => match serde_json::to_value(&status) {
+                Ok(v) => WsFrame::ok_response("", v),
+                Err(e) => WsFrame::error_response("", &format!("network status serialize failed: {e}")),
+            },
+            Err(err) => network_error_frame(&err),
+        }
+    }
+
+    /// Design §3.2: append ONE audit row per `wifi_connect`/`wifi_forget`
+    /// call, success or failure — `{ssid, ok, code, source}` only. No psk,
+    /// no "psk_supplied" flag (that alone is password-shaped metadata).
+    fn audit_wifi_event(&self, event_type: &str, ssid: &str, result: &Result<(), crate::network::WifiError>) {
+        let (ok, code) = match result {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e.code.code())),
+        };
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                event_type,
+                ssid,
+                duduclaw_security::audit::Severity::Info,
+                json!({ "ssid": ssid, "ok": ok, "code": code, "source": "dashboard" }),
+            ),
+        );
+    }
+
     async fn handle_device_update_status(&self) -> WsFrame {
         device_op_result_frame(crate::device_ops::select_device_ops().update_status().await)
     }
@@ -44545,11 +44686,12 @@ mod device_rpc_tests {
         }
     }
 
-    /// Every `device.*` method, tried with no `DUDUCLAW_APPLIANCE` set —
-    /// the default test-process state (this crate never sets that env var
-    /// in any other test). Every one must fail closed with
-    /// `not_appliance`, admin or not — the appliance gate runs regardless
-    /// of role.
+    /// Every `device.*` method (plus D4a's `network.*` family, which shares
+    /// the exact same `require_admin!() + require_appliance!()` gate), tried
+    /// with no `DUDUCLAW_APPLIANCE` set — the default test-process state
+    /// (this crate never sets that env var in any other test). Every one
+    /// must fail closed with `not_appliance`, admin or not — the appliance
+    /// gate runs regardless of role.
     #[tokio::test]
     async fn all_device_methods_fail_closed_off_appliance() {
         assert!(
@@ -44578,6 +44720,11 @@ mod device_rpc_tests {
             // SAME code as the rest of the family (`PowerLocalDenial::
             // NotAppliance`), so a client branches on one string, not two.
             ("device.power_local", json!({"action": "reboot"})),
+            // D4a: network.* shares the device.* gate byte-for-byte.
+            ("network.wifi_scan", json!({})),
+            ("network.wifi_connect", json!({"ssid": "SomeNetwork", "psk": "somepassphrase"})),
+            ("network.wifi_forget", json!({"ssid": "SomeNetwork"})),
+            ("network.status", json!({})),
         ] {
             let frame = handler.handle(method, params, &ctx).await;
             assert_eq!(

@@ -1952,6 +1952,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/api/change-password", post(handle_change_password))
         .route("/api/first-run/status", get(handle_first_run_status))
         .route("/api/first-run/claim", post(handle_first_run_claim))
+        // D4a: OOBE pre-auth network setup — see `first_run_network_gate`'s
+        // doc for the fail-closed conditions shared by all three routes.
+        // Deliberately no `/api/first-run/network/forget` — see
+        // `handle_first_run_network_connect`'s doc.
+        .route("/api/first-run/network/status", get(handle_first_run_network_status))
+        .route("/api/first-run/network/scan", post(handle_first_run_network_scan))
+        .route("/api/first-run/network/connect", post(handle_first_run_network_connect))
         .route("/api/session/local", post(handle_local_session))
         .with_state(state.clone());
 
@@ -3063,6 +3070,171 @@ async fn handle_first_run_claim(
             )
                 .into_response()
         }
+    }
+}
+
+// ── D4a: OOBE pre-auth network setup ─────────────────────────────────────
+//
+// The OOBE flow's order is "network step, THEN account step" (design
+// `DESIGN-network-settings-2026-08.md` §5.1) — the network step runs before
+// any account exists, so `require_admin!()`'s WS-RPC gate can never be
+// satisfied yet. These three routes are the pre-auth twin of `network.*`,
+// shaped exactly like the existing `/api/first-run/claim` flow above:
+// loopback-only + unclaimed-instance-only, with one extra condition
+// `/api/first-run/claim` doesn't need — appliance-only, since this whole
+// feature is meaningless off the appliance image (a laptop dev build has no
+// iwd to drive).
+
+/// Fail-closed gate shared by all three `/api/first-run/network/*` routes:
+/// loopback caller, instance still unclaimed, AND running on the appliance
+/// image. Every failure returns the exact SAME message regardless of which
+/// condition tripped — matching `handle_local_session`'s "an off-loopback
+/// prober must not be able to learn the edition, the switch state, or which
+/// condition it tripped" discipline (and `handle_first_run_status`'s
+/// analogous loopback-only rule) — a probe from off-loopback, or one that
+/// arrives after claim, or one against a non-appliance build, all look
+/// identical from the outside.
+fn first_run_network_gate(state: &AppState, addr: SocketAddr) -> Option<axum::response::Response> {
+    let allowed =
+        addr.ip().is_loopback() && state.user_db.is_unclaimed_default_admin() && duduclaw_core::is_appliance();
+    if allowed {
+        return None;
+    }
+    Some(
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "first-run network setup is only available from localhost on an appliance before setup"
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// `{"ok": false, "code": ..., "message": ...}` at HTTP 200 — design §5.1's
+/// deliberate choice of an envelope over HTTP status semantics: the shell is
+/// a hand-rolled HTTP/1.1 client (see `duduclaw-shell/src/oobe/claim.rs`),
+/// and a single explicit `code` field it can switch on is far more robust
+/// than asking it to correctly interpret 4xx/5xx nuance. Body-parse failures
+/// and the three gate conditions above are NOT rendered this way — those
+/// are 400/403 respectively, because they are not one of the closed nine
+/// [`crate::network::WifiErrorCode`] outcomes this envelope exists for.
+fn network_error_envelope(err: &crate::network::WifiError) -> axum::response::Response {
+    Json(serde_json::json!({
+        "ok": false,
+        "code": err.code.code(),
+        "message": err.code.message(),
+    }))
+    .into_response()
+}
+
+/// GET /api/first-run/network/status
+async fn handle_first_run_network_status(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> axum::response::Response {
+    if let Some(denied) = first_run_network_gate(&state, addr) {
+        return denied;
+    }
+    // `network::status()` never returns `Err` in the current implementation
+    // (see that function's own doc) — the `Err` arm below is symmetry with
+    // the other two handlers, not reachable dead code by design.
+    match crate::network::status().await {
+        Ok(status) => match serde_json::to_value(&status) {
+            Ok(v) => Json(serde_json::json!({"ok": true, "result": v})).into_response(),
+            Err(e) => {
+                warn!("first-run network status serialize failed: {e}");
+                network_error_envelope(&crate::network::WifiError {
+                    code: crate::network::WifiErrorCode::BackendUnavailable,
+                    detail: e.to_string(),
+                })
+            }
+        },
+        Err(err) => network_error_envelope(&err),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FirstRunNetworkScanRequest {
+    /// `None` (field omitted) defaults to `true` — a fresh scan — matching
+    /// `network.wifi_scan`'s own default.
+    #[serde(default)]
+    rescan: Option<bool>,
+}
+
+/// POST /api/first-run/network/scan
+async fn handle_first_run_network_scan(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<FirstRunNetworkScanRequest>,
+) -> axum::response::Response {
+    if let Some(denied) = first_run_network_gate(&state, addr) {
+        return denied;
+    }
+    let rescan = body.rescan.unwrap_or(true);
+    match crate::network::wifi_scan(rescan).await {
+        Ok(result) => {
+            Json(serde_json::json!({"ok": true, "result": crate::network::scan_result_to_json(&result)}))
+                .into_response()
+        }
+        Err(err) => network_error_envelope(&err),
+    }
+}
+
+/// POST /api/first-run/network/connect
+///
+/// Deliberately has NO `/api/first-run/network/forget` twin — OOBE has no
+/// "forget this network" UI at all (there is nothing yet to forget on a
+/// freshly-provisioned appliance), so a pre-auth forget endpoint would only
+/// be extra pre-auth attack surface for zero product value — minimal attack
+/// surface wins (design §5.1).
+async fn handle_first_run_network_connect(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<crate::network::WifiConnectRequest>,
+) -> axum::response::Response {
+    if let Some(denied) = first_run_network_gate(&state, addr) {
+        return denied;
+    }
+    if body.ssid.trim().is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "ssid must not be empty"})))
+            .into_response();
+    }
+    let result = crate::network::wifi_connect(&body.ssid, body.psk.as_deref()).await;
+
+    // Audited exactly like the `network.wifi_connect` RPC (design §3.2), and
+    // arguably MORE important here: this path has no authenticated caller to
+    // attribute — that is the whole point of a pre-auth route — so the audit
+    // row is the only record that the box's network was changed at all, and
+    // `source` distinguishes it from a dashboard-initiated change. Same
+    // payload discipline as the RPC: SSID, outcome, error class. Never the
+    // passphrase, and never a "was one supplied" flag either (that alone is
+    // password-shaped metadata).
+    let (ok, code) = match &result {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e.code.code())),
+    };
+    duduclaw_security::audit::append_audit_event(
+        &state.home_dir,
+        &duduclaw_security::audit::AuditEvent::new(
+            "wifi_connect",
+            &body.ssid,
+            duduclaw_security::audit::Severity::Info,
+            serde_json::json!({ "ssid": body.ssid, "ok": ok, "code": code, "source": "first_run_oobe" }),
+        ),
+    );
+
+    match result {
+        Ok(()) => {
+            Json(serde_json::json!({"ok": true, "result": {"state": "connected", "ssid": body.ssid}}))
+                .into_response()
+        }
+        Err(err) => Json(serde_json::json!({
+            "ok": false,
+            "code": err.code.code(),
+            "message": err.code.message_with_ssid(&body.ssid),
+        }))
+        .into_response(),
     }
 }
 

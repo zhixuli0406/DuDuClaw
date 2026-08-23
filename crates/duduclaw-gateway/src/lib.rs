@@ -37,6 +37,9 @@ pub mod auth;
 // ── WP-B: appliance-image device management (`device.*` dashboard RPCs) ──
 pub mod device;
 pub mod device_ops;
+// ── D4a: network settings (Wi-Fi over iwd D-Bus) — `network.*` RPCs +
+// `/api/first-run/network/*` OOBE pre-auth endpoints ─────────────────────
+pub mod network;
 // ── IMPL-POWER: the appliance lock screen's login-free power surface ─────
 pub mod power_local;
 // ── WP-G1: scheduled backups + device-migration restore ──────────────────
