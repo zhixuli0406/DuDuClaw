@@ -54,7 +54,11 @@ const DEFAULT_WATCH_IDLE_SECS: u64 = 60;
 /// mode fire on essentially every redraw tick, which is really "always
 /// paused" wearing an idle-timeout costume; reject that shape rather than
 /// silently accepting it.
-const MIN_WATCH_IDLE_SECS: u64 = 5;
+///
+/// E1a-1a reuses this as the human-seat synthesis quiet window
+/// (`human_seat::HUMAN_ACTIVE_WINDOW`) — see that constant's doc for why the
+/// semantics carry over rather than a fresh number being invented.
+pub(super) const MIN_WATCH_IDLE_SECS: u64 = 5;
 
 /// Pure parse+clamp, unit-testable without touching the environment.
 /// Missing or unparseable input, or a value under [`MIN_WATCH_IDLE_SECS`],

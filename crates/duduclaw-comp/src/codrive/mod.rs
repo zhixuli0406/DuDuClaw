@@ -93,6 +93,7 @@ mod audit;
 mod cursor;
 mod debug_sim;
 mod highlight;
+mod human_seat;
 mod keymap_ascii;
 mod listener;
 mod protocol;
@@ -342,6 +343,33 @@ impl DuduclawComp {
     /// cheap no-op (the flag is already set; there's no "extend freeze"
     /// timer at CD-0/CD-1 — that's watch-mode territory, CD-2).
     pub fn on_human_input(&mut self, kind: &'static str) {
+        // E1a-1a self-freeze guard (DESIGN §6.1.1 item ②, §6.1.2 M3/M4).
+        // Unreachable today — `human_seat.rs`'s emission helpers call `Seat`
+        // APIs directly, and this function's only caller is `input.rs::
+        // process_input_event` (plus `debug_sim.rs`) — so this is defence in
+        // depth against a future refactor that routes synthesis through the
+        // backend path. Without it that refactor would either live-lock the
+        // agent (inject → freeze itself → drop the next inject) or forge "a
+        // human is present" and permanently disarm watch mode's idle
+        // auto-pause. Reported rather than silent, per the module's standing
+        // "never a silent no-op" doctrine.
+        if self.codrive_synthesizing {
+            tracing::error!(
+                kind,
+                "codrive: a human-input event arrived while human-seat synthesis was in flight — \
+                 IGNORED. Agent-synthesised events must never be observed as human input (see \
+                 codrive/human_seat.rs). This means synthesis is now re-entering the backend \
+                 input path, which it must not."
+            );
+            self.codrive.record(
+                "synthesis_reentry_ignored",
+                Some(kind),
+                None,
+                None,
+                Some("a synthesised event re-entered on_human_input (E1a-1a guard)".into()),
+            );
+            return;
+        }
         self.codrive_last_human_activity = std::time::Instant::now();
         if self.codrive_try_watch_resume() {
             return; // CD-3: this event itself IS the "still watching" signal.
@@ -479,44 +507,57 @@ impl DuduclawComp {
             return;
         }
 
-        // E1a-1 backstop: would this command deliver to a client the seat
-        // filter hides the agent seat from? smithay routes seat events through
-        // the client's OWN `wl_keyboard`/`wl_pointer` objects, which only
-        // exist if the client bound that seat (`for_each_focused_kbds` /
-        // `for_each_focused_pointer`) — so such a command reaches nobody. Same
-        // doctrine as the `paused_by_ime` guard above: report it, never let
-        // `inject_applied` claim a keystroke that went nowhere. See
-        // `crate::ime::seat_filter`.
-        if let Some(target) = self.agent_delivery_target(&cmd) {
-            if crate::ime::seat_filter::agent_seat_hidden_from(&target) {
-                let (op, x, y) = cmd.describe();
-                let app = target
-                    .get_data::<crate::state::ClientState>()
-                    .and_then(|d| d.comm().map(str::to_string))
-                    .unwrap_or_else(|| "<unknown>".to_string());
-                tracing::warn!(
-                    op,
-                    app = %app,
-                    "codrive: dropping a command — the target client cannot see the agent seat, \
-                     so it holds no wl_keyboard/wl_pointer on it and the event would reach \
-                     nobody. Allow-list the process with {} to make it co-drivable (see \
-                     crate::ime::seat_filter for the tradeoff)",
-                    crate::ime::seat_filter::AGENT_SEAT_PROCS_ENV
-                );
-                self.codrive.record(
-                    "inject_dropped",
-                    Some(op),
-                    x,
-                    y,
-                    Some(format!(
-                        "unreachable_client: {app} does not see the agent seat (E1a-1 seat filter)"
-                    )),
-                );
-                return;
-            }
+        // E1a-1 / E1a-1a routing. smithay routes seat events through the
+        // client's OWN `wl_keyboard`/`wl_pointer` objects, which only exist if
+        // the client bound that seat (`for_each_focused_kbds` /
+        // `for_each_focused_pointer`) — so a command aimed at a client the
+        // seat filter hides the agent seat from reaches nobody.
+        //
+        // E1a-1 shipped the honest half of that: report the drop, never let
+        // `inject_applied` claim a keystroke that went nowhere. E1a-1a (option
+        // (b), user decision 2026-08-24, reviewed in DESIGN §6.1) adds the
+        // recovery: mirror the event onto the HUMAN seat, which every client
+        // can see. `human_seat::route_inject` is the whole policy as one pure
+        // function; the reasons it refuses, and the two red-line defences
+        // behind them, are in that module's doc.
+        let target = self.agent_delivery_target(&cmd);
+        // Deliberately a closure, not an eagerly-built `String`: the unchanged
+        // agent-seat path must stay allocation-free, and only the drop and
+        // mirror branches ever need a name.
+        let target_app = || {
+            target
+                .as_ref()
+                .and_then(|c| c.get_data::<crate::state::ClientState>())
+                .and_then(|d| d.comm().map(str::to_string))
+                .unwrap_or_else(|| "<unknown>".to_string())
+        };
+        let routing = human_seat::route_inject(
+            human_seat::op_kind_of(&cmd),
+            target.as_ref().map(crate::ime::seat_filter::agent_seat_hidden_from),
+            &self.codrive_synthesis_env(),
+        );
+        if let Some(reason) = routing.drop_with {
+            let (op, x, y) = cmd.describe();
+            let app = target_app();
+            tracing::warn!(
+                op,
+                app = %app,
+                ?reason,
+                "codrive: dropping a command — the target client cannot see the agent seat, and \
+                 human-seat synthesis is not available for it. Allow-list the process with {} to \
+                 co-drive it on the agent seat instead (see crate::ime::seat_filter for the \
+                 tradeoff)",
+                crate::ime::seat_filter::AGENT_SEAT_PROCS_ENV
+            );
+            self.codrive.record("inject_dropped", Some(op), x, y, Some(reason.audit_detail(&app)));
+            return;
         }
 
         let (op, x, y) = cmd.describe();
+        // Kept for the human-seat mirror below: the agent-seat `match` takes
+        // `cmd` by value. Injection commands are small (a `String` at worst),
+        // and this clone only happens on the synthesis path.
+        let mirror = routing.mirror_to_human_seat.then(|| cmd.clone());
 
         match cmd {
             InjectCmd::Move { x, y } => {
@@ -685,6 +726,14 @@ impl DuduclawComp {
             InjectCmd::ActivateWindow { app_id } => self.codrive_activate_window(app_id),
         }
 
+        // E1a-1a: the agent-seat path above ran first and unchanged (it keeps
+        // the amber cursor, the agent seat's own focus bookkeeping and every
+        // existing audit line honest); this additionally puts the same event
+        // on the human seat, which is the only seat the target can see.
+        if let Some(cmd) = &mirror {
+            self.codrive_mirror_to_human_seat(cmd);
+        }
+
         // A4-1 damage source: every arm above that reaches this point moved
         // the agent cursor, clicked, typed into a focused surface, armed a
         // highlight box, or toggled the shadow workspace / takeover / watch
@@ -696,27 +745,50 @@ impl DuduclawComp {
 
         // WP-CD2-freeze-scope: tag shadow-bypassed applies for the audit
         // trail; `None` (unchanged) for every non-bypass apply.
-        self.codrive.record(
-            "inject_applied",
-            Some(op),
-            x,
-            y,
-            if shadow_bypass { Some("scope:shadow".to_string()) } else { None },
-        );
+        //
+        // E1a-1a: a synthesised command gets its OWN audit kind rather than a
+        // tagged `inject_applied`, so existing `inject_applied` counts keep
+        // meaning "delivered on the agent seat" (DESIGN §6.1.1 item ③).
+        if mirror.is_some() {
+            let app = target_app();
+            self.codrive.record(
+                "inject_via_human_seat",
+                Some(op),
+                x,
+                y,
+                Some(format!("synthesized_via=human_seat; target={app}")),
+            );
+        } else {
+            self.codrive.record(
+                "inject_applied",
+                Some(op),
+                x,
+                y,
+                if shadow_bypass { Some("scope:shadow".to_string()) } else { None },
+            );
+        }
     }
 
     /// E1a-1: which client, if any, would this command actually deliver to?
     ///
     /// Only the ops whose entire purpose is client delivery are answered.
-    /// `Move` is deliberately absent: an agent pointer motion that no client
-    /// hears still moves the compositor-drawn amber cursor, which is a real
-    /// effect and not a failure. `Highlight` / `Shadow` / `Watch` /
-    /// `TakeOver` / `ActivateWindow` are compositor-side by construction.
+    /// `Highlight` / `Shadow` / `Watch` / `TakeOver` / `ActivateWindow` are
+    /// compositor-side by construction.
     ///
     /// `None` means "cannot tell" — no keyboard focus, nothing under the
     /// pointer, or a surface whose client already went away — and is treated
     /// as "do not drop", i.e. the check fails open. The command then behaves
     /// exactly as it did before this guard existed.
+    ///
+    /// **E1a-1a added the `Move` arm.** Under E1a-1 alone this function's only
+    /// consumer was the drop decision, and `Move` had to be absent from it: an
+    /// agent pointer motion no client hears still moves the compositor-drawn
+    /// amber cursor, which is a real effect, not a failure. It is now also the
+    /// input to the *mirror* decision, where `Move` matters — a synthesised
+    /// click lands wherever the human pointer already is, so the motion has to
+    /// be mirrored too. `human_seat::route_inject` keeps `Move`'s exemption
+    /// from the drop half explicitly, so answering it here cannot make a
+    /// motion droppable.
     fn agent_delivery_target(&self, cmd: &InjectCmd) -> Option<wayland_server::Client> {
         use wayland_server::Resource as _;
         match cmd {
@@ -729,6 +801,11 @@ impl DuduclawComp {
                 let pos = self.agent_seat.get_pointer()?.current_location();
                 self.surface_under(pos).and_then(|(surface, _)| surface.client())
             }
+            // The DESTINATION, not the current location: the question is which
+            // client the pointer is about to be over.
+            InjectCmd::Move { x, y } => self
+                .surface_under(Point::<f64, Logical>::from((*x, *y)))
+                .and_then(|(surface, _)| surface.client()),
             _ => None,
         }
     }

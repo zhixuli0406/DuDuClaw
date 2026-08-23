@@ -5803,3 +5803,163 @@ here because all three are policy calls:
    travels through a seat object distinct from the human's.
 3. Accept the loss until gpui gains multi-seat support upstream, at which
    point the shell needs no exemption and no ordering workaround either.
+
+## E1a-1a (2026-08-24): driving a client that cannot see the agent seat — human-seat synthesis
+
+Answers the open decision E1a-1 left on the table (that section's last block):
+with the seat filter armed, co-drive could reach no third-party app at all.
+User decision 2026-08-24, option **(b)**: when the target cannot see the agent
+seat, synthesise the event on the **human** seat, which every client can see.
+Red-line review before implementation is
+`commercial/docs/DESIGN-codrive-desktop-2026-08.md` §6.1.
+
+### What the review changed about the plan
+
+Option (b) touches DESIGN §3.3.1 ("事件源頭天然歸因…全部以 seat 為單位"), so the
+review went red line by red line. Two findings changed the implementation:
+
+1. **A real hole nobody had named: modifier residue.** `KeyboardHandle::input`
+   updates the *seat's* xkb modifier state. Synthesising a bare Logo-down on
+   the human seat leaves `modifiers.logo == true` for the next **genuine**
+   human key — so a plain Escape would fire the emergency stop and a plain
+   Enter the hand-back. That is §6 red line 3 ("急停鍵永遠有效，agent 不可攔截")
+   defeated indirectly, by remote-controlling a human-only gesture rather than
+   forging it. Logo and Alt are therefore refused outright on the synthesis
+   path. `key_name`'s table contains no modifier and `text` only uses Shift, so
+   only a raw `key` can carry one.
+
+2. **The shadow workspace and the human seat are mutually exclusive.** A
+   shadow session is separate state from the freeze flag (`shadow.rs` module
+   doc), so it can be live while nothing is frozen — and the human seat's
+   pointer and keyboard focus are on the MAIN output. Mirroring a
+   shadow-confined command onto them would deliver the agent's keystrokes into
+   whatever window the human is actually using and drag the human's cursor
+   toward the shadow origin `(0, 100000)`, i.e. off-screen: a direct breach of
+   DESIGN §3.1 rule 2 ("與人的桌面零交集"). Synthesis is therefore refused for
+   the whole duration of a shadow session, using the mode flag rather than a
+   per-command "is this target really on the shadow output" test — the latter
+   would have to fail *open* to be useful, and failing open is the wrong
+   direction for a cross-domain leak.
+
+3. **The freeze is the main defence, but it has two documented gaps.** Any
+   human input freezes the agent, so human/agent events cannot normally
+   interleave. Two paths deliberately do *not* freeze: `codrive_try_watch_
+   resume` (a watch-idle pause is lifted by presence, returning before the
+   freeze) and `input.rs::is_system_gesture_tail` (the Super+Enter chord tail,
+   the CD-2 real-hardware fix). Both leave a live seat with a human's hands on
+   it. A synthesis-only quiet window closes them.
+
+### What landed
+
+`src/codrive/human_seat.rs` — the whole policy as one pure function, same
+shape as `seat_filter::agent_seat_visible_to` and
+`shadow::freeze_bypass_decision`:
+
+```rust
+pub fn route_inject(kind: OpKind, target_hidden: Option<bool>, env: &SynthesisEnv)
+    -> InjectRouting  // { mirror_to_human_seat: bool, drop_with: Option<RefuseReason> }
+```
+
+* **Additive, never a replacement.** The agent-seat path runs first and
+  unchanged (amber cursor, agent-seat focus bookkeeping, every existing audit
+  line); the mirror is emitted afterwards. That is what keeps a following
+  `text` op resolving to the same target.
+* **Refusal reasons**, each its own audit `detail` prefix:
+  `unreachable_client_synth_disabled` (kill switch), `shadow_active`,
+  `human_active`, `paused_by_ime_human_seat`, `no_human_focus`,
+  `gesture_modifier`.
+* **`move` is never dropped**, keeping E1a-1's exemption: a blocked synthesis
+  degrades to "the agent cursor still moves, the human pointer is not dragged",
+  not to a drop.
+* **Distinct audit kind** `inject_via_human_seat` (detail
+  `synthesized_via=human_seat; target=<comm>`) rather than a tagged
+  `inject_applied`, so existing counts keep meaning "delivered on the agent
+  seat".
+* **Quiet window is borrowed, not invented.** `HUMAN_ACTIVE_WINDOW =
+  watch::MIN_WATCH_IDLE_SECS` (5s) — this crate has no "freeze window"
+  constant (`codrive_freeze_set_at` is a timestamp; DESIGN §5's `<50ms` is a
+  latency target), and that constant already means "the shortest silence we
+  will call 'nobody is there'".
+* **Self-freeze guard.** `DuduclawComp::codrive_synthesizing` is set around
+  every mirror; `on_human_input` checks it first and, if set, warns + records
+  `synthesis_reentry_ignored` and returns. Unreachable today (the emission
+  helpers call `Seat` APIs directly, never `process_input_event`) — it exists
+  so a future refactor fails loudly instead of live-locking the agent
+  (inject → freeze itself → drop) or forging "a human is present" and
+  permanently disarming watch-mode idle auto-pause.
+* **Knob** — `DUDUCLAW_COMP_CODRIVE_HUMAN_SEAT_SYNTH=off` restores E1a-1's
+  drop exactly. Anything else leaves it on, matching
+  `DUDUCLAW_COMP_SEAT_FILTER`'s "a typo lands on the shipped side".
+
+`agent_delivery_target` gained a `Move` arm (the destination client, not the
+current one). Under E1a-1 it fed only the drop decision, where `Move` had to
+be absent; it now also feeds the mirror decision, where `Move` matters —
+a synthesised click lands wherever the human pointer already is.
+
+### Two behaviour changes, disclosed rather than hidden
+
+* The human's **pointer moves** during synthesis (without it a synthesised
+  click lands at the human's last cursor position and hover-driven UI never
+  responds).
+* The human's **keyboard focus changes** when a synthesised click lands
+  (click-to-focus is per-seat).
+
+Both follow from "the agent is driving the human's desktop"; both are
+consistent with the mutual exclusion the freeze already enforces. A third
+consequence is irreducible and is written into DESIGN §6.1.1 instead of being
+argued away: **the client cannot tell a synthesised event from a human one**,
+so an app's own log attributes it to the user — the same property RDP,
+`xdotool` and `wtype` have. comp-side attribution (audit kind + `comm`) is
+unaffected.
+
+### Live verification (2026-08-24, nested container stack)
+
+Same three-layer rig as E1a-1/D3-c — `weston --backend=headless-backend.so` →
+`duduclaw-comp` (winit) → `foot` under `WAYLAND_DEBUG=1` — plus real `fcitx5`
+for round 4. Scripts kept out of the repo (scratchpad). **10/10 PASS**:
+
+| # | check | evidence |
+|---|---|---|
+| 1 | a non-allow-listed client sees only the human seat | foot: one `wl_registry@2.global(11, "wl_seat", 9)`, `wl_seat@11.name("winit")`, `get_keyboard(wl_keyboard@19)` |
+| 2 | …and synthesised text really lands on it | `wl_keyboard@19.enter(...)`, then `.key(...,35,1) .key(...,35,0) .key(...,23,1) .key(...,23,0)` — evdev 35/23 = `h`/`i`. E1a-1's baseline for the identical command was **0** key events |
+| 3 | …audited as such | `inject_via_human_seat`, `detail: "synthesized_via=human_seat; target=foot"` for `move`/`button`/`button`/`text` |
+| 4 | sustained synthesis never self-freezes | 30 consecutive `text` ops → 30 `inject_via_human_seat`, **0** `freeze`, **0** `synthesis_reentry_ignored`, `status` still `frozen:false` |
+| 5 | a human touch refuses synthesis, and `move` still is not dropped | `simulate_human` → `simulate_super_enter` → immediate inject: `text`/`button` → `inject_dropped … "human_active: …"`; `move` → `inject_applied`. After 6s the same `text` → `inject_via_human_seat` |
+| 6 | Logo/Alt are refused, ordinary modifiers are not | `key` 133 (LEFTMETA) and 64 (LEFTALT) → `inject_dropped … "gesture_modifier: …"`; `key` 37 (LEFTCTRL) → `inject_via_human_seat`, so Ctrl-chords stay drivable |
+| 7 | real fcitx5 grabbing the human seat refuses keyboard ops only | comp: `input-method keyboard grab changed human_seat=true agent_seat=false`; `text`/`key_name` → `inject_dropped … "paused_by_ime_human_seat: …"`; `move`/`button` → `inject_via_human_seat` |
+| 8 | a shadow session never borrows the human seat | `shadow enable` → `text` → `inject_dropped … "shadow_active: …"`; after `shadow disable` the same `text` routes normally again |
+| 9 | the kill switch restores E1a-1 exactly | `…HUMAN_SEAT_SYNTH=off`: `button` → `inject_dropped … "unreachable_client_synth_disabled: …"`, foot got **0** key events |
+| 10 | an allow-listed client keeps the agent-seat path byte-identical | `DUDUCLAW_COMP_AGENT_SEAT_PROCS=duduclaw-shell,foot`: foot binds both seats, keys land on `wl_keyboard@22` under `wl_seat@11.name("duduclaw-agent")`, audit is plain `inject_applied` with **no** `inject_via_human_seat` |
+
+Container: `cargo test` **522 passed** (497 + 25: the routing truth table
+including every refusal reason and the `move`-never-drops rows, op
+classification, the gesture-modifier table, the kill-switch parser, the audit
+detail shapes, and three source-structure invariants pinning the self-freeze
+guard), `cargo clippy --all-targets -- -D warnings` clean. Binary in
+`appliance/.build/duduclaw-comp-linux` (previous rotated to `.prev`, old
+`.prev` → `.prev7`).
+
+### Honest gaps
+
+* **Chromium under synthesis** is still a VM step — the container has no
+  Chromium. Row 1/2 prove the mechanism against a real multi-seat-aware client
+  (`foot` binds both seats when allowed, which is exactly why hiding one broke
+  co-drive), but "the LINE extension responds to a synthesised click" is not
+  claimed here.
+* **The socket ack does not carry the refusal.** A dropped-at-the-main-thread
+  command still answers `{"ok":true}` on the socket; only the audit trail
+  records the drop. This is E1a-1's shape carried forward, not new — but it
+  means the gateway driver cannot yet see a `human_active` refusal in its
+  reply. `paused_by_ime` (agent seat) is the one op-level pre-rejection with
+  an `ok:false` today; extending that to the E1a-1a reasons needs the socket
+  thread to mirror the human-seat state and is deliberately not done here.
+* **A synthesised non-gesture modifier can still be left held** (e.g. `key`
+  Ctrl-down with no matching up) and would then affect a later human keystroke
+  on that seat. It cannot reach a compositor gesture (those all need Logo or
+  Alt), and any human input freezes the agent, so the window is small — but it
+  is a real residue and is recorded in DESIGN §6.1.2 rather than fixed by
+  tracking synthesised key state.
+* **The three self-freeze pins are source-structure tests.** The property is
+  structural ("no code path from a synthesised event into the human-input
+  observer"), so there is no value to assert on, and a runtime test would need
+  a live compositor with a GL context, which this suite does not build.

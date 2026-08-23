@@ -161,6 +161,20 @@ pub struct DuduclawComp {
     /// set_at` which only updates on the not-frozen→frozen transition).
     /// `codrive_check_watch_idle` compares `Instant::now()` against this.
     pub codrive_last_human_activity: std::time::Instant,
+    /// E1a-1a (`codrive/human_seat.rs`): true only for the duration of one
+    /// human-seat synthesised emission. `codrive::on_human_input` refuses to
+    /// treat anything as human input while it is set.
+    ///
+    /// Defence in depth, not a live requirement: the synthesis helpers call
+    /// `Seat` APIs directly and never reach `input.rs::process_input_event`,
+    /// which is the only caller of `on_human_input`. The flag exists so that
+    /// a future change which *does* route synthesis through the backend path
+    /// fails loudly (an audited, warned no-op) instead of silently live-
+    /// locking the agent — inject → freeze itself → drop — or forging "a
+    /// human is present" and disarming watch mode's idle auto-pause. See
+    /// DESIGN-codrive-desktop-2026-08.md §6.1.1 item ②. Main-thread-only
+    /// `bool`, same as `codrive_shadow_active`/`codrive_takeover_active`.
+    pub codrive_synthesizing: bool,
     /// WP-comp-shell-ipc (2026-08-22): cross-thread state shared with the
     /// shell-control socket thread (`shell_control::init`) — a SEPARATE
     /// channel/trust-boundary from `codrive` above, see that module's own
@@ -454,6 +468,7 @@ impl DuduclawComp {
             codrive_watch_active: false,
             codrive_watch_paused: false,
             codrive_last_human_activity: start_time,
+            codrive_synthesizing: false,
             shell_control,
             pending_shell_intents: std::collections::VecDeque::new(),
             theme: crate::decor::Theme::default(),
