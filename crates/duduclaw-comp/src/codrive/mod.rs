@@ -126,6 +126,15 @@ pub use shadow::{create_shadow_output, SHADOW_ORIGIN};
 // CodriveShared` from sibling submodules) keeps working unchanged.
 pub use shared::CodriveShared;
 
+/// The agent seat's `wl_seat` name.
+///
+/// A named constant rather than a literal because D3-c's per-client seat
+/// filter (`crate::ime::seat_filter`) identifies the agent seat *by this
+/// name*, and a silent divergence between the two would disarm the filter
+/// at startup — which is exactly the sort of thing a constant prevents and
+/// a duplicated string literal invites.
+pub const AGENT_SEAT_NAME: &str = "duduclaw-agent";
+
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -227,7 +236,7 @@ pub fn init(
         }
     };
 
-    let mut agent_seat: Seat<DuduclawComp> = seat_state.new_wl_seat(dh, "duduclaw-agent");
+    let mut agent_seat: Seat<DuduclawComp> = seat_state.new_wl_seat(dh, AGENT_SEAT_NAME);
     agent_seat
         .add_keyboard(XkbConfig::default(), 200, 25)
         .expect("codrive: failed to initialize agent seat keyboard");
@@ -419,6 +428,27 @@ impl DuduclawComp {
     /// freeze re-check here, not just the socket thread's, is the
     /// authoritative one.
     pub fn handle_agent_inject(&mut self, cmd: InjectCmd) {
+        // D3-c backstop. Keeps the socket thread's mirror honest AND is the
+        // authoritative read for the keyboard gate below.
+        let ime_paused = self.codrive_refresh_ime_pause();
+        if ime_paused && cmd.is_keyboard_op() {
+            let (op, x, y) = cmd.describe();
+            tracing::warn!(
+                op,
+                "codrive: dropping a keyboard command — an input method holds a keyboard \
+                 grab on the agent seat, so the keystroke would vanish into a composition \
+                 instead of reaching the focused window. See crate::ime::seat_filter"
+            );
+            self.codrive.record(
+                "inject_dropped",
+                Some(op),
+                x,
+                y,
+                Some("paused_by_ime: an input method holds the agent seat's keyboard grab".into()),
+            );
+            return;
+        }
+
         let frozen = self.codrive.frozen.load(Ordering::SeqCst);
         // WP-CD2-freeze-scope (module doc item 8): drops everything while
         // frozen UNLESS THIS command's actual target is confirmed confined
@@ -636,6 +666,70 @@ impl DuduclawComp {
             y,
             if shadow_bypass { Some("scope:shadow".to_string()) } else { None },
         );
+    }
+
+    /// D3-c backstop: is an input method holding a keyboard grab on the
+    /// AGENT seat right now?
+    ///
+    /// This should never be true — `crate::ime::seat_filter` hides the agent
+    /// seat from input-method clients precisely so no such grab can be
+    /// established. It exists because that filter has one soft edge: it
+    /// recognises an input method by its process name, so an input method
+    /// running under an unexpected name (or a smithay upgrade that disarms
+    /// the filter's self-check) would slip past. The failure that would then
+    /// occur is the worst possible kind — `type_text` returning success while
+    /// every keystroke vanishes into a composition nobody reads — so it gets
+    /// an explicit, reported state rather than being left to chance.
+    ///
+    /// Reads smithay's own per-seat `InputMethodHandle`, which tracks whether
+    /// a live `zwp_input_method_keyboard_grab_v2` exists for this seat.
+    pub fn codrive_ime_grab_active(&self) -> bool {
+        use smithay::wayland::input_method::InputMethodSeat;
+        self.agent_seat.input_method().keyboard_grabbed()
+    }
+
+    /// The same read for the HUMAN seat, where an input-method grab is the
+    /// normal, wanted state. Only used for the paired transition log in
+    /// `DuduclawComp::ime_note_grab_state`.
+    pub fn human_ime_grab_active(&self) -> bool {
+        use smithay::wayland::input_method::InputMethodSeat;
+        self.seat.input_method().keyboard_grabbed()
+    }
+
+    /// Re-reads [`Self::codrive_ime_grab_active`], publishes it to the socket
+    /// thread's mirror, and returns it.
+    ///
+    /// Called from `handle_agent_inject` (so the authoritative check and the
+    /// mirror can never disagree at the moment it matters) and once per
+    /// housekeeping tick from both backends (so the mirror cannot latch
+    /// `true` after the input method exits — a latched mirror would make
+    /// `listener.rs` reject keyboard ops forever, with no injection left to
+    /// clear it).
+    pub fn codrive_refresh_ime_pause(&mut self) -> bool {
+        let paused = self.codrive_ime_grab_active();
+        // Piggy-backed here rather than given its own per-tick call site:
+        // this method already runs exactly where and when that observation is
+        // wanted, and both halves read the same pair of seats.
+        let human = self.human_ime_grab_active();
+        self.ime_note_grab_state(human, paused);
+        let was = self.codrive.ime_paused.swap(paused, Ordering::SeqCst);
+        if was != paused {
+            tracing::warn!(
+                paused,
+                "codrive: agent-seat keyboard injection {} by an input method grab \
+                 (D3-c backstop — the seat filter should have prevented this; see \
+                 crate::ime::seat_filter)",
+                if paused { "PAUSED" } else { "resumed" }
+            );
+            self.codrive.record(
+                if paused { "ime_pause" } else { "ime_resume" },
+                None,
+                None,
+                None,
+                Some("input-method keyboard grab on the agent seat".into()),
+            );
+        }
+        paused
     }
 
     fn agent_key(&mut self, xkb_code: u32, pressed: bool) {

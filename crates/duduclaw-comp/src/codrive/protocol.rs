@@ -185,6 +185,30 @@ impl InjectCmd {
             InjectCmd::WindowGeometry { .. } => ("window_geometry", None, None),
         }
     }
+
+    /// Does executing this command put a key on the agent seat's keyboard?
+    ///
+    /// D3-c: exactly the ops an input-method keyboard grab on the agent seat
+    /// would swallow. Written as an exhaustive match rather than
+    /// `matches!(…, Key | KeyName | Text)` so that adding a new keyboard op
+    /// later is a compile error here instead of a silent hole in the gate —
+    /// the same fail-closed shape `describe` above uses.
+    pub fn is_keyboard_op(&self) -> bool {
+        match self {
+            InjectCmd::Key { .. } | InjectCmd::KeyName { .. } | InjectCmd::Text { .. } => true,
+            InjectCmd::Move { .. }
+            | InjectCmd::Button { .. }
+            | InjectCmd::Resume
+            | InjectCmd::Status
+            | InjectCmd::Highlight { .. }
+            | InjectCmd::RotateToken
+            | InjectCmd::Shadow { .. }
+            | InjectCmd::TakeOver { .. }
+            | InjectCmd::Watch { .. }
+            | InjectCmd::ActivateWindow { .. }
+            | InjectCmd::WindowGeometry { .. } => false,
+        }
+    }
 }
 
 /// The mandatory first line of every new connection (CD-1, DESIGN §3.3.1's

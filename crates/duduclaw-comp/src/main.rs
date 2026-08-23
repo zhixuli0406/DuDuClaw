@@ -35,12 +35,14 @@
 
 mod handlers;
 
+mod abs_pointer;
 mod alt_tab;
 mod backend_choice;
 mod codrive;
 mod cursor;
 mod decor;
 mod grabs;
+mod ime;
 mod input;
 mod layer_shell;
 mod minimize;

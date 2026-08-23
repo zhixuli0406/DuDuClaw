@@ -5179,3 +5179,439 @@ mostly input:
   (it is centred per output, and `build_output_elements` runs per output). One
   panel on the focused monitor would be the refined behaviour; nothing on the
   appliance has two monitors yet.
+
+## D3-a / D3-c (2026-08-23): Chinese input — three globals, the candidate window, and keeping fcitx5 off the agent seat
+
+Design/research: `research/native-os-2026-08/ime-fcitx5-gpui-2026-08.md` (the
+D3 spike). Tracking: `commercial/docs/TODO-agent-first-os-2026-08.md`, rows
+`D3` / `D3-c 探針`. Shell-side (D3-b) and image packaging (D3-d) are separate
+work packages and are **not** in this round.
+
+### What landed
+
+New module `src/ime/`:
+
+| file | what |
+|---|---|
+| `mod.rs` | the three globals, `InputMethodHandler`, candidate-window render elements |
+| `seat_filter.rs` | D3-c: the agent seat is invisible to input-method clients |
+| `popup.rs` | pure candidate-window placement geometry + tests |
+
+Touched: `state.rs` (field + construction + per-client classification at accept
+time), `handlers/mod.rs` (`delegate_seat!` moved, see below), `decor/paint.rs`
+(one line in `build_output_elements`), `codrive/{mod,shared,listener,protocol}.rs`
+(the `paused_by_ime` backstop), `winit_backend.rs` / `udev_backend.rs` (one
+housekeeping call each).
+
+### Why all three globals, in one call
+
+fcitx5's `WaylandIMServerV2::init()` only sets `init_ = true` when it has found
+**both** `zwp_input_method_manager_v2` **and** `zwp_virtual_keyboard_manager_v1`.
+Advertising the input-method global alone produces a compositor where Chinese
+input silently never starts, with no error anywhere. Clients need the third,
+`zwp_text_input_manager_v3`. So all three are created together in
+`ImeState::new`, before `init_wayland_listener` opens the socket.
+
+Focus needs no code at all: smithay ties text-input focus to keyboard focus.
+
+### The candidate window is mandatory, not a nicety
+
+With no `zwp_input_popup_surface_v2` path, fcitx5's classicui logs "No Panel
+surface available, return." and keeps composing **invisibly** — the hardest
+failure in this chain to diagnose. `InputMethodHandler::new_popup` records the
+surface; `DuduclawComp::ime_popup_elements` draws it through the
+`WaylandSurfaceRenderElement` variant CUR-1 already added, so no new element
+kind and no change to `render_output`'s `custom_elements` interface were needed.
+
+It is inserted in `build_output_elements` directly after the Alt-Tab panel:
+above every window and every layer surface (it is anchored to a caret; a panel
+drawn over it would hide the characters being chosen), below the switcher
+(modal while up) and below the cursors.
+
+### D3-c: what the probe actually found
+
+The spike report proposed reaching a per-client filter through
+`create_global_with_filter`. **That literal route is closed.**
+`SeatState::new_wl_seat` uses plain `create_global`, and `SeatGlobalData<D>`
+has a private `arc` field with no constructor — this crate cannot build the
+global data, so it cannot create the seat global itself.
+
+What is open, and what shipped:
+
+1. **`delegate_seat!` splits.** It is one `delegate_global_dispatch!` plus four
+   `delegate_dispatch!` over public types. `src/ime/seat_filter.rs` writes the
+   four `Dispatch` delegations verbatim and hand-rolls only the
+   `GlobalDispatch`, whose `bind` forwards straight to smithay's own impl. The
+   single behavioural difference from the macro is the `can_view` override.
+2. **The seat's name is readable through `Debug`.** `can_view` receives only
+   `&SeatGlobalData<D>`, but `SeatRc<D>`'s `Debug` prints `name` as its first
+   field. A `fmt::Write` sink aborts the rendering the moment the name is
+   complete, so `SeatRc::inner` (a `Mutex` over the pointer/keyboard handles
+   and the bound-seat list) is never formatted.
+
+Point 2 leans on a `Debug` rendering, which is not a stability guarantee. Two
+things keep that honest:
+
+* `parse_seat_name` is a pure function with unit tests, and
+  `a_real_seats_name_survives_the_round_trip` drives the whole extraction over
+  a **real** `Seat<DuduclawComp>` built by the linked smithay. A smithay
+  upgrade that changes the rendering fails in CI.
+* `seat_filter::arm` re-runs that extraction at startup over the two real
+  seats and **disarms** on any surprise — every seat stays visible to everyone,
+  exactly as before this module existed, with a loud `error!`. The codrive
+  backstop below then turns the consequence into a reported error rather than
+  silence.
+
+Input-method clients are identified once per connection, at accept time, from
+`Client::get_credentials`'s pid → `/proc/<pid>/comm` (`std`'s
+`UnixStream::peer_cred` is still unstable — `E0658`, rust-lang/rust#42839 —
+which `shell_control/listener.rs` had already run into). `/proc/comm` is not
+authentication, and does not need to be: a process that lies its way into "I am
+an input method" only loses sight of the agent seat.
+
+Knobs: `DUDUCLAW_COMP_IME_PROCS` (comma-separated process names; default
+`fcitx5,fcitx,ibus-daemon,kimpanel`; an empty value turns detection, and hence
+the filter, off) and `DUDUCLAW_COMP_IME_STRICT=1` (only detected input methods
+may bind the two IME manager globals; default off, because a false negative
+there kills Chinese input outright while the appliance's client set is entirely
+ours).
+
+### The backstop: `paused_by_ime`
+
+The filter has one soft edge — process-name recognition. If an input method
+slips past it, the failure mode is the worst kind: `type_text` returns success
+while every keystroke disappears into a composition nobody reads. So codrive
+gained an explicit state:
+
+* `DuduclawComp::codrive_ime_grab_active` reads smithay's per-seat
+  `InputMethodHandle` for a live `zwp_input_method_keyboard_grab_v2`.
+* `codrive_refresh_ime_pause` publishes it to `CodriveShared::ime_paused` and
+  is called from `handle_agent_inject` **and** once per housekeeping tick on
+  both backends — the tick is what stops the mirror latching `true` after the
+  input method exits (a latched mirror would reject keyboard ops forever, with
+  no injection left to clear it).
+* `listener.rs` pre-rejects `key`/`key_name`/`text` with
+  `{"ok":false,"error":"paused_by_ime","reason":"input_method_holds_agent_seat_keyboard"}`;
+  the main thread re-checks authoritatively and drops with an audit record. A
+  race can lose a keystroke; it can never let one through silently.
+* `ime_note_grab_state` logs the `(human, agent)` grab pair on every change.
+  `human=true agent=false` is a healthy Chinese-input session; `agent=true`
+  means D3-c failed. That one line is the operational answer to "is the IME on
+  the right seat".
+
+### Container verification (2026-08-23)
+
+Same warm-cache container as the A4-1/WM-3 rounds (`duduclaw-comp-cargo`,
+`duduclaw-comp-cargo-git`, `duduclaw-comp-target`), plus `fcitx5
+fcitx5-modules fcitx5-chewing dbus-x11 wayland-utils` for the live rounds.
+
+```
+cargo build                              -> Finished
+cargo clippy --all-targets -- -D warnings -> Finished (no warnings)
+cargo test                               -> ok. 425 passed; 0 failed
+```
+
+**425 = the 398 pre-existing tests (all still green) + 27 new**: 17 in
+`ime::seat_filter` (7 parser, 3 sniffer-against-real-smithay, 4 self-check
+decision, 3 process-name matching), 10 in `ime::popup` (placement, flipping,
+clamping).
+
+### Live rounds
+
+Rig: `weston --backend=headless-backend.so` → `duduclaw-comp` (winit) →
+`{ foot, fcitx5 + fcitx5-chewing }`. Headless weston has **no input device**,
+so the nested compositor's *human* seat can never be driven from outside —
+which is exactly the seat fcitx5's grab lives on. The full-chain round
+therefore nests **two** comps: codrive drives the OUTER comp's agent seat, and
+the outer comp's focused client is the INNER comp's winit window, so those keys
+arrive at the inner comp as ordinary winit input, i.e. on its HUMAN seat.
+(`WAYLAND_DISPLAY` accepts an absolute socket path, which is what lets the two
+comps keep separate `XDG_RUNTIME_DIR`s and therefore separate codrive sockets.)
+
+**1. Globals, and who sees which seat.** `wayland-info` (an ordinary client)
+against comp:
+
+```
+interface: 'wl_seat',                        version: 9, name: 10
+interface: 'wl_seat',                        version: 9, name: 11
+interface: 'zwp_text_input_manager_v3',      version: 1, name: 13
+interface: 'zwp_input_method_manager_v2',    version: 1, name: 14
+interface: 'zwp_virtual_keyboard_manager_v1',version: 1, name: 15
+```
+
+fcitx5's own `WAYLAND_DEBUG=1` registry, same compositor, same moment:
+
+```
+wl_registry@2.global(11, "wl_seat", 9)            <- ONE seat, not two
+wl_registry@2.global(14, "zwp_input_method_manager_v2", 1)
+wl_registry@2.global(15, "zwp_virtual_keyboard_manager_v1", 1)
+waylandimserverv2.cpp:80] INIT IM V2
+ -> zwp_virtual_keyboard_manager_v1@9.create_virtual_keyboard(wl_seat@11, ...)
+ -> zwp_input_method_manager_v2@3.get_input_method(wl_seat@11, ...)
+wl_seat@11.name("winit")                          <- the human seat
+```
+
+comp side: `comp/ime: client identified as an input method … pid=1936
+comm=fcitx5`, `status="armed"`.
+
+**2. Full chain: 注音組字 → 候選窗 → 上屏.** Injected `su3cl3` (ㄋㄧˇ ㄏㄠˇ),
+then space, then `1`:
+
+```
+fcitx5 -> comp:   zwp_input_method_v2@14.set_preedit_string("ㄋ", 0, 3)
+                  ... ("ㄋㄧ") ... ("你") ... ("你ㄏ") ... ("你ㄏㄠ") ... ("你好")
+                  zwp_input_method_v2@14.get_input_popup_surface(new id …@18, wl_surface@20)
+                  zwp_input_popup_surface_v2@18.text_input_rectangle(324, 16, 1, 14)
+                  zwp_input_method_v2@14.commit_string("你好")
+comp -> foot:     zwp_text_input_v3@19.preedit_string("ㄋ", 0, 3)
+                  ... ("你好", 6, 6) ...
+                  zwp_text_input_v3@19.commit_string("你好")
+comp log:         comp/ime: candidate window opened
+                    location=(177, 16) caret=(177, 16, 14, 14)
+                  comp/ime: input-method keyboard grab changed
+                    human_seat=true agent_seat=false
+```
+
+Note fcitx5 loads the `chewing` addon **after** it reads its profile, so
+`DefaultIM=chewing` cannot take effect on a first run; the test switches
+explicitly over D-Bus (`org.fcitx.Fcitx.Controller1.SetCurrentIM`). Worth
+remembering for D3-d's firstboot provisioning.
+
+> **Superseded by D3-f (2026-08-23).** That D-Bus switch is gone from
+> `duduclaw-kiosk-launch.sh`. It was a cold-start patch for a profile whose
+> item order was itself the bug (chewing at `Items/0` killed fcitx5's
+> `Shift_L` Chinese/English toggle — see the `D3-f/P0-2` row in
+> `commercial/docs/TODO-agent-first-os-2026-08.md`), and it raced a fixed
+> three-second sleep against daemon startup. The seed now puts `keyboard-us`
+> at `Items/0` and gets "lands in Chinese" from `[Behavior]
+> ActiveByDefault=True` instead, which needs no D-Bus call and no timing
+> assumption at all.
+
+**3. Negative control — the conflict is real, and the filter is what stops it.**
+Same rig with `DUDUCLAW_COMP_IME_PROCS=""` (detection, hence the filter, off),
+then an agent click so the agent seat gets a focused text-input client:
+
+```
+ -> zwp_input_method_manager_v2@3.get_input_method(wl_seat@11, …@16)   <- TWO input methods
+ -> zwp_input_method_manager_v2@3.get_input_method(wl_seat@13, …@18)
+wl_seat@11.name("duduclaw-agent")
+wl_seat@13.name("winit")
+zwp_input_method_v2@16.activate()
+ -> zwp_input_method_v2@16.grab_keyboard(new id zwp_input_method_keyboard_grab_v2@23)
+
+comp:  comp/ime: input-method keyboard grab changed human_seat=false agent_seat=true
+       WARN codrive: agent-seat keyboard injection PAUSED by an input method grab
+
+codrive: {"op":"text","s":"agent-typed"}
+      -> {"ok":false,"error":"paused_by_ime","reason":"input_method_holds_agent_seat_keyboard"}
+audit:   "kind":"inject_dropped","op":"text","detail":"paused_by_ime: …"
+```
+
+With the filter on, the second `get_input_method` never happens and codrive
+types normally.
+
+### Honest gaps
+
+* **fcitx5 5.0.21 (bookworm, the container) grabs on `activate`, not at input
+  context creation.** The spike report's "grab at IC creation" reading is from
+  fcitx5 **master**; trixie ships 5.1.12. Either behaviour is covered — the
+  filter removes the second input context entirely — but the negative control
+  above needed an explicit agent-seat focus to make the grab appear, and that
+  detail is version-specific.
+* **The candidate window's pixels are unverified.** `new_popup` fires with a
+  real caret rectangle and the render path runs every frame without incident,
+  but a headless container has nothing to screenshot. Placement geometry is
+  unit-tested; on-screen position, size and z-order belong to the VM round
+  (D3-e).
+* **`parent_geometry` searches windows only, not layer surfaces.** Nothing puts
+  a text field on a layer surface yet (`crate::layer_shell`'s scope note); an
+  unmatched surface degrades to the space origin. Revisit when the shell's dock
+  and menu bar migrate.
+* **`ime_paused` is refreshed per housekeeping tick**, so `listener.rs`'s
+  pre-check can be up to one tick stale in either direction. The main thread's
+  check is authoritative, so the only cost of staleness is a keystroke dropped
+  with an honest error, never one silently swallowed.
+* **`keyboard_grabbed()` over-reports if a popup grab later replaces the input
+  method's grab on the same seat.** The seat filter should make that
+  unreachable; if it happened, the backstop would refuse agent typing (with a
+  reason) rather than lose it.
+
+## D3-f (2026-08-23): a press must never reach a pointer that has no focus
+
+Found while chasing a user report of "after `systemctl restart
+duduclaw-kiosk` the Home 交辦欄 takes clicks and nothing happens". Tracking:
+`commercial/docs/TODO-agent-first-os-2026-08.md`, rows `D3-f/*`.
+
+### The defect
+
+A `wl_pointer` client only learns where the pointer is from an `enter`, and
+smithay emits one only from `PointerHandle::motion`. Until this round the
+two `InputEvent::PointerMotion*` arms in `src/input.rs` were the **only**
+call sites — nothing placed the pointer at startup. So between comp coming
+up and the first time the pointer physically MOVED:
+
+* `PointerHandle` had no focused surface,
+* `PointerHandle::button` therefore had nowhere to deliver a press,
+* and comp's own click-to-focus still ran, so `focus: activation set`
+  appeared in the journal on every swallowed click.
+
+From the outside that reads as a healthy compositor in front of a shell that
+ignores the mouse — which is exactly how it was reported.
+
+It is not a VM artefact. An absolute-positioning device (touchscreen, KVM,
+QEMU's `usb-tablet`) emits no motion at all when the tap lands where the
+pointer already is, so the first tap after every restart is dead by
+construction. A relative mouse hides it behind the jitter of picking the
+mouse up.
+
+### The fix
+
+`DuduclawComp::ensure_pointer_focus(time)`, called at the very top of the
+`InputEvent::PointerButton` arm before any routing: if the human pointer has
+no `current_focus()`, synthesise one `pointer.motion` at its current
+(clamped) location so the surface under it gets its `enter`. Idempotent, one
+comparison per press on the healthy path, and no behaviour change once the
+pointer has ever moved.
+
+### Live evidence (VM, arm64 udev backend)
+
+Staged: pointer parked on the composer, `systemctl restart duduclaw-kiosk`,
+then the first input after the compositor came up was a **bare QMP button
+with no motion event whatsoever**.
+
+| | before | after |
+|---|---|---|
+| shell log | *(nothing at all)* | `[probe] os mouse_down at Point { x: 0px, y: 0px }` then `[hit] backdrop -> close overlay` |
+| comp log | `focus: activation set target=…18…` | same |
+
+Plus three full cycles of "click 交辦欄 → Launcher opens → 注音 su3 → candidate
+window → Escape ×3 → back to Home", all green.
+
+### Observation, not fixed: libinput's initial device batch is drained late
+
+Across three restarts, `Initializing a libinput backend` was followed by
+`New device "event0/1/2"` only **24–47 seconds later** — always at the exact
+moment of the first real human input, never on a timer. The queued
+`DEVICE_ADDED` events sit unread until the fd next becomes readable, i.e.
+until someone actually types or moves. Delivery of that first event is not
+lost (the `codrive: human input observed` line fires with the correct kind),
+so this is not the click-swallowing bug above — but per-device libinput
+configuration is not applied until then, and the log reads as if the machine
+had no input devices for the first minute. Left as a known gap rather than
+guessed at.
+
+## D3-f2 (2026-08-23): the enter has to carry the RIGHT coordinates
+
+D3-f above shipped, and clicks still hit nothing. Tracking:
+`commercial/docs/TODO-agent-first-os-2026-08.md`, row `D3-f2/P0-1b`.
+
+### What D3-f actually verified
+
+Its "live evidence" table records the shell reporting
+`[probe] os mouse_down at Point { x: 0px, y: 0px }` — and scores that a
+PASS. The press had arrived, which was the thing being fixed, so the round
+closed there. But the tablet was parked at (639, 226): every click in the
+session was being delivered to the top-left corner, so no UI element could
+ever be hit. The verification checked *arrival* and never checked *where*.
+
+### The defect
+
+`ensure_pointer_focus` built its synthesised motion from
+`PointerHandle::current_location()`. The precondition for that function
+running is "no motion has ever arrived", and a pointer that has never been
+moved sits at smithay's `(0, 0)` default — so the one value it had to get
+right was guaranteed to be wrong. It is not a rounding error or an offset:
+it is the origin, every time, until something moves.
+
+Measured on the appliance VM (arm64 udev backend), three independent
+vantage points on the same click:
+
+| vantage | reading |
+|---|---|
+| kernel, `EVIOCGABS` on `/dev/input/event1` | `ABS_X` 16357/32767, `ABS_Y` 9256/32767 = **(639.0, 226.0)** |
+| comp, `WAYLAND_DEBUG=1` server side | `-> wl_pointer@93.enter(2, wl_surface@18[0], 0.0000, 0.0000)` |
+| shell, `DUDUCLAW_SHELL_DIAG=1` | `[probe] os mouse_down at Point { x: 0px, y: 0px }` → `[hit] backdrop -> close overlay` |
+
+The third row is the user-visible bug in one line: the pointer was sitting
+on the Launcher's search field, and the click closed the Launcher as if it
+had landed on the backdrop behind it.
+
+Not a client bug — the pinned gpui rev handles `enter` correctly
+(`gpui_linux/src/linux/wayland/client.rs` sets `mouse_location` from
+`surface_x`/`surface_y` and even synthesises a `MouseMove` from it). It was
+faithfully rendering the coordinates comp sent.
+
+### The fix
+
+`src/abs_pointer.rs` (new) — ask the kernel instead of guessing.
+`EVIOCGABS(ABS_X)`/`EVIOCGABS(ABS_Y)` return an absolute device's *current*
+axis values; the kernel keeps them because that is exactly what it compares
+against to decide an unchanged `EV_ABS` event is redundant and drop it —
+the same mechanism that causes this bug supplies its cure. Normalisation
+divides by `maximum - minimum + 1`, matching libinput's own
+`scale_axis`/`absinfo_range`, so a synthesised position and a real
+`PointerMotionAbsolute` at the same device value produce bit-identical
+logical coordinates (verified below).
+
+**Getting at the fd without widening privilege.** comp runs as
+`duduclaw-kiosk` (uid 999, groups `video`+`render`); `/dev/input/event*` is
+`root:input 0660` — measured in the VM, not assumed. A direct `open()` is
+`EACCES`; input devices reach comp only through seatd. So
+`RecordingInterface` wraps whatever `LibinputInterface` the backend passes
+to `Libinput::new_with_udev` and keeps a `dup()` of every fd
+`open_restricted` returns, dropping it again on `close_restricted`. It
+opens nothing itself, so it cannot widen what this process may touch, and
+it needs no image change, no `input` group, and no second seatd round trip.
+
+Two injection points, both fail-open to the pre-D3-f2 behaviour:
+
+* `InputEvent::DeviceAdded` (pointer-capability devices only) →
+  `seed_absolute_pointer_position`. This is what makes the *first frame*
+  honest: before it, comp drew its cursor at the origin until something was
+  pressed and then teleported it. Guarded by `pointer_motion_seen` so a
+  device hot-plugged into a session already in use can never drag the
+  cursor somewhere the user did not put it. Deliberately does **not** call
+  `on_human_input` — a device appearing is not somebody touching it, and
+  treating it as such would freeze the agent seat every time a keyboard is
+  plugged in.
+* `ensure_pointer_focus` → same lookup at press time, as the backstop for
+  the case where the seeding could not run (no output yet when the device
+  arrived).
+
+Touch devices are excluded by the `DeviceCapability::Pointer` guard: their
+ABS axes hold the last *touch* point, which is not where a cursor should
+be, and this compositor still has no touch arm at all.
+
+### Live evidence (VM, arm64 udev backend)
+
+Same VM, same parked tablet, old binary vs new. `d3f2-*.png` screenshots
+under `appliance/.vm/`.
+
+| | before (D3-f binary) | after (D3-f2 binary) |
+|---|---|---|
+| bare button at (639, 226) | `enter(…, 0.0000, 0.0000)`, shell `{ x: 0px, y: 0px }` | `enter(…, 638.9453, 225.9766)`, shell `{ x: 638.9453px, y: 225.97656px }` |
+| bare button at (1150, 700) | — | shell `{ x: 1149.9609px, y: 699.97266px }` → `[hit] backdrop -> close overlay` |
+| cold-boot Home, tablet on the 交辦欄, first input is a bare button | nothing happens (`d3f2-OLD-4-bare-click-on-composer.png`) | **Launcher opens** (`d3f2-NEW-2-after-bare-click.png`) |
+| cursor drawn at boot | origin (`d3f2-before-cursor.png`) | the tablet's real position (`d3f2-D-home-closed.png`) |
+| move → click, unchanged path | — | same click at (639, 226) reports `638.9453 / 225.97656` — **the identical value the synthesised path produces**, `[hit] composer -> open Launcher` |
+
+Worst error across the rounds: 0.06 px. That last row is the real proof
+that `normalize` agrees with libinput rather than merely being close: the
+synthesised enter and a genuine motion event land on the same float.
+
+Container: `cargo build`, `cargo clippy --all-targets -- -D warnings`
+clean, `cargo test` **434 passed** (9 new in `abs_pointer`, covering the
+ioctl request numbers against the values a live `fcntl.ioctl` in the guest
+accepted, libinput's inclusive-range denominator, degenerate/out-of-range
+axes refusing to answer, whole-basename device matching, and the
+record/forget lifecycle).
+
+### Not fixed, observed
+
+`DUDUCLAW_SHELL_DIAG=1` makes the shell dispatch `ToggleLauncher` once at
+boot (`[action] ToggleLauncher fired` with no preceding `[probe] os
+key_down`), so the Launcher is already open before any input. A/B'd against
+the **old** comp binary: it happens there too, so it is a shell-side DIAG
+behaviour, not a D3-f2 regression. It only shows up with DIAG on — a
+DIAG-off boot lands on a clean Home (`d3f2-NEW-1-boot.png`). Left alone;
+noted because it will confuse the next person staging a click round.

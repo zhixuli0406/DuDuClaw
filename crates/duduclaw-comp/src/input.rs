@@ -7,8 +7,9 @@
 
 use smithay::{
     backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
+        InputBackend, InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        PointerMotionEvent,
     },
     desktop::Window,
     input::{
@@ -218,6 +219,9 @@ impl DuduclawComp {
                 // compositor with no pointer-constraint protocol.
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time_msec();
+                // D3-f2: from here on the compositor's own pointer location is
+                // authoritative — see `pointer_motion_seen`'s doc comment.
+                self.pointer_motion_seen = true;
                 let pointer = self.seat.get_pointer().unwrap();
                 let pos = self.clamp_pointer(pointer.current_location() + event.delta());
                 // WM-2: the close button lights up on hover, and the title bar
@@ -255,6 +259,8 @@ impl DuduclawComp {
 
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
 
+                // D3-f2: see the identical line in the relative-motion arm.
+                self.pointer_motion_seen = true;
                 let serial = SERIAL_COUNTER.next_serial();
                 let pointer = self.seat.get_pointer().unwrap();
                 // WM-2: see the identical call in the relative-motion arm.
@@ -274,6 +280,18 @@ impl DuduclawComp {
             }
             InputEvent::PointerButton { event, .. } => {
                 self.on_human_input("pointer_button");
+
+                // D3-f: before ANY of the routing below — a press must never
+                // reach a pointer that has never entered a surface. See
+                // `ensure_pointer_focus` for the failure this closes.
+                //
+                // D3-f2: and it must not enter it at the WRONG PLACE either,
+                // which is what shipped. The device that produced this press
+                // is the only thing that knows where the press happened when
+                // no motion preceded it, so it is passed down rather than
+                // left to `PointerHandle`'s `(0, 0)` default.
+                let device_sysname = Device::id(&event.device());
+                self.ensure_pointer_focus(event.time_msec(), &device_sysname);
 
                 let pointer = self.seat.get_pointer().unwrap();
 
@@ -436,6 +454,20 @@ impl DuduclawComp {
                 let pointer = self.seat.get_pointer().unwrap();
                 pointer.axis(self, frame);
                 pointer.frame(self);
+            }
+            // D3-f2. Deliberately NOT `on_human_input`: a device appearing is
+            // not somebody touching it, and treating it as such would freeze
+            // the agent seat every time a keyboard is plugged in.
+            //
+            // The guard keeps this to pointers. A touchscreen also carries
+            // ABS_X/ABS_Y, but those hold the last TOUCH point, which is not
+            // where any cursor should be — and this compositor has no touch
+            // arm at all yet, so believing them would invent a position out
+            // of nothing. Non-pointer devices fall through to `_ => {}`,
+            // exactly as they did before this arm existed.
+            InputEvent::DeviceAdded { device } if device.has_capability(DeviceCapability::Pointer) => {
+                let sysname = Device::id(&device);
+                self.seed_absolute_pointer_position(&sysname);
             }
             _ => {}
         }
@@ -673,6 +705,156 @@ impl DuduclawComp {
             return pos;
         };
         clamp_to(pos, b)
+    }
+
+    /// D3-f: make sure the human pointer has a focused surface before a
+    /// button is forwarded to it.
+    ///
+    /// ## The bug this fixes
+    ///
+    /// A `wl_pointer` client only ever learns where the pointer is from an
+    /// `enter`, and smithay only emits one from [`PointerHandle::motion`].
+    /// Nothing in this compositor called `motion` at startup — the two
+    /// `InputEvent::PointerMotion*` arms were the only call sites — so
+    /// between comp coming up and the first time the pointer physically
+    /// MOVED, `PointerHandle` had no focus at all and
+    /// `PointerHandle::button` had nowhere to deliver a press. The click was
+    /// swallowed whole: comp itself still ran its click-to-focus path (the
+    /// `focus: activation set` line appears in the journal), so from the
+    /// outside the compositor looked healthy while the shell never saw a
+    /// thing.
+    ///
+    /// Reproduced in the D3-f VM round after `systemctl restart
+    /// duduclaw-kiosk`: the Home 交辦欄 took clicks that did nothing and the
+    /// Launcher never opened, recovering only once the pointer was dragged
+    /// across the screen. It is not a VM artefact — an absolute-positioning
+    /// device (a touchscreen, a KVM, QEMU's `usb-tablet`) reports no motion
+    /// at all when the tap lands where the pointer already is, so the first
+    /// tap after every restart is dead by construction; a relative mouse
+    /// merely hides it behind the jitter of picking the mouse up.
+    ///
+    /// Cheap and idempotent: one comparison per press on the healthy path,
+    /// which is why it sits at the top of the button arm rather than behind
+    /// a "have we started yet" flag that would go stale the first time
+    /// something else cleared pointer focus.
+    ///
+    /// ## D3-f2: the enter has to carry the RIGHT coordinates
+    ///
+    /// The version above shipped, and clicks still missed every target. The
+    /// synthesised `enter` was built from `PointerHandle::current_location()`
+    /// — which, on the very path this function exists to rescue, is the
+    /// untouched `(0, 0)` default, because "no motion has ever arrived" is
+    /// the precondition. Measured on the appliance VM: tablet parked at
+    /// (639, 226), `wl_pointer.enter(…, 0.0000, 0.0000)`, shell reports
+    /// `mouse_down at Point { x: 0px, y: 0px }`. Every press landed on the
+    /// top-left corner, so the press *arrived* (D3-f's fix was real) and hit
+    /// nothing (D3-f's verification only checked arrival).
+    ///
+    /// `device_sysname` is libinput's name for the device that produced the
+    /// press (`"event1"` for QEMU's tablet). If that device is absolute, the
+    /// kernel still holds its current axis values and
+    /// [`crate::abs_pointer`] reads them — no event needed. Anything else
+    /// (relative mouse, unreadable fd, winit backend, degenerate axis range)
+    /// falls through to the pre-D3-f2 behaviour unchanged.
+    fn ensure_pointer_focus(&mut self, time: u32, device_sysname: &str) {
+        let pointer = self.seat.get_pointer().expect("human seat always has a pointer");
+        if pointer.current_focus().is_some() {
+            return;
+        }
+        let (pos, source) = match self.absolute_device_position(device_sysname) {
+            Some(p) => (self.clamp_pointer(p), "device"),
+            None => (self.clamp_pointer(pointer.current_location()), "compositor"),
+        };
+        let under = self.surface_under(pos);
+        if under.is_none() {
+            // Nothing under the cursor to enter. Sending a focus-less motion
+            // would be a no-op, and pretending otherwise would just hide the
+            // fact that the press really did land on empty space.
+            //
+            // D3-f2: the position is still worth committing when it came from
+            // the device — the human cursor is drawn at
+            // `PointerHandle::current_location()` (`cursor/mod.rs`), so
+            // leaving it at the origin would draw a cursor that lies about
+            // where the next click will go.
+            if source == "device" {
+                let serial = SERIAL_COUNTER.next_serial();
+                self.update_close_hover(pos);
+                pointer.motion(self, None, &MotionEvent { location: pos, serial, time });
+                pointer.frame(self);
+                self.queue_redraw();
+            }
+            return;
+        }
+        tracing::debug!(
+            ?pos,
+            source,
+            device = device_sysname,
+            "input: pointer had no focused surface — synthesising an enter before the press (D3-f/D3-f2)"
+        );
+        self.update_close_hover(pos);
+        let serial = SERIAL_COUNTER.next_serial();
+        pointer.motion(self, under, &MotionEvent { location: pos, serial, time });
+        pointer.frame(self);
+    }
+
+    /// D3-f2: where `device_sysname` says it is, in this compositor's logical
+    /// coordinate space — or `None` if it is not an absolute device, is not
+    /// one libinput opened through us, or has no usable axis range.
+    ///
+    /// Deliberately reads the kernel on every call rather than caching: the
+    /// value is one `ioctl` on an already-open fd, it is only ever consulted
+    /// on a press that found no pointer focus (i.e. almost never), and a
+    /// cache would be exactly the sort of thing that goes stale in the one
+    /// situation this exists to handle.
+    pub(crate) fn absolute_device_position(&self, device_sysname: &str) -> Option<Point<f64, Logical>> {
+        let (nx, ny) = self.abs_pointer.normalized_position(device_sysname)?;
+        let output = self.primary_output()?;
+        let geo = self.space.output_geometry(output)?;
+        Some(crate::abs_pointer::map_to_output(nx, ny, geo))
+    }
+
+    /// D3-f2: place the pointer where an absolute device says it is, the
+    /// moment libinput tells us that device exists.
+    ///
+    /// `ensure_pointer_focus` above already makes the first *click* land
+    /// correctly. This makes the first *frame* correct too: without it the
+    /// compositor draws its cursor at the origin until something is pressed,
+    /// which reads as "the mouse is broken" and then teleports on click.
+    ///
+    /// Runs once, and only while the pointer has never genuinely moved
+    /// ([`crate::state::DuduclawComp::pointer_motion_seen`]) — a device
+    /// hot-plugged into a session already in use must not drag the cursor
+    /// somewhere the user did not put it. `DeviceAdded` is NOT human input:
+    /// it must not call `on_human_input`, or merely plugging in a keyboard
+    /// would freeze the agent seat.
+    fn seed_absolute_pointer_position(&mut self, device_sysname: &str) {
+        if self.pointer_motion_seen {
+            return;
+        }
+        let Some(pos) = self.absolute_device_position(device_sysname) else {
+            return;
+        };
+        let pos = self.clamp_pointer(pos);
+        let pointer = self.seat.get_pointer().expect("human seat always has a pointer");
+        if pointer.current_location() == pos {
+            return;
+        }
+        tracing::debug!(
+            ?pos,
+            device = device_sysname,
+            "input: seeding the pointer from an absolute device's current axis values (D3-f2)"
+        );
+        self.update_close_hover(pos);
+        let under = self.surface_under(pos);
+        let serial = SERIAL_COUNTER.next_serial();
+        // `time` is a client-visible event timestamp in the same
+        // milliseconds base every other pointer event uses; there is no
+        // libinput timestamp on `DeviceAdded`, so it comes from the
+        // compositor's own clock (`start_time`) — monotonic, no wall clock.
+        let time = self.start_time.elapsed().as_millis() as u32;
+        pointer.motion(self, under, &MotionEvent { location: pos, serial, time });
+        pointer.frame(self);
+        self.queue_redraw();
     }
 }
 

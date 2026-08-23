@@ -206,6 +206,13 @@ pub fn init_winit(
                 // unthrottled redraw loop.
                 state.codrive_check_watch_idle(std::time::Instant::now());
 
+                // D3-c backstop (`codrive_refresh_ime_pause`): keeps the
+                // socket thread's `ime_paused` mirror from latching `true`
+                // after an input method exits. Two atomic loads and a swap —
+                // cheap enough for this loop, and the only reason the mirror
+                // can be trusted by `listener.rs` at all.
+                state.codrive_refresh_ime_pause();
+
                 // CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): a
                 // second, offscreen render pass of the shadow output into a
                 // persistent GLES texture, wrapped as a PiP element and

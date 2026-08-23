@@ -73,6 +73,10 @@ pub struct DuduclawComp {
     /// not live here: smithay keeps one `LayerMap` per `Output`, in that
     /// output's own `UserDataMap`. See `crate::layer_shell`'s module doc.
     pub layer_shell_state: WlrLayerShellState,
+    /// D3-a (2026-08-23): the three input-method globals plus the live
+    /// candidate window. See `crate::ime`'s module doc for why all three
+    /// globals are mandatory and why the popup is not optional.
+    pub ime: crate::ime::ImeState,
     pub popups: PopupManager,
 
     /// The real human seat — every hardware/winit-forwarded input event
@@ -222,6 +226,25 @@ pub struct DuduclawComp {
     /// up cannot regress the already-verified nested path. Starts `true` so
     /// the very first frame is drawn without waiting for an event.
     pub pending_redraw: bool,
+
+    /// D3-f2 (2026-08-23): live evdev fds for the devices libinput opened, so
+    /// an ABSOLUTE pointing device's real position can be read on demand.
+    /// Populated by the udev backend (`udev_backend::init_udev`); left empty
+    /// by the winit backend, where every lookup misses and the caller falls
+    /// back to the compositor's own pointer location. See
+    /// [`crate::abs_pointer`] for why this exists and why it is a `dup()` of
+    /// libinput's fd rather than an `open()` of our own.
+    pub abs_pointer: crate::abs_pointer::AbsPointerTable,
+
+    /// D3-f2: has a real `InputEvent::PointerMotion*` ever arrived on the
+    /// human seat in this process's lifetime?
+    ///
+    /// Guards the one-shot startup seeding in
+    /// [`DuduclawComp::seed_absolute_pointer_position`]: once the pointer has
+    /// genuinely moved, its location is authoritative and a later device
+    /// hot-plug must never teleport the cursor to that new device's idea of
+    /// where it is.
+    pub pointer_motion_seen: bool,
 }
 
 impl DuduclawComp {
@@ -357,6 +380,21 @@ impl DuduclawComp {
             crate::window_policy::SHELL_APP_ID_ENV,
         );
 
+        // D3-a: the three IME globals. Same "must exist before any client
+        // binds" constraint as the protocol globals above — and therefore
+        // strictly before `init_wayland_listener` opens the socket.
+        let ime = crate::ime::ImeState::new(&dh);
+
+        // D3-c: arm the per-client agent-seat filter, now that both seats
+        // exist. Runs its own self-check and stays OFF if that fails — see
+        // `ime::seat_filter`'s module doc for what "off" then costs and what
+        // still catches it (codrive's `paused_by_ime` guard).
+        let seat_filter = crate::ime::seat_filter::arm(&seat, &agent_seat);
+        tracing::info!(
+            status = seat_filter.as_str(),
+            "comp: codrive×IME seat isolation (D3-c)"
+        );
+
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
 
@@ -377,6 +415,7 @@ impl DuduclawComp {
             cursor_shape_manager_state,
             xdg_decoration_state,
             layer_shell_state,
+            ime,
             popups,
             seat,
             cursor,
@@ -403,6 +442,8 @@ impl DuduclawComp {
             switcher: crate::switcher::SwitcherState::default(),
             last_titlebar_click: None,
             pending_redraw: true,
+            abs_pointer: crate::abs_pointer::AbsPointerTable::default(),
+            pointer_motion_seen: false,
         }
     }
 
@@ -462,10 +503,24 @@ impl DuduclawComp {
 
         loop_handle
             .insert_source(listening_socket, move |client_stream, _, state| {
-                state
+                let data = Arc::new(ClientState::default());
+                let client = state
                     .display_handle
-                    .insert_client(client_stream, Arc::new(ClientState::default()))
+                    .insert_client(client_stream, data.clone())
                     .unwrap();
+                // D3-c: classify the peer ONCE, here. `can_view` runs on the
+                // registry path for every global × every client and gets no
+                // `DisplayHandle` to ask for credentials, so it reads this
+                // cached flag instead of touching `/proc` per advertisement.
+                //
+                // Setting it after `insert_client` is safe: client requests
+                // are dispatched from a different calloop source (the
+                // `Display` generic source below), never re-entrantly from
+                // inside this accept callback, so no `can_view` can observe
+                // the pre-classification value.
+                if crate::ime::seat_filter::classify_client(&client, &state.display_handle) {
+                    data.mark_input_method();
+                }
             })
             .expect("Failed to init the wayland event source.");
 
@@ -627,6 +682,30 @@ impl DuduclawComp {
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
+    /// D3-c: was this connection's peer process recognised as an input
+    /// method at accept time? Decided once, in `init_wayland_listener`; read
+    /// by `ime::seat_filter`'s `can_view` to decide whether this client gets
+    /// to see the agent seat. See that module's doc for why the check lives
+    /// on the connection rather than in the filter.
+    ///
+    /// Atomic because `ClientData` is handed to wayland-server as a shared
+    /// `Arc` — the flag is written once, immediately after `insert_client`
+    /// returns the `Client` the credentials come from, and read-only after
+    /// that.
+    is_input_method: std::sync::atomic::AtomicBool,
+}
+
+impl ClientState {
+    /// D3-c: records that this connection's peer is an input method.
+    pub fn mark_input_method(&self) {
+        self.is_input_method
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// D3-c: see [`Self::mark_input_method`].
+    pub fn is_input_method(&self) -> bool {
+        self.is_input_method.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl ClientData for ClientState {

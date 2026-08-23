@@ -342,6 +342,31 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
             continue;
         }
 
+        // D3-c backstop. An input method holding the agent seat's keyboard
+        // grab eats every injected key, so a "success" ack here would be a
+        // lie — the caller would see `type_text` succeed and nothing typed.
+        // Same optimistic-mirror shape as the `shadow_active`/
+        // `takeover_active` pre-checks below: the main thread re-checks
+        // authoritatively in `handle_agent_inject` and drops there too, so a
+        // race can lose a keystroke but can never let one through silently.
+        // The mirror is refreshed once per housekeeping tick as well as per
+        // command, so it clears on its own when the input method exits.
+        if shared.ime_paused.load(Ordering::SeqCst) && cmd.is_keyboard_op() {
+            let (op, x, y) = cmd.describe();
+            shared.record(
+                "inject_dropped",
+                Some(op),
+                x,
+                y,
+                Some("paused_by_ime: an input method holds the agent seat's keyboard grab".into()),
+            );
+            let _ = writeln!(
+                writer,
+                r#"{{"ok":false,"error":"paused_by_ime","reason":"input_method_holds_agent_seat_keyboard"}}"#
+            );
+            continue;
+        }
+
         let frozen = shared.frozen.load(Ordering::SeqCst);
         if frozen {
             // Freeze policy (DESIGN §3.1, "作用域" note + task brief):

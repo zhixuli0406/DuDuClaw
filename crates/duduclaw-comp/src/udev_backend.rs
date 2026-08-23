@@ -368,8 +368,20 @@ pub fn init_udev(
     }
 
     // ---- 6. libinput --------------------------------------------------
-    let mut libinput_context =
-        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
+    // D3-f2: the session interface is wrapped so comp keeps a `dup()` of every
+    // evdev fd seatd opens on libinput's behalf. That is the only way to read
+    // an absolute device's real position without asking for `input`-group
+    // access comp deliberately does not have (`crate::abs_pointer`'s module
+    // doc has the measured permissions). `RecordingInterface` delegates every
+    // decision to the wrapped `LibinputSessionInterface` — it opens nothing
+    // itself, so it cannot widen what this process may touch.
+    let (recording_interface, abs_pointer_table) = crate::abs_pointer::RecordingInterface::new(
+        LibinputSessionInterface::<LibSeatSession>::from(session.clone()),
+    );
+    data.state.abs_pointer = abs_pointer_table;
+    let mut libinput_context = Libinput::new_with_udev::<
+        crate::abs_pointer::RecordingInterface<LibinputSessionInterface<LibSeatSession>>,
+    >(recording_interface);
     libinput_context
         .udev_assign_seat(&seat_name)
         .map_err(|e| UdevInitError::Session(format!("udev_assign_seat({seat_name:?}): {e:?}")))?;
@@ -468,6 +480,11 @@ pub fn init_udev(
             // their own clock.
             let frozen_before = data.state.codrive.is_frozen();
             data.state.codrive_check_watch_idle(now);
+            // D3-c backstop: see the matching call in `winit_backend.rs`. On
+            // this backend it is the ONLY refresh an idle desktop gets, which
+            // is what stops the `ime_paused` mirror latching after the input
+            // method exits.
+            data.state.codrive_refresh_ime_pause();
             if data.state.codrive.is_frozen() != frozen_before {
                 // A watch-mode idle auto-pause just flipped the agent
                 // cursor between amber and dimmed red (`codrive/cursor.rs`),

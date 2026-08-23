@@ -73,6 +73,15 @@ pub struct CodriveShared {
     pub shadow_active: AtomicBool,
     /// CD-3 mirror of `codrive_takeover_active` — see `takeover.rs`.
     pub takeover_active: AtomicBool,
+    /// D3-c backstop mirror: true while an input method holds a keyboard grab
+    /// on the AGENT seat, which makes every injected keystroke disappear into
+    /// a composition nobody reads (`crate::ime::seat_filter`'s module doc has
+    /// the chain). Kept ONLY for `listener.rs`'s optimistic pre-check, exactly
+    /// like `shadow_active`/`takeover_active` above; the authoritative test is
+    /// `DuduclawComp::codrive_ime_grab_active` on the main thread. Refreshed
+    /// once per housekeeping tick as well as per command, so it can never
+    /// latch `true` after the input method exits.
+    pub ime_paused: AtomicBool,
     /// The currently-connected agent's stream, kept so `emergency_stop`
     /// can force-close it and so state-transition events (`frozen`/
     /// `resumed`) can be pushed to it — both from the main thread.
@@ -128,6 +137,7 @@ impl CodriveShared {
             terminated: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),
             audit,
@@ -142,6 +152,7 @@ impl CodriveShared {
             terminated: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),
             audit: None,
@@ -161,6 +172,7 @@ impl CodriveShared {
             terminated: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),
             audit,
@@ -293,6 +305,7 @@ impl CodriveShared {
             terminated: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),
             audit: None,
@@ -313,6 +326,7 @@ impl CodriveShared {
             terminated: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),
             audit: None,

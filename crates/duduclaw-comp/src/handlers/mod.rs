@@ -19,7 +19,7 @@ use smithay::wayland::selection::data_device::{
 };
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::tablet_manager::TabletSeatHandler;
-use smithay::{delegate_cursor_shape, delegate_data_device, delegate_output, delegate_seat};
+use smithay::{delegate_cursor_shape, delegate_data_device, delegate_output};
 
 impl SeatHandler for DuduclawComp {
     type KeyboardFocus = WlSurface;
@@ -66,7 +66,12 @@ impl SeatHandler for DuduclawComp {
     }
 }
 
-delegate_seat!(DuduclawComp);
+// NOTE (D3-c, 2026-08-23): `delegate_seat!(DuduclawComp)` used to be here.
+// It is now written out by hand in `crate::ime::seat_filter` — the four
+// `Dispatch` halves delegated verbatim, the `GlobalDispatch` half hand-rolled
+// so `can_view` can hide the agent seat from input-method clients. `bind`
+// still forwards to smithay's own impl, so binding behaviour is unchanged.
+// See that module's doc for why an input method must not see the agent seat.
 
 //
 // Cursor shape v1 (CUR-1)

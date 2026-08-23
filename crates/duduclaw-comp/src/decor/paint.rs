@@ -398,6 +398,15 @@ impl DuduclawComp {
         let switcher = self.build_switcher_elements(renderer, output_geo, scale);
         overlays.extend(switcher);
 
+        // D3-a: the IME candidate window. Above every window AND above every
+        // layer surface — it is transient input UI anchored to a caret, so a
+        // panel drawn over it would hide the very characters the user is
+        // choosing between. Below the Alt-Tab panel (which is modal while it
+        // is up) and below the cursors, which stay on top of everything.
+        // Empty and cheap whenever no composition is in flight, which is
+        // almost always.
+        overlays.extend(self.ime_popup_elements(renderer, output_geo, scale));
+
         // WM-3: layer surfaces on the `overlay` and `top` layers, in that
         // order. See `layer_shell::geometry` for why this crate ranks the four
         // bands explicitly instead of using smithay's two-way split.
