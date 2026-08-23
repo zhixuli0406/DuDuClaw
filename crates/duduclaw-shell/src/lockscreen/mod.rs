@@ -162,6 +162,34 @@ pub(crate) fn password_required_from_env() -> bool {
     !std::env::var("DUDUCLAW_SHELL_LOCK_NO_PASSWORD").is_ok_and(|v| v.trim() == "1")
 }
 
+/// Every accessibility option this shell can actually apply, live, from the
+/// LOCK SCREEN — ICON-3 (2026-08-23). It is EMPTY, and that is the finding,
+/// not an oversight.
+///
+/// The approved board draws two 40px glass buttons in the bottom-centre
+/// group: accessibility and power. Power is real (see `PowerMenu` above).
+/// For accessibility, the honest question is "which switch could this button
+/// flip that takes effect immediately, before anyone has logged in?", and
+/// the answer today is none:
+///
+/// * **Pointer size / style** — real, and shipping this same round, but it
+///   lives in the pointer-settings surface and is applied by
+///   `duduclaw-comp`, not by this surface. The work package that added it
+///   explicitly rules it out of this button's scope.
+/// * **Large text / high contrast** — this crate has no font-scale or
+///   contrast control at all. `ShellPalette` has exactly two variants
+///   (light/dark) and every text size is a literal at its call site.
+/// * **Screen reader / magnifier** — gpui exposes no accessibility API at
+///   the pinned rev, and no magnifier exists anywhere in this OS yet.
+///
+/// So the button is NOT RENDERED (`render::system_actions_row` checks this
+/// slice), because a button that opens a panel of options that do nothing —
+/// or worse, a panel of "coming soon" rows — is a promise this shell cannot
+/// keep. When the first real switch lands, it is added here and the button
+/// appears with it; `the_accessibility_button_is_hidden_while_nothing_is_
+/// wired` below is what keeps the two facts from drifting apart.
+pub(crate) const LOCKSCREEN_A11Y_ACTIONS: &[&str] = &[];
+
 /// Consecutive failed verify attempts (since the lock started, or since the
 /// last one settled) before the client-side throttle kicks in — task
 /// brief: "3 次後 2 秒節流防爆破".
@@ -224,6 +252,50 @@ pub(crate) enum UnlockFailureKind {
     Unreachable,
 }
 
+/// The bottom-centre power control's own sub-state — ICON-3 (2026-08-23).
+///
+/// Every transition is deliberate and explicit; there is no path from a
+/// single click to a machine going down. `Closed` -> (click the button)
+/// `Open` -> (pick an action) `Confirming` -> (confirm) `Sending` ->
+/// terminal. The two-step confirm is the same shape `overlay/
+/// notifications.rs` already uses for approve/reject, applied here because
+/// this is the one control on a pre-auth surface that ends the session.
+///
+/// `Copy`, like everything else on `LockScreenState` — `PowerAction` and
+/// `PowerFailure` are both plain field-less enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PowerMenu {
+    #[default]
+    Closed,
+    /// The two-item menu is showing; nothing has been chosen.
+    Open,
+    /// An action was picked and is waiting on its confirmation.
+    Confirming(crate::gateway_client::PowerAction),
+    /// A request is in flight. Blocks further submits — see
+    /// `LockScreenState::begin_power`.
+    Sending(crate::gateway_client::PowerAction),
+    /// The request settled without confirmation. The menu STAYS open on
+    /// this state so the message is attached to the control that produced
+    /// it, rather than vanishing with the panel.
+    Failed(PowerFailure),
+}
+
+/// Why a power request did not land, in the two flavours the operator can
+/// act on differently — see `gateway_client::PowerError`'s own doc comment,
+/// which this mirrors exactly (this is the gpui-free half; that one is the
+/// transport half).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PowerFailure {
+    /// No confirmation came back. Deliberately NOT worded as "nothing
+    /// happened": a reboot that succeeds can tear the connection down
+    /// before its own response frame is read, so this state genuinely means
+    /// "no answer", and the message says exactly that.
+    NoAnswer,
+    /// The gateway answered that it does not implement this method — an
+    /// older build. Retrying cannot help.
+    Unsupported,
+}
+
 /// Runtime lock-screen state — lives on `ShellView` as `lockscreen` (see
 /// `main.rs`'s own field doc comment). Deliberately plain data (no gpui
 /// types) — see this file's header comment.
@@ -248,6 +320,12 @@ pub(crate) struct LockScreenState {
     /// WP-lock-pw (2026-08-22) — the password prompt's own sub-state. See
     /// `UnlockPrompt`'s own doc comment.
     unlock_prompt: UnlockPrompt,
+    /// ICON-3 (2026-08-23) — the bottom-centre power control. Reset to
+    /// `Closed` by BOTH `lock()` and `unlock()`, so a half-answered "are you
+    /// sure you want to shut down?" can never survive into a later session
+    /// and be answered by accident — the same guarantee `overlay::
+    /// OverlayUiState::close_launcher_query` gives the install gate.
+    power: PowerMenu,
     /// WP-A4-4 (2026-08-22) — single-arm guard for `render::
     /// schedule_clock_tick`. That timer used to be armed once per render
     /// pass while ALSO being the thing that causes the next render (it
@@ -262,7 +340,14 @@ pub(crate) struct LockScreenState {
 
 impl Default for LockScreenState {
     fn default() -> Self {
-        Self { locked: false, locked_at: None, last_input_at: Instant::now(), unlock_prompt: UnlockPrompt::default(), clock_timer_armed: false }
+        Self {
+            locked: false,
+            locked_at: None,
+            last_input_at: Instant::now(),
+            unlock_prompt: UnlockPrompt::default(),
+            power: PowerMenu::default(),
+            clock_timer_armed: false,
+        }
     }
 }
 
@@ -312,17 +397,19 @@ impl LockScreenState {
         // lock starting from a guaranteed-clean slate costs nothing and
         // removes any need to trust that invariant.
         self.unlock_prompt = UnlockPrompt::default();
+        self.power = PowerMenu::Closed;
     }
 
     /// See `last_input_at`'s own doc comment for why this also resets the
     /// idle clock. Also resets `unlock_prompt` unconditionally — see that
     /// type's own doc comment: no error/attempt-count/visibility from THIS
-    /// lock survives into the next one.
+    /// lock survives into the next one. Same for the power menu.
     pub(crate) fn unlock(&mut self) {
         self.locked = false;
         self.locked_at = None;
         self.last_input_at = Instant::now();
         self.unlock_prompt = UnlockPrompt::default();
+        self.power = PowerMenu::Closed;
     }
 
     pub(crate) fn note_input(&mut self) {
@@ -406,6 +493,66 @@ impl LockScreenState {
         self.unlock_prompt.phase = UnlockPhase::Failed(kind);
         self.unlock_prompt.fail_count += 1;
         self.unlock_prompt.last_attempt_at = Some(now);
+    }
+
+    // ── ICON-3 (2026-08-23): the power control ────────────────────────────
+
+    pub(crate) fn power_menu(&self) -> PowerMenu {
+        self.power
+    }
+
+    /// The power button's own click. Opens the menu from `Closed`, and
+    /// closes it from ANY other state — including mid-`Sending`, which only
+    /// dismisses the panel: the request already left, and this state machine
+    /// has no way to recall it, so the honest thing is to stop claiming to
+    /// represent it rather than to pretend the button can cancel it.
+    pub(crate) fn toggle_power_menu(&mut self) {
+        self.power = match self.power {
+            PowerMenu::Closed => PowerMenu::Open,
+            _ => PowerMenu::Closed,
+        };
+    }
+
+    /// Arms the second step. Refused while a request is in flight so a
+    /// stray click cannot re-arm a menu that is mid-send.
+    pub(crate) fn arm_power_confirm(&mut self, action: crate::gateway_client::PowerAction) {
+        if matches!(self.power, PowerMenu::Sending(_)) {
+            return;
+        }
+        self.power = PowerMenu::Confirming(action);
+    }
+
+    /// Back out of a confirmation (or clear a settled failure) WITHOUT
+    /// closing the menu — the operator is still in the power menu, they
+    /// just changed their mind about which action. A no-op while
+    /// `Sending`, same reason `toggle_power_menu` gives.
+    pub(crate) fn cancel_power_confirm(&mut self) {
+        if matches!(self.power, PowerMenu::Sending(_)) {
+            return;
+        }
+        self.power = PowerMenu::Open;
+    }
+
+    /// The ONLY transition into `Sending`, and it is gated: a dispatch is
+    /// allowed exactly from `Confirming(action)` for that SAME action.
+    /// Returns `false` (and changes nothing) otherwise, so a caller that
+    /// forgot the confirm step gets a no-op rather than a machine that
+    /// powers off.
+    pub(crate) fn begin_power(&mut self, action: crate::gateway_client::PowerAction) -> bool {
+        if self.power != PowerMenu::Confirming(action) {
+            return false;
+        }
+        self.power = PowerMenu::Sending(action);
+        true
+    }
+
+    /// Records a settled failure. Only meaningful while `Sending` — a
+    /// result arriving for a menu the operator already closed is dropped,
+    /// so a late error can never re-open a dismissed panel.
+    pub(crate) fn settle_power_failure(&mut self, failure: PowerFailure) {
+        if matches!(self.power, PowerMenu::Sending(_)) {
+            self.power = PowerMenu::Failed(failure);
+        }
     }
 
     /// Pure predicate the idle watchdog (`render::maybe_auto_lock`) consults
@@ -749,6 +896,107 @@ mod tests {
         assert!(!state.can_submit(now), "a further failure re-arms the throttle");
         now += THROTTLE_DURATION;
         assert!(state.can_submit(now), "and it clears again after another cooldown — never a permanent lockout");
+    }
+
+    // ── ICON-3 (2026-08-23): power menu + accessibility honesty ──────────
+
+    use crate::gateway_client::PowerAction;
+
+    /// Pins the claim `LOCKSCREEN_A11Y_ACTIONS`' own doc comment makes. If
+    /// a future round wires a real switch, this test fails and forces a
+    /// deliberate decision about the button, rather than letting the slice
+    /// and the rendered UI drift apart in either direction.
+    #[test]
+    fn the_accessibility_button_is_hidden_while_nothing_is_wired() {
+        assert!(
+            LOCKSCREEN_A11Y_ACTIONS.is_empty(),
+            "an accessibility action was registered — `render::system_actions_row` will now draw \
+             the button, so the panel behind it must actually apply these"
+        );
+    }
+
+    #[test]
+    fn the_power_menu_starts_closed_and_toggles() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        assert_eq!(state.power_menu(), PowerMenu::Closed);
+        state.toggle_power_menu();
+        assert_eq!(state.power_menu(), PowerMenu::Open);
+        state.toggle_power_menu();
+        assert_eq!(state.power_menu(), PowerMenu::Closed);
+    }
+
+    /// The load-bearing guarantee of the whole control: one click can never
+    /// reach `Sending`. `begin_power` is reachable ONLY out of a matching
+    /// `Confirming`.
+    #[test]
+    fn a_power_action_cannot_be_dispatched_without_its_own_confirmation() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        assert!(!state.begin_power(PowerAction::Shutdown), "dispatch from Closed must be refused");
+        state.toggle_power_menu();
+        assert!(!state.begin_power(PowerAction::Shutdown), "dispatch from Open must be refused");
+        state.arm_power_confirm(PowerAction::Reboot);
+        assert!(!state.begin_power(PowerAction::Shutdown), "confirming a REBOOT must not authorize a SHUTDOWN");
+        assert_eq!(state.power_menu(), PowerMenu::Confirming(PowerAction::Reboot));
+        assert!(state.begin_power(PowerAction::Reboot));
+        assert_eq!(state.power_menu(), PowerMenu::Sending(PowerAction::Reboot));
+    }
+
+    #[test]
+    fn a_second_dispatch_is_refused_while_one_is_already_in_flight() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        state.toggle_power_menu();
+        state.arm_power_confirm(PowerAction::Reboot);
+        assert!(state.begin_power(PowerAction::Reboot));
+        assert!(!state.begin_power(PowerAction::Reboot));
+        // …and neither of the two menu mutators can rewind it either.
+        state.arm_power_confirm(PowerAction::Shutdown);
+        state.cancel_power_confirm();
+        assert_eq!(state.power_menu(), PowerMenu::Sending(PowerAction::Reboot));
+    }
+
+    #[test]
+    fn cancelling_a_confirmation_returns_to_the_menu_not_to_closed() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        state.toggle_power_menu();
+        state.arm_power_confirm(PowerAction::Shutdown);
+        state.cancel_power_confirm();
+        assert_eq!(state.power_menu(), PowerMenu::Open);
+    }
+
+    #[test]
+    fn a_settled_failure_only_lands_while_sending() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        state.toggle_power_menu();
+        // A late result for a menu the operator already closed is dropped.
+        state.toggle_power_menu();
+        state.settle_power_failure(PowerFailure::NoAnswer);
+        assert_eq!(state.power_menu(), PowerMenu::Closed);
+
+        state.toggle_power_menu();
+        state.arm_power_confirm(PowerAction::Reboot);
+        state.begin_power(PowerAction::Reboot);
+        state.settle_power_failure(PowerFailure::Unsupported);
+        assert_eq!(state.power_menu(), PowerMenu::Failed(PowerFailure::Unsupported));
+    }
+
+    #[test]
+    fn locking_and_unlocking_both_drop_a_half_answered_power_prompt() {
+        for reset in [LockScreenState::unlock, |s: &mut LockScreenState| {
+            s.unlock();
+            s.lock();
+        }] {
+            let mut state = LockScreenState::default();
+            state.lock();
+            state.toggle_power_menu();
+            state.arm_power_confirm(PowerAction::Shutdown);
+            reset(&mut state);
+            assert_eq!(state.power_menu(), PowerMenu::Closed, "an unanswered shutdown prompt must never outlive its session");
+        }
     }
 
     #[test]

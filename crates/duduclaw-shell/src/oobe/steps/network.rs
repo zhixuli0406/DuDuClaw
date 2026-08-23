@@ -46,6 +46,7 @@ use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 use duduclaw_native_gui::theme;
 
 use crate::i18n::{t, t1, Key};
+use crate::icons;
 use crate::oobe::widgets::{self, NetworkFields, StepButtonVariant};
 use crate::oobe::{network, NetConnectFailureKind, NetConnectState, NetScanState, OobeFlow, OobeUiState};
 use crate::palette::ShellPalette;
@@ -62,7 +63,23 @@ pub(super) fn render(flow: &OobeFlow, ui: &OobeUiState, fields: &NetworkFields, 
         _ => widgets::subtitle(t(locale, Key::NetworkSubtitlePrompt), palette),
     };
 
-    let mut column = div().flex().flex_col().items_center().gap(px(20.)).child(widgets::title(t(locale, Key::NetworkTitle), palette)).child(status);
+    // ICON-3 (2026-08-23): `OOBE-KeySteps.dc.html` puts a 32px
+    // `network-wireless` above this step's title. All four layers are
+    // painted the SAME colour here — the level-dependent tinting is the ROW
+    // indicator's job (`signal_arcs` below), not the title's, which is why
+    // this goes through `wifi_plain_layers` and not `wifi_signal_layers`.
+    //
+    // Spacing note (applies to every step-title icon added this round): the
+    // board's own rhythm is icon → 16px → title → 10px → subtitle → 20px →
+    // card, but this column has used ONE uniform 20px gap since Shell-S1,
+    // shared by all ten steps. Reproducing the board's per-child margins for
+    // only the steps that gained an icon would make those steps inconsistent
+    // with the seven that did not, so the uniform gap is kept deliberately.
+    let mut column = div().flex().flex_col().items_center().gap(px(20.));
+    if let Some(icon) = icons::icon_or_none(&icons::wifi_plain_layers(palette.muted_foreground), 32.) {
+        column = column.child(icon);
+    }
+    let mut column = column.child(widgets::title(t(locale, Key::NetworkTitle), palette)).child(status);
 
     if ui.net_backend_kind == Some(network::NetBackendKind::Fake) {
         column = column.child(demo_mode_notice(locale, palette));
@@ -222,15 +239,29 @@ fn wifi_row(ap: &network::AccessPoint, index: usize, flow: &OobeFlow, ui: &OobeU
             div()
                 .flex()
                 .items_center()
-                .gap(px(10.))
-                .child(signal_bars(ap.signal_bars, palette))
+                // 11px, the board's own row gap (was 10 when the indicator
+                // was a four-div bar stack).
+                .gap(px(11.))
+                .child(signal_arcs(ap.signal_bars, palette))
                 .child(div().text_size(px(theme::TEXT_SM)).child(ap.ssid.clone()))
                 .when(ap.secured, |el| {
+                    // ICON-3 (2026-08-23): `network-wireless-encrypted`, a
+                    // 14px padlock, replaces the "需密碼" text
+                    // (`OOBE-KeySteps.dc.html`, and the assignment table's
+                    // own "取代「需密碼」文字"). The text stays in the
+                    // catalog as this icon's `icon_or_glyph` fallback, so a
+                    // missing asset degrades to the pre-ICON-3 row rather
+                    // than dropping the "you'll need a password" signal
+                    // entirely.
                     el.child(
                         div()
                             .text_size(px(theme::TEXT_XS))
                             .text_color(theme::alpha(palette.muted_foreground, 1.0))
-                            .child(t(locale, Key::NetworkSecuredBadge)),
+                            .child(icons::icon_or_glyph(
+                                &[(icons::LOCK_CLOSED_SM, palette.muted_foreground)],
+                                14.,
+                                t(locale, Key::NetworkSecuredBadge),
+                            )),
                     )
                 }),
         )
@@ -250,24 +281,27 @@ fn wifi_row(ap: &network::AccessPoint, index: usize, flow: &OobeFlow, ui: &OobeU
     row
 }
 
-/// Signal-strength indicator — four bars of increasing height, filled up to
-/// `strength`. Plain colored `div()`s, which is what the approved OOBE
-/// board itself draws: those boards contain no SVG at all (unlike the
-/// Home/overlay boards, whose icons ICON-1 wired up through
-/// `crate::icons`), so there is no vector artwork to render here.
-fn signal_bars(strength: u8, palette: ShellPalette) -> Div {
-    let mut row = div().flex().items_end().gap(px(2.));
-    for bar in 1..=4u8 {
-        let filled = bar <= strength;
-        row = row.child(
-            div()
-                .w(px(3.))
-                .h(px(4. + f32::from(bar) * 2.))
-                .rounded(px(1.))
-                .bg(if filled { theme::alpha(palette.brand, 1.0) } else { palette.surface_border }),
-        );
+/// Signal-strength indicator — ICON-3 (2026-08-23).
+///
+/// This used to be four plain `div()` bars of increasing height, and the
+/// comment here used to say the OOBE boards "contain no SVG at all". That
+/// was true of the Shell-S1 boards; it is not true of
+/// `OOBE-KeySteps.dc.html`, which draws the real five-level concentric-arc
+/// family and explicitly retires the bar stack ("現行的四格 div 條…退休").
+/// `crate::icons::wifi_signal_layers` owns the level → tint decision; this
+/// fn is now only the 20px frame around it.
+///
+/// Degrades to NOTHING (not to a substitute glyph) if an asset is missing —
+/// the row still reads correctly without it (SSID + lock + connected badge
+/// are all still there), and there is no honest single character that means
+/// "three of five bars". Same call `icon_or_none`'s own doc comment
+/// describes for the menu-bar Wi-Fi indicator.
+fn signal_arcs(strength: u8, palette: ShellPalette) -> Div {
+    let layers = icons::wifi_signal_layers(strength, palette);
+    match icons::icon_or_none(&layers, 20.) {
+        Some(icon) => div().flex().flex_none().child(icon),
+        None => div().flex_none(),
     }
-    row
 }
 
 /// The PSK-entry / connecting-progress / failure panel — shown once a row

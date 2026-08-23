@@ -1,0 +1,2 @@
+<!-- a11y-seeing — OOBE-ProgressAndIcons.dc.html, the 視覺 row. Same shape the boards view-reveal (password eye) uses. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#52525c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12s3.6-6 9.5-6 9.5 6 9.5 6-3.6 6-9.5 6-9.5-6-9.5-6z"></path><circle cx="12" cy="12" r="2.6"></circle></svg>

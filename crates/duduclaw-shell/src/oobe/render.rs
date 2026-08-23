@@ -63,7 +63,11 @@ pub fn render(flow: &OobeFlow, ui: &OobeUiState, account_fields: &AccountFields,
                 .justify_center()
                 .gap(px(28.))
                 .px(px(48.))
-                .child(widgets::progress_dots(step.index(), OobeStep::ALL.len(), palette))
+                // ICON-3 (2026-08-23): the progress dots used to be the
+                // FIRST child here, above the step's own title. The board
+                // moves them into the bottom toolbar alongside 返回/繼續 —
+                // see `widgets::progress_dots`'s own doc comment for the
+                // measurements and `button_row` below for the placement.
                 // No `.items_center()` here, deliberately (2026-08-20 user
                 // report "把所有版面寬度統一"): centering THIS wrapper made
                 // each step's root shrink to its intrinsic content width, so
@@ -122,13 +126,23 @@ fn button_row(step: OobeStep, flow: &OobeFlow, cx: &mut Context<ShellView>) -> D
         cx.notify();
     });
 
-    let left = div().when(can_back, |el| {
+    // ICON-3 (2026-08-23): the toolbar is now a THREE-column row —
+    // `OOBE-ProgressAndIcons.dc.html` fixes the outer two at 180px each and
+    // lets the dots take the flexible middle, so the dot group stays
+    // centred on the SCREEN rather than drifting with the button widths
+    // (which change with the locale and with whether 略過 is present).
+    // `justify_between` was enough for two columns; it is not for three.
+    const NAV_COLUMN_WIDTH: f32 = 180.;
+
+    let left = div().w(px(NAV_COLUMN_WIDTH)).when(can_back, |el| {
         el.child(widgets::step_button("oobe-back", t(locale, Key::NavBack), StepButtonVariant::Ghost, false, palette, back_click))
     });
 
     let right = div()
+        .w(px(NAV_COLUMN_WIDTH))
         .flex()
         .items_center()
+        .justify_end()
         .gap(px(10.))
         .when(skippable, |el| {
             el.child(widgets::step_button("oobe-skip", t(locale, Key::NavSkip), StepButtonVariant::Secondary, false, palette, skip_click))
@@ -151,11 +165,11 @@ fn button_row(step: OobeStep, flow: &OobeFlow, cx: &mut Context<ShellView>) -> D
         .w_full()
         .flex()
         .items_center()
-        .justify_between()
         .px(px(48.))
         .py(px(20.))
         .border_t_1()
         .border_color(palette.border())
         .child(left)
+        .child(div().flex_1().child(widgets::progress_dots(step.index(), OobeStep::ALL.len(), palette)))
         .child(right)
 }

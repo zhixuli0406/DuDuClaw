@@ -20,6 +20,18 @@ pub enum Overlay {
     Launcher,
     Notifications,
     ControlCenter,
+    /// ICON-3 (2026-08-23) — 「協助工具 › 指向與點按」, reached from a row
+    /// inside ControlCenter. A fourth overlay rather than a card inside
+    /// ControlCenter itself: the five size buttons draw the real cursor at
+    /// up to 96px, which does not fit that panel's 372px width, and this
+    /// shell has no settings application to make it a page of. See
+    /// `overlay/pointer_settings.rs`'s own header comment.
+    ///
+    /// Note that opening it therefore CLOSES ControlCenter — overlays never
+    /// stack (see `open` below) — and Escape from here returns to Home, not
+    /// back to ControlCenter. That is the existing model applied
+    /// consistently, not a special case.
+    PointerSettings,
 }
 
 impl Overlay {
@@ -34,6 +46,7 @@ impl Overlay {
             "launcher" => Some(Overlay::Launcher),
             "notifications" => Some(Overlay::Notifications),
             "controlcenter" => Some(Overlay::ControlCenter),
+            "pointer" => Some(Overlay::PointerSettings),
             _ => None,
         }
     }
@@ -143,10 +156,11 @@ mod tests {
     }
 
     #[test]
-    fn debug_env_parses_all_three_known_values() {
+    fn debug_env_parses_all_known_values() {
         assert_eq!(Overlay::from_debug_env("launcher"), Some(Overlay::Launcher));
         assert_eq!(Overlay::from_debug_env("notifications"), Some(Overlay::Notifications));
         assert_eq!(Overlay::from_debug_env("controlcenter"), Some(Overlay::ControlCenter));
+        assert_eq!(Overlay::from_debug_env("pointer"), Some(Overlay::PointerSettings));
     }
 
     #[test]

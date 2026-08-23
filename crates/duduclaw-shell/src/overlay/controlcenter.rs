@@ -119,7 +119,91 @@ pub(super) fn render(ui: &OverlayUiState, audio_ui: &audio::AudioUiState, palett
         // See this file's header comment on why this is dark-only.
         panel = panel.text_color(theme::alpha(palette.foreground, 1.0));
     }
-    panel.child(quick_tiles_row(palette)).child(sliders_card(audio_ui, palette, cx)).child(ai_team_card(ui, palette, cx)).child(footer_row(palette, cx))
+    panel
+        .child(quick_tiles_row(palette))
+        .child(sliders_card(audio_ui, palette, cx))
+        .child(ai_team_card(ui, palette, cx))
+        .child(accessibility_card(palette, cx))
+        .child(footer_row(palette, cx))
+}
+
+/// ICON-3 (2026-08-23): the entry point for 「協助工具 › 指向與點按」.
+///
+/// This panel is what the dock's gear opens (`home/home_dock.rs::
+/// dock_settings`), i.e. it IS this shell's settings surface — so a settings
+/// section belongs behind a row here, not behind an invented settings
+/// application. The section label matches the board's own sidebar wording so
+/// the two places that name this screen agree.
+///
+/// Its strings go through `crate::i18n` with a hardcoded `Locale::ZhTw`,
+/// unlike the `fake_data::CC_*` literals around it. That is deliberate and
+/// is the SAME shape `lockscreen/render.rs` already uses: this label is the
+/// title of a screen that is itself fully i18n'd, so keeping the two in one
+/// catalog is what stops them drifting apart. It does not change this file's
+/// existing convention for its own strings — see the `AUDIO_DEMO_MODE_NOTICE`
+/// comment above, which stays true of everything else here.
+fn accessibility_card(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    use crate::i18n::{t, Key, Locale};
+
+    let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.12).into() } else { palette.border() };
+    let label_divider = if palette.is_dark() { theme::alpha(0xffffff, 0.08) } else { theme::alpha(0xf0f0f2, 1.0) };
+
+    let open_click = cx.listener(|view, _ev, _window, cx| {
+        view.surface.open(crate::surface::Overlay::PointerSettings);
+        cx.notify();
+    });
+
+    div()
+        .bg(theme::alpha(palette.surface_raised, 1.0))
+        .border_1()
+        .border_color(border_color)
+        .rounded(px(13.))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .text_size(px(11.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::alpha(palette.text_faint, 1.0))
+                .px(px(14.))
+                .pt(px(11.))
+                .pb(px(9.))
+                .border_b_1()
+                .border_color(label_divider)
+                .child(t(Locale::ZhTw, Key::PointerSectionAccessibility)),
+        )
+        .child(
+            div()
+                .id("cc-pointer-entry")
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(14.))
+                .py(px(11.))
+                .hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0)))
+                .child(icons::icon_or_none(&[(icons::A11Y_POINTING, palette.icon_control())], 18.).unwrap_or_else(|| div().into_any_element()))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::alpha(palette.foreground, 1.0))
+                                .child(t(Locale::ZhTw, Key::PointerTitle)),
+                        )
+                        // `#9f9fa9` in BOTH themes, the same non-inverting
+                        // literal `switch_row`/`quick_tile` use — see this
+                        // file's header comment.
+                        .child(div().text_size(px(11.)).text_color(theme::alpha(0x9f9fa9, 1.0)).child(t(Locale::ZhTw, Key::PointerEntryDesc))),
+                )
+                .child(icons::icon_or_none(&[(icons::CHEVRON_RIGHT, palette.text_faint)], 14.).unwrap_or_else(|| div().into_any_element()))
+                .on_click(open_click),
+        )
 }
 
 /// The bespoke "inactive control" gray this file's header comment

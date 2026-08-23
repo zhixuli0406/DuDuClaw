@@ -31,11 +31,16 @@
 
 pub mod approvals;
 mod login;
+/// ICON-3 (2026-08-23): `device.power_local`, the lockscreen's restart/
+/// shut-down control — see that module's own header comment for the wire
+/// contract and for why a pre-auth surface may call it at all.
+mod power;
 pub mod session;
 mod ws_rpc;
 
 pub use approvals::{decide_approval, list_approvals, ApprovalItem};
 pub(crate) use login::{verify_password, LoginError};
+pub(crate) use power::{power_local, PowerAction, PowerError};
 pub use session::{bootstrap_local_session, SessionError};
 pub use ws_rpc::RpcError;
 

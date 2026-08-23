@@ -1,0 +1,2 @@
+<!-- avatar-default (L7) — Main.dc.html; only used when a name has no usable first character. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fafafa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><circle cx="12" cy="9.8" r="3"></circle><path d="M6.2 18.8a6.4 6.4 0 0 1 11.6 0"></path></svg>

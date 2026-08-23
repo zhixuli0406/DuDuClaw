@@ -16,6 +16,7 @@ use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 use duduclaw_native_gui::theme;
 
 use crate::i18n::{t, Key, Locale};
+use crate::icons;
 use crate::palette::ShellPalette;
 use crate::oobe::widgets;
 use crate::oobe::{OobeFlow, PrivacyToggle};
@@ -29,14 +30,15 @@ pub(super) fn render(flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
         rows = rows.child(toggle_row(flow, toggle, locale, palette, cx));
     }
 
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(20.))
-        .child(widgets::title(t(locale, Key::PrivacyTitle), palette))
-        .child(widgets::subtitle(t(locale, Key::PrivacySubtitle), palette))
-        .child(widgets::card(rows, palette))
+    // ICON-3 (2026-08-23): the 32px `preferences-system-privacy` shield
+    // `OOBE-KeySteps.dc.html` puts above this step's title. See
+    // `steps::network::render`'s own comment for why the column keeps its
+    // uniform 20px gap rather than the board's per-child margins.
+    let mut column = div().flex().flex_col().items_center().gap(px(20.));
+    if let Some(icon) = icons::icon_or_none(&[(icons::SHIELD, palette.muted_foreground)], 32.) {
+        column = column.child(icon);
+    }
+    column.child(widgets::title(t(locale, Key::PrivacyTitle), palette)).child(widgets::subtitle(t(locale, Key::PrivacySubtitle), palette)).child(widgets::card(rows, palette))
 }
 
 fn toggle_row(flow: &OobeFlow, toggle: PrivacyToggle, locale: Locale, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
@@ -58,9 +60,18 @@ fn toggle_row(flow: &OobeFlow, toggle: PrivacyToggle, locale: Locale, palette: S
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(14.))
+        .gap(px(11.))
         .px(px(4.))
         .py(px(9.))
+        // ICON-3 (2026-08-23) — the operator's ruling ⑤, which overturns
+        // this board's own GNOME-派 choice ("頁內四列全裸") in favour of the
+        // elementary one: every row carries a 20px icon. The board's own
+        // note is explicit that this is all-or-nothing ("要翻案就是整頁四列
+        // 都加，不能只加一半"), which is why `icons::privacy_toggle_layers`
+        // is keyed by `PrivacyToggle::slug()` and a fifth toggle added
+        // without an icon fails a test rather than shipping a half-iconed
+        // list.
+        .child(icons::icon_or_none(&icons::privacy_toggle_layers(toggle.slug(), palette).unwrap_or_default(), 20.).unwrap_or_else(|| div().into_any_element()))
         .child(
             div()
                 .flex_1()

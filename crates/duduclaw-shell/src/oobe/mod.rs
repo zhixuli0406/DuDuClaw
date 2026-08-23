@@ -129,6 +129,14 @@ pub use selections::{LanguageChoice, OobeSelections, OobeState, PrivacyToggle, T
 /// files either (same `#[allow]` reasoning as `OobeSelections`/`OobeState`
 /// just above).
 #[allow(unused_imports)]
-pub use persistence::{boot_theme, load_state, resolve_boot_flow, save_state, state_path};
+pub use persistence::{boot_operator_name, boot_theme, load_state, resolve_boot_flow, save_state, state_path};
 /// Ephemeral UI-only state — see `ui_state.rs`'s own header comment.
 pub use ui_state::{AccountClaimFailureKind, AccountClaimState, OobeUiState};
+/// ICON-3 (2026-08-23): the language step's five accessibility categories,
+/// surfaced here only so `crate::icons`' mapping tests can iterate them —
+/// see `steps/mod.rs`'s own re-export comment. `#[allow(unused_imports)]`
+/// for exactly the reason the `OobeSelections`/`state_path` re-exports above
+/// carry it: the ONLY consumer is a `#[cfg(test)]` module, so a release
+/// build legitimately sees no use of the path.
+#[allow(unused_imports)]
+pub(crate) use steps::A11yCategory;

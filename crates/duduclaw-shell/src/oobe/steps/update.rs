@@ -18,11 +18,14 @@ pub(super) fn render(flow: &OobeFlow) -> Div {
     let locale = flow.locale();
     let palette = flow.palette();
 
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(20.))
+    // ICON-3 (2026-08-23): `software-update-available`, the 32px title icon
+    // `OOBE-ProgressAndIcons.dc.html`'s assignment table gives this step.
+    // See `steps::network::render`'s own comment on the column's spacing.
+    let mut column = div().flex().flex_col().items_center().gap(px(20.));
+    if let Some(icon) = crate::icons::icon_or_none(&[(crate::icons::SOFTWARE_UPDATE, palette.muted_foreground)], 32.) {
+        column = column.child(icon);
+    }
+    column
         .child(widgets::title(t(locale, Key::UpdateTitle), palette))
         .child(widgets::subtitle(t(locale, Key::UpdateChecking), palette))
         .child(widgets::card(

@@ -1,0 +1,2 @@
+<!-- network-wireless-signal-* layer 1/4 — OOBE-KeySteps.dc.html. The board paints ONE concentric-arc shape and only changes each arcs colour per level, so gpui (one colour per svg element) needs one file per arc. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2171cc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 8.1a13.6 13.6 0 0 1 18.8 0"></path></svg>

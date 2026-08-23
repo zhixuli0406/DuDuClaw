@@ -69,9 +69,36 @@ pub enum Key {
     InputDetectionDetected,
 
     LanguageAccessibilityEntry,
+    /// ICON-3 (2026-08-23): these two are no longer the row's PRIMARY
+    /// affordance — the board replaced the "展開 ▼"/"收合 ▲" text with a
+    /// `go-next`/`go-down` chevron. They stay in the catalog, and stay
+    /// translated, as that chevron's `icon_or_glyph` text fallback (the
+    /// arrow inside each string is exactly what makes them a usable
+    /// fallback), so a missing asset degrades to the pre-ICON-3 wording
+    /// rather than to a blank hole.
     LanguageAccessibilityCollapse,
     LanguageAccessibilityExpand,
+    /// ICON-3: reworded. It used to name three specific options
+    /// (旁白／放大鏡／對比度) because it was the ONLY thing the expanded
+    /// panel showed; the panel now lists the board's five real categories
+    /// above it, so this line's job is narrower — it says, honestly, that
+    /// none of the five is adjustable yet.
     LanguageAccessibilityPlaceholder,
+    /// ICON-3 (2026-08-23): the five accessibility categories
+    /// `OOBE-ProgressAndIcons.dc.html` draws inside the expanded panel.
+    /// Purely informational rows (no toggle, no chevron, no click target),
+    /// exactly as the board draws them — see `steps::language`'s own header
+    /// comment on why they are NOT interactive.
+    LanguageA11ySeeingLabel,
+    LanguageA11ySeeingDesc,
+    LanguageA11yHearingLabel,
+    LanguageA11yHearingDesc,
+    LanguageA11yTypingLabel,
+    LanguageA11yTypingDesc,
+    LanguageA11yPointingLabel,
+    LanguageA11yPointingDesc,
+    LanguageA11yZoomLabel,
+    LanguageA11yZoomDesc,
 
     CommonSelected,
 
@@ -243,6 +270,75 @@ pub enum Key {
     /// informational, not a hard lockout.
     LockThrottledLabel,
 
+    /// ICON-3 (2026-08-23): the lockscreen's bottom-centre power button and
+    /// its two-item menu. Both actions are irreversible from this surface's
+    /// point of view (the machine goes away), so each takes a second
+    /// confirmation — the same two-step shape `overlay/notifications.rs`
+    /// already uses for approve/reject, applied to the one control on this
+    /// surface that can end the session.
+    LockPowerRestart,
+    LockPowerShutdown,
+    LockPowerConfirmRestart,
+    LockPowerConfirmShutdown,
+    LockPowerSending,
+    /// Every transport-level failure — no session, unreachable gateway,
+    /// timeout, a rejection this client has no specific handling for. One
+    /// honest message, the same collapse `LockOfflineError` already makes
+    /// for the unlock path.
+    LockPowerFailed,
+    /// The gateway answered, and answered that it does not know this method
+    /// — an older gateway build. Distinct from `LockPowerFailed` because
+    /// the operator's response differs: nothing is going to fix itself by
+    /// retrying.
+    LockPowerUnsupported,
+
+    /// ICON-3 (2026-08-23): the pointer-settings surface
+    /// (`overlay/pointer_settings.rs`) — entirely new process chrome with
+    /// no zh-TW-literal neighbours of its own, so it routes through this
+    /// catalog exactly like the `Launcher*`/`InstallGate*` keys above. Its
+    /// ENTRY row inside ControlCenter reads from these same keys via
+    /// `t(Locale::ZhTw, ..)`, the same shape `lockscreen/render.rs` already
+    /// uses, so the two places that name this screen can never disagree.
+    PointerTitle,
+    PointerSubtitle,
+    PointerEntryDesc,
+    PointerSectionAccessibility,
+    PointerShapeLabel,
+    PointerSizeLabel,
+    PointerSourceSystem,
+    PointerSourceSystemDesc,
+    PointerSourceBrand,
+    PointerSourceBrandDesc,
+    PointerSizeDefault,
+    PointerSizeMedium,
+    PointerSizeLarge,
+    PointerSizeExtraLarge,
+    PointerSizeLargest,
+    /// GNOME's own `cc-cursor-size-page` help line, translated — the one
+    /// piece of copy on this screen with a verbatim upstream precedent.
+    PointerZoomHint,
+    PointerLoading,
+    /// No compositor to talk to at all: `$XDG_RUNTIME_DIR` unset, or no
+    /// `duduclaw-shell.sock`. The ordinary case on a dev Mac, and the
+    /// honest one on a Linux box whose compositor is down.
+    PointerUnavailable,
+    /// The compositor is there and answered, but does not implement
+    /// `set_cursor_size` (or reported no `size` at all) — an older
+    /// `duduclaw-comp`. Only the SIZE half degrades; shape still works.
+    PointerSizeUnsupported,
+    PointerApplyFailed,
+    /// The compositor is drawing a DIFFERENT cursor theme from the one that
+    /// was chosen, because the chosen one is not installed
+    /// (`CursorState::theme_missing`). The radio keeps showing the choice;
+    /// this line explains why the pointer does not match it.
+    PointerThemeMissing,
+    /// An operator pinned the cursor style and/or size in the compositor's
+    /// spawn environment (`DUDUCLAW_COMP_CURSOR_SOURCE` / `XCURSOR_SIZE`),
+    /// which outranks anything stored from this screen at the next start.
+    /// Without this line the page would quietly promise a choice that does
+    /// not survive a reboot.
+    PointerEnvPinned,
+
     /// WP-A3 (2026-08-22): the Launcher's live search box going from a
     /// static predisplay to real typing (`overlay/launcher.rs`) introduces
     /// genuinely new process chrome — same "honest-state messaging is
@@ -338,7 +434,17 @@ fn zh_tw(key: Key) -> &'static str {
         Key::LanguageAccessibilityEntry => "輔助使用設定",
         Key::LanguageAccessibilityCollapse => "收合 ▲",
         Key::LanguageAccessibilityExpand => "展開 ▼",
-        Key::LanguageAccessibilityPlaceholder => "輔助使用選項（旁白／放大鏡／對比度）— 下一輪實作",
+        Key::LanguageAccessibilityPlaceholder => "以上選項尚未開放調整，之後會在設定中提供",
+        Key::LanguageA11ySeeingLabel => "視覺",
+        Key::LanguageA11ySeeingDesc => "放大文字、高對比、朗讀畫面",
+        Key::LanguageA11yHearingLabel => "聽覺",
+        Key::LanguageA11yHearingDesc => "單聲道、視覺提示音",
+        Key::LanguageA11yTypingLabel => "打字",
+        Key::LanguageA11yTypingDesc => "螢幕鍵盤、相黏鍵、慢速鍵",
+        Key::LanguageA11yPointingLabel => "指向與點按",
+        Key::LanguageA11yPointingDesc => "指標大小與造型、滑鼠鍵",
+        Key::LanguageA11yZoomLabel => "縮放",
+        Key::LanguageA11yZoomDesc => "畫面放大鏡",
 
         Key::CommonSelected => "已選擇",
 
@@ -448,6 +554,37 @@ fn zh_tw(key: Key) -> &'static str {
         Key::LockVerifyingLabel => "驗證中…",
         Key::LockThrottledLabel => "嘗試次數過多，請稍候再試",
 
+        Key::LockPowerRestart => "重新啟動",
+        Key::LockPowerShutdown => "關機",
+        Key::LockPowerConfirmRestart => "確定要重新啟動這台機器嗎？",
+        Key::LockPowerConfirmShutdown => "確定要關閉這台機器嗎？",
+        Key::LockPowerSending => "正在送出…",
+        Key::LockPowerFailed => "本機服務未回應，指令沒有送出",
+        Key::LockPowerUnsupported => "這台機器目前不支援從鎖定畫面執行這個動作",
+
+        Key::PointerTitle => "指向與點按",
+        Key::PointerSubtitle => "協助工具 · 指標的大小與造型",
+        Key::PointerEntryDesc => "指標大小與造型",
+        Key::PointerSectionAccessibility => "協助工具",
+        Key::PointerShapeLabel => "造型",
+        Key::PointerSizeLabel => "大小",
+        Key::PointerSourceSystem => "系統標準",
+        Key::PointerSourceSystemDesc => "預設",
+        Key::PointerSourceBrand => "嘟嘟爪印",
+        Key::PointerSourceBrandDesc => "只換箭頭與抓取手勢，其餘沿用系統形狀",
+        Key::PointerSizeDefault => "預設",
+        Key::PointerSizeMedium => "中",
+        Key::PointerSizeLarge => "大",
+        Key::PointerSizeExtraLarge => "特大",
+        Key::PointerSizeLargest => "最大",
+        Key::PointerZoomHint => "指標大小可以和「縮放」搭配使用，讓指標更容易看見。",
+        Key::PointerLoading => "正在讀取指標設定…",
+        Key::PointerUnavailable => "找不到桌面服務，這台機器上目前無法調整指標。",
+        Key::PointerSizeUnsupported => "這台機器的桌面服務還不支援調整指標大小。",
+        Key::PointerApplyFailed => "無法套用這個設定，請稍後再試。",
+        Key::PointerThemeMissing => "這台機器沒有安裝選定的指標圖案，目前畫的是系統指標。",
+        Key::PointerEnvPinned => "這台機器的指標設定由開機環境固定，這裡的選擇下次開機不會生效。",
+
         Key::LauncherSearchPlaceholder => "輸入以搜尋…",
         Key::LauncherNoAppResults => "沒有符合的 app",
         Key::LauncherAppsScanning => "正在尋找這台機器上的應用程式…",
@@ -490,7 +627,17 @@ fn en(key: Key) -> &'static str {
         Key::LanguageAccessibilityEntry => "Accessibility",
         Key::LanguageAccessibilityCollapse => "Collapse ▲",
         Key::LanguageAccessibilityExpand => "Expand ▼",
-        Key::LanguageAccessibilityPlaceholder => "Accessibility options (VoiceOver, Zoom, Contrast). Coming in a future update.",
+        Key::LanguageAccessibilityPlaceholder => "None of these can be adjusted yet. They'll arrive in Settings in a future update.",
+        Key::LanguageA11ySeeingLabel => "Seeing",
+        Key::LanguageA11ySeeingDesc => "Larger text, high contrast, screen reader",
+        Key::LanguageA11yHearingLabel => "Hearing",
+        Key::LanguageA11yHearingDesc => "Mono audio, visual alerts",
+        Key::LanguageA11yTypingLabel => "Typing",
+        Key::LanguageA11yTypingDesc => "On-screen keyboard, sticky keys, slow keys",
+        Key::LanguageA11yPointingLabel => "Pointing & clicking",
+        Key::LanguageA11yPointingDesc => "Pointer size and style, mouse keys",
+        Key::LanguageA11yZoomLabel => "Zoom",
+        Key::LanguageA11yZoomDesc => "Screen magnifier",
 
         Key::CommonSelected => "Selected",
 
@@ -600,6 +747,37 @@ fn en(key: Key) -> &'static str {
         Key::LockVerifyingLabel => "Verifying…",
         Key::LockThrottledLabel => "Too many attempts. Please wait a moment.",
 
+        Key::LockPowerRestart => "Restart",
+        Key::LockPowerShutdown => "Shut down",
+        Key::LockPowerConfirmRestart => "Restart this machine?",
+        Key::LockPowerConfirmShutdown => "Shut down this machine?",
+        Key::LockPowerSending => "Sending…",
+        Key::LockPowerFailed => "The local service didn't respond; nothing was sent.",
+        Key::LockPowerUnsupported => "This machine can't do that from the lock screen.",
+
+        Key::PointerTitle => "Pointing & clicking",
+        Key::PointerSubtitle => "Accessibility · pointer size and style",
+        Key::PointerEntryDesc => "Pointer size and style",
+        Key::PointerSectionAccessibility => "Accessibility",
+        Key::PointerShapeLabel => "Style",
+        Key::PointerSizeLabel => "Size",
+        Key::PointerSourceSystem => "System standard",
+        Key::PointerSourceSystemDesc => "Default",
+        Key::PointerSourceBrand => "DuDu paw",
+        Key::PointerSourceBrandDesc => "Replaces the arrow and grab shapes only; everything else stays as the system draws it",
+        Key::PointerSizeDefault => "Default",
+        Key::PointerSizeMedium => "Medium",
+        Key::PointerSizeLarge => "Large",
+        Key::PointerSizeExtraLarge => "Extra large",
+        Key::PointerSizeLargest => "Largest",
+        Key::PointerZoomHint => "Pointer size can be combined with Zoom to make it easier to see the pointer.",
+        Key::PointerLoading => "Reading pointer settings…",
+        Key::PointerUnavailable => "The desktop service isn't reachable, so the pointer can't be changed on this machine.",
+        Key::PointerSizeUnsupported => "This machine's desktop service can't change the pointer size yet.",
+        Key::PointerApplyFailed => "Couldn't apply that setting. Please try again shortly.",
+        Key::PointerThemeMissing => "The chosen pointer artwork isn't installed on this machine, so system pointers are being drawn.",
+        Key::PointerEnvPinned => "This machine's pointer settings are pinned at startup, so a choice made here won't apply after a restart.",
+
         Key::LauncherSearchPlaceholder => "Type to search…",
         Key::LauncherNoAppResults => "No matching apps",
         Key::LauncherAppsScanning => "Looking for the apps on this machine\u{2026}",
@@ -642,7 +820,17 @@ fn ja_jp(key: Key) -> &'static str {
         Key::LanguageAccessibilityEntry => "アクセシビリティ設定",
         Key::LanguageAccessibilityCollapse => "閉じる ▲",
         Key::LanguageAccessibilityExpand => "開く ▼",
-        Key::LanguageAccessibilityPlaceholder => "アクセシビリティ設定（読み上げ／拡大鏡／コントラスト）。今後のアップデートで対応予定です。",
+        Key::LanguageAccessibilityPlaceholder => "上記の項目はまだ変更できません。今後のアップデートで設定から対応予定です。",
+        Key::LanguageA11ySeeingLabel => "視覚",
+        Key::LanguageA11ySeeingDesc => "文字の拡大、ハイコントラスト、画面の読み上げ",
+        Key::LanguageA11yHearingLabel => "聴覚",
+        Key::LanguageA11yHearingDesc => "モノラル音声、視覚的な通知音",
+        Key::LanguageA11yTypingLabel => "入力",
+        Key::LanguageA11yTypingDesc => "スクリーンキーボード、固定キー、スローキー",
+        Key::LanguageA11yPointingLabel => "ポインタ操作",
+        Key::LanguageA11yPointingDesc => "ポインタの大きさと形状、マウスキー",
+        Key::LanguageA11yZoomLabel => "ズーム",
+        Key::LanguageA11yZoomDesc => "画面の拡大鏡",
 
         Key::CommonSelected => "選択済み",
 
@@ -751,6 +939,37 @@ fn ja_jp(key: Key) -> &'static str {
         Key::LockOfflineError => "ローカルサービスが応答していません。しばらくしてから再試行してください。",
         Key::LockVerifyingLabel => "確認中…",
         Key::LockThrottledLabel => "試行回数が多すぎます。少し待ってから再試行してください。",
+
+        Key::LockPowerRestart => "再起動",
+        Key::LockPowerShutdown => "シャットダウン",
+        Key::LockPowerConfirmRestart => "この端末を再起動しますか？",
+        Key::LockPowerConfirmShutdown => "この端末をシャットダウンしますか？",
+        Key::LockPowerSending => "送信中…",
+        Key::LockPowerFailed => "ローカルサービスが応答しないため、指示は送信されていません。",
+        Key::LockPowerUnsupported => "この端末はロック画面からこの操作を実行できません。",
+
+        Key::PointerTitle => "ポインタ操作",
+        Key::PointerSubtitle => "アクセシビリティ · ポインタの大きさと形状",
+        Key::PointerEntryDesc => "ポインタの大きさと形状",
+        Key::PointerSectionAccessibility => "アクセシビリティ",
+        Key::PointerShapeLabel => "形状",
+        Key::PointerSizeLabel => "大きさ",
+        Key::PointerSourceSystem => "システム標準",
+        Key::PointerSourceSystemDesc => "デフォルト",
+        Key::PointerSourceBrand => "ドゥドゥの肉球",
+        Key::PointerSourceBrandDesc => "矢印とつかむ形だけを差し替え、その他はシステムの形状のままです",
+        Key::PointerSizeDefault => "デフォルト",
+        Key::PointerSizeMedium => "中",
+        Key::PointerSizeLarge => "大",
+        Key::PointerSizeExtraLarge => "特大",
+        Key::PointerSizeLargest => "最大",
+        Key::PointerZoomHint => "ポインタの大きさはズームと組み合わせると、より見つけやすくなります。",
+        Key::PointerLoading => "ポインタ設定を読み込んでいます…",
+        Key::PointerUnavailable => "デスクトップサービスに接続できないため、この端末ではポインタを変更できません。",
+        Key::PointerSizeUnsupported => "この端末のデスクトップサービスはまだポインタの大きさを変更できません。",
+        Key::PointerApplyFailed => "設定を適用できませんでした。しばらくしてから再試行してください。",
+        Key::PointerThemeMissing => "選択したポインタの画像がこの端末にインストールされていないため、システムのポインタを表示しています。",
+        Key::PointerEnvPinned => "この端末のポインタ設定は起動時に固定されているため、ここでの選択は次回起動時には反映されません。",
 
         Key::LauncherSearchPlaceholder => "入力して検索…",
         Key::LauncherNoAppResults => "該当するアプリがありません",

@@ -1,0 +1,2 @@
+<!-- preferences-desktop-theme — OOBE-ProgressAndIcons.dc.html + PointerSettings.dc.html sidebar. A circle with its right half filled; a single colour, so one file (see icons.rs on why multi-COLOUR icons need layers and this one does not). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#71717b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="#71717b" stroke="none"></path></svg>

@@ -125,16 +125,36 @@ pub(super) fn step_button(
 /// 條", §A "主要分歧" progress-indicator row) which does not apply here:
 /// DuDuClaw OS's OOBE is a fixed ten-step linear sequence, so a dot per
 /// step is an honest indicator, not a promise the flow can't keep.
+///
+/// ── ICON-3 (2026-08-23): re-measured against the board ────────────────
+/// `OOBE-ProgressAndIcons.dc.html`'s own before/after strip replaces the
+/// 16×6 pill + 6×6 dots (top of the content column) with **12px / 8px
+/// CIRCLES at gap 8, in the bottom toolbar** — the measurements it lifts
+/// from Ubuntu, the one surveyed OS that shows a step indicator at all.
+/// The move to the toolbar is `render::button_row`'s doing; this fn only
+/// owns the dots' own geometry.
+///
+/// Honest gap: the same board also asks for a 「第 N 步，共 10 步」 screen-
+/// reader label. gpui exposes no accessibility/AT API at the pinned rev
+/// (nothing in `gpui::` sets an accessible name or role), so there is
+/// nowhere to put one — and rendering it as VISIBLE text would be a
+/// different design than the board's, not an implementation of it. Left
+/// undone and reported, rather than faked.
 pub(super) fn progress_dots(current_index: usize, total: usize, palette: ShellPalette) -> Div {
-    let mut row = div().flex().items_center().gap(px(6.));
+    let mut row = div().flex().items_center().justify_center().gap(px(8.));
     for i in 0..total {
         let active = i == current_index;
+        let size = if active { 12. } else { 8. };
         row = row.child(
             div()
-                .w(px(if active { 16. } else { 6. }))
-                .h(px(6.))
-                .rounded(px(3.))
-                .bg(if active { theme::alpha(palette.brand, 1.0) } else { palette.surface_border }),
+                .w(px(size))
+                .h(px(size))
+                .rounded(px(size))
+                // The board paints an unlit dot `#d4d4d8`, which is exactly
+                // `icon_inactive()` in light — switched off `surface_border`
+                // (a near-miss inherited from the pill-shaped original) so
+                // the dots match the board they were re-measured from.
+                .bg(theme::alpha(if active { palette.brand } else { palette.icon_inactive() }, 1.0)),
         );
     }
     row

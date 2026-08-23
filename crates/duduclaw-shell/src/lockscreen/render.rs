@@ -14,11 +14,38 @@
 // `crate::palette`'s own header comment establishes for its badge-color
 // gaps, just applied to an entire surface instead of one field.
 //
-// ── Read-only, EXCEPT for the password field itself (WP-lock-pw reversal) ─
+// ── ICON-3 (2026-08-23): the board this file now follows ────────────────
+// The visual spec above (`duduclaw-os-desktop/LockScreen.dc.html`) is
+// SUPERSEDED for everything below the summary card by
+// `commercial/design/duduclaw-lockscreen-oobe-icons/Main.dc.html`, plus five
+// operator rulings that override the board where it left a question open.
+// The three that land here:
+//
+//   ① the 56px glass circle holds a real `changes-prevent` padlock (not the
+//      "鎖" glyph, and not the identity) — the identity moves to its own
+//      22px letter-avatar row underneath it (`name_row`);
+//   ② the two system-action buttons go BOTTOM-CENTRE (the GNOME
+//      convention), not the board's own bottom-right (the Windows one);
+//   ③ the power menu offers 關機 as well as 重新啟動.
+//
+// Plus the research's §E dark-surface legibility numbers: the clock's weight
+// goes 700 → 800 and the wake-up hint becomes bold. See each call site.
+//
+// ── Read-only, EXCEPT for the password field and the power control ──────
+// The paragraph below was written when the ONLY interactive thing here was
+// the password field. ICON-3 adds a second: the bottom-centre power button
+// (`system_actions_row` → `power_menu_panel`). That is not a departure from
+// the researched precedent — §A.1 finds a power control on the lock surface
+// to be the cross-OS norm — but it IS the one thing on this pre-auth screen
+// that can end the session, so it is gated behind an explicit two-step
+// confirmation (see `crate::lockscreen::PowerMenu`). The board's OTHER
+// bottom-centre button, accessibility, is deliberately not drawn at all:
+// see `crate::lockscreen::LOCKSCREEN_A11Y_ACTIONS`.
+//
 // Every OS precedent researched (§3.3) keeps the lock surface non-
 // interactive outside of its own credential entry, and that is now the
 // shape here too: the clock/summary card/glow blobs still have ZERO click
-// targets of their own, but `unlock_prompt_panel` below renders one real
+// targets of their own, but `unlock_prompt_rows` below renders one real
 // `OobeTextField` (the SAME reusable widget OOBE's `AccountCreate`/`Network`
 // steps use — see `crate::oobe::LockPasswordField`'s own doc comment for
 // why it's reached through that module rather than re-derived here) once
@@ -96,6 +123,12 @@ pub(crate) fn render(
     state: &LockScreenState,
     notifications: &NotificationsFeed,
     password_field: &LockPasswordField,
+    // ICON-3 (2026-08-23): the identity row's display name, read ONCE at
+    // boot from the persisted OOBE state (`main.rs`'s `operator_name`
+    // field — see `oobe::boot_operator_name`'s own doc comment). `None`
+    // means no name is on file; the row then draws `avatar-default` and no
+    // text, which is honest rather than a blank pill.
+    operator_name: Option<&str>,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
     schedule_clock_tick(cx);
@@ -126,16 +159,52 @@ pub(crate) fn render(
         .child(cat_watermark())
         .child(clock_block(&time_text, &date_text));
 
-    // WP-lock-pw: the hint ("按任意鍵或點擊以輸入密碼") only makes sense
-    // BEFORE the field exists — once revealed, `unlock_prompt_panel` takes
-    // over the same bottom-of-screen real estate.
-    root = if state.prompt_visible() { root.child(unlock_prompt_panel(state, password_field)) } else { root.child(unlock_hint()) };
-
     if privacy != LockPrivacy::None {
         root = root.child(summary_card(state, notifications, privacy));
     }
 
+    // ICON-3 (2026-08-23): the whole bottom band is ONE column now.
+    //
+    // It used to be two independently-anchored blocks: the unlock hint /
+    // password prompt at `bottom: 90` (or 70), and nothing else. This round
+    // adds the board's system-action buttons at `bottom: 30`, and a popover
+    // menu above them — three stacked things whose heights all change with
+    // state (the prompt grows an input and up to two status lines; the menu
+    // grows a confirmation). Keeping them on separate absolute anchors would
+    // mean hand-tuning offsets that only happen to clear each other in the
+    // states someone thought to check. One bottom-anchored flex column makes
+    // non-overlap structural instead, and reproduces the board's own
+    // measurements exactly in the resting state: buttons 40px tall at
+    // `bottom: 30` (→ 830..870), gap 20, so the identity block's own bottom
+    // edge lands at 810 — the board's `bottom: 90`.
+    root = root.child(bottom_stack(state, password_field, operator_name, cx));
+
     root
+}
+
+/// The bottom band: identity/unlock block, the power menu when it is open,
+/// and the system-action button row. See `render`'s own comment above for
+/// why these three share one anchor.
+fn bottom_stack(
+    state: &LockScreenState,
+    password_field: &LockPasswordField,
+    operator_name: Option<&str>,
+    cx: &mut Context<ShellView>,
+) -> Div {
+    let mut col = div()
+        .absolute()
+        .bottom(px(30.))
+        .left(px(0.))
+        .right(px(0.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(20.))
+        .child(identity_block(state, password_field, operator_name));
+    if let Some(menu) = power_menu_panel(state, cx) {
+        col = col.child(menu);
+    }
+    col.child(system_actions_row(cx))
 }
 
 fn glow_top_right() -> Div {
@@ -170,7 +239,13 @@ fn clock_block(time_text: &str, date_text: &str) -> Div {
         .flex_col()
         .items_center()
         .gap(px(6.))
-        .child(div().text_size(px(92.)).font_weight(FontWeight::BOLD).text_color(theme::alpha(0xfafafa, 1.0)).child(time_text.to_string()))
+        // ICON-3 (2026-08-23): 700 -> 800. The research's §E takes GNOME's
+        // own lock-screen stylesheet as the only first-hand set of numbers
+        // for a dark lock surface, and its clock is `font-weight: 800`; the
+        // revised board follows it. gpui has no letter-spacing primitive at
+        // the pinned rev, so the board's `-0.02em` tracking is not applied —
+        // an honest gap, not a silent substitution.
+        .child(div().text_size(px(92.)).font_weight(FontWeight::EXTRA_BOLD).text_color(theme::alpha(0xfafafa, 1.0)).child(time_text.to_string()))
         .child(div().text_size(px(17.)).font_weight(FontWeight::MEDIUM).text_color(theme::alpha(0xfafafa, 0.75)).child(date_text.to_string()))
 }
 
@@ -279,26 +354,39 @@ fn summary_line(dot_hex: u32, text: String) -> Div {
         .child(div().text_size(px(13.5)).text_color(theme::alpha(0xfafafa, 0.92)).child(text))
 }
 
-fn unlock_hint() -> Div {
-    div()
-        .absolute()
-        .bottom(px(90.))
-        .left(px(0.))
-        .right(px(0.))
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(12.))
-        .child(lock_glyph_circle())
-        .child(div().text_size(px(12.)).text_color(theme::alpha(0xfafafa, 0.55)).child(t(Locale::ZhTw, Key::LockUnlockHint)))
+/// The lock glyph, the identity row, and then EITHER the wake-up hint or the
+/// real password prompt — one block, because the board draws them as one
+/// centred stack and because the transition between hint and prompt must not
+/// move the glyph or the name.
+fn identity_block(state: &LockScreenState, password_field: &LockPasswordField, operator_name: Option<&str>) -> Div {
+    let col = div().flex().flex_col().items_center().gap(px(12.)).child(lock_glyph_circle()).child(name_row(operator_name));
+    if state.prompt_visible() {
+        unlock_prompt_rows(col, state, password_field)
+    } else {
+        // The board raised this from `rgba(250,250,250,0.55)` regular to
+        // `0.62` BOLD — per the research's §E, weight is the primary
+        // legibility lever for hint text on a dark surface (GNOME's own
+        // `.unlock-dialog-clock-hint { font-weight: bold }`), not alpha.
+        col.child(
+            div()
+                .text_size(px(12.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::alpha(0xfafafa, 0.62))
+                .child(t(Locale::ZhTw, Key::LockUnlockHint)),
+        )
+    }
 }
 
-/// A single CJK glyph ("鎖", lock) stands in for a real lock icon. ICON-1
-/// (2026-08-22) gave this crate real vector icons (`crate::icons`) but did
-/// NOT change this slot: `LockScreen.dc.html` — the approved board for this
-/// very surface — contains no SVG at all, so there is no board artwork to
-/// draw here and inventing one would be this file deciding a design
-/// question. Left as the honest placeholder, listed as a gap.
+/// The 56px glass circle. ICON-3 (2026-08-23) replaces the single CJK glyph
+/// ("鎖") that stood here since Shell-S4-lock: the revised board draws a real
+/// 24px `changes-prevent` padlock inside it, so there IS board artwork now —
+/// the earlier note that there was none was accurate against
+/// `duduclaw-os-desktop/LockScreen.dc.html`, which is a different (older)
+/// board. The glyph survives as the icon's `icon_or_glyph` fallback.
+///
+/// The operator's ruling ① settled the board's own open question here:
+/// padlock in the circle, and the identity moves to its own row below (see
+/// `name_row`) rather than competing for this slot.
 fn lock_glyph_circle() -> Div {
     div()
         .w(px(56.))
@@ -310,22 +398,72 @@ fn lock_glyph_circle() -> Div {
         .flex()
         .items_center()
         .justify_center()
-        .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).text_color(theme::alpha(0xfafafa, 1.0)).child("鎖"))
+        .text_size(px(20.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(theme::alpha(0xfafafa, 1.0))
+        .child(crate::icons::icon_or_glyph(&[(crate::icons::LOCK_CLOSED, 0xfafafa)], 24., "鎖"))
 }
 
-/// WP-lock-pw (2026-08-22) — replaces `unlock_hint()` once the password
-/// prompt is revealed, at the same bottom-of-screen position (`unlock_hint`
-/// sits at `bottom(px(90.))`; this panel starts a little higher to leave
-/// room for the input box itself, still well clear of the summary card
-/// above it at `top(px(420.))`). Keeps the same lock glyph as a visual
-/// anchor so the transition from "hint" to "prompt" doesn't jump the whole
-/// layout around.
-fn unlock_prompt_panel(state: &LockScreenState, password_field: &LockPasswordField) -> Div {
-    let now = Instant::now();
-    let mut col = div().absolute().bottom(px(70.)).left(px(0.)).right(px(0.)).flex().flex_col().items_center().gap(px(10.));
+/// The identity row — ICON-3 (2026-08-23), the operator's ruling ①: a 22px
+/// letter avatar followed by the name, in the same visual vocabulary the
+/// dock's agent avatars already use (a circular tile, the first character,
+/// bold, in the tile's own foreground).
+///
+/// With no name on file the row degrades to the board's own `avatar-default`
+/// (L7: 「取不到名字首字母時才用」) and NO name text — this shell must not
+/// invent a name for a machine that was never given one.
+fn name_row(operator_name: Option<&str>) -> Div {
+    let initial = operator_name.and_then(first_initial);
+    let mut row = div().flex().items_center().gap(px(8.));
 
-    col = col.child(lock_glyph_circle());
-    col = col.child(div().w(px(240.)).child(password_field.field.clone()));
+    row = row.child(match initial {
+        Some(letter) => div()
+            .w(px(22.))
+            .h(px(22.))
+            .rounded(px(11.))
+            .bg(theme::alpha(0xffffff, 0.18))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(11.))
+            .font_weight(FontWeight::BOLD)
+            .text_color(theme::alpha(0xfafafa, 1.0))
+            .child(letter)
+            .into_any_element(),
+        None => crate::icons::icon_or_none(&[(crate::icons::AVATAR_DEFAULT, 0xfafafa)], 22.).unwrap_or_else(|| div().into_any_element()),
+    });
+
+    if let Some(name) = operator_name {
+        row = row.child(
+            div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::alpha(0xfafafa, 0.92)).child(name.to_string()),
+        );
+    }
+    row
+}
+
+/// The avatar's letter: the name's first CHARACTER, upper-cased.
+///
+/// Deliberately `chars().next()`, never `&name[..1]` — this crate's coding
+/// convention 1 (a byte slice panics mid-codepoint, and an operator name is
+/// very often CJK here). `to_uppercase()` is the Unicode-correct form and
+/// can yield more than one char for a few Latin letters (ß → SS); those are
+/// kept whole rather than truncated, since a 22px tile showing "SS" is
+/// merely wide, while a half-uppercased letter would be wrong. CJK is
+/// unaffected — uppercasing a Han character is the identity.
+///
+/// `None` when the name has no characters at all, which is the same signal
+/// `oobe::boot_operator_name` already filters for; belt-and-braces, because
+/// the fallback path has to exist anyway for `operator_name == None`.
+fn first_initial(name: &str) -> Option<String> {
+    name.chars().next().map(|c| c.to_uppercase().to_string())
+}
+
+/// The password prompt's own rows, appended to the identity block once the
+/// prompt is revealed (WP-lock-pw, 2026-08-22; re-parented into
+/// `identity_block` by ICON-3 — see that fn's own doc comment).
+fn unlock_prompt_rows(col: Div, state: &LockScreenState, password_field: &LockPasswordField) -> Div {
+    let now = Instant::now();
+    let mut col = col.child(div().w(px(240.)).child(password_field.field.clone()));
 
     match state.unlock_phase() {
         UnlockPhase::Idle => {}
@@ -359,6 +497,269 @@ fn prompt_hint_line(text: &str) -> Div {
 /// correct, not a light/dark choice that got hardcoded by accident.
 fn prompt_error_line(text: &str) -> Div {
     div().text_size(px(12.)).text_color(theme::alpha(theme::dark::DESTRUCTIVE, 1.0)).child(text.to_string())
+}
+
+// ── System actions: the bottom-centre glass buttons ─────────────────────
+// ICON-3 (2026-08-23). The board drew these bottom-RIGHT (the Windows
+// login-screen convention); the operator's ruling ② moved them to a
+// bottom-CENTRE group (the GNOME convention), which is what this renders.
+
+/// The 40px glass button group. Today it has exactly ONE button — power.
+/// The board's second button (accessibility) is deliberately not drawn:
+/// see `crate::lockscreen::LOCKSCREEN_A11Y_ACTIONS`' own doc comment for
+/// the "which switch could it flip?" audit that came back empty, and the
+/// test that will fail the moment that stops being true.
+fn system_actions_row(cx: &mut Context<ShellView>) -> Div {
+    let mut row = div().flex().items_center().justify_center().gap(px(10.));
+    if !super::LOCKSCREEN_A11Y_ACTIONS.is_empty() {
+        // Intentionally unreachable today. Left as a real branch, not a
+        // `todo!()`, so adding the first action is a one-line change here
+        // rather than a rewrite — and so this row's geometry (a two-button
+        // group, gap 10, exactly as the board draws it) is already correct
+        // when it happens.
+        row = row.child(glass_button("lock-a11y-button", crate::icons::ACCESSIBILITY, "無", |_view, _cx| {}, cx));
+    }
+    row.child(glass_button(
+        "lock-power-button",
+        crate::icons::POWER,
+        "電",
+        |view, cx| {
+            view.lockscreen.toggle_power_menu();
+            cx.notify();
+        },
+        cx,
+    ))
+}
+
+/// One 40px circular glass button — `rgba(255,255,255,0.12)` on a
+/// `rgba(255,255,255,0.2)` hairline, a 20px `#fafafa` stroke icon inside.
+/// Board measurements, unchanged from the bottom-right group it replaces.
+fn glass_button(
+    id: &'static str,
+    icon: &'static str,
+    fallback_glyph: &'static str,
+    on_click: impl Fn(&mut ShellView, &mut Context<ShellView>) + 'static,
+    cx: &mut Context<ShellView>,
+) -> Stateful<Div> {
+    let listener = cx.listener(move |view, _ev, _window, cx| on_click(view, cx));
+    div()
+        .id(id)
+        .cursor_pointer()
+        .w(px(40.))
+        .h(px(40.))
+        .rounded(px(20.))
+        .bg(theme::alpha(0xffffff, 0.12))
+        .border_1()
+        .border_color(theme::alpha(0xffffff, 0.2))
+        .hover(|style| style.bg(theme::alpha(0xffffff, 0.20)))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(15.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(theme::alpha(0xfafafa, 1.0))
+        .child(crate::icons::icon_or_glyph(&[(icon, 0xfafafa)], 20., fallback_glyph))
+        .on_click(listener)
+}
+
+/// The power popover — `None` while the menu is closed, so `bottom_stack`
+/// simply doesn't add a child and the button row sits directly under the
+/// identity block.
+///
+/// Four visual states, one per `PowerMenu` variant (see that enum's own doc
+/// comment for the transitions). The confirmation is a real second step, not
+/// a styling flourish: a single click anywhere in here never reaches the
+/// gateway.
+fn power_menu_panel(state: &LockScreenState, cx: &mut Context<ShellView>) -> Option<Div> {
+    use crate::gateway_client::PowerAction;
+    use super::{PowerFailure, PowerMenu};
+
+    let panel = |body: Div| {
+        div()
+            .w(px(240.))
+            .bg(theme::alpha(0xffffff, 0.10))
+            .border_1()
+            .border_color(theme::alpha(0xffffff, 0.16))
+            .rounded(px(14.))
+            .p(px(8.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(body)
+    };
+
+    match state.power_menu() {
+        PowerMenu::Closed => None,
+        PowerMenu::Open => Some(panel(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(power_action_row(PowerAction::Reboot, cx))
+                .child(power_action_row(PowerAction::Shutdown, cx)),
+        )),
+        PowerMenu::Confirming(action) => Some(panel(confirm_body(action, cx))),
+        PowerMenu::Sending(_) => Some(panel(div().px(px(8.)).py(px(8.)).child(prompt_hint_line(t(Locale::ZhTw, Key::LockPowerSending))))),
+        PowerMenu::Failed(failure) => {
+            let key = match failure {
+                PowerFailure::NoAnswer => Key::LockPowerFailed,
+                PowerFailure::Unsupported => Key::LockPowerUnsupported,
+            };
+            Some(panel(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(8.))
+                    .child(prompt_error_line(t(Locale::ZhTw, key)))
+                    .child(power_text_button("lock-power-dismiss", t(Locale::ZhTw, Key::NetworkCancelButton), cx)),
+            ))
+        }
+    }
+}
+
+/// One row of the two-item menu. Clicking it only ARMS the confirmation —
+/// `LockScreenState::arm_power_confirm`, never `begin_power`.
+fn power_action_row(action: crate::gateway_client::PowerAction, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    use crate::gateway_client::PowerAction;
+    let (id, key) = match action {
+        PowerAction::Reboot => ("lock-power-reboot", Key::LockPowerRestart),
+        PowerAction::Shutdown => ("lock-power-shutdown", Key::LockPowerShutdown),
+    };
+    let listener = cx.listener(move |view, _ev, _window, cx| {
+        view.lockscreen.arm_power_confirm(action);
+        cx.notify();
+    });
+    div()
+        .id(id)
+        .cursor_pointer()
+        .px(px(10.))
+        .py(px(8.))
+        .rounded(px(9.))
+        .hover(|style| style.bg(theme::alpha(0xffffff, 0.12)))
+        .text_size(px(13.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::alpha(0xfafafa, 0.92))
+        .child(t(Locale::ZhTw, key))
+        .on_click(listener)
+}
+
+/// The second step: the question, then 取消 / 確定. `確定` is the ONLY thing
+/// in this file that reaches the gateway.
+fn confirm_body(action: crate::gateway_client::PowerAction, cx: &mut Context<ShellView>) -> Div {
+    use crate::gateway_client::PowerAction;
+    let question = match action {
+        PowerAction::Reboot => Key::LockPowerConfirmRestart,
+        PowerAction::Shutdown => Key::LockPowerConfirmShutdown,
+    };
+    let confirm = cx.listener(move |view, _ev, _window, cx| dispatch_power_action(view, action, cx));
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .px(px(8.))
+        .py(px(8.))
+        .child(div().text_size(px(12.5)).text_color(theme::alpha(0xfafafa, 0.92)).child(t(Locale::ZhTw, question)))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(power_text_button("lock-power-cancel", t(Locale::ZhTw, Key::NetworkCancelButton), cx))
+                .child(
+                    div()
+                        .id("lock-power-confirm")
+                        .cursor_pointer()
+                        .px(px(12.))
+                        .py(px(6.))
+                        .rounded(px(8.))
+                        .bg(theme::alpha(0xffffff, 0.22))
+                        .hover(|style| style.bg(theme::alpha(0xffffff, 0.30)))
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::alpha(0xfafafa, 1.0))
+                        .child(t(Locale::ZhTw, Key::NotifConfirmButton))
+                        .on_click(confirm),
+                ),
+        )
+}
+
+/// A low-key "back out" text button inside the popover — 取消 next to a
+/// confirmation, and the dismiss under a failure message.
+///
+/// Both go to `cancel_power_confirm`, i.e. back to the two-item MENU rather
+/// than closing the popover outright: the operator opened the power menu on
+/// purpose, and changing their mind about WHICH action is not the same as
+/// changing their mind about the menu. Closing it is what the power button
+/// itself does.
+fn power_text_button(id: &'static str, label: &'static str, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    let listener = cx.listener(move |view, _ev, _window, cx| {
+        view.lockscreen.cancel_power_confirm();
+        cx.notify();
+    });
+    div()
+        .id(id)
+        .cursor_pointer()
+        .px(px(12.))
+        .py(px(6.))
+        .rounded(px(8.))
+        .hover(|style| style.bg(theme::alpha(0xffffff, 0.12)))
+        .text_size(px(12.5))
+        .text_color(theme::alpha(0xfafafa, 0.7))
+        .child(label)
+        .on_click(listener)
+}
+
+/// Sends one confirmed power request. Same "background thread + `std::sync::
+/// mpsc` + a `cx.spawn` poll loop" bridge `dispatch_unlock_attempt` above
+/// already uses (and `oobe/steps/account.rs` established for this crate) —
+/// `gateway_client::power_local` is a plain blocking call and gpui's main
+/// thread must never block on I/O.
+///
+/// The `begin_power` guard is the authoritative one: it refuses unless the
+/// state is exactly `Confirming(action)`, so a click that somehow arrived
+/// out of order sends nothing.
+///
+/// SUCCESS IS NEVER RENDERED, deliberately. A gateway that accepts a reboot
+/// is about to take this process down with it; there is no "done" for the
+/// operator to read, and drawing one would be a claim this surface cannot
+/// stand behind. Only failures produce UI.
+fn dispatch_power_action(view: &mut ShellView, action: crate::gateway_client::PowerAction, cx: &mut Context<ShellView>) {
+    if !view.lockscreen.begin_power(action) {
+        return;
+    }
+    cx.notify();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::gateway_client::power_local(action));
+    });
+
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(result) => {
+                let _ = weak.update(cx, |view, cx| {
+                    if let Err(e) = result {
+                        // Detail to stderr only; the operator-facing text is
+                        // one of two honest messages (see `PowerFailure`).
+                        eprintln!("[lockscreen] power_local({action:?}) failed: {e:?}");
+                        let failure = match e {
+                            crate::gateway_client::PowerError::Unsupported(_) => super::PowerFailure::Unsupported,
+                            crate::gateway_client::PowerError::Failed(_) => super::PowerFailure::NoAnswer,
+                        };
+                        view.lockscreen.settle_power_failure(failure);
+                        cx.notify();
+                    }
+                });
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(Duration::from_millis(50)).await;
+    })
+    .detach();
 }
 
 // ── Trigger / unlock entry points (called from `main.rs`) ─────────────────

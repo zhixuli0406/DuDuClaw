@@ -20,6 +20,14 @@ mod templates;
 mod theme;
 mod update;
 
+/// ICON-3 (2026-08-23): the language step's five accessibility categories.
+/// Re-exported up through `oobe` (see `oobe/mod.rs`'s own `pub(crate) use`)
+/// purely so `crate::icons`' slot-mapping tests can iterate them the same
+/// way they iterate `PrivacyToggle::ALL` — nothing outside this step
+/// RENDERS them. Same shape `network_ui`'s own enums already establish for
+/// their re-export.
+pub(crate) use language::A11yCategory;
+
 use gpui::{Context, Div};
 
 use super::widgets::{AccountFields, NetworkFields};

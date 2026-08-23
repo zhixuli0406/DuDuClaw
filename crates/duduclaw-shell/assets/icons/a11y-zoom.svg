@@ -1,0 +1,2 @@
+<!-- a11y-zoom — OOBE-ProgressAndIcons.dc.html, the 縮放 row. Deliberately NOT the existing search.svg: that one is the Launchers own magnifier (cx 11 / r 7 / no linejoin), a different circle and tail. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#52525c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.8" cy="10.8" r="6.6"></circle><path d="M15.6 15.6l4.6 4.6"></path></svg>

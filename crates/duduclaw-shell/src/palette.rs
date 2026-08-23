@@ -426,6 +426,27 @@ impl ShellPalette {
         }
     }
 
+    /// The "this part of the control is OFF" gray — light `#d4d4d8` / dark
+    /// `#3f3f46`. ICON-3 (2026-08-23): named here because the OOBE Wi-Fi
+    /// signal family needs it for its unlit arcs (`OOBE-KeySteps.dc.html`
+    /// paints those `#d4d4d8`), and it is the SAME pair `overlay/
+    /// controlcenter.rs`'s own `track_off_hex` helper already spells out for
+    /// its toggle/slider tracks. That helper is deliberately left alone —
+    /// it returns the identical values for a different family of widgets,
+    /// and merging the two would mean one of the two files reaching across
+    /// a module boundary for a two-line branch.
+    ///
+    /// Distinct from `icon_control()` above: that is an icon that IS active
+    /// but sits on a neutral surface; this is a part of an icon that is
+    /// deliberately unlit.
+    pub(crate) fn icon_inactive(&self) -> u32 {
+        if self.dark {
+            0x3f3f46
+        } else {
+            0xd4d4d8
+        }
+    }
+
     /// The browser globe's stroke — light `#1f7ae0` (bespoke: NOT `brand`,
     /// which is `#2171cc`) / dark `#59a6ff`, which IS `brand_bright`
     /// exactly. Kept as one method so the asymmetry is stated once.

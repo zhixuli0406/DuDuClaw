@@ -143,6 +143,27 @@ pub fn boot_theme(persisted: &OobeState) -> ThemeChoice {
     persisted.selections.theme
 }
 
+/// The operator's display name for the LOCKSCREEN's identity row — ICON-3
+/// (2026-08-23). Same "read it off the persisted state at boot, before
+/// `resolve_boot_flow` consumes it" shape `boot_theme` above establishes,
+/// and for the same reason: the lockscreen only ever renders on the boot
+/// path where OOBE resolved to `None`, so pulling this out of that `Option`
+/// would lose it exactly where it is needed.
+///
+/// Whitespace-only and empty values come back as `None`, not as a blank
+/// name — the lockscreen's identity row falls back to `avatar-default` plus
+/// no name text in that case, which is honest ("this machine has no name on
+/// file") rather than rendering an empty pill.
+///
+/// This is the SAME local-display-only field `OobeSelections::operator_name`
+/// documents: the gateway's `admin@local` account has no profile name of its
+/// own to ask for, so what OOBE typed is the only name that exists. It is
+/// never used for authentication — `gateway_client::verify_password` sends
+/// only the password.
+pub fn boot_operator_name(persisted: &OobeState) -> Option<String> {
+    persisted.selections.operator_name.as_deref().map(str::trim).filter(|name| !name.is_empty()).map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

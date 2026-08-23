@@ -8,10 +8,11 @@
 // that crate's `lib.rs`) rather than forking either.
 //
 // Surface model: `Home` is the always-present base surface (`home.rs`);
-// `Launcher` / `Notifications` / `ControlCenter` are overlays (`overlay.rs`
-// + its `overlay/{launcher,notifications,controlcenter}.rs` content
-// modules) that render on top of it, at most one at a time, driven by the
-// pure state machine in `surface.rs`. cmd-k toggles the Launcher
+// `Launcher` / `Notifications` / `ControlCenter` / `PointerSettings` are
+// overlays (`overlay.rs` + its `overlay/{launcher,notifications,
+// controlcenter,pointer_settings}.rs` content modules) that render on top of
+// it, at most one at a time, driven by the pure state machine in
+// `surface.rs`. cmd-k toggles the Launcher
 // specifically; Escape closes whatever overlay is currently open; clicking
 // the overlay backdrop (anywhere outside the panel) also closes it — see
 // `overlay.rs`'s header comment for why that no longer conflicts with
@@ -152,6 +153,13 @@ pub struct ShellView {
     /// comment for what it holds and why it's plain data, not a gpui
     /// `Entity`.
     pub(crate) audio_ui: audio::AudioUiState,
+    /// ICON-3 (2026-08-23) — the pointer-settings overlay's compositor-backed
+    /// state. A sibling field rather than part of `overlay_ui`, for exactly
+    /// the reason `audio_ui` above already is one: it is this round's own
+    /// state, and keeping it out of `OverlayUiState`'s body keeps the diff
+    /// away from fields other work packages own. See
+    /// `overlay::pointer_settings::PointerUiState`'s own doc comment.
+    pub(crate) pointer_ui: overlay::pointer_settings::PointerUiState,
     /// Shell-S4-lock (2026-08-22) — the lock-screen surface's own runtime
     /// state (locked?/since-when/idle clock). `Some(&self.lockscreen)` never
     /// exists standalone the way `oobe: Option<...>` does: locking is a
@@ -193,6 +201,19 @@ pub struct ShellView {
     /// `OobeTextField::new` constructor is private to that module — this
     /// field has nothing conceptually to do with OOBE.
     pub(crate) lockscreen_password_field: oobe::LockPasswordField,
+    /// ICON-3 (2026-08-23) — the lockscreen identity row's display name.
+    /// Read ONCE at window-open time from the persisted OOBE state
+    /// (`oobe::boot_operator_name`), exactly like `theme` just below and for
+    /// the same reason: the lockscreen only ever renders on a boot path
+    /// where `initial_oobe` resolved to `None`, so it cannot read the name
+    /// out of a live `OobeFlow`. Not re-read per render — `load_state()` is
+    /// a blocking disk read, and this value cannot change while the shell is
+    /// running (the only writer is the OOBE flow, which by definition is not
+    /// running when the lock screen is).
+    ///
+    /// `None` means no name is on file; see `lockscreen::render::name_row`
+    /// for what that draws.
+    pub(crate) operator_name: Option<String>,
     /// `Some` while the system-level first-run flow (OOBE) owns the whole
     /// screen — see this file's header comment and `oobe/mod.rs`'s own for
     /// the design. `None` (the boot-resolved normal case once OOBE has
@@ -287,6 +308,12 @@ impl ShellView {
         // close path, cheaper than branching on `self.surface.overlay()`'s
         // new value to tell the two apart.
         self.overlay_ui.close_launcher_query();
+        // ICON-3 (2026-08-23): closing ANY overlay also forgets the
+        // pointer surface's compositor snapshot, so the next open re-reads
+        // it — the cursor can have been changed by something else in
+        // between, and showing a stale selection would be a claim this
+        // surface never verified. Cheap: a no-op when it was never loaded.
+        self.pointer_ui.reset();
         cx.notify();
     }
 
@@ -318,6 +345,12 @@ impl ShellView {
         }
         self.surface.close();
         self.overlay_ui.close_launcher_query();
+        // ICON-3 (2026-08-23): closing ANY overlay also forgets the
+        // pointer surface's compositor snapshot, so the next open re-reads
+        // it — the cursor can have been changed by something else in
+        // between, and showing a stale selection would be a claim this
+        // surface never verified. Cheap: a no-op when it was never loaded.
+        self.pointer_ui.reset();
         cx.notify();
     }
 
@@ -526,7 +559,13 @@ impl Render for ShellView {
             // isn't rendered at all while locked, so there is nothing for a
             // Home overlay to sit on top of (mirrors the `self.oobe.is_
             // none()` guard on the overlay-render block further down).
-            root.child(lockscreen::render::render(&self.lockscreen, &self.overlay_ui.notifications, &self.lockscreen_password_field, cx))
+            root.child(lockscreen::render::render(
+                &self.lockscreen,
+                &self.overlay_ui.notifications,
+                &self.lockscreen_password_field,
+                self.operator_name.as_deref(),
+                cx,
+            ))
         } else {
             // WP-comp-shell-ipc: `&self.running_windows` threaded down the
             // same way `&self.overlay_ui.notifications` already is just
@@ -574,9 +613,20 @@ impl Render for ShellView {
                     }
                     view.surface.close();
                     view.overlay_ui.close_launcher_query();
+                    // See `on_toggle_launcher`'s own note on this call.
+                    view.pointer_ui.reset();
                     cx.notify();
                 });
-                root = root.child(overlay::render(active, &self.overlay_ui, &self.audio_ui, &self.installed_apps, home_palette, on_close, cx));
+                root = root.child(overlay::render(
+                    active,
+                    &self.overlay_ui,
+                    &self.audio_ui,
+                    &self.installed_apps,
+                    &self.pointer_ui,
+                    home_palette,
+                    on_close,
+                    cx,
+                ));
             }
         }
         root
@@ -689,6 +739,11 @@ fn main() {
         // selections at all). `ThemeChoice` is `Copy`, so reading this
         // field first doesn't need to clone the state.
         let initial_theme = oobe::boot_theme(&persisted_oobe_state);
+        // ICON-3 (2026-08-23): same read-before-`resolve_boot_flow`-consumes-
+        // it shape as `initial_theme` just above — see `ShellView.
+        // operator_name`'s own doc comment. Unlike `ThemeChoice` this one
+        // is not `Copy`, so it clones the string out rather than the state.
+        let initial_operator_name = oobe::boot_operator_name(&persisted_oobe_state);
         let force_oobe = std::env::var("DUDUCLAW_SHELL_FORCE_OOBE").ok();
         let skip_oobe = std::env::var("DUDUCLAW_SHELL_SKIP_OOBE").ok();
         let debug_oobe_step = std::env::var("DUDUCLAW_SHELL_DEBUG_OOBE_STEP").ok();
@@ -737,10 +792,12 @@ fn main() {
                         surface: SurfaceState::default(),
                         overlay_ui: overlay::OverlayUiState::default(),
                         audio_ui: audio::AudioUiState::default(),
+                        pointer_ui: overlay::pointer_settings::PointerUiState::default(),
                         lockscreen: lockscreen::LockScreenState::default(),
                         running_windows: home::running_windows::RunningWindowsFeed::default(),
                         installed_apps: apps::feed::InstalledAppsFeed::default(),
                         lockscreen_password_field,
+                        operator_name: initial_operator_name,
                         oobe: initial_oobe,
                         oobe_ui: oobe::OobeUiState::default(),
                         oobe_account_fields,
@@ -802,7 +859,7 @@ fn main() {
         // `duduclaw-native-gui/src/main.rs`'s own `DUDUCLAW_NATIVE_GUI_
         // DEBUG_PAGE` hook works around for that crate). Unset by default;
         // `DUDUCLAW_SHELL_DEBUG_SURFACE=launcher|notifications|
-        // controlcenter|lockscreen` opens that surface immediately after
+        // controlcenter|pointer|lockscreen` opens that surface immediately after
         // boot so a real render pass over its code path is observable
         // without a manual cmd-k/click/idle-wait. An unrecognized value is
         // logged and ignored, never a panic — but an EMPTY value (`export

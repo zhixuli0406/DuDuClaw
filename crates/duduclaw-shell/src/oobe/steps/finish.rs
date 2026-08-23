@@ -37,19 +37,23 @@ use crate::palette::ShellPalette;
 use crate::oobe::widgets;
 use crate::oobe::{OobeFlow, PrivacyToggle, TemplateChoice};
 
-/// Brand mark for this step's header glyph (2026-08-21 — replaces the `🐾`
-/// emoji placeholder; repo-wide OS-shell convention is zero emoji, brand
-/// marks are asset PNGs, not glyphs — see `home.rs`'s header comment on
-/// `MARK_32`/`CAT_512` for the convention this follows). Same
-/// `appliance/branding/png/` + `include_bytes!` + `home::png()` pipeline
-/// `home.rs` already established, reused here via `home::png` (that fn is
-/// `pub(super)` on `home`, i.e. crate-visible, precisely for this kind of
-/// reuse) rather than duplicating the byte->Arc<Image> helper. `mark-128.png`
-/// (not `mark-32.png`) is the source so the 40×40 on-screen size the
-/// original glyph occupied stays crisp under 2x/3x HiDPI scaling (128/40 =
-/// 3.2x oversampling) — the `.rounded(px(20.))` mask below matches the same
-/// full-circle treatment `home.rs` already applies to `MARK_32`.
-const MARK_128: &[u8] = include_bytes!("../../../../../appliance/branding/png/mark-128.png");
+/// ICON-3 (2026-08-23): this step's header art is the ORIGAMI CAT at 72px
+/// tall, not the 40×40 circular paw mark it was between 2026-08-21 and this
+/// round. `OOBE-KeySteps.dc.html`'s 完成 artboard draws `cat-256.png` at
+/// `height: 72px`, and the operator's ruling ④ settled the one open question
+/// that board left ("72px 維持還是放大？") in favour of keeping 72.
+///
+/// Reuses `home::CAT_512` rather than adding a `cat-256` const of its own:
+/// it is the same artwork at 2× the pixels (264×512 vs 132×256, both 33:64),
+/// already embedded in this binary for the lockscreen watermark, and
+/// oversampling 512→72 costs nothing at render time while a second
+/// `include_bytes!` of the same picture would cost a duplicate copy in the
+/// binary. Width is derived from the PNG's real aspect (264/512 × 72 ≈
+/// 37.1), the same derivation `home::cat_hero` and `lockscreen::render::
+/// cat_watermark` already do — gpui sizes an `img()` by the box you give it,
+/// so passing only a height would stretch it.
+const CAT_HEIGHT: f32 = 72.;
+const CAT_WIDTH: f32 = 264. / 512. * CAT_HEIGHT;
 
 pub(super) fn render(flow: &OobeFlow) -> Div {
     let s = flow.selections();
@@ -101,7 +105,7 @@ pub(super) fn render(flow: &OobeFlow) -> Div {
         .flex_col()
         .items_center()
         .gap(px(20.))
-        .child(img(home::png(MARK_128)).w(px(40.)).h(px(40.)).rounded(px(20.)))
+        .child(img(home::png(home::CAT_512)).w(px(CAT_WIDTH)).h(px(CAT_HEIGHT)))
         .child(widgets::title(t(locale, Key::FinishTitle), palette))
         .child(widgets::subtitle(t(locale, Key::FinishSubtitle), palette))
         .child(widgets::card(rows, palette))

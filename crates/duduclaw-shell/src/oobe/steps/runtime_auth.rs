@@ -73,11 +73,15 @@ pub(super) fn render(flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
             ))
     };
 
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(20.))
+    // ICON-3 (2026-08-23): `dialog-password` — a key, i.e. "an
+    // authorization credential", the 32px title icon
+    // `OOBE-ProgressAndIcons.dc.html`'s assignment table gives this step.
+    // See `steps::network::render`'s own comment on the column's spacing.
+    let mut column = div().flex().flex_col().items_center().gap(px(20.));
+    if let Some(icon) = crate::icons::icon_or_none(&[(crate::icons::KEY, palette.muted_foreground)], 32.) {
+        column = column.child(icon);
+    }
+    column
         .child(widgets::title(t(locale, Key::RuntimeAuthTitle), palette))
         .child(widgets::subtitle(t(locale, Key::RuntimeAuthSubtitle), palette))
         .child(widgets::card(body, palette))

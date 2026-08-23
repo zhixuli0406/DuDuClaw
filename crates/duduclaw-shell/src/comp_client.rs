@@ -104,6 +104,97 @@ impl std::fmt::Display for CompClientError {
     }
 }
 
+/// The compositor's current cursor configuration — ICON-3 (2026-08-23), the
+/// pointer-settings surface. Mirrors comp's `cursor` object field-for-field,
+/// but every field except `source` is `Option` on purpose: this shell has to
+/// keep working against a comp build that predates any given field.
+///
+/// `size` in particular is NEW this round. A comp that has not been upgraded
+/// answers `get_cursor_source` with no `size` key at all, which arrives here
+/// as `None` — the honest signal the size控制 must degrade rather than
+/// guess a number and then show it as the current one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CursorState {
+    /// What is ACTUALLY being drawn — `"system"` or `"brand"`. Kept as the
+    /// raw string rather than an enum: comp owns this vocabulary, and a
+    /// value this build has never heard of must render as "not brand", not
+    /// fail to parse the whole response.
+    pub source: String,
+    /// What the operator ASKED for. Comp draws `source`; when the two
+    /// disagree it means the requested theme is not installed and system
+    /// cursors are being drawn instead — an honest signal, not an error
+    /// (comp's own `shell_control` module doc spells this out). `None` on a
+    /// comp build that predates the field, which is why every reader goes
+    /// through `requested_source()` below.
+    #[serde(default)]
+    pub requested: Option<String>,
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// The size that is STORED. `effective_size` is what is drawn.
+    #[serde(default)]
+    pub size: Option<u32>,
+    /// The size actually drawn. An XCursor theme holds a fixed set of image
+    /// sizes and the nearest is used at its own size — nothing is upscaled —
+    /// so a 96 request against a theme whose largest image is 64 really
+    /// draws 64, and comp says so rather than claiming 96. On the
+    /// appliance's own Adwaita the two are equal at all five offered steps.
+    /// `None` on a comp build that predates the field.
+    #[serde(default)]
+    pub effective_size: Option<u32>,
+    /// An operator pinned `DUDUCLAW_COMP_CURSOR_SOURCE` in comp's spawn
+    /// environment, so a stored preference will not apply at the next start.
+    #[serde(default)]
+    pub env_pinned: bool,
+    /// The size-side twin: `XCURSOR_SIZE` is pinned in comp's environment.
+    #[serde(default)]
+    pub size_env_pinned: bool,
+}
+
+impl CursorState {
+    /// Whether the brand (paw) theme is what is being DRAWN. Anything else —
+    /// including `"system"` and including a value from a future comp this
+    /// build doesn't know — is not brand.
+    pub fn is_brand(&self) -> bool {
+        self.source == "brand"
+    }
+
+    /// The value a style RADIO should follow: what the operator chose, which
+    /// is not always what is drawn. Falls back to `source` on a comp that
+    /// does not report `requested` — there, the two are the same thing as
+    /// far as this shell can tell, and pretending otherwise would invent a
+    /// distinction.
+    pub fn requested_is_brand(&self) -> bool {
+        match self.requested.as_deref() {
+            Some(requested) => requested == "brand",
+            None => self.is_brand(),
+        }
+    }
+
+    /// True when comp is drawing something OTHER than what was asked for —
+    /// i.e. the requested cursor theme is not installed. Only ever true when
+    /// comp actually reported `requested`; a build that does not is silent
+    /// rather than assumed fine… which is the same thing here, because a
+    /// build that cannot report the difference also cannot have one to
+    /// report.
+    pub fn theme_missing(&self) -> bool {
+        self.requested.as_deref().is_some_and(|requested| requested != self.source)
+    }
+
+    /// The size a segment control should show as selected: what is DRAWN,
+    /// not what was stored. Falls back to `size` on a comp that predates
+    /// `effective_size`.
+    pub fn drawn_size(&self) -> Option<u32> {
+        self.effective_size.or(self.size)
+    }
+
+    /// Whether either half of the cursor configuration is pinned by comp's
+    /// spawn environment, in which case a choice made here will not survive
+    /// the next start and the UI has to say so.
+    pub fn any_env_pinned(&self) -> bool {
+        self.env_pinned || self.size_env_pinned
+    }
+}
+
 /// Permissive ack struct — every field but `ok` is `Option`, same
 /// "shape varies by op" convention `duduclaw-gateway/src/codrive/
 /// client.rs::CodriveAck`'s own doc comment establishes for the sibling
@@ -117,6 +208,8 @@ struct CompResponse {
     matched_app_id: Option<String>,
     #[serde(default)]
     matched_title_prefix: Option<String>,
+    #[serde(default)]
+    cursor: Option<CursorState>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -202,6 +295,84 @@ pub fn focus_window(query: &str) -> Result<FocusMatch, CompClientError> {
         (None, None) => Err(CompClientError::Protocol("ok response carried neither matched_app_id nor matched_title_prefix".to_string())),
     }
 }
+
+// ── Cursor configuration (ICON-3, 2026-08-23) ───────────────────────────
+// Three ops behind the pointer-settings surface. The compositor side is
+// implemented by a SEPARATE work package this round; this client is written
+// against the agreed wire contract and, crucially, degrades cleanly against
+// a comp that has only half of it:
+//
+//   {"op":"get_cursor_source"}                        -> {"ok":true,"cursor":{…}}
+//   {"op":"set_cursor_source","params":{"source":…}}  -> {"ok":true[,"cursor":{…}]}
+//   {"op":"set_cursor_size","params":{"size":N}}      -> {"ok":true,"cursor":{…}}
+//
+// `set_cursor_source` predates this round on the comp side and its response
+// shape was never specified to include the cursor object, so both setters
+// return `Option<CursorState>` — `None` means "accepted, but told us
+// nothing", and the caller re-reads. Inventing the post-set state locally
+// would be this client asserting something it did not observe.
+
+/// `{"op":"get_cursor_source"}`. Blocking; see this file's module doc for
+/// the threading contract.
+///
+/// A response with `ok:true` but no `cursor` object is a `Protocol` error,
+/// not a silent default: the whole point of this call is to learn the
+/// current state, and having no answer is different from having a default
+/// one.
+pub fn get_cursor_source() -> Result<CursorState, CompClientError> {
+    let resp = call(r#"{"op":"get_cursor_source"}"#)?;
+    if !resp.ok {
+        return Err(CompClientError::Comp(resp.error.unwrap_or_else(|| "unknown error".to_string())));
+    }
+    resp.cursor.ok_or_else(|| CompClientError::Protocol("ok response carried no cursor object".to_string()))
+}
+
+/// `{"op":"set_cursor_source","params":{"source":"system"|"brand"}}`.
+///
+/// `source` is `&str` rather than an enum for the same reason
+/// `CursorState::source` is: comp owns the vocabulary. Call sites pass one
+/// of `CURSOR_SOURCE_SYSTEM`/`CURSOR_SOURCE_BRAND` below so the two spellings
+/// live in exactly one place.
+pub fn set_cursor_source(source: &str) -> Result<Option<CursorState>, CompClientError> {
+    let req = serde_json::json!({ "op": "set_cursor_source", "params": { "source": source } }).to_string();
+    let resp = call(&req)?;
+    if !resp.ok {
+        return Err(CompClientError::Comp(resp.error.unwrap_or_else(|| "unknown error".to_string())));
+    }
+    Ok(resp.cursor)
+}
+
+/// `{"op":"set_cursor_size","params":{"size":N}}`.
+///
+/// A comp that predates this op answers `{"ok":false,"error":"..."}`, which
+/// arrives as `CompClientError::Comp` — the caller's cue to disable the size
+/// control and say so, rather than to show an error dialog for something the
+/// operator cannot fix.
+pub fn set_cursor_size(size: u32) -> Result<Option<CursorState>, CompClientError> {
+    let req = serde_json::json!({ "op": "set_cursor_size", "params": { "size": size } }).to_string();
+    let resp = call(&req)?;
+    if !resp.ok {
+        return Err(CompClientError::Comp(resp.error.unwrap_or_else(|| "unknown error".to_string())));
+    }
+    Ok(resp.cursor)
+}
+
+/// The two `source` values comp accepts. Consts, not an enum, so this
+/// client never has to decide what to do with a third value it might one day
+/// be told about (see `CursorState::source`'s own doc comment).
+pub const CURSOR_SOURCE_SYSTEM: &str = "system";
+pub const CURSOR_SOURCE_BRAND: &str = "brand";
+
+/// Comp's own refusal code for a size outside its five-step set
+/// (`duduclaw-comp/src/shell_control/listener.rs`). It means "that VALUE is
+/// not offered", NOT "this build cannot change the size" — which is why the
+/// pointer surface must not treat it as evidence the op is missing. This
+/// shell only ever sends the five, so seeing it at all would mean the two
+/// sides' step lists have drifted apart.
+/// (Comp's style axis has the same distinction, `invalid_cursor_source`, but
+/// no consumer here: the style control has no "disable it" state to protect,
+/// so every style refusal renders the same way regardless of code.)
+pub const CURSOR_ERR_INVALID_SIZE: &str = "invalid_cursor_size";
 
 #[cfg(test)]
 mod tests {
@@ -300,6 +471,139 @@ mod tests {
         assert!(!resp.ok);
         assert_eq!(resp.error.as_deref(), Some("not_found"));
         assert!(resp.windows.is_none());
+    }
+
+    // ── ICON-3 (2026-08-23): cursor ops ──────────────────────────────────
+
+    /// Comp's own documented reply shape, copied from
+    /// `duduclaw-comp/src/shell_control/mod.rs`'s module doc rather than
+    /// invented here.
+    #[test]
+    fn compresponse_deserializes_a_full_cursor_object() {
+        let json = r#"{"ok":true,"cursor":{"source":"brand","requested":"brand","theme":"DuDuClaw","origin":"runtime",
+                        "size":32,"effective_size":32,"size_env_pinned":false,"env_pinned":false,"persisted":true}}"#;
+        let resp: CompResponse = serde_json::from_str(json).unwrap();
+        let cursor = resp.cursor.expect("cursor object must parse");
+        assert_eq!(cursor.source, "brand");
+        assert!(cursor.is_brand());
+        assert!(cursor.requested_is_brand());
+        assert!(!cursor.theme_missing());
+        assert_eq!(cursor.theme.as_deref(), Some("DuDuClaw"));
+        assert_eq!(cursor.drawn_size(), Some(32));
+        assert!(!cursor.any_env_pinned());
+        // Fields this shell does not read (`origin`, `persisted`) must not
+        // break the parse — that is what makes comp free to add more.
+    }
+
+    /// The degradation this whole `Option<u32>` exists for: a comp that
+    /// predates `set_cursor_size` reports no `size` key at all. That must
+    /// parse fine and come back as `None` — NOT as a default number the UI
+    /// would then present as the machine's actual setting.
+    #[test]
+    fn a_cursor_object_without_size_parses_with_size_none() {
+        let json = r#"{"ok":true,"cursor":{"source":"system","theme":"Adwaita"}}"#;
+        let resp: CompResponse = serde_json::from_str(json).unwrap();
+        let cursor = resp.cursor.expect("cursor object must parse");
+        assert_eq!(cursor.size, None);
+        assert_eq!(cursor.drawn_size(), None);
+        assert!(!cursor.is_brand());
+        // No `requested` either — the radio falls back to `source`, and
+        // "the theme is missing" is not claimed on evidence that doesn't
+        // exist.
+        assert!(!cursor.requested_is_brand());
+        assert!(!cursor.theme_missing());
+    }
+
+    /// The honest-signal case comp's own doc names: the brand theme was
+    /// asked for but is not installed, so system cursors are drawn. The
+    /// radio follows the CHOICE; the screen says what is actually drawn.
+    #[test]
+    fn a_requested_theme_that_is_not_installed_is_reported_not_hidden() {
+        let json = r#"{"ok":true,"cursor":{"source":"system","requested":"brand","theme":"Adwaita","size":24,"effective_size":24}}"#;
+        let cursor = serde_json::from_str::<CompResponse>(json).unwrap().cursor.expect("cursor");
+        assert!(!cursor.is_brand(), "what is DRAWN is the system theme");
+        assert!(cursor.requested_is_brand(), "what was CHOSEN is the paw theme");
+        assert!(cursor.theme_missing());
+    }
+
+    /// The size-side honest signal: a step the installed theme has no image
+    /// for is drawn at the nearest one it does have, and the selection has
+    /// to follow what is drawn.
+    #[test]
+    fn a_size_the_theme_cannot_draw_reports_the_size_it_actually_drew() {
+        let json = r#"{"ok":true,"cursor":{"source":"system","requested":"system","size":96,"effective_size":64}}"#;
+        let cursor = serde_json::from_str::<CompResponse>(json).unwrap().cursor.expect("cursor");
+        assert_eq!(cursor.size, Some(96));
+        assert_eq!(cursor.drawn_size(), Some(64), "the selection must follow the drawn size, not the stored one");
+    }
+
+    #[test]
+    fn an_env_pinned_cursor_is_reported_on_either_axis() {
+        let source_pinned = serde_json::from_str::<CompResponse>(r#"{"ok":true,"cursor":{"source":"system","env_pinned":true}}"#)
+            .unwrap()
+            .cursor
+            .expect("cursor");
+        assert!(source_pinned.any_env_pinned());
+        let size_pinned = serde_json::from_str::<CompResponse>(r#"{"ok":true,"cursor":{"source":"system","size_env_pinned":true}}"#)
+            .unwrap()
+            .cursor
+            .expect("cursor");
+        assert!(size_pinned.any_env_pinned());
+        let neither =
+            serde_json::from_str::<CompResponse>(r#"{"ok":true,"cursor":{"source":"system"}}"#).unwrap().cursor.expect("cursor");
+        assert!(!neither.any_env_pinned());
+    }
+
+    /// A `source` value from a future comp must not fail the whole parse —
+    /// it reads as "not brand", which is what the system card honestly
+    /// describes.
+    #[test]
+    fn an_unknown_source_value_still_parses_and_is_not_brand() {
+        let json = r#"{"ok":true,"cursor":{"source":"something-new"}}"#;
+        let resp: CompResponse = serde_json::from_str(json).unwrap();
+        let cursor = resp.cursor.expect("cursor object must parse");
+        assert!(!cursor.is_brand());
+        assert_eq!(cursor.theme, None);
+        assert_eq!(cursor.size, None);
+    }
+
+    #[test]
+    fn cursor_requests_are_well_formed_json() {
+        let src = serde_json::json!({ "op": "set_cursor_source", "params": { "source": CURSOR_SOURCE_BRAND } });
+        let back: serde_json::Value = serde_json::from_str(&src.to_string()).unwrap();
+        assert_eq!(back["op"], "set_cursor_source");
+        assert_eq!(back["params"]["source"], "brand");
+
+        let size = serde_json::json!({ "op": "set_cursor_size", "params": { "size": 96u32 } });
+        let back: serde_json::Value = serde_json::from_str(&size.to_string()).unwrap();
+        assert_eq!(back["op"], "set_cursor_size");
+        assert_eq!(back["params"]["size"], 96);
+    }
+
+    /// The dev-Mac / compositor-down path, end to end: no socket means
+    /// `NotAvailable`, never a panic and never a fabricated `CursorState`.
+    #[test]
+    fn cursor_ops_against_a_missing_socket_are_not_available_not_a_panic() {
+        let _guard = env_guard();
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+        let dir = std::env::temp_dir().join(format!("duduclaw-shell-cursor-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        }
+        let get = get_cursor_source().expect_err("no comp process is listening in this test dir");
+        assert!(matches!(get, CompClientError::NotAvailable(_)), "unexpected error variant: {get:?}");
+        let set_source = set_cursor_source(CURSOR_SOURCE_BRAND).expect_err("no comp process");
+        assert!(matches!(set_source, CompClientError::NotAvailable(_)), "unexpected error variant: {set_source:?}");
+        let set_size = set_cursor_size(48).expect_err("no comp process");
+        assert!(matches!(set_size, CompClientError::NotAvailable(_)), "unexpected error variant: {set_size:?}");
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

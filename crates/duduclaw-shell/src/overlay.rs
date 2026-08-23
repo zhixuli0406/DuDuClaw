@@ -4,7 +4,8 @@
 // generic "半透明遮罩＋置中面板顯示 surface 名稱" stub. This round replaces
 // that with each overlay's REAL content, lifted from its own `.dc.html`
 // artboard — `overlay::launcher` / `overlay::notifications` /
-// `overlay::controlcenter`, one file each (`src/overlay/*.rs` — same
+// `overlay::controlcenter` (and, since ICON-3, `overlay::pointer_settings`),
+// one file each (`src/overlay/*.rs` — same
 // "big screen, own directory" convention `home.rs` + `home/home_dock.rs`
 // already established, chosen here over a separate top-level `overlays/`
 // directory so this crate doesn't end up with two near-identically-named
@@ -35,7 +36,9 @@
 // UNDIMMED floating panel over the live Home surface (the macOS
 // Notification-Center / Control-Center convention, not a modal) — their
 // backdrop is still present, so a click outside the panel still closes the
-// overlay (consistent behavior across all three), just fully transparent
+// overlay (consistent behavior across every overlay, PointerSettings
+// included — its board is a settings window, which has no dimming of its own
+// either), just fully transparent
 // rather than omitted: an explicit zero-alpha `.bg(...)` keeps the click
 // target real instead of betting on an unset background still being
 // hit-testable.
@@ -75,6 +78,11 @@ pub(crate) mod notifications;
 /// crate's `Cargo.toml`/`gateway_client` comments already state.
 mod notifications_backoff;
 pub mod notifications_feed;
+/// ICON-3 (2026-08-23): 「協助工具 › 指向與點按」 — see its own header
+/// comment for why the board's settings PAGE lands as an overlay here.
+/// `pub(crate)`, not private: `main.rs` owns its `PointerUiState` field on
+/// `ShellView`, same as it owns `audio::AudioUiState`.
+pub(crate) mod pointer_settings;
 
 /// Runtime-mutable state backing the two overlays that have actual
 /// interactive controls this round (round 1's `SurfaceState` only tracked
@@ -184,6 +192,15 @@ impl OverlayUiState {
 /// reaches it. `palette` is resolved once per render pass by the caller
 /// (`ShellView::render` in `main.rs`) — same convention `home::render`
 /// establishes (see that fn's own doc comment).
+///
+/// The parameter list is long and gets one longer with each overlay that
+/// owns real state (ICON-3's `pointer_ui` is the fourth). Bundling them into
+/// a struct was considered and rejected: every field is an INDEPENDENT
+/// immutable borrow of a different `ShellView` field, which is exactly what
+/// lets the caller take them all at once alongside `&mut Context`; a wrapper
+/// struct would have to be built from those same borrows anyway, buying a
+/// type and a construction site and no safety.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     overlay: Overlay,
     ui: &OverlayUiState,
@@ -200,6 +217,11 @@ pub fn render(
     // Home's dock, which renders underneath every overlay — this surface
     // deliberately does not schedule a second one.
     installed_apps: &crate::apps::feed::InstalledAppsFeed,
+    // ICON-3 (2026-08-23): the pointer surface's own compositor-backed state
+    // (`crate::overlay::pointer_settings::PointerUiState`, lives on
+    // `ShellView` as `pointer_ui`), threaded through exactly the way
+    // `audio_ui` already is. Every other overlay ignores it.
+    pointer_ui: &pointer_settings::PointerUiState,
     palette: ShellPalette,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &mut Context<ShellView>,
@@ -224,6 +246,7 @@ pub fn render(
         Overlay::Launcher => launcher::render(ui, installed_apps, palette, cx),
         Overlay::Notifications => notifications::render(ui, palette, cx),
         Overlay::ControlCenter => controlcenter::render(ui, audio_ui, palette, cx),
+        Overlay::PointerSettings => pointer_settings::render(pointer_ui, palette, cx),
     };
 
     // The wrapper MUST be absolutely positioned (`absolute().inset_0()`),

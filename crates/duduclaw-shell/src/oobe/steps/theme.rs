@@ -57,11 +57,16 @@ pub(super) fn render(flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
         .child(theme_option_card(ThemeChoice::Light, selected == ThemeChoice::Light, locale, palette, cx))
         .child(theme_option_card(ThemeChoice::Dark, selected == ThemeChoice::Dark, locale, palette, cx));
 
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(20.))
+    // ICON-3 (2026-08-23): `preferences-desktop-theme`, the 32px title icon
+    // `OOBE-ProgressAndIcons.dc.html`'s assignment table gives this step.
+    // The table's own 頁內 column for this step still reads 「不畫圖示」 —
+    // the two mini-desktop previews below stay exactly as they are.
+    // See `steps::network::render`'s own comment on the column's spacing.
+    let mut column = div().flex().flex_col().items_center().gap(px(20.));
+    if let Some(icon) = crate::icons::icon_or_none(&[(crate::icons::THEME_CONTRAST, palette.muted_foreground)], 32.) {
+        column = column.child(icon);
+    }
+    column
         .child(widgets::title(t(locale, Key::ThemeTitle), palette))
         .child(widgets::subtitle(t(locale, Key::ThemeSubtitle), palette))
         .child(widgets::card(body, palette))

@@ -220,6 +220,136 @@ async fn call_once_async(url: &str, jwt: &str, method: &str, params: Value) -> R
     outcome
 }
 
+// ── Pre-auth (lock-screen) round trip — ICON-3 (2026-08-23) ─────────────
+// The lock screen has no credential to present, and must not depend on one:
+// `bootstrap_local_session` only issues a JWT where the Personal edition's
+// `local_auto_login` is on, so an Enterprise/Pro appliance — or any machine
+// with auto-login turned off — would answer 403 and leave the power button
+// dead for exactly the operator standing in front of the box.
+//
+// The gateway's own answer to that is a RESTRICTED handshake
+// (`server.rs::pre_auth_handshake_allowed`): a credential-less `connect`
+// frame carrying `pre_auth: true`, admitted only on an appliance from a
+// loopback peer, granting a session whose RPC dispatch is allow-listed down
+// to the single method `device.power_local`
+// (`power_local::PRE_AUTH_ALLOWED_METHOD`). That is edition-independent and
+// login-independent, which is why it is the path this client takes.
+
+/// What a pre-auth call settled as. The second variant is the reason this
+/// function exists separately from `call_once` at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreAuthOutcome {
+    /// A real `res` frame came back and the gateway said `ok: true`.
+    Answered(Value),
+    /// The request WAS written to the socket, and then the connection closed
+    /// or went quiet before any matching response arrived.
+    ///
+    /// For this method that is the EXPECTED shape of success, not a failure:
+    /// a gateway that accepts `reboot` proceeds to take the machine down,
+    /// and the socket dies with it. Distinguishing this from a failure
+    /// BEFORE the write is the whole point — see `power::power_local`.
+    SentButNoAnswer,
+}
+
+/// One pre-auth round trip. Synchronous, same throwaway-runtime shape as
+/// `call_once_at`; callers run it from a `std::thread::spawn`.
+pub(crate) fn call_once_pre_auth(method: &str, params: Value) -> Result<PreAuthOutcome, RpcError> {
+    call_once_pre_auth_at(&ws_url(), method, params)
+}
+
+pub(crate) fn call_once_pre_auth_at(url: &str, method: &str, params: Value) -> Result<PreAuthOutcome, RpcError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| RpcError::Unreachable(format!("failed to start local async runtime: {e}")))?;
+    rt.block_on(pre_auth_async(url, method, params))
+}
+
+/// The gateway's own literal answer to an accepted restricted handshake
+/// (`server.rs`: `json!({ "status": "pre_auth" })`). Checked rather than
+/// assumed: an `ok: true` handshake response that says anything ELSE means
+/// this connection authenticated as something other than a lock screen, and
+/// this client has no business sending a power request over it.
+const PRE_AUTH_STATUS: &str = "pre_auth";
+
+async fn pre_auth_async(url: &str, method: &str, params: Value) -> Result<PreAuthOutcome, RpcError> {
+    let connect_fut = tokio_tungstenite::connect_async(url);
+    let (ws_stream, _response) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_fut).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(classify_connect_error(&e)),
+        Err(_) => return Err(RpcError::Timeout),
+    };
+    let (mut write, mut read) = ws_stream.split();
+
+    // No `jwt`, no `token` — `pre_auth_handshake_allowed`'s first condition
+    // is that the frame presents NO credential, so sending an empty one
+    // would push this down the JWT branch and fail.
+    let connect_req = serde_json::json!({
+        "type": "req", "id": "connect", "method": "connect", "params": { "pre_auth": true },
+    });
+    write.send(Message::Text(connect_req.to_string())).await.map_err(|e| RpcError::Unreachable(e.to_string()))?;
+
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, read.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => {
+            let v: Value = serde_json::from_str(&text).map_err(|e| RpcError::Malformed(format!("handshake response was not valid JSON: {e}")))?;
+            if v.get("ok").and_then(Value::as_bool) != Some(true) {
+                return Err(RpcError::AuthRejected);
+            }
+            if v.pointer("/payload/status").and_then(Value::as_str) != Some(PRE_AUTH_STATUS) {
+                return Err(RpcError::AuthRejected);
+            }
+        }
+        Ok(Some(Ok(_))) => return Err(RpcError::Malformed("handshake response was not a text frame".to_string())),
+        Ok(Some(Err(e))) => return Err(RpcError::Unreachable(e.to_string())),
+        Ok(None) => return Err(RpcError::Unreachable("connection closed during handshake".to_string())),
+        Err(_) => return Err(RpcError::Timeout),
+    }
+
+    let req = serde_json::json!({ "type": "req", "id": "call", "method": method, "params": params });
+    write.send(Message::Text(req.to_string())).await.map_err(|e| RpcError::Unreachable(e.to_string()))?;
+    // Past this line the request is on the wire. Every "no answer" path
+    // below therefore reports `SentButNoAnswer` rather than an error — the
+    // distinction the caller needs and the reason this is not `call_once`.
+
+    let outcome = 'frames: {
+        for _ in 0..MAX_FRAMES_BEFORE_GIVING_UP {
+            match tokio::time::timeout(CALL_TIMEOUT, read.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let v: Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(e) => break 'frames Err(RpcError::Malformed(format!("response was not valid JSON: {e}"))),
+                    };
+                    // The gateway's REFUSAL frames for this method carry an
+                    // EMPTY id (`reject_power_local` builds `WsFrame::
+                    // Response { id: String::new(), .. }`), so matching on
+                    // `id == "call"` alone would skip them and time out.
+                    // Match "our id, or any `res` frame that is not ok" —
+                    // this connection sends exactly one request and receives
+                    // no subscriptions, so an error frame can only be ours.
+                    let is_res = v.get("type").and_then(Value::as_str) == Some("res");
+                    let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    let is_ours = is_res && (v.get("id").and_then(Value::as_str) == Some("call") || !ok);
+                    if !is_ours {
+                        continue;
+                    }
+                    break 'frames if ok {
+                        Ok(PreAuthOutcome::Answered(v.get("payload").cloned().unwrap_or(Value::Null)))
+                    } else {
+                        Err(RpcError::Rejected(v.get("error").map(ToString::to_string).unwrap_or_default()))
+                    };
+                }
+                Ok(Some(Ok(_))) => continue,
+                // The three "went quiet after we sent it" shapes.
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => break 'frames Ok(PreAuthOutcome::SentButNoAnswer),
+            }
+        }
+        Ok(PreAuthOutcome::SentButNoAnswer)
+    };
+
+    let _ = write.close().await;
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     // `SinkExt`/`StreamExt` (for `.send()`/`.next()` in the mock server
@@ -324,6 +454,101 @@ mod tests {
 
         let result = call_once_at(&url, "jwt-abc", "approvals.decide", serde_json::json!({"id":"a1","approve":true}));
         assert_eq!(result, Ok(serde_json::json!({"ok": true})));
+    }
+
+    // ── ICON-3 (2026-08-23): the pre-auth path ───────────────────────────
+
+    #[test]
+    fn a_pre_auth_handshake_sends_no_credential_and_asks_for_pre_auth() {
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let url = start_mock_ws_server(move |mut ws| async move {
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                let _ = seen_tx.send(text.to_string());
+            }
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":true,"payload":{"status":"pre_auth"}}"#.into())).await;
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"call","ok":true,"payload":{"ok":true}}"#.into())).await;
+        });
+
+        let result = call_once_pre_auth_at(&url, "device.power_local", serde_json::json!({"action": "reboot"}));
+        assert_eq!(result, Ok(PreAuthOutcome::Answered(serde_json::json!({"ok": true}))));
+
+        let frame: Value = serde_json::from_str(&seen_rx.recv_timeout(Duration::from_secs(3)).expect("handshake frame")).unwrap();
+        assert_eq!(frame["method"], "connect");
+        assert_eq!(frame["params"]["pre_auth"], true);
+        // The gateway refuses to grant a restricted session to any frame
+        // that presents a credential, so this must carry neither.
+        assert!(frame["params"].get("jwt").is_none(), "a pre-auth handshake must present no jwt");
+        assert!(frame["params"].get("token").is_none(), "a pre-auth handshake must present no token");
+    }
+
+    /// An `ok:true` handshake that authenticated as something OTHER than a
+    /// lock screen is refused: this connection would not be dispatch-limited
+    /// to the one allow-listed method, and this client has no business
+    /// sending a power request over it.
+    #[test]
+    fn a_handshake_that_is_ok_but_not_pre_auth_is_refused() {
+        let url = start_mock_ws_server(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":true,"payload":{"status":"authenticated"}}"#.into())).await;
+        });
+        assert_eq!(call_once_pre_auth_at(&url, "device.power_local", serde_json::json!({})), Err(RpcError::AuthRejected));
+    }
+
+    /// The load-bearing one: a gateway that accepts a reboot goes down with
+    /// the machine, so the connection dies before any response arrives. That
+    /// must NOT read as a failure — see `PreAuthOutcome::SentButNoAnswer`.
+    #[test]
+    fn a_connection_that_dies_after_the_request_reports_sent_but_no_answer() {
+        let url = start_mock_ws_server(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":true,"payload":{"status":"pre_auth"}}"#.into())).await;
+            let _ = ws.next().await;
+            // …and now the "machine" goes away without answering.
+            drop(ws);
+        });
+        assert_eq!(
+            call_once_pre_auth_at(&url, "device.power_local", serde_json::json!({"action": "reboot"})),
+            Ok(PreAuthOutcome::SentButNoAnswer)
+        );
+    }
+
+    /// A failure BEFORE the request reaches the wire is still a real error —
+    /// this is the half `SentButNoAnswer` must never swallow, or a power
+    /// button that never sent anything would report success.
+    #[test]
+    fn a_failure_before_the_request_is_sent_is_still_an_error() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("build runtime");
+        let addr = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            listener.local_addr().expect("local_addr")
+        });
+        drop(rt);
+        let result = call_once_pre_auth_at(&format!("ws://{addr}/ws"), "device.power_local", serde_json::json!({}));
+        assert!(matches!(result, Err(RpcError::Unreachable(_))), "{result:?}");
+    }
+
+    /// The gateway's refusal frames for this method carry an EMPTY id
+    /// (`handlers.rs::reject_power_local`), so a client that only matched
+    /// `id == "call"` would skip them and sit until the timeout — reporting
+    /// a refused shutdown as if it had been accepted.
+    #[test]
+    fn a_refusal_frame_with_an_empty_id_is_still_recognised_as_the_answer() {
+        let url = start_mock_ws_server(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":true,"payload":{"status":"pre_auth"}}"#.into())).await;
+            let _ = ws.next().await;
+            let _ = ws
+                .send(Message::Text(
+                    r#"{"type":"res","id":"","ok":false,"error":{"code":"not_local","message":"電源操作只能在值班機本機的畫面上進行。"}}"#.into(),
+                ))
+                .await;
+        });
+        let result = call_once_pre_auth_at(&url, "device.power_local", serde_json::json!({"action": "shutdown"}));
+        match result {
+            Err(RpcError::Rejected(text)) => assert!(text.contains("not_local"), "{text}"),
+            other => panic!("expected a Rejected, got {other:?}"),
+        }
     }
 
     #[test]
