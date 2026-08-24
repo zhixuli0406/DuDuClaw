@@ -9,6 +9,7 @@ use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
+mod data_migrate;         // H3g: `duduclaw data-migrate` — /data forward-only settings migrator CLI front door
 mod docs_cmd;              // Stripe-style `duduclaw docs [<topic>]` (E12) — GitHub doc links, browser hand-off
 mod eval;                 // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
 mod secaudit;              // Code security audit MVP: intake + OSS scanner orchestration (`duduclaw secaudit`)
@@ -47,6 +48,7 @@ pub(crate) mod mcp_sse_store;  // W20-P1 Phase 2C: SSE event ring buffer
 pub mod mcp_wiki;
 pub mod license;               // M1: license activate/status/refresh/export/import/deactivate
 mod migrate;
+mod os_drive;                  // A7a: `duduclaw os <group> <verb>` self-drive CLI surface
 mod export_to;                 // G9: export agents as an agentcompanies/v1 package
 mod migrate_from;              // Painless migration from OpenClaw / Hermes / paperclip
 pub mod expert;                // WP2.1/WP2.2: expert-pack install/pack/list/remove/export
@@ -888,6 +890,43 @@ enum Commands {
         /// 主題關鍵字（大小寫不拘，比對檔名或文件說明）。留空列出全部主題。
         topic: Option<String>,
     },
+
+    /// `/data` forward-only settings migrator (H3g). Replays baked-in
+    /// `/usr/share/duduclaw/migrations/*.sh` scripts against
+    /// `<DUDUCLAW_HOME>` — the appliance's A/B root rollback can never undo
+    /// a `/data` format change, so this is the forward-only complement.
+    /// Not `duduclaw migrate` (agent.toml conversion) or `migrate-from`
+    /// (cross-platform import) — a third, unrelated command.
+    ///
+    /// This is the same invocation the boot-time
+    /// `duduclaw-data-migrate.service` uses for `--run`; `--pending` /
+    /// `--check` are read-only and safe to run anytime.
+    ///
+    /// Examples:
+    ///     duduclaw data-migrate --pending
+    ///     duduclaw data-migrate --check       # exit 1 iff something is pending
+    ///     duduclaw data-migrate --run
+    #[command(name = "data-migrate")]
+    DataMigrate {
+        /// List pending migrations. Always exits 0 (a listing is
+        /// informational, never a failure).
+        #[arg(long)]
+        pending: bool,
+
+        /// Exit 0 if nothing is pending, 1 if something is — for
+        /// scripts/health checks. Prints no listing.
+        #[arg(long)]
+        check: bool,
+
+        /// Actually apply every pending migration, oldest-first, stopping
+        /// at the first failure.
+        #[arg(long)]
+        run: bool,
+
+        /// Machine-readable JSON output instead of the human console text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1033,6 +1072,197 @@ enum OsCommands {
     /// Diagnose OS-native integration: notification helper availability, a live
     /// test notification, and per-agent os_native / [os_watch] path status.
     Doctor,
+
+    /// A7a: self-drive display group — human pointer size/source + comp's
+    /// own decoration theme, via comp's `shell_control` socket. See
+    /// `commercial/docs/DESIGN-os-self-drive-2026-08.md` §3/§7 for the
+    /// same-uid `SO_PEERCRED` boundary this hits when called by an
+    /// agent-identity CLI subprocess on the appliance (comp/殼 run as
+    /// `duduclaw-kiosk`, agents run as `duduclaw` — structurally two
+    /// different socket peers).
+    Display {
+        #[command(subcommand)]
+        command: OsDisplayCommands,
+    },
+
+    /// A7a: self-drive system group — device identity/timezone/ntp/
+    /// update-check, reusing the same `duduclaw-gateway` functions the
+    /// dashboard `device.*`/`system.*` RPCs call (no WS, no admin session —
+    /// see the design doc §3). `timezone-set`/`ntp-set` require
+    /// `ApprovalBroker` approval when called by an agent-identity caller
+    /// (§5), and dial `duduclaw-sysd` directly.
+    System {
+        #[command(subcommand)]
+        command: OsSystemCommands,
+    },
+
+    /// A7a: self-drive network group — read-only wired/Wi-Fi status queries,
+    /// reusing `duduclaw-gateway`'s `network`/`device` modules directly.
+    Network {
+        #[command(subcommand)]
+        command: OsNetworkCommands,
+    },
+
+    /// A7a: machine-readable capability discovery for the whole
+    /// `display`/`system`/`network` self-drive surface — the precondition
+    /// A7b's skill needs to teach an agent to self-discover what this CLI
+    /// can do instead of hardcoding a command list into a prompt.
+    Commands {
+        /// Emit the full metadata table (route/summary/args/examples/
+        /// hidden/requires_approval) as JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// A7a display group verbs. Every request round-trips comp's
+/// `shell_control` socket — see `os_drive::display`'s module doc for the
+/// exact wire shape and connection-failure diagnostics.
+#[derive(Subcommand)]
+enum OsDisplayCommands {
+    /// Read the current human pointer size + effective size.
+    CursorSizeGet,
+    /// Set the human pointer size — closed set 24/32/48/64/96.
+    CursorSizeSet {
+        size: i64,
+    },
+    /// Read the current human pointer artwork source (system/brand).
+    CursorSourceGet,
+    /// Set the human pointer artwork source — "system" or "brand".
+    CursorSourceSet {
+        source: String,
+    },
+    /// Switch comp's own server-side decoration theme live — "light" or
+    /// "dark". No get op exists on this wire (comp does not persist the
+    /// value; the shell is the source of truth and re-announces at boot).
+    ThemeSet {
+        theme: String,
+    },
+}
+
+/// A7a system group verbs. Reads are pure/file-based
+/// (`duduclaw_gateway::device_about`); `timezone-set`/`ntp-set` additionally
+/// dial `duduclaw-sysd` and require approval when called by an
+/// agent-identity caller (see `os_drive::approval`).
+#[derive(Subcommand)]
+enum OsSystemCommands {
+    /// Device identity: OS version, kernel, hostname, device id.
+    About,
+    /// Read the current timezone + local/UTC time.
+    TimezoneGet,
+    /// Set the system timezone (IANA identifier, e.g. `Asia/Taipei`).
+    TimezoneSet {
+        timezone: String,
+    },
+    /// Read whether NTP time sync is enabled/synchronized.
+    NtpGet,
+    /// Enable/disable NTP time sync.
+    NtpSet {
+        // A bare positional `bool` defaults to `ArgAction::SetTrue` (a flag,
+        // no value) — incompatible with being positional (clap's own
+        // debug_assert catches this: "positional ... must take a value but
+        // action is SetTrue"). `ArgAction::Set` makes it a normal
+        // value-taking positional parsed via `bool::from_str` ("true"/
+        // "false"), matching the CLI shape documented in `commands --json`.
+        #[arg(action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
+    /// Check for available updates (duduclaw self-update + appliance OS
+    /// image, when running on the appliance).
+    UpdateCheck,
+}
+
+/// A7a network group verbs — read-only.
+#[derive(Subcommand)]
+enum OsNetworkCommands {
+    /// List network interfaces.
+    Status,
+    /// Wired interface status.
+    WiredStatus,
+    /// Wi-Fi link + IP + internet-reachability status.
+    WifiStatus,
+}
+
+/// A7a lint: `--help` must never reach a command's implementation.
+///
+/// Omarchy's own CLI router had exactly this bug — a hand-rolled scanner
+/// that only checked the FIRST leftover argument for `--help` let
+/// `omarchy update aur --help` actually run the update
+/// (`research/native-os-2026-08/omarchy-borrowings-2026-08.md` §7.1 quotes
+/// the fix commit's own words: "checking only the first leftover once let
+/// that invocation start a real update"). DuDuClaw's router is a real
+/// declarative `clap` parser, not a hand-rolled arg scanner, so this class
+/// of bug is structurally different here — but the design doc's brief
+/// explicitly asks for a dedicated regression test pinning the guarantee
+/// (`commercial/docs/DESIGN-os-self-drive-2026-08.md` §6), so this exists to
+/// catch a FUTURE regression (e.g. someone adding a raw/external-subcommand
+/// arg sink to one of these enums) rather than a bug that exists today.
+#[cfg(test)]
+mod os_drive_help_never_executes_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn assert_help_short_circuits(args: &[&str]) {
+        let mut full = vec!["duduclaw"];
+        full.extend_from_slice(args);
+        // `.expect_err()` would need `Cli: Debug` (not derived — clap's
+        // generated struct carries no such requirement elsewhere in this
+        // file), so match explicitly instead of pulling in a derive just
+        // for this one test's panic message.
+        let err = match Cli::try_parse_from(full.iter()) {
+            Err(e) => e,
+            Ok(_) => panic!("must not parse into a runnable Cli for {args:?} — --help must short-circuit"),
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelp,
+            "expected --help to produce DisplayHelp for {args:?}, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[test]
+    fn help_on_a_display_write_command_never_executes_it() {
+        // If this somehow parsed into a runnable command instead of
+        // short-circuiting, the next step would be trying to reach comp's
+        // shell_control socket and switch the live theme — exactly the
+        // class of "a --help invocation had a real side effect" bug the
+        // Omarchy citation above describes.
+        assert_help_short_circuits(&["os", "display", "theme-set", "dark", "--help"]);
+        assert_help_short_circuits(&["os", "display", "--help"]);
+        assert_help_short_circuits(&["os", "--help"]);
+    }
+
+    #[test]
+    fn help_on_a_system_write_command_never_executes_it() {
+        assert_help_short_circuits(&["os", "system", "timezone-set", "Asia/Taipei", "--help"]);
+        assert_help_short_circuits(&["os", "system", "ntp-set", "true", "--help"]);
+    }
+
+    #[test]
+    fn help_flag_in_the_middle_of_args_is_still_caught() {
+        // Mirrors the exact Omarchy bug shape: `--help` is not the LAST
+        // token. A scanner that only checks the first leftover argument
+        // would miss this; clap's declarative parser does not have that
+        // failure mode, and this test pins that.
+        assert_help_short_circuits(&["os", "display", "--help", "cursor-size-set", "48"]);
+    }
+
+    #[test]
+    fn a_literal_help_like_value_after_a_double_dash_is_not_treated_as_the_flag() {
+        // `--` marks the end of flag parsing — clap treats everything after
+        // it as a positional value, so a hypothetical future positional
+        // argument that happened to be spelled "--help" would be taken
+        // literally, never as the help flag. `timezone-set` has exactly one
+        // positional (`timezone`), so this exercises that path directly.
+        let parsed = Cli::try_parse_from(["duduclaw", "os", "system", "timezone-set", "--", "--help"]);
+        let cli = parsed.expect("value after -- must parse as a literal positional, not trigger help");
+        let Commands::Os(OsCommands::System { command: OsSystemCommands::TimezoneSet { timezone } }) = cli.command
+        else {
+            panic!("expected Os(System(TimezoneSet)) — parse landed on a different command variant");
+        };
+        assert_eq!(timezone, "--help");
+    }
 }
 
 /// WP22 T1 — operator-facing maintenance of `~/.duduclaw/org.toml`.
@@ -1947,6 +2177,19 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             Ok(())
         }
         Commands::Docs { topic } => docs_cmd::run(topic).await,
+        Commands::DataMigrate { pending, check, run, json } => {
+            // Custom 0/1 exit contract (task spec), same reasoning as
+            // Commands::Secaudit above — not the generic "any Err ⇒ exit 1"
+            // wrapper.
+            let code = data_migrate::run(data_migrate::DataMigrateOptions {
+                pending,
+                check,
+                run,
+                json,
+            })
+            .await;
+            std::process::exit(code);
+        }
     }
 }
 
@@ -2319,6 +2562,35 @@ async fn cmd_os(
 
             Ok(())
         }
+
+        // ── A7a: self-drive display/system/network + commands introspection.
+        // Every arm is a thin call into `os_drive` — see that module's own
+        // doc comment for why the real logic lives there instead of inline
+        // here (this file is a shared hotspot other in-flight work also
+        // touches this round).
+        OsCommands::Display { command } => match command {
+            OsDisplayCommands::CursorSizeGet => os_drive::cursor_size_get().await,
+            OsDisplayCommands::CursorSizeSet { size } => os_drive::cursor_size_set(size).await,
+            OsDisplayCommands::CursorSourceGet => os_drive::cursor_source_get().await,
+            OsDisplayCommands::CursorSourceSet { source } => os_drive::cursor_source_set(&source).await,
+            OsDisplayCommands::ThemeSet { theme } => os_drive::theme_set(&theme).await,
+        },
+        OsCommands::System { command } => match command {
+            OsSystemCommands::About => os_drive::system_about().await,
+            OsSystemCommands::TimezoneGet => os_drive::system_timezone_get().await,
+            OsSystemCommands::TimezoneSet { timezone } => {
+                os_drive::system_timezone_set(home_dir, &timezone).await
+            }
+            OsSystemCommands::NtpGet => os_drive::system_ntp_get().await,
+            OsSystemCommands::NtpSet { enabled } => os_drive::system_ntp_set(home_dir, enabled).await,
+            OsSystemCommands::UpdateCheck => os_drive::system_update_check().await,
+        },
+        OsCommands::Network { command } => match command {
+            OsNetworkCommands::Status => os_drive::network_status().await,
+            OsNetworkCommands::WiredStatus => os_drive::network_wired_status(home_dir).await,
+            OsNetworkCommands::WifiStatus => os_drive::network_wifi_status().await,
+        },
+        OsCommands::Commands { json } => os_drive::commands(json),
     }
 }
 
