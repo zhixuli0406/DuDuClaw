@@ -148,6 +148,18 @@ impl TextEngine {
             .unwrap_or_else(|| self.selected_range.clone())
     }
 
+    /// The BYTE length [`Self::effective_range`] would remove for this
+    /// `range_utf16` — i.e. what a `replace_*` call is actually replacing,
+    /// before the new text goes in. Exposed so a caller can compute NET
+    /// growth (`content.len() - removed + incoming.len()`) rather than
+    /// treating every insert as pure append — D9-bug7/D9-bug8's flood
+    /// guardrail (`input_state.rs`'s `insert_committed`) needs this so a
+    /// full-selection replace on already-long content is never mistaken for
+    /// unbounded growth and wrongly refused.
+    pub fn removed_len_for(&self, range_utf16: Option<Range<usize>>) -> usize {
+        self.effective_range(range_utf16).len()
+    }
+
     /// Final commit of an edit (either a plain keystroke insert or an IME
     /// composition's final commit) — replaces `range` with `new_text`,
     /// clears any composition, and parks the cursor right after the

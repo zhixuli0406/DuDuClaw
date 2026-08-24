@@ -90,6 +90,23 @@ fn trace_enabled() -> bool {
     std::env::var("DUDUCLAW_IME_TRACE").is_ok_and(|v| v == "1")
 }
 
+/// D9-bug7/D9-bug8 (2026-08-24) — see [`ImeTextInput::insert_committed`]'s
+/// own doc comment for the full flood-guardrail write-up.
+const MAX_SINGLE_LINE_CONTENT_BYTES: usize = 128;
+const MAX_MULTI_LINE_CONTENT_BYTES: usize = 8192;
+
+/// Pure predicate behind the cap — same "gpui-free logic lives in a plain
+/// function, tested directly" convention `text_engine.rs`'s own module doc
+/// establishes for this sibling file, and `duduclaw-comp::session_lock`'s
+/// `should_swallow_unbound_locked_key` establishes for this round's other
+/// half of the same fix. `insert_committed` cannot be unit-tested directly
+/// (it needs a live `ImeTextInput` entity, which needs a real gpui `App`
+/// context this crate has no test harness for), so the one bit of decision
+/// logic that matters is isolated here instead.
+fn exceeds_content_cap(current_len: usize, removed_len: usize, incoming_len: usize, cap: usize) -> bool {
+    current_len.saturating_sub(removed_len).saturating_add(incoming_len) > cap
+}
+
 #[derive(Debug, Clone)]
 pub enum ImeTextInputEvent {
     /// Enter (without Shift) while not mid-composition — carries the
@@ -211,10 +228,49 @@ impl ImeTextInput {
     /// Insert committed text, honouring the single-line contract. Every
     /// buffer-mutating entry point funnels through here so a `\n` cannot
     /// sneak into a one-line field via a paste or an IME commit.
-    fn insert_committed(&mut self, range_utf16: Option<Range<usize>>, new_text: &str) {
+    ///
+    /// D9-bug7/D9-bug8 (2026-08-24) flood guardrail: returns `false` (and
+    /// changes nothing) when accepting `new_text` would push `content` past
+    /// [`MAX_SINGLE_LINE_CONTENT_BYTES`]/[`MAX_MULTI_LINE_CONTENT_BYTES`].
+    /// This is NOT the root fix for the runaway-repeat bug this round
+    /// root-caused on the compositor side (see `duduclaw-comp::
+    /// session_lock`'s own D9-bug7 doc comment for the full write-up) — it
+    /// is the backstop for whatever else can still make a client keep
+    /// synthesizing an unbounded stream of identical single-character
+    /// inserts. Measured directly on the W5-1 VM round: even after comp was
+    /// fixed to correctly deliver the release that ends a Cmd-held chord,
+    /// gpui's own Linux/Wayland backend kept redelivering the stuck-repeat
+    /// keystroke LOCALLY — a client-side mechanism this crate does not own
+    /// (vendored dependency) and cannot patch here. No real password,
+    /// search query, or Wi-Fi PSK is anywhere near 128 bytes (WPA2's own
+    /// PSK ceiling is 63 ASCII characters), and no real
+    /// chat message is anywhere near 8 KiB, so this never fires on genuine
+    /// input; the caller (`EntityInputHandler::replace_text_in_range`) skips
+    /// `cx.notify()` on a refusal, which is what actually stops the redraw
+    /// storm — an insert that changes nothing has nothing to repaint.
+    fn insert_committed(&mut self, range_utf16: Option<Range<usize>>, new_text: &str) -> bool {
         let sanitized =
             if self.style.multi_line { std::borrow::Cow::Borrowed(new_text) } else { strip_line_breaks(new_text) };
+        let cap = if self.style.multi_line { MAX_MULTI_LINE_CONTENT_BYTES } else { MAX_SINGLE_LINE_CONTENT_BYTES };
+        // NET growth, not raw length: `removed_len_for` is whatever this
+        // exact call is about to replace (the common case — a repeat's
+        // synthetic keystroke — has an empty effective range, i.e. removed
+        // == 0, a pure append), so a full-selection replace on already-long
+        // content is never mistaken for unbounded growth and wrongly
+        // refused.
+        let removed = self.engine.removed_len_for(range_utf16.clone());
+        if exceeds_content_cap(self.engine.content.len(), removed, sanitized.len(), cap) {
+            if trace_enabled() {
+                eprintln!(
+                    "[ime] insert refused — would exceed the {cap}-byte cap (current={}, removed={removed}, incoming={})",
+                    self.engine.content.len(),
+                    sanitized.len()
+                );
+            }
+            return false;
+        }
         self.engine.replace_text_in_range(range_utf16, sanitized.as_ref());
+        true
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -459,7 +515,14 @@ impl EntityInputHandler for ImeTextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.insert_committed(range_utf16, new_text);
+        // D9-bug7/D9-bug8: a refused (capped) insert changes nothing, so it
+        // gets neither a trace line under normal tracing (the refusal
+        // itself already logs, see `insert_committed`) nor a `cx.notify()`
+        // — an unbounded flood of these must never turn into an unbounded
+        // flood of repaints.
+        if !self.insert_committed(range_utf16, new_text) {
+            return;
+        }
         self.trace("replace_text_in_range", Some(new_text));
         cx.notify();
     }
@@ -559,5 +622,79 @@ impl Render for ImeTextInput {
             .text_color(self.style.text)
             .cursor(gpui::CursorStyle::IBeam)
             .child(ImeTextElement { input: cx.entity() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exceeds_content_cap, MAX_MULTI_LINE_CONTENT_BYTES, MAX_SINGLE_LINE_CONTENT_BYTES};
+
+    // ── D9-bug7/D9-bug8 (2026-08-24): the flood guardrail ──────────────────
+    // See `ImeTextInput::insert_committed`'s own doc comment for the full
+    // write-up — this is the pure decision that guardrail is built on.
+
+    #[test]
+    fn an_insert_that_stays_at_or_under_the_cap_is_never_refused() {
+        assert!(!exceeds_content_cap(0, 0, MAX_SINGLE_LINE_CONTENT_BYTES, MAX_SINGLE_LINE_CONTENT_BYTES));
+        assert!(!exceeds_content_cap(MAX_SINGLE_LINE_CONTENT_BYTES - 1, 0, 1, MAX_SINGLE_LINE_CONTENT_BYTES));
+        assert!(!exceeds_content_cap(0, 0, 0, MAX_SINGLE_LINE_CONTENT_BYTES));
+    }
+
+    #[test]
+    fn an_insert_that_would_push_one_byte_past_the_cap_is_refused() {
+        assert!(exceeds_content_cap(MAX_SINGLE_LINE_CONTENT_BYTES, 0, 1, MAX_SINGLE_LINE_CONTENT_BYTES));
+        assert!(exceeds_content_cap(MAX_SINGLE_LINE_CONTENT_BYTES - 1, 0, 2, MAX_SINGLE_LINE_CONTENT_BYTES));
+    }
+
+    /// The exact shape a stuck client-side key repeat produces: content
+    /// already near/at the cap, one more single-grapheme insert arriving.
+    /// This is what actually bounds an otherwise-unbounded flood — it must
+    /// start refusing and then STAY refused for every subsequent call, not
+    /// just the one that first crosses the line.
+    #[test]
+    fn a_runaway_single_character_flood_is_capped_and_stays_capped() {
+        let mut len = 0usize;
+        let mut refusals = 0u32;
+        for _ in 0..(MAX_SINGLE_LINE_CONTENT_BYTES + 2_000) {
+            // A repeat's synthetic keystroke always lands at the cursor
+            // with an empty selection — removed == 0, a pure append.
+            if exceeds_content_cap(len, 0, 1, MAX_SINGLE_LINE_CONTENT_BYTES) {
+                refusals += 1;
+            } else {
+                len += 1;
+            }
+        }
+        assert_eq!(len, MAX_SINGLE_LINE_CONTENT_BYTES, "growth must stop exactly at the cap, never past it");
+        assert_eq!(refusals, 2_000, "every call past the cap must be refused, not just the first");
+    }
+
+    #[test]
+    fn the_multi_line_cap_is_far_more_generous_than_the_single_line_one() {
+        // A real chat message can legitimately run long; a password/search/
+        // PSK field cannot — the two caps must not accidentally converge.
+        assert!(MAX_MULTI_LINE_CONTENT_BYTES > MAX_SINGLE_LINE_CONTENT_BYTES * 4);
+    }
+
+    #[test]
+    fn a_shrinking_or_steady_replace_is_never_refused_regardless_of_current_length() {
+        // An empty incoming string, replacing a range at least as long as
+        // itself, must never be blocked by the cap no matter how long the
+        // existing content is — the cap only ever refuses NET GROWTH.
+        let huge = MAX_MULTI_LINE_CONTENT_BYTES * 2;
+        assert!(!exceeds_content_cap(huge, huge, 0, MAX_SINGLE_LINE_CONTENT_BYTES));
+    }
+
+    /// The exact scenario that motivated tracking `removed_len` at all: a
+    /// full-selection replace on content already sitting AT the cap must
+    /// not be refused just because the OLD length alone already meets it —
+    /// the replacement's own net result ("hi", 2 bytes) is what matters.
+    #[test]
+    fn a_full_selection_replace_on_at_cap_content_is_judged_by_its_net_result() {
+        assert!(!exceeds_content_cap(
+            MAX_SINGLE_LINE_CONTENT_BYTES,
+            MAX_SINGLE_LINE_CONTENT_BYTES,
+            2,
+            MAX_SINGLE_LINE_CONTENT_BYTES
+        ));
     }
 }

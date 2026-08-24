@@ -123,6 +123,22 @@ pub(crate) fn gesture_allowed_while_locked(gesture: SystemGesture) -> bool {
     matches!(gesture, SystemGesture::EmergencyStop)
 }
 
+/// D9-bug7 (2026-08-24, root-caused on the W5-1 VM round): whether an
+/// UNRECOGNISED (not a [`SystemGesture`]) Logo/Alt-modified key event should
+/// be swallowed by [`DuduclawComp::locked_key_filter`] rather than delivered
+/// to the layer surface.
+///
+/// Pure and unit-tested on purpose — same "decision here, dispatch in the
+/// caller" split [`classify_gesture`]/[`gesture_allowed_while_locked`]
+/// already establish above. The one bit of behaviour this encodes is the
+/// fix itself: **only a PRESS is swallowed on the strength of a held
+/// modifier; a RELEASE never is**, and that asymmetry is load-bearing, not
+/// an oversight — see [`DuduclawComp::locked_key_filter`]'s own doc comment
+/// for the measured failure mode it closes.
+pub(crate) fn should_swallow_unbound_locked_key(key_state: KeyState, modifiers: &ModifiersState) -> bool {
+    key_state == KeyState::Pressed && (modifiers.logo || modifiers.alt)
+}
+
 /// Which [`SystemGesture`], if any, this key press is — mirroring exactly the
 /// arms `input.rs`'s unlocked keyboard filter matches, using that module's own
 /// keysym predicates so the two cannot drift apart.
@@ -245,10 +261,12 @@ impl DuduclawComp {
     /// method's keyboard grab (see this module's doc). Three outcomes:
     ///
     /// 1. Super+Esc still freezes the agent seat — [`gesture_allowed_while_locked`];
-    /// 2. any other Logo/Alt chord is swallowed, so the switcher, Super+Q,
-    ///    Super+K and Super+Enter cannot be reached from the lock screen;
-    /// 3. every remaining key is delivered **directly** to the focused layer
-    ///    surface, or dropped if focus is not on one.
+    /// 2. any other Logo/Alt chord's PRESS is swallowed, so the switcher,
+    ///    Super+Q, Super+K and Super+Enter cannot be reached from the lock
+    ///    screen — but see the D9-bug7 note below for why its RELEASE is not;
+    /// 3. every remaining key (including every release) is delivered
+    ///    **directly** to the focused layer surface, or dropped if focus is
+    ///    not on one.
     ///
     /// `modifiers` is re-sent immediately before each key rather than only on
     /// change: this path bypasses `KeyboardHandle::input_forward`, which is
@@ -256,6 +274,47 @@ impl DuduclawComp {
     /// lost Shift would reject every password containing a capital letter.
     /// `wl_keyboard.modifiers` is idempotent, so re-sending costs one small
     /// event per keystroke and cannot desynchronise anything.
+    ///
+    /// ── D9-bug7 (2026-08-24) — the release/press asymmetry ────────────────
+    /// Until this round, an unrecognised Logo/Alt chord swallowed its
+    /// RELEASE the same way it swallowed its PRESS, on the reasoning (still
+    /// correct for a chord that starts AND ends while already locked) that
+    /// "the client never saw the press either, so nothing needs to be told
+    /// it came back up." That reasoning breaks for exactly the chord that
+    /// LOCKS the screen — `cmd-l` — because its PRESS is dispatched through
+    /// the *unlocked* path (`session_locked()` was still `false` at that
+    /// instant, before the shell's async `set_session_locked(true)` IPC call
+    /// lands) and reaches the shell as an ordinary keystroke; that is what
+    /// fires `LockScreenNow` in the first place. If the operator is still
+    /// physically holding `l` (or Cmd) by the time the lock takes effect
+    /// compositor-side, the RELEASE arrives here instead, on the *locked*
+    /// path, with `modifiers.logo` still `true` — and the old code swallowed
+    /// it. The shell never learns the key came back up, so its own
+    /// client-side autorepeat timer (armed by the press it DID see) free-runs
+    /// forever. Measured on the W5-1 VM round: a multi-thousand-character
+    /// flood of `l`s into the freshly-revealed password field (`content`
+    /// climbing past 1,100 masked clusters, unbounded) that eventually broke
+    /// the Wayland connection outright (`duduclaw_comp::state: xdg client
+    /// disconnected … reason=ConnectionClosed`), which the shell then
+    /// surfaces as a clean `exit(0)` — invisible to `duduclaw-kiosk.service`'s
+    /// `Restart=on-failure` (see that unit file's own D9-bug8 comment for the
+    /// matching self-heal fix; the two rounds share one root symptom class:
+    /// an unbounded key-repeat flood the client cannot recover from on its
+    /// own).
+    ///
+    /// [`should_swallow_unbound_locked_key`] is where this is now decided:
+    /// a PRESS still swallows on a held Logo/Alt (unchanged), a RELEASE
+    /// never does. This is deliberately NOT conditioned on "was this
+    /// specific release's press actually delivered" — that would need this
+    /// compositor to keep a second, private copy of exactly the physical-key
+    /// bookkeeping `KeyboardHandle` already keeps. Always forwarding the
+    /// release is the safe simplification: a client that receives a
+    /// `wl_keyboard.key` RELEASE for a keysym it has no memory of pressing
+    /// (e.g. the release half of a gesture whose press WAS intercepted, like
+    /// Super+Esc) is ordinary, expected Wayland-client behaviour — it is
+    /// silently ignored, never inserts text and never arms a repeat timer on
+    /// its own — whereas swallowing the WRONG release is what produces an
+    /// unbounded flood.
     pub(crate) fn locked_key_filter(
         &mut self,
         modifiers: &ModifiersState,
@@ -292,14 +351,12 @@ impl DuduclawComp {
                 return FilterResult::Intercept(());
             }
         }
-        if modifiers.logo || modifiers.alt {
-            // An unrecognised Logo/Alt chord, plus every chord's trailing
-            // releases. Swallowed rather than delivered: a lock screen has no
-            // use for a modifier chord, and guessing at one this compositor
-            // does not bind would be inventing behaviour. The client never saw
-            // the press either, so its modifier bookkeeping stays consistent —
-            // and the explicit `modifiers` send below resynchronises it on the
-            // next ordinary key regardless.
+        if should_swallow_unbound_locked_key(key_state, modifiers) {
+            // An unrecognised Logo/Alt chord's PRESS. Swallowed rather than
+            // delivered: a lock screen has no use for a modifier chord, and
+            // guessing at one this compositor does not bind would be
+            // inventing behaviour. See this fn's own D9-bug7 doc comment for
+            // why the RELEASE half no longer takes this branch.
             return FilterResult::Intercept(());
         }
         let Some(surface) = self.locked_key_target() else {
@@ -335,11 +392,48 @@ impl DuduclawComp {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_gesture, gesture_allowed_while_locked, SystemGesture};
+    use super::{classify_gesture, gesture_allowed_while_locked, should_swallow_unbound_locked_key, SystemGesture};
+    use smithay::backend::input::KeyState;
     use smithay::input::keyboard::{keysyms, Keysym, ModifiersState};
 
     fn mods(logo: bool, alt: bool) -> ModifiersState {
         ModifiersState { logo, alt, ..Default::default() }
+    }
+
+    // ── D9-bug7 (2026-08-24): the release/press asymmetry ─────────────────
+    // Root-caused on the W5-1 VM round: `cmd-l`'s own RELEASE, arriving here
+    // after the lock takes effect while Logo is still physically held,
+    // MUST reach the layer surface — swallowing it left the shell's
+    // client-side autorepeat timer (armed by the press, which reached the
+    // shell through the pre-lock path) with no way to learn the key came
+    // back up, and it free-ran forever (measured: 1,100+ masked clusters
+    // flooding the password field, ending in the Wayland connection itself
+    // breaking). See `DuduclawComp::locked_key_filter`'s own doc comment for
+    // the full write-up.
+
+    #[test]
+    fn an_unbound_logo_or_alt_press_is_swallowed() {
+        assert!(should_swallow_unbound_locked_key(KeyState::Pressed, &mods(true, false)));
+        assert!(should_swallow_unbound_locked_key(KeyState::Pressed, &mods(false, true)));
+        assert!(should_swallow_unbound_locked_key(KeyState::Pressed, &mods(true, true)));
+    }
+
+    #[test]
+    fn a_press_with_neither_modifier_held_is_never_swallowed_here() {
+        // Not this predicate's job to decide plain keys — `locked_key_filter`
+        // only reaches it after `classify_gesture` already found nothing.
+        assert!(!should_swallow_unbound_locked_key(KeyState::Pressed, &mods(false, false)));
+    }
+
+    #[test]
+    fn a_release_is_never_swallowed_on_the_strength_of_a_held_modifier_alone() {
+        // The load-bearing regression: this is exactly the state a plain
+        // `l` key-up arrives in while the operator is still holding Cmd
+        // (Logo) down after the `cmd-l` chord that locked the screen.
+        assert!(!should_swallow_unbound_locked_key(KeyState::Released, &mods(true, false)));
+        assert!(!should_swallow_unbound_locked_key(KeyState::Released, &mods(false, true)));
+        assert!(!should_swallow_unbound_locked_key(KeyState::Released, &mods(true, true)));
+        assert!(!should_swallow_unbound_locked_key(KeyState::Released, &mods(false, false)));
     }
 
     #[test]
