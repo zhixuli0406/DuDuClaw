@@ -88,9 +88,20 @@ const CORE_BARS: [(f64, f64, i32, i32); 2] = [(-9.0, -2.0, 18, 4), (-2.0, -9.0, 
 ///
 /// CUR-1: this used to build the human pointer as well; it no longer does.
 /// See `crate::cursor` and this file's header.
+///
+/// `scale` is the rendered output's own live scale
+/// (`render::output_render_scale`) — WP-comp-shell-display D4b-3 replaced a
+/// hardcoded `Scale::from(1.0)`. Unlike the human cursor, this element is
+/// `SolidColorRenderElement`-based, whose `Element::geometry()` IGNORES the
+/// scale `render_output` passes it at render time (checked against smithay
+/// 0.7.0 source: `fn geometry(&self, _scale: Scale<f64>)`) — so both the
+/// cross's PHYSICAL position and its PHYSICAL size are baked in right here,
+/// at construction, from whatever `scale` this caller supplies. Passing the
+/// wrong value does not just misplace the cross, it also mis-sizes it.
 pub fn build_agent_cursor_elements(
     agent_pos: Point<f64, Logical>,
     mode: DrivingMode,
+    scale: Scale<f64>,
 ) -> Vec<SolidColorRenderElement> {
     let core_color = match mode {
         // No session — nothing may move this pointer, so there is no pointer
@@ -101,7 +112,6 @@ pub fn build_agent_cursor_elements(
     };
     let core_color = [core_color[0], core_color[1], core_color[2], GHOST_CORE_ALPHA];
 
-    let scale = Scale::from(1.0);
     let mut elems = Vec::with_capacity(4);
 
     // The core goes in FIRST on purpose: this crate's backends treat earlier
@@ -146,21 +156,44 @@ fn bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only needed to call `.geometry()` directly in the D4b-3 scale
+    // regression test below — everything else in this file builds elements
+    // without ever inspecting their own trait-level geometry.
+    use smithay::backend::renderer::element::Element;
 
     #[test]
     fn human_mode_draws_no_agent_pointer_at_all() {
         // A2 behavior change: before this round the cross was drawn
         // unconditionally, leaving a ghost pointer on a desktop with no
         // co-drive session. See this file's header.
-        let elems = build_agent_cursor_elements(Point::from((100.0, 100.0)), DrivingMode::Human);
+        let elems = build_agent_cursor_elements(Point::from((100.0, 100.0)), DrivingMode::Human, Scale::from(1.0));
         assert!(elems.is_empty());
     }
 
     #[test]
     fn the_two_active_modes_draw_a_core_cross_plus_its_halo() {
         for mode in [DrivingMode::CoDrive, DrivingMode::Handover] {
-            let elems = build_agent_cursor_elements(Point::from((0.0, 0.0)), mode);
+            let elems = build_agent_cursor_elements(Point::from((0.0, 0.0)), mode, Scale::from(1.0));
             assert_eq!(elems.len(), 4, "{mode:?}: two core bars + two halo bars");
+        }
+    }
+
+    /// WP-comp-shell-display D4b-3: since `SolidColorRenderElement`'s size is
+    /// baked in at construction (its `geometry()` ignores the render-time
+    /// scale — see this function's own doc), a caller-supplied scale must
+    /// actually change the buffer this produces, or the "single source of
+    /// truth" claim is untested.
+    #[test]
+    fn a_real_output_scale_changes_the_baked_geometry() {
+        let at_1x = build_agent_cursor_elements(Point::from((100.0, 100.0)), DrivingMode::CoDrive, Scale::from(1.0));
+        let at_2x = build_agent_cursor_elements(Point::from((100.0, 100.0)), DrivingMode::CoDrive, Scale::from(2.0));
+        assert_eq!(at_1x.len(), at_2x.len());
+        for (a, b) in at_1x.iter().zip(at_2x.iter()) {
+            assert_ne!(
+                a.geometry(Scale::from(1.0)),
+                b.geometry(Scale::from(1.0)),
+                "the 2x-scale element must not report the same physical geometry as the 1x one"
+            );
         }
     }
 

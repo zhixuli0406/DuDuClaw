@@ -610,10 +610,22 @@ fn build_surfaces(
         // `Transform::Normal`, unlike the winit backend's `Flipped180` — the
         // flip there is a winit/EGL surface-orientation quirk, not something
         // real scanout needs.
+        //
+        // WP-comp-shell-display D4b-3: restore a scale chosen via a previous
+        // run's `set_output_scale`, in this SAME `change_current_state` call
+        // — see `winit_backend.rs::init_winit`'s matching comment for why
+        // that (not a follow-up call) is what avoids every client's first
+        // `wl_output.scale` announcement being wrong. Keyed by THIS
+        // connector's own name (`output_prefs`'s module doc: stable across
+        // boots as long as the same monitor stays on the same connector); a
+        // renamed/reconnected-elsewhere output simply finds no entry and
+        // boots at the implicit 100% default, same as before this round.
+        let initial_scale = crate::output_prefs::load_scale_pct(&name)
+            .map(|pct| smithay::output::Scale::Fractional(pct as f64 / 100.0));
         output.change_current_state(
             Some(wl_mode),
             Some(Transform::Normal),
-            None,
+            initial_scale,
             Some((next_x, 0).into()),
         );
         output.set_preferred(wl_mode);
@@ -785,12 +797,18 @@ fn render_surface(
     // global logical space of `Space`. On a single output at (0, 0) — the
     // winit case and the overwhelmingly common hardware case — the offset is
     // zero and this is byte-identical to what the winit backend does.
-    let output_loc = state
-        .space
-        .output_geometry(&output)
-        .map(|g| g.loc)
-        .unwrap_or_default();
+    //
+    // WP-comp-shell-display D4b-3: this same `output_geometry` call also
+    // gives the output's TRUE logical SIZE (physical mode size / scale) —
+    // reused below for the mode indicator's frame instead of the raw
+    // physical `Mode::size` every caller here used to feed it mislabeled as
+    // `Logical` (only harmless while scale was always 1.0).
+    let output_geo = state.space.output_geometry(&output).unwrap_or_default();
+    let output_loc = output_geo.loc;
     let offset = Point::<f64, Logical>::from((-(output_loc.x as f64), -(output_loc.y as f64)));
+    // Single source of truth for every overlay element built below — see
+    // `render::output_render_scale`'s own doc.
+    let scale = crate::render::output_render_scale(&output);
 
     let now = Instant::now();
     let agent_pos = state.agent_seat.get_pointer().unwrap().current_location() + offset;
@@ -803,15 +821,15 @@ fn render_surface(
     // custom element, and it takes `offset` itself (it reads the pointer
     // position internally) rather than a pre-offset position, unlike the
     // agent cross below.
-    let mut elements: Vec<CodriveElement> = state.build_human_cursor_elements(renderer, offset);
+    let mut elements: Vec<CodriveElement> = state.build_human_cursor_elements(renderer, offset, scale);
     elements.extend(
-        crate::codrive::build_agent_cursor_elements(agent_pos, driving_mode)
+        crate::codrive::build_agent_cursor_elements(agent_pos, driving_mode, scale)
             .into_iter()
             .map(CodriveElement::Solid),
     );
     elements.extend(
         state
-            .codrive_highlight_elements_at(now, offset)
+            .codrive_highlight_elements_at(now, offset, scale)
             .into_iter()
             .map(CodriveElement::Solid),
     );
@@ -823,12 +841,9 @@ fn render_surface(
     // interpreted in — applying the global→local offset here would push a
     // second monitor's frame off its own screen. See
     // `codrive/mode_indicator.rs`'s "Coordinate space" section.
-    let indicator_size = output
-        .current_mode()
-        .map(|m| smithay::utils::Size::<i32, Logical>::from((m.size.w, m.size.h)))
-        .unwrap_or_default();
+    let indicator_size = output_geo.size;
     elements.extend(
-        crate::codrive::build_mode_indicator_elements(indicator_size, driving_mode)
+        crate::codrive::build_mode_indicator_elements(indicator_size, driving_mode, scale)
             .into_iter()
             .map(CodriveElement::Solid),
     );

@@ -85,7 +85,18 @@ pub fn init_winit(
         },
     );
     let _global = output.create_global::<DuduclawComp>(display_handle);
-    output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
+    // WP-comp-shell-display D4b-3: restore a scale chosen via a previous
+    // run's `set_output_scale`, in the SAME `change_current_state` call that
+    // sets the initial mode/transform — the FIRST state this output is ever
+    // announced at, not "boot at 100% then immediately jump" (which would
+    // mean every client's very first `wl_output.scale` event is wrong and
+    // has to be followed by a second one a moment later). No stored
+    // preference (the overwhelmingly common case: fresh install, or an
+    // output name never seen before) -> `None`, byte-identical to every
+    // prior round.
+    let initial_scale = crate::output_prefs::load_scale_pct("winit")
+        .map(|pct| smithay::output::Scale::Fractional(pct as f64 / 100.0));
+    output.change_current_state(Some(mode), Some(Transform::Flipped180), initial_scale, Some((0, 0).into()));
     output.set_preferred(mode);
 
     state.space.map_output(&output, (0, 0));
@@ -178,16 +189,35 @@ pub fn init_winit(
                 // screen-edge indicator appears. See `codrive/mode.rs`.
                 let agent_pos = state.agent_seat.get_pointer().unwrap().current_location();
                 let driving_mode = state.codrive_driving_mode();
+                // WP-comp-shell-display D4b-3: the single scale every
+                // overlay element built below shares — see `render::
+                // output_render_scale`'s own doc. Computed once per frame,
+                // same as `decor::paint::build_output_elements`'s own copy
+                // computes at the same live value a few lines later when
+                // this frame's `build_output_elements` call runs.
+                let scale = crate::render::output_render_scale(&output);
+                // The mode indicator's frame must be sized in the output's
+                // TRUE logical space (physical mode size / scale), not the
+                // raw physical window size `size` below (that stays
+                // physical on purpose — it also feeds `damage`/`submit`,
+                // which want physical pixels). `output_geometry` is the
+                // same scale-aware source `decor::paint::build_output_
+                // elements` and `shell_output_info` already trust.
+                let indicator_logical_size = state
+                    .space
+                    .output_geometry(&output)
+                    .map(|g| g.size)
+                    .unwrap_or_default();
                 let mut cursor_elements: Vec<CodriveElement> = {
                     let renderer = backend.renderer();
-                    state.build_human_cursor_elements(renderer, Point::from((0.0, 0.0)))
+                    state.build_human_cursor_elements(renderer, Point::from((0.0, 0.0)), scale)
                 };
                 // CD-2: cursor/highlight elements now go through the
                 // combined `CodriveElement` enum (see `render.rs`'s
                 // `render_elements!` invocation) so the PiP texture element
                 // below can share the same `custom_elements` slice.
                 cursor_elements.extend(
-                    crate::codrive::build_agent_cursor_elements(agent_pos, driving_mode)
+                    crate::codrive::build_agent_cursor_elements(agent_pos, driving_mode, scale)
                         .into_iter()
                         .map(CodriveElement::Solid),
                 );
@@ -198,8 +228,9 @@ pub fn init_winit(
                 // origin anyway. See `codrive/mode_indicator.rs`.
                 cursor_elements.extend(
                     crate::codrive::build_mode_indicator_elements(
-                        smithay::utils::Size::from((size.w, size.h)),
+                        indicator_logical_size,
                         driving_mode,
+                        scale,
                     )
                     .into_iter()
                     .map(CodriveElement::Solid),
@@ -213,7 +244,7 @@ pub fn init_winit(
                 // a free function like `build_cursor_elements`.
                 cursor_elements.extend(
                     state
-                        .codrive_highlight_elements(std::time::Instant::now())
+                        .codrive_highlight_elements(std::time::Instant::now(), scale)
                         .into_iter()
                         .map(CodriveElement::Solid),
                 );

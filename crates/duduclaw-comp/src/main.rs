@@ -46,6 +46,7 @@ mod ime;
 mod input;
 mod layer_shell;
 mod minimize;
+mod output_prefs;
 mod render;
 mod seat_order;
 mod session_lock;

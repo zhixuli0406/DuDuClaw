@@ -308,6 +308,17 @@ impl DuduclawComp {
     /// cursor in the right place. Both backends pass the pointer position
     /// pre-offset and this recomputes nothing.
     ///
+    /// `scale` is the rendered output's own live scale
+    /// (`render::output_render_scale`) — WP-comp-shell-display D4b-3
+    /// replaced a hardcoded `Scale::from(1.0)` here, which put the human
+    /// pointer at the wrong PHYSICAL position (not just the wrong apparent
+    /// size) the moment `set_output_scale` moved the output off 100%: this
+    /// function only converts the pointer's LOGICAL position to physical
+    /// pixels, it does not affect the themed cursor artwork's own size (that
+    /// is `MemoryRenderBufferRenderElement::geometry`'s job, which already
+    /// re-derives physical size from the render-time scale `render_output`
+    /// passes it — checked against smithay 0.7.0 source, not assumed).
+    ///
     /// Returns an empty vec for a hidden cursor, and *also* for an image the
     /// renderer refuses to import — an unimportable cursor is a missing
     /// cursor, never a panic on the render path.
@@ -315,8 +326,8 @@ impl DuduclawComp {
         &mut self,
         renderer: &mut GlesRenderer,
         offset: Point<f64, Logical>,
+        scale: Scale<f64>,
     ) -> Vec<CodriveElement> {
-        let scale = Scale::from(1.0);
         let Some(pointer) = self.seat.get_pointer() else {
             return Vec::new();
         };
@@ -341,7 +352,7 @@ impl DuduclawComp {
                         "cursor: client cursor surface died — reverting to the default cursor"
                     );
                     self.cursor.status = CursorImageStatus::default_named();
-                    return self.build_human_cursor_elements(renderer, offset);
+                    return self.build_human_cursor_elements(renderer, offset, scale);
                 }
                 let hotspot = cursor_surface_hotspot(&surface);
                 let loc: Point<i32, Physical> =

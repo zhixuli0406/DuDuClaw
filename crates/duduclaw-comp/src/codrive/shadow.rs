@@ -101,9 +101,14 @@ use super::protocol::InjectCmd;
 /// while shadow mode is already active straight to the shadow region.
 pub const SHADOW_ORIGIN: (i32, i32) = (0, 100_000);
 
-/// Fixed logical/physical size for the shadow output (this crate has never
-/// used a compositor scale other than 1.0 — see `cursor.rs`/`highlight.rs`
-/// — so logical and physical pixels coincide throughout this file).
+/// Fixed logical/physical size for the shadow output. The SHADOW output's
+/// own scale specifically stays 1.0 forever: `shell_control_find_output`
+/// (`shell_control/mod.rs`) explicitly excludes `DuduclawComp::
+/// shadow_output` from every `get_outputs`/`set_output_scale` lookup, so
+/// there is no wire path that can ever change it — logical and physical
+/// pixels coincide throughout this file regardless of what scale a REAL
+/// output is running at (WP-comp-shell-display D4b-3 made that a live,
+/// per-output choice — see `render::output_render_scale`'s doc).
 const SHADOW_SIZE: (i32, i32) = (1280, 800);
 
 /// PiP thumbnail's fixed size on the main output, same 8:5 aspect ratio as

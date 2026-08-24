@@ -403,7 +403,10 @@ impl DuduclawComp {
             // skips it in exactly the same way.
             return overlays;
         };
-        let scale = Scale::from(output.current_scale().fractional_scale());
+        // WP-comp-shell-display D4b-3: single source of truth, shared with
+        // every custom overlay element built for this same frame — see
+        // `render::output_render_scale`'s own doc.
+        let scale = crate::render::output_render_scale(output);
 
         let focused = self
             .seat

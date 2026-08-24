@@ -202,6 +202,28 @@ impl DuduclawComp {
         }
         self.session_locked = locked;
         tracing::info!(locked, "session_lock: session lock state changed");
+        // D9-bug9 (2026-08-24), M1 round: force a REAL wl_keyboard leave+
+        // enter cycle on whoever currently holds keyboard focus, before
+        // `settle_layer_keyboard_focus` below even runs. See
+        // `Self::force_keyboard_leave_enter_cycle`'s own doc comment for the
+        // full evidence chain (a source read of the pinned gpui rev) this is
+        // built on — short version: gpui's Linux/Wayland backend runs its
+        // OWN client-side software autorepeat timer, armed on every key
+        // PRESS it receives and disarmed ONLY by a `wl_keyboard.leave`
+        // event (its own source comment: "Prevent keyboard events from
+        // repeating after opening e.g. a file chooser and closing it
+        // quickly") — a matching RELEASE for the same keycode ALSO disarms
+        // it, but `settle_layer_keyboard_focus` below never sends either:
+        // the shell's layer surface almost always ALREADY holds keyboard
+        // focus at the moment a lock gesture fires (that focus is
+        // literally how the shell saw the keystroke that triggered the
+        // lock in the first place), so its own "already-focused, no early
+        // surface change" short-circuit (`held.as_ref() == Some(&surface)`)
+        // means the real leave/enter pair this bug needs never gets sent.
+        // Cycling focus through `None` first (this call) guarantees a
+        // genuine focus transition on BOTH edges, independent of whether
+        // the surface identity is about to change at all.
+        self.force_keyboard_leave_enter_cycle();
         self.settle_layer_keyboard_focus(
             if locked { "session_locked" } else { "session_unlocked" },
             None,
@@ -209,6 +231,70 @@ impl DuduclawComp {
         self.resettle_pointer_focus();
         self.queue_redraw();
         true
+    }
+
+    /// D9-bug9 (2026-08-24): unconditionally drops keyboard focus to
+    /// `None` (a genuine transition whenever anything is currently
+    /// focused — Wayland's protocol never merges a leave+enter pair into a
+    /// no-op the way re-targeting the SAME surface can), then relies on the
+    /// caller's own immediate re-settle (`settle_layer_keyboard_focus` in
+    /// [`Self::set_session_locked`]) to hand focus back out on the very
+    /// next line.
+    ///
+    /// ── Why this exists — read the M1 evidence chain first ────────────────
+    /// A source read of the pinned gpui rev
+    /// (`gpui_linux/src/linux/wayland/client.rs`, `wl_keyboard::Event`
+    /// handling) confirms gpui's Linux/Wayland platform backend runs its
+    /// OWN client-side software key-repeat timer: any non-modifier key
+    /// PRESS arms a `calloop` timer that keeps re-delivering a synthetic
+    /// `KeyDown(is_held: true)` at the keyboard's reported rate, using the
+    /// `Keystroke` (including whatever modifiers were held) captured AT ARM
+    /// TIME — forever, until either (a) a RELEASE for the exact same
+    /// keycode arrives, or (b) a `wl_keyboard::Event::Leave` fires, which
+    /// unconditionally bumps an internal generation counter
+    /// (`repeat.current_id`) that invalidates any in-flight timer
+    /// regardless of keycode. Case (b) is not a guess — it is that file's
+    /// own comment, verbatim: "Prevent keyboard events from repeating after
+    /// opening e.g. a file chooser and closing it quickly." Gpui's authors
+    /// already anticipated this exact class of bug and built the escape
+    /// hatch; this compositor just wasn't pulling it at the one moment that
+    /// needed it.
+    ///
+    /// `duduclaw-native-gui`'s own 128-byte flood-guard doc comment
+    /// (`ime_input/input_state.rs`, D9-bug7/D9-bug8) already documents (a)
+    /// as a known, ACCEPTED gap from the previous round — "a client-side
+    /// mechanism this crate does not own (vendored dependency) and cannot
+    /// patch here" — but that conclusion stopped one layer too early: this
+    /// crate does not own gpui's timer, but it DOES own the Wayland
+    /// `wl_keyboard` events gpui's timer listens to, and (b) is reachable
+    /// entirely from here.
+    ///
+    /// A held-but-since-released `l` from a `cmd-l` chord that physically
+    /// overlaps the lock transition (a completely ordinary human typing
+    /// pattern — Cmd tends to lift a beat before the letter) leaves that
+    /// timer armed with `is_held: true` copies of an `l` keystroke, which
+    /// then flood straight into the just-revealed lock-screen password
+    /// field once `locked_key_filter` starts forwarding plain (no longer
+    /// Logo-chorded) keys to it — measured on the M1 VM round as an
+    /// apparently-permanent leak that thousands of Backspaces could not
+    /// visibly clear (the 128-byte insert cap in `insert_committed` only
+    /// refuses GROWTH past the cap; it never stops the flood, so every
+    /// Backspace's one byte of headroom was refilled by the very next
+    /// synthetic repeat, pinning the field at the cap instead of emptying
+    /// it).
+    ///
+    /// Idempotent by construction: if nothing is currently focused,
+    /// `set_focus(self, None, ...)` is already a no-op inside smithay
+    /// itself, so calling this on every lock AND unlock edge (not just
+    /// lock) costs nothing extra on a quiet seat.
+    fn force_keyboard_leave_enter_cycle(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if keyboard.current_focus().is_none() {
+            return;
+        }
+        keyboard.set_focus(self, None, smithay::utils::SERIAL_COUNTER.next_serial());
     }
 
     /// Re-runs surface routing for the pointer at its current position.
@@ -393,6 +479,39 @@ impl DuduclawComp {
 #[cfg(test)]
 mod tests {
     use super::{classify_gesture, gesture_allowed_while_locked, should_swallow_unbound_locked_key, SystemGesture};
+
+    /// D9-bug9 (2026-08-24): `set_session_locked` must call
+    /// `force_keyboard_leave_enter_cycle()` BEFORE `settle_layer_keyboard_
+    /// focus` on every edge — reordering or dropping this call reintroduces
+    /// the exact regression this round fixed. This can't be a live
+    /// `DuduclawComp`/seat unit test (this crate has no such fixture — every
+    /// other stateful method here is verified against a real VM instead,
+    /// same convention this file's own `locked_key_filter` follows); a
+    /// source-scan is the same "crude but load-bearing" instrument
+    /// `duduclaw-shell`'s own test module already uses for gpui closures it
+    /// cannot drive from a plain unit test — it cannot prove the leave/enter
+    /// pair reaches the Wayland wire (that's the VM check), but it fails
+    /// loudly the moment the call is removed or reordered.
+    #[test]
+    fn set_session_locked_forces_a_keyboard_refocus_cycle_before_settling_layer_focus() {
+        let source = include_str!("session_lock.rs");
+        let start = source
+            .find("pub(crate) fn set_session_locked")
+            .expect("set_session_locked not found in session_lock.rs");
+        let body = &source[start..(start + 2200).min(source.len())];
+        let refocus_at = body
+            .find("self.force_keyboard_leave_enter_cycle();")
+            .expect("set_session_locked no longer calls force_keyboard_leave_enter_cycle()");
+        let settle_at = body
+            .find("self.settle_layer_keyboard_focus(")
+            .expect("set_session_locked no longer calls settle_layer_keyboard_focus");
+        assert!(
+            refocus_at < settle_at,
+            "force_keyboard_leave_enter_cycle() must run BEFORE settle_layer_keyboard_focus — \
+             settle_layer_keyboard_focus no-ops when the layer surface already holds focus (the \
+             common case at lock time), so the forced None-focus edge must land first"
+        );
+    }
     use smithay::backend::input::KeyState;
     use smithay::input::keyboard::{keysyms, Keysym, ModifiersState};
 

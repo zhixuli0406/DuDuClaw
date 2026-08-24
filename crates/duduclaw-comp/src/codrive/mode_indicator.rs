@@ -72,14 +72,24 @@ fn indicator_bars(width: i32, height: i32, thickness: i32) -> Vec<(i32, i32, i32
 
 /// This frame's screen-edge indicator elements for `mode`.
 ///
-/// `output_size` is the size of the output being rendered, in its own
-/// logical space (this crate composites at scale 1.0 throughout — see
-/// `shell_control/mod.rs`'s "Why `set_output_scale` always answers
-/// `scale_change_unsupported`" section for the grep-checked statement of
-/// that).
+/// `output_size` MUST be the true LOGICAL size of the output being
+/// rendered — i.e. physical mode size divided by the output's own current
+/// scale, exactly what `Space::output_geometry(output).size` already
+/// computes. WP-comp-shell-display D4b-3: before this round every caller
+/// fed this the raw PHYSICAL mode/window size mislabeled as `Logical`,
+/// which only happened to be correct because scale was always 1.0 — with a
+/// real scale in play that size is TWICE (or however-many-times) too big,
+/// and `scale` below would multiply it up again on top of that.
+///
+/// `scale` is the output's own live scale (`render::output_render_scale`).
+/// This element is `SolidColorRenderElement`-based (geometry baked in at
+/// construction — see `codrive::cursor::build_agent_cursor_elements`'s doc
+/// for the smithay-source-checked reason), so both the frame's PHYSICAL
+/// position and thickness come from it.
 pub fn build_mode_indicator_elements(
     output_size: Size<i32, Logical>,
     mode: DrivingMode,
+    scale: Scale<f64>,
 ) -> Vec<SolidColorRenderElement> {
     let color = match mode {
         // No session, nothing to indicate. Drawing a frame here would tell
@@ -89,7 +99,6 @@ pub fn build_mode_indicator_elements(
         DrivingMode::Handover => AGENT_COLOR_FROZEN,
     };
 
-    let scale = Scale::from(1.0);
     indicator_bars(output_size.w, output_size.h, INDICATOR_PX)
         .into_iter()
         .map(|(x, y, w, h)| {
@@ -108,15 +117,31 @@ mod tests {
     #[test]
     fn human_mode_draws_nothing_at_all() {
         assert!(
-            build_mode_indicator_elements(Size::from((1920, 1080)), DrivingMode::Human).is_empty()
+            build_mode_indicator_elements(Size::from((1920, 1080)), DrivingMode::Human, Scale::from(1.0)).is_empty()
         );
     }
 
     #[test]
     fn codrive_and_handover_both_draw_four_bars() {
         for mode in [DrivingMode::CoDrive, DrivingMode::Handover] {
-            let elems = build_mode_indicator_elements(Size::from((1920, 1080)), mode);
+            let elems = build_mode_indicator_elements(Size::from((1920, 1080)), mode, Scale::from(1.0));
             assert_eq!(elems.len(), 4, "{mode:?} should frame the whole output");
+        }
+    }
+
+    /// WP-comp-shell-display D4b-3: `SolidColorRenderElement` bakes its
+    /// geometry in at construction, so a different `scale` argument must
+    /// produce a different physical geometry — see `codrive::cursor::
+    /// build_agent_cursor_elements`'s doc for the smithay-source-checked
+    /// reason this is asserted directly rather than assumed.
+    #[test]
+    fn a_real_output_scale_changes_the_baked_geometry() {
+        use smithay::backend::renderer::element::Element;
+        let at_1x = build_mode_indicator_elements(Size::from((1920, 1080)), DrivingMode::CoDrive, Scale::from(1.0));
+        let at_2x = build_mode_indicator_elements(Size::from((1920, 1080)), DrivingMode::CoDrive, Scale::from(2.0));
+        assert_eq!(at_1x.len(), at_2x.len());
+        for (a, b) in at_1x.iter().zip(at_2x.iter()) {
+            assert_ne!(a.geometry(Scale::from(1.0)), b.geometry(Scale::from(1.0)));
         }
     }
 

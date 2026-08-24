@@ -176,9 +176,14 @@
 //!                                       "height":1080,"refresh_mhz":60000}}
 //! <- {"ok":false,"error":"mode_switch_unsupported"}
 //!
-//! -> {"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":125}}
-//! <- {"ok":false,"error":"scale_change_unsupported"}
+//! -> {"op":"set_output_scale","params":{"output":"Virtual-1","scale_pct":200}}
+//! <- {"ok":true,"outputs":[
+//!      {"name":"Virtual-1", … ,"scale_pct":200, … }
+//!    ]}
 //! ```
+//! (D4b-3, 2026-08-24: `set_output_scale` now applies for real — see "Scale,
+//! real as of D4b-3" below. `set_output_mode` is unchanged and still always
+//! refuses — see the section right after this one.)
 //! The CD-2 shadow workspace's headless output never appears in `outputs` —
 //! same exclusion `state.rs::primary_output` already applies, for the same
 //! reason: it is not a screen a human can see.
@@ -223,11 +228,49 @@
 //! - **winit** (`winit_backend.rs`): the only handle to the host `winit::
 //!   window::Window` lives inside the `move` closure `init_winit` builds
 //!   for the event source, captured by value — it is not stored on
-//!   `DuduclawComp` or reachable from anywhere `shell_control` can see.
-//!   Threading it through would mean hoisting that closure's state out
-//!   (exactly the "on-demand winit" refactor `winit_backend.rs`'s own doc
-//!   comment records as attempted and reverted this round, for an unrelated
-//!   reason) — real restructuring, not a bounded addition.
+//!   `DuduclawComp` or reachable from anywhere `shell_control` can see, and
+//!   there is no public accessor to an owned/cloneable handle either
+//!   (checked against smithay 0.7.0 source: `WinitGraphicsBackend` holds
+//!   `window: Arc<WinitWindow>` PRIVATELY and exposes only `fn window(&self)
+//!   -> &WinitWindow`, so the `Arc` itself cannot be cloned out through the
+//!   public API).
+//!
+//!   **Revised finding, D4b-3 (2026-08-24) — this is NOT a hard wall.** A
+//!   *mailbox* pattern is genuinely available and was not in scope for this
+//!   round: add `DuduclawComp::pending_output_mode_request: Option<(String,
+//!   Mode)>`; `shell_control_set_output_mode` sets it (a plain data write,
+//!   no window handle needed) instead of refusing; `init_winit`'s own
+//!   `WinitEvent::Redraw` arm — which already captures `backend` by move and
+//!   therefore already HAS `backend.window()` in scope every frame — polls
+//!   and clears it, calling `output.change_current_state(...)` (cheap,
+//!   already proven safe: this is exactly what `set_output_scale` below
+//!   does) followed by `backend.window().request_inner_size(...)`. This is
+//!   the same "the consumer already holds the resource; hand it a mailbox
+//!   instead of trying to extract the resource" shape `codrive_sync_mode`/
+//!   `codrive_check_watch_idle` already use for other main-thread-only
+//!   state. It is explicitly NOT the "on-demand winit" refactor
+//!   `winit_backend.rs`'s own doc comment records as attempted and reverted
+//!   (that one hoisted the REDRAW SCHEDULING itself out of the closure and
+//!   regressed to ~780k skipped frames/5s under CPU measurement — a
+//!   different, larger, unrelated change).
+//!
+//!   **Deferred anyway**, for reasons independent of the mailbox's
+//!   feasibility: (1) the host window manager is free to grant a DIFFERENT
+//!   size than requested (`request_inner_size` is a request, not a
+//!   guarantee), so the synchronous `set_output_mode` reply cannot honestly
+//!   report the outcome without either blocking a frame or echoing state it
+//!   has not observed yet — the existing `Ok(None) ⇒ shell re-reads`
+//!   contract handles this, but it is untested for a resize specifically;
+//!   (2) the winit backend only ever runs nested in a host Wayland/X11
+//!   session for local development/CI (`BUILD.md`: "The appliance runs the
+//!   udev backend") — it has ZERO production value on the duty-machine
+//!   appliance this crate ships on, which is the udev backend below; (3) no
+//!   test coverage exists yet for a live resize racing the tight unthrottled
+//!   winit redraw loop. Left as a scoped, bounded follow-up rather than
+//!   implemented under this round's time budget — the point of writing this
+//!   down is that "impossible" was the WRONG conclusion the first time this
+//!   doc was written, and the corrected one is "possible, low production
+//!   value, deferred".
 //! - **udev/DRM** (`udev_backend.rs`): the surface's mode is fixed at
 //!   `DrmDevice::create_surface(crtc, drm_mode, …)` and baked into the
 //!   `GbmBufferedSurface` swapchain's buffer size (`build_surfaces`). A
@@ -235,7 +278,10 @@
 //!   `GbmBufferedSurface` — i.e. rebuilding the `SurfaceData` this backend's
 //!   whole render/vblank/damage-tracking lifecycle is built around, while
 //!   `UdevBackendState` (in `CalloopData::udev`) is not even reachable from
-//!   `DuduclawComp`, which is all `shell_control`'s handlers ever get.
+//!   `DuduclawComp`, which is all `shell_control`'s handlers ever get. This
+//!   is the backend that actually ships (see above) and the surface-rebuild
+//!   risk here is real, not a documentation gap — still refused, on purpose,
+//!   this round.
 //!
 //! Given that, `get_outputs`'s `mode_switch_supported` is always `false` —
 //! the one thing the task's own instructions call out as unacceptable is a
@@ -243,25 +289,50 @@
 //! other way. A future round that actually threads a mode-change request
 //! into one backend can flip this per-output without lying about the other.
 //!
-//! ### Why `set_output_scale` always answers `scale_change_unsupported`
-//! `Output::change_current_state` *can* set a new `Scale` live — smithay
-//! sends the wire update itself (`wl_change_current_state`, gated on
-//! `wayland_frontend`). The reason this op still refuses is NOT a missing
-//! smithay feature; it is that this crate's own render pipeline does not
-//! consistently read the output's scale at all. Checked by grep, not
-//! assumed: `cursor/mod.rs`, `codrive/cursor.rs`, and `codrive/highlight.rs`
-//! each hardcode `Scale::from(1.0)` when building their render elements, and
-//! `codrive/shadow.rs`'s own `SHADOW_SIZE` comment already states it plainly
-//! — "this crate has never used a compositor scale other than 1.0". The
-//! **only** place that reads `Output::current_scale()` today is
+//! ### Scale, real as of D4b-3 (2026-08-24)
+//! `Output::change_current_state` could always set a new `Scale` live —
+//! smithay sends the wire update itself (`wl_change_current_state`, gated on
+//! `wayland_frontend`). What blocked this op through the previous round was
+//! never a missing smithay feature; it was that this crate's own render
+//! pipeline did not consistently read the output's scale at all. Checked by
+//! grep, not assumed: `cursor/mod.rs`, `codrive/cursor.rs`,
+//! `codrive/highlight.rs`, and `codrive/mode_indicator.rs` each hardcoded
+//! `Scale::from(1.0)` when building their render elements, while the
+//! **only** place that read `Output::current_scale()` was
 //! `decor/paint.rs`'s decoration-buffer rendering. Flipping the output's
-//! live scale would make decorations resize while the human/agent cursors,
-//! the codrive highlight box, and (per CUR-3's own "no HiDPI" limitation
-//! note) every other composited pixel stayed physical-pixel-for-logical-
-//! pixel — a real desync, not a hypothetical one. Fixing that is a
-//! render-pipeline change, not a `shell_control` change, so this op is
-//! validated fully (`unknown_output`, `invalid_scale` — the closed
-//! `protocol::OUTPUT_SCALE_STEPS` set) and then honestly refused.
+//! live scale would have made decorations resize while the human/agent
+//! cursors, the codrive highlight box, and the screen-edge co-drive
+//! indicator stayed physical-pixel-for-logical-pixel — a real desync, not a
+//! hypothetical one.
+//!
+//! Fixed this round by consolidating every one of those four call sites
+//! (plus `decor/paint.rs`'s own, pre-existing correct one) onto
+//! `render::output_render_scale(&Output) -> Scale<f64>` as the single
+//! source of truth — see that function's own doc for why it is a cheap
+//! per-call read rather than a cached field. `shell_control_set_output_scale`
+//! now: validates (`unknown_output`, `invalid_scale` against the closed
+//! `protocol::OUTPUT_SCALE_STEPS` set, unchanged) → applies live via
+//! `change_current_state` → re-derives layer-shell/window layout against the
+//! output's now-different LOGICAL geometry (`rearrange_layers` +
+//! `reapply_window_policy_all`, mirroring what a MODE change already
+//! triggers) → persists the choice (`output_prefs`, survives a restart) →
+//! echoes the refreshed `outputs` list. This is backend-agnostic: nothing
+//! about it touches a `DrmSurface`/`GbmBufferedSurface`, so it applies the
+//! same way on udev/DRM as on winit — unlike mode-switching above, scale
+//! was never actually blocked by hardware surface lifetime, only by the
+//! render pipeline having been built assuming it forever stayed 1.0.
+//!
+//! **Verified this round only for the two integer steps (100%/200%)** —
+//! task brief priority ("整数倍先行"). The three fractional steps
+//! (125/150/175%) go through the exact same code path (`Scale::Fractional`
+//! uniformly, see `shell_control_set_output_scale`'s own doc) and are
+//! believed correct by the same reasoning, but were not independently VM/
+//! live-verified: this crate registers `xdg_output` but no
+//! `wp_fractional_scale_v1` global (checked: `state.rs`'s global list), so a
+//! client that only understands integer `wl_output.scale` sees `ceil()` of
+//! the fractional value and may render slightly soft at those three steps
+//! specifically — a genuine, disclosed limitation, not a hidden one. See
+//! this crate's `BUILD.md` for the live-verification log this round added.
 //!
 //! ## D2: `set_theme` — comp's own appearance, driven by the shell
 //! ```text
@@ -325,13 +396,19 @@ mod protocol;
 
 pub(crate) use protocol::{
     ShellControlRequest, ShellControlResponse, ShellIntent, ShellOutputInfo, ShellOutputMode,
-    ShellWindowInfo, MAX_PENDING_SHELL_INTENTS,
+    ShellWindowInfo, MAX_PENDING_SHELL_INTENTS, OUTPUT_SCALE_STEPS,
 };
 
 use std::{path::PathBuf, sync::Arc};
 
 use smithay::{
-    output::Output,
+    // Aliased: `smithay::output::Scale` (the output-configuration enum
+    // `change_current_state` takes) and `smithay::utils::Scale<f64>` (the
+    // geometry-conversion factor `render::output_render_scale` returns) are
+    // two different types with the same bare name — this file only ever
+    // needs the former, but the alias keeps that unambiguous at every call
+    // site rather than relying on nobody importing the other one later.
+    output::{Output, Scale as OutputScale},
     reexports::calloop::{self, EventLoop},
     utils::SERIAL_COUNTER,
 };
@@ -769,21 +846,26 @@ impl DuduclawComp {
         ShellControlResponse::err("mode_switch_unsupported")
     }
 
-    /// WP-comp-shell-display: `set_output_scale` — validates fully
-    /// (`unknown_output` / `invalid_scale`) but never actually switches a
-    /// scale on this build. See this module's own doc ("Why
-    /// `set_output_scale` always answers `scale_change_unsupported`") for
-    /// the grep-checked reason (this crate's cursor/highlight render
-    /// elements hardcode scale 1.0). Audited regardless of outcome, same
-    /// reasoning as `shell_control_set_output_mode` above.
+    /// WP-comp-shell-display D4b-3: `set_output_scale` — validates fully
+    /// (`unknown_output` / `invalid_scale`) and now actually applies the
+    /// change. See this module's own doc ("Scale, real as of D4b-3") for why
+    /// this was safe to turn on: `Output::change_current_state` could always
+    /// set a live `Scale` (smithay sends the wire update itself); what
+    /// blocked this op was that four render-element builders across
+    /// `cursor/`, `codrive/cursor.rs`, `codrive/highlight.rs`, and
+    /// `codrive/mode_indicator.rs` hardcoded `Scale::from(1.0)` instead of
+    /// reading the output's real one — fixed this round, consolidated onto
+    /// `render::output_render_scale` as the single source every one of them
+    /// now reads. Audited regardless of outcome, same reasoning as
+    /// `shell_control_set_output_mode` above.
     fn shell_control_set_output_scale(&mut self, output_name: &str, scale_pct: i64) -> ShellControlResponse {
-        if self.shell_control_find_output(output_name).is_none() {
+        let Some(output) = self.shell_control_find_output(output_name).cloned() else {
             self.shell_control.record(
                 "set_output_scale_failed",
                 Some(format!("output={output_name:?} error=unknown_output")),
             );
             return ShellControlResponse::err("unknown_output");
-        }
+        };
 
         if !protocol::OUTPUT_SCALE_STEPS.contains(&scale_pct) {
             // Reached the main thread with a value `listener::validate`
@@ -800,11 +882,69 @@ impl DuduclawComp {
             return ShellControlResponse::err("invalid_scale");
         }
 
+        // `Scale::Fractional` uniformly for every step, integer (100/200) or
+        // not (125/150/175) — `fractional_scale()` round-trips either way,
+        // and this crate's own render math only ever reads the fractional
+        // value (`render::output_render_scale`), never the enum variant. A
+        // client that only understands integer `wl_output.scale` sees
+        // `Scale::integer_scale()` (`ceil()` of this value) via smithay's own
+        // wire translation — the standard Wayland fallback, not something
+        // this crate has to implement itself.
+        let new_scale = OutputScale::Fractional(scale_pct as f64 / 100.0);
+        output.change_current_state(None, None, Some(new_scale), None);
+
+        // WM-1/WM-3: layer-shell surfaces and windows are laid out against
+        // the output's LOGICAL geometry (`Space::output_geometry`), which
+        // just changed even though the physical mode did not — logical size
+        // = physical mode size / scale, so a 100% -> 200% change HALVES it.
+        // Mirrors exactly what `winit_backend.rs`'s `WinitEvent::Resized`
+        // handler already does after a MODE change; a scale change shrinks
+        // or grows that same logical work area via a different divisor, and
+        // needs the identical re-layout so the dock/panel and every mapped
+        // window get a fresh `configure` at the new size instead of
+        // overflowing (or under-filling) the screen until something else
+        // happens to trigger a relayout.
+        self.rearrange_layers();
+        self.reapply_window_policy_all();
+
+        let (persisted, persist_error) = match crate::output_prefs::store_scale_pct(output_name, scale_pct) {
+            Ok(path) => {
+                tracing::debug!(path = %path.display(), output = output_name, scale_pct, "display: scale preference stored");
+                (true, None)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    output = output_name,
+                    "display: the scale switch is live but could not be persisted — it will \
+                     revert at the next compositor start"
+                );
+                (false, Some(e))
+            }
+        };
+
+        // Apply-first-persist-second, same ordering (and the same reasoning)
+        // as `shell_control_set_cursor_source`: the switch itself cannot
+        // fail, writing the preference file can, and a write failure must
+        // never take back a live change that already succeeded.
         self.shell_control.record(
-            "set_output_scale_failed",
-            Some(format!("output={output_name:?} scale_pct={scale_pct} error=scale_change_unsupported")),
+            "set_output_scale",
+            Some(format!(
+                "output={output_name:?} scale_pct={scale_pct} persisted={persisted}{}",
+                match &persist_error {
+                    Some(e) => format!(" persist_error={e:?}"),
+                    None => String::new(),
+                }
+            )),
         );
-        ShellControlResponse::err("scale_change_unsupported")
+
+        // Echo the refreshed output list rather than a bare `{"ok":true}` —
+        // `comp_client::set_output_scale`'s own doc already anticipated this
+        // shape (`Result<Option<Vec<CompOutput>>, _>`), and it saves the
+        // settings page a second round trip to see its own change take
+        // effect (`scale_pct`/`modes[].current` etc. all reflect the output
+        // exactly as it stands after this call, not a locally-guessed copy).
+        ShellControlResponse::outputs(self.shell_control_get_outputs())
     }
 
     /// D2: switch comp's own decoration appearance live, then audit the

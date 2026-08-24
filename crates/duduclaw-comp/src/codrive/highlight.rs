@@ -39,8 +39,8 @@ impl DuduclawComp {
     /// `self.codrive_highlight` once expired ("過期就清掉", task brief req
     /// 5) so a stale highlight can't reappear on some later check before
     /// the next `highlight` op arrives.
-    pub fn codrive_highlight_elements(&mut self, now: Instant) -> Vec<SolidColorRenderElement> {
-        self.codrive_highlight_elements_at(now, Point::from((0.0, 0.0)))
+    pub fn codrive_highlight_elements(&mut self, now: Instant, scale: Scale<f64>) -> Vec<SolidColorRenderElement> {
+        self.codrive_highlight_elements_at(now, Point::from((0.0, 0.0)), scale)
     }
 
     /// A4-1: same as [`Self::codrive_highlight_elements`] but shifted by
@@ -53,10 +53,20 @@ impl DuduclawComp {
     /// hardware case — so the zero-offset wrapper above is byte-identical to
     /// the pre-A4-1 behaviour. The udev backend passes `-output.loc` so a
     /// highlight box lands in the right place on a second monitor too.
+    ///
+    /// `scale` is the rendered output's own live scale
+    /// (`render::output_render_scale`) — WP-comp-shell-display D4b-3
+    /// replaced a hardcoded `Scale::from(1.0)`. Like the agent cursor cross,
+    /// this element is `SolidColorRenderElement`-based (geometry baked in at
+    /// construction, ignored at render time — see `codrive::cursor::
+    /// build_agent_cursor_elements`'s doc for the smithay-source-checked
+    /// reason), so both the border's PHYSICAL position and thickness come
+    /// from whatever `scale` this caller supplies.
     pub fn codrive_highlight_elements_at(
         &mut self,
         now: Instant,
         offset: Point<f64, Logical>,
+        scale: Scale<f64>,
     ) -> Vec<SolidColorRenderElement> {
         let Some((rect, deadline)) = self.codrive_highlight else {
             return Vec::new();
@@ -65,12 +75,11 @@ impl DuduclawComp {
             self.codrive_highlight = None;
             return Vec::new();
         }
-        build_border(Rectangle::new(rect.loc + offset, rect.size))
+        build_border(Rectangle::new(rect.loc + offset, rect.size), scale)
     }
 }
 
-fn build_border(rect: Rectangle<f64, Logical>) -> Vec<SolidColorRenderElement> {
-    let scale = Scale::from(1.0);
+fn build_border(rect: Rectangle<f64, Logical>, scale: Scale<f64>) -> Vec<SolidColorRenderElement> {
     let loc = rect.loc;
     let size = rect.size;
     let b = BORDER_PX;
@@ -133,7 +142,24 @@ mod tests {
     #[test]
     fn build_border_produces_four_bars_for_a_normal_rect() {
         let rect = Rectangle::<f64, Logical>::new(Point::from((10.0, 20.0)), smithay::utils::Size::from((100.0, 50.0)));
-        let elems = build_border(rect);
+        let elems = build_border(rect, Scale::from(1.0));
         assert_eq!(elems.len(), 4, "a normal-sized rect should produce top/bottom/left/right bars");
+    }
+
+    /// WP-comp-shell-display D4b-3: `SolidColorRenderElement` bakes its
+    /// geometry in at construction (ignores the render-time scale — see
+    /// `codrive::cursor::build_agent_cursor_elements`'s doc), so a
+    /// different `scale` argument here must produce a different physical
+    /// geometry, or the "single source of truth" claim is untested.
+    #[test]
+    fn a_real_output_scale_changes_the_baked_geometry() {
+        use smithay::backend::renderer::element::Element;
+        let rect = Rectangle::<f64, Logical>::new(Point::from((10.0, 20.0)), smithay::utils::Size::from((100.0, 50.0)));
+        let at_1x = build_border(rect, Scale::from(1.0));
+        let at_2x = build_border(rect, Scale::from(2.0));
+        assert_eq!(at_1x.len(), at_2x.len());
+        for (a, b) in at_1x.iter().zip(at_2x.iter()) {
+            assert_ne!(a.geometry(Scale::from(1.0)), b.geometry(Scale::from(1.0)));
+        }
     }
 }

@@ -6249,3 +6249,121 @@ line, the screenshot is proving the pixels follow it.
 * **The gateway↔comp round trip for `codrive_status`.** Its `CodriveClient` is
   the same one CD-1 already live-proved, and its serde shape is unit-pinned
   against these exact bytes, but no gateway process talked to this comp.
+
+## D4b-3 / W6-5: `set_output_scale` goes live (2026-08-24)
+
+Closes the two setters TODO's D4b-3 row flagged as "honestly refused" —
+`set_output_scale` now actually applies, persists, and re-layouts; a
+`set_output_mode` feasibility finding is recorded but not implemented this
+round. See `shell_control/mod.rs`'s "Scale, real as of D4b-3" doc section
+for the full design; this section is the live-verification evidence.
+
+### What changed
+
+Four render-element builders across `cursor/mod.rs`, `codrive/cursor.rs`,
+`codrive/highlight.rs`, and `codrive/mode_indicator.rs` each hardcoded
+`Scale::from(1.0)` (a fourth site — `mode_indicator.rs` — beyond the three
+the D4b-3 TODO row originally named; it was added the same day by the A2
+共駕復活 round, after that row was written). Consolidated onto
+`render::output_render_scale(&Output) -> Scale<f64>` as the single source
+every one of them, plus `decor/paint.rs`'s pre-existing correct one, now
+reads. `shell_control_set_output_scale` (`shell_control/mod.rs`) went from
+an always-refuse stub to: validate → `Output::change_current_state` (live,
+backend-agnostic — no `DrmSurface`/`GbmBufferedSurface` rebuild, unlike a
+mode change) → `rearrange_layers` + `reapply_window_policy_all` (the output's
+LOGICAL geometry just changed even though its physical mode did not) →
+persist via a new `output_prefs.rs` module (`$XDG_STATE_HOME/duduclaw-comp/
+display.json`, keyed by output name, same read-modify-write/atomic-rename
+discipline `cursor::persist` established) → echo the refreshed `outputs`
+list. Both backends (`winit_backend.rs::init_winit`,
+`udev_backend.rs::build_surfaces`) restore a persisted scale in the SAME
+`change_current_state` call that sets the initial mode, so a returning
+output's first-ever `wl_output.scale` announcement is already correct.
+
+### Build/test (this round)
+
+Container command per "Reproducible build command" above (the A4-1-current
+one, with all seven system deps).
+
+```
+cargo build --locked   → Finished, no warnings
+cargo clippy --locked --all-targets → Finished, zero warnings
+cargo test --locked    → 600 passed; 0 failed (was 590 before this round —
+                          +10: 3 direct "a real output scale changes the
+                          baked geometry" regression tests against
+                          `Element::geometry()`, one per SolidColorRenderElement-
+                          based builder, plus 7 for the new `output_prefs`
+                          module)
+```
+
+### Live verification — real running binary, real socket, real client
+
+Same nested-headless-weston harness as the "Nested headless live-run"
+section above (layer 1 `weston --backend=headless-backend.so`, layer 2 the
+freshly built `duduclaw-comp` as a `winit` client, layer 3 `foot` as a real
+xdg-shell client), plus a small Python client speaking the shell-control
+wire protocol directly against `$XDG_RUNTIME_DIR/duduclaw-shell.sock`:
+
+```
+get_outputs                                  -> scale_pct: 100 (fresh boot)
+set_output_scale(winit, 200)                 -> ok, echoed outputs scale_pct: 200
+get_outputs (independent re-read)            -> scale_pct: 200  (proves the
+                                                 live Output state actually
+                                                 changed, not just the one
+                                                 reply)
+set_output_scale(winit, 125)                 -> ok, scale_pct: 125 (fractional
+                                                 step, same code path)
+set_output_scale(winit, 100)                 -> ok, scale_pct: 100
+set_output_mode(winit, <a real known mode>)  -> {"ok":false,
+                                                 "error":"mode_switch_unsupported"}
+                                                 (unchanged, as designed)
+```
+
+All five calls succeeded against the SAME long-running `duduclaw-comp`
+process with `foot` attached the whole time; `duduclaw-comp.log` shows no
+panic/error lines across all four scale transitions (the only `error`/`panic`
+grep hits are EGL/GL extension name substrings — `EGL_KHR_create_context_
+no_error`, `GL_KHR_no_error` — not real failures), and the process shut down
+cleanly afterward. `display.json` round-tripped each write
+(`display: scale preference stored path=… output="winit" scale_pct=200`
+etc. in the log).
+
+### Honest stub / limitation list (this round)
+
+* **Only 100%/200% independently live-verified**, per the task's own
+  "整數倍先行" priority. 125/150/175% go through the exact same code path
+  (`Scale::Fractional` uniformly — see `shell_control_set_output_scale`'s
+  own doc) and are covered by the `geometry()`-level unit tests, but were
+  not separately live-run. This crate registers `xdg_output` but no
+  `wp_fractional_scale_v1` global (checked: `state.rs`'s global list), so a
+  client that only understands integer `wl_output.scale` sees `ceil()` of a
+  fractional value and may render slightly soft at those three steps
+  specifically.
+* **No pixel screenshot of the scaled frame.** `weston-screenshooter`
+  requires `weston --debug` (a documented DoS/info-leak surface, deliberately
+  not something to leave on) and, once enabled, this round's attempt did not
+  reach a captured PNG within the container run budget. The evidence above is
+  protocol-level (the live `Output` state actually changed, re-read
+  independently) and geometry-math-level (direct `Element::geometry()`
+  assertions against real smithay types), not a human/AI eyeballing an
+  actual rendered frame at 2x.
+* **`duduclaw-shell`'s own UI was not exercised.** Everything above proves
+  comp's OWN render pipeline (human/agent cursor, highlight box, co-drive
+  edge frame, and — via `decor/paint.rs`, unchanged this round —
+  comp-drawn SSD title bars) stays in lock-step with a live scale change.
+  Whether `duduclaw-shell`'s own layer-shell-drawn dock/title chrome
+  visually enlarges in response (depends on gpui's own `wl_output`/
+  `xdg_output` scale-factor handling, which this round did not touch or
+  verify) needs a real VM run with both binaries — not completed this
+  round; see the task's own "殼 GUI 全案" line for the wider status.
+* **`set_output_mode` mailbox pattern is documented, not implemented.** See
+  `shell_control/mod.rs`'s doc for the full finding: technically bounded
+  (winit's `WinitEvent::Redraw` closure already holds `backend.window()`
+  every frame; a `pending_output_mode_request` field would let
+  `shell_control_set_output_mode` hand it a request instead of refusing),
+  deferred because the winit backend has zero production value on the
+  appliance (udev/DRM ships; see "Why Docker, not `cargo build`" above) and
+  because the synchronous reply contract for a resize the host WM might not
+  grant exactly needs its own design pass. udev/DRM mode-switching remains
+  genuinely blocked without rebuilding `DrmSurface`/`GbmBufferedSurface`,
+  unchanged from the previous round's finding.

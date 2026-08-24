@@ -8,14 +8,46 @@
 //! invocation itself is unchanged from the CD-2 shadow-workspace round; see
 //! the doc comment below (moved here verbatim) for why it exists at all.
 
-use smithay::backend::renderer::{
-    element::{
-        memory::MemoryRenderBufferRenderElement, render_elements,
-        solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
-        texture::TextureRenderElement,
+use smithay::{
+    backend::renderer::{
+        element::{
+            memory::MemoryRenderBufferRenderElement, render_elements,
+            solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
+            texture::TextureRenderElement,
+        },
+        gles::{GlesRenderer, GlesTexture},
     },
-    gles::{GlesRenderer, GlesTexture},
+    output::Output,
+    utils::Scale,
 };
+
+/// WP-comp-shell-display D4b-3: the single source of truth for the geometry
+/// scale used when building EVERY custom render element for one output's
+/// frame — the human cursor (`cursor::build_human_cursor_elements`), the
+/// agent cursor (`codrive::build_agent_cursor_elements`), the target
+/// highlight box (`codrive::codrive_highlight_elements_at`), and the
+/// screen-edge co-drive indicator (`codrive::build_mode_indicator_elements`).
+///
+/// Before this round each of those four call sites hardcoded
+/// `Scale::from(1.0)` independently — only `decor::paint::
+/// build_output_elements` (windows/layer-shell/switcher/IME) read the
+/// output's REAL scale. That meant a live `set_output_scale` would move
+/// decorations while leaving every cursor/highlight/indicator pixel
+/// positioned and sized as if scale was still 1.0 — a real desync, not a
+/// hypothetical one (see `shell_control/mod.rs`'s "Scale, real as of D4b-3"
+/// section for the full before/after).
+///
+/// This is deliberately a free function taking `&Output`, not a cached
+/// field: `Output::current_scale()` is already O(1) (an `Arc<Mutex<..>>`
+/// read), and a cache would be one more thing to invalidate the moment
+/// `set_output_scale` changes it live. Every caller reads the SAME live
+/// value at the SAME point in one frame's construction — `decor::paint::
+/// build_output_elements` calls this too (previously it computed the
+/// identical expression inline), so a window's decoration and the cursor
+/// drawn a few lines earlier in the same frame can never disagree.
+pub(crate) fn output_render_scale(output: &Output) -> Scale<f64> {
+    Scale::from(output.current_scale().fractional_scale())
+}
 
 // CD-2 shadow workspace (WP-CD2-shadow, DESIGN §3.3.4): the same
 // "compositor-internal render element" convention `codrive/cursor.rs` and

@@ -261,14 +261,15 @@ pub enum ShellControlRequest {
     /// `i64` for the same `invalid_scale`-not-`parse_error` reason
     /// `SetOutputMode`'s fields are.
     ///
-    /// Always audited, and — like `SetOutputMode` — always answers
-    /// `scale_change_unsupported` on this build. See `mod.rs`'s module doc:
-    /// this crate composites at a hardcoded scale of 1.0 in the cursor and
-    /// highlight render paths (`cursor/mod.rs`, `codrive/cursor.rs`,
-    /// `codrive/highlight.rs`), so a live output-scale change would desync
-    /// those from decoration rendering (the one path that already reads
-    /// `Output::current_scale()`, `decor/paint.rs`) rather than actually
-    /// rescaling the desktop.
+    /// Always audited. WP-comp-shell-display D4b-3 (2026-08-24): this now
+    /// APPLIES for real — validated request → live `change_current_state` →
+    /// layer/window re-layout → persisted to `output_prefs` → refreshed
+    /// `outputs` echoed back. See `mod.rs`'s module doc ("Scale, real as of
+    /// D4b-3") for what unblocked this (every custom render element used to
+    /// hardcode `Scale::from(1.0)`; consolidated onto `render::
+    /// output_render_scale`) and for the one disclosed gap (the three
+    /// fractional steps were not independently live-verified, only 100%/
+    /// 200%).
     SetOutputScale { output: String, scale_pct: i64 },
     /// D2. `{"op":"set_theme","params":{"theme":"dark"}}` — switch comp's own
     /// server-side decorations (title bar / border / shadow / Alt-Tab
