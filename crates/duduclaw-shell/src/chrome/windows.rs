@@ -314,7 +314,38 @@ fn render_surface_content(kind: ChromeSurface, shell: &mut ShellView, window: &m
         // trailing overlay-render block) and what it keeps (OOBE branch,
         // lock-screen branch, focus tracking, every action/key/mouse
         // listener).
-        ChromeSurface::Home => shell.render_root(window, cx, false).into_any_element(),
+        ChromeSurface::Home => {
+            // D9-bug3 follow-up (2026-08-24): keep gpui keyboard focus on the
+            // Home window while the screen is locked and the password prompt
+            // has not been revealed yet, so the root's `on_key_down` catch-all
+            // (`note_input_or_reveal`) actually fires on the first key — i.e.
+            // "按任意鍵喚醒" works.
+            //
+            // Why it is needed only in `LayerSurfaces` mode, and only here:
+            // when the lock is triggered from an OVERLAY (Super+K opens the
+            // Launcher, then Super+L locks), the compositor correctly moves
+            // wl_keyboard focus onto this Home surface as the Launcher overlay
+            // is torn down (`duduclaw-comp`'s `session_lock` + layer-focus
+            // settle) — but gpui focus is per-window, and the destroyed
+            // Launcher window was the one that held it. Nothing re-claimed it
+            // for the Home window, so keys reached the surface (verified: the
+            // compositor delivers them) but landed on no focused element and
+            // the catch-all never ran. Measured on the appliance VM: after a
+            // Launcher-initiated lock, only a CLICK woke the field; a keypress
+            // did nothing. A lock triggered directly from Home never hit this
+            // because the Home window already held focus.
+            //
+            // Gated on `!prompt_visible`: once the field is shown,
+            // `reveal_and_focus` owns focus (it moves it onto the password
+            // field, which lives in THIS window), and re-claiming it for the
+            // root here would fight that and swallow typed characters.
+            // Idempotent when focus is already on this window's root.
+            if shell.lockscreen.is_locked() && !shell.lockscreen.prompt_visible() {
+                let handle = shell.focus_handle.clone();
+                window.focus(&handle, cx);
+            }
+            shell.render_root(window, cx, false).into_any_element()
+        }
         ChromeSurface::Overlay(_) => render_overlay_content(shell, window, cx, palette),
     }
 }
@@ -341,6 +372,11 @@ fn render_overlay_content(shell: &mut ShellView, _window: &mut Window, cx: &mut 
         view.surface.close();
         view.settle_launcher_query(window, cx);
         view.pointer_ui.reset();
+        // A2 (2026-08-23): the 共駕 row re-reads on its next open too — same
+        // reasoning `main.rs`'s own overlay-close paths document, and this
+        // chrome mode has to carry it or the refresh would work only on the
+        // other one.
+        view.overlay_ui.codrive.reset();
         cx.notify();
     });
 

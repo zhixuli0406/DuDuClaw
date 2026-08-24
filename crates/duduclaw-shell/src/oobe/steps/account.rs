@@ -152,7 +152,10 @@ pub(super) fn try_submit(view: &mut ShellView, cx: &mut Context<ShellView>) {
     // list. Skips the network entirely and reproduces round 2's original
     // local-only click verbatim (no password-length gate either — matching
     // that behavior exactly, not the real gateway rule below).
-    if std::env::var("DUDUCLAW_SHELL_OOBE_LOCAL_ACCOUNT").is_ok_and(|v| v == "1") {
+    // Q1 (2026-08-24): behind the shipping gate — this skips the device-claim
+    // RPC entirely, so a shipping build must never take it. See
+    // `crate::shipping`.
+    if crate::shipping::debug_env_is_one("DUDUCLAW_SHELL_OOBE_LOCAL_ACCOUNT") {
         if let Some(flow) = view.oobe.as_mut() {
             flow.set_operator_name(&name);
             flow.set_account_created(true);

@@ -62,6 +62,11 @@ use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::ShellView;
 
+/// A2 (2026-08-23): the 共駕 row inside ControlCenter's 「AI 團隊」 card —
+/// see its own header comment. `pub(crate)`, not private, for the same
+/// reason `pointer_settings` below is: `main.rs` and `chrome::windows` both
+/// call `CodriveUiState::reset` from their overlay-close paths.
+pub(crate) mod codrive_row;
 mod controlcenter;
 /// WP-A4-4 (2026-08-22): the Launcher's flatpak install confirmation gate —
 /// a pure state machine, see its own header comment.
@@ -106,6 +111,17 @@ pub struct OverlayUiState {
     /// one — see `notifications_feed`'s own header comment for why they
     /// share ONE model rather than each keeping their own.
     pub notifications: notifications_feed::NotificationsFeed,
+    /// A2 (2026-08-23): the 共駕 row's compositor-backed state.
+    ///
+    /// It lives HERE rather than as a sibling field on `ShellView` (the shape
+    /// `audio_ui`/`pointer_ui` use) for one concrete reason: this row renders
+    /// INSIDE `controlcenter::ai_team_card`, which already receives
+    /// `&OverlayUiState`. A sibling field would mean widening
+    /// `overlay::render`, `controlcenter::render` and `ai_team_card`'s
+    /// signatures plus their call sites — four files' worth of churn through
+    /// code other work packages are editing this round, to deliver one row.
+    /// See `codrive_row::CodriveUiState`'s own doc comment for what it holds.
+    pub(crate) codrive: codrive_row::CodriveUiState,
     automation_on: bool,
     proactive_on: bool,
     pause_all_on: bool,
@@ -121,6 +137,9 @@ impl Default for OverlayUiState {
     fn default() -> Self {
         Self {
             notifications: notifications_feed::NotificationsFeed::default(),
+            // A2: nothing has been asked of the compositor yet — the row's
+            // own `NotLoaded` default, which is what arms its first read.
+            codrive: codrive_row::CodriveUiState::default(),
             // ControlCenter.dc.html: 自動化/主動行為 both render as an ON
             // (blue) toggle, 全部暫停 renders OFF (gray) — the design
             // board's actual snapshot state, kept verbatim as the boot

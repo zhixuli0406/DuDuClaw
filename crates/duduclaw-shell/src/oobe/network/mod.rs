@@ -400,7 +400,11 @@ fn is_appliance() -> bool {
 ///   3. Otherwise (not an appliance — the Mac dev loop, or a non-appliance
 ///      Linux box) — `FakeNetworkBackend`.
 pub(crate) fn select_backend() -> (Box<dyn NetworkBackend>, NetBackendKind) {
-    if std::env::var("DUDUCLAW_SHELL_FAKE_NET").ok().as_deref() == Some("1") {
+    // Q1 (2026-08-24): behind the shipping gate. Showing fabricated Wi-Fi
+    // networks on a real appliance is the exact D4a §1.2/§5.4 ship-blocker
+    // named three lines up, and an env file must not be able to re-create it.
+    // See `crate::shipping`.
+    if crate::shipping::debug_env_is_one("DUDUCLAW_SHELL_FAKE_NET") {
         return (Box::new(FakeNetworkBackend::new()), NetBackendKind::Fake);
     }
 
@@ -450,15 +454,25 @@ mod tests {
         unsafe { std::env::set_var("DUDUCLAW_SHELL_FAKE_NET", "1") };
         let (_, kind) = select_backend();
         clear_net_env();
+        // Q1 (2026-08-24): with the override gated out, this falls through to
+        // the "not an appliance" tier, which is `Fake` anyway — so the
+        // assertion is the same either way and stays a real check of the
+        // override's own tier only in a debug build. The appliance case below
+        // is where the gate is actually observable.
         assert_eq!(kind, NetBackendKind::Fake);
     }
 
     #[test]
-    fn fake_net_override_wins_even_when_appliance_is_also_set() {
+    fn fake_net_override_wins_even_when_appliance_is_also_set_only_in_a_debug_build() {
         // The dev/test escape hatch must outrank appliance mode — otherwise
         // there would be no way to force Fake on a machine that also has
         // `DUDUCLAW_APPLIANCE=1` set (e.g. a VM used for both kinds of
         // testing).
+        //
+        // Q1 (2026-08-24): and in a SHIPPING build it must not outrank it at
+        // all — fabricated Wi-Fi networks on a real appliance is the D4a
+        // §1.2/§5.4 ship-blocker, and an operator env file must not be able
+        // to bring it back. Both branches assert; see `crate::shipping`.
         let _g = ENV_LOCK.lock().unwrap();
         clear_net_env();
         unsafe {
@@ -467,7 +481,15 @@ mod tests {
         }
         let (_, kind) = select_backend();
         clear_net_env();
-        assert_eq!(kind, NetBackendKind::Fake);
+        if crate::shipping::debug_affordances_available() {
+            assert_eq!(kind, NetBackendKind::Fake);
+        } else {
+            assert_ne!(
+                kind,
+                NetBackendKind::Fake,
+                "a shipping build must never fall back to demo Wi-Fi on an appliance"
+            );
+        }
     }
 
     #[test]

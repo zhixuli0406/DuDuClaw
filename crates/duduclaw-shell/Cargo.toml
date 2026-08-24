@@ -14,6 +14,26 @@ publish = false
 # from here).
 [workspace]
 
+# Q1 (2026-08-24): the shipping gate. See `src/shipping.rs`'s header comment
+# for the `/etc/duduclaw/kiosk.env` hole this closes and for the full list of
+# what it covers.
+#
+# DELIBERATELY EMPTY DEFAULT. `cargo build` with no flags — which is what the
+# appliance image is built from — produces a binary in which
+# `DUDUCLAW_SHELL_DIAG`, `_DEBUG_SURFACE`, `_DEBUG_OOBE_STEP`,
+# `_DEBUG_SETTINGS_PAGE`, `_FORCE_OOBE`, `_SKIP_OOBE`, `_OOBE_LOCAL_ACCOUNT`,
+# `_FAKE_NET`, `_FAKE_AUDIO` and `_LOCK_NO_PASSWORD` are not read at all.
+# Forgetting the flag is therefore SAFE; an on-by-default feature would have
+# the opposite failure direction.
+#
+# Dev loop / VM diagnosis:
+#   cargo build --features debug-affordances
+#   cargo test  --features debug-affordances
+# `cargo test` must pass in BOTH configurations — see `src/shipping.rs`.
+[features]
+default = []
+debug-affordances = []
+
 [dependencies]
 # Pinned to the exact rev `duduclaw-native-gui/Cargo.toml` pins — required
 # to match: two different revs resolve to two distinct, incompatible `gpui`

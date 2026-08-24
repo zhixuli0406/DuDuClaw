@@ -262,8 +262,13 @@ impl SettingsUiState {
     /// The state the shell boots with, honoring [`DEBUG_PAGE_ENV`]. Read
     /// live rather than cached so a smoke run can set it per invocation;
     /// `Default` stays env-free so every test builds a predictable state.
+    /// Q1 (2026-08-24): reads through `crate::shipping::debug_env`, so a
+    /// shipping binary always boots on the default page.
     pub(crate) fn from_env() -> Self {
-        let category = std::env::var(DEBUG_PAGE_ENV).ok().as_deref().and_then(SettingsCategory::from_slug).unwrap_or_default();
+        let category = crate::shipping::debug_env(DEBUG_PAGE_ENV)
+            .as_deref()
+            .and_then(SettingsCategory::from_slug)
+            .unwrap_or_default();
         Self { category, ..Self::default() }
     }
 
@@ -567,8 +572,20 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var(DEBUG_PAGE_ENV).ok();
 
+        // Q1 (2026-08-24): the hook is now behind the compile-time shipping
+        // gate, so what "correct" means here depends on the build. Both
+        // branches assert something real rather than one of them being
+        // `#[cfg]`-skipped — see `crate::shipping`'s header comment.
         unsafe { std::env::set_var(DEBUG_PAGE_ENV, "update") };
-        assert_eq!(SettingsUiState::from_env().category, SettingsCategory::Update);
+        if crate::shipping::debug_affordances_available() {
+            assert_eq!(SettingsUiState::from_env().category, SettingsCategory::Update);
+        } else {
+            assert_eq!(
+                SettingsUiState::from_env().category,
+                SettingsCategory::Network,
+                "a shipping build must ignore the debug page hook entirely"
+            );
+        }
 
         unsafe { std::env::set_var(DEBUG_PAGE_ENV, "bogus") };
         assert_eq!(SettingsUiState::from_env().category, SettingsCategory::Network, "a typo must not open a blank app");

@@ -88,6 +88,11 @@ mod audio;
 // comment for the whole design; `chrome::windows` (Linux-only) is what
 // `main()` calls into below instead of opening a single window directly.
 mod chrome;
+/// A2 (2026-08-23): the co-driving (共駕) half of comp's shell-control
+/// socket. Its own module rather than more lines in `comp_client` (already
+/// over this crate's file ceiling) — the SOCKET is still shared, see that
+/// module's `call_raw`.
+mod codrive_client;
 mod comp_client;
 mod fake_data;
 mod gateway_client;
@@ -111,6 +116,11 @@ mod palette;
 /// overlay (`surface::Overlay::Settings`), which is the whole of its
 /// relationship to that module.
 mod settings;
+/// Q1 (2026-08-24) — the compile-time gate that keeps this crate's debug
+/// affordances out of a shipping binary. See its own header comment for the
+/// `/etc/duduclaw/kiosk.env` hole it closes and for what is deliberately
+/// left ungated.
+mod shipping;
 mod surface;
 
 use gpui::{
@@ -240,9 +250,15 @@ fn spawn_global_task_poll_loop(shared: gpui::Entity<ShellView>, cx: &mut App) {
     .detach();
 }
 
+/// Q1 (2026-08-24): now behind the compile-time shipping gate
+/// (`shipping::debug_env_is_one`), so a shipping binary answers `false` no
+/// matter what `/etc/duduclaw/kiosk.env` puts in the environment. See
+/// `crate::shipping`'s header comment. The `OnceLock` is kept: this is read
+/// on every render pass, and in a gated-out build the whole body folds to a
+/// constant anyway.
 pub(crate) fn diag_enabled() -> bool {
     static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DIAG.get_or_init(|| std::env::var("DUDUCLAW_SHELL_DIAG").is_ok_and(|v| v == "1"))
+    *DIAG.get_or_init(|| shipping::debug_env_is_one("DUDUCLAW_SHELL_DIAG"))
 }
 
 /// D2 (2026-08-23): tell the compositor which palette to draw its
@@ -271,6 +287,48 @@ pub(crate) fn notify_comp_theme(theme: oobe::ThemeChoice) {
             }
         }
         Err(e) => eprintln!("[theme] comp set_theme({wire}) failed (decorations keep their previous palette): {e}"),
+    });
+}
+
+/// D9-bug3/D9-bug4 (2026-08-24): tell the compositor whether this shell's
+/// lock screen is up.
+///
+/// Same fire-and-forget-on-a-detached-thread shape (and the same reasoning)
+/// as [`notify_comp_theme`] directly above: every `comp_client` call is plain
+/// blocking with a 3 s socket timeout, and this fires from gpui's main thread
+/// at boot, on every lock and on every unlock. Blocking the UI thread for
+/// three seconds *while locking the screen* would be the worst possible place
+/// to stall.
+///
+/// The failure is logged and never surfaced — but note that the two
+/// directions fail differently, which is why the log line says which one it
+/// was. A failed `locked=true` means comp keeps painting application windows
+/// behind the lock screen (the D9-bug4 symptom, i.e. no worse than before
+/// this round, but the operator should be able to find it in the journal); a
+/// failed `locked=false` means comp keeps hiding them after the operator has
+/// unlocked, which looks like "my windows are gone". Neither can be retried
+/// usefully from here — comp is either listening or it is not — and the next
+/// lock/unlock announces again anyway.
+///
+/// On the macOS dev loop there is never a real compositor, so this is
+/// expected to log `NotAvailable` on every call and is deliberately quiet
+/// about it unless `DUDUCLAW_SHELL_DIAG=1` is set.
+pub(crate) fn notify_comp_session_locked(locked: bool) {
+    std::thread::spawn(move || match comp_client::set_session_locked(locked) {
+        Ok(()) => {
+            if diag_enabled() {
+                eprintln!("[lock] comp accepted set_session_locked({locked})");
+            }
+        }
+        Err(comp_client::CompClientError::NotAvailable(_)) if !cfg!(target_os = "linux") => {
+            if diag_enabled() {
+                eprintln!("[lock] no compositor on this platform — set_session_locked({locked}) skipped");
+            }
+        }
+        Err(e) => eprintln!(
+            "[lock] comp set_session_locked({locked}) failed: {e} — the compositor is still {} application windows",
+            if locked { "painting" } else { "hiding" }
+        ),
     });
 }
 
@@ -558,6 +616,12 @@ impl ShellView {
         // between, and showing a stale selection would be a claim this
         // surface never verified. Cheap: a no-op when it was never loaded.
         self.pointer_ui.reset();
+        // A2 (2026-08-23): and the 共駕 row's own snapshot, for a sharper
+        // version of the same reason — driving state changes on its own,
+        // without anyone touching this panel, so a stale 「AI 正在操作這台
+        // 電腦」 would be an outright false statement rather than a merely
+        // out-of-date one. See `overlay::codrive_row::CodriveUiState::reset`.
+        self.overlay_ui.codrive.reset();
         // D4b (2026-08-23): same reasoning, one surface further — closing
         // ANY overlay drops the settings app's cached backend reads AND
         // every one of its typed fields, two of which hold passwords. See
@@ -601,6 +665,12 @@ impl ShellView {
         // between, and showing a stale selection would be a claim this
         // surface never verified. Cheap: a no-op when it was never loaded.
         self.pointer_ui.reset();
+        // A2 (2026-08-23): and the 共駕 row's own snapshot, for a sharper
+        // version of the same reason — driving state changes on its own,
+        // without anyone touching this panel, so a stale 「AI 正在操作這台
+        // 電腦」 would be an outright false statement rather than a merely
+        // out-of-date one. See `overlay::codrive_row::CodriveUiState::reset`.
+        self.overlay_ui.codrive.reset();
         // D4b (2026-08-23): same reasoning, one surface further — closing
         // ANY overlay drops the settings app's cached backend reads AND
         // every one of its typed fields, two of which hold passwords. See
@@ -1111,7 +1181,37 @@ impl ShellView {
         if self.diag {
             root = root
                 .on_key_down(cx.listener(|_, ev: &KeyDownEvent, _, _| {
-                    eprintln!("[probe] os key_down: {:?}", ev.keystroke);
+                    // Q1 (2026-08-24): the typed CHARACTER is never printed.
+                    //
+                    // This listener sits on the window ROOT, and the lock
+                    // screen renders as a child of that same root — so a
+                    // keystroke typed into the password field bubbles past the
+                    // field (whose own `OobeTextField::on_key_down` does not
+                    // stop propagation) and reaches here. The previous version
+                    // `{:?}`-formatted the whole `Keystroke`, whose `Debug`
+                    // includes `key_char: Some("a")`. That was not theoretical:
+                    // `lockscreen/render.rs`'s own `reveal_and_focus` comment
+                    // records three such lines being MEASURED on the appliance
+                    // while typing a password, and under the kiosk unit stderr
+                    // goes to journald on persistent storage.
+                    //
+                    // Everything this probe was actually built to answer —
+                    // "did a key arrive at all, and with which modifiers" — is
+                    // kept. Only the identity of the key is dropped. Note the
+                    // shipping gate on `diag` above is a SECOND line of
+                    // defence, not the fix: a password must not be written to
+                    // a log in any build.
+                    //
+                    // Only the modifiers are printed. Not even the character's
+                    // LENGTH is reported: reading that field here would trip
+                    // this crate's own `no_shell_surface_hand_rolls_raw_
+                    // character_text_entry` guard, and the byte count adds
+                    // nothing to "did a key arrive" while leaking a little
+                    // about what was typed.
+                    eprintln!(
+                        "[probe] os key_down: modifiers={:?} (key identity withheld)",
+                        ev.keystroke.modifiers
+                    );
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1153,8 +1253,9 @@ impl ShellView {
                     }
                     view.surface.close();
                     view.settle_launcher_query(window, cx);
-                    // See `on_toggle_launcher`'s own note on these three.
+                    // See `on_toggle_launcher`'s own note on these four.
                     view.pointer_ui.reset();
+                    view.overlay_ui.codrive.reset();
                     view.settings_ui.reset();
                     view.settings_fields.clear_all(cx);
                     cx.notify();
@@ -1245,6 +1346,11 @@ impl Render for ShellView {
 //     `lockscreen::password_required_from_env()`.
 fn main() {
     eprintln!("[main] starting duduclaw-shell S0");
+    // Q1 (2026-08-24): a build with the debug affordances compiled in says so
+    // on its first line of stderr, unconditionally — so "why does this
+    // machine behave oddly" is answerable from the journal alone. Silent in a
+    // shipping build. See `crate::shipping`.
+    shipping::announce_build_flavour();
 
     // ICON-1 (2026-08-22): the shell's embedded SVG asset source. This is
     // the ONLY point where it can be installed — `Application::with_assets`
@@ -1322,9 +1428,14 @@ fn main() {
         // operator_name`'s own doc comment. Unlike `ThemeChoice` this one
         // is not `Copy`, so it clones the string out rather than the state.
         let initial_operator_name = oobe::boot_operator_name(&persisted_oobe_state);
-        let force_oobe = std::env::var("DUDUCLAW_SHELL_FORCE_OOBE").ok();
-        let skip_oobe = std::env::var("DUDUCLAW_SHELL_SKIP_OOBE").ok();
-        let debug_oobe_step = std::env::var("DUDUCLAW_SHELL_DEBUG_OOBE_STEP").ok();
+        // Q1 (2026-08-24): all three read through the shipping gate. Forcing,
+        // skipping or jumping the first-run flow decides whether a machine
+        // ever performs its device claim, which is not something an operator
+        // env file on a duty appliance should be able to change. See
+        // `crate::shipping`.
+        let force_oobe = shipping::debug_env("DUDUCLAW_SHELL_FORCE_OOBE");
+        let skip_oobe = shipping::debug_env("DUDUCLAW_SHELL_SKIP_OOBE");
+        let debug_oobe_step = shipping::debug_env("DUDUCLAW_SHELL_DEBUG_OOBE_STEP");
         let initial_oobe =
             oobe::resolve_boot_flow(force_oobe.as_deref(), skip_oobe.as_deref(), debug_oobe_step.as_deref(), persisted_oobe_state);
         match &initial_oobe {
@@ -1341,6 +1452,17 @@ fn main() {
         // light until the next theme change. Non-blocking; see
         // `notify_comp_theme`.
         notify_comp_theme(initial_theme);
+
+        // D9-bug3/D9-bug4 (2026-08-24): and announce that this session is
+        // NOT locked. comp's own default is already `false`, so this is a
+        // no-op against a compositor that started with (or after) this
+        // shell — it matters when comp OUTLIVES a shell that died while
+        // locked. comp deliberately keeps the lock in that case (windows
+        // stay hidden, the safe direction — see comp's `session_lock.rs`
+        // "Fail-closed choices"), and this line is what lets the
+        // supervisor-restarted shell take the screen back. Non-blocking;
+        // see `notify_comp_session_locked`.
+        notify_comp_session_locked(false);
 
         // WM-3 (2026-08-23): `shared_state` replaces the single window's
         // root-view construction that used to happen inline inside `cx.
@@ -1386,7 +1508,14 @@ fn main() {
             oobe_network_fields,
             theme: initial_theme,
             focus_handle: cx.focus_handle(),
-            diag: std::env::var("DUDUCLAW_SHELL_DIAG").is_ok_and(|v| v == "1"),
+            // Q1 (2026-08-24): through the shipping gate, exactly like the
+            // free `diag_enabled()` — NOT a raw `std::env::var`. This field
+            // drives the boot-time auto-`cmd-k` dispatch and the keystroke
+            // probe below; reading the env directly here was the miss that
+            // let `DUDUCLAW_SHELL_DIAG=1` from `/etc/duduclaw/kiosk.env`
+            // re-enable both in a shipping binary. `debug_env_is_one` folds to
+            // `false` in a shipping build. See `crate::shipping`.
+            diag: shipping::debug_env_is_one("DUDUCLAW_SHELL_DIAG"),
             diag_scheduled: false,
         });
 
@@ -1530,7 +1659,10 @@ fn main() {
         // overlay and lets `chrome::windows::SurfaceView::
         // reconcile_overlay_window` pick it up — and focus it correctly
         // itself — on Home's next render pass.
-        match std::env::var("DUDUCLAW_SHELL_DEBUG_SURFACE") {
+        // Q1 (2026-08-24): behind the shipping gate — see `crate::shipping`.
+        // `Ok(_)`/`Err(_)` become `Some(_)`/`None`, and a shipping build takes
+        // the `None` arm unconditionally.
+        match shipping::debug_env("DUDUCLAW_SHELL_DEBUG_SURFACE").ok_or(()) {
             Ok(raw) if raw.is_empty() => {}
             Ok(raw) if raw == "lockscreen" => {
                 let _ = shared_state.update(cx, |view, cx| {

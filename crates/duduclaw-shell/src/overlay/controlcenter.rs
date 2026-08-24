@@ -32,10 +32,34 @@
 // sysfs interface with no research pass done against it yet), explicitly
 // out of scope for this round, left for a future one. Click/drag on the
 // volume track calls `set_volume`; clicking the volume glyph calls
-// `toggle_mute` — both through `kick_off_audio_call` below, the same
+// `toggle_mute` — both through `audio::kick_off_audio_call`, the same
 // background-thread + `std::sync::mpsc` + `cx.spawn` poll bridge
-// `steps::network`'s click handlers established (`kick_off_audio_call`'s
-// own doc comment has the exact shape).
+// `steps::network`'s click handlers established. (That helper lived in this
+// file until D5 moved it to `audio::bridge`, where a second caller — the
+// settings 聲音 page — could reach it; see that module's own header comment
+// for the exact shape and why it is not `settings::spawn_rpc`.)
+//
+// ── D5 (2026-08-24): the volume row shows only what was actually read ────
+// Two changes, both in service of the same rule the settings app already
+// holds itself to (`settings/mod.rs`'s honesty contract):
+//   1. NO SEEDED VALUE. The row used to open at 62% — `fake_data::
+//      SLIDER_ROWS[0]`'s static snapshot, copied into `AudioUiState`'s
+//      default — and only started telling the truth after the operator's
+//      first drag round-tripped. It now dispatches an eager read on first
+//      render (`audio::ensure_volume_probed`) and renders a plainly
+//      un-read state until that lands, so no number is ever displayed that
+//      a backend did not report.
+//   2. AN HONEST DISABLED STATE. PipeWire ships in the appliance image as of
+//      this round, so a Linux box that cannot reach it has a real fault, and
+//      `audio::select_backend` now returns `Unavailable` there instead of
+//      silently substituting the demo backend (see `crate::audio`'s own
+//      header comment). This row renders that as a dimmed, non-interactive
+//      track with the reason under it — never as a slider that moves and
+//      changes nothing.
+// The 示範模式 notice is unchanged and still fires on `Fake`, which is now
+// reachable only on a non-Linux host or via `DUDUCLAW_SHELL_FAKE_AUDIO=1`.
+// Brightness (`SLIDER_ROWS[1]`) is untouched by all of this and remains the
+// static snapshot it has always been.
 //
 // Layout: gpui does have a real `Display::Grid` (`Styled::grid()`, backed
 // by Taffy) that could reproduce the board's `grid-template-columns:
@@ -93,6 +117,28 @@ use crate::{fake_data, ShellView};
 /// through `i18n::t()` while everything around it stays hardcoded would be
 /// a worse inconsistency than staying literal alongside its neighbors.
 const AUDIO_DEMO_MODE_NOTICE: &str = "示範模式：目前的音量調整為模擬效果，尚未連接真實音訊裝置";
+
+/// Shown in place of the slider's percentage when this run's audio backend
+/// cannot do anything — the `AudioBackendKind::Unavailable` state. Wording
+/// deliberately names an ACTION the operator can take rather than a
+/// component they have never heard of ("PipeWire"): internal implementation
+/// names do not belong on an operator-facing surface (opus-playbook §7,
+/// 使用者視角).
+const AUDIO_UNAVAILABLE_NOTICE: &str = "音訊服務未啟動，目前無法調整音量。可到「系統設定 › 聲音」查看詳情。";
+
+/// Shown while the eager first read is still in flight or has not been
+/// dispatched yet. Says nothing about a level, because nothing is known.
+const AUDIO_NOT_READ_YET_NOTICE: &str = "正在讀取音量…";
+
+/// Shown next to a working control whose LAST call failed — the value on
+/// screen is real but stale, and pretending the adjustment took would be the
+/// dishonest option.
+const AUDIO_LAST_CALL_FAILED_NOTICE: &str = "最後一次音量調整沒有成功，畫面上是上一次讀到的數值。";
+
+/// The audio service answered, but this machine has no volume to read — in
+/// practice a box with no sound output attached, which is a different fault
+/// from the service being down and gets its own sentence.
+const AUDIO_NO_VALUE_NOTICE: &str = "讀不到音量，這台機器可能沒有接上輸出裝置。";
 
 pub(super) fn render(ui: &OverlayUiState, audio_ui: &audio::AudioUiState, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
     // ControlCenter.dc.html: bg `rgba(255,255,255,0.96)` light / `rgba(30,
@@ -353,6 +399,11 @@ fn quick_tile(tile: &fake_data::QuickTile, palette: ShellPalette) -> Stateful<Di
 }
 
 fn sliders_card(audio_ui: &audio::AudioUiState, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    // Eager first read — see this file's header comment (D5) and
+    // `audio::ensure_volume_probed`'s own doc comment on why a render-time
+    // dispatch is the right shape here and why it cannot loop.
+    audio::ensure_volume_probed(cx);
+
     // ControlCenter.dc.html: bg `#ffffff` light / `#1e1e21` dark —
     // `surface_raised`. Border: opaque `border()` light / `rgba(255,255,
     // 255,0.10)` dark (bespoke, not `border()`'s own dark 0.06).
@@ -371,22 +422,70 @@ fn sliders_card(audio_ui: &audio::AudioUiState, palette: ShellPalette, cx: &mut 
         // Brightness (`SLIDER_ROWS[1]`) stays the pre-existing static
         // snapshot — see this file's header comment on why.
         .child(slider_row(&fake_data::SLIDER_ROWS[1], palette));
-    if audio_ui.backend_kind == Some(AudioBackendKind::Fake) {
-        card = card.child(demo_mode_notice(palette));
+    for (text, tone) in audio_notices(audio_ui) {
+        card = card.child(audio_notice(text, tone, palette));
     }
     card
 }
 
-fn demo_mode_notice(palette: ShellPalette) -> Div {
+/// Which honest line(s) belong under the sliders, given what the audio
+/// backend has actually said so far. Pure and exhaustive over the state
+/// space, so the four cases are visible in one place and testable without a
+/// window — the same reason `settings::sound_page::classify` is a free
+/// function.
+///
+/// At most two lines, and only one of them is ever a backend-identity
+/// notice: a demo/unavailable/not-read line, optionally followed by the
+/// "last call failed" line (which can accompany an otherwise-working
+/// control).
+fn audio_notices(audio_ui: &audio::AudioUiState) -> Vec<(&'static str, NoticeTone)> {
+    let mut notices = Vec::new();
+    match audio_ui.backend_kind {
+        None => notices.push((AUDIO_NOT_READ_YET_NOTICE, NoticeTone::Muted)),
+        Some(AudioBackendKind::Fake) => notices.push((AUDIO_DEMO_MODE_NOTICE, NoticeTone::Warning)),
+        Some(AudioBackendKind::Unavailable) => notices.push((AUDIO_UNAVAILABLE_NOTICE, NoticeTone::Warning)),
+        // A real backend needs no identity notice; only a failure gets one.
+        Some(AudioBackendKind::Real) => {}
+    }
+    // An `Unavailable` backend fails EVERY call by construction, so adding a
+    // per-call failure line under it would be a second way of saying the
+    // same thing.
+    if audio_ui.last_call_failed && audio_ui.backend_kind != Some(AudioBackendKind::Unavailable) {
+        // Two different failures, two different sentences: never having read
+        // a value at all (no sink) is not the same as an adjustment that did
+        // not take (a value IS on screen, it is just stale).
+        notices.push(if audio_ui.has_reading() {
+            (AUDIO_LAST_CALL_FAILED_NOTICE, NoticeTone::Warning)
+        } else {
+            (AUDIO_NO_VALUE_NOTICE, NoticeTone::Warning)
+        });
+    }
+    notices
+}
+
+/// The two weights an audio notice comes in. Local to this file (the panel
+/// has its own colour decisions, see the header comment) rather than shared
+/// with `settings::widgets::Tone`, which belongs to a different surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeTone {
+    Warning,
+    Muted,
+}
+
+fn audio_notice(text: &'static str, tone: NoticeTone, palette: ShellPalette) -> Div {
+    let color = match tone {
+        NoticeTone::Warning => palette.warning,
+        NoticeTone::Muted => palette.muted_foreground,
+    };
     div()
         .w_full()
         .px(px(12.))
         .py(px(8.))
         .rounded(px(theme::RADIUS_LG))
-        .bg(theme::alpha(palette.warning, 0.14))
+        .bg(theme::alpha(color, 0.14))
         .text_size(px(theme::TEXT_XS))
-        .text_color(theme::alpha(palette.warning, 1.0))
-        .child(AUDIO_DEMO_MODE_NOTICE)
+        .text_color(theme::alpha(color, 1.0))
+        .child(text)
 }
 
 /// The brightness row — UNCHANGED from before this round (still reads
@@ -435,26 +534,43 @@ fn slider_row(row: &fake_data::SliderRow, palette: ShellPalette) -> Div {
 /// mute-toggle click target, dimmed/tinted red while muted for feedback
 /// beyond the (separate) track fill.
 fn volume_slider_row(audio_ui: &audio::AudioUiState, palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+    // D5: the fill is drawn from a REAL reading or not at all. Before the
+    // first successful read (`has_reading() == false`) the track is empty —
+    // an empty track reads as "nothing known yet", while a track filled from
+    // `pct`'s default would read as "this machine is at 0%", and both of
+    // those are wrong in different ways from the old seeded 62%.
     let pct = audio_ui.pct.min(100);
-    let fraction = f32::from(pct) / 100.0;
+    let fraction = if audio_ui.has_reading() { f32::from(pct) / 100.0 } else { 0.0 };
+    // Two independent reasons the track stops taking input, kept separate
+    // because they mean different things: `busy` is momentary (one call in
+    // flight) and cosmetic, `interactive` is a property of this run's
+    // backend and is the honest disabled state.
     let busy = audio_ui.in_flight;
+    let interactive = audio_ui.is_interactive();
 
     let glyph_hex = if palette.is_dark() { 0xb0b0b8 } else { 0x52525c };
-    let icon_hex = if audio_ui.muted { palette.destructive } else { glyph_hex };
+    let icon_hex = if audio_ui.muted && audio_ui.has_reading() { palette.destructive } else { glyph_hex };
     let mute_click = cx.listener(|view, _ev: &ClickEvent, _window, cx| {
-        kick_off_audio_call(view, cx, None, |backend| backend.toggle_mute());
+        audio::kick_off_audio_call(view, cx, None, |backend| backend.toggle_mute());
     });
-    let icon = div()
+    let mut icon = div()
         .id("cc-volume-icon")
-        .cursor_pointer()
         .text_size(px(13.))
         .text_color(theme::alpha(icon_hex, 1.0))
         // ICON-1: the board's 15px speaker icon replaces "音". `icon_hex`
         // (not `glyph_hex`) is passed through deliberately — this icon is
         // the mute toggle and already tints red while muted, and the real
         // icon has to keep that feedback rather than lose it.
-        .child(icons::icon_or_glyph(&[(icons::VOLUME, icon_hex)], 15., fake_data::SLIDER_ROWS[0].glyph))
-        .on_click(mute_click);
+        .child(icons::icon_or_glyph(&[(icons::VOLUME, icon_hex)], 15., fake_data::SLIDER_ROWS[0].glyph));
+    if interactive {
+        icon = icon.cursor_pointer().on_click(mute_click);
+    } else {
+        // Same treatment `settings::widgets::button` gives a disabled
+        // control: still visible, still where the operator expects it, just
+        // plainly inert — a control that DISAPPEARS reads as a missing
+        // feature rather than an unavailable one.
+        icon = icon.opacity(0.55);
+    }
 
     // Captures the track's laid-out bounds every paint pass — `on_mouse_
     // down`/`on_mouse_move` closures only ever receive a WINDOW-relative
@@ -471,14 +587,14 @@ fn volume_slider_row(audio_ui: &audio::AudioUiState, palette: ShellPalette, cx: 
 
     let down_handler = cx.listener(move |view, ev: &MouseDownEvent, _window, cx| {
         let target_pct = pct_from_event_position(bounds_for_down.get(), ev.position);
-        kick_off_audio_call(view, cx, Some(target_pct), move |backend| backend.set_volume(target_pct));
+        audio::kick_off_audio_call(view, cx, Some(target_pct), move |backend| backend.set_volume(target_pct));
     });
     let move_handler = cx.listener(move |view, ev: &MouseMoveEvent, _window, cx| {
         if !ev.dragging() {
             return;
         }
         let target_pct = pct_from_event_position(bounds_for_move.get(), ev.position);
-        kick_off_audio_call(view, cx, Some(target_pct), move |backend| backend.set_volume(target_pct));
+        audio::kick_off_audio_call(view, cx, Some(target_pct), move |backend| backend.set_volume(target_pct));
     });
 
     let mut track = div()
@@ -490,7 +606,10 @@ fn volume_slider_row(audio_ui: &audio::AudioUiState, palette: ShellPalette, cx: 
         .bg(theme::alpha(track_off_hex(palette), 1.0))
         .child(div().absolute().left(px(0.)).top(px(0.)).bottom(px(0.)).w(relative(fraction)).rounded(px(5.)).bg(theme::alpha(palette.brand, 1.0)))
         .child(bounds_tracker(track_bounds));
-    if !busy {
+    if !interactive {
+        track = track.opacity(0.55);
+    }
+    if interactive && !busy {
         // Same "visually inert while an operation is in flight, cosmetic
         // only" pattern `steps::network::wifi_row` establishes — the
         // AUTHORITATIVE guard lives in `kick_off_audio_call` itself (checked
@@ -524,61 +643,6 @@ fn pct_from_event_position(bounds: Bounds<Pixels>, position: Point<Pixels>) -> u
     }
     let local_x = (position.x.as_f32() - bounds.origin.x.as_f32()).clamp(0.0, width);
     ((local_x / width) * 100.0).round() as u8
-}
-
-/// Dispatches ONE `AudioBackend` call on a background thread and bridges
-/// its result back to `ShellView` — same background-thread ->
-/// `std::sync::mpsc` -> `cx.spawn` poll-loop pattern `steps::network`'s
-/// `kick_off_scan`/`kick_off_connect` already established (see that file's
-/// own header comment for why: no `reqwest`/`tokio` in this crate, and
-/// gpui's main thread must never block on real I/O — a subprocess spawn,
-/// here, rather than a network call). Shared by both `set_volume` (`down_
-/// handler`/`move_handler` above, `call` closes over the target pct) and
-/// `toggle_mute` (`mute_click` above, no pct) rather than being duplicated
-/// per call site, since the two only differ in which `AudioBackend` method
-/// they invoke. The in-flight guard is checked here FIRST, before
-/// `AudioUiState::begin` even runs — this is the authoritative guard `audio
-/// ::AudioUiState.in_flight`'s own doc comment refers to, not the `busy`
-/// cosmetic gate in `volume_slider_row`.
-fn kick_off_audio_call(
-    view: &mut ShellView,
-    cx: &mut Context<ShellView>,
-    optimistic_pct: Option<u8>,
-    call: impl FnOnce(&dyn audio::AudioBackend) -> Result<audio::VolumeState, audio::AudioError> + Send + 'static,
-) {
-    if view.audio_ui.in_flight {
-        return;
-    }
-    view.audio_ui.begin(optimistic_pct);
-    cx.notify();
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let (backend, kind) = audio::select_backend();
-        let result = call(backend.as_ref());
-        let _ = tx.send((kind, result));
-    });
-
-    // 20ms poll interval, shorter than `steps::network`'s 50ms — a volume
-    // backend call is a local sub-10ms round-trip, not real network I/O, so
-    // polling more often keeps a drag feeling responsive without adding
-    // meaningful busy-work (this timer only runs while ONE call is
-    // in-flight, never continuously).
-    cx.spawn(async move |weak, cx| loop {
-        match rx.try_recv() {
-            Ok((kind, result)) => {
-                let _ = weak.update(cx, |view, cx| {
-                    view.audio_ui.settle(kind, result);
-                    cx.notify();
-                });
-                break;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-        }
-        cx.background_executor().timer(std::time::Duration::from_millis(20)).await;
-    })
-    .detach();
 }
 
 // ── AI 團隊 (interactive) ─────────────────────────────────────────────────
@@ -626,6 +690,13 @@ fn ai_team_card(ui: &OverlayUiState, palette: ShellPalette, cx: &mut Context<She
                 .border_color(label_divider)
                 .child(fake_data::CC_SECTION_AI_TEAM),
         )
+        // A2 (2026-08-23): 共駕 — who is driving this machine right now, plus
+        // the 接管/交還 button. First row in the card on purpose: it is the
+        // only row here that reports something happening RIGHT NOW, and the
+        // three switches below it are standing preferences. Its whole
+        // implementation (state, compositor calls, copy) lives in
+        // `overlay/codrive_row.rs`.
+        .child(super::codrive_row::render(&ui.codrive, palette, cx))
         .child(switch_row(fake_data::CC_SWITCH_AUTOMATION_LABEL, fake_data::CC_SWITCH_AUTOMATION_DESC, ui.automation_on(), true, palette, automation_click))
         .child(switch_row(fake_data::CC_SWITCH_PROACTIVE_LABEL, fake_data::CC_SWITCH_PROACTIVE_DESC, ui.proactive_on(), true, palette, proactive_click))
         .child(switch_row(fake_data::CC_SWITCH_PAUSE_ALL_LABEL, fake_data::CC_SWITCH_PAUSE_ALL_DESC, ui.pause_all_on(), false, palette, pause_all_click))
@@ -761,4 +832,92 @@ fn small_avatar(initial: &'static str, bg_hex: u32, palette: ShellPalette) -> Di
         .items_center()
         .justify_center()
         .child(div().text_size(px(10.)).font_weight(FontWeight::BOLD).text_color(theme::alpha(palette.brand_foreground, 1.0)).child(initial))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::{AudioError, AudioUiState, VolumeState};
+
+    fn settled(kind: AudioBackendKind, result: Result<VolumeState, AudioError>) -> AudioUiState {
+        let mut ui = AudioUiState::default();
+        ui.settle(kind, result);
+        ui
+    }
+
+    /// Before anything is read the panel says so, in muted weight — it does
+    /// NOT show a percentage, and it does not warn (nothing is wrong yet).
+    #[test]
+    fn an_unread_state_says_it_is_reading_and_shows_no_warning() {
+        let notices = audio_notices(&AudioUiState::default());
+        assert_eq!(notices, vec![(AUDIO_NOT_READ_YET_NOTICE, NoticeTone::Muted)]);
+    }
+
+    /// The state this whole round exists to make reachable: a Linux box that
+    /// cannot reach its audio service gets one plain explanation, not a
+    /// slider that pretends.
+    #[test]
+    fn an_unavailable_backend_explains_itself_exactly_once() {
+        let ui = settled(AudioBackendKind::Unavailable, Err(AudioError::Unavailable("no pipewire".to_string())));
+        assert_eq!(notice_texts(&ui), vec![AUDIO_UNAVAILABLE_NOTICE], "the per-call failure line would just repeat this one");
+    }
+
+    #[test]
+    fn a_working_backend_needs_no_notice_at_all() {
+        let ui = settled(AudioBackendKind::Real, Ok(VolumeState { pct: 40, muted: false }));
+        assert!(audio_notices(&ui).is_empty());
+    }
+
+    #[test]
+    fn the_demo_backend_is_labelled_not_silenced() {
+        let ui = settled(AudioBackendKind::Fake, Ok(VolumeState { pct: 40, muted: false }));
+        assert_eq!(notice_texts(&ui), vec![AUDIO_DEMO_MODE_NOTICE]);
+    }
+
+    /// A real backend whose last call failed keeps its (stale, real) reading
+    /// on screen and says the adjustment did not take.
+    #[test]
+    fn a_transient_failure_on_a_real_backend_is_disclosed() {
+        let mut ui = settled(AudioBackendKind::Real, Ok(VolumeState { pct: 40, muted: false }));
+        ui.settle(AudioBackendKind::Real, Err(AudioError::Unavailable("boom".to_string())));
+        assert_eq!(notice_texts(&ui), vec![AUDIO_LAST_CALL_FAILED_NOTICE]);
+    }
+
+    /// The demo backend can also fail (its `set_default_output` does), and
+    /// then BOTH facts are true and both are stated.
+    #[test]
+    fn a_failure_on_the_demo_backend_shows_both_lines() {
+        let mut ui = settled(AudioBackendKind::Fake, Ok(VolumeState { pct: 40, muted: false }));
+        ui.settle(AudioBackendKind::Fake, Err(AudioError::Unavailable("boom".to_string())));
+        assert_eq!(notice_texts(&ui), vec![AUDIO_DEMO_MODE_NOTICE, AUDIO_LAST_CALL_FAILED_NOTICE]);
+    }
+
+    /// A working service on a machine with no sound output: the read fails,
+    /// so there is no value — and that is a different sentence from "the
+    /// adjustment didn't take", which would be nonsense here (there was no
+    /// adjustment and there is no value on screen).
+    #[test]
+    fn a_real_backend_that_never_produced_a_value_says_so_specifically() {
+        let ui = settled(AudioBackendKind::Real, Err(AudioError::Unavailable("no default sink".to_string())));
+        assert_eq!(notice_texts(&ui), vec![AUDIO_NO_VALUE_NOTICE]);
+        assert!(!ui.is_interactive(), "a slider with no readable level must not be draggable");
+    }
+
+    /// Interactivity needs BOTH a usable backend and a real reading — the
+    /// four combinations must not collapse onto one another.
+    #[test]
+    fn only_a_usable_backend_with_a_real_reading_makes_the_track_interactive() {
+        assert!(!AudioUiState::default().is_interactive(), "nothing read yet");
+        assert!(settled(AudioBackendKind::Real, Ok(VolumeState { pct: 1, muted: false })).is_interactive());
+        assert!(settled(AudioBackendKind::Fake, Ok(VolumeState { pct: 1, muted: false })).is_interactive());
+        assert!(!settled(AudioBackendKind::Unavailable, Err(AudioError::Unavailable("x".to_string()))).is_interactive());
+        assert!(
+            !settled(AudioBackendKind::Real, Err(AudioError::Unavailable("no sink".to_string()))).is_interactive(),
+            "a reachable service with no readable level is still nothing to drag"
+        );
+    }
+
+    fn notice_texts(ui: &AudioUiState) -> Vec<&'static str> {
+        audio_notices(ui).into_iter().map(|(text, _)| text).collect()
+    }
 }

@@ -232,6 +232,24 @@ struct CompResponse {
 /// `codrive/mod.rs` debug tooling, which gets away with raw string
 /// literals only because none of ITS values are caller-supplied free text).
 fn call(req_line: &str) -> Result<CompResponse, CompClientError> {
+    let line = call_raw(req_line)?;
+    serde_json::from_str::<CompResponse>(line.trim()).map_err(|e| CompClientError::Protocol(e.to_string()))
+}
+
+/// The SOCKET half of [`call`], split out (A2 共駕, 2026-08-23) so a sibling
+/// client module can parse the very same round trip into its OWN response
+/// type — see `crate::codrive_client`, which does exactly that.
+///
+/// The alternative was hanging yet another op-specific `Option` field off
+/// [`CompResponse`] (that struct already carries five). This way each family
+/// of ops owns its own reply type and there is still exactly ONE piece of
+/// socket code in this crate, which is the property that actually matters:
+/// timeouts, the missing-socket classification and the "connection closed
+/// with no response" case are all decided here, once, for every caller.
+///
+/// Returns the raw response LINE (newline trimmed by the caller's parser).
+/// Blocking; see this file's own module doc for the threading contract.
+pub(crate) fn call_raw(req_line: &str) -> Result<String, CompClientError> {
     let Some(path) = socket_path() else {
         return Err(CompClientError::NotAvailable("XDG_RUNTIME_DIR is not set".to_string()));
     };
@@ -255,7 +273,7 @@ fn call(req_line: &str) -> Result<CompResponse, CompClientError> {
         Err(e) => return Err(classify_io_error(e)),
     }
 
-    serde_json::from_str::<CompResponse>(line.trim()).map_err(|e| CompClientError::Protocol(e.to_string()))
+    Ok(line)
 }
 
 fn classify_io_error(e: std::io::Error) -> CompClientError {
@@ -604,6 +622,35 @@ pub fn set_theme(theme: &str) -> Result<(), CompClientError> {
     Ok(())
 }
 
+/// D9-bug3/D9-bug4 (2026-08-24): tell comp whether this shell's lock screen
+/// is up.
+///
+/// comp cannot work that out for itself — a lock screen is just pixels on a
+/// layer surface — and three compositor-owned behaviours depend on knowing:
+/// ordinary windows are not painted at all (which is what stops a locked
+/// screen showing the browser that was open behind it), only layer surfaces
+/// can take pointer input, and keys are delivered straight to the shell
+/// instead of through the input method's keyboard grab (which is what makes
+/// "press any key to wake" work while fcitx5 is in 注音 mode). See comp's own
+/// `session_lock.rs` module doc for the whole rule.
+///
+/// Returns `Ok(())` rather than an echoed state, for exactly the reason
+/// [`set_theme`] gives: comp answers with a bare ack, and reporting a
+/// "current lock state" we never observed would be this client asserting
+/// something it did not see.
+///
+/// Blocking; see this file's module doc for the threading contract. The one
+/// caller (`crate::notify_comp_session_locked`) runs it detached, so a comp
+/// that is slow or absent can never stall the lock/unlock itself.
+pub fn set_session_locked(locked: bool) -> Result<(), CompClientError> {
+    let req = serde_json::json!({ "op": "set_session_locked", "params": { "locked": locked } }).to_string();
+    let resp = call(&req)?;
+    if !resp.ok {
+        return Err(CompClientError::Comp(resp.error.unwrap_or_else(|| "unknown error".to_string())));
+    }
+    Ok(())
+}
+
 /// One thing comp is asking this shell to do, because comp saw a global
 /// hotkey the shell could not have seen itself.
 ///
@@ -893,6 +940,50 @@ mod tests {
         let back: serde_json::Value = serde_json::from_str(&size.to_string()).unwrap();
         assert_eq!(back["op"], "set_cursor_size");
         assert_eq!(back["params"]["size"], 96);
+    }
+
+    /// D9-bug3/D9-bug4: pinned to the LITERAL line comp's own protocol test
+    /// (`duduclaw-comp/src/shell_control/protocol.rs`,
+    /// `set_session_locked_wire_shape_is_what_the_shell_sends`) asserts
+    /// against. The two crates cannot depend on each other — see this file's
+    /// module doc — so these two string literals ARE the contract, and this is
+    /// the same "pin wire formats to literal JSON" discipline the cursor ops
+    /// above already follow.
+    #[test]
+    fn set_session_locked_request_is_the_exact_line_comp_parses() {
+        for locked in [true, false] {
+            let req = serde_json::json!({ "op": "set_session_locked", "params": { "locked": locked } });
+            let expected = if locked {
+                r#"{"op":"set_session_locked","params":{"locked":true}}"#
+            } else {
+                r#"{"op":"set_session_locked","params":{"locked":false}}"#
+            };
+            assert_eq!(req.to_string(), expected);
+        }
+    }
+
+    /// The dev-Mac / compositor-down path for the lock announcement: no
+    /// compositor must never be a panic, and (through
+    /// `crate::notify_comp_session_locked`, which discards the result) must
+    /// never be able to block a lock from happening.
+    #[test]
+    fn set_session_locked_against_a_missing_socket_is_not_available_not_a_panic() {
+        let _guard = env_guard();
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+        let dir = std::env::temp_dir().join(format!("duduclaw-shell-lock-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        }
+        assert!(matches!(set_session_locked(true), Err(CompClientError::NotAvailable(_))));
+        assert!(matches!(set_session_locked(false), Err(CompClientError::NotAvailable(_))));
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The dev-Mac / compositor-down path, end to end: no socket means

@@ -29,7 +29,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use super::{AudioBackend, AudioError, VolumeState};
+use super::{AudioBackend, AudioError, OutputDevice, VolumeState};
 
 /// Seed volume, percent — mirrors `fake_data::SLIDER_ROWS[0].pct` (`0.62`),
 /// the exact static number ControlCenter showed before this round. Kept as
@@ -70,6 +70,33 @@ impl AudioBackend for FakeAudioBackend {
     fn toggle_mute(&self) -> Result<VolumeState, AudioError> {
         MUTED.fetch_xor(true, Ordering::Relaxed);
         self.get_volume()
+    }
+
+    /// Successfully enumerates ZERO devices (D5, 2026-08-24) — and that is
+    /// the honest answer, not a stub.
+    ///
+    /// This backend simulates a volume knob so the macOS dev loop's
+    /// ControlCenter slider stays draggable; it does not simulate hardware.
+    /// Inventing a "示範輸出裝置" row would put fabricated device names on a
+    /// settings page whose entire contract is that it never does that
+    /// (`settings/mod.rs`'s honesty section). An empty list renders as
+    /// 「沒有可用的輸出裝置」, which is exactly true of a machine whose audio
+    /// backend is a pair of atomics.
+    ///
+    /// It is unreachable from the settings page in practice anyway: that
+    /// page runs its own probe and only reaches its device list on
+    /// `Availability::Available`, which requires a real `wpctl` and a real
+    /// PipeWire socket. Implemented honestly rather than with `unreachable!()`
+    /// because a panic in a settings page is never the right answer to a
+    /// surprise (same reasoning that page's own `Load::Failed` arm gives).
+    fn list_outputs(&self) -> Result<Vec<OutputDevice>, AudioError> {
+        Ok(Vec::new())
+    }
+
+    /// There is nothing to switch to — see `list_outputs` above. An `Ok`
+    /// here would report a successful switch that did not happen.
+    fn set_default_output(&self, _id: u32) -> Result<Vec<OutputDevice>, AudioError> {
+        Err(AudioError::Unavailable("the demo audio backend has no output devices to switch between".to_string()))
     }
 }
 
@@ -170,5 +197,14 @@ mod tests {
         // under test parallelism regardless of `TEST_LOCK` contention.
         let from_fake_data = (crate::fake_data::SLIDER_ROWS[0].pct * 100.0).round() as u8;
         assert_eq!(SEED_PCT, from_fake_data);
+    }
+
+    /// D5: the demo backend enumerates no hardware and says so, rather than
+    /// inventing a device row for a settings page that forbids fake data.
+    #[test]
+    fn the_demo_backend_owns_no_output_devices() {
+        let backend = FakeAudioBackend::new();
+        assert_eq!(backend.list_outputs().unwrap(), Vec::new());
+        assert!(backend.set_default_output(1).is_err(), "switching to a device that does not exist must not report success");
     }
 }

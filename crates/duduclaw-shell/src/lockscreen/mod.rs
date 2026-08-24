@@ -158,8 +158,25 @@ pub(crate) fn idle_after_from_env() -> Option<Duration> {
 /// establish. Any other value — including unset, empty, or a typo — means
 /// "password required": the safe default, so a malformed value can never
 /// accidentally disable the credential gate.
+///
+/// ── Q1 (2026-08-24): now behind the compile-time shipping gate ──────────
+/// This is a **complete lock bypass**, and the appliance's kiosk launcher
+/// sources `/etc/duduclaw/kiosk.env` with `set -a` into the session tree on
+/// a read-write root — so on the previous code one line in one file
+/// permanently unlocked a duty machine, invisibly, with no image rebuild.
+/// It now reads through `crate::shipping::debug_env`, which answers `None`
+/// unless the binary was built `--features debug-affordances`. A shipping
+/// binary therefore ALWAYS requires the password.
+///
+/// The headless-smoke and unattended-kiosk cases the hatch was written for
+/// still work on a `debug-affordances` build (the dev loop's default
+/// invocation). An unattended kiosk that genuinely needs no lock password in
+/// a SHIPPING image now needs a real decision — a build-time/OEM flag, not a
+/// runtime env var — and that is recorded as an open 拍板 item in this
+/// round's report rather than quietly kept as an env-var backdoor.
 pub(crate) fn password_required_from_env() -> bool {
-    !std::env::var("DUDUCLAW_SHELL_LOCK_NO_PASSWORD").is_ok_and(|v| v.trim() == "1")
+    !crate::shipping::debug_env("DUDUCLAW_SHELL_LOCK_NO_PASSWORD")
+        .is_some_and(|v| v.trim() == "1")
 }
 
 /// Every accessibility option this shell can actually apply, live, from the
@@ -780,10 +797,21 @@ mod tests {
         });
     }
 
+    /// Q1 (2026-08-24): the assertion now depends on the SHIPPING GATE, and
+    /// deliberately asserts something in both configurations rather than
+    /// being `#[cfg]`-skipped in one of them — a bypass test that silently
+    /// stops running is worse than no test. See `crate::shipping`.
     #[test]
-    fn no_password_env_exactly_one_disables_the_password_requirement() {
+    fn no_password_env_exactly_one_disables_the_password_requirement_only_in_a_debug_build() {
         with_env("DUDUCLAW_SHELL_LOCK_NO_PASSWORD", Some("1"), || {
-            assert!(!password_required_from_env());
+            if crate::shipping::debug_affordances_available() {
+                assert!(!password_required_from_env());
+            } else {
+                assert!(
+                    password_required_from_env(),
+                    "a shipping build must require the password no matter what the environment says"
+                );
+            }
         });
     }
 

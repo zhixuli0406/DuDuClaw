@@ -773,7 +773,17 @@ fn dispatch_power_action(view: &mut ShellView, action: crate::gateway_client::Po
 /// `overlay/controlcenter.rs`'s own doc comment) and the idle watchdog
 /// (`maybe_auto_lock` below), so both paths behave identically.
 pub(crate) fn lock_and_refresh(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    let was_locked = view.lockscreen.is_locked();
     view.lockscreen.lock();
+    // D9-bug4 (2026-08-24): tell the compositor, or the lock screen paints
+    // UNDER every application window (it lives on the `Background` layer) and
+    // the operator sees Chromium on a machine they just locked. Announced on
+    // the false -> true edge only: this is also the auto-lock watchdog's
+    // entry point, and it must not spawn a socket thread every tick once the
+    // screen is already locked. See `crate::notify_comp_session_locked`.
+    if !was_locked {
+        crate::notify_comp_session_locked(true);
+    }
     view.surface.close();
     // D3-b (2026-08-23): closing the Launcher this way must also drop
     // whatever was typed into its search box, exactly as every other close
@@ -797,6 +807,10 @@ pub(crate) fn unlock(view: &mut ShellView, cx: &mut Context<ShellView>) {
         return;
     }
     view.lockscreen.unlock();
+    // D9-bug4: the mirror of `lock_and_refresh`'s announcement. The early
+    // return above already makes this the true -> false edge, so the
+    // compositor is told exactly once per real unlock.
+    crate::notify_comp_session_locked(false);
     cx.notify();
 }
 
