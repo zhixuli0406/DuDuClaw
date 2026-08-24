@@ -147,8 +147,6 @@ struct HfListModel {
     #[serde(default)]
     downloads: Option<u64>,
     #[serde(default)]
-    likes: Option<u64>,
-    #[serde(default)]
     tags: Option<Vec<String>>,
 }
 
@@ -764,7 +762,6 @@ mod tests {
         let m = |id: &str, tags: &[&str]| HfListModel {
             model_id: id.into(),
             downloads: Some(1),
-            likes: None,
             tags: Some(tags.iter().map(|s| s.to_string()).collect()),
         };
         assert!(intent_matches_listing(Intent::Code, &m("unsloth/Qwen3-Coder-GGUF", &[])));
