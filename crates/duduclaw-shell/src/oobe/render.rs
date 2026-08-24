@@ -110,11 +110,28 @@ fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Contex
         }
         cx.notify();
     });
+    // D2-b (2026-08-24): the mouse-driven completion paths below used to
+    // set `view.oobe = None` on `flow.completed()` WITHOUT the two lines
+    // `main.rs`'s keyboard path (`handle_enter_key`'s `EnterOutcome::
+    // Advance` arm) carries out right next to its own `self.oobe = None` —
+    // copying `flow.state().selections.theme` onto `view.theme` and telling
+    // comp via `notify_comp_theme`. `ShellView::render` paints Home from
+    // `self.theme`, never from the (now-gone) `flow.state()`, so OOBE
+    // completed via 完成/略過 (the buttons everyone actually clicks —
+    // `Enter` is a keyboard-only alternate path) landed on Home still
+    // showing whatever `initial_theme` boot loaded, even though `save_
+    // state` had already written the picked theme to disk correctly (which
+    // is why a SHELL RESTART after this same OOBE run picked it up fine —
+    // only the same-process transition was missing it). Both closures below
+    // now mirror `main.rs`'s two lines exactly, so all three completion
+    // sites (Enter, 完成, 略過) agree.
     let skip_click = cx.listener(|view, _ev, _window, cx| {
         if let Some(flow) = view.oobe.as_mut() {
             flow.skip();
             super::save_state(flow.state());
             if flow.completed() {
+                view.theme = flow.state().selections.theme;
+                crate::notify_comp_theme(view.theme);
                 view.oobe = None;
             }
         }
@@ -130,6 +147,10 @@ fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Contex
             flow.next_with_wired(wired_online);
             super::save_state(flow.state());
             if flow.completed() {
+                // D2-b: see this fn's header comment just above `skip_
+                // click` for why these two lines must run here too.
+                view.theme = flow.state().selections.theme;
+                crate::notify_comp_theme(view.theme);
                 view.oobe = None;
             }
         }
@@ -182,4 +203,50 @@ fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Contex
         .child(left)
         .child(div().flex_1().child(widgets::progress_dots(step.index(), OobeStep::ALL.len(), palette)))
         .child(right)
+}
+
+#[cfg(test)]
+mod tests {
+    /// D2-b (2026-08-24): both mouse-driven completion closures in
+    /// [`button_row`] (`continue_click` for 完成/繼續, `skip_click` for 略過)
+    /// must carry `flow.state().selections.theme` onto `view.theme` and call
+    /// `notify_comp_theme` before dropping `view.oobe` — see `ShellView::
+    /// theme`'s own doc comment (`main.rs`) for why. `Enter` (`main.rs`'s
+    /// `handle_enter_key`) already did this; the two button closures here did
+    /// not, which is exactly why a same-process OOBE→Home transition via the
+    /// button everyone actually clicks silently kept the boot-time theme
+    /// while a shell RESTART after the same run picked the persisted choice
+    /// up fine (`oobe::save_state` was never the missing half).
+    ///
+    /// Same "crude but load-bearing" source-scan shape `main.rs`'s own test
+    /// module already uses for gpui closures a plain unit test cannot drive
+    /// (no `TestAppContext` window round-trip for one assertion) — it cannot
+    /// prove the theme reaches the screen (that's the VM live check), but it
+    /// fails loudly the instant either closure regresses to bare
+    /// `view.oobe = None`.
+    #[test]
+    fn both_oobe_completion_buttons_carry_the_theme_pick_onto_home() {
+        let source = include_str!("render.rs");
+        let closures = [
+            ("skip_click", "let skip_click ="),
+            ("continue_click", "let continue_click ="),
+        ];
+        for (name, marker) in closures {
+            let start = source.find(marker).unwrap_or_else(|| panic!("{name} closure not found in oobe/render.rs"));
+            // Each closure body is short and self-contained; a fixed forward
+            // window comfortably covers it without needing a real brace
+            // matcher (same pragmatism the rest of this crate's source-scan
+            // tests use).
+            let window = &source[start..(start + 1200).min(source.len())];
+            assert!(
+                window.contains("view.theme = flow.state().selections.theme"),
+                "{name} completes OOBE without carrying the theme pick onto `view.theme` — \
+                 Home would keep showing the boot-time theme until the next restart"
+            );
+            assert!(
+                window.contains("notify_comp_theme(view.theme)"),
+                "{name} completes OOBE without telling comp the new theme via notify_comp_theme"
+            );
+        }
+    }
 }

@@ -117,10 +117,16 @@ pub(crate) fn parse_status(payload: &Value) -> UpdateStatus {
 /// Pure: `systemd-sysupdate list --json=short`'s stdout -> rows.
 ///
 /// Deliberately tolerant in one direction only. It accepts a top-level array
-/// (the documented shape) or an object with a `"versions"`/`"transfers"`
-/// array (shapes seen across systemd releases), and it skips any entry with
-/// no usable `version` string. It never SYNTHESISES a row: text it cannot
-/// parse yields an empty vec, and the caller then shows the raw output.
+/// (the documented shape), an object with a `"versions"`/`"transfers"` array
+/// (shapes seen across systemd releases), or the REAL shape this appliance's
+/// own `systemd-sysupdate` binary actually emits — `{"current":"0.1.0",
+/// "all":["0.1.0"],"appstreamUrls":[]}` — found live during the M1 VM sweep
+/// (2026-08-24): every prior round's build only ever produced the honest
+/// "無法判斷" fallback in practice, because NONE of the shapes this function
+/// recognized before today matched the command it actually parses. It skips
+/// any entry with no usable `version` string. It never SYNTHESISES a row:
+/// text it cannot parse yields an empty vec, and the caller then shows the
+/// raw output.
 pub(crate) fn parse_version_rows(stdout: &str) -> Vec<VersionRow> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -129,6 +135,9 @@ pub(crate) fn parse_version_rows(stdout: &str) -> Vec<VersionRow> {
     let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
         return Vec::new();
     };
+    if let Some(rows) = parse_current_all_shape(&value) {
+        return rows;
+    }
     let list = match &value {
         Value::Array(items) => items.clone(),
         Value::Object(map) => map
@@ -160,6 +169,42 @@ pub(crate) fn parse_version_rows(stdout: &str) -> Vec<VersionRow> {
         });
     }
     rows
+}
+
+/// The real `systemd-sysupdate list --json=short` shape: a top-level OBJECT
+/// with `"current"` (the installed version string) and `"all"` (every
+/// version string sysupdate knows about, INCLUDING current — a flat array of
+/// STRINGS, not objects). Unlike the `"versions"`/`"transfers"` shape above,
+/// these entries carry no per-item flags at all, so `installed`/`available`
+/// have to be DERIVED from `current` and list membership rather than read
+/// off each entry.
+///
+/// Returns `None` (not an empty `Vec`) when the shape does not match at all,
+/// so the caller can fall through to the other shapes rather than treating a
+/// present-but-different object as "this shape, zero rows".
+fn parse_current_all_shape(value: &Value) -> Option<Vec<VersionRow>> {
+    let map = value.as_object()?;
+    let current = map.get("current").and_then(Value::as_str)?;
+    let all = map.get("all").and_then(Value::as_array)?;
+    let mut rows = Vec::new();
+    for entry in all {
+        let Some(version) = entry.as_str() else { continue };
+        if version.trim().is_empty() {
+            continue;
+        }
+        rows.push(VersionRow {
+            version: version.to_string(),
+            installed: version == current,
+            // Listed at all ⇒ sysupdate can fetch/has fetched it — the same
+            // "listed means available" reading the other shape uses for a
+            // missing `available` key.
+            available: true,
+            // This shape carries no obsolete/superseded concept; never
+            // invented, same default the other shape uses for a missing key.
+            obsolete: false,
+        });
+    }
+    Some(rows)
 }
 
 fn parse_apply(payload: &Value) -> ApplyOutcome {
@@ -373,6 +418,39 @@ mod tests {
     fn an_object_wrapped_listing_also_parses() {
         let s = status(r#"{"versions":[{"version":"0.3.0","installed":true}]}"#, true);
         assert_eq!(s.installed_version(), Some("0.3.0"));
+    }
+
+    /// The REAL `systemd-sysupdate list --json=short` shape — found live
+    /// during the M1 VM sweep (2026-08-24): this appliance's actual binary
+    /// answers `{"current":"0.1.0","all":["0.1.0"],"appstreamUrls":[]}`, not
+    /// either shape above. Before this test/fix, this exact real-world
+    /// output always fell through to "無法判斷" on every real machine —
+    /// caught by clicking through the live Settings 更新 page, not by
+    /// reading the code.
+    #[test]
+    fn the_real_sysupdate_current_all_shape_parses() {
+        let s = status(r#"{"current":"0.1.0","all":["0.1.0"],"appstreamUrls":[]}"#, true);
+        assert!(s.has_structured_answer(), "the real shape must not fall back to the unparseable-output message");
+        assert_eq!(s.installed_version(), Some("0.1.0"));
+        assert_eq!(s.candidate_version(), None, "the only listed version IS the installed one — nothing to offer");
+    }
+
+    /// Same real shape, but `all` actually offers something newer.
+    #[test]
+    fn the_real_sysupdate_shape_offers_a_newer_version_when_one_is_listed() {
+        let s = status(r#"{"current":"0.1.0","all":["0.1.0","0.2.0"],"appstreamUrls":[]}"#, true);
+        assert_eq!(s.installed_version(), Some("0.1.0"));
+        assert_eq!(s.candidate_version(), Some("0.2.0"));
+    }
+
+    /// An object that merely HAPPENS to have neither `"current"`/`"all"` nor
+    /// `"versions"`/`"transfers"` must still fall through to the honest
+    /// empty answer, not panic or silently match the wrong branch.
+    #[test]
+    fn an_object_with_none_of_the_known_shapes_yields_no_rows() {
+        let s = status(r#"{"unexpected":"shape"}"#, true);
+        assert!(s.rows.is_empty());
+        assert!(!s.has_structured_answer());
     }
 
     /// An obsolete or already-installed entry is never offered as an update.

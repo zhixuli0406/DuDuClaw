@@ -305,7 +305,14 @@ fn render_surface_content(kind: ChromeSurface, shell: &mut ShellView, window: &m
                     .relative()
                     .size_full()
                     .font(theme::app_font())
-                    .child(home::render_dock(palette, &shell.running_windows, &shell.installed_apps, cx))
+                    .child(home::render_dock(
+                        palette,
+                        &shell.running_windows,
+                        &shell.installed_apps,
+                        &shell.overlay_ui.notifications,
+                        &shell.overlay_ui.task_progress,
+                        cx,
+                    ))
                     .into_any_element()
             }
         }
@@ -377,6 +384,9 @@ fn render_overlay_content(shell: &mut ShellView, _window: &mut Window, cx: &mut 
         // chrome mode has to carry it or the refresh would work only on the
         // other one.
         view.overlay_ui.codrive.reset();
+        // D4a-6 (2026-08-24): same reasoning, one row further — see
+        // `overlay::wifi_tile::WifiTileState::reset`.
+        view.overlay_ui.wifi_tile.reset();
         cx.notify();
     });
 

@@ -311,7 +311,7 @@ pub(super) fn render(
     panel
         .child(header(palette, ui.notifications.is_busy()))
         .child(tabs(palette))
-        .child(content(&ui.notifications, notify_center, palette, cx))
+        .child(content(&ui.notifications, &ui.task_progress, notify_center, palette, cx))
         .child(footer(palette))
 }
 
@@ -388,6 +388,12 @@ pub(crate) fn schedule_stale_check(cx: &mut Context<ShellView>) {
                     return false;
                 }
                 trigger_refresh_if_stale(view, cx);
+                // A4 (2026-08-24): rides this SAME already-armed timer —
+                // see `notifications_tasks::trigger_task_refresh_if_stale`'s
+                // own doc comment for why a second independent timer is
+                // exactly the WP-A4-4 regression this file's own header
+                // comment documents.
+                super::notifications_tasks::trigger_task_refresh_if_stale(view, cx);
                 true
             });
             match keep_polling {
@@ -462,6 +468,11 @@ fn tabs(palette: ShellPalette) -> Div {
 
 fn content(
     feed: &NotificationsFeed,
+    // A4 (2026-08-24): the "進行中任務" section's own feed — see
+    // `overlay::notifications_tasks`'s own header comment for why it is a
+    // sibling read here rather than folded into `feed` above (a different
+    // gateway query, a different, much simpler state machine).
+    task_progress: &super::task_progress_feed::TaskProgressFeed,
     notify_center: &crate::notifyd::center::NotificationCenter,
     palette: ShellPalette,
     cx: &mut Context<ShellView>,
@@ -499,6 +510,7 @@ fn content(
     }
 
     body = super::notifications_apps::app_notifications_section(body, notify_center, palette, cx);
+    body = super::notifications_tasks::task_progress_section(body, task_progress, palette);
 
     body.child(
         div()

@@ -20,6 +20,17 @@
 //                  use here, and `Cargo.toml`'s own comment for the same).
 //   `approvals` — typed `ApprovalItem` + `list_approvals`/`decide_approval`,
 //                  the only two RPCs this round needs.
+//   `tasks`     — A1 result-loopback (2026-08-24): `AgentRef`/`CreatedGoal`/
+//                  `TaskSnapshot` + `list_agents`/`pick_default_agent`/
+//                  `create_goal`/`list_tasks`/`decide_goal_task` — the
+//                  Launcher's 交辦 card and its own agent-scoped poll loop.
+//   `task_progress` — A4 (2026-08-24): typed `TaskProgressItem` +
+//                  `list_in_progress_tasks`, over the SAME `ws_rpc::
+//                  call_once` — the dock badge / Notifications panel's
+//                  "進行中任務" section. A SEPARATE module from `tasks`
+//                  above on purpose — see `task_progress.rs`'s own header
+//                  comment for why the two `tasks.list` callers don't share
+//                  one function.
 //
 // Every function in this module tree is a PLAIN BLOCKING call. Callers run
 // it from a `std::thread::spawn` and bridge the result back to gpui via
@@ -36,9 +47,27 @@ mod login;
 /// contract and for why a pre-auth surface may call it at all.
 mod power;
 pub mod session;
+/// A1 result-loopback (2026-08-24): agent listing + goal-task submit/poll/
+/// decide for the Launcher's 交辦 card — see this file's own module-table
+/// comment above.
+pub mod tasks;
+/// A4 (2026-08-24): `tasks.list(status="in_progress")` — the in-progress
+/// task count/list the dock badge and Notifications panel's "進行中任務"
+/// section this round need. See this file's own module-table comment above
+/// for why it is not folded into `tasks` above.
+pub mod task_progress;
 mod ws_rpc;
 
 pub use approvals::{decide_approval, list_approvals, ApprovalItem};
+// `AgentRef`/`CreatedGoal` are only ever named through inference at their two
+// call sites (`launcher.rs`'s `pick_default_agent(&agents)` /
+// `create_goal(...)`'s return value, never spelled `gateway_client::AgentRef`
+// literally) — same "kept for whichever future caller needs it by name"
+// allowance `duduclaw-native-gui/src/rpc.rs::CallError::Rejected`'s own doc
+// comment gives for the identical situation, not dead code to delete.
+#[allow(unused_imports)]
+pub use tasks::{create_goal, decide_goal_task, list_agents, list_tasks, pick_default_agent, AgentRef, CreatedGoal, TaskSnapshot};
+pub use task_progress::{list_in_progress_tasks, TaskProgressItem};
 pub(crate) use login::{verify_password, LoginError};
 pub(crate) use power::{power_local, PowerAction, PowerError};
 pub use session::{bootstrap_local_session, SessionError};

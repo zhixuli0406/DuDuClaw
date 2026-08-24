@@ -84,6 +84,7 @@ use crate::fake_data;
 use crate::i18n::{t, Key, Locale};
 use crate::icons;
 use crate::overlay::notifications_feed::{FeedStatus, NotificationsFeed};
+use crate::overlay::task_progress_feed::TaskProgressFeed;
 use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::ShellView;
@@ -168,9 +169,17 @@ pub fn render(
     notifications: &NotificationsFeed,
     running_windows: &RunningWindowsFeed,
     installed_apps: &crate::apps::feed::InstalledAppsFeed,
+    // A4 (2026-08-24): `&self.overlay_ui.task_progress` from the same
+    // caller — the dock badge (`home_dock::dock`) reads it alongside
+    // `notifications` for its combined pending-approvals/in-progress-tasks
+    // count. See `overlay::task_progress_feed::TaskProgressFeed`'s own
+    // header comment.
+    task_progress: &TaskProgressFeed,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
-    desktop_content(palette, cx).child(menu_bar(palette, notifications, cx)).child(home_dock::dock(palette, running_windows, installed_apps, cx))
+    desktop_content(palette, cx)
+        .child(menu_bar(palette, notifications, cx))
+        .child(home_dock::dock(palette, running_windows, installed_apps, notifications, task_progress, cx))
 }
 
 /// WM-3 layer-shell migration (`crate::chrome`, 2026-08-23): everything
@@ -252,13 +261,18 @@ pub(crate) fn render_dock(
     palette: ShellPalette,
     running_windows: &RunningWindowsFeed,
     installed_apps: &crate::apps::feed::InstalledAppsFeed,
+    // A4 (2026-08-24): same two feeds `render`'s own doc comment above adds
+    // — the layer-shell dock surface must show the identical badge the
+    // single-fullscreen path does.
+    notifications: &NotificationsFeed,
+    task_progress: &TaskProgressFeed,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
     div()
         .id("shell-dock-surface")
         .relative()
         .size_full()
-        .child(home_dock::dock_surface(palette, running_windows, installed_apps, cx))
+        .child(home_dock::dock_surface(palette, running_windows, installed_apps, notifications, task_progress, cx))
 }
 
 fn blob_top_left(top: f32, left: f32, size: f32, color: gpui::Rgba) -> Div {

@@ -792,6 +792,31 @@ pub(crate) fn lock_and_refresh(view: &mut ShellView, cx: &mut Context<ShellView>
     // half is handled anyway: `reveal_and_focus` moves focus onto the
     // password field on the first keystroke after locking.
     view.launcher_query_field.field.update(cx, |field, cx| field.clear(cx));
+    // D9-bug9 (2026-08-24), M1 round: the password field gets the SAME
+    // unconditional clear the Launcher's search box gets just above — it
+    // used to get NONE. `LockPasswordField` is created ONCE at window-open
+    // time and reused for the shell's entire process lifetime (`main.rs`'s
+    // own field doc comment); before this round the only path that ever
+    // cleared it was a SUCCESSFUL submit (`dispatch_unlock_attempt` below),
+    // so anything left behind by a lock cycle that never reached a clean
+    // submit — a throttled/in-flight attempt the operator gave up on, or
+    // (the M1 evidence) a flood of synthetic repeat characters from a
+    // `cmd-l` chord's release racing the lock transition (see
+    // `duduclaw-comp::session_lock::DuduclawComp::force_keyboard_leave_
+    // enter_cycle`'s own doc comment for that mechanism) — sat there
+    // silently and reappeared the INSTANT the next lock's prompt was
+    // revealed, before the operator had typed a single character. Clearing
+    // here makes every lock start from a guaranteed-empty field regardless
+    // of how the PREVIOUS lock cycle ended, the same guarantee `lock()`
+    // already gives `unlock_prompt`/`power` (see `LockScreenState::lock`'s
+    // own doc comment) — this is the missing third piece of that same
+    // "guaranteed-clean slate" contract, just one layer up (gpui state, not
+    // `LockScreenState`'s own plain data). This does NOT by itself stop a
+    // repeat flood that is still actively happening at THIS exact instant
+    // (only `force_keyboard_leave_enter_cycle` on the compositor side does
+    // that) — it closes the SEPARATE "leftover from last time" hole a live
+    // flood-suppression fix cannot.
+    view.lockscreen_password_field.field.update(cx, |field, cx| field.clear(cx));
     crate::overlay::notifications::trigger_refresh_if_stale(view, cx);
     cx.notify();
 }

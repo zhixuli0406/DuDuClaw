@@ -45,6 +45,8 @@ use crate::apps::installed::InstalledApp;
 use crate::comp_client;
 use crate::fake_data::{self, AgentDockStatus, GoalDot};
 use crate::home::running_windows::RunningWindowsFeed;
+use crate::overlay::notifications_feed::NotificationsFeed;
+use crate::overlay::task_progress_feed::TaskProgressFeed;
 use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::ShellView;
@@ -225,9 +227,11 @@ pub(super) fn dock(
     palette: ShellPalette,
     running_windows: &RunningWindowsFeed,
     installed: &InstalledAppsFeed,
+    notifications: &NotificationsFeed,
+    task_progress: &TaskProgressFeed,
     cx: &mut Context<ShellView>,
 ) -> Div {
-    dock_container(palette, running_windows, installed, cx)
+    dock_container(palette, running_windows, installed, notifications, task_progress, cx)
 }
 
 /// D9-bug (2026-08-24): the dock as `ChromeMode::LayerSurfaces` composes it —
@@ -258,9 +262,11 @@ pub(super) fn dock_surface(
     palette: ShellPalette,
     running_windows: &RunningWindowsFeed,
     installed: &InstalledAppsFeed,
+    notifications: &NotificationsFeed,
+    task_progress: &TaskProgressFeed,
     cx: &mut Context<ShellView>,
 ) -> Div {
-    dock_container(palette, running_windows, installed, cx).on_children_prepainted(|children, window, _cx| {
+    dock_container(palette, running_windows, installed, notifications, task_progress, cx).on_children_prepainted(|children, window, _cx| {
         let wanted = crate::chrome::input_region::shown_region_for(&children);
         crate::chrome::input_region::apply(window, crate::chrome::input_region::RegionSlot::Dock, wanted);
     })
@@ -270,6 +276,8 @@ fn dock_container(
     palette: ShellPalette,
     running_windows: &RunningWindowsFeed,
     installed: &InstalledAppsFeed,
+    notifications: &NotificationsFeed,
+    task_progress: &TaskProgressFeed,
     cx: &mut Context<ShellView>,
 ) -> Div {
     // WP-comp-shell-ipc: keeps `running_windows` warm for as long as Home
@@ -281,6 +289,17 @@ fn dock_container(
     // of Home, so this ONE dispatch keeps the feed warm for both surfaces —
     // the Launcher deliberately does not schedule its own.
     schedule_installed_apps_poll(cx);
+    // A4 (2026-08-24): arms `overlay::notifications`'s single-slot stale
+    // timer from the dock too, not only from the Notifications panel /
+    // lockscreen (that fn's own doc comment names this gap explicitly:
+    // "Home 本身沒有 arm 它... 是後續範圍"). `try_arm_stale_timer` is a
+    // single-claim guard (see that field's own doc comment) — a render pass
+    // that finds it already armed by the panel or the lockscreen is a
+    // one-comparison no-op, so calling this unconditionally on every dock
+    // render costs nothing extra. This is what lets the dock badge below
+    // show real numbers from first paint, on a machine that has never
+    // opened Notifications or locked once.
+    crate::overlay::notifications::schedule_stale_check(cx);
 
     // Main.dc.html: bg `rgba(255,255,255,0.78)` light / `rgba(30,30,33,
     // 0.78)` dark — `surface_raised` (matches `composer`'s own reasoning in
@@ -320,6 +339,13 @@ fn dock_container(
         row = row.child(dock_agent(agent, palette));
     }
     row = row.child(dock_divider(palette));
+    // A4 (2026-08-24): real gap fill — before this round the dock had no
+    // representation at all of pending approvals or in-progress tasks
+    // (`NotificationsFeed`/`TaskProgressFeed` were readable only from the
+    // Notifications panel and the lockscreen). `pending_approvals`/
+    // `in_progress_tasks` are cheap `usize` reads off feeds this fn already
+    // keeps warm via `schedule_stale_check` above — no extra I/O.
+    row = row.child(dock_task_badge(notifications.pending_count(), task_progress.count(), palette, cx));
     row = row.child(dock_settings(palette, cx));
 
     div().absolute().bottom(px(24.)).left(px(0.)).right(px(0.)).flex().justify_center().child(row)
@@ -703,6 +729,99 @@ fn dock_agent(agent: &fake_data::DockAgent, palette: ShellPalette) -> Stateful<D
                 // token).
                 .border_color(theme::alpha(palette.surface_raised, 1.0)),
         )
+}
+
+/// A4 (2026-08-24) — real gap fill: "dock badge：待審批數/進行中任務數的即時
+/// 徽章" (the task brief's own framing). Before this round the dock carried
+/// no signal at all for either count — only `RunningWindowsFeed`'s per-app
+/// running dot (comp windows, a different domain) and the two STATIC
+/// `fake_data::DOCK_AGENTS` `Running`/`NeedsHuman` dots. One tile, same
+/// 44px/10px-radius/neutral-gradient treatment `dock_settings` below
+/// establishes (this crate has no design-board precedent for either of
+/// these — the board never modeled a live task/approval count — so the
+/// EXISTING settings-tile visual language is reused rather than inventing a
+/// new one, same "no board precedent, reuse an existing token pair" call
+/// `dock_app`'s own header comment makes for its running-indicator dot).
+///
+/// Clicking it opens the SAME Notifications panel the menu-bar approval
+/// ticker opens (`overlay::notifications::open_and_refresh`) — this round
+/// also adds that panel's "進行中任務" section (`notifications_tasks::
+/// task_progress_section`), so the number on the badge and what appears
+/// when you click it are the same underlying data, not two disconnected
+/// surfaces.
+fn dock_task_badge(pending_approvals: usize, in_progress_tasks: usize, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    let total = pending_approvals + in_progress_tasks;
+    let on_click = cx.listener(|view, _ev, _window, cx| {
+        if crate::diag_enabled() {
+            eprintln!("[hit] dock task badge -> open Notifications");
+        }
+        crate::overlay::notifications::open_and_refresh(view, cx);
+        cx.notify();
+    });
+
+    let glyph_color = if palette.is_dark() { palette.text_secondary } else { palette.brand_foreground };
+
+    let mut tile = div()
+        .id("shell-dock-task-badge")
+        .relative()
+        .cursor_pointer()
+        .w(px(44.))
+        .h(px(44.))
+        .rounded(px(10.))
+        .bg(linear_gradient(
+            180.0,
+            linear_color_stop(rgb(palette.settings_gradient_top), 0.0),
+            linear_color_stop(rgb(palette.settings_gradient_bottom), 1.0),
+        ))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(14.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::alpha(glyph_color, 1.0))
+        .shadow(palette.icon_shadow(0.18, 0.30))
+        .hover(|style| style.opacity(0.85))
+        // "通" (a plain zh-TW glyph, not an emoji — this crate's own "零
+        // emoji／手繪 SVG" convention) is the fallback if `icons::BELL`'s
+        // asset ever fails to resolve; the real SVG is what renders in the
+        // common case (`assets/icons/bell.svg` — declared in `icons.rs` but,
+        // as of this round, otherwise unused anywhere in the shell).
+        .child(crate::icons::icon_or_glyph(&[(crate::icons::BELL, palette.icon_on_neutral_gradient())], 20., "通"));
+
+    if total > 0 {
+        // Capped display, not a capped COUNT — `total` itself is never
+        // clamped (a caller reading `pending_approvals`/`in_progress_tasks`
+        // directly still gets the real numbers), only the two-character
+        // badge glyph is, same "honest data, bounded rendering" split
+        // `notifications_feed::MAX_DECIDED_HISTORY`'s own doc comment draws
+        // for a different list.
+        let label = if total > 9 { "9+".to_string() } else { total.to_string() };
+        tile = tile.child(
+            div()
+                .absolute()
+                .top(px(-3.))
+                .right(px(-3.))
+                .min_w(px(16.))
+                .h(px(16.))
+                .rounded(px(8.))
+                .px(px(3.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme::alpha(palette.destructive, 1.0))
+                .border_2()
+                // Same "dot's border matches the surface it sits against"
+                // rule `dock_agent`'s own status dot uses — here that
+                // surface is the DOCK, not the menu bar.
+                .border_color(theme::alpha(palette.surface_raised, 1.0))
+                .text_size(px(9.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::alpha(0xffffff, 1.0))
+                .child(label),
+        );
+    }
+
+    tile.on_click(on_click)
 }
 
 /// Round 3: clicking the settings icon opens ControlCenter (task brief:

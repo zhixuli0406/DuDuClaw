@@ -242,6 +242,23 @@ pub(crate) struct OobeTextField {
     inner: Entity<ImeTextInput>,
     masked: bool,
     chrome: FieldChrome,
+    /// W7-3 (`IME-account-fields-zhuyin`, 2026-08-24): does this field ever
+    /// legitimately hold non-ASCII content? `false` (the default via
+    /// `new_ascii_only`'s siblings below) means "no" — on focus-gained this
+    /// field proactively switches fcitx5 to `keyboard-us` (and back to
+    /// `chewing` on focus-lost), via `super::ime_focus::on_focus_transition`
+    /// in `Render::render` below. See `ime_focus.rs`'s own header comment
+    /// for the full bug writeup and why this is safe (does NOT touch
+    /// `accepts_text_input`/text-input-disable, which `TextInputStyle::
+    /// masked`'s own doc comment already found unsafe on this appliance).
+    /// Independent of `masked`: the account NAME field is ASCII-only but
+    /// not masked, so a single flag cannot serve both purposes.
+    ascii_only: bool,
+    /// Edge-detect state for the focus-transition call above — `render` runs
+    /// every frame and recomputes `focused` fresh each time (no separate
+    /// focus-change subscription exists on this widget), so the transition
+    /// itself has to be diffed against the previous pass's read.
+    was_focused: bool,
 }
 
 impl OobeTextField {
@@ -249,6 +266,7 @@ impl OobeTextField {
         cx: &mut App,
         placeholder: impl Into<SharedString>,
         masked: bool,
+        ascii_only: bool,
         chrome: FieldChrome,
     ) -> Entity<Self> {
         // Colors are pushed per render pass (see `Render` below) — the style
@@ -257,7 +275,7 @@ impl OobeTextField {
         // a globally bound `OobeNext` action in this crate, so it never
         // reaches a raw key listener), and whether it masks.
         let inner = ImeTextInput::with_style(cx, placeholder, TextInputStyle::single_line().masked(masked));
-        cx.new(|_cx| Self { inner, masked, chrome })
+        cx.new(|_cx| Self { inner, masked, chrome, ascii_only, was_focused: false })
     }
 
     /// Everything typed so far. Returns an owned `String` rather than a
@@ -302,6 +320,13 @@ impl Render for OobeTextField {
         let palette = cx.try_global::<ShellPalette>().copied().unwrap_or_default();
         let handle = self.inner.read(cx).focus_handle(cx);
         let focused = handle.is_focused(window);
+        // W7-3: edge-detect a focus transition on this ASCII-only field and
+        // proactively switch fcitx5's active engine — see `ime_focus.rs`'s
+        // own header comment. A no-op for every non-`ascii_only` field
+        // (Launcher search, chat) and for every steady (non-transitioning)
+        // frame, which is the overwhelming majority of render passes.
+        super::ime_focus::on_focus_transition(self.ascii_only, self.was_focused, focused);
+        self.was_focused = focused;
         let is_empty = self.inner.read(cx).is_empty();
 
         // `Bare` (the Launcher row) uses the faint text-ladder rank for its
@@ -393,8 +418,12 @@ impl AccountFields {
         // longer typed in for the operator (task brief: replace the static
         // fake VALUES with real typing, not invent new placeholder copy).
         Self {
-            name: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_NAME, false, FieldChrome::Boxed),
-            password: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true, FieldChrome::Boxed),
+            // Both fields are Linux account credentials — ASCII-only by
+            // definition, and exactly the two fields
+            // `IME-account-fields-zhuyin` was filed against. `ascii_only:
+            // true` on both.
+            name: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_NAME, false, true, FieldChrome::Boxed),
+            password: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true, true, FieldChrome::Boxed),
         }
     }
 }
@@ -419,7 +448,9 @@ impl NetworkFields {
         // uses — a generic "this field is masked" shape hint, not a
         // localized string (see that field's own construction above for
         // why `fake_data`'s constants stay unlocalized placeholders).
-        Self { psk: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true, FieldChrome::Boxed) }
+        // A WPA passphrase is ASCII-only (WPA2's own PSK charset) —
+        // `ascii_only: true`, same reasoning as `AccountFields`.
+        Self { psk: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true, true, FieldChrome::Boxed) }
     }
 }
 
@@ -450,7 +481,17 @@ pub(crate) struct LockPasswordField {
 
 impl LockPasswordField {
     pub(crate) fn new(cx: &mut App) -> Self {
-        Self { field: OobeTextField::new(cx, crate::i18n::t(crate::i18n::Locale::ZhTw, crate::i18n::Key::LockPasswordPlaceholder), true, FieldChrome::Boxed) }
+        // The unlock password is the same Linux account credential
+        // `AccountFields.password` sets — `ascii_only: true`.
+        Self {
+            field: OobeTextField::new(
+                cx,
+                crate::i18n::t(crate::i18n::Locale::ZhTw, crate::i18n::Key::LockPasswordPlaceholder),
+                true,
+                true,
+                FieldChrome::Boxed,
+            ),
+        }
     }
 }
 
@@ -477,9 +518,15 @@ impl LauncherQueryField {
         // operator locale selection to read yet, and this crate hardcodes
         // that locale everywhere outside OOBE anyway.
         Self {
+            // The Launcher searches app names/keywords, which are routinely
+            // Chinese (`native.*` i18n strings) — `ascii_only: false`, so
+            // this field keeps starting in `chewing` (`ActiveByDefault`)
+            // exactly as before W7-3. Deliberately verified NOT broken by
+            // this round: see `ime_focus.rs`'s own header comment.
             field: OobeTextField::new(
                 cx,
                 crate::i18n::t(crate::i18n::Locale::ZhTw, crate::i18n::Key::LauncherSearchPlaceholder),
+                false,
                 false,
                 FieldChrome::Bare,
             ),
@@ -522,15 +569,19 @@ pub(crate) struct SettingsFields {
 
 impl SettingsFields {
     pub(crate) fn new(cx: &mut App) -> Self {
+        // Every field in this panel is ASCII-only by construction (IANA zone
+        // names, account passwords, a WPA passphrase, dotted-quad/CIDR
+        // addresses) — `ascii_only: true` throughout, same W7-3 reasoning as
+        // `AccountFields`/`NetworkFields`/`LockPasswordField` above.
         Self {
-            timezone: OobeTextField::new(cx, "Asia/Taipei", false, FieldChrome::Boxed),
-            current_password: OobeTextField::new(cx, "••••••••", true, FieldChrome::Boxed),
-            new_password: OobeTextField::new(cx, "••••••••", true, FieldChrome::Boxed),
-            confirm_password: OobeTextField::new(cx, "••••••••", true, FieldChrome::Boxed),
-            wifi_psk: OobeTextField::new(cx, "••••••••", true, FieldChrome::Boxed),
-            ip_address: OobeTextField::new(cx, "192.168.1.50/24", false, FieldChrome::Boxed),
-            ip_gateway: OobeTextField::new(cx, "192.168.1.1", false, FieldChrome::Boxed),
-            ip_dns: OobeTextField::new(cx, "1.1.1.1, 8.8.8.8", false, FieldChrome::Boxed),
+            timezone: OobeTextField::new(cx, "Asia/Taipei", false, true, FieldChrome::Boxed),
+            current_password: OobeTextField::new(cx, "••••••••", true, true, FieldChrome::Boxed),
+            new_password: OobeTextField::new(cx, "••••••••", true, true, FieldChrome::Boxed),
+            confirm_password: OobeTextField::new(cx, "••••••••", true, true, FieldChrome::Boxed),
+            wifi_psk: OobeTextField::new(cx, "••••••••", true, true, FieldChrome::Boxed),
+            ip_address: OobeTextField::new(cx, "192.168.1.50/24", false, true, FieldChrome::Boxed),
+            ip_gateway: OobeTextField::new(cx, "192.168.1.1", false, true, FieldChrome::Boxed),
+            ip_dns: OobeTextField::new(cx, "1.1.1.1, 8.8.8.8", false, true, FieldChrome::Boxed),
         }
     }
 

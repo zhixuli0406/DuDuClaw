@@ -73,6 +73,9 @@
 mod claim;
 mod fake_data;
 mod focus_order;
+// W7-3 (2026-08-24, `IME-account-fields-zhuyin`): proactive fcitx5 engine
+// switch on focus of ASCII-only fields — see its own header comment.
+mod ime_focus;
 mod network;
 mod network_ui;
 mod persistence;

@@ -77,22 +77,29 @@ pub(super) fn render(flow: &OobeFlow, ui: &OobeUiState, fields: &AccountFields, 
         .child(labeled_field(t(locale, Key::AccountNameLabel), fields.name.clone(), palette))
         .child(labeled_field(t(locale, Key::AccountPasswordLabel), fields.password.clone(), palette));
 
-    if ui.account_validation_error {
-        body = body.child(message_line(t(locale, Key::AccountValidationError), palette.destructive));
+    // W7-2 (OOBE-acct-stuck, 2026-08-24): the status slot is now ALWAYS
+    // appended — never conditionally — so the button below it never moves.
+    // See `status_line`'s own doc comment for the VM-reproduced failure
+    // mode this closes: a `message_line` appearing/disappearing used to
+    // shift the "建立帳號" button's Y position, so a resubmit click aimed at
+    // the button's PRE-error location could land on the (inert) message
+    // text instead once an error was showing — indistinguishable from
+    // `try_submit` itself refusing to run again.
+    let status = if ui.account_validation_error {
+        Some((t(locale, Key::AccountValidationError), palette.destructive))
     } else {
         match ui.account_claim {
             AccountClaimState::Failed(AccountClaimFailureKind::PasswordTooShort) => {
-                body = body.child(message_line(t(locale, Key::AccountPasswordTooShortError), palette.destructive));
+                Some((t(locale, Key::AccountPasswordTooShortError), palette.destructive))
             }
             AccountClaimState::Failed(AccountClaimFailureKind::Unreachable) => {
-                body = body.child(message_line(t(locale, Key::AccountUnreachableError), palette.destructive));
+                Some((t(locale, Key::AccountUnreachableError), palette.destructive))
             }
-            AccountClaimState::Done { already: true } => {
-                body = body.child(message_line(t(locale, Key::AccountAlreadyClaimedInfo), palette.success));
-            }
-            AccountClaimState::Idle | AccountClaimState::InFlight | AccountClaimState::Done { already: false } => {}
+            AccountClaimState::Done { already: true } => Some((t(locale, Key::AccountAlreadyClaimedInfo), palette.success)),
+            AccountClaimState::Idle | AccountClaimState::InFlight | AccountClaimState::Done { already: false } => None,
         }
-    }
+    };
+    body = body.child(status_line(status, palette));
 
     let button_label = if created {
         t(locale, Key::AccountCreatedButton)
@@ -267,5 +274,85 @@ fn labeled_field(label: &'static str, field: gpui::Entity<widgets::OobeTextField
 /// already-resolved `ShellPalette` token (`.destructive` or `.success`) the
 /// caller picked; this helper is just the shared size/layout.
 fn message_line(text: &'static str, color: u32) -> Div {
-    div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(color, 1.0)).child(text)
+    message_line_with_alpha(text, color, 1.0)
+}
+
+/// `message_line`'s own implementation, generalized over the alpha factor
+/// so `status_line`'s invisible placeholder (alpha 0) can reuse the EXACT
+/// same size/shape rather than hand-duplicating it — the whole point of the
+/// placeholder is to be pixel-identical in layout to a real message, just
+/// unseen.
+fn message_line_with_alpha(text: &'static str, color: u32, alpha_factor: f32) -> Div {
+    div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(color, alpha_factor)).child(text)
+}
+
+/// The `AccountCreate` step's status slot — see `render`'s own call site
+/// comment (W7-2, OOBE-acct-stuck) for why this is unconditionally present
+/// rather than appended-or-not. `status` is `None` on the two states that
+/// have nothing to say (`Idle`/`InFlight`/freshly-claimed `Done{already:
+/// false}` — that last one flips `created` instead, which switches the
+/// button label, not this slot); `Some((text, color))` otherwise. Reuses
+/// `message_line_with_alpha` at alpha 0 with a non-breaking space (not an
+/// empty string — an empty text child can collapse a line's height to
+/// zero, defeating the whole point of reserving space) so the placeholder
+/// occupies the SAME height a real one-line message would.
+fn status_line(status: Option<(&'static str, u32)>, palette: crate::palette::ShellPalette) -> Div {
+    match status {
+        Some((text, color)) => message_line(text, color),
+        None => message_line_with_alpha("\u{a0}", palette.destructive, 0.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // ── W7-2 (OOBE-acct-stuck, 2026-08-24) ──────────────────────────────
+    // Root cause, live-reproduced on a scratch VM clone
+    // (`appliance/.vm/w72-evidence/`): `render`'s status message used to be
+    // appended to `body` only when there was something to show, which
+    // shifted the "建立帳號" button down by the message line's height the
+    // instant a validation/claim error appeared. A resubmit click aimed at
+    // the button's PRE-error screen position could then land on the (now
+    // inert) message text instead of the button — `message_line` has no
+    // click handler at all — leaving the screen showing the exact same
+    // "請輸入操作者名稱與密碼" text no matter how many times the operator
+    // retried, indistinguishable from `try_submit` itself refusing to run
+    // again. `try_submit`'s own state transitions were verified correct via
+    // the same VM repro (empty→error→filled→a DIFFERENT, correct message
+    // each time when clicked at the button's CURRENT position) — the bug is
+    // purely this layout instability, not `account_validation_error`/
+    // `AccountClaimState` bookkeeping.
+    //
+    // Same "crude but load-bearing" source-scan shape this crate already
+    // uses for gpui closures a plain unit test cannot drive (no
+    // `TestAppContext` window round-trip for one assertion; see
+    // `oobe/render.rs`'s and `main.rs`'s own test modules for precedent).
+
+    #[test]
+    fn the_status_slot_is_appended_unconditionally_so_the_button_never_moves() {
+        let source = include_str!("account.rs");
+        assert!(
+            source.contains("\n    body = body.child(status_line(status, palette));\n"),
+            "status_line must be appended as a top-level statement in `render` (4-space \
+             indent) — not nested inside an `if`/`match` arm — or the button's Y position goes \
+             back to depending on whether a status message is showing (OOBE-acct-stuck)"
+        );
+    }
+
+    #[test]
+    fn status_line_has_a_placeholder_arm_for_the_no_message_case() {
+        let source = include_str!("account.rs");
+        let start = source.find("fn status_line(").expect("status_line not found in oobe/steps/account.rs");
+        let window = &source[start..(start + 700).min(source.len())];
+        assert!(
+            window.contains("None =>"),
+            "status_line must handle the no-message case with a real (placeholder) render, not \
+             by omitting the child — an omitted child reintroduces the exact same layout-shift \
+             bug one layer down"
+        );
+        assert!(
+            window.contains("message_line_with_alpha"),
+            "the placeholder arm must reuse message_line_with_alpha so its reserved height \
+             matches a real one-line message's height exactly"
+        );
+    }
 }

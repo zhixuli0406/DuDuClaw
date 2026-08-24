@@ -89,6 +89,21 @@
 // ALSO reused by the two horizontal sliders' own track background — both
 // are the same bespoke gray this file's `track_off_hex` helper centralizes,
 // rather than being duplicated as a literal pair at three call sites.
+//
+// ── D4a-6 (2026-08-24): the Wi-Fi tile is real ────────────────────────────
+// `quick_tiles_row`/`quick_tile` used to render all three quick-settings
+// tiles straight off `fake_data::QUICK_TILES`'s static snapshot (see this
+// file's own earlier header comment, "still renders as a static snapshot of
+// the board's own state"). D4b built a real `network.status`-backed Wi-Fi
+// page and deliberately left this row alone (its own header comment says
+// so); this round closes that one gap. `quick_tile` is now generic over
+// primitives (id/glyph/title/subtitle/active) rather than `&fake_data::
+// QuickTile`, so ONE render function serves both the two still-fake tiles
+// (Bluetooth/勿擾, unchanged) and the Wi-Fi tile's real
+// `overlay::wifi_tile::WifiTileState` — see that module's own header
+// comment for the backend/state side. Matched by id
+// (`wifi_tile::WIFI_TILE_ID`), not by array position, so a future reorder
+// of `fake_data::QUICK_TILES` cannot silently wire the wrong tile.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -141,6 +156,17 @@ const AUDIO_LAST_CALL_FAILED_NOTICE: &str = "最後一次音量調整沒有成�
 const AUDIO_NO_VALUE_NOTICE: &str = "讀不到音量，這台機器可能沒有接上輸出裝置。";
 
 pub(super) fn render(ui: &OverlayUiState, audio_ui: &audio::AudioUiState, palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+    // D4a-6 (2026-08-24): the Wi-Fi tile's real read — the same render-time,
+    // idempotent `cx.spawn` then `weak.update` dispatch `codrive_row::
+    // render`/`audio::ensure_volume_probed` already use for a panel that has
+    // to show state nobody clicked for yet. `ensure_loaded` itself is a
+    // no-op once loaded (`Load::needs_load()` only arms on `NotLoaded`), so
+    // this is safe to call on every repaint.
+    cx.spawn(async move |weak, cx| {
+        let _ = weak.update(cx, super::wifi_tile::ensure_loaded);
+    })
+    .detach();
+
     // ControlCenter.dc.html: bg `rgba(255,255,255,0.96)` light / `rgba(30,
     // 30,33,0.96)` dark — `surface_raised` in both. Border: opaque
     // `border()` light / `rgba(255,255,255,0.12)` dark.
@@ -166,7 +192,7 @@ pub(super) fn render(ui: &OverlayUiState, audio_ui: &audio::AudioUiState, palett
         panel = panel.text_color(theme::alpha(palette.foreground, 1.0));
     }
     panel
-        .child(quick_tiles_row(palette))
+        .child(quick_tiles_row(&ui.wifi_tile, palette))
         .child(sliders_card(audio_ui, palette, cx))
         .child(ai_team_card(ui, palette, cx))
         .child(system_settings_card(palette, cx))
@@ -337,17 +363,27 @@ fn track_off_hex(palette: ShellPalette) -> u32 {
     if palette.is_dark() { 0x3f3f46 } else { 0xe4e4e7 }
 }
 
-// ── Quick settings (static) ──────────────────────────────────────────────
+// ── Quick settings (Wi-Fi real, Bluetooth/勿擾 still static) ─────────────
 
-fn quick_tiles_row(palette: ShellPalette) -> Div {
+fn quick_tiles_row(wifi: &super::wifi_tile::WifiTileState, palette: ShellPalette) -> Div {
     let mut row = div().flex().gap(px(10.));
     for tile in fake_data::QUICK_TILES {
-        row = row.child(quick_tile(tile, palette));
+        if tile.id == super::wifi_tile::WIFI_TILE_ID {
+            let (active, subtitle) = wifi.tile_status();
+            row = row.child(quick_tile(tile.id, tile.glyph, tile.title, &subtitle, active, palette));
+        } else {
+            row = row.child(quick_tile(tile.id, tile.glyph, tile.title, tile.subtitle, tile.active, palette));
+        }
     }
     row
 }
 
-fn quick_tile(tile: &fake_data::QuickTile, palette: ShellPalette) -> Stateful<Div> {
+/// Renders one quick-settings tile. Generic over primitives (not
+/// `&fake_data::QuickTile`) since D4a-6: the Wi-Fi tile's title/subtitle are
+/// now a real, owned `String` read from `network.status`, while Bluetooth/
+/// 勿擾 still pass `fake_data::QuickTile`'s own `&'static str` fields
+/// straight through — one render function, two data sources.
+fn quick_tile(id: &'static str, glyph: &'static str, title: &str, subtitle: &str, active: bool, palette: ShellPalette) -> Stateful<Div> {
     // Active (Wi-Fi) tile: bg `brand` in both themes; title/subtitle stay
     // the SAME literal (`#fafafa` opaque / `rgba(250,250,250,.75)`) in both
     // themes too — a colored tile's own white-on-brand text doesn't need to
@@ -359,20 +395,20 @@ fn quick_tile(tile: &fake_data::QuickTile, palette: ShellPalette) -> Stateful<Di
     // per theme); icon glyph stroke is a bespoke pair (`#52525c`/`#b0b0b8`,
     // no clean token); subtitle is the ONE literal that does NOT invert —
     // see this file's header comment.
-    let (bg_hex, title_hex) = if tile.active { (palette.brand, 0xfafafa) } else { (palette.surface_hover, palette.foreground) };
+    let (bg_hex, title_hex) = if active { (palette.brand, 0xfafafa) } else { (palette.surface_hover, palette.foreground) };
     // ICON-1 (2026-08-22): the two inline literals this used to spell out
     // are now `palette.brand_foreground` (`#fafafa`, the active tile's
     // white-on-brand stroke) and `palette.icon_control()` (`#52525c` light
     // / `#b0b0b8` dark) — the SAME values, resolved through the methods
     // that also tint the real stroke icons below, so the icon and its text
     // fallback can never drift apart.
-    let glyph_hex = if tile.active { palette.brand_foreground } else { palette.icon_control() };
+    let glyph_hex = if active { palette.brand_foreground } else { palette.icon_control() };
     // Main.dc.html/ControlCenter.dc.html: `#9f9fa9`, unchanged across
     // themes — see this file's header comment.
-    let (sub_hex, sub_alpha) = if tile.active { (0xfafafa, 0.75) } else { (0x9f9fa9, 1.0) };
+    let (sub_hex, sub_alpha) = if active { (0xfafafa, 0.75) } else { (0x9f9fa9, 1.0) };
 
     div()
-        .id(tile.id)
+        .id(id)
         .flex_1()
         .bg(theme::alpha(bg_hex, 1.0))
         .rounded(px(13.))
@@ -386,15 +422,15 @@ fn quick_tile(tile: &fake_data::QuickTile, palette: ShellPalette) -> Stateful<Di
                 // (Wi-Fi arcs / Bluetooth rune / crescent moon), falling
                 // back to the "W"/"B"/"勿" placeholder if its asset is
                 // missing.
-                icons::icon_or_glyph(&icons::quick_tile_layers(tile.id, palette, tile.active).unwrap_or_default(), 17., tile.glyph),
+                icons::icon_or_glyph(&icons::quick_tile_layers(id, palette, active).unwrap_or_default(), 17., glyph),
             ),
         )
         .child(
             div()
                 .flex()
                 .flex_col()
-                .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::alpha(title_hex, 1.0)).child(tile.title))
-                .child(div().text_size(px(10.5)).text_color(theme::alpha(sub_hex, sub_alpha)).child(tile.subtitle)),
+                .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::alpha(title_hex, 1.0)).child(title.to_string()))
+                .child(div().text_size(px(10.5)).text_color(theme::alpha(sub_hex, sub_alpha)).child(subtitle.to_string())),
         )
 }
 

@@ -71,7 +71,12 @@ mod controlcenter;
 /// WP-A4-4 (2026-08-22): the Launcher's flatpak install confirmation gate —
 /// a pure state machine, see its own header comment.
 pub(crate) mod install_gate;
-mod launcher;
+/// A1 result-loopback (2026-08-24): `pub(crate)`, not private — `main.rs`
+/// (a sibling module of this one) calls `launcher::try_submit_delegate`
+/// directly from `ShellView::on_oobe_next`, same "sibling caller needs the
+/// path" reasoning `install_gate`/`notifications` above already state for
+/// theirs.
+pub(crate) mod launcher;
 // `pub(crate)`, not private: `home.rs` (a sibling module of this one, not a
 // descendant) calls `notifications::open_and_refresh` directly from its two
 // "open Notifications" click sites — see that fn's own doc comment.
@@ -88,11 +93,27 @@ mod notifications_apps;
 /// crate's `Cargo.toml`/`gateway_client` comments already state.
 mod notifications_backoff;
 pub mod notifications_feed;
+/// A4 (2026-08-24): the SAME panel's "進行中任務" section (real
+/// `tasks.list(status="in_progress")` rows) — its own file for the same
+/// "already at the line-count ceiling" reason `notifications_apps`'s own
+/// header comment gives.
+mod notifications_tasks;
 /// ICON-3 (2026-08-23): 「協助工具 › 指向與點按」 — see its own header
 /// comment for why the board's settings PAGE lands as an overlay here.
 /// `pub(crate)`, not private: `main.rs` owns its `PointerUiState` field on
 /// `ShellView`, same as it owns `audio::AudioUiState`.
 pub(crate) mod pointer_settings;
+/// A4 (2026-08-24): the in-progress task-board feed backing the dock badge
+/// and the Notifications panel's "進行中任務" section — see that struct's
+/// own header comment. `pub`, not private, for the same reason
+/// `notifications_feed` is: `home_dock.rs` (a sibling module, not a
+/// descendant) reads it for the dock badge count.
+pub mod task_progress_feed;
+/// D4a-6 (2026-08-24): the ControlCenter Wi-Fi quick tile's real backend —
+/// see its own header comment. `pub(crate)`, not private, for the same
+/// reason `codrive_row` above is: `main.rs` and `chrome::windows` both call
+/// `WifiTileState::reset` from their overlay-close paths.
+pub(crate) mod wifi_tile;
 
 /// Runtime-mutable state backing the two overlays that have actual
 /// interactive controls this round (round 1's `SurfaceState` only tracked
@@ -111,6 +132,12 @@ pub struct OverlayUiState {
     /// one — see `notifications_feed`'s own header comment for why they
     /// share ONE model rather than each keeping their own.
     pub notifications: notifications_feed::NotificationsFeed,
+    /// A4 (2026-08-24): the in-progress task-board feed — same cross-module
+    /// sharing reason `notifications` above states: `home_dock.rs` (the
+    /// dock badge count) and this panel's own "進行中任務" section
+    /// (`notifications_tasks::task_progress_section`) both read it. See
+    /// `task_progress_feed::TaskProgressFeed`'s own header comment.
+    pub task_progress: task_progress_feed::TaskProgressFeed,
     /// A2 (2026-08-23): the 共駕 row's compositor-backed state.
     ///
     /// It lives HERE rather than as a sibling field on `ShellView` (the shape
@@ -122,6 +149,11 @@ pub struct OverlayUiState {
     /// code other work packages are editing this round, to deliver one row.
     /// See `codrive_row::CodriveUiState`'s own doc comment for what it holds.
     pub(crate) codrive: codrive_row::CodriveUiState,
+    /// D4a-6 (2026-08-24): the Wi-Fi quick tile's real-status read. Lives
+    /// here for the identical reason `codrive` does — it renders INSIDE
+    /// `controlcenter::quick_tiles_row`, which already receives
+    /// `&OverlayUiState`. See `wifi_tile::WifiTileState`'s own doc comment.
+    pub(crate) wifi_tile: wifi_tile::WifiTileState,
     automation_on: bool,
     proactive_on: bool,
     pause_all_on: bool,
@@ -137,9 +169,16 @@ impl Default for OverlayUiState {
     fn default() -> Self {
         Self {
             notifications: notifications_feed::NotificationsFeed::default(),
+            // A4: nothing has been fetched yet — the same honest "no data
+            // yet" starting point `notifications` above uses.
+            task_progress: task_progress_feed::TaskProgressFeed::default(),
             // A2: nothing has been asked of the compositor yet — the row's
             // own `NotLoaded` default, which is what arms its first read.
             codrive: codrive_row::CodriveUiState::default(),
+            // D4a-6: nothing has been read from `network.status` yet — the
+            // tile's own `NotLoaded` default, which is what arms its first
+            // read.
+            wifi_tile: wifi_tile::WifiTileState::default(),
             // ControlCenter.dc.html: 自動化/主動行為 both render as an ON
             // (blue) toggle, 全部暫停 renders OFF (gray) — the design
             // board's actual snapshot state, kept verbatim as the boot

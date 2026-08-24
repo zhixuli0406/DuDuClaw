@@ -117,6 +117,16 @@ pub(crate) struct CenterNotification {
     /// How many further notifications the flood guard folded onto this card.
     /// `0` for an ordinary card; the UI renders "+N" only when it is not.
     pub(crate) merged: u32,
+    /// A1 result-loopback (2026-08-24): `Some(task_id)` when THIS shell
+    /// posted the card itself (`post_system`, below) about one of its own
+    /// goal-task delegations — `None` for every third-party D-Bus card,
+    /// which is the overwhelming majority. Two things key off this:
+    /// `NotificationCenter::invoke` must not queue a D-Bus `ActionInvoked`
+    /// signal for an id no real client ever sent (see that fn's own note),
+    /// and `overlay/notifications_apps.rs`'s button click handler uses it to
+    /// route a `sysact_retry`/`sysact_abort` click to `tasks.goal_decide`
+    /// instead of the generic D-Bus emit path.
+    pub(crate) system_task: Option<String>,
 }
 
 impl CenterNotification {
@@ -135,6 +145,7 @@ impl CenterNotification {
             received_at: now,
             expires_at,
             merged: 0,
+            system_task: None,
         }
     }
 
@@ -164,7 +175,21 @@ pub(crate) struct NotificationCenter {
     /// Cumulative events lost to a full inbox queue. Reported once per
     /// increase, never silently.
     lost: u64,
+    /// A1 result-loopback (2026-08-24): id allocator for `post_system`, kept
+    /// entirely SEPARATE from `inbox::Inbox::allocate_id` (which is
+    /// Linux-only — D-Bus does not exist on the macOS dev loop, but this
+    /// shell's own result-loopback cards must still post there). Handed out
+    /// with the top bit set (`SYSTEM_ID_BASE | n`) so a system card's id can
+    /// never collide with a D-Bus one even in the same session, and vice
+    /// versa — the two counters share nothing else, so keeping their ranges
+    /// disjoint is the only thing standing between them.
+    next_system_id: u32,
 }
+
+/// The top bit — see `next_system_id`'s own doc comment. `inbox::Inbox::
+/// allocate_id` counts up from 1 and would need over two billion D-Bus
+/// notifications in one session to ever reach this range.
+const SYSTEM_ID_BASE: u32 = 0x8000_0000;
 
 impl NotificationCenter {
     // ── the one drain task ────────────────────────────────────────────────
@@ -274,9 +299,66 @@ impl NotificationCenter {
         while self.items.len() > MAX_ITEMS {
             // Oldest is last — `items` is newest-first.
             if let Some(evicted) = self.items.pop() {
-                self.outbox.push(EmitCommand::Closed { id: evicted.id, reason: CloseReason::Undefined });
+                // A1 result-loopback: same "no real D-Bus sender to tell"
+                // skip `close`'s own doc comment gives.
+                if evicted.system_task.is_none() {
+                    self.outbox.push(EmitCommand::Closed { id: evicted.id, reason: CloseReason::Undefined });
+                }
             }
         }
+    }
+
+    // ── shell-originated cards (A1 result-loopback, 2026-08-24) ────────────
+
+    /// Posts a card this shell wrote itself — a goal task this shell
+    /// delegated (`crate::task_result`) reaching `done`/`failed`/
+    /// `needs_human`. Deliberately a SEPARATE entry point from `apply`
+    /// (which only ever consumes `DaemonEvent`s drained from the D-Bus
+    /// inbox): this shell is not a D-Bus client of itself, there is no
+    /// `NotifyRequest` to sanitize, and the id has to come from
+    /// `next_system_id` (see that field's own doc comment), not `inbox::
+    /// Inbox`. The SAME boundary rules still apply to the text, though — a
+    /// task's `result_summary`/`judge_feedback` is agent-generated free
+    /// text this shell did not author either, so `summary`/`body` are run
+    /// through the identical `sanitize_line`/`sanitize_block` + length caps
+    /// `NotifyRequest::sanitized` applies to a third-party D-Bus call.
+    ///
+    /// Lands at the FRONT of the list (newest-first, same as `insert_or_
+    /// replace`) and persists until the operator dismisses or acts on it —
+    /// no `expires_at` is ever set here, matching this shell's own policy
+    /// for `-1`/server-default D-Bus cards (`ExpirePolicy::resolve`'s own
+    /// doc comment: there is no banner layer, so an unattended timeout would
+    /// be exactly the silent-loss failure D6 exists to prevent — doubly true
+    /// for a card the operator explicitly delegated work through).
+    ///
+    /// Returns the id, so a caller that wants to reference the card later
+    /// (none does yet) can.
+    pub(crate) fn post_system(
+        &mut self,
+        app_name: &str,
+        summary: &str,
+        body: &str,
+        urgency: super::Urgency,
+        actions: Vec<NotificationAction>,
+        system_task: Option<String>,
+    ) -> u32 {
+        self.next_system_id = self.next_system_id.wrapping_add(1);
+        let id = SYSTEM_ID_BASE | self.next_system_id;
+        let card = CenterNotification {
+            id,
+            app_name: super::sanitize_line(app_name, super::MAX_APP_NAME_CHARS),
+            summary: super::sanitize_line(summary, super::MAX_SUMMARY_CHARS),
+            body: super::sanitize_block(body, super::MAX_BODY_CHARS),
+            actions,
+            urgency,
+            received_at: Instant::now(),
+            expires_at: None,
+            merged: 0,
+            system_task,
+        };
+        self.items.insert(0, card);
+        self.enforce_capacity();
+        id
     }
 
     // ── time ──────────────────────────────────────────────────────────────
@@ -331,6 +413,13 @@ impl NotificationCenter {
     ///
     /// Refuses an action key the card never declared: the key goes straight
     /// out on the bus, and a UI bug must not be able to invent one.
+    ///
+    /// A1 result-loopback (2026-08-24): a card this shell posted itself
+    /// (`card.system_task.is_some()`, see that field's own doc comment) has
+    /// no real D-Bus sender waiting on `ActionInvoked` — queuing the signal
+    /// anyway would be harmless (nothing holds that id) but is still a
+    /// pointless wakeup of the notifyd thread for a broadcast nobody can
+    /// hear, so it is skipped for system cards specifically.
     pub(crate) fn invoke(&mut self, id: u32, action_key: &str) -> bool {
         let Some(card) = self.items.iter().find(|c| c.id == id) else {
             return false;
@@ -338,7 +427,9 @@ impl NotificationCenter {
         if !card.actions.iter().any(|a| a.key == action_key) {
             return false;
         }
-        self.outbox.push(EmitCommand::ActionInvoked { id, action_key: action_key.to_string() });
+        if card.system_task.is_none() {
+            self.outbox.push(EmitCommand::ActionInvoked { id, action_key: action_key.to_string() });
+        }
         self.close(id, CloseReason::Dismissed)
     }
 
@@ -353,12 +444,20 @@ impl NotificationCenter {
         self.invoke(id, DEFAULT_ACTION_KEY)
     }
 
+    /// A1 result-loopback (2026-08-24): skips the `Closed` emit for a
+    /// `system_task` card, same reasoning `invoke`'s own doc comment gives
+    /// for skipping `ActionInvoked` — there is no real D-Bus sender on the
+    /// other end of that signal either way, for ANY reason a system card
+    /// closes (an explicit dismiss, `invoke`, capacity eviction, or —
+    /// though `post_system` never sets an expiry — `expire_due`).
     fn close(&mut self, id: u32, reason: CloseReason) -> bool {
         let Some(pos) = self.items.iter().position(|c| c.id == id) else {
             return false;
         };
-        self.items.remove(pos);
-        self.outbox.push(EmitCommand::Closed { id, reason });
+        let removed = self.items.remove(pos);
+        if removed.system_task.is_none() {
+            self.outbox.push(EmitCommand::Closed { id, reason });
+        }
         true
     }
 
@@ -615,5 +714,61 @@ mod tests {
         c.expire_due(t0 + Duration::from_secs(6));
         c.expire_due(t0 + Duration::from_secs(60 * 60 * 24 * 7));
         assert_eq!(c.items().iter().map(|i| i.id).collect::<Vec<_>>(), vec![2]);
+    }
+
+    // ── A1 result-loopback: post_system ────────────────────────────────────
+
+    #[test]
+    fn post_system_lands_newest_first_and_never_expires() {
+        let mut c = NotificationCenter::default();
+        let a = c.post_system("DuDuClaw", "「寄出報價單」已完成", "已寄出，對方已回覆收到", Urgency::Normal, vec![], Some("t1".to_string()));
+        let b = c.post_system("DuDuClaw", "「整理報告」失敗", "缺少附件", Urgency::Normal, vec![], Some("t2".to_string()));
+        assert_eq!(c.items().iter().map(|i| i.id).collect::<Vec<_>>(), vec![b, a]);
+        assert!(c.items().iter().all(|i| i.expires_at.is_none()), "a task-result card must persist until acted on");
+    }
+
+    #[test]
+    fn post_system_ids_never_collide_with_dbus_ids_even_after_many_of_each() {
+        let mut c = NotificationCenter::default();
+        // A run of ordinary D-Bus posts (small ids, starting at 1).
+        for id in 1..=5 {
+            c.apply(batch(vec![DaemonEvent::Posted(Box::new(posted(id, "chromium", "x")))]), Instant::now());
+        }
+        let dbus_ids: std::collections::HashSet<u32> = c.items().iter().map(|i| i.id).collect();
+        let sys_id = c.post_system("DuDuClaw", "s", "b", Urgency::Normal, vec![], None);
+        assert!(!dbus_ids.contains(&sys_id), "a system id must never land in the D-Bus id range");
+        assert!(sys_id >= SYSTEM_ID_BASE, "system ids must live in the reserved high range");
+    }
+
+    #[test]
+    fn post_system_sanitizes_the_same_way_a_dbus_notify_call_does() {
+        let mut c = NotificationCenter::default();
+        c.post_system("DuDuClaw", "hello\nthere", "line\u{0007}one", Urgency::Normal, vec![], None);
+        let card = &c.items()[0];
+        assert_eq!(card.summary, "hello there", "the summary must be forced onto one line, same as a D-Bus card");
+        assert_eq!(card.body, "lineone", "control characters must be stripped, same as a D-Bus card");
+    }
+
+    #[test]
+    fn invoking_a_system_cards_action_closes_it_without_queuing_a_phantom_dbus_signal() {
+        let mut c = NotificationCenter::default();
+        let action = NotificationAction { key: "sysact_retry".to_string(), label: "重試".to_string() };
+        let id = c.post_system("DuDuClaw", "s", "b", Urgency::Normal, vec![action], Some("t1".to_string()));
+        assert!(c.invoke(id, "sysact_retry"));
+        assert!(!c.items().iter().any(|i| i.id == id), "the card must close on invoke, same as a D-Bus card");
+        assert!(c.take_emits().is_empty(), "a system card has no real D-Bus sender — nothing should be queued for the bus");
+    }
+
+    #[test]
+    fn invoking_a_dbus_cards_action_still_queues_the_real_signal() {
+        // Regression guard for the branch added alongside `post_system`:
+        // ordinary D-Bus cards (`system_task: None`) must be byte-identical
+        // to before this round.
+        let mut c = NotificationCenter::default();
+        let mut p = posted(1, "chromium", "x");
+        p.actions = vec![NotificationAction { key: "reply".to_string(), label: "Reply".to_string() }];
+        c.apply(batch(vec![DaemonEvent::Posted(Box::new(p))]), Instant::now());
+        assert!(c.invoke(1, "reply"));
+        assert_eq!(c.take_emits(), vec![EmitCommand::ActionInvoked { id: 1, action_key: "reply".to_string() }, EmitCommand::Closed { id: 1, reason: CloseReason::Dismissed }]);
     }
 }

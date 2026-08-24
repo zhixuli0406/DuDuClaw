@@ -122,6 +122,11 @@ mod settings;
 /// left ungated.
 mod shipping;
 mod surface;
+/// A1 result-loopback (2026-08-24): the terminal-state watch behind "Super
+/// +K 交辦一個任務 → 結果推回殼" — see its own header comment for the full
+/// design and for why it is a separate module from `notifyd` (the SINK the
+/// events it produces are turned into cards on) rather than folded into it.
+mod task_result;
 
 use gpui::{
     actions, div, prelude::*, App, Context, FocusHandle, Focusable, KeyBinding, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, Render,
@@ -440,6 +445,12 @@ pub struct ShellView {
     /// draining takes `&mut` on both at once, and disjoint fields is what
     /// makes that a plain borrow instead of a dance.
     pub(crate) notify_center: notifyd::center::NotificationCenter,
+    /// A1 result-loopback (2026-08-24) — every goal task this shell itself
+    /// delegated (`overlay::launcher::try_submit_delegate`), watched until
+    /// it reaches a terminal state. `schedule_task_result_poll` drains its
+    /// events into `notify_center` above — see `task_result`'s own module
+    /// doc for the full design.
+    pub(crate) task_results: task_result::TaskResultTracker,
     /// WP-lock-pw (2026-08-22) — the lockscreen's real password-entry
     /// `Entity<OobeTextField>`, same "created once, unconditionally, at
     /// window-open time" precedent `oobe_account_fields`/`oobe_network_fields`
@@ -497,12 +508,22 @@ pub struct ShellView {
     /// once at window-open time from `oobe::boot_theme(&persisted_oobe_
     /// state)` (see that fn's own doc comment for why it's read independent
     /// of `initial_oobe`'s Home-vs-OOBE decision), and updated exactly once
-    /// more, in `on_oobe_next`, at the moment OOBE completes — so a THEME
-    /// step pick made during THIS run reaches Home on its very first frame,
-    /// not just on the next restart. `ShellView::render` resolves this into
-    /// a `palette::ShellPalette` fresh every render pass (same "recompute,
+    /// more at the moment OOBE completes — so a THEME step pick made during
+    /// THIS run reaches Home on its very first frame, not just on the next
+    /// restart. `ShellView::render` resolves this into a
+    /// `palette::ShellPalette` fresh every render pass (same "recompute,
     /// never cache" convention `OobeFlow::palette()` already established)
     /// and threads it into `home::render`/`overlay::render`.
+    ///
+    /// D2-b (2026-08-24): OOBE has THREE completion sites — this file's
+    /// own `handle_enter_key` (`EnterOutcome::Advance` arm, keyboard Enter)
+    /// and `oobe/render.rs`'s `button_row` (`continue_click`/`skip_click`,
+    /// the 完成/略過 mouse buttons everyone actually uses). All three MUST
+    /// copy `flow.state().selections.theme` here and call
+    /// `notify_comp_theme` before dropping `self.oobe` — the button paths
+    /// were missing this (they only called `oobe::save_state`, which is why
+    /// a shell RESTART after OOBE always picked the theme up correctly but
+    /// the same-process OOBE→Home transition did not).
     theme: oobe::ThemeChoice,
     /// Root-level focus handle — see this file's header comment ("Keyboard
     /// dispatch needs a focused element, full stop."). Tracked on the root
@@ -622,6 +643,10 @@ impl ShellView {
         // 電腦」 would be an outright false statement rather than a merely
         // out-of-date one. See `overlay::codrive_row::CodriveUiState::reset`.
         self.overlay_ui.codrive.reset();
+        // D4a-6 (2026-08-24): and the Wi-Fi quick tile's own snapshot — the
+        // link can drop or reconnect without anyone touching this panel.
+        // See `overlay::wifi_tile::WifiTileState::reset`.
+        self.overlay_ui.wifi_tile.reset();
         // D4b (2026-08-23): same reasoning, one surface further — closing
         // ANY overlay drops the settings app's cached backend reads AND
         // every one of its typed fields, two of which hold passwords. See
@@ -671,6 +696,10 @@ impl ShellView {
         // 電腦」 would be an outright false statement rather than a merely
         // out-of-date one. See `overlay::codrive_row::CodriveUiState::reset`.
         self.overlay_ui.codrive.reset();
+        // D4a-6 (2026-08-24): and the Wi-Fi quick tile's own snapshot — the
+        // link can drop or reconnect without anyone touching this panel.
+        // See `overlay::wifi_tile::WifiTileState::reset`.
+        self.overlay_ui.wifi_tile.reset();
         // D4b (2026-08-23): same reasoning, one surface further — closing
         // ANY overlay drops the settings app's cached backend reads AND
         // every one of its typed fields, two of which hold passwords. See
@@ -681,15 +710,18 @@ impl ShellView {
     }
 
     /// `enter`'s action handler — OOBE's keyboard "continue" binding (task
-    /// brief: "Enter=繼續"). A no-op outside OOBE (Home has no Enter
-    /// binding of its own this round). WP-lock-pw (2026-08-22): while
-    /// locked, Enter is now this surface's SUBMIT trigger instead of an
-    /// instant unlock — `lockscreen::render::submit_or_reveal` reveals the
-    /// prompt on a first press (same as any other key) or, once the
-    /// password field is already visible and focused, dispatches a real
-    /// verify attempt against whatever the operator just typed into it (see
-    /// that fn's own doc comment for why Enter reliably reaches the
-    /// currently-focused field BEFORE bubbling up to this global binding).
+    /// brief: "Enter=繼續"), and (A1 result-loopback, 2026-08-24) the
+    /// Launcher's own "Enter 交辦" outside OOBE — see
+    /// `overlay::launcher::try_submit_delegate`'s own doc comment for
+    /// exactly which states that covers. A no-op in every other situation
+    /// (Home itself still has no Enter binding of its own). WP-lock-pw
+    /// (2026-08-22): while locked, Enter is instead this surface's SUBMIT
+    /// trigger — `lockscreen::render::submit_or_reveal` reveals the prompt
+    /// on a first press (same as any other key) or, once the password field
+    /// is already visible and focused, dispatches a real verify attempt
+    /// against whatever the operator just typed into it (see that fn's own
+    /// doc comment for why Enter reliably reaches the currently-focused
+    /// field BEFORE bubbling up to this global binding).
     fn on_oobe_next(&mut self, _action: &OobeNext, window: &mut Window, cx: &mut Context<Self>) {
         if diag_enabled() {
             eprintln!("[action] OobeNext fired");
@@ -699,6 +731,18 @@ impl ShellView {
             return;
         }
         self.lockscreen.note_input();
+        // A1 result-loopback (2026-08-24): outside OOBE, Enter's other real
+        // meaning is the Launcher's "Enter 交辦" hint
+        // (`fake_data::LAUNCHER_DELEGATE_HINT`) — checked BEFORE the
+        // OOBE-only logic below so a delegate submit can never be shadowed
+        // by it (`self.oobe` is already `None` here in every case that
+        // matters, since the lockscreen/OOBE-active paths already returned
+        // or reduce to a no-op below, but the explicit guard documents the
+        // intent rather than relying on that incidentally).
+        if self.oobe.is_none() && overlay::launcher::try_submit_delegate(self, window, cx) {
+            cx.notify();
+            return;
+        }
         // WP-oobe-enter (2026-08-23): the three signals `OobeFlow::enter_
         // outcome` needs, read BEFORE the mutable borrow of `self.oobe`
         // below — a disjoint-field borrow of `self.oobe_ui`, not a
@@ -871,6 +915,79 @@ impl ShellView {
     }
 }
 
+/// The "check the mpsc channel" tick for `ShellView::
+/// schedule_task_result_poll`'s own thread + `mpsc` + `cx.spawn` bridge —
+/// same value (and reasoning) `overlay/notifications.rs::POLL_INTERVAL`/
+/// `overlay/launcher.rs::SUBMIT_BRIDGE_POLL_INTERVAL` already use for
+/// theirs; kept as its own module-level constant here (not a cross-module
+/// import of either) since neither is `pub` and both are private
+/// implementation details of files this one has no other reason to depend
+/// on.
+const TASK_RESULT_BRIDGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Runs entirely on a background `std::thread` — never called from gpui's
+/// own executor, same contract every other blocking call in this crate
+/// documents. `new_jwt` mirrors `overlay/notifications.rs::fetch_once`'s own
+/// `Some` only when THIS call bootstrapped a fresh session.
+fn task_result_poll_once(existing_jwt: Option<String>, agent_id: String) -> (Option<String>, Result<Vec<gateway_client::TaskSnapshot>, gateway_client::GatewayError>) {
+    let (jwt, new_jwt) = match existing_jwt {
+        Some(jwt) => (jwt, None),
+        None => match gateway_client::bootstrap_local_session() {
+            Ok(jwt) => (jwt.clone(), Some(jwt)),
+            Err(e) => return (None, Err(e.into())),
+        },
+    };
+    let result = gateway_client::list_tasks(&jwt, &agent_id).map_err(gateway_client::GatewayError::from);
+    (new_jwt, result)
+}
+
+/// Turns one terminal-state transition into a card on `notify_center` — the
+/// "結果推回殼" half of A1's TODO line. Three deliberate choices, all
+/// stated here rather than scattered:
+///
+/// 1. **User-facing text, zero internal vocabulary** (task brief: "結果文
+///    字使用者視角，零內部術語") — the summary names the task by its own
+///    title, never its id; the three outcomes get three distinct honest
+///    sentences (`Key::TaskResult{Done,Failed,NeedsHuman}Summary`), never a
+///    generic "任務更新".
+/// 2. **`needs_human` alone gets decision buttons** — `retry`/`abort`
+///    dispatch straight to `gateway_client::decide_goal_task`
+///    (`tasks.goal_decide`, the SAME RPC the dashboard's needs_human board
+///    already uses — task brief: "沿用既有審批卡/決策管道，別重造"). See
+///    `overlay/notifications_apps.rs`'s click-handler doc comment for why
+///    `done`/`takeover` are deliberately left off a notification card.
+/// 3. **The body is what `TaskSnapshot` actually said, truncated by
+///    `post_system`'s own boundary caps** (task brief: "長結果截斷帶「查
+///    看完整」路徑") — `MAX_BODY_CHARS` (1200 codepoints) covers the
+///    overwhelming majority of a real `result_summary`/`judge_feedback`
+///    without truncating at all, and the card stays in the persistent 通知
+///    中心 panel (not a toast) until dismissed, so there is somewhere to
+///    keep reading it. A dedicated "open full task detail" surface is
+///    explicitly OUT of scope this round — no such view exists yet in this
+///    shell (tracked separately) — so this deliberately does not invent a
+///    click target that would go nowhere; see this module's own A1 report
+///    for the honest state of that gap.
+fn post_task_result_card(view: &mut ShellView, event: &task_result::TaskResultEvent) {
+    use task_result::GoalOutcome;
+    let locale = i18n::Locale::ZhTw;
+    let (summary_key, urgency, needs_decision) = match event.outcome {
+        GoalOutcome::Done => (i18n::Key::TaskResultDoneSummary, notifyd::Urgency::Normal, false),
+        GoalOutcome::Failed => (i18n::Key::TaskResultFailedSummary, notifyd::Urgency::Normal, false),
+        GoalOutcome::NeedsHuman => (i18n::Key::TaskResultNeedsHumanSummary, notifyd::Urgency::Critical, true),
+    };
+    let summary = i18n::t1(locale, summary_key, &event.title);
+    let body = event.detail.clone().unwrap_or_else(|| i18n::t(locale, i18n::Key::TaskResultNoDetail).to_string());
+    let actions = if needs_decision {
+        vec![
+            notifyd::NotificationAction { key: task_result::ACTION_RETRY.to_string(), label: i18n::t(locale, i18n::Key::TaskResultRetryButton).to_string() },
+            notifyd::NotificationAction { key: task_result::ACTION_ABORT.to_string(), label: i18n::t(locale, i18n::Key::TaskResultAbortButton).to_string() },
+        ]
+    } else {
+        Vec::new()
+    };
+    view.notify_center.post_system(task_result::NOTIFY_APP_NAME, &summary, &body, urgency, actions, Some(event.task_id.clone()));
+}
+
 impl ShellView {
     /// Builds the root element for whichever window is showing OOBE / the
     /// lock screen / the Home desktop — this is `Render::render`'s ENTIRE
@@ -1012,6 +1129,93 @@ impl ShellView {
         .detach();
     }
 
+    /// A1 result-loopback (2026-08-24): the poll loop behind
+    /// `task_results` — see that field's own doc comment and `task_result`'s
+    /// module doc for the full design.
+    ///
+    /// Same "claim the single slot once, loop internally" shape
+    /// `schedule_notification_drain` above establishes, armed from the same
+    /// call site for the same reason (a task that finishes while nobody has
+    /// any overlay open must still produce a notification). Unlike that
+    /// loop, this one performs real network I/O each tick it actually polls
+    /// (`gateway_client::list_tasks`), so it follows `overlay/
+    /// notifications.rs::trigger_refresh_if_stale`'s established
+    /// thread + `mpsc` + `cx.spawn` bridge for the I/O itself, nested inside
+    /// the same self-re-arming sleep this fn's outer loop already needs.
+    /// `TaskResultTracker::begin_poll` itself refuses (cheaply, no I/O) when
+    /// nothing is watched, so an idle machine that has never delegated
+    /// anything pays only the sleep — no socket is ever opened.
+    fn schedule_task_result_poll(&mut self, cx: &mut Context<Self>) {
+        if !self.task_results.try_arm_poll() {
+            return;
+        }
+        cx.spawn(async move |weak, cx| {
+            loop {
+                let delay = match weak.update(cx, |view, _cx| view.task_results.next_check_delay()) {
+                    Ok(d) => d,
+                    Err(_) => return, // view gone
+                };
+                cx.background_executor().timer(delay).await;
+
+                let poll_input = weak.update(cx, |view, _cx| {
+                    if !view.task_results.begin_poll() {
+                        return None;
+                    }
+                    Some((view.task_results.session_jwt().map(str::to_string), view.task_results.watch_agent_id().unwrap_or_default().to_string()))
+                });
+                let Ok(Some((existing_jwt, agent_id))) = poll_input else {
+                    if poll_input.is_err() {
+                        return; // view gone
+                    }
+                    continue; // nothing due yet — sleep again
+                };
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(task_result_poll_once(existing_jwt, agent_id));
+                });
+                let outcome = loop {
+                    match rx.try_recv() {
+                        Ok(v) => break Some(v),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                    }
+                    cx.background_executor().timer(TASK_RESULT_BRIDGE_POLL_INTERVAL).await;
+                };
+                let Some((new_jwt, result)) = outcome else {
+                    continue; // the worker thread vanished without sending — treat as a lost tick, try again next cadence
+                };
+
+                let updated = weak.update(cx, |view, cx| {
+                    if let Some(jwt) = new_jwt {
+                        view.task_results.apply_session(jwt);
+                    }
+                    match result {
+                        Ok(snapshots) => {
+                            let events = view.task_results.apply_poll_ok(snapshots);
+                            if !events.is_empty() {
+                                for event in events {
+                                    post_task_result_card(view, &event);
+                                }
+                                cx.notify();
+                            }
+                        }
+                        Err(e) => {
+                            if diag_enabled() {
+                                eprintln!("[task_result] poll failed: {e:?}");
+                            }
+                            view.task_results.apply_poll_err();
+                        }
+                    }
+                });
+                if updated.is_err() {
+                    return; // view gone
+                }
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn render_root(&mut self, window: &mut Window, cx: &mut Context<Self>, single_window: bool) -> impl IntoElement {
         if self.diag {
             eprintln!("[render] overlay={:?}", self.surface.overlay());
@@ -1026,6 +1230,10 @@ impl ShellView {
         // on the first pass and keeps the notification centre fed thereafter.
         // Idempotent by construction — see its own doc comment.
         self.schedule_notification_drain(cx);
+        // A1 result-loopback (2026-08-24): the terminal-state watch behind
+        // "Super+K 交辦一個任務 → 結果推回殼". Same idempotent single-arm
+        // shape as the call directly above.
+        self.schedule_task_result_poll(cx);
         if self.diag && !self.diag_scheduled {
             self.diag_scheduled = true;
             let handle = self.focus_handle.clone();
@@ -1165,7 +1373,14 @@ impl ShellView {
             // above — an immutable borrow of one `self` field alongside
             // `cx` (a separate parameter, not a second borrow of `self`),
             // same shape, no conflict.
-            root.child(home::render(home_palette, &self.overlay_ui.notifications, &self.running_windows, &self.installed_apps, cx))
+            root.child(home::render(
+                home_palette,
+                &self.overlay_ui.notifications,
+                &self.running_windows,
+                &self.installed_apps,
+                &self.overlay_ui.task_progress,
+                cx,
+            ))
         } else {
             // WM-3, `ChromeMode::LayerSurfaces`: the menu bar and dock are
             // separate `duduclaw-shell-menubar`/`-dock` layer surfaces (see
@@ -1253,9 +1468,10 @@ impl ShellView {
                     }
                     view.surface.close();
                     view.settle_launcher_query(window, cx);
-                    // See `on_toggle_launcher`'s own note on these four.
+                    // See `on_toggle_launcher`'s own note on these five.
                     view.pointer_ui.reset();
                     view.overlay_ui.codrive.reset();
+                    view.overlay_ui.wifi_tile.reset();
                     view.settings_ui.reset();
                     view.settings_fields.clear_all(cx);
                     cx.notify();
@@ -1499,6 +1715,8 @@ fn main() {
             // bus can never delay or break window creation.
             notify_runtime: notifyd::NotifyRuntime::default(),
             notify_center: notifyd::center::NotificationCenter::default(),
+            // A1 result-loopback: nothing delegated yet this session.
+            task_results: task_result::TaskResultTracker::default(),
             lockscreen_password_field,
             launcher_query_field,
             operator_name: initial_operator_name,
@@ -1621,7 +1839,7 @@ fn main() {
         // `Window`, so this is identical in both chrome modes (there may be
         // zero, one, or four windows open by this point depending on mode;
         // none of that matters here).
-        let _ = shared_state.update(cx, |_view, cx| {
+        shared_state.update(cx, |_view, cx| {
             lockscreen::render::spawn_idle_watchdog(cx);
         });
 
@@ -1665,7 +1883,7 @@ fn main() {
         match shipping::debug_env("DUDUCLAW_SHELL_DEBUG_SURFACE").ok_or(()) {
             Ok(raw) if raw.is_empty() => {}
             Ok(raw) if raw == "lockscreen" => {
-                let _ = shared_state.update(cx, |view, cx| {
+                shared_state.update(cx, |view, cx| {
                     lockscreen::render::lock_and_refresh(view, cx);
                 });
                 eprintln!("[main] DUDUCLAW_SHELL_DEBUG_SURFACE=lockscreen -> locked");
@@ -1683,7 +1901,7 @@ fn main() {
                             cx.notify();
                         });
                     } else {
-                        let _ = shared_state.update(cx, |view, cx| {
+                        shared_state.update(cx, |view, cx| {
                             view.surface.open(overlay);
                             view.overlay_ui.close_launcher_query();
                             view.launcher_query_field.field.update(cx, |field, cx| field.clear(cx));
@@ -1773,6 +1991,33 @@ mod tests {
         assert!(
             source.contains("fn settle_launcher_query"),
             "the open/close focus hand-off for the Launcher search field is gone"
+        );
+    }
+
+    /// D9-bug9 (2026-08-24), M1 round: `lock_and_refresh` must clear BOTH
+    /// text fields it dismisses on every lock — the Launcher's search box
+    /// (already fixed, D3-b) and the lockscreen's own password field (this
+    /// round's fix). Same "source-scan, not a live gpui test" convention
+    /// this module's own tests already establish (`lockscreen/render.rs`
+    /// itself deliberately carries no `#[cfg(test)] mod tests` — see that
+    /// file's own trailing comment) — cannot prove the field is empty on
+    /// screen (that's the VM check), but fails loudly if either `.clear(cx)`
+    /// call is removed.
+    #[test]
+    fn lock_and_refresh_clears_both_the_launcher_query_and_the_password_field() {
+        let source = include_str!("lockscreen/render.rs");
+        let start = source.find("pub(crate) fn lock_and_refresh").expect("lock_and_refresh not found");
+        let end = source[start..].find("\n}\n").map(|i| start + i).unwrap_or(source.len());
+        let body = &source[start..end];
+        assert!(
+            body.contains("view.launcher_query_field.field.update(cx, |field, cx| field.clear(cx))"),
+            "lock_and_refresh no longer clears the Launcher's search field"
+        );
+        assert!(
+            body.contains("view.lockscreen_password_field.field.update(cx, |field, cx| field.clear(cx))"),
+            "lock_and_refresh no longer clears the lockscreen password field — a lock cycle that \
+             never reached a clean submit (throttled, in-flight, or a synthetic repeat flood) would \
+             leak its leftover content into the VERY NEXT lock's freshly-revealed prompt"
         );
     }
 

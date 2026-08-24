@@ -102,6 +102,7 @@ use crate::apps::icon_theme;
 use crate::apps::installed::InstalledApp;
 use crate::apps::VerifiedTier;
 use crate::fake_data;
+use crate::gateway_client;
 use crate::i18n::{t, Key, Locale};
 use crate::icons;
 use crate::palette::ShellPalette;
@@ -888,4 +889,194 @@ fn footer(palette: ShellPalette) -> Div {
         .text_color(theme::alpha(palette.text_faint, 1.0))
         .child(div().child(fake_data::LAUNCHER_FOOTER_LEFT))
         .child(div().child(fake_data::LAUNCHER_FOOTER_RIGHT))
+}
+
+// ── A1 result-loopback (2026-08-24): "Enter 交辦" submits a real task ─────
+//
+// `fake_data::LAUNCHER_DELEGATE_HINT` has said "Enter 交辦" since Shell-S0
+// round 2, and it lied: pressing Enter here did nothing (`ShellView::
+// on_oobe_next`'s own doc comment, before this round: "A no-op outside OOBE
+// — Home has no Enter binding of its own"). This is the other end of the
+// TODO line A1 named: "「結果回流」（交辦結果推回通道）整塊未動" started
+// with nothing to loop back FROM either — a typed delegation had no path to
+// the gateway at all. `crate::main::ShellView::on_oobe_next` now calls
+// `try_submit_delegate` before falling through to its OOBE-only logic (see
+// that fn's own updated doc comment).
+//
+// The delegate CARD above (`delegate_section`) is still the fixed demo
+// preview — this only wires the text FIELD's Enter key, not a live
+// "here is what I'm about to delegate" plan preview (that needs an
+// NL-understanding backend this round does not build; see this file's
+// header comment on the card staying demo content). What IS real: the
+// typed sentence becomes the `description` of an actual `goal_mode` task
+// (`gateway_client::create_goal`, the exact `tasks.goal_create` RPC the
+// dashboard's own AssignSheet uses), assigned to this session's resolved
+// default agent (`gateway_client::pick_default_agent` — the org's
+// `role: "main"` agent, or the first one reachable), and handed to
+// `ShellView.task_results` (`crate::task_result::TaskResultTracker`) to
+// watch for a terminal state. `overlay::notifications_apps`'s A4 section
+// already established "no picker, no plan preview, just submit the text" —
+// wait, no, that section reads existing data; the precedent this borrows is
+// `overlay/notifications.rs::trigger_refresh_if_stale`'s own thread + mpsc +
+// `cx.spawn` bridge shape, reused verbatim below.
+
+/// `overlay/notifications.rs::POLL_INTERVAL`'s exact value and reasoning —
+/// the "check the mpsc channel" tick for this bridge, not a fetch cadence.
+const SUBMIT_BRIDGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Attempts to submit the Launcher's typed query as a delegation. Returns
+/// `true` when Enter's press should be considered HANDLED (the caller must
+/// not fall through to any other Enter meaning) — which is also `true`
+/// while a previous submit is still in flight, so a second Enter cannot
+/// fire a duplicate `tasks.goal_create` while quietly doing nothing else
+/// either. `false` means "this wasn't a delegate-submit situation at all"
+/// (Launcher isn't open, the install-confirmation sheet is armed and owns
+/// Enter's meaning instead, or the query is empty) — the caller's cue to
+/// keep evaluating its other Enter branches.
+pub(crate) fn try_submit_delegate(view: &mut ShellView, window: &mut gpui::Window, cx: &mut Context<ShellView>) -> bool {
+    if view.surface.overlay() != Some(crate::surface::Overlay::Launcher) {
+        return false;
+    }
+    // The install-confirmation sheet REPLACES this panel while armed (see
+    // `render`'s own comment) — Enter must not race a "start installing
+    // 2.4GB" decision the operator hasn't made against a delegate submit
+    // they also haven't made.
+    if view.overlay_ui.install_gate.is_some() {
+        return false;
+    }
+    let query = view.launcher_query_field.field.read(cx).content(cx);
+    let description = query.trim().to_string();
+    if description.is_empty() {
+        return false;
+    }
+    if !view.task_results.begin_submit() {
+        // Already submitting — swallow this Enter (still "handled": no
+        // other Enter meaning should fire either) rather than starting a
+        // second `tasks.goal_create` for the same typed sentence.
+        return true;
+    }
+
+    // Optimistic close: same UX `install_gate`'s confirm click already
+    // gives (the panel dismisses immediately, the RESULT arrives later,
+    // asynchronously, as a notification card — see `apply_submit_outcome`'s
+    // failure branch for what happens if the gateway actually says no).
+    view.surface.close();
+    view.settle_launcher_query(window, cx);
+
+    let existing_jwt = view.task_results.session_jwt().map(str::to_string);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(submit_once(existing_jwt, description));
+    });
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(outcome) => {
+                let _ = weak.update(cx, |view, cx| {
+                    apply_submit_outcome(view, outcome);
+                    cx.notify();
+                });
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(SUBMIT_BRIDGE_POLL_INTERVAL).await;
+    })
+    .detach();
+    true
+}
+
+/// What one background-thread submit attempt settled as.
+enum SubmitOutcome {
+    Created { agent_id: String, task_id: String, title: String },
+    /// `agents.list` succeeded but came back empty — a deployment with no
+    /// reachable agent at all. Distinct from a plain RPC failure so the
+    /// posted card can say the honest, specific thing rather than a generic
+    /// "try again" that would never stop failing.
+    NoAgent,
+    Failed(gateway_client::GatewayError),
+}
+
+/// Runs entirely on a background `std::thread` — never called from gpui's
+/// own executor, same contract every other blocking call in this crate
+/// documents. `new_jwt` mirrors `overlay/notifications.rs::fetch_once`'s own
+/// `Some` only when THIS call bootstrapped a fresh session.
+fn submit_once(existing_jwt: Option<String>, description: String) -> (Option<String>, SubmitOutcome) {
+    let (jwt, new_jwt) = match existing_jwt {
+        Some(jwt) => (jwt, None),
+        None => match gateway_client::bootstrap_local_session() {
+            Ok(jwt) => (jwt.clone(), Some(jwt)),
+            Err(e) => return (None, SubmitOutcome::Failed(e.into())),
+        },
+    };
+    let agents = match gateway_client::list_agents(&jwt) {
+        Ok(a) => a,
+        Err(e) => return (new_jwt, SubmitOutcome::Failed(e.into())),
+    };
+    let Some(agent) = gateway_client::pick_default_agent(&agents) else {
+        return (new_jwt, SubmitOutcome::NoAgent);
+    };
+    let agent_id = agent.id.clone();
+    match gateway_client::create_goal(&jwt, &agent_id, &description) {
+        Ok(created) => {
+            // `tasks.goal_create` truncates the title from the description
+            // at 60 chars server-side; an empty title would only happen for
+            // a description that is somehow all-whitespace after the
+            // gateway's own `trim()` — already excluded by the `is_empty()`
+            // guard in `try_submit_delegate` for the CLIENT-typed text, but
+            // kept here as a defensive fallback rather than ever showing an
+            // untitled card.
+            let title = if created.title.is_empty() { description } else { created.title };
+            (new_jwt, SubmitOutcome::Created { agent_id, task_id: created.task_id, title })
+        }
+        Err(e) => (new_jwt, SubmitOutcome::Failed(e.into())),
+    }
+}
+
+/// Applies one settled submit attempt: persists a freshly-bootstrapped
+/// session, arms the watch on success, or posts an honest failure card —
+/// the operator pressed Enter and the panel already closed, so a silent
+/// failure here would be indistinguishable from "it worked", exactly the
+/// failure mode 5.誠實回報 forbids.
+fn apply_submit_outcome(view: &mut ShellView, outcome: (Option<String>, SubmitOutcome)) {
+    let (new_jwt, result) = outcome;
+    if let Some(jwt) = new_jwt {
+        view.task_results.apply_session(jwt);
+    }
+    match result {
+        SubmitOutcome::Created { agent_id, task_id, title } => {
+            if crate::diag_enabled() {
+                eprintln!("[launcher] delegate submitted: agent={agent_id} task={task_id} title={title:?}");
+            }
+            view.task_results.apply_submit_ok(agent_id, task_id, title);
+        }
+        SubmitOutcome::NoAgent => {
+            view.task_results.apply_submit_err();
+            eprintln!("[launcher] delegate submit refused: no agent is reachable from this session");
+            post_submit_failure_card(view, t(Locale::ZhTw, Key::LauncherDelegateNoAgent));
+        }
+        SubmitOutcome::Failed(e) => {
+            view.task_results.apply_submit_err();
+            eprintln!("[launcher] delegate submit failed: {e:?}");
+            post_submit_failure_card(view, t(Locale::ZhTw, Key::LauncherDelegateSubmitFailed));
+        }
+    }
+}
+
+/// Posts a shell-originated "couldn't even submit" card through the SAME
+/// D6 notification centre a terminal task result uses
+/// (`crate::task_result`'s own consumer in `main.rs`) — the operator has
+/// already watched the Launcher close, so this is the only honest way left
+/// to tell them Enter did not actually work. No `system_task` id: there is
+/// no task to retry FROM (it was never created), so no action button is
+/// offered — dismissing it is the whole interaction.
+fn post_submit_failure_card(view: &mut ShellView, message: &str) {
+    view.notify_center.post_system(
+        crate::task_result::NOTIFY_APP_NAME,
+        t(Locale::ZhTw, Key::LauncherDelegateSubmitFailedTitle),
+        message,
+        crate::notifyd::Urgency::Normal,
+        Vec::new(),
+        None,
+    );
 }

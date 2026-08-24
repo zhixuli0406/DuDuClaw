@@ -302,6 +302,14 @@ pub enum Key {
     NotifAgeHours,
     NotifAgeDays,
 
+    /// A4 (2026-08-24) — the same panel's "進行中任務" section (real
+    /// `tasks.list(status="in_progress")` rows, see `overlay::
+    /// notifications_tasks`'s own header comment). Same boundary rule as
+    /// `NotifAppSectionLabel` above: this heading is process CHROME, the
+    /// task `title`/`assigned_to` it lists is server-generated DATA and
+    /// stays a plain literal.
+    NotifTaskSectionLabel,
+
     /// Shell-S4-lock lockscreen chrome — see `lockscreen/render.rs`'s header.
     LockAwaySummaryTitle,
     LockPendingCountLabel,
@@ -449,6 +457,47 @@ pub enum Key {
     VerifiedTierPartial,
     VerifiedTierUnsupported,
     VerifiedTierUnrated,
+
+    /// A1 result-loopback (2026-08-24): the Launcher's "Enter 交辦" submit
+    /// path (`overlay::launcher::try_submit_delegate`) failing BEFORE a
+    /// task was ever created — new chrome, same catalog as every other
+    /// `Launcher*`/`Notif*` honest-state string above. Two distinct
+    /// failures get two distinct sentences (5.誠實回報: no generic "出錯
+    ///了" that could mean anything): no agent this session can delegate
+    /// to at all, versus the submit RPC itself failing (offline gateway,
+    /// rejected request, etc.).
+    LauncherDelegateNoAgent,
+    LauncherDelegateSubmitFailed,
+    /// The failure card's title (`overlay::launcher::
+    /// post_submit_failure_card`) — separate from the two sentences above
+    /// so either can be reused as the card BODY under one shared heading.
+    LauncherDelegateSubmitFailedTitle,
+
+    /// A1 result-loopback (2026-08-24): `main.rs::post_task_result_card`'s
+    /// three terminal-state card summaries (a single `{}` placeholder for
+    /// the task's own title, `t1`), the honest fallback when the gateway
+    /// gave no `result_summary`/`judge_feedback`/`pause_reason` at all, and
+    /// the two decision buttons a `needs_human` card offers
+    /// (`gateway_client::decide_goal_task`, `action: "retry"|"abort"` — the
+    /// SAME verbs the dashboard's needs_human board sends, see
+    /// `overlay/notifications_apps.rs`'s own doc comment on why only these
+    /// two ride a notification card). User-facing, zero internal
+    /// vocabulary: no "goal_mode", "needs_human", or task id ever appears.
+    TaskResultDoneSummary,
+    TaskResultFailedSummary,
+    TaskResultNeedsHumanSummary,
+    TaskResultNoDetail,
+    TaskResultRetryButton,
+    TaskResultAbortButton,
+    /// Posted (also through `post_system`, `system_task: None`) when a
+    /// retry/abort click's own `tasks.goal_decide` call fails — the
+    /// original `needs_human` card is deliberately left in place on this
+    /// path (`overlay/notifications_apps.rs::apply_decide_outcome`) so the
+    /// operator can just press it again, but silently doing nothing beyond
+    /// that would still be exactly the kind of hidden failure 5.誠實回報
+    /// forbids, hence this second card.
+    TaskResultDecideFailedTitle,
+    TaskResultDecideFailed,
 }
 
 /// Look up `key` in `locale`'s catalog. Never falls through to a "missing
@@ -625,6 +674,7 @@ fn zh_tw(key: Key) -> &'static str {
         Key::NotifAgeMinutes => "{} 分鐘前",
         Key::NotifAgeHours => "{} 小時前",
         Key::NotifAgeDays => "{} 天前",
+        Key::NotifTaskSectionLabel => "進行中任務",
 
         Key::LockAwaySummaryTitle => "你離開的 {}",
         Key::LockPendingCountLabel => "{} 件等你決定",
@@ -689,6 +739,19 @@ fn zh_tw(key: Key) -> &'static str {
         Key::VerifiedTierPartial => "部分支援",
         Key::VerifiedTierUnsupported => "不支援",
         Key::VerifiedTierUnrated => "未評級",
+
+        Key::LauncherDelegateNoAgent => "找不到可交辦的 AI 員工，請先在儀表板建立一個。",
+        Key::LauncherDelegateSubmitFailed => "交辦沒有送出，請稍後再試一次。",
+        Key::LauncherDelegateSubmitFailedTitle => "交辦沒有送出",
+
+        Key::TaskResultDoneSummary => "「{}」已完成",
+        Key::TaskResultFailedSummary => "「{}」失敗",
+        Key::TaskResultNeedsHumanSummary => "「{}」需要你確認",
+        Key::TaskResultNoDetail => "沒有附上摘要內容。",
+        Key::TaskResultRetryButton => "重試",
+        Key::TaskResultAbortButton => "放棄",
+        Key::TaskResultDecideFailedTitle => "決定沒有送出",
+        Key::TaskResultDecideFailed => "沒有送出成功，請稍後再試一次。",
     }
 }
 
@@ -841,6 +904,7 @@ fn en(key: Key) -> &'static str {
         Key::NotifAgeMinutes => "{} min ago",
         Key::NotifAgeHours => "{} h ago",
         Key::NotifAgeDays => "{} d ago",
+        Key::NotifTaskSectionLabel => "In progress",
 
         Key::LockAwaySummaryTitle => "Away for {}",
         Key::LockPendingCountLabel => "{} awaiting your decision",
@@ -905,6 +969,19 @@ fn en(key: Key) -> &'static str {
         Key::VerifiedTierPartial => "Partial",
         Key::VerifiedTierUnsupported => "Unsupported",
         Key::VerifiedTierUnrated => "Unrated",
+
+        Key::LauncherDelegateNoAgent => "No agent is reachable to delegate to — set one up on the dashboard first.",
+        Key::LauncherDelegateSubmitFailed => "The delegation wasn't sent — please try again in a moment.",
+        Key::LauncherDelegateSubmitFailedTitle => "Delegation not sent",
+
+        Key::TaskResultDoneSummary => "\u{201c}{}\u{201d} is done",
+        Key::TaskResultFailedSummary => "\u{201c}{}\u{201d} failed",
+        Key::TaskResultNeedsHumanSummary => "\u{201c}{}\u{201d} needs your input",
+        Key::TaskResultNoDetail => "No summary was attached.",
+        Key::TaskResultRetryButton => "Retry",
+        Key::TaskResultAbortButton => "Abort",
+        Key::TaskResultDecideFailedTitle => "That decision wasn't sent",
+        Key::TaskResultDecideFailed => "That didn't go through — please try again in a moment.",
     }
 }
 
@@ -1057,6 +1134,7 @@ fn ja_jp(key: Key) -> &'static str {
         Key::NotifAgeMinutes => "{} 分前",
         Key::NotifAgeHours => "{} 時間前",
         Key::NotifAgeDays => "{} 日前",
+        Key::NotifTaskSectionLabel => "進行中のタスク",
 
         Key::LockAwaySummaryTitle => "離席していた時間：{}",
         Key::LockPendingCountLabel => "{} 件があなたの判断を待っています",
@@ -1121,6 +1199,19 @@ fn ja_jp(key: Key) -> &'static str {
         Key::VerifiedTierPartial => "一部対応",
         Key::VerifiedTierUnsupported => "非対応",
         Key::VerifiedTierUnrated => "未評価",
+
+        Key::LauncherDelegateNoAgent => "委任できる AI スタッフが見つかりません。ダッシュボードで作成してください。",
+        Key::LauncherDelegateSubmitFailed => "委任を送信できませんでした。しばらくしてからもう一度お試しください。",
+        Key::LauncherDelegateSubmitFailedTitle => "委任を送信できませんでした",
+
+        Key::TaskResultDoneSummary => "「{}」が完了しました",
+        Key::TaskResultFailedSummary => "「{}」が失敗しました",
+        Key::TaskResultNeedsHumanSummary => "「{}」の確認が必要です",
+        Key::TaskResultNoDetail => "要約は添付されていません。",
+        Key::TaskResultRetryButton => "再試行",
+        Key::TaskResultAbortButton => "中止",
+        Key::TaskResultDecideFailedTitle => "決定を送信できませんでした",
+        Key::TaskResultDecideFailed => "送信できませんでした。しばらくしてからもう一度お試しください。",
     }
 }
 

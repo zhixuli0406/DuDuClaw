@@ -116,9 +116,16 @@ pub(crate) const SERVER_VENDOR: &str = "DuDuClaw";
 pub(crate) const DEFAULT_ACTION_KEY: &str = "default";
 
 // ── Boundary caps (untrusted input) ──────────────────────────────────────
-const MAX_APP_NAME_CHARS: usize = 48;
-const MAX_SUMMARY_CHARS: usize = 160;
-const MAX_BODY_CHARS: usize = 1200;
+// `pub(crate)` (was private until A1 result-loopback, 2026-08-24):
+// `center::NotificationCenter::post_system` applies the SAME caps to
+// shell-originated cards (a task's `result_summary`/`judge_feedback` is
+// agent-generated free text, not literally untrusted the way a third-party
+// D-Bus call is, but a card with an unbounded body or an embedded newline
+// in its summary looks exactly as broken either way — see that fn's own
+// doc comment).
+pub(crate) const MAX_APP_NAME_CHARS: usize = 48;
+pub(crate) const MAX_SUMMARY_CHARS: usize = 160;
+pub(crate) const MAX_BODY_CHARS: usize = 1200;
 const MAX_ACTION_LABEL_CHARS: usize = 40;
 const MAX_ACTION_KEY_CHARS: usize = 64;
 /// Buttons a single notification may contribute to the panel. Anything past
@@ -144,13 +151,13 @@ const TRANSIENT_DEFAULT_EXPIRE: Duration = Duration::from_secs(8);
 /// Declared, because each is genuinely implemented:
 /// - `body`        — the body text is rendered on the card.
 /// - `actions`     — action buttons are rendered, and a click on the card
-///                   itself invokes `default` when the sender declared it
-///                   (`center::NotificationCenter::invoke_default`).
+///   itself invokes `default` when the sender declared it
+///   (`center::NotificationCenter::invoke_default`).
 /// - `persistence` — notifications stay in the 通知中心 until dismissed
-///                   rather than vanishing with a popup. This is literally
-///                   what this shell does, and it is also what makes the
-///                   `expire_timeout` policy below defensible (see
-///                   `ExpirePolicy::resolve`).
+///   rather than vanishing with a popup. This is literally
+///   what this shell does, and it is also what makes the
+///   `expire_timeout` policy below defensible (see
+///   `ExpirePolicy::resolve`).
 ///
 /// Deliberately NOT declared, because they are not implemented — an
 /// over-claimed capability makes a client send content we then silently

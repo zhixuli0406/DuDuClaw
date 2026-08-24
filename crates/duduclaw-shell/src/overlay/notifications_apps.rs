@@ -33,14 +33,29 @@
 // on its next tick and handed to the notifyd thread — nothing in this file
 // touches D-Bus, or knows it exists.
 
+use std::sync::mpsc;
+use std::time::Duration;
+
 use gpui::{div, prelude::*, px, Context, Div, FontWeight, Rgba, Stateful};
 
 use duduclaw_native_gui::theme;
 
 use super::notifications::{action_button, agent_color_for, avatar, decision_badge_owned, status_banner};
+use crate::gateway_client;
 use crate::i18n::{t, t1, Key, Locale};
 use crate::palette::ShellPalette;
 use crate::ShellView;
+
+/// The "check the mpsc channel" tick for `dispatch_goal_decide`'s own
+/// thread + `mpsc` + `cx.spawn` bridge — same value (and reasoning) every
+/// other such bridge in this crate uses. A local constant, not a reuse of
+/// `overlay::notifications::POLL_INTERVAL`: that one is private to its own
+/// file, and this module is a SIBLING of it, not a descendant — same
+/// "private is per-file, not per-directory" wall this crate's other
+/// bridge-poll constants (`overlay/launcher.rs::SUBMIT_BRIDGE_POLL_
+/// INTERVAL`, `main.rs::TASK_RESULT_BRIDGE_POLL_INTERVAL`) already work
+/// around identically.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Appends the section heading, the honest daemon-status banner (when there
 /// is bad news) and one card per notification. Renders nothing at all when
@@ -208,10 +223,29 @@ fn app_notification_card(
     // Buttons: the sender's own non-default actions, then 關閉. `button_
     // actions` already excludes `default` (that one is the card click), and
     // `notifyd` caps how many can arrive at all.
+    //
+    // A1 result-loopback (2026-08-24): `card.system_task`'s `sysact_retry`/
+    // `sysact_abort` are the ONE exception to "a click just calls
+    // `notify_center.invoke`" — see `dispatch_goal_decide`'s own doc
+    // comment for why they route to a real `tasks.goal_decide` call instead.
+    // Every other action (every D-Bus card ever, and any future
+    // `system_task` action key this doesn't recognize) keeps the exact
+    // pre-existing behavior.
     let mut buttons = div().flex().items_center().gap(px(8.));
     for action in card.button_actions() {
         let key = action.key.clone();
+        let system_task = card.system_task.clone();
         let on_click = cx.listener(move |view, _ev, _window, cx| {
+            if let Some(task_id) = &system_task {
+                if key == crate::task_result::ACTION_RETRY {
+                    dispatch_goal_decide(view, id, task_id.clone(), "retry", cx);
+                    return;
+                }
+                if key == crate::task_result::ACTION_ABORT {
+                    dispatch_goal_decide(view, id, task_id.clone(), "abort", cx);
+                    return;
+                }
+            }
             if view.notify_center.invoke(id, &key) {
                 cx.notify();
             }
@@ -255,6 +289,108 @@ fn age_label(received_at: std::time::Instant, now: std::time::Instant) -> String
     }
 }
 
+// ── A1 result-loopback (2026-08-24): needs_human decide from a card ───────
+//
+// A `needs_human` card's `sysact_retry`/`sysact_abort` buttons (declared by
+// `main.rs::post_task_result_card`) are the ONE action-button flavour on
+// this panel that is not a plain D-Bus round trip: they dispatch a REAL
+// `tasks.goal_decide` call — the same RPC (and therefore the same
+// `goal_notify`/audit-trail machinery) the dashboard's needs_human board
+// already drives (task brief: "沿用既有審批卡/決策管道，別重造"). Only
+// these two verbs are offered from a card — `done`/`takeover` stay
+// dashboard-only, because a card holds one line of context, not the task's
+// full timeline the dashboard's needs_human board shows, and both are
+// harder to take back than a retry or an abort.
+//
+// Same thread + `mpsc` + `cx.spawn` bridge shape every other blocking call
+// in this crate uses (`overlay/notifications.rs::trigger_refresh_if_stale`
+// is the closest sibling — a single-flight gateway call kicked off by a
+// click, not a timer).
+
+/// Dispatches one `tasks.goal_decide` call. Single-flight PER TASK ID
+/// (`TaskResultTracker::begin_decide`) — a double-click, or a stale render
+/// pass replaying an old click event, must not fire the RPC twice.
+fn dispatch_goal_decide(view: &mut ShellView, card_id: u32, task_id: String, action: &'static str, cx: &mut Context<ShellView>) {
+    if !view.task_results.begin_decide(&task_id) {
+        return;
+    }
+    let existing_jwt = view.task_results.session_jwt().map(str::to_string);
+    let thread_task_id = task_id.clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(decide_once(existing_jwt, thread_task_id, action));
+    });
+    cx.spawn(async move |weak, cx| loop {
+        match rx.try_recv() {
+            Ok(outcome) => {
+                let _ = weak.update(cx, |view, cx| apply_decide_outcome(view, card_id, &task_id, outcome, cx));
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(POLL_INTERVAL).await;
+    })
+    .detach();
+}
+
+/// Runs entirely on a background `std::thread` — never called from gpui's
+/// own executor, same contract every other blocking call in this crate
+/// documents.
+fn decide_once(existing_jwt: Option<String>, task_id: String, action: &'static str) -> (Option<String>, Result<(), gateway_client::GatewayError>) {
+    let (jwt, new_jwt) = match existing_jwt {
+        Some(jwt) => (jwt, None),
+        None => match gateway_client::bootstrap_local_session() {
+            Ok(jwt) => (jwt.clone(), Some(jwt)),
+            Err(e) => return (None, Err(e.into())),
+        },
+    };
+    let result = gateway_client::decide_goal_task(&jwt, &task_id, action, "來自殼通知中心").map_err(gateway_client::GatewayError::from);
+    (new_jwt, result)
+}
+
+/// Applies one settled decide attempt.
+///
+/// **Success**: `notify_center.dismiss(card_id)`, not `invoke` — the RPC
+/// itself already IS the decision (unlike a D-Bus card, there is no sender
+/// left to notify via `ActionInvoked`; `dismiss` closes the card the exact
+/// same way `invoke` would have, just without the pointless bus signal —
+/// see `NotificationCenter::invoke`'s own doc comment on this same
+/// distinction).
+///
+/// **Failure**: the original card is left EXACTLY as it was — still open,
+/// its buttons still live, so pressing the same one again is the retry
+/// affordance — and a second, separate honest failure card is posted (same
+/// 5.誠實回報 reasoning `overlay/launcher.rs::apply_submit_outcome`'s own
+/// doc comment gives for its analogous "the operator won't otherwise learn
+/// this failed" case).
+fn apply_decide_outcome(view: &mut ShellView, card_id: u32, task_id: &str, outcome: (Option<String>, Result<(), gateway_client::GatewayError>), cx: &mut Context<ShellView>) {
+    let (new_jwt, result) = outcome;
+    if let Some(jwt) = new_jwt {
+        view.task_results.apply_session(jwt);
+    }
+    view.task_results.end_decide(task_id);
+    match result {
+        Ok(()) => {
+            view.notify_center.dismiss(card_id);
+            cx.notify();
+        }
+        Err(e) => {
+            if crate::diag_enabled() {
+                eprintln!("[notifications] goal_decide failed for task {task_id}: {e:?}");
+            }
+            view.notify_center.post_system(
+                crate::task_result::NOTIFY_APP_NAME,
+                t(Locale::ZhTw, Key::TaskResultDecideFailedTitle),
+                t(Locale::ZhTw, Key::TaskResultDecideFailed),
+                crate::notifyd::Urgency::Normal,
+                Vec::new(),
+                None,
+            );
+            cx.notify();
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
