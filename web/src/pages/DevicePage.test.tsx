@@ -89,6 +89,14 @@ describe('<DevicePage> — appliance device management', () => {
     const updateStatus = vi
       .spyOn(api.device, 'updateStatus')
       .mockResolvedValue({ success: true, stdout: '{"available":false}', stderr: '' });
+    // H3d §11.5 item 1: `runUpdateCheck` now ALSO calls `device.update_check`
+    // (the real-source answer) in parallel — stub it so this test exercises
+    // only the raw-log-disclosure behavior it was written for.
+    vi.spyOn(api.device, 'updateCheck').mockResolvedValue({
+      available: false,
+      current_version: '0.1.0',
+      latest_version: '0.1.0',
+    });
 
     renderWithProviders(<DevicePage />);
     const user = userEvent.setup();
@@ -101,6 +109,44 @@ describe('<DevicePage> — appliance device management', () => {
     // It can still be collapsed again.
     await user.click(screen.getByRole('button', { name: 'Hide details' }));
     expect(screen.queryByText('{"available":false}')).not.toBeInTheDocument();
+  });
+
+  it('device.update_check reports a real newer version from the configured source', async () => {
+    vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
+    vi.spyOn(api.device, 'updateStatus').mockResolvedValue({ success: true, stdout: '', stderr: '' });
+    const updateCheck = vi.spyOn(api.device, 'updateCheck').mockResolvedValue({
+      available: true,
+      current_version: '0.1.0',
+      latest_version: '0.2.0',
+    });
+
+    renderWithProviders(<DevicePage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Check for updates' }));
+
+    await waitFor(() => expect(updateCheck).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText('Update available')).toBeInTheDocument();
+    expect(screen.getByText('Current 0.1.0 → latest 0.2.0')).toBeInTheDocument();
+  });
+
+  it('device.update_check honestly refuses instead of claiming "up to date" when no source is configured', async () => {
+    vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
+    vi.spyOn(api.device, 'updateStatus').mockResolvedValue({ success: true, stdout: '', stderr: '' });
+    vi.spyOn(api.device, 'updateCheck').mockRejectedValue({
+      code: 'not_configured',
+      message: '尚未設定更新來源，請先在設定中填入更新來源網址。',
+    });
+
+    renderWithProviders(<DevicePage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Check for updates' }));
+
+    expect(
+      await screen.findByText('No update source is configured yet — set one in Settings first.'),
+    ).toBeInTheDocument();
+    // Must never render an "up to date" badge on a failed check.
+    expect(screen.queryByText('Up to date')).not.toBeInTheDocument();
+    expect(screen.queryByText('Update available')).not.toBeInTheDocument();
   });
 
   it('the "roll back to previous version" button opens a confirm dialog, then calls device.update_rollback on confirm', async () => {

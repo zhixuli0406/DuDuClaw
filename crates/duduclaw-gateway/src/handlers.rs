@@ -7110,6 +7110,11 @@ impl MethodHandler {
                 require_appliance!();
                 self.handle_device_update_status().await
             }
+            "device.update_check" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_update_check().await
+            }
             "device.update_apply" => {
                 require_admin!();
                 require_appliance!();
@@ -7508,6 +7513,7 @@ impl MethodHandler {
                     { "name": "device.status", "description": "Appliance CPU/RAM/disk/temperature/uptime/network snapshot (admin, appliance-only)" },
                     { "name": "device.network", "description": "Read network interfaces; setting a static IP is not implemented yet (admin, appliance-only)" },
                     { "name": "device.update_status", "description": "Check for an available OS update via systemd-sysupdate (admin, appliance-only)" },
+                    { "name": "device.update_check", "description": "Check the configured update source for a newer OS version (signed manifest only, no download) (admin, appliance-only)" },
                     { "name": "device.update_apply", "description": "Install the newest available OS update (admin, appliance-only)" },
                     { "name": "device.update_rollback", "description": "Roll back to the previous OS version and reboot (admin, appliance-only, destructive: requires confirm)" },
                     { "name": "device.boot_assessment", "description": "Report systemd's automatic boot assessment state for the running version (admin, appliance-only, read-only)" },
@@ -44334,6 +44340,50 @@ impl MethodHandler {
         device_op_result_frame(crate::device_ops::select_device_ops().update_status().await)
     }
 
+    /// `device.update_check` — H3d §11.5 (item 1): read the REAL update
+    /// source (`config.toml [os_update] source_url`), not local staging.
+    ///
+    /// `device.update_status` above only ever reflects
+    /// `systemd-sysupdate list`'s view of the LOCAL staging directory,
+    /// which is empty until an `update_apply` call has actually downloaded
+    /// something — so it can never answer "is there something new
+    /// upstream". This calls [`crate::os_update::check_update`], which
+    /// fetches and signature-verifies the same two small manifest files
+    /// [`crate::os_update::stage_update`] does, but stops there (no payload
+    /// download, no slot resolution) and reports an honest
+    /// `{available, current_version, latest_version}` — or a distinct error
+    /// code per failure mode, never a fabricated "up to date" on a network
+    /// or verification failure.
+    async fn handle_device_update_check(&self) -> WsFrame {
+        match crate::os_update::check_update(self.home_dir()).await {
+            Ok(report) => WsFrame::Response {
+                id: String::new(),
+                ok: true,
+                payload: Some(json!({
+                    "available": report.available,
+                    "current_version": report.current_version,
+                    "latest_version": report.latest_version,
+                })),
+                error: None,
+            },
+            Err(e) => WsFrame::Response {
+                id: String::new(),
+                ok: false,
+                payload: None,
+                error: Some(json!({
+                    "code": match e {
+                        crate::os_update::StageError::NotConfigured => "not_configured",
+                        crate::os_update::StageError::UpToDate(_) => "up_to_date",
+                        crate::os_update::StageError::Rejected(_) => "verification_failed",
+                        crate::os_update::StageError::Network(_) => "network_error",
+                        crate::os_update::StageError::Io(_) => "io_error",
+                    },
+                    "message": e.user_message(),
+                })),
+            },
+        }
+    }
+
     /// `device.update_apply` — stage a verified release, then install it.
     ///
     /// The staging half (H3d) is not optional and not a convenience: this
@@ -44379,6 +44429,61 @@ impl MethodHandler {
                 };
             }
         };
+
+        // H3d §11.5 item 2: best-effort pre-update /data snapshot — never
+        // blocks the update itself (see `pre_update_backup` module doc for
+        // the "automatic, narrow, best-effort" reasoning). A failure here
+        // is logged and the flow continues exactly as before this step
+        // existed.
+        match crate::pre_update_backup::snapshot_before_update(self.home_dir(), &staged.version) {
+            Ok(report) => tracing::info!(
+                "[device.update_apply] pre-update snapshot: {} file(s), {} bytes, in {}",
+                report.files_copied,
+                report.bytes_copied,
+                report.dir.display()
+            ),
+            Err(e) => tracing::warn!(
+                "[device.update_apply] pre-update snapshot failed (continuing with the update): {e}"
+            ),
+        }
+
+        // H3d §11.7: clear a stale exhausted ESP entry for the version we
+        // are about to install, BEFORE calling sysupdate. Without this, a
+        // version that was manually rolled back (device.update_rollback's
+        // tier 2) can never be reinstalled: its exhausted ESP entry and its
+        // unchanged partition label both already satisfy
+        // systemd-sysupdate's InstancesMax accounting, so `update apply`
+        // silently writes nothing and still reports success — "rolled back
+        // once, uninstallable forever, and lies about it." Idempotent
+        // (no-op when there is nothing stale), so this runs unconditionally
+        // rather than only after a detected rollback.
+        //
+        // Off-appliance (no sysd reachable) there is no ESP at all —
+        // `select_sysd_ops()` is `None` and this step is skipped entirely;
+        // `update_apply()` below degrades the same way it always has there.
+        // On-appliance, a genuine failure here is treated as fatal to the
+        // whole apply rather than best-effort: proceeding anyway risks
+        // reproducing the exact "reports success but did nothing" bug this
+        // step exists to close.
+        if let Some(sysd) = crate::device_ops::select_sysd_ops() {
+            if let Err(e) = sysd.clear_exhausted_update_target(&staged.version).await {
+                tracing::error!(
+                    "[device.update_apply] could not prepare the ESP for {}: {e}",
+                    staged.version
+                );
+                return WsFrame::Response {
+                    id: String::new(),
+                    ok: false,
+                    payload: None,
+                    error: Some(json!({
+                        "code": "esp_prepare_failed",
+                        "message": format!(
+                            "更新檔已驗證，但清理舊開機項目失敗，安裝已中止（裝置未被更動）：{e}"
+                        ),
+                    })),
+                };
+            }
+        }
 
         let applied = crate::device_ops::select_device_ops().update_apply().await;
         // Only when sysupdate actually succeeded: confirm from the live GPT
@@ -45128,6 +45233,7 @@ mod device_rpc_tests {
             ("device.status", json!({})),
             ("device.network", json!({})),
             ("device.update_status", json!({})),
+            ("device.update_check", json!({})),
             ("device.update_apply", json!({})),
             ("device.update_rollback", json!({"confirm": true})),
             ("device.boot_assessment", json!({})),

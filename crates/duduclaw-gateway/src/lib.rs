@@ -40,6 +40,7 @@ pub mod device;
 pub mod device_about;
 pub mod device_ops;
 pub mod os_update;
+pub mod pre_update_backup;
 // ── D4a: network settings (Wi-Fi over iwd D-Bus) — `network.*` RPCs +
 // `/api/first-run/network/*` OOBE pre-auth endpoints ─────────────────────
 pub mod network;

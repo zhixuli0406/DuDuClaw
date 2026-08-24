@@ -10,7 +10,7 @@
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
 //! the same adjacently-tagged shape `duduclaw-cli-worker`'s protocol uses)
-//! — the entire caller-reachable surface is eleven fixed verbs, wire-encoded
+//! — the entire caller-reachable surface is twelve fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
 //! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
 //! data. `deny_unknown_fields` means a stray extra top-level key fails to
@@ -22,8 +22,8 @@
 //! [`SysdRequest::FactoryReset`]) carry zero fields on purpose: for these
 //! the server never builds a command line by concatenating caller-supplied
 //! strings, it only ever runs a hardcoded argv literal per verb (see
-//! `dispatch.rs`). The remaining four carry caller data, and each keeps
-//! that data out of the argv-concatenation hazard via one of three
+//! `dispatch.rs`). The remaining five carry caller data, and each keeps
+//! that data out of the argv-concatenation hazard via one of four
 //! disciplines, depending on shape:
 //! - [`SysdRequest::Hostname`] `{ set }` and [`SysdRequest::SetTimezone`]
 //!   `{ timezone }` pass their one string straight to `Command::arg()`
@@ -49,6 +49,18 @@
 //!   caller-supplied string written to disk verbatim — so there is no
 //!   string to escape or sanitize in the first place, only typed values to
 //!   re-serialize.
+//! - [`SysdRequest::ClearExhaustedUpdateTarget`] `{ version }` uses a
+//!   fourth discipline: `version` never reaches a spawned process, and it
+//!   never reaches a path join either. It is validated into a typed value
+//!   first (`dispatch::validate_update_version_syntax`, the identical
+//!   character class `os_update::is_version_text` enforces gateway-side),
+//!   then used only to compute a boot-entry *stem* that is compared against
+//!   filenames this process already enumerated from a real directory
+//!   listing (`dispatch::read_esp_entries`) — the one filesystem write this
+//!   verb performs ever only targets a filename it just read back out of
+//!   that same listing, never a path built by joining caller text onto a
+//!   base directory (see `dispatch::dispatch_clear_exhausted_update_target`
+//!   for the H3d §11.7 bug this closes).
 //!
 //! An unrecognized `verb` string, or any malformed JSON, fails
 //! `serde_json::from_str` and the server responds with a structured
@@ -187,6 +199,31 @@ pub enum SysdRequest {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         dns: Vec<String>,
     },
+    /// H3d §11.7: clear a stale, **exhausted** ESP boot entry for `version`
+    /// before installing it.
+    ///
+    /// Closes a real bug found in live-fire QEMU testing: once a version is
+    /// staged, installed, booted and then manually rolled back
+    /// (`UpdateRollback`'s tier 2), the destination partition's GPT label is
+    /// left unchanged (rollback only ever touches ESP entries, never
+    /// partition labels) and the ESP still holds that version's UKI,
+    /// already renamed to the exhausted `+0-1` shape. Both facts are enough
+    /// for `systemd-sysupdate` to count the version as already installed
+    /// against its `InstancesMax=2` accounting — the root transfer matches
+    /// the partition by label, the UKI transfer's
+    /// `duduclaw-os_@v+@l-@d.efi` pattern matches `+0-1` too — so
+    /// `SysupdateApply` writes nothing at all and still exits 0. See
+    /// `dispatch::dispatch_clear_exhausted_update_target` for the exact
+    /// decision (idempotent no-op when there is nothing stale, and it
+    /// refuses to touch the entry for the version currently running rather
+    /// than ever guessing).
+    ///
+    /// `version` is validated by `dispatch::validate_update_version_syntax`
+    /// — the same character class `os_update::is_version_text` enforces
+    /// gateway-side — before it is used for anything; see the module doc
+    /// comment above for why that is enough to keep this verb out of the
+    /// argv/path-injection hazard the rest of this file documents.
+    ClearExhaustedUpdateTarget { version: String },
 }
 
 impl SysdRequest {
@@ -206,6 +243,7 @@ impl SysdRequest {
             SysdRequest::SetTimezone { .. } => "set_timezone",
             SysdRequest::SetNtp { .. } => "set_ntp",
             SysdRequest::NetworkWiredConfig { .. } => "network_wired_config",
+            SysdRequest::ClearExhaustedUpdateTarget { .. } => "clear_exhausted_update_target",
         }
     }
 }
@@ -481,6 +519,26 @@ mod tests {
     #[test]
     fn set_timezone_rejects_unknown_param_field() {
         let raw = r#"{"verb":"set_timezone","params":{"timezone":"Asia/Taipei","extra":"x"}}"#;
+        let r: Result<SysdRequest, _> = serde_json::from_str(raw);
+        assert!(r.is_err(), "unexpected param field must be rejected");
+    }
+
+    #[test]
+    fn clear_exhausted_update_target_round_trips_with_exact_wire_shape() {
+        let req = SysdRequest::ClearExhaustedUpdateTarget { version: "0.2.0".to_string() };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            s,
+            r#"{"verb":"clear_exhausted_update_target","params":{"version":"0.2.0"}}"#
+        );
+        let back: SysdRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(req, back);
+        assert_eq!(req.verb_name(), "clear_exhausted_update_target");
+    }
+
+    #[test]
+    fn clear_exhausted_update_target_rejects_unknown_param_field() {
+        let raw = r#"{"verb":"clear_exhausted_update_target","params":{"version":"0.2.0","extra":"x"}}"#;
         let r: Result<SysdRequest, _> = serde_json::from_str(raw);
         assert!(r.is_err(), "unexpected param field must be rejected");
     }

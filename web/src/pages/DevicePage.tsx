@@ -26,6 +26,7 @@ import {
   type DeviceStatus,
   type DeviceNetworkInterface,
   type DeviceOpResult,
+  type DeviceUpdateCheckResult,
   type DeviceBackupScheduleConfig,
   type DeviceBackupFileEntry,
 } from '@/lib/api';
@@ -274,17 +275,53 @@ export function DevicePage() {
   const [showUpdateLog, setShowUpdateLog] = useState(false);
   const [rollbackConfirmOpen, setRollbackConfirmOpen] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
+  // H3d §11.5 item 1: `device.update_check`'s answer — the REAL update
+  // source, not `device.update_status`'s local-staging-only view (which
+  // still feeds `updateLog`/`showUpdateLog` below for the raw detail
+  // toggle). `checkError` carries the gateway's own zh-TW reason
+  // (`not_configured` renders its own copy; everything else falls back to
+  // `formatError`) rather than a generic failure clause.
+  const [checkResult, setCheckResult] = useState<DeviceUpdateCheckResult | null>(null);
+  const [checkError, setCheckError] = useState<string | null>(null);
 
   const runUpdateCheck = async () => {
     setChecking(true);
     try {
-      const res = await api.device.updateStatus();
-      setUpdateLog(res);
-      setShowUpdateLog(true);
-      toast.success(t('device.update.checkDone'));
-    } catch (e) {
-      console.warn('[device.update_status]', e);
-      toast.error(formatError(e));
+      const [statusOutcome, checkOutcome] = await Promise.allSettled([
+        api.device.updateStatus(),
+        api.device.updateCheck(),
+      ]);
+      if (statusOutcome.status === 'fulfilled') {
+        setUpdateLog(statusOutcome.value);
+        setShowUpdateLog(true);
+      } else {
+        console.warn('[device.update_status]', statusOutcome.reason);
+      }
+
+      // `fulfilled` alone is not enough to trust — a malformed/empty
+      // response (e.g. the test double's default `null`) must fall through
+      // to the honest-failure branch below rather than dereferencing a
+      // field that isn't there.
+      if (checkOutcome.status === 'fulfilled' && checkOutcome.value) {
+        const result = checkOutcome.value;
+        setCheckResult(result);
+        setCheckError(null);
+        toast.success(
+          result.available
+            ? t('device.update.checkAvailable', { version: result.latest_version })
+            : t('device.update.checkUpToDate', { version: result.current_version }),
+        );
+      } else {
+        const reason = checkOutcome.status === 'rejected' ? checkOutcome.reason : undefined;
+        console.warn('[device.update_check]', reason ?? 'empty response');
+        setCheckResult(null);
+        const msg =
+          errorCode(reason) === 'not_configured'
+            ? t('device.update.check.notConfigured')
+            : (errorMessage(reason) ?? t('device.update.check.failed'));
+        setCheckError(msg);
+        toast.error(msg);
+      }
     } finally {
       setChecking(false);
     }
@@ -687,6 +724,29 @@ export function DevicePage() {
           {/* ② 更新中心 */}
           <Panel icon={Download} title={t('device.section.update')} description={t('device.section.update.desc')}>
             <div className="space-y-3">
+              {/* H3d §11.5 item 1: the REAL update source's answer
+                  (device.update_check), not the local-staging-only view
+                  the raw detail toggle below still shows. Renders nothing
+                  until a check has actually run. */}
+              {checkResult && (
+                <div className="flex items-center gap-2 rounded-lg border border-surface-border bg-muted/30 p-2.5">
+                  <Badge
+                    variant="secondary"
+                    className={checkResult.available ? 'bg-warning/15 text-warning' : 'bg-success/15 text-success'}
+                  >
+                    {t(checkResult.available ? 'device.update.checkAvailableBadge' : 'device.update.checkUpToDateBadge')}
+                  </Badge>
+                  <span className="text-xs text-muted-foreground">
+                    {t('device.update.checkVersions', {
+                      current: checkResult.current_version,
+                      latest: checkResult.latest_version,
+                    })}
+                  </span>
+                </div>
+              )}
+              {checkError && !checkResult && (
+                <p className="text-xs text-muted-foreground">{checkError}</p>
+              )}
               <div className="flex flex-wrap gap-2">
                 <Button variant="outline" size="sm" onClick={runUpdateCheck} disabled={checking || applying || rollingBack}>
                   <Download className={cn(checking && 'animate-pulse')} />

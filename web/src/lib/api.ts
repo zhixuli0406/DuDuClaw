@@ -2561,6 +2561,19 @@ export interface DeviceOpResult {
   stderr: string;
 }
 
+/** `device.update_check` (H3d §11.5 item 1) — the REAL update source's
+ *  answer, not `device.update_status`'s local-staging-only view. `available`
+ *  is only ever derived from a signature-verified manifest fetched from
+ *  `config.toml [os_update] source_url`; a network/verification failure
+ *  surfaces as a rejected promise (`code: 'not_configured' |
+ *  'verification_failed' | 'network_error' | 'io_error'`), never as a
+ *  fabricated `available: false`. */
+export interface DeviceUpdateCheckResult {
+  available: boolean;
+  current_version: string;
+  latest_version: string;
+}
+
 export interface DeviceBackupResult {
   /** Pass straight to `GET /api/files/download?name=<filename>` to fetch it. */
   filename: string;
@@ -6161,6 +6174,11 @@ export const api = {
       client.call('device.network') as Promise<{ interfaces: DeviceNetworkInterface[] }>,
     /** `systemd-sysupdate list --json=short`, forwarded verbatim in `.stdout`. */
     updateStatus: () => client.call('device.update_status') as Promise<DeviceOpResult>,
+    /** H3d §11.5 item 1: checks the REAL update source (signed manifest,
+     *  no download) — unlike `updateStatus` above, this can actually answer
+     *  "is there something new upstream". A network/verification failure
+     *  rejects the promise rather than reporting a fabricated "up to date". */
+    updateCheck: () => client.call('device.update_check') as Promise<DeviceUpdateCheckResult>,
     /** Installs the newest available update. */
     updateApply: () => client.call('device.update_apply') as Promise<DeviceOpResult>,
     /** Always rejects `unsupported` this round (no verified appliance A/B

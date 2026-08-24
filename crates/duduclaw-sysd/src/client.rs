@@ -47,8 +47,30 @@ pub struct SysdClient {
 }
 
 impl SysdClient {
+    /// Default per-call timeout. **Must cover full completion, not just
+    /// "accepted and started"** — [`Self::call`] blocks on the server's
+    /// response line, and the server (`dispatch.rs`) only writes that line
+    /// after the underlying command's `Child::wait()` returns. A shorter
+    /// value here does not make a slow verb fail faster; it makes an
+    /// otherwise-successful call get reported as a client-side timeout
+    /// while the privileged operation keeps running to completion on the
+    /// server, unobserved.
+    ///
+    /// Measured live (H3d §11.7 T8r probe, 2026-08-24): `SysupdateApply`
+    /// (`systemd-sysupdate update`, writing a multi-GiB root payload) took
+    /// 39s under ordinary QEMU + host disk contention — comfortably over a
+    /// 30s default this crate previously shipped, which surfaced as
+    /// `{"code":"unsupported","message":"sysd call timed out after 30s"}`
+    /// even though `sysd`'s own audit log showed `success=true` for the
+    /// same call a few seconds later. 600s leaves generous headroom for a
+    /// slow disk or a loaded host without meaningfully weakening the
+    /// timeout's job for every OTHER verb (hostname/timezone/ntp/network
+    /// config/boot-assessment all still return in well under a second in
+    /// practice — a longer ceiling costs nothing when the call is fast).
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
     pub fn new(socket_path: PathBuf) -> Self {
-        Self { socket_path, timeout: Duration::from_secs(30) }
+        Self { socket_path, timeout: Self::DEFAULT_TIMEOUT }
     }
 
     /// Build from the shared env-aware resolver
@@ -58,12 +80,15 @@ impl SysdClient {
         Self::new(crate::protocol::resolve_socket_path())
     }
 
-    /// Override the per-call timeout (default 30s — generous enough for
-    /// `systemd-sysupdate update` to at least be accepted and start; the
-    /// verbs that tear down the machine, `reboot`/`poweroff`/the reboot
-    /// half of `factory_reset`, may never actually send a response at all
-    /// if the box goes down mid-write, which callers must treat as a
-    /// plausible success, not a hard failure — see `DeviceOps` callers).
+    /// Override the per-call timeout (default [`Self::DEFAULT_TIMEOUT`] —
+    /// see its doc comment for why it must cover full completion, not just
+    /// acceptance). The verbs that tear down the machine —
+    /// `reboot`/`poweroff`/the reboot half of `factory_reset` — may never
+    /// actually send a response at all if the box goes down mid-write,
+    /// which callers must treat as a plausible success, not a hard failure
+    /// (see `DeviceOps` callers); that is a dropped connection, a distinct
+    /// failure mode from this timeout ever firing on a call that is still
+    /// quietly running to completion server-side.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -143,6 +168,22 @@ impl SysdClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression pin (H3d §11.7 T8r probe, 2026-08-24): the default must
+    /// stay generous enough to cover a real multi-GiB `SysupdateApply`
+    /// under host contention (measured 39s), not just "the call was
+    /// accepted". See [`SysdClient::DEFAULT_TIMEOUT`]'s doc comment.
+    #[test]
+    fn default_timeout_is_generous_enough_for_a_real_sysupdate_apply() {
+        let client = SysdClient::new(PathBuf::from("/tmp/x.sock"));
+        assert!(
+            client.timeout >= Duration::from_secs(120),
+            "default timeout {:?} is too short — a real SysupdateApply measured 39s under \
+             load and a client-side timeout on a call that succeeded server-side is exactly \
+             the kind of dishonest-looking failure this crate exists to avoid",
+            client.timeout
+        );
+    }
 
     #[test]
     fn from_env_uses_default_when_unset() {

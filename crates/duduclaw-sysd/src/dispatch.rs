@@ -971,6 +971,164 @@ async fn rollback_by_renaming_selected_entry() -> Result<String, SysdError> {
     Ok(format!("marked {on_disk} bad (renamed to {target})"))
 }
 
+// ---------------------------------------------------------------------------
+// H3d §11.7: clear a stale exhausted ESP entry before reinstalling a version
+// ---------------------------------------------------------------------------
+
+/// Prefix every Type#2 boot entry filename carries — the same literal
+/// `duduclaw-gateway::os_update::SLOT_LABEL_PREFIX` uses for GPT partition
+/// labels. Duplicated rather than shared (this crate cannot depend on
+/// `duduclaw-gateway` — the dependency direction runs the other way); kept
+/// as one named constant so the two copies are trivial to eyeball against
+/// each other if either ever changes.
+const ENTRY_STEM_PREFIX: &str = "duduclaw-os_";
+
+/// Maximum accepted length of a `ClearExhaustedUpdateTarget { version }`
+/// value — mirrors `os_update::is_version_text`'s 32-byte cap so a version
+/// this daemon accepts is exactly a version the gateway could have named in
+/// a signed manifest.
+const MAX_UPDATE_VERSION_LEN: usize = 32;
+
+/// Pure syntax check for a `ClearExhaustedUpdateTarget { version }` value —
+/// deliberately the *exact same* character class `os_update::is_version_text`
+/// enforces gateway-side (must start with a letter or digit, then only
+/// alphanumerics plus `._-+`). No filesystem access, so this half is
+/// unit-testable on any host. The companion decision logic is
+/// [`find_exhausted_entry`] / [`target_is_running_entry`], both pure over
+/// an already-read entry list.
+pub(crate) fn validate_update_version_syntax(v: &str) -> Result<&str, SysdError> {
+    let trimmed = v.trim();
+    if trimmed.is_empty() {
+        return Err(SysdError::bad_request("version value must not be empty"));
+    }
+    if trimmed.len() > MAX_UPDATE_VERSION_LEN {
+        return Err(SysdError::bad_request(format!(
+            "version value exceeds {MAX_UPDATE_VERSION_LEN} bytes"
+        )));
+    }
+    let starts_ok = trimmed
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric());
+    if !starts_ok {
+        return Err(SysdError::bad_request(
+            "version value must start with a letter or digit",
+        ));
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
+    {
+        return Err(SysdError::bad_request(
+            "version value contains disallowed characters",
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// True when `want_stem` (the stable identity of the version a caller wants
+/// cleared) is the entry the machine is **currently running**. `running` is
+/// whatever [`running_entry_name`] returned, if anything — compared through
+/// [`entry_stem`] so a counted filename (`…+2-1.efi`) still resolves to the
+/// same identity as its blessed form, exactly like [`check_rollback_target`]
+/// does for the rollback path.
+///
+/// This is the one hard refusal in the whole verb: a caller asking to clear
+/// the entry for the version the machine is presently running is either
+/// confused about which version it means or attempting to make the running
+/// boot entry disappear out from under the machine. Neither is this verb's
+/// job — it only ever prepares a DIFFERENT, about-to-be-installed version's
+/// slot.
+pub fn target_is_running_entry(running: Option<&str>, want_stem: &str) -> bool {
+    running.and_then(entry_stem).as_deref() == Some(want_stem)
+}
+
+/// Pure decision: which (if any) ESP entry is the stale, exhausted leftover
+/// for `want_stem` that this verb needs to clear.
+///
+/// `None` covers two different situations on purpose, because the caller
+/// (the update-apply flow) treats them identically — "nothing to do here":
+/// - no entry for this version exists at all (a first install of it), or
+/// - an entry exists but is **not** exhausted — still mid-assessment
+///   (`+2-1`) or already blessed (no suffix). That is live boot-assessment
+///   state this verb must never touch; only the exhausted `+0-…` shape is a
+///   stale leftover from a rollback that already happened.
+pub fn find_exhausted_entry<'a>(entries: &'a [String], want_stem: &str) -> Option<&'a String> {
+    entries
+        .iter()
+        .find(|e| entry_stem(e).as_deref() == Some(want_stem) && is_exhausted_entry(e))
+}
+
+/// H3d §11.7: clear a stale exhausted ESP entry for `version` before
+/// installing it, so `systemd-sysupdate` cannot mistake a previously
+/// rolled-back version for one that is already installed.
+///
+/// **The bug this closes** (found in 2026-08-24 live-fire QEMU testing, not
+/// in code review — see the design doc §11.7). Once a version has been
+/// staged, installed, booted and then manually rolled back
+/// ([`dispatch_update_rollback`]'s tier 2), the destination partition's GPT
+/// label is left exactly as it was — rollback only ever renames an ESP
+/// entry, it never touches a partition label — and the ESP still holds that
+/// version's UKI, already renamed to the exhausted `+0-1` shape. Both of
+/// those independently satisfy `systemd-sysupdate`'s `InstancesMax=2`
+/// accounting for that version (the root transfer matches the partition by
+/// label; the UKI transfer's `duduclaw-os_@v+@l-@d.efi` pattern matches
+/// `+0-1` too), so a later `SysupdateApply` for the very same version writes
+/// nothing at all and still exits 0 — "rolled back once, never installable
+/// again, and the update flow lies about it."
+///
+/// **The fix only has to touch the ESP.** The partition's contents are
+/// still correct (rollback never wrote to it), so removing the stale
+/// exhausted UKI is sufficient: the next `SysupdateApply` sees the version's
+/// instance count drop below `InstancesMax`, writes a fresh `+3-0` entry
+/// from the (already re-verified, already PARTUUID-bound) staged UKI, and
+/// sd-boot can actually try booting it again.
+///
+/// **Deliberately idempotent**, meant to run unconditionally before every
+/// `SysupdateApply` rather than only after a detected rollback (cheaper than
+/// tracking "was this version ever rolled back", and correct either way —
+/// see [`find_exhausted_entry`] for the no-op cases). Refuses
+/// ([`target_is_running_entry`]) rather than ever touching the entry for the
+/// version currently running.
+async fn dispatch_clear_exhausted_update_target(version: &str) -> DispatchResult {
+    let version = validate_update_version_syntax(version)?;
+    let want_stem = format!("{ENTRY_STEM_PREFIX}{version}");
+
+    if target_is_running_entry(running_entry_name().as_deref(), &want_stem) {
+        return Err(SysdError::bad_request(
+            "refusing to clear the boot entry for the version currently running".to_string(),
+        ));
+    }
+
+    let (dir, entries) = read_esp_entries().await?;
+    let Some(target) = find_exhausted_entry(&entries, &want_stem) else {
+        return Ok(SysdOpOutput {
+            success: true,
+            stdout: format!("no exhausted ESP entry for {version}; nothing to clear"),
+            stderr: String::new(),
+        });
+    };
+
+    let path = dir.join(target);
+    std::fs::remove_file(&path).map_err(|e| {
+        SysdError::io(format!(
+            "could not remove exhausted entry {}: {e}",
+            path.display()
+        ))
+    })?;
+    // Same FAT32-is-not-atomic reasoning as the rollback rename below: the
+    // ESP is what makes this machine bootable at all, flush before
+    // reporting success.
+    if let Ok(f) = std::fs::File::open(&dir) {
+        let _ = f.sync_all();
+    }
+    Ok(SysdOpOutput {
+        success: true,
+        stdout: format!("removed exhausted ESP entry {target} for version {version}"),
+        stderr: String::new(),
+    })
+}
+
 /// Dispatch one already-authorized, already-parsed request to its
 /// hardcoded command sequence.
 pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
@@ -1016,6 +1174,9 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
                 dns,
             )
             .await
+        }
+        SysdRequest::ClearExhaustedUpdateTarget { version } => {
+            dispatch_clear_exhausted_update_target(version).await
         }
     }
 }
@@ -1756,5 +1917,91 @@ mod tests {
             std::fs::read_to_string(&final_path).unwrap(),
             "new content\n"
         );
+    }
+
+    // --- H3d §11.7: clear_exhausted_update_target ------------------------
+
+    #[test]
+    fn update_version_syntax_accepts_ordinary_semver_and_rejects_junk() {
+        assert_eq!(validate_update_version_syntax("0.2.0").unwrap(), "0.2.0");
+        assert_eq!(
+            validate_update_version_syntax("1.0.0-rc1+build.5").unwrap(),
+            "1.0.0-rc1+build.5"
+        );
+        assert_eq!(validate_update_version_syntax("  0.2.0  ").unwrap(), "0.2.0");
+
+        let long = "a".repeat(MAX_UPDATE_VERSION_LEN + 1);
+        for bad in [
+            "",
+            "   ",
+            "../../etc/passwd",
+            "0.2.0; rm -rf /",
+            "0.2.0 rm",
+            ".hidden",
+            "-leading",
+            "+leading",
+            long.as_str(),
+        ] {
+            assert!(
+                validate_update_version_syntax(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_exhausted_entry_only_matches_the_exhausted_shape_of_the_target_stem() {
+        let entries = vec![
+            "duduclaw-os_0.1.0.efi".to_string(),
+            "duduclaw-os_0.2.0+0-1.efi".to_string(),
+        ];
+        assert_eq!(
+            find_exhausted_entry(&entries, "duduclaw-os_0.2.0").map(String::as_str),
+            Some("duduclaw-os_0.2.0+0-1.efi"),
+            "the rolled-back version's exhausted entry must be found"
+        );
+        // A healthy/blessed entry for a DIFFERENT stem must never match —
+        // nothing stale to clear for it.
+        assert_eq!(find_exhausted_entry(&entries, "duduclaw-os_0.1.0"), None);
+        // No entry at all for a third version — also nothing to do.
+        assert_eq!(find_exhausted_entry(&entries, "duduclaw-os_0.3.0"), None);
+    }
+
+    #[test]
+    fn find_exhausted_entry_leaves_live_boot_assessment_state_alone() {
+        // +2-1 (tries still left) and no suffix (blessed) are both LIVE
+        // state, not stale leftovers — must never be reported as
+        // "exhausted", or this verb would delete a boot entry that is
+        // actively being evaluated or already healthy.
+        let mid_assessment = vec!["duduclaw-os_0.2.0+2-1.efi".to_string()];
+        assert_eq!(find_exhausted_entry(&mid_assessment, "duduclaw-os_0.2.0"), None);
+
+        let blessed = vec!["duduclaw-os_0.2.0.efi".to_string()];
+        assert_eq!(find_exhausted_entry(&blessed, "duduclaw-os_0.2.0"), None);
+    }
+
+    #[test]
+    fn target_is_running_entry_refuses_the_machines_own_boot_entry() {
+        assert!(target_is_running_entry(
+            Some("duduclaw-os_0.2.0.efi"),
+            "duduclaw-os_0.2.0"
+        ));
+        // A counted filename must still resolve through the stem — this is
+        // the exact drift `check_rollback_target` also has to handle.
+        assert!(target_is_running_entry(
+            Some("duduclaw-os_0.2.0+2-1.efi"),
+            "duduclaw-os_0.2.0"
+        ));
+        assert!(!target_is_running_entry(
+            Some("duduclaw-os_0.1.0.efi"),
+            "duduclaw-os_0.2.0"
+        ));
+        assert!(!target_is_running_entry(None, "duduclaw-os_0.2.0"));
+    }
+
+    #[tokio::test]
+    async fn clear_exhausted_update_target_rejects_bad_version_without_touching_the_esp() {
+        let result = dispatch_clear_exhausted_update_target("../../etc/passwd").await;
+        assert!(matches!(result, Err(e) if e.kind == "bad_request"));
     }
 }

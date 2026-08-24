@@ -884,6 +884,82 @@ async fn fetch_payload_inner(
     Ok(total)
 }
 
+/// Fetch, verify and parse a release's signed manifest into the matched
+/// (root, uki) pair for this machine's architecture — the network+trust
+/// prefix shared by [`check_update_with`] (stops here: cheap, no payload
+/// download) and [`stage_update_with`] (goes on to download and bind the
+/// payloads). One place decides "is this manifest legitimate and does it
+/// name a usable release", so the two callers can never drift on what
+/// counts as verified.
+async fn fetch_verified_release(source: &Source) -> Result<ReleaseFiles, StageError> {
+    let manifest = fetch_small(source, MANIFEST_NAME, MAX_MANIFEST_BYTES).await?;
+    let signature = fetch_small(source, SIGNATURE_NAME, MAX_SIGNATURE_BYTES).await?;
+    let sig_text = String::from_utf8_lossy(&signature.bytes).into_owned();
+    crate::updater::verify_minisign_signature_with_pubkey(
+        &manifest.bytes,
+        &sig_text,
+        OS_IMAGE_UPDATE_PUBKEY,
+    )
+    .map_err(StageError::Rejected)?;
+    info!("[os_update] release manifest signature verified against the pinned OS key");
+
+    let manifest_text = String::from_utf8_lossy(&manifest.bytes).into_owned();
+    let entries = parse_manifest(&manifest_text).map_err(StageError::Rejected)?;
+    let arch = machine_arch();
+    select_release_files(&entries, arch).map_err(StageError::Rejected)
+}
+
+/// What a cheap "check for updates" call found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateCheckReport {
+    pub current_version: String,
+    pub latest_version: String,
+    pub available: bool,
+}
+
+/// H3d §11.5 (item 1): read the REAL update source, not local staging.
+///
+/// Before this existed, `device.update_status` (`systemd-sysupdate list
+/// --json=short`) only ever reflected the LOCAL staging directory — empty
+/// until a `device.update_apply` call had actually downloaded something —
+/// so pressing "check for updates" reported "nothing new" regardless of
+/// what the configured source actually offered ("使用者按「檢查更新」永遠
+/// 顯示最新版" in the design doc). This fetches the same two small files
+/// [`stage_update_with`] verifies before ANY payload byte is downloaded
+/// ([`fetch_verified_release`]) and compares versions — the cost is bytes
+/// in the hundreds, not gigabytes, and the trust chain is byte-identical to
+/// the one that gates an actual install.
+///
+/// Every failure mode mirrors [`stage_update_with`]'s and stays a distinct
+/// [`StageError`] variant — never collapsed into a generic "no update"
+/// result. A network failure while checking must never be reported as "you
+/// are up to date"; that is exactly the silent-false-success shape this
+/// whole module exists to refuse.
+pub async fn check_update(home: &Path) -> Result<UpdateCheckReport, StageError> {
+    let cfg = OsUpdateConfig::from_home(home);
+    check_update_with(&cfg).await
+}
+
+pub async fn check_update_with(cfg: &OsUpdateConfig) -> Result<UpdateCheckReport, StageError> {
+    if cfg.source_url.trim().is_empty() {
+        return Err(StageError::NotConfigured);
+    }
+    let source = parse_source(&cfg.source_url).map_err(StageError::Rejected)?;
+    let release = fetch_verified_release(&source).await?;
+
+    // Honest fallback rather than a panic or a guessed version: an
+    // off-image dev/test host (or a corrupted os-release) has no
+    // IMAGE_VERSION at all, and "unknown" still lets the caller show "an
+    // update is available" truthfully (unknown != release.version).
+    let current = running_image_version().unwrap_or_else(|| "unknown".to_string());
+    let available = current != release.version;
+    Ok(UpdateCheckReport {
+        current_version: current,
+        latest_version: release.version,
+        available,
+    })
+}
+
 /// Download, verify and bind a release, leaving the staging directory
 /// holding exactly one version that `systemd-sysupdate update` can install.
 ///
@@ -905,21 +981,7 @@ pub async fn stage_update_with(
     let staging = cfg.staging_dir(home);
 
     // ---- 1. manifest + signature, verified before anything is downloaded
-    let manifest = fetch_small(&source, MANIFEST_NAME, MAX_MANIFEST_BYTES).await?;
-    let signature = fetch_small(&source, SIGNATURE_NAME, MAX_SIGNATURE_BYTES).await?;
-    let sig_text = String::from_utf8_lossy(&signature.bytes).into_owned();
-    crate::updater::verify_minisign_signature_with_pubkey(
-        &manifest.bytes,
-        &sig_text,
-        OS_IMAGE_UPDATE_PUBKEY,
-    )
-    .map_err(StageError::Rejected)?;
-    info!("[os_update] release manifest signature verified against the pinned OS key");
-
-    let manifest_text = String::from_utf8_lossy(&manifest.bytes).into_owned();
-    let entries = parse_manifest(&manifest_text).map_err(StageError::Rejected)?;
-    let arch = machine_arch();
-    let release = select_release_files(&entries, arch).map_err(StageError::Rejected)?;
+    let release = fetch_verified_release(&source).await?;
 
     // ---- 2. already running it? (before spending 5 GiB of transfer)
     if let Some(running) = running_image_version() {
@@ -1483,6 +1545,34 @@ mod tests {
             "the OS image channel must pin its own key — see the module doc"
         );
         assert!(minisign_verify::PublicKey::from_base64(OS_IMAGE_UPDATE_PUBKEY).is_ok());
+    }
+
+    // --- check_update_with (H3d §11.5 item 1) -----------------------------
+
+    #[tokio::test]
+    async fn check_update_unconfigured_source_never_touches_the_network() {
+        let cfg = OsUpdateConfig::default();
+        let err = check_update_with(&cfg).await.unwrap_err();
+        assert_eq!(err, StageError::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn check_update_reports_a_missing_manifest_honestly_not_as_up_to_date() {
+        // A `file://` source pointed at a directory with no manifest at
+        // all — this must surface as `Rejected`, never as a fabricated
+        // "you are up to date" answer. Mirrors
+        // `a_release_with_no_signature_is_rejected_not_retried` but through
+        // the check path instead of the stage path.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = OsUpdateConfig {
+            source_url: format!("file://{}", dir.path().display()),
+            staging_dir: None,
+        };
+        let err = check_update_with(&cfg).await.unwrap_err();
+        assert!(
+            matches!(err, StageError::Rejected(_)),
+            "a missing manifest must be Rejected, not silently reported up-to-date: {err:?}"
+        );
     }
 
     #[test]

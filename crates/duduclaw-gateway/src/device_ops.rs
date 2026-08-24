@@ -296,6 +296,29 @@ impl SysdDeviceOps {
         sysd_call(&self.client, duduclaw_sysd::SysdRequest::SetNtp { enabled }).await
     }
 
+    /// H3d §11.7 fix: clear a stale, exhausted ESP boot entry for `version`
+    /// before installing it — see
+    /// `duduclaw_sysd::protocol::SysdRequest::ClearExhaustedUpdateTarget`
+    /// for the mechanism and the bug this closes (a manually rolled-back
+    /// version could never be reinstalled: its exhausted ESP entry and its
+    /// unchanged partition label both already satisfied
+    /// `systemd-sysupdate`'s `InstancesMax` accounting, so `update apply`
+    /// silently did nothing and still reported success). Not part of the
+    /// `DeviceOps` trait — same reasoning as `set_hostname` above: this is a
+    /// step specific to the `device.update_apply` flow (see
+    /// `handlers.rs::handle_device_update_apply`), not a shape every
+    /// `DeviceOps` implementor needs to answer for. Idempotent: a no-op
+    /// (`Ok`) when there is nothing stale to clear.
+    pub async fn clear_exhausted_update_target(&self, version: &str) -> OpResult {
+        sysd_call(
+            &self.client,
+            duduclaw_sysd::SysdRequest::ClearExhaustedUpdateTarget {
+                version: version.to_string(),
+            },
+        )
+        .await
+    }
+
     /// System-settings app: `network.wired_config`. `dns` is cloned into the
     /// request as owned `String`s — the wire shape (`SysdRequest::
     /// NetworkWiredConfig`) takes `Vec<String>`, not a borrowed slice.
@@ -720,6 +743,57 @@ mod tests {
                     assert!(!msg.contains("unauthorized"), "unexpected rejection: {msg}");
                 }
                 Err(e) => panic!("unexpected error variant: {e}"),
+            }
+
+            server.stop().await;
+        }
+
+        /// H3d §11.7: `clear_exhausted_update_target` (the
+        /// `ClearExhaustedUpdateTarget { version }` verb) reaches real
+        /// dispatch when authorized — same "authorization outcome, not
+        /// underlying-ESP-availability" assertion as the other verbs in
+        /// this module (this dev/CI host has no EFI System Partition at
+        /// all, so sysd's own `Unsupported("cannot locate the ESP")` is an
+        /// expected, non-authorization failure here).
+        #[tokio::test]
+        async fn clear_exhausted_update_target_reaches_real_dispatch() {
+            let server = TestServer::spawn(Some(current_uid())).await;
+            let ops = server.device_ops();
+
+            let result = ops.clear_exhausted_update_target("0.2.0").await;
+            match result {
+                Ok(_) => {}
+                Err(DeviceOpError::Unsupported(msg)) => {
+                    assert!(
+                        !msg.contains("unauthorized"),
+                        "authorized caller must not be rejected: {msg}"
+                    );
+                }
+                Err(e) => panic!("unexpected error variant: {e}"),
+            }
+
+            server.stop().await;
+        }
+
+        /// A malformed version value is rejected as `bad_request` by sysd
+        /// itself, surfaced here as a structured `Unsupported` (never a
+        /// panic, never silently accepted) — mirrors the sysd-crate-level
+        /// `clear_exhausted_update_target_rejects_bad_version_without_touching_the_esp`
+        /// test, but through the gateway's own client call path.
+        #[tokio::test]
+        async fn clear_exhausted_update_target_rejects_bad_version() {
+            let server = TestServer::spawn(Some(current_uid())).await;
+            let ops = server.device_ops();
+
+            let result = ops.clear_exhausted_update_target("../../etc/passwd").await;
+            match result {
+                Err(DeviceOpError::Unsupported(msg)) => {
+                    assert!(
+                        msg.contains("bad_request"),
+                        "expected a bad_request rejection, got: {msg}"
+                    );
+                }
+                other => panic!("expected a bad_request rejection, got {other:?}"),
             }
 
             server.stop().await;
