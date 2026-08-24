@@ -7167,7 +7167,7 @@ impl MethodHandler {
                 require_admin!();
                 require_appliance!();
                 require_confirm!();
-                self.handle_device_factory_reset().await
+                self.handle_device_factory_reset(params).await
             }
             "device.power" => {
                 require_admin!();
@@ -7523,7 +7523,7 @@ impl MethodHandler {
                     { "name": "device.backup_list", "description": "List scheduled backups stored under <home>/backups/ (admin, appliance-only)" },
                     { "name": "device.backup_delete", "description": "Delete one scheduled backup file (admin, appliance-only)" },
                     { "name": "device.backup_restore", "description": "Stage an uploaded backup for device-migration restore on next boot (admin, appliance-only, destructive: requires confirm)" },
-                    { "name": "device.factory_reset", "description": "Wipe device state and re-provision on next boot (admin, appliance-only, destructive: requires confirm)" },
+                    { "name": "device.factory_reset", "description": "Wipe device state and re-provision on next boot; optional clear_network also clears saved Wi-Fi credentials (default: kept) (admin, appliance-only, destructive: requires confirm)" },
                     { "name": "device.power", "description": "Restart or shut down the device (admin, appliance-only, destructive: requires confirm)" },
                     { "name": "device.power_local", "description": "Lock-screen power menu: restart or shut down the device (no login, appliance-only, loopback-only, rate limited)" },
                     { "name": "network.wifi_scan", "description": "Scan for Wi-Fi networks via iwd D-Bus (admin, appliance-only)" },
@@ -44526,10 +44526,15 @@ impl MethodHandler {
         )
     }
 
-    async fn handle_device_factory_reset(&self) -> WsFrame {
+    /// `device.factory_reset` — `params.clear_network` (D4a-8, optional,
+    /// default `false`) additionally clears saved Wi-Fi credentials; see
+    /// `DeviceOps::factory_reset`'s doc comment for the default-keep
+    /// rationale.
+    async fn handle_device_factory_reset(&self, params: Value) -> WsFrame {
+        let clear_network = params.get("clear_network").and_then(Value::as_bool).unwrap_or(false);
         device_op_result_frame(
             crate::device_ops::select_device_ops()
-                .factory_reset(self.home_dir())
+                .factory_reset(self.home_dir(), clear_network)
                 .await,
         )
     }

@@ -4902,6 +4902,8 @@
   "device.danger.factoryReset.confirmMessage": "Everything on this device will be erased and this cannot be undone. Type “RESET” to confirm.",
   "device.danger.factoryReset.confirmHint": "Type “RESET” to confirm",
   "device.danger.factoryReset.done": "Factory reset started — this device is about to restart",
+  "device.danger.factoryReset.clearNetwork": "Also clear saved Wi-Fi credentials",
+  "device.danger.factoryReset.clearNetworkHint": "By default, saved Wi-Fi credentials are kept so the device reconnects automatically after reset. If checked, they are cleared too — if this was the only way to reach the device, you'll need physical access to set up networking again.",
   "device.danger.restart.title": "Restart",
   "device.danger.restart.desc": "Restarts this device. Every service on it will be briefly unavailable.",
   "device.danger.restart.cta": "Restart",

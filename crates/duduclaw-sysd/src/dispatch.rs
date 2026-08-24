@@ -83,6 +83,55 @@ const WIRED_NETWORK_FILENAME: &str = "10-duduclaw-wired.network";
 /// Maximum accepted `dns` entries for a static `NetworkWiredConfig`.
 const MAX_DNS_ENTRIES: usize = 3;
 
+/// Home directory of the `duduclaw-kiosk` service user (`useradd -d
+/// /data/duduclaw-kiosk`, appliance/postinst.d/20-users-and-units.sh) —
+/// owned by a DIFFERENT unprivileged user than this daemon's peer
+/// (`duduclaw`), so wiping it needs root. This is where the shell persists
+/// its OOBE-completion flag (`shell/oobe_state.json`, see
+/// `duduclaw-shell/src/oobe/persistence.rs`'s `duduclaw_home()` — the kiosk
+/// session's `$DUDUCLAW_HOME` is set to exactly this path by
+/// `duduclaw-kiosk-launch.sh`) plus disposable Chromium/cage browser
+/// cache/profile state (postinst.d's own comment: "its entire $HOME is
+/// disposable browser cache/profile state"), so wiping the WHOLE directory
+/// on factory reset is both simpler and more thorough than surgically
+/// deleting one file.
+const KIOSK_HOME_DIR: &str = "/data/duduclaw-kiosk";
+
+/// Directory whose CONTENTS are iwd's persisted Wi-Fi credential files
+/// (`/data/network/iwd`, 0700 root:root — see
+/// `appliance/mkosi.extra/usr/lib/tmpfiles.d/duduclaw-network.conf`). The
+/// directory itself is left in place (tmpfiles recreates it unconditionally
+/// every boot); only the credential files inside are removed, mirroring
+/// `duduclaw-gateway/src/device_ops.rs`'s own `wipe_dir_contents` for
+/// `home_dir` — same "the mount point survives, what's inside does not"
+/// discipline this module's [`wipe_dir_contents`] below implements.
+const NETWORK_CREDENTIALS_DIR: &str = "/data/network/iwd";
+
+/// Remove every entry directly under `dir` (not `dir` itself). Missing
+/// `dir` is not an error (nothing to wipe) — mirrors
+/// `duduclaw-gateway/src/device_ops.rs`'s identically-named helper for
+/// `home_dir`; this is that same discipline applied on the root side of
+/// the privilege boundary, for the two paths ([`KIOSK_HOME_DIR`],
+/// [`NETWORK_CREDENTIALS_DIR`]) the unprivileged gateway process cannot
+/// reach on its own.
+fn wipe_dir_contents(dir: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 pub type DispatchResult = Result<SysdOpOutput, SysdError>;
 
 async fn run(mut cmd: Command) -> DispatchResult {
@@ -96,18 +145,27 @@ async fn run(mut cmd: Command) -> DispatchResult {
     }
 }
 
-/// `systemctl enable duduclaw-firstboot-provision.service` then
-/// `systemctl reboot`. The enable step is best-effort — an image without
-/// that unit (or a dev/test host) should still complete the reboot rather
-/// than abort the whole factory-reset flow; a failure there is folded into
-/// the final `stdout` as a `[warn]` line, mirroring the equivalent note
-/// `SystemDeviceOps::factory_reset` used to build itself before this
-/// verb existed.
+/// Wipe [`KIOSK_HOME_DIR`], `systemctl enable
+/// duduclaw-firstboot-provision.service`, then `systemctl reboot`. Both the
+/// wipe and the enable step are best-effort — a dev/test host with no
+/// `/data/duduclaw-kiosk` (or no firstboot unit) should still complete the
+/// reboot rather than abort the whole factory-reset flow; a failure in
+/// either is folded into the final `stdout` as a `[warn]` line, mirroring
+/// the equivalent note `SystemDeviceOps::factory_reset` used to build
+/// itself before this verb existed. The kiosk-home wipe runs FIRST: it is
+/// the whole point of this verb's H3g-b/M1 fix (see
+/// `SysdRequest::FactoryReset`'s doc comment) and must not be silently
+/// skipped just because a later step also happened to fail.
 async fn dispatch_factory_reset() -> DispatchResult {
+    let kiosk_wipe_warn = match wipe_dir_contents(Path::new(KIOSK_HOME_DIR)) {
+        Ok(()) => String::new(),
+        Err(e) => format!("\n[warn] wiping {KIOSK_HOME_DIR} failed: {e}"),
+    };
+
     let mut enable_cmd = Command::new("systemctl");
     enable_cmd.args(["enable", "duduclaw-firstboot-provision.service"]);
     let enable = enable_cmd.output().await;
-    let warn_note = match &enable {
+    let enable_warn = match &enable {
         Ok(out) if out.status.success() => String::new(),
         Ok(out) => format!(
             "\n[warn] re-arming first-boot provisioning failed: {}",
@@ -119,7 +177,32 @@ async fn dispatch_factory_reset() -> DispatchResult {
     let mut reboot_cmd = Command::new("systemctl");
     reboot_cmd.arg("reboot");
     let reboot = run(reboot_cmd).await?;
-    Ok(SysdOpOutput { stdout: format!("{}{warn_note}", reboot.stdout), ..reboot })
+    Ok(SysdOpOutput {
+        stdout: format!("{}{kiosk_wipe_warn}{enable_warn}", reboot.stdout),
+        ..reboot
+    })
+}
+
+/// Wipe the CONTENTS of [`NETWORK_CREDENTIALS_DIR`] — see that constant's
+/// doc comment for what lives there and why the directory entry itself
+/// survives. Unlike the kiosk-home wipe in [`dispatch_factory_reset`], a
+/// failure here is returned as a hard `Err` rather than folded into a
+/// `[warn]` note: this verb only ever runs when an operator explicitly
+/// opted in to "一併清除網路設定", and the gateway-side caller
+/// (`SysdDeviceOps::factory_reset`) treats that opt-in as fail-closed —
+/// silently downgrading a real failure to a warning would let the operator
+/// walk away believing saved Wi-Fi credentials are gone when they are not.
+async fn dispatch_clear_network_credentials() -> DispatchResult {
+    match wipe_dir_contents(Path::new(NETWORK_CREDENTIALS_DIR)) {
+        Ok(()) => Ok(SysdOpOutput {
+            success: true,
+            stdout: format!("cleared {NETWORK_CREDENTIALS_DIR}"),
+            stderr: String::new(),
+        }),
+        Err(e) => Err(SysdError::io(format!(
+            "clearing {NETWORK_CREDENTIALS_DIR} failed: {e}"
+        ))),
+    }
 }
 
 /// `hostnamectl set-hostname <name>`. Rejects an empty or over-length
@@ -1156,6 +1239,7 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
         SysdRequest::BootAssessmentStatus => bless_boot("status").await,
         SysdRequest::UpdateRollback => dispatch_update_rollback().await,
         SysdRequest::FactoryReset => dispatch_factory_reset().await,
+        SysdRequest::ClearNetworkCredentials => dispatch_clear_network_credentials().await,
         SysdRequest::Hostname { set } => dispatch_hostname(set).await,
         SysdRequest::SetTimezone { timezone } => dispatch_set_timezone(timezone).await,
         SysdRequest::SetNtp { enabled } => dispatch_set_ntp(*enabled).await,
@@ -1917,6 +2001,56 @@ mod tests {
             std::fs::read_to_string(&final_path).unwrap(),
             "new content\n"
         );
+    }
+
+    // --- M1: wipe_dir_contents (kiosk-home + network-credentials wipes) --
+
+    #[test]
+    fn wipe_dir_contents_removes_files_and_subdirs_but_not_dir_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("oobe_state.json"), b"{}").unwrap();
+        std::fs::create_dir(dir.path().join("shell")).unwrap();
+        std::fs::write(dir.path().join("shell/nested.json"), b"{}").unwrap();
+
+        wipe_dir_contents(dir.path()).unwrap();
+
+        assert!(dir.path().exists(), "the directory itself must survive");
+        let remaining: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(remaining.is_empty(), "contents must be gone: {remaining:?}");
+    }
+
+    #[test]
+    fn wipe_dir_contents_missing_dir_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(wipe_dir_contents(&missing).is_ok());
+    }
+
+    #[test]
+    fn wipe_dir_contents_on_an_already_empty_dir_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(wipe_dir_contents(dir.path()).is_ok());
+        assert!(dir.path().exists());
+    }
+
+    // --- M1: dispatch_clear_network_credentials (via wipe_dir_contents) --
+
+    #[test]
+    fn network_credentials_dir_wipe_leaves_the_directory_itself_in_place() {
+        // Exercises the exact helper `dispatch_clear_network_credentials`
+        // calls, against a stand-in for `/data/network/iwd` — the real
+        // path is root-owned and not writable in a test process, so this
+        // proves the underlying wipe semantics (dir survives, credential
+        // files inside do not) the same way `remove_wired_static_config`'s
+        // tests above prove their own hardcoded-path sibling's behavior.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MyHomeWiFi.psk"), b"secret").unwrap();
+        std::fs::write(dir.path().join("OfficeAP.psk"), b"secret2").unwrap();
+
+        wipe_dir_contents(dir.path()).unwrap();
+
+        assert!(dir.path().exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 
     // --- H3d §11.7: clear_exhausted_update_target ------------------------

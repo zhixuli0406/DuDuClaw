@@ -6188,9 +6188,14 @@ export const api = {
     /** Archives the device's writable data partition. Feed `.filename` to
      *  `GET /api/files/download?name=<filename>` to fetch it. */
     backupCreate: () => client.call('device.backup_create') as Promise<DeviceBackupResult>,
-    /** Wipes device state and re-provisions on next boot. Irreversible. */
-    factoryReset: () =>
-      client.call('device.factory_reset', { confirm: true }) as Promise<DeviceOpResult>,
+    /** Wipes device state and re-provisions on next boot. Irreversible.
+     *  `clearNetwork` (D4a-8, default `false` — kept) additionally clears
+     *  saved Wi-Fi credentials under `/data/network/iwd`. */
+    factoryReset: (clearNetwork = false) =>
+      client.call('device.factory_reset', {
+        confirm: true,
+        clear_network: clearNetwork,
+      }) as Promise<DeviceOpResult>,
     power: (action: 'restart' | 'shutdown') =>
       client.call('device.power', { action, confirm: true }) as Promise<DeviceOpResult>,
     // ── WP-G1: scheduled backups + device-migration restore ──────────

@@ -387,9 +387,12 @@ pub(crate) async fn handle_os_factory_reset(args: &Value, home_dir: &Path, calle
     if let Err(msg) = require_factory_reset_approval(home_dir, caller_client_id).await {
         return os_ops_error(&msg);
     }
+    // D4a-8: same optional `clear_network` (default `false` — keep saved
+    // Wi-Fi credentials) as the dashboard `device.factory_reset` RPC.
+    let clear_network = args.get("clear_network").and_then(Value::as_bool).unwrap_or(false);
     device_op_result_text(
         duduclaw_gateway::device_ops::select_device_ops()
-            .factory_reset(home_dir)
+            .factory_reset(home_dir, clear_network)
             .await,
     )
 }

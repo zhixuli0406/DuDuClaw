@@ -4902,6 +4902,8 @@
   "device.danger.factoryReset.confirmMessage": "這台裝置上的所有資料都會被清除且無法復原。請輸入「RESET」以確認執行。",
   "device.danger.factoryReset.confirmHint": "請輸入「RESET」",
   "device.danger.factoryReset.done": "已送出原廠重設，裝置即將重新開機",
+  "device.danger.factoryReset.clearNetwork": "一併清除已儲存的 Wi-Fi 設定",
+  "device.danger.factoryReset.clearNetworkHint": "預設會保留 Wi-Fi 密碼，重設後仍可自動連線；勾選後將一併清除，若這是唯一的連線方式，清除後需要實體接觸裝置才能重新設定網路",
   "device.danger.restart.title": "重新啟動",
   "device.danger.restart.desc": "重新啟動這台裝置，過程中服務會短暫中斷",
   "device.danger.restart.cta": "重新啟動",

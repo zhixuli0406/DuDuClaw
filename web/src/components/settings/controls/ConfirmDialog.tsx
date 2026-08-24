@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle } from 'lucide-react';
 import {
@@ -31,6 +31,7 @@ export function ConfirmDialog({
   requireText,
   requireTextHint,
   busy,
+  children,
 }: {
   open: boolean;
   onClose: () => void;
@@ -43,6 +44,11 @@ export function ConfirmDialog({
   requireText?: string;
   requireTextHint?: string;
   busy?: boolean;
+  /** Optional extra controls rendered between the message and the
+   *  type-to-confirm input (e.g. a checkbox for a destructive action's
+   *  optional side effect). Additive — every existing caller that doesn't
+   *  pass this renders exactly as before. */
+  children?: ReactNode;
 }) {
   const intl = useIntl();
   const [typed, setTyped] = useState('');
@@ -65,6 +71,8 @@ export function ConfirmDialog({
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
           <p className="text-sm text-muted-foreground">{message}</p>
         </div>
+
+        {children}
 
         {requireText && (
           <div className="space-y-1.5">

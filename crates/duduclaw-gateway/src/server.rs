@@ -202,6 +202,21 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         });
     }
 
+    // ── H3g-b: surface a failed /data migration to the dashboard ─────────
+    // `duduclaw-data-migrate.service` runs before this process and, on
+    // failure, records `<home>/system/migrations.failed.json` — nothing
+    // ever read that back until now. Spawned (not awaited) for the same
+    // reason as the wired-config reapply just above: a slow/failing
+    // task-store open must never delay the rest of boot. See
+    // `migration_alert.rs`'s module doc for the one-time-per-failure dedup
+    // contract.
+    {
+        let home_dir = home_dir.clone();
+        tokio::spawn(async move {
+            crate::migration_alert::check_and_notify(&home_dir).await;
+        });
+    }
+
     // ── Memory-db split self-heal (2026-08-20 關鍵洞察 incident) ─────────
     // Merge any per-agent `agents/<id>/[state/]memory.db` back into the
     // shared `<home>/memory.db` and archive the source file, restoring the

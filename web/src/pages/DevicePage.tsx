@@ -44,6 +44,7 @@ import {
   ErrorState,
   Skeleton,
   Switch,
+  Checkbox,
   Input,
   Table,
   TableHeader,
@@ -594,13 +595,22 @@ export function DevicePage() {
   //    gone through it, never inferred client-side ahead of time. ──
   const [confirmAction, setConfirmAction] = useState<DangerAction | null>(null);
   const [dangerBusy, setDangerBusy] = useState(false);
+  // D4a-8: "一併清除網路設定" — defaults to false (keep saved Wi-Fi
+  // credentials) on every open, same "reset each time the dialog opens"
+  // discipline ConfirmDialog's own `requireText` input follows.
+  const [clearNetworkOnReset, setClearNetworkOnReset] = useState(false);
+
+  const openConfirm = (action: DangerAction) => {
+    setClearNetworkOnReset(false);
+    setConfirmAction(action);
+  };
 
   const runDangerAction = async () => {
     if (!confirmAction) return;
     setDangerBusy(true);
     try {
       if (confirmAction === 'factoryReset') {
-        await api.device.factoryReset();
+        await api.device.factoryReset(clearNetworkOnReset);
       } else {
         await api.device.power(confirmAction === 'restart' ? 'restart' : 'shutdown');
       }
@@ -1004,7 +1014,7 @@ export function DevicePage() {
                     <p className="text-sm font-medium text-foreground">{t(`device.danger.${action}.title`)}</p>
                     <p className="text-xs text-muted-foreground">{t(`device.danger.${action}.desc`)}</p>
                   </div>
-                  <Button variant="destructive" size="sm" onClick={() => setConfirmAction(action)}>
+                  <Button variant="destructive" size="sm" onClick={() => openConfirm(action)}>
                     {action === 'factoryReset' ? <AlertTriangle /> : action === 'restart' ? <RefreshCw /> : <Power />}
                     {t(`device.danger.${action}.cta`)}
                   </Button>
@@ -1025,7 +1035,23 @@ export function DevicePage() {
         requireText={confirmAction === 'factoryReset' ? 'RESET' : undefined}
         requireTextHint={confirmAction === 'factoryReset' ? t('device.danger.factoryReset.confirmHint') : undefined}
         busy={dangerBusy}
-      />
+      >
+        {confirmAction === 'factoryReset' && (
+          <label className="flex items-start gap-2 text-sm text-foreground">
+            <Checkbox
+              className="mt-0.5"
+              checked={clearNetworkOnReset}
+              onCheckedChange={(v) => setClearNetworkOnReset(v === true)}
+            />
+            <span>
+              <span className="block">{t('device.danger.factoryReset.clearNetwork')}</span>
+              <span className="block text-xs text-muted-foreground">
+                {t('device.danger.factoryReset.clearNetworkHint')}
+              </span>
+            </span>
+          </label>
+        )}
+      </ConfirmDialog>
 
       {/* 回到上一版：重新開機並切回上一版本，資料不受影響 */}
       <ConfirmDialog

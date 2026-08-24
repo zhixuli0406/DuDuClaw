@@ -275,7 +275,31 @@ describe('<DevicePage> — appliance device management', () => {
     expect(confirmButton).toBeEnabled();
 
     await user.click(confirmButton);
-    await waitFor(() => expect(factoryReset).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(factoryReset).toHaveBeenCalledWith(false));
+  });
+
+  it('factory reset defaults to keeping saved Wi-Fi credentials, and honors the opt-in checkbox', async () => {
+    vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
+    const factoryReset = vi.spyOn(api.device, 'factoryReset').mockResolvedValue({
+      success: true,
+      stdout: '',
+      stderr: '',
+    });
+
+    renderWithProviders(<DevicePage />);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole('button', { name: 'Factory reset' }));
+
+    const dialogButtons = screen.getAllByRole('button', { name: 'Factory reset' });
+    const confirmButton = dialogButtons[dialogButtons.length - 1];
+    await user.type(screen.getByPlaceholderText('RESET'), 'RESET');
+
+    // D4a-8: opt into "also clear saved Wi-Fi credentials" before confirming.
+    await user.click(screen.getByRole('checkbox'));
+    await user.click(confirmButton);
+
+    await waitFor(() => expect(factoryReset).toHaveBeenCalledWith(true));
   });
 });
 

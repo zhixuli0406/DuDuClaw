@@ -109,7 +109,24 @@ pub trait DeviceOps: Send + Sync {
     async fn boot_assessment_status(&self) -> OpResult;
     /// Wipe `home_dir`'s contents, best-effort re-arm the first-boot
     /// provisioning unit, then `systemctl reboot`.
-    async fn factory_reset(&self, home_dir: &Path) -> OpResult;
+    ///
+    /// Also wipes the `duduclaw-kiosk` service user's home directory
+    /// (`/data/duduclaw-kiosk`) — which is where the shell's OOBE-completion
+    /// flag lives (`shell/oobe_state.json`) — so a factory reset actually
+    /// re-runs first-time setup on next boot instead of silently returning
+    /// to Home. That half needs root ([`SysdDeviceOps`]'s `FactoryReset`
+    /// verb does it) since `home_dir` and the kiosk home are owned by two
+    /// different unprivileged users; [`SystemDeviceOps`] (no sysd, no
+    /// appliance) has no such directory to wipe at all.
+    ///
+    /// `clear_network`: when `true`, ALSO clears saved Wi-Fi credentials
+    /// under `/data/network/iwd` (D4a-8) — always requires root
+    /// ([`SysdDeviceOps`] only; see `SysdRequest::ClearNetworkCredentials`).
+    /// Defaults to keeping them: losing Wi-Fi on a headless LAN appliance
+    /// can mean permanent physical-access-only recovery, so this is an
+    /// explicit opt-in the dashboard confirmation surfaces as a checkbox,
+    /// never an implicit side effect of "wipe everything".
+    async fn factory_reset(&self, home_dir: &Path, clear_network: bool) -> OpResult;
     /// `tar -czf <dest_path> -C <source_dir> .` — archive everything under
     /// `source_dir` into `dest_path`. Caller is responsible for choosing a
     /// `dest_path` outside `source_dir` (otherwise tar would try to include
@@ -193,13 +210,21 @@ impl DeviceOps for SystemDeviceOps {
         ))
     }
 
-    async fn factory_reset(&self, home_dir: &Path) -> OpResult {
+    async fn factory_reset(&self, home_dir: &Path, clear_network: bool) -> OpResult {
         if let Err(e) = wipe_dir_contents(home_dir) {
             return Err(DeviceOpError::Io(format!(
                 "wiping {} failed: {e}",
                 home_dir.display()
             )));
         }
+        // `clear_network` and the `/data/duduclaw-kiosk` OOBE-flag wipe are
+        // both no-ops here on purpose: this impl runs off-appliance (dev
+        // machine, desktop, container) where there is no iwd credential
+        // store and no kiosk shell home to speak of — the D4a Wi-Fi feature
+        // and the OOBE flow it's asked about are appliance-only concepts.
+        // The appliance path is `SysdDeviceOps::factory_reset`, which does
+        // both over the privileged socket.
+        let _ = clear_network;
         // Best-effort: re-arm first-boot provisioning so the next boot
         // re-seeds device identity + minimal config onto the now-empty home
         // dir. The unit self-disables after a successful first run (see
@@ -380,16 +405,28 @@ impl DeviceOps for SysdDeviceOps {
         sysd_call(&self.client, duduclaw_sysd::SysdRequest::BootAssessmentStatus).await
     }
 
-    async fn factory_reset(&self, home_dir: &Path) -> OpResult {
+    async fn factory_reset(&self, home_dir: &Path, clear_network: bool) -> OpResult {
         // The wipe itself is filesystem-only and needs no root (the
         // `duduclaw` user already owns `home_dir`) — only the unit re-arm
-        // + reboot that follow need root, which is exactly what the
-        // `FactoryReset` verb does on the sysd side.
+        // + kiosk-home wipe + reboot that follow need root, which is
+        // exactly what the `FactoryReset` verb does on the sysd side (it
+        // now also wipes `/data/duduclaw-kiosk` — see that verb's doc
+        // comment for the OOBE-flag bug this closes).
         if let Err(e) = wipe_dir_contents(home_dir) {
             return Err(DeviceOpError::Io(format!(
                 "wiping {} failed: {e}",
                 home_dir.display()
             )));
+        }
+        if clear_network {
+            // D4a-8, fail-closed: runs BEFORE the `FactoryReset` verb
+            // (which ends in `systemctl reboot`) so there is no race
+            // against the box going down mid-request, and a failure here
+            // aborts the whole call (`?`) rather than silently proceeding
+            // to reboot while leaving saved Wi-Fi credentials in place —
+            // an operator who explicitly asked for them to be cleared must
+            // never be told "done" when they were not.
+            sysd_call(&self.client, duduclaw_sysd::SysdRequest::ClearNetworkCredentials).await?;
         }
         sysd_call(&self.client, duduclaw_sysd::SysdRequest::FactoryReset).await
     }
@@ -524,8 +561,11 @@ pub mod mock {
                 .push("boot_assessment_status".to_string());
             take_or_default(&self.boot_assessment_status_result, "boot_assessment_status")
         }
-        async fn factory_reset(&self, _home_dir: &Path) -> OpResult {
-            self.calls.lock().unwrap().push("factory_reset".to_string());
+        async fn factory_reset(&self, _home_dir: &Path, clear_network: bool) -> OpResult {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("factory_reset(clear_network={clear_network})"));
             take_or_default(&self.factory_reset_result, "factory_reset")
         }
         async fn backup_create(&self, _source_dir: &Path, _dest_path: &Path) -> OpResult {
@@ -713,7 +753,7 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             std::fs::write(home.path().join("leftover.txt"), b"x").unwrap();
 
-            let result = ops.factory_reset(home.path()).await;
+            let result = ops.factory_reset(home.path(), false).await;
             // The wipe must have happened regardless of whether the
             // downstream `systemctl` calls exist on this host.
             let remaining: Vec<_> = std::fs::read_dir(home.path()).unwrap().collect();
@@ -727,6 +767,61 @@ mod tests {
             }
 
             server.stop().await;
+        }
+
+        /// D4a-8: `clear_network: true` must ALSO reach the
+        /// `ClearNetworkCredentials` verb (not just `FactoryReset`) —
+        /// asserted the same "authorization outcome, not underlying
+        /// filesystem state" way as `authorized_calls_reach_real_dispatch_
+        /// not_auth_rejection` above (the real `/data/network/iwd` does not
+        /// exist on this dev/CI host, but `wipe_dir_contents` treats a
+        /// missing directory as a no-op success, so this reaches real
+        /// dispatch and returns `Ok` rather than erroring for an unrelated
+        /// filesystem reason).
+        #[tokio::test]
+        async fn factory_reset_with_clear_network_reaches_real_dispatch() {
+            let server = TestServer::spawn(Some(current_uid())).await;
+            let ops = server.device_ops();
+
+            let home = tempfile::tempdir().unwrap();
+            let result = ops.factory_reset(home.path(), true).await;
+            match result {
+                Ok(_) => {}
+                Err(DeviceOpError::Unsupported(msg)) => {
+                    assert!(!msg.contains("unauthorized"), "unexpected rejection: {msg}");
+                }
+                Err(e) => panic!("unexpected error variant: {e}"),
+            }
+
+            server.stop().await;
+        }
+
+        /// D4a-8 fail-closed contract: when `clear_network: true` and the
+        /// sysd socket is unreachable, `factory_reset` must surface an
+        /// `Err` — never silently proceed to a fabricated "Ok" while saved
+        /// Wi-Fi credentials were never actually cleared. `home_dir`'s own
+        /// (unprivileged, local) wipe still happens first and must succeed
+        /// regardless — only the privileged half is unreachable here.
+        #[tokio::test]
+        async fn factory_reset_with_clear_network_fails_closed_when_socket_unreachable() {
+            let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(
+                std::path::PathBuf::from("/tmp/duduclaw-sysd-test-no-such-socket.sock"),
+            ));
+
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("leftover.txt"), b"x").unwrap();
+
+            let result = ops.factory_reset(home.path(), true).await;
+
+            let remaining: Vec<_> = std::fs::read_dir(home.path()).unwrap().collect();
+            assert!(
+                remaining.is_empty(),
+                "the local home_dir wipe must still have happened: {remaining:?}"
+            );
+            assert!(
+                matches!(result, Err(DeviceOpError::Unsupported(_))),
+                "an unreachable socket must surface as Err, never a fabricated success: {result:?}"
+            );
         }
 
         /// `set_hostname` (the `Hostname { set }` verb) round-trips a

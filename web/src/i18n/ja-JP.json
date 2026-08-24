@@ -4902,6 +4902,8 @@
   "device.danger.factoryReset.confirmMessage": "このデバイス上のすべてのデータが消去され、元に戻せません。確認のため「RESET」と入力してください。",
   "device.danger.factoryReset.confirmHint": "確認のため「RESET」と入力してください",
   "device.danger.factoryReset.done": "工場出荷時リセットを開始しました。まもなく再起動します",
+  "device.danger.factoryReset.clearNetwork": "保存済みの Wi-Fi 設定も削除する",
+  "device.danger.factoryReset.clearNetworkHint": "既定では保存済みの Wi-Fi 設定は保持され、リセット後も自動的に再接続します。チェックすると設定も削除されます。それが唯一の接続手段だった場合、ネットワークを再設定するには実機での操作が必要になります。",
   "device.danger.restart.title": "再起動",
   "device.danger.restart.desc": "このデバイスを再起動します。再起動中はすべてのサービスが一時的に利用できなくなります。",
   "device.danger.restart.cta": "再起動",

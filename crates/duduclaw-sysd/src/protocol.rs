@@ -10,16 +10,17 @@
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
 //! the same adjacently-tagged shape `duduclaw-cli-worker`'s protocol uses)
-//! — the entire caller-reachable surface is twelve fixed verbs, wire-encoded
+//! — the entire caller-reachable surface is thirteen fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
 //! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
 //! data. `deny_unknown_fields` means a stray extra top-level key fails to
 //! parse rather than being silently ignored.
 //!
-//! Seven variants ([`SysdRequest::Reboot`], [`SysdRequest::Poweroff`],
+//! Eight variants ([`SysdRequest::Reboot`], [`SysdRequest::Poweroff`],
 //! [`SysdRequest::SysupdateStatus`], [`SysdRequest::SysupdateApply`],
 //! [`SysdRequest::BootAssessmentStatus`], [`SysdRequest::UpdateRollback`],
-//! [`SysdRequest::FactoryReset`]) carry zero fields on purpose: for these
+//! [`SysdRequest::FactoryReset`], [`SysdRequest::ClearNetworkCredentials`])
+//! carry zero fields on purpose: for these
 //! the server never builds a command line by concatenating caller-supplied
 //! strings, it only ever runs a hardcoded argv literal per verb (see
 //! `dispatch.rs`). The remaining five carry caller data, and each keeps
@@ -149,14 +150,38 @@ pub enum SysdRequest {
     /// until this verb did. See `dispatch::dispatch_update_rollback` for the
     /// two tiers and why the second one is needed.
     UpdateRollback,
-    /// Re-arm first-boot provisioning (`systemctl enable
-    /// duduclaw-firstboot-provision.service`, best-effort) then
-    /// `systemctl reboot`. Deliberately carries no path/param — wiping the
-    /// data directory itself does not need root (the `duduclaw` user
-    /// already owns it) and stays a caller-side filesystem operation; only
-    /// the unit-file re-arm and reboot need root, and both are fixed
-    /// literals.
+    /// Wipe the `duduclaw-kiosk` service user's home directory
+    /// (`/data/duduclaw-kiosk`, best-effort), re-arm first-boot provisioning
+    /// (`systemctl enable duduclaw-firstboot-provision.service`,
+    /// best-effort) then `systemctl reboot`. Deliberately carries no
+    /// path/param — wiping the GATEWAY's data directory does not need root
+    /// (the `duduclaw` user already owns it) and stays a caller-side
+    /// filesystem operation, but wiping `/data/duduclaw-kiosk` DOES need
+    /// root: it is owned by the *different* unprivileged `duduclaw-kiosk`
+    /// user (postinst.d/20-users-and-units.sh), which is the sysd peer
+    /// (`duduclaw`) has no access to. This closes a real bug: the shell
+    /// persists its OOBE-completion flag at
+    /// `/data/duduclaw-kiosk/shell/oobe_state.json` (see
+    /// `duduclaw-shell/src/oobe/persistence.rs`), so without this wipe a
+    /// "還原原廠" left that flag set and the box booted straight back to
+    /// Home instead of re-running first-time setup — the gateway-side wipe
+    /// of its own home dir alone was never enough. The unit-file re-arm and
+    /// reboot are unchanged: both fixed literals.
     FactoryReset,
+    /// Wipe the CONTENTS of `/data/network/iwd` — the iwd-managed store of
+    /// saved Wi-Fi credentials (0700 root:root, see
+    /// `appliance/mkosi.extra/usr/lib/tmpfiles.d/duduclaw-network.conf`).
+    /// The directory itself is left in place (tmpfiles recreates it every
+    /// boot regardless); only the credential files inside are removed.
+    /// Needs root because the `duduclaw` gateway user has no access to a
+    /// root-owned directory. Carries no param: it is an unconditional wipe
+    /// of a single fixed, well-known path, never a caller-shaped one.
+    /// Dispatched only when an operator opts in to "一併清除網路設定" on
+    /// the factory-reset confirmation — the default is to KEEP saved
+    /// Wi-Fi credentials, since losing them on a headless LAN appliance can
+    /// mean permanent physical-access-only recovery (see
+    /// `commercial/docs/DESIGN-network-settings-2026-08.md` §4.4).
+    ClearNetworkCredentials,
     /// `hostnamectl set-hostname <set>`. `set` is passed to
     /// `Command::arg()`, never shell-interpreted; the server still
     /// rejects empty values and values over [`MAX_HOSTNAME_LEN`] as a
@@ -239,6 +264,7 @@ impl SysdRequest {
             SysdRequest::BootAssessmentStatus => "boot_assessment_status",
             SysdRequest::UpdateRollback => "update_rollback",
             SysdRequest::FactoryReset => "factory_reset",
+            SysdRequest::ClearNetworkCredentials => "clear_network_credentials",
             SysdRequest::Hostname { .. } => "hostname",
             SysdRequest::SetTimezone { .. } => "set_timezone",
             SysdRequest::SetNtp { .. } => "set_ntp",
@@ -323,11 +349,19 @@ mod tests {
             SysdRequest::BootAssessmentStatus,
             SysdRequest::UpdateRollback,
             SysdRequest::FactoryReset,
+            SysdRequest::ClearNetworkCredentials,
         ] {
             let s = serde_json::to_string(&req).unwrap();
             let back: SysdRequest = serde_json::from_str(&s).unwrap();
             assert_eq!(req, back, "round-trip mismatch for {s}");
         }
+    }
+
+    #[test]
+    fn clear_network_credentials_has_the_documented_stable_wire_shape() {
+        let s = serde_json::to_string(&SysdRequest::ClearNetworkCredentials).unwrap();
+        assert_eq!(s, r#"{"verb":"clear_network_credentials"}"#);
+        assert_eq!(SysdRequest::ClearNetworkCredentials.verb_name(), "clear_network_credentials");
     }
 
     #[test]
