@@ -7121,6 +7121,11 @@ impl MethodHandler {
                 require_confirm!();
                 self.handle_device_update_rollback().await
             }
+            "device.boot_assessment" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_device_boot_assessment().await
+            }
             "device.backup_create" => {
                 require_admin!();
                 require_appliance!();
@@ -7504,7 +7509,8 @@ impl MethodHandler {
                     { "name": "device.network", "description": "Read network interfaces; setting a static IP is not implemented yet (admin, appliance-only)" },
                     { "name": "device.update_status", "description": "Check for an available OS update via systemd-sysupdate (admin, appliance-only)" },
                     { "name": "device.update_apply", "description": "Install the newest available OS update (admin, appliance-only)" },
-                    { "name": "device.update_rollback", "description": "Roll back to the previous OS version — not yet implemented, always returns unsupported (admin, appliance-only, destructive: requires confirm)" },
+                    { "name": "device.update_rollback", "description": "Roll back to the previous OS version and reboot (admin, appliance-only, destructive: requires confirm)" },
+                    { "name": "device.boot_assessment", "description": "Report systemd's automatic boot assessment state for the running version (admin, appliance-only, read-only)" },
                     { "name": "device.backup_create", "description": "Archive the device's writable data partition for download (admin, appliance-only)" },
                     { "name": "device.backup_schedule_get", "description": "Read the scheduled-backup config (admin, appliance-only)" },
                     { "name": "device.backup_schedule_set", "description": "Update the scheduled-backup config (schedule_enabled/interval_hours/retention_count) (admin, appliance-only)" },
@@ -44328,12 +44334,91 @@ impl MethodHandler {
         device_op_result_frame(crate::device_ops::select_device_ops().update_status().await)
     }
 
+    /// `device.update_apply` — stage a verified release, then install it.
+    ///
+    /// The staging half (H3d) is not optional and not a convenience: this
+    /// appliance's `systemd-sysupdate` source is `Type=regular-file`, for
+    /// which sysupdate does no integrity or authenticity checking at all
+    /// (`sysupdate.d(5)`, v257 — there is no switch to enable it). So the
+    /// only thing standing between a payload and the boot chain is
+    /// [`crate::os_update::stage_update`], which verifies a signed manifest
+    /// against a pinned key before a single byte reaches the staging
+    /// directory.
+    ///
+    /// That is also why an unconfigured source is a **refusal, not a
+    /// fall-through**: running sysupdate against whatever happens to be
+    /// lying in the staging directory is precisely the hole this package
+    /// closes. `UpToDate` is likewise reported honestly instead of being
+    /// dressed up as an install.
     async fn handle_device_update_apply(&self) -> WsFrame {
-        device_op_result_frame(crate::device_ops::select_device_ops().update_apply().await)
+        let staged = match crate::os_update::stage_update(self.home_dir()).await {
+            Ok(report) => {
+                tracing::info!(
+                    "[device.update_apply] staged {} for {} ({} bytes)",
+                    report.version,
+                    report.destination_partuuid,
+                    report.bytes_downloaded
+                );
+                report
+            }
+            Err(e) => {
+                return WsFrame::Response {
+                    id: String::new(),
+                    ok: false,
+                    payload: None,
+                    error: Some(json!({
+                        "code": match e {
+                            crate::os_update::StageError::NotConfigured => "not_configured",
+                            crate::os_update::StageError::UpToDate(_) => "up_to_date",
+                            crate::os_update::StageError::Rejected(_) => "verification_failed",
+                            crate::os_update::StageError::Network(_) => "network_error",
+                            crate::os_update::StageError::Io(_) => "io_error",
+                        },
+                        "message": e.user_message(),
+                    })),
+                };
+            }
+        };
+
+        let applied = crate::device_ops::select_device_ops().update_apply().await;
+        // Only when sysupdate actually succeeded: confirm from the live GPT
+        // that it wrote the slot the kernel image was bound to, and reclaim
+        // the ~4 GiB of payload now that the partition label is the ledger.
+        // A mismatch is surfaced as a failure even though the install
+        // "worked" — rebooting into a kernel/root pair from two different
+        // versions is the failure this whole package exists to prevent.
+        if matches!(&applied, Ok(out) if out.success) {
+            if let Err(why) = crate::os_update::confirm_installed_slot(&staged).await {
+                tracing::error!("[device.update_apply] slot mismatch after install: {why}");
+                return WsFrame::Response {
+                    id: String::new(),
+                    ok: false,
+                    payload: None,
+                    error: Some(json!({
+                        "code": "slot_mismatch",
+                        "message": format!("更新已寫入，但寫入的位置與預期不符，請勿重新開機並聯絡技術支援：{why}"),
+                    })),
+                };
+            }
+            crate::os_update::cleanup_staged(&staged);
+        }
+        device_op_result_frame(applied)
     }
 
     async fn handle_device_update_rollback(&self) -> WsFrame {
         device_op_result_frame(crate::device_ops::select_device_ops().update_rollback().await)
+    }
+
+    /// `device.boot_assessment` — read-only view of systemd's automatic
+    /// boot assessment (`good` / `bad` / `indeterminate` / `clean`), so the
+    /// dashboard can tell an operator whether the running version is still
+    /// on probation without triggering anything.
+    async fn handle_device_boot_assessment(&self) -> WsFrame {
+        device_op_result_frame(
+            crate::device_ops::select_device_ops()
+                .boot_assessment_status()
+                .await,
+        )
     }
 
     async fn handle_device_factory_reset(&self) -> WsFrame {
@@ -45045,6 +45130,7 @@ mod device_rpc_tests {
             ("device.update_status", json!({})),
             ("device.update_apply", json!({})),
             ("device.update_rollback", json!({"confirm": true})),
+            ("device.boot_assessment", json!({})),
             ("device.backup_create", json!({})),
             ("device.backup_schedule_get", json!({})),
             ("device.backup_schedule_set", json!({"schedule_enabled": true})),

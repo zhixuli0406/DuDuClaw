@@ -894,7 +894,15 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // change. The dispatch gate ADDITIONALLY requires the agent's own
         // `[capabilities] codrive = true` (deny-by-default, defence in
         // depth — see `mcp_dispatch.rs`'s `CODRIVE_TOOLS` check).
-        "codrive_run" => Some(Scope::Admin),
+        //
+        // A2: `codrive_status` is the read-only driving-state query on the
+        // same socket. It is deliberately held to the SAME tier as
+        // `codrive_run` rather than being softened for being a read: it
+        // reveals whether a human is at the shared desktop right now, which
+        // is exactly the signal an agent would want in order to time an
+        // action around the human's absence. Enumerated on its own line for
+        // the same reason `codrive_run` is — never the Admin fall-through.
+        "codrive_run" | "codrive_status" => Some(Scope::Admin),
         // ── High-impact tools — explicitly Admin (C2 fix) ────────────────
         // Arbitrary code execution, agent lifecycle/identity mutation, prompt
         // rewrite, cross-agent dispatch, scheduling, and evolution control.
@@ -1324,6 +1332,33 @@ is_external = {is_external}
                 enforced, entry.scope,
                 "catalog scope for `{}` ({}) drifted from tool_requires_scope ({})",
                 entry.name, entry.scope, enforced
+            );
+        }
+    }
+
+    /// A2: both co-drive tool faces resolve to Admin through their OWN
+    /// enumerated arm, never the Admin fall-through — so a future scope
+    /// split for co-drive stays a one-line diff instead of a silent
+    /// behavior change. The read-only `codrive_status` is deliberately held
+    /// to the same tier as `codrive_run`: knowing whether a human is
+    /// currently at the shared desktop is not a harmless read.
+    #[test]
+    fn test_both_codrive_tools_require_admin_and_are_internal_only() {
+        for tool in ["codrive_run", "codrive_status"] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::Admin),
+                "tool {tool} must require Admin"
+            );
+            let external = Principal {
+                client_id: "external-client".to_string(),
+                scopes: [Scope::Admin].into_iter().collect(),
+                is_external: true,
+                created_at: chrono::Utc::now(),
+            };
+            assert!(
+                !external_tool_allowed(tool, &external),
+                "tool {tool} must never be reachable by an external client"
             );
         }
     }

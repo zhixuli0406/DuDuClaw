@@ -1,13 +1,20 @@
-import { describe, it, expect } from 'vitest';
-import { screen } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
 import { UpdateStatusCard } from './UpdateStatusCard';
+import { api } from '@/lib/api';
+import { toast } from '@/lib/toast';
 import {
   FIXTURE_UPDATE_STATUS,
   FIXTURE_UPDATE_STATUS_WITH_SYSTEM,
   FIXTURE_UPDATE_STATUS_SYSTEM_ONLY,
 } from './fixtures';
 import type { UpdateStatusArtifact } from './artifact-types';
+
+beforeEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('<UpdateStatusCard> — system (self-update) half', () => {
   it('renders nothing extra when payload.system is absent (backward compatible)', () => {
@@ -80,5 +87,69 @@ describe('<UpdateStatusCard> — P5: optional `result` (device) half', () => {
     expect(screen.getByText('DuDuClaw version')).toBeInTheDocument();
     expect(screen.getByText('Update complete')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Roll back to previous version/ })).toBeInTheDocument();
+  });
+});
+
+describe('<UpdateStatusCard> — rollback (inline confirm, three-way response handling)', () => {
+  const payload = FIXTURE_UPDATE_STATUS_WITH_SYSTEM.payload as UpdateStatusArtifact['payload'];
+
+  it('reveals an inline confirm step before calling device.update_rollback', async () => {
+    const rollback = vi
+      .spyOn(api.device, 'updateRollback')
+      .mockResolvedValue({ success: true, stdout: '', stderr: '' });
+    const successToast = vi.spyOn(toast, 'success');
+    const user = userEvent.setup();
+
+    renderWithProviders(<UpdateStatusCard payload={payload} />);
+
+    await user.click(screen.getByRole('button', { name: 'Roll back to previous version' }));
+    // Nothing destructive happens until the inline confirm step is accepted.
+    expect(rollback).not.toHaveBeenCalled();
+    expect(
+      screen.getByText('The device will restart and switch back to the previous version. Your data will not be affected.'),
+    ).toBeInTheDocument();
+
+    // Two buttons now share the "Roll back to previous version" label — the
+    // original trigger is hidden while confirming, so this is unambiguous.
+    await user.click(screen.getByRole('button', { name: 'Roll back to previous version' }));
+
+    await waitFor(() => expect(rollback).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(successToast).toHaveBeenCalledWith('Rollback scheduled — the device is restarting…'),
+    );
+    expect(await screen.findByText('Rollback scheduled — the device is restarting…')).toBeInTheDocument();
+  });
+
+  it("shows the backend's own reason verbatim when device.update_rollback answers unsupported — not a generic error", async () => {
+    const backendMessage = '沒有可回退的版本。';
+    vi.spyOn(api.device, 'updateRollback').mockRejectedValue({ code: 'unsupported', message: backendMessage });
+    const infoToast = vi.spyOn(toast, 'info');
+    const errorToast = vi.spyOn(toast, 'error');
+    const user = userEvent.setup();
+
+    renderWithProviders(<UpdateStatusCard payload={payload} />);
+
+    await user.click(screen.getByRole('button', { name: 'Roll back to previous version' }));
+    await user.click(screen.getByRole('button', { name: 'Roll back to previous version' }));
+
+    await waitFor(() => expect(infoToast).toHaveBeenCalledWith(backendMessage));
+    expect(errorToast).not.toHaveBeenCalled();
+    // The exact backend text renders inline too, not a generic clause.
+    expect(await screen.findByText(backendMessage)).toBeInTheDocument();
+  });
+
+  it('surfaces a generic failure toast for a non-unsupported rejection', async () => {
+    vi.spyOn(api.device, 'updateRollback').mockRejectedValue(new Error('network error'));
+    const errorToast = vi.spyOn(toast, 'error');
+    const infoToast = vi.spyOn(toast, 'info');
+    const user = userEvent.setup();
+
+    renderWithProviders(<UpdateStatusCard payload={payload} />);
+
+    await user.click(screen.getByRole('button', { name: 'Roll back to previous version' }));
+    await user.click(screen.getByRole('button', { name: 'Roll back to previous version' }));
+
+    await waitFor(() => expect(errorToast).toHaveBeenCalledTimes(1));
+    expect(infoToast).not.toHaveBeenCalled();
   });
 });

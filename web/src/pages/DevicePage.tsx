@@ -70,11 +70,26 @@ import { DangerZone, ConfirmDialog } from '@/components/settings/controls';
  * crashing when reached on a non-appliance install.
  *
  * User-facing copy deliberately avoids internal terms ("A/B 槽",
- * "sysupdate", "RPC") — 更新中心 says "系統更新", the disabled rollback button
- * says "回到上一版". `device.update_rollback` always answers `unsupported`
- * this round (no verified appliance A/B boot-selection mechanism yet — see
- * the gateway's own doc comment), so the button stays disabled with a
- * "即將推出" caption instead of pretending the action works.
+ * "sysupdate", "systemd-bless-boot", "RPC") — 更新中心 says "系統更新", the
+ * rollback button says "回到上一版", and its confirm dialog only ever
+ * promises "重新開機＋切回上一版＋資料不受影響".
+ *
+ * `device.update_rollback` is now backed by a real appliance action (see the
+ * gateway's own doc comment on `SystemDeviceOps::update_rollback`) — the
+ * button is no longer disabled. Its response still needs THREE-way
+ * handling, not a plain success/failure binary:
+ *   1. Resolves `{ success: true }` → the box is about to reboot into the
+ *      previous slot. The toast says "已排定" (scheduled), never "完成"
+ *      (done) — the WebSocket connection is about to drop, so this tab will
+ *      never observe a real completion event.
+ *   2. Rejects with `error.code === 'unsupported'` → an HONEST refusal, not
+ *      a bug (e.g. this box's A/B rollback mechanism isn't enabled, or
+ *      there is no previous slot to fall back to). The gateway already
+ *      writes a specific zh-TW reason into `error.message` — this UI must
+ *      surface that text verbatim rather than overwrite it with a generic
+ *      clause.
+ *   3. Anything else (network / timeout / other RPC error) → the ordinary
+ *      `formatError()` toast.
  */
 
 // ── Small structured-error helper (RPC rejects with `{ code, message }`) ──
@@ -83,6 +98,18 @@ function errorCode(err: unknown): string | undefined {
   if (err && typeof err === 'object' && 'code' in err) {
     const c = (err as { code?: unknown }).code;
     return typeof c === 'string' ? c : undefined;
+  }
+  return undefined;
+}
+
+/** Extract `.message` from a `{ code, message }` RPC rejection — the
+ *  companion to `errorCode` above. Used only for the `unsupported` rollback
+ *  refusal, where the gateway's own zh-TW reason must reach the user
+ *  verbatim instead of being replaced by a generic classified clause. */
+function errorMessage(err: unknown): string | undefined {
+  if (err && typeof err === 'object' && 'message' in err) {
+    const m = (err as { message?: unknown }).message;
+    return typeof m === 'string' ? m : undefined;
   }
   return undefined;
 }
@@ -245,6 +272,8 @@ export function DevicePage() {
   const [applying, setApplying] = useState(false);
   const [updateLog, setUpdateLog] = useState<DeviceOpResult | null>(null);
   const [showUpdateLog, setShowUpdateLog] = useState(false);
+  const [rollbackConfirmOpen, setRollbackConfirmOpen] = useState(false);
+  const [rollingBack, setRollingBack] = useState(false);
 
   const runUpdateCheck = async () => {
     setChecking(true);
@@ -275,6 +304,35 @@ export function DevicePage() {
       toast.error(formatError(e));
     } finally {
       setApplying(false);
+    }
+  };
+
+  // Three-way response handling — see the module doc comment above for why
+  // this is deliberately not a plain success/failure binary.
+  const runUpdateRollback = async () => {
+    setRollingBack(true);
+    try {
+      const res = await api.device.updateRollback();
+      setUpdateLog(res);
+      setShowUpdateLog(true);
+      if (res.success) {
+        // The gateway is about to reboot the box — "scheduled", not "done".
+        toast.success(t('device.update.rollback.scheduled'));
+        setRollbackConfirmOpen(false);
+      } else {
+        toast.error(t('device.update.rollback.failed'));
+      }
+    } catch (e) {
+      console.warn('[device.update_rollback]', e);
+      if (errorCode(e) === 'unsupported') {
+        // Honest refusal, not a bug — show the gateway's own reason
+        // verbatim instead of a generic error clause.
+        toast.info(errorMessage(e) ?? t('device.update.rollback.unsupportedFallback'));
+      } else {
+        toast.error(formatError(e));
+      }
+    } finally {
+      setRollingBack(false);
     }
   };
 
@@ -630,20 +688,24 @@ export function DevicePage() {
           <Panel icon={Download} title={t('device.section.update')} description={t('device.section.update.desc')}>
             <div className="space-y-3">
               <div className="flex flex-wrap gap-2">
-                <Button variant="outline" size="sm" onClick={runUpdateCheck} disabled={checking || applying}>
+                <Button variant="outline" size="sm" onClick={runUpdateCheck} disabled={checking || applying || rollingBack}>
                   <Download className={cn(checking && 'animate-pulse')} />
                   {checking ? t('device.update.checking') : t('device.update.check')}
                 </Button>
-                <Button variant="brand" size="sm" onClick={runUpdateApply} disabled={checking || applying}>
+                <Button variant="brand" size="sm" onClick={runUpdateApply} disabled={checking || applying || rollingBack}>
                   <RefreshCw className={cn(applying && 'animate-spin')} />
                   {applying ? t('device.update.applying') : t('device.update.apply')}
                 </Button>
-                <Button variant="outline" size="sm" disabled title={t('device.update.rollback.comingSoon')}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setRollbackConfirmOpen(true)}
+                  disabled={checking || applying || rollingBack}
+                >
                   <RotateCcw />
                   {t('device.update.rollback')}
                 </Button>
               </div>
-              <p className="text-xs text-muted-foreground">{t('device.update.rollback.comingSoon')}</p>
 
               {updateLog && (
                 <div className="space-y-1.5">
@@ -903,6 +965,17 @@ export function DevicePage() {
         requireText={confirmAction === 'factoryReset' ? 'RESET' : undefined}
         requireTextHint={confirmAction === 'factoryReset' ? t('device.danger.factoryReset.confirmHint') : undefined}
         busy={dangerBusy}
+      />
+
+      {/* 回到上一版：重新開機並切回上一版本，資料不受影響 */}
+      <ConfirmDialog
+        open={rollbackConfirmOpen}
+        onClose={() => setRollbackConfirmOpen(false)}
+        onConfirm={() => void runUpdateRollback()}
+        title={t('device.update.rollback.confirmTitle')}
+        message={t('device.update.rollback.confirmMessage')}
+        confirmLabel={t('device.update.rollback')}
+        busy={rollingBack}
       />
 
       {/* 刪除單一備份檔 */}

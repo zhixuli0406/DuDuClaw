@@ -39,6 +39,7 @@ pub mod device;
 // ── System-settings app: `device.about` / `device.timedate*` data ─────────
 pub mod device_about;
 pub mod device_ops;
+pub mod os_update;
 // ── D4a: network settings (Wi-Fi over iwd D-Bus) — `network.*` RPCs +
 // `/api/first-run/network/*` OOBE pre-auth endpoints ─────────────────────
 pub mod network;
@@ -249,6 +250,7 @@ pub mod screenshot_audit;
 pub mod secret_redact;
 pub mod risk_detector;
 pub mod defensive_prompt;
+pub mod uki_patch;
 pub mod updater;
 pub mod webchat;
 pub mod webhook;

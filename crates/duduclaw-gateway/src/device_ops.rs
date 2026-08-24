@@ -87,21 +87,26 @@ pub trait DeviceOps: Send + Sync {
     async fn update_status(&self) -> OpResult;
     /// `systemd-sysupdate update` — installs the newest available version.
     async fn update_apply(&self) -> OpResult;
-    /// Roll back to the previously-installed A/B slot.
+    /// Roll back to the previously-installed A/B slot, then reboot.
     ///
-    /// `systemd-sysupdate` (confirmed against its upstream manual, 2026-08)
-    /// has NO `rollback`/`revert` verb — A/B fallback is instead a property
-    /// of systemd-boot's boot-counting + `systemd-bless-boot.service`, and
-    /// the exact mechanics of that interaction are an explicitly open point
-    /// in `appliance/README.md` ("not traced end-to-end"). Rather than
-    /// fabricate a command that doesn't exist, or guess at
-    /// `systemd-sysupdate list --json=short`'s field names to pick a
-    /// rollback target automatically (wrong guess = rolling back to the
-    /// wrong slot on a headless box — a genuinely dangerous failure mode),
-    /// this always returns `Unsupported` until the appliance A/B
-    /// boot-selection mechanism is verified end-to-end. The RPC (and this
-    /// trait method) exist so the seam is in place for that follow-up.
+    /// `systemd-sysupdate` has no `rollback` verb, so this is NOT built on
+    /// it. It is a *relative* operation — "do not boot the entry I am
+    /// running" — carried out on the appliance by `duduclaw-sysd`'s
+    /// `UpdateRollback` verb (H3f, 2026-08-24), which never computes a slot
+    /// number and therefore cannot pick the wrong one. See that verb's doc
+    /// comment for the two tiers (`systemd-bless-boot bad` while a boot
+    /// counter is in flight; renaming the entry named by
+    /// `LoaderEntrySelected` to the exhausted shape once it is not).
+    ///
+    /// Off the appliance ([`SystemDeviceOps`]) this still answers
+    /// `Unsupported`: a dev box or container has no ESP, no boot counting
+    /// and no second slot, and fabricating a success there would be a lie.
     async fn update_rollback(&self) -> OpResult;
+    /// `systemd-bless-boot status` — `good` / `bad` / `indeterminate` /
+    /// `clean`, forwarded verbatim in `stdout`. Read-only: the dashboard
+    /// uses it to say whether the current boot is still under assessment,
+    /// without any side effect.
+    async fn boot_assessment_status(&self) -> OpResult;
     /// Wipe `home_dir`'s contents, best-effort re-arm the first-boot
     /// provisioning unit, then `systemctl reboot`.
     async fn factory_reset(&self, home_dir: &Path) -> OpResult;
@@ -172,10 +177,19 @@ impl DeviceOps for SystemDeviceOps {
     }
 
     async fn update_rollback(&self) -> OpResult {
+        // Deliberately not "try it and see": this implementation is the
+        // non-appliance one (dev machine, container, desktop install).
+        // There is no ESP, no A/B slot pair and no boot assessment here, so
+        // there is nothing a rollback could mean. The appliance path is
+        // `SysdDeviceOps::update_rollback`.
         Err(DeviceOpError::Unsupported(
-            "systemd-sysupdate 沒有原生的 rollback 指令；A/B 開機槽的自動回退機制尚未在真機驗證完成，\
-             本版暫不提供自動選擇回退版本（避免猜錯槽位造成裝置無法開機）。"
-                .to_string(),
+            "這台裝置不是 DuDuClaw 值班機，沒有可回退的上一個系統版本。".to_string(),
+        ))
+    }
+
+    async fn boot_assessment_status(&self) -> OpResult {
+        Err(DeviceOpError::Unsupported(
+            "這台裝置不是 DuDuClaw 值班機，沒有開機評估狀態可查詢。".to_string(),
         ))
     }
 
@@ -233,16 +247,13 @@ impl DeviceOps for SystemDeviceOps {
 /// sysd socket exists; see `SystemDeviceOps`'s doc comment for why this
 /// exists at all.
 ///
-/// Only the genuinely privileged verbs (reboot / poweroff / sysupdate /
-/// the unit-re-arm-and-reboot half of factory reset) cross the socket —
-/// `duduclaw-sysd`'s protocol is a closed six-verb enum
-/// (`duduclaw_sysd::SysdRequest`) that does not include an
-/// `update_rollback` or `backup_create` verb, because neither needs root:
-/// `update_rollback` never shells out at all (same reasoning as
-/// `SystemDeviceOps`, see that trait method's doc comment) and
-/// `backup_create` (`tar`) only reads/writes paths the unprivileged
-/// `duduclaw` user already owns, so it is delegated straight to
-/// `SystemDeviceOps`'s local shell-out rather than duplicated here.
+/// Only the genuinely privileged verbs cross the socket — reboot /
+/// poweroff / sysupdate status+apply / boot assessment + rollback / the
+/// unit-re-arm-and-reboot half of factory reset. `backup_create` (`tar`)
+/// is the one `DeviceOps` method with no sysd verb, because it needs no
+/// root: it only reads and writes paths the unprivileged `duduclaw` user
+/// already owns, so it is delegated straight to `SystemDeviceOps`'s local
+/// shell-out rather than duplicated here.
 pub struct SysdDeviceOps {
     client: duduclaw_sysd::SysdClient,
 }
@@ -339,9 +350,11 @@ impl DeviceOps for SysdDeviceOps {
     }
 
     async fn update_rollback(&self) -> OpResult {
-        // No sysd verb exists for this — see this impl's own doc comment
-        // and `SystemDeviceOps::update_rollback`'s doc comment for why.
-        SystemDeviceOps.update_rollback().await
+        sysd_call(&self.client, duduclaw_sysd::SysdRequest::UpdateRollback).await
+    }
+
+    async fn boot_assessment_status(&self) -> OpResult {
+        sysd_call(&self.client, duduclaw_sysd::SysdRequest::BootAssessmentStatus).await
     }
 
     async fn factory_reset(&self, home_dir: &Path) -> OpResult {
@@ -447,6 +460,7 @@ pub mod mock {
         pub update_status_result: Mutex<Option<OpResult>>,
         pub update_apply_result: Mutex<Option<OpResult>>,
         pub update_rollback_result: Mutex<Option<OpResult>>,
+        pub boot_assessment_status_result: Mutex<Option<OpResult>>,
         pub factory_reset_result: Mutex<Option<OpResult>>,
         pub backup_create_result: Mutex<Option<OpResult>>,
     }
@@ -479,6 +493,13 @@ pub mod mock {
         async fn update_rollback(&self) -> OpResult {
             self.calls.lock().unwrap().push("update_rollback".to_string());
             take_or_default(&self.update_rollback_result, "update_rollback")
+        }
+        async fn boot_assessment_status(&self) -> OpResult {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("boot_assessment_status".to_string());
+            take_or_default(&self.boot_assessment_status_result, "boot_assessment_status")
         }
         async fn factory_reset(&self, _home_dir: &Path) -> OpResult {
             self.calls.lock().unwrap().push("factory_reset".to_string());
@@ -545,12 +566,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_rollback_never_shells_out() {
-        // Real SystemDeviceOps::update_rollback must be a pure Err — no
-        // subprocess spawn at all — see the trait method's doc comment.
+    async fn update_rollback_never_shells_out_off_the_appliance() {
+        // The non-appliance implementation must be a pure Err — no
+        // subprocess spawn at all. A dev box has no ESP and no A/B slot
+        // pair, so "roll back" has no meaning here and must not be faked.
+        // The appliance path is SysdDeviceOps::update_rollback, which
+        // crosses the socket to duduclaw-sysd's UpdateRollback verb.
         let ops = SystemDeviceOps;
-        let result = ops.update_rollback().await;
-        assert!(matches!(result, Err(DeviceOpError::Unsupported(_))));
+        assert!(matches!(
+            ops.update_rollback().await,
+            Err(DeviceOpError::Unsupported(_))
+        ));
+        assert!(matches!(
+            ops.boot_assessment_status().await,
+            Err(DeviceOpError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -771,13 +801,21 @@ mod tests {
         /// all (no sysd verb exists for either — see the impl's doc
         /// comment) — confirm both still work even with NO server running.
         #[tokio::test]
-        async fn update_rollback_and_backup_create_never_need_the_socket() {
+        async fn backup_create_never_needs_the_socket() {
+            // `backup_create` is the ONE DeviceOps method with no sysd verb,
+            // because tar needs no root — it only touches paths the
+            // unprivileged `duduclaw` user already owns. It must therefore
+            // work with no sysd running at all.
+            //
+            // `update_rollback` used to be asserted here too, back when it
+            // was a pure `Err` that never opened the socket. Since H3f it
+            // crosses to the `UpdateRollback` verb, so that half moved to
+            // `update_rollback_surfaces_a_missing_socket_honestly` below —
+            // leaving it here would have kept passing while asserting the
+            // opposite of what the code does.
             let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(
                 std::path::PathBuf::from("/tmp/duduclaw-sysd-test-no-such-socket.sock"),
             ));
-
-            let rollback = ops.update_rollback().await;
-            assert!(matches!(rollback, Err(DeviceOpError::Unsupported(_))));
 
             let src = tempfile::tempdir().unwrap();
             std::fs::write(src.path().join("a.txt"), b"hi").unwrap();
@@ -785,6 +823,24 @@ mod tests {
             let dest_path = dest.path().join("out.tar.gz");
             let backup = ops.backup_create(src.path(), &dest_path).await;
             assert!(backup.is_ok(), "backup_create must not require the sysd socket: {backup:?}");
+        }
+
+        #[tokio::test]
+        async fn update_rollback_surfaces_a_missing_socket_honestly() {
+            // With no sysd reachable, the appliance path must report a
+            // structured `Unsupported` — never panic, and never fall back to
+            // pretending a rollback happened.
+            let ops = SysdDeviceOps::new(duduclaw_sysd::SysdClient::new(
+                std::path::PathBuf::from("/tmp/duduclaw-sysd-test-no-such-socket.sock"),
+            ));
+            assert!(matches!(
+                ops.update_rollback().await,
+                Err(DeviceOpError::Unsupported(_))
+            ));
+            assert!(matches!(
+                ops.boot_assessment_status().await,
+                Err(DeviceOpError::Unsupported(_))
+            ));
         }
     }
 }

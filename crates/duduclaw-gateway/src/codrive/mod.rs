@@ -26,6 +26,13 @@
 //!   emergency stop, and the activity-feed ticker.
 //! - [`identity`] — CD-2: resolves + authorizes the `agent`-parameter
 //!   identity override for `codrive_run` ([`identity::resolve_run_identity`]).
+//! - [`mode`] — A2: the closed driving-mode / handover-reason enums comp
+//!   reports ([`mode::CodriveDrivingMode`]). Parsing only — comp owns the
+//!   one state machine; this side never re-derives it.
+//! - `plan_approval` — DESIGN §3.5: the opt-in session-level approval card
+//!   `driver.rs` files before connecting when `[codrive] plan_approval`.
+//! - [`status`] — A2: the read-only `codrive_status` query
+//!   ([`status::query_status`]) behind the MCP tool of the same name.
 //! - [`registry`] — CD-4/WP-CD4a: the C-L2 third-party app API/CLI/D-Bus
 //!   action registry ([`registry::dispatch`]), tried by `step.rs` ahead of
 //!   the ordinary C-L1 coordinate dispatch.
@@ -52,8 +59,11 @@ pub mod client;
 pub mod config;
 pub mod driver;
 pub mod identity;
+pub mod mode;
+mod plan_approval;
 pub mod registry;
 pub mod script;
+pub mod status;
 mod step;
 
 #[cfg(all(test, unix))]
@@ -71,6 +81,9 @@ mod tests_registry;
 #[cfg(all(test, unix))]
 mod tests_atspi_locate;
 
+#[cfg(all(test, unix))]
+mod tests_mode;
+
 /// Permanent `#[ignore]` live-bridge harness against the real comp
 /// container stack — see its module doc for the playbook.
 #[cfg(all(test, unix))]
@@ -83,6 +96,10 @@ pub use client::{
 };
 pub use config::CodriveConfig;
 pub use driver::{CodriveRunReport, CodriveStepReport, run_script};
+pub use mode::{CodriveDrivingMode, CodriveHandoverReason};
+pub use status::{
+    query_status as query_codrive_status, CodriveDrivingState, CodriveStatusReport,
+};
 pub use identity::{resolve_run_identity, RunIdentityError};
 pub use registry::{dispatch as registry_dispatch, DispatchOutcome as RegistryDispatchOutcome};
 pub use script::{

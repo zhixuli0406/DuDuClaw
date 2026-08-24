@@ -28,6 +28,8 @@ use crate::task_store::{ActivityRow, TaskStore};
 
 use super::client::{CodriveClient, CodriveCmd};
 use super::config::CodriveConfig;
+use super::mode::{CodriveDrivingMode, CodriveHandoverReason};
+use super::plan_approval::{PLAN_DENIED_STATE, gate_plan_approval};
 use super::script::CodriveScript;
 use super::step::{TOOL_NAME, run_one_step};
 
@@ -63,7 +65,9 @@ pub struct CodriveStepReport {
 pub struct CodriveRunReport {
     pub session_id: String,
     /// e.g. `completed` / `refused_invalid` / `refused_denylist` /
-    /// `aborted_connect` / `aborted_approval_denied` /
+    /// `aborted_connect` / `aborted_plan_denied` (A2: the DESIGN §3.5
+    /// session-level plan card was not approved — see the `plan_approval`
+    /// module) / `aborted_approval_denied` /
     /// `aborted_approval_expired` / `aborted_frozen_timeout` /
     /// `aborted_emergency_stop` / `aborted_connection_lost`. (CD-3: a
     /// `Credential`-classed step no longer produces `refused_credential` —
@@ -72,6 +76,26 @@ pub struct CodriveRunReport {
     pub final_state: &'static str,
     pub detail: Option<String>,
     pub steps: Vec<CodriveStepReport>,
+    /// A2 §1: which seat comp reported was driving when this session
+    /// started, and when it ended. `None` means comp never reported a mode
+    /// on this connection — either a compositor that predates A2, or a run
+    /// that ended before any mode-bearing line came back. It deliberately
+    /// does NOT default to `human`: "nobody told us" and "the agent had no
+    /// driving authority" are different facts and a report that conflates
+    /// them is a report that lies.
+    ///
+    /// **Cost: zero extra wire ops.** Both values are read out of
+    /// [`super::client::CodriveClient::last_driving_mode`], which is
+    /// populated as a side effect of lines the session was already going to
+    /// exchange — the `driving_mode` pushes comp sends on every real mode
+    /// change (A2 §3.2) and the `status` acks `step::wait_for_resume`
+    /// already polls while frozen. No `status` query was added to any
+    /// script path for this field.
+    pub driving_mode_at_start: Option<CodriveDrivingMode>,
+    pub driving_mode_at_end: Option<CodriveDrivingMode>,
+    /// The handover reason accompanying [`Self::driving_mode_at_end`], when
+    /// the session ended in `handover`.
+    pub handover_reason_at_end: Option<CodriveHandoverReason>,
 }
 
 /// Run one co-drive script end to end. Never panics; every failure path
@@ -104,12 +128,7 @@ pub async fn run_script(
     let script = match script.sanitize() {
         Ok(s) => s,
         Err(e) => {
-            return CodriveRunReport {
-                session_id,
-                final_state: "refused_invalid",
-                detail: Some(e),
-                steps,
-            };
+            return early_report(session_id, "refused_invalid", Some(e));
         }
     };
 
@@ -131,12 +150,7 @@ pub async fn run_script(
             &format!("共駕請求被拒（拒做清單）：{reason}"),
         )
         .await;
-        return CodriveRunReport {
-            session_id,
-            final_state: "refused_denylist",
-            detail: Some(reason),
-            steps,
-        };
+        return early_report(session_id, "refused_denylist", Some(reason));
     }
     // CD-3 (task brief item 1): a credential-classed step is no longer a
     // whole-script refusal — see `step::take_over_reason` for the
@@ -144,6 +158,27 @@ pub async fn run_script(
     // above (banking/CAPTCHA keywords) is a SEPARATE, unchanged gate.
 
     let cfg = CodriveConfig::from_home(home_dir);
+
+    // ── DESIGN §3.5 plan-approval card (A2 item 3), opt-in ──────────────
+    // Deliberately BEFORE `resolve_endpoint`/`connect`: a plan nobody
+    // approved must never open a co-drive session at all, so there is no
+    // window in which comp has an authenticated agent connection for a run
+    // that is about to be refused. Fail-closed on every non-approval —
+    // see `plan_approval`'s module doc.
+    if cfg.plan_approval {
+        if let Err(detail) = gate_plan_approval(home_dir, agent_id, &script, &cfg).await {
+            ticker(
+                home_dir,
+                agent_id,
+                "codrive_session",
+                &session_id,
+                &format!("共駕計畫未獲核准，未連線即中止：{detail}"),
+            )
+            .await;
+            return early_report(session_id, PLAN_DENIED_STATE, Some(detail));
+        }
+    }
+
     let (socket_path, token) = match resolve_endpoint(&cfg).await {
         Ok(v) => v,
         Err(e) => {
@@ -155,12 +190,7 @@ pub async fn run_script(
                 &format!("共駕連線設定錯誤：{e}"),
             )
             .await;
-            return CodriveRunReport {
-                session_id,
-                final_state: "aborted_connect",
-                detail: Some(e),
-                steps,
-            };
+            return early_report(session_id, "aborted_connect", Some(e));
         }
     };
     let connect_timeout = Duration::from_secs(cfg.connect_timeout_secs.max(1));
@@ -176,14 +206,14 @@ pub async fn run_script(
                 &format!("共駕連線失敗：{detail}"),
             )
             .await;
-            return CodriveRunReport {
-                session_id,
-                final_state: "aborted_connect",
-                detail: Some(detail),
-                steps,
-            };
+            return early_report(session_id, "aborted_connect", Some(detail));
         }
     };
+
+    // A2 §1: the mode comp reported by the time the session was live.
+    // Read from the client's passive observation cache — no `status` query
+    // is sent for it (see `CodriveRunReport::driving_mode_at_start`).
+    let driving_mode_at_start = client.last_driving_mode();
 
     ticker(
         home_dir,
@@ -290,6 +320,30 @@ pub async fn run_script(
         final_state,
         detail: final_detail,
         steps,
+        driving_mode_at_start,
+        driving_mode_at_end: client.last_driving_mode(),
+        handover_reason_at_end: client.last_handover_reason(),
+    }
+}
+
+/// Every pre-session failure path (invalid script, refuse-list hit,
+/// unapproved plan, no endpoint, failed connect) shares one shape: no steps
+/// ran and no driving mode is known, because comp was never in a position
+/// to report one. Kept as a constructor so a future field cannot be added
+/// to [`CodriveRunReport`] and silently forgotten on four of five paths.
+fn early_report(
+    session_id: String,
+    final_state: &'static str,
+    detail: Option<String>,
+) -> CodriveRunReport {
+    CodriveRunReport {
+        session_id,
+        final_state,
+        detail,
+        steps: Vec::new(),
+        driving_mode_at_start: None,
+        driving_mode_at_end: None,
+        handover_reason_at_end: None,
     }
 }
 
@@ -307,7 +361,12 @@ fn denylist_hit(script: &CodriveScript) -> Option<String> {
     None
 }
 
-async fn resolve_endpoint(cfg: &CodriveConfig) -> Result<(std::path::PathBuf, String), String> {
+/// `pub(super)` so [`super::status`]'s read-only query reuses this exact
+/// endpoint/token resolution instead of keeping a second copy that could
+/// drift from the config surface.
+pub(super) async fn resolve_endpoint(
+    cfg: &CodriveConfig,
+) -> Result<(std::path::PathBuf, String), String> {
     let socket_path = cfg.resolved_socket_path()?;
     let token_path = cfg.resolved_token_path()?;
     let token = tokio::fs::read_to_string(&token_path)

@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/render';
 import { DevicePage } from './DevicePage';
 import { api } from '@/lib/api';
+import { toast } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 
@@ -102,15 +103,75 @@ describe('<DevicePage> — appliance device management', () => {
     expect(screen.queryByText('{"available":false}')).not.toBeInTheDocument();
   });
 
-  it('the "roll back to previous version" button stays disabled — the RPC always answers unsupported', async () => {
+  it('the "roll back to previous version" button opens a confirm dialog, then calls device.update_rollback on confirm', async () => {
     vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
-    const rollback = vi.spyOn(api.device, 'updateRollback');
+    const rollback = vi
+      .spyOn(api.device, 'updateRollback')
+      .mockResolvedValue({ success: true, stdout: '', stderr: '' });
+    const successToast = vi.spyOn(toast, 'success');
 
     renderWithProviders(<DevicePage />);
+    const user = userEvent.setup();
 
     const btn = await screen.findByRole('button', { name: 'Roll back to previous version' });
-    expect(btn).toBeDisabled();
+    expect(btn).toBeEnabled();
+    await user.click(btn);
+    // Nothing destructive happens until the dialog is explicitly confirmed.
     expect(rollback).not.toHaveBeenCalled();
+    expect(await screen.findByText('Roll back to the previous version?')).toBeInTheDocument();
+
+    // The confirm dialog renders through a portal — query document-scoped.
+    // Trigger button + dialog confirm button share the same label (same
+    // convention as the "restart" test above), so click the last one.
+    const dialogButtons = screen.getAllByRole('button', { name: 'Roll back to previous version' });
+    await user.click(dialogButtons[dialogButtons.length - 1]);
+
+    await waitFor(() => expect(rollback).toHaveBeenCalledTimes(1));
+    // The gateway is about to reboot the box — the toast says "scheduled",
+    // never "done".
+    await waitFor(() =>
+      expect(successToast).toHaveBeenCalledWith('Rollback scheduled — the device is restarting…'),
+    );
+    // Dialog closes once the rollback is scheduled.
+    expect(screen.queryByText('Roll back to the previous version?')).not.toBeInTheDocument();
+  });
+
+  it('shows the backend\'s own reason verbatim when device.update_rollback answers unsupported — not a generic error', async () => {
+    vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
+    const backendMessage = '這台機器的自動回退機制未啟用。';
+    vi.spyOn(api.device, 'updateRollback').mockRejectedValue({ code: 'unsupported', message: backendMessage });
+    const infoToast = vi.spyOn(toast, 'info');
+    const errorToast = vi.spyOn(toast, 'error');
+
+    renderWithProviders(<DevicePage />);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole('button', { name: 'Roll back to previous version' }));
+    const dialogButtons = screen.getAllByRole('button', { name: 'Roll back to previous version' });
+    await user.click(dialogButtons[dialogButtons.length - 1]);
+
+    // An honest refusal is not a bug — it renders via the "info" toast with
+    // the gateway's own zh-TW reason passed through untouched, never
+    // replaced by a generic classified error clause.
+    await waitFor(() => expect(infoToast).toHaveBeenCalledWith(backendMessage));
+    expect(errorToast).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a generic failure toast when device.update_rollback rejects for a reason other than unsupported', async () => {
+    vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
+    vi.spyOn(api.device, 'updateRollback').mockRejectedValue(new Error('network error'));
+    const errorToast = vi.spyOn(toast, 'error');
+    const infoToast = vi.spyOn(toast, 'info');
+
+    renderWithProviders(<DevicePage />);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole('button', { name: 'Roll back to previous version' }));
+    const dialogButtons = screen.getAllByRole('button', { name: 'Roll back to previous version' });
+    await user.click(dialogButtons[dialogButtons.length - 1]);
+
+    await waitFor(() => expect(errorToast).toHaveBeenCalledTimes(1));
+    expect(infoToast).not.toHaveBeenCalled();
   });
 
   it('creates a backup and triggers the download once device.backup_create resolves', async () => {

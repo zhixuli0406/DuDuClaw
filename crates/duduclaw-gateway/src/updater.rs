@@ -34,7 +34,7 @@ const GITHUB_REPO: &str = "zhixuli0406/DuDuClaw";
 /// secret key (CI `MINISIGN_SECRET_KEY` secret / `~/.minisign/duduclaw-release.key`).
 /// Rotating the key requires shipping a release signed by the OLD key that
 /// contains the NEW key here.
-const UPDATE_PUBKEY: &str = "RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh";
+pub(crate) const UPDATE_PUBKEY: &str = "RWTh5pOpk0YmdBgm3VyB2bzxFtajNLXr7zFDhbcc75TgM8YfeV+NSzXh";
 /// Current version: prefers build-time `DUDUCLAW_VERSION` env (set by Pro build script),
 /// then runtime `DUDUCLAW_VERSION` env, finally falls back to this crate's `CARGO_PKG_VERSION`.
 pub fn current_version() -> &'static str {
@@ -553,7 +553,16 @@ pub fn is_valid_download_url(url: &str) -> bool {
 /// `pubkey_b64`. Fails closed: any parse or verification error rejects the
 /// update. Legacy (non-prehashed) signatures are rejected — CI signs with
 /// modern minisign (`ED` alg).
-fn verify_minisign_signature_with_pubkey(
+///
+/// `pub` since H3d because the OS-image update chain
+/// ([`crate::os_update`]) signs a *manifest* covering several payload files
+/// rather than one archive, so it needs detached-signature verification on
+/// its own, and must not grow a second minisign dialect to get it. The key
+/// stays a parameter for the same reason
+/// [`verify_archive_with_pubkey`] takes one: the OS channel pins a
+/// different keypair than the app channel, so a compromise of one cannot
+/// install over the other's users.
+pub fn verify_minisign_signature_with_pubkey(
     data: &[u8],
     sig_text: &str,
     pubkey_b64: &str,

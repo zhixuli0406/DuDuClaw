@@ -311,6 +311,14 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "agent", description: "Optional: run (and capability-check) as a different agent id instead of the caller's own identity. Omit to use your own identity.", required: false },
         ],
     },
+    // A2: the read-only twin of `codrive_run`. Same Admin scope and same
+    // deny-by-default `[capabilities] codrive` gate — a read that tells you
+    // whether a human is at the shared desktop is not a "safe" read.
+    ToolDef {
+        name: "codrive_status",
+        description: "Read the current driving state of the shared co-drive desktop, without touching it. Returns which seat is driving right now — 'human' (no co-drive session, or it was emergency-stopped; you have zero driving authority), 'codrive' (a session is live and you are driving while a person watches), or 'handover' (a session exists but a person currently holds the keyboard and mouse — paused, not ended) — plus, when in handover, why ('human_input' / 'agent_take_over' / 'watch_idle' / 'shell_take_wheel'), whether you are working in a shadow output rather than the shared desktop, and whether idle-presence watch supervision is armed or currently pausing you. Use it to check the state of play before or between co-drive sessions; it sends no input and changes nothing. The desktop accepts one co-drive connection at a time, so this query can time out while another session holds the wheel — that timeout is reported honestly rather than guessed at. A compositor older than this feature answers with the mode fields absent, which is reported as unknown, never as 'human'. Requires the codrive capability to be explicitly enabled on this agent.",
+        params: &[],
+    },
     ToolDef {
         name: "memory_read",
         description: "Read a single memory entry by ID",
@@ -10404,6 +10412,7 @@ pub(crate) async fn handle_tools_call(
         "belief_stats" => handle_belief_stats(home_dir, default_agent).await,
         // ── Human-machine co-drive (CD-1) ──
         "codrive_run" => handle_codrive_run(&arguments, home_dir, default_agent).await,
+        "codrive_status" => handle_codrive_status(home_dir, default_agent).await,
         // ── Agent Mail (P2-d) ──
         "mail_list" => handle_mail_list(&arguments, home_dir, default_agent).await,
         "mail_read" => handle_mail_read(&arguments, home_dir, default_agent).await,
@@ -16028,6 +16037,47 @@ async fn handle_codrive_run(args: &Value, home_dir: &Path, default_agent: &str) 
     };
 
     let report = duduclaw_gateway::codrive::run_script(home_dir, &agent_id, script).await;
+    tool_text(&serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()))
+}
+
+/// A2 `codrive_status`: read-only driving-state query.
+///
+/// Authorization is the same three-layer stack `codrive_run` sits behind —
+/// `Scope::Admin` (`mcp_auth::tool_requires_scope`), the deny-by-default
+/// `[capabilities] codrive` dispatch gate (`mcp_dispatch::CODRIVE_TOOLS`,
+/// keyed to the CALLING principal), and this in-handler re-check via
+/// `resolve_run_identity` (the "雙保險 fail-closed" half). Unlike
+/// `codrive_run` this tool takes NO `agent` parameter: a read has no
+/// approval to attribute and no script to run, so there is nothing an
+/// identity override would buy except a second way to be wrong. The
+/// capability is therefore always checked against the caller's own
+/// identity.
+///
+/// Success is not audited (it is a read that changes nothing, matching the
+/// wider convention for read tools); a capability refusal is, exactly like
+/// `codrive_run`'s.
+async fn handle_codrive_status(home_dir: &Path, default_agent: &str) -> Value {
+    let caller_agent_id = resolve_audit_agent(|| default_agent.to_string());
+    match duduclaw_gateway::codrive::resolve_run_identity(home_dir, &caller_agent_id, None) {
+        Ok(_) => {}
+        Err(duduclaw_gateway::codrive::RunIdentityError::InvalidAgentId) => {
+            return tool_error("invalid agent id");
+        }
+        Err(duduclaw_gateway::codrive::RunIdentityError::CapabilityMissing(id)) => {
+            let msg = "此代理未啟用人機共駕能力（agent.toml [capabilities] codrive = true）。".to_string();
+            duduclaw_security::audit::append_tool_call_denied(
+                home_dir,
+                &id,
+                "codrive_status",
+                "codrive_capability_missing",
+                &msg,
+                None,
+            );
+            return tool_error(&msg);
+        }
+    }
+
+    let report = duduclaw_gateway::codrive::query_codrive_status(home_dir).await;
     tool_text(&serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()))
 }
 
@@ -23205,6 +23255,54 @@ mod wiki_namespace_tests {
                 "codrive_run script description must spell out '{keyword}'; description: {script_desc}"
             );
         }
+    }
+
+    // ── A2: `codrive_status` is advertised, Admin-scoped, and catalogued ──
+    // The drift guard for the read-only driving-state query. It must be
+    // discoverable (an undeclared MCP tool is an uncallable one), it must
+    // name the three modes it can return so a caller can act on them, and
+    // it must be in the shared capability catalog with the same scope the
+    // security gate enforces (`mcp_auth::tool_requires_scope`, whose own
+    // `test_catalog_scopes_match_tool_requires_scope` closes the loop).
+    #[test]
+    fn codrive_status_is_advertised_and_names_the_three_modes() {
+        use serde_json::json;
+        let id = json!(1);
+
+        let response = super::handle_tools_list(&id, &super::test_principal(false), tmp_home_for_tools_list().path());
+        let tools = response["result"]["tools"].as_array().expect("tools must be array");
+
+        let tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("codrive_status"))
+            .expect("codrive_status must be present in internal tools list");
+
+        let desc = tool["description"].as_str().unwrap_or("");
+        assert!(!desc.is_empty(), "codrive_status must have a non-empty description");
+        for keyword in ["human", "codrive", "handover", "shadow", "watch"] {
+            assert!(
+                desc.contains(keyword),
+                "codrive_status description must mention '{keyword}'; description: {desc}"
+            );
+        }
+        // A read-only query takes no parameters — pinned so nobody quietly
+        // grows it an identity override it has no use for.
+        let props = tool["inputSchema"]["properties"]
+            .as_object()
+            .expect("inputSchema.properties must be an object");
+        assert!(props.is_empty(), "codrive_status must take no parameters: {props:?}");
+    }
+
+    #[test]
+    fn codrive_status_is_in_the_builtin_tool_catalog_under_the_codrive_category() {
+        let entry = duduclaw_core::tool_catalog::builtin_tool_catalog()
+            .into_iter()
+            .find(|e| e.name == "codrive_status")
+            .expect("codrive_status must be in the built-in tool catalog");
+        assert_eq!(entry.scope, "admin");
+        assert_eq!(entry.category, "codrive");
+        assert_eq!(entry.kind, "mcp");
+        assert_eq!(entry.qualified, "mcp__duduclaw__codrive_status");
     }
 
     // ── G5 hub + curator tools ──────────────────────────────────────

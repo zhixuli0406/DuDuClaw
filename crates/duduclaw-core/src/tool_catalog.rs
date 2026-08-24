@@ -960,6 +960,12 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "codrive",
     ),
     (
+        "codrive_status",
+        "Read who is driving the shared desktop right now (read-only)",
+        "admin",
+        "codrive",
+    ),
+    (
         "activity_list",
         "List recent Activity Feed events",
         "admin",

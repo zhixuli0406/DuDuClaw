@@ -94,10 +94,14 @@ const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
 /// codrive` master switch (CD-1,
 /// `commercial/docs/DESIGN-codrive-desktop-2026-08.md` §6 red line 1).
 /// Same deny-by-default shape as [`OS_NATIVE_TOOLS`] / [`RECORDING_TOOLS`]
-/// / [`SYSTEM_OPERATOR_TOOLS`] — `codrive_run` is already `Scope::Admin`
-/// (mcp_auth.rs), but scope alone is opt-out; this makes it opt-in per
+/// / [`SYSTEM_OPERATOR_TOOLS`] — both tools are already `Scope::Admin`
+/// (mcp_auth.rs), but scope alone is opt-out; this makes them opt-in per
 /// agent regardless of scope.
-const CODRIVE_TOOLS: &[&str] = &["codrive_run"];
+///
+/// A2 added the read-only `codrive_status`. It is gated identically and on
+/// purpose: an agent without the co-drive capability has no business
+/// learning whether a human is currently at the shared desktop.
+const CODRIVE_TOOLS: &[&str] = &["codrive_run", "codrive_status"];
 
 /// Neutralize `os_notify` `title`/`body` in place for the user's visual surface
 /// (P2-5). Each value is replaced by its perception-sanitized form (control

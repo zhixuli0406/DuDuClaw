@@ -31,6 +31,10 @@ const DEFAULT_APPROVAL_TTL_SECS: i64 = 3600;
 /// 明確動作", never an implicit auto-resume; this is the honest-failure
 /// backstop if a human never resumes).
 const DEFAULT_MAX_SESSION_SECS: u64 = 600;
+/// Default for the DESIGN §3.5 plan-approval card — OFF. See
+/// [`CodriveConfig::plan_approval`] for why this specific default is a
+/// rollout state rather than a safety judgement.
+const DEFAULT_PLAN_APPROVAL: bool = false;
 
 /// `config.toml [codrive]`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -50,6 +54,21 @@ pub struct CodriveConfig {
     /// Whole-script wall-clock ceiling, seconds — bounds the run and the
     /// frozen-retry poll loop.
     pub max_session_secs: u64,
+    /// Plan-approval card (DESIGN §3.5): when `true`, the WHOLE script is
+    /// put in front of a human via the existing [`crate::approval::
+    /// ApprovalBroker`] BEFORE the comp socket is even opened — one
+    /// session-level card on top of (never instead of) the per-step
+    /// `codrive_action` gates that already exist.
+    ///
+    /// **Default `false`, deliberately.** This is a rollout state, not a
+    /// judgement that session-level approval is optional: the CD-1/CD-4
+    /// live-bridge harness (`live_tests.rs`) drives real VM sessions with
+    /// no session-level decider attached, so flipping this default would
+    /// make every already-verified live path expire-and-abort at the new
+    /// card instead of running. Turning it on is a per-deployment operator
+    /// decision today; making it the default is an explicit call for the
+    /// next round, once the live harness grows a decider.
+    pub plan_approval: bool,
 }
 
 impl Default for CodriveConfig {
@@ -60,6 +79,7 @@ impl Default for CodriveConfig {
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             approval_ttl_secs: DEFAULT_APPROVAL_TTL_SECS,
             max_session_secs: DEFAULT_MAX_SESSION_SECS,
+            plan_approval: DEFAULT_PLAN_APPROVAL,
         }
     }
 }
@@ -165,6 +185,25 @@ mod tests {
         assert_eq!(cfg.socket_path.as_deref(), Some("/tmp/x.sock"));
         assert_eq!(cfg.max_session_secs, 30);
         assert_eq!(cfg.approval_ttl_secs, DEFAULT_APPROVAL_TTL_SECS);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The plan-approval card is OFF unless an operator says otherwise —
+    /// pinned so the default can only move as a deliberate, visible edit.
+    #[test]
+    fn plan_approval_defaults_off() {
+        assert!(!CodriveConfig::default().plan_approval);
+        let home = tempdir();
+        std::fs::write(home.join("config.toml"), "[codrive]\nmax_session_secs = 30\n").unwrap();
+        assert!(!CodriveConfig::from_home(&home).plan_approval);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn plan_approval_can_be_turned_on() {
+        let home = tempdir();
+        std::fs::write(home.join("config.toml"), "[codrive]\nplan_approval = true\n").unwrap();
+        assert!(CodriveConfig::from_home(&home).plan_approval);
         let _ = std::fs::remove_dir_all(&home);
     }
 

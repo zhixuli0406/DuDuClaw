@@ -22,6 +22,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::mode::{CodriveDrivingMode, CodriveHandoverReason};
+
 // ── Wire types ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,13 +145,59 @@ pub struct CodriveAck {
     /// matched — diagnostics for the audit trail.
     #[serde(default)]
     pub candidates: Option<usize>,
+
+    // ── A2 driving-mode block (§3.1) ────────────────────────────────────
+    // Present on a `status` ack from a comp that speaks A2. EVERY field
+    // here is `#[serde(default)]` and that is load-bearing, not tidiness:
+    // the gateway and comp are separately deployed binaries (gateway runs
+    // as `duduclaw`, comp as `duduclaw-kiosk` on the appliance) and their
+    // versions WILL skew. A comp that predates A2 answers the old
+    // three-field shape `{"ok":true,"frozen":…,"terminated":…}`; that must
+    // keep parsing into `None`s, never become a hard `Decode` error that
+    // takes down `wait_for_resume`'s poll loop with it.
+    //
+    // `mode`/`handover_reason` are parsed into this crate's own closed
+    // enums; an unrecognized token becomes `Unknown(<token>)` rather than a
+    // decode failure or a silent fallback to `Human` — see [`super::mode`].
+    /// Which seat is driving (A2 §1). `None` = comp did not report one.
+    #[serde(default)]
+    pub mode: Option<CodriveDrivingMode>,
+    /// Why the seat is in `handover`; comp sends `null` in every other
+    /// mode, which lands here as `None` (A2 §2).
+    #[serde(default)]
+    pub handover_reason: Option<CodriveHandoverReason>,
+    /// Whether the agent is working in a shadow output. Deliberately NOT
+    /// folded into `mode` — see [`super::mode`]'s module doc.
+    #[serde(default)]
+    pub shadow: Option<bool>,
+    /// Whether idle-based watch supervision is armed for this session.
+    #[serde(default)]
+    pub watch_active: Option<bool>,
+    /// Whether watch supervision has currently auto-paused the seat.
+    #[serde(default)]
+    pub watch_paused: Option<bool>,
 }
 
 /// An unsolicited `{"event": "..."}` line, interleaved with acks in the
 /// read stream (`frozen` / `resumed` / `emergency_stop`).
+///
+/// A2 §3.2 adds one ADDITIVE event on top of those three —
+/// `{"event":"driving_mode","mode":"codrive","reason":null}` — pushed only
+/// when the mode genuinely changes. The two payload fields are
+/// `#[serde(default)]` for the same version-skew reason [`CodriveAck`]'s
+/// are, and they are the reason this client can report a driving mode
+/// without sending a single extra `status` query: the push arrives on the
+/// connection the session already holds.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CodriveEvent {
     pub event: String,
+    /// A2 §3.2: set on a `driving_mode` event, absent on every other.
+    #[serde(default)]
+    pub mode: Option<CodriveDrivingMode>,
+    /// A2 §3.2: the handover reason on a `driving_mode` event; `null`
+    /// whenever the new mode is not `handover`.
+    #[serde(default)]
+    pub reason: Option<CodriveHandoverReason>,
 }
 
 /// Client-side error classification.
@@ -193,6 +241,14 @@ mod unix_impl {
         writer: OwnedWriteHalf,
         pending_events: VecDeque<CodriveEvent>,
         op_timeout: Duration,
+        /// A2: the most recent driving mode comp reported on THIS
+        /// connection, from either source — a `status` ack's mode block
+        /// (§3.1) or a pushed `driving_mode` event (§3.2). Updated where
+        /// the line is parsed, never where it is consumed, so
+        /// [`Self::drain_events`] taking the events away (as
+        /// `step::wait_for_resume` does every poll) cannot erase it.
+        last_mode: Option<CodriveDrivingMode>,
+        last_handover_reason: Option<CodriveHandoverReason>,
     }
 
     impl CodriveClient {
@@ -219,6 +275,8 @@ mod unix_impl {
                 writer: write_half,
                 pending_events: VecDeque::new(),
                 op_timeout,
+                last_mode: None,
+                last_handover_reason: None,
             };
             let ack = client
                 .write_and_read_ack(&CodriveCmd::Auth { token: token.to_string() })
@@ -256,6 +314,41 @@ mod unix_impl {
             self.pending_events.drain(..).collect()
         }
 
+        /// A2: the last driving mode comp reported on this connection, or
+        /// `None` if it never reported one (a pre-A2 comp, or a session so
+        /// short nothing carrying a mode came back yet). Deliberately NOT
+        /// defaulted to `Human` — see [`super::mode`]'s module doc.
+        ///
+        /// This is a passive observation, not a query: reading it sends
+        /// nothing. Every source that populates it (`status` acks,
+        /// `driving_mode` pushes) is traffic the session was already going
+        /// to carry, which is why the run report can carry a mode without
+        /// adding a single wire op to any existing script path.
+        pub fn last_driving_mode(&self) -> Option<CodriveDrivingMode> {
+            self.last_mode.clone()
+        }
+
+        /// The handover reason that accompanied [`Self::last_driving_mode`].
+        pub fn last_handover_reason(&self) -> Option<CodriveHandoverReason> {
+            self.last_handover_reason.clone()
+        }
+
+        /// Record a mode observation. A line that carries no mode leaves
+        /// the cache untouched (absence is not evidence of `Human`); a line
+        /// that does carry one replaces both fields together, so the reason
+        /// can never outlive the mode it belonged to.
+        fn observe_mode(
+            &mut self,
+            mode: Option<&CodriveDrivingMode>,
+            reason: Option<&CodriveHandoverReason>,
+        ) {
+            let Some(mode) = mode else {
+                return;
+            };
+            self.last_mode = Some(mode.clone());
+            self.last_handover_reason = reason.cloned();
+        }
+
         async fn write_and_read_ack(&mut self, cmd: &CodriveCmd) -> Result<CodriveAck, CodriveClientError> {
             let mut line = serde_json::to_string(cmd)
                 .map_err(|e| CodriveClientError::Decode(format!("encode command: {e}")))?;
@@ -290,11 +383,13 @@ mod unix_impl {
                 if value.get("event").is_some() {
                     let event: CodriveEvent = serde_json::from_value(value)
                         .map_err(|e| CodriveClientError::Decode(format!("event: {e}")))?;
+                    self.observe_mode(event.mode.as_ref(), event.reason.as_ref());
                     self.pending_events.push_back(event);
                     continue;
                 }
                 let ack: CodriveAck = serde_json::from_value(value)
                     .map_err(|e| CodriveClientError::Decode(format!("ack: {e}")))?;
+                self.observe_mode(ack.mode.as_ref(), ack.handover_reason.as_ref());
                 return Ok(ack);
             }
         }
@@ -335,6 +430,16 @@ impl CodriveClient {
 
     pub fn drain_events(&mut self) -> Vec<CodriveEvent> {
         Vec::new()
+    }
+
+    /// Always `None` — this target can never hold a co-drive session, so
+    /// it has never observed a mode. Honest absence, not a guessed `Human`.
+    pub fn last_driving_mode(&self) -> Option<CodriveDrivingMode> {
+        None
+    }
+
+    pub fn last_handover_reason(&self) -> Option<CodriveHandoverReason> {
+        None
     }
 }
 
@@ -464,6 +569,122 @@ mod tests {
         .unwrap();
         assert_eq!(ack.takeover, Some(true));
     }
+
+    // ── A2 driving-mode block (§3.1/§3.2) ───────────────────────────────
+    // These tests ARE the lock against the two binaries drifting apart:
+    // the exact JSON in the A2 contract must parse into the exact fields,
+    // and a comp on either side of the version line must never produce a
+    // decode error.
+
+    #[test]
+    fn ack_status_with_full_a2_block_parses_verbatim() {
+        // The contract's own example line (A2 §3.1), byte for byte.
+        let ack: CodriveAck = serde_json::from_value(serde_json::json!({
+            "ok": true, "frozen": false, "terminated": false, "takeover": false,
+            "mode": "human", "handover_reason": null,
+            "shadow": false, "watch_active": false, "watch_paused": false
+        }))
+        .unwrap();
+        assert_eq!(ack.mode, Some(CodriveDrivingMode::Human));
+        assert_eq!(ack.handover_reason, None, "an explicit null is None, not a variant");
+        assert_eq!(ack.shadow, Some(false));
+        assert_eq!(ack.watch_active, Some(false));
+        assert_eq!(ack.watch_paused, Some(false));
+    }
+
+    #[test]
+    fn ack_status_handover_carries_its_reason() {
+        let ack: CodriveAck = serde_json::from_value(serde_json::json!({
+            "ok": true, "frozen": true, "terminated": false, "takeover": false,
+            "mode": "handover", "handover_reason": "shell_take_wheel",
+            "shadow": false, "watch_active": true, "watch_paused": false
+        }))
+        .unwrap();
+        assert_eq!(ack.mode, Some(CodriveDrivingMode::Handover));
+        assert_eq!(
+            ack.handover_reason,
+            Some(CodriveHandoverReason::ShellTakeWheel)
+        );
+        assert_eq!(ack.watch_active, Some(true));
+    }
+
+    /// Shadow is NOT a fourth mode (A2 §1): the shared desktop's seat is
+    /// still the human's while the agent works in a shadow output.
+    #[test]
+    fn ack_status_shadow_is_reported_beside_human_mode_not_folded_into_it() {
+        let ack: CodriveAck = serde_json::from_value(serde_json::json!({
+            "ok": true, "frozen": false, "terminated": false,
+            "mode": "human", "shadow": true
+        }))
+        .unwrap();
+        assert_eq!(ack.mode, Some(CodriveDrivingMode::Human));
+        assert_eq!(ack.shadow, Some(true));
+    }
+
+    /// Version skew, gateway ahead of comp: a pre-A2 status ack must parse
+    /// into `None`s, never a hard error.
+    #[test]
+    fn pre_a2_status_ack_leaves_every_new_field_none() {
+        let ack: CodriveAck =
+            serde_json::from_value(serde_json::json!({"ok": true, "frozen": true, "terminated": false}))
+                .unwrap();
+        assert_eq!(ack.mode, None);
+        assert_eq!(ack.handover_reason, None);
+        assert_eq!(ack.shadow, None);
+        assert_eq!(ack.watch_active, None);
+        assert_eq!(ack.watch_paused, None);
+    }
+
+    /// Version skew the other way, comp ahead of gateway: an unrecognized
+    /// token must NOT fail the whole ack (which would break the frozen
+    /// poll loop) and must NOT be rounded down to `human`.
+    #[test]
+    fn ack_with_an_unknown_mode_token_still_parses_and_is_not_human() {
+        let ack: CodriveAck = serde_json::from_value(serde_json::json!({
+            "ok": true, "frozen": false, "terminated": false,
+            "mode": "teleop", "handover_reason": "meteor"
+        }))
+        .unwrap();
+        assert_eq!(ack.mode, Some(CodriveDrivingMode::Unknown("teleop".into())));
+        assert_eq!(
+            ack.handover_reason,
+            Some(CodriveHandoverReason::Unknown("meteor".into()))
+        );
+    }
+
+    #[test]
+    fn driving_mode_event_parses_with_and_without_a_reason() {
+        let ev: CodriveEvent = serde_json::from_value(
+            serde_json::json!({"event": "driving_mode", "mode": "codrive", "reason": null}),
+        )
+        .unwrap();
+        assert_eq!(ev.event, "driving_mode");
+        assert_eq!(ev.mode, Some(CodriveDrivingMode::CoDrive));
+        assert_eq!(ev.reason, None);
+
+        let handover: CodriveEvent = serde_json::from_value(
+            serde_json::json!({"event": "driving_mode", "mode": "handover", "reason": "human_input"}),
+        )
+        .unwrap();
+        assert_eq!(handover.mode, Some(CodriveDrivingMode::Handover));
+        assert_eq!(handover.reason, Some(CodriveHandoverReason::HumanInput));
+    }
+
+    /// The three pre-A2 events are untouched — they carry no mode payload
+    /// and must still parse (this is the "additive, nothing replaced" half
+    /// of A2 §3.2).
+    #[test]
+    fn legacy_events_still_parse_and_carry_no_mode() {
+        for name in ["frozen", "resumed", "emergency_stop"] {
+            let ev: CodriveEvent = serde_json::from_value(serde_json::json!({"event": name})).unwrap();
+            assert_eq!(ev.event, name);
+            assert_eq!(ev.mode, None);
+            assert_eq!(ev.reason, None);
+        }
+    }
+
+    // The `CodriveDrivingState` projection of these acks lives with its
+    // only consumer, the read-only status query — see `super::status`.
 
     #[test]
     fn ack_resume_and_session_terminated() {
