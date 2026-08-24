@@ -10,14 +10,15 @@
 //! [`SysdRequest`] is a **closed enum**
 //! (`#[serde(tag = "verb", content = "params", deny_unknown_fields)]` —
 //! the same adjacently-tagged shape `duduclaw-cli-worker`'s protocol uses)
-//! — the entire caller-reachable surface is nine fixed verbs, wire-encoded
+//! — the entire caller-reachable surface is eleven fixed verbs, wire-encoded
 //! as `{"verb":"reboot"}` for a fieldless verb or
 //! `{"verb":"hostname","params":{"set":"..."}}` for a verb that carries
 //! data. `deny_unknown_fields` means a stray extra top-level key fails to
 //! parse rather than being silently ignored.
 //!
-//! Five variants ([`SysdRequest::Reboot`], [`SysdRequest::Poweroff`],
+//! Seven variants ([`SysdRequest::Reboot`], [`SysdRequest::Poweroff`],
 //! [`SysdRequest::SysupdateStatus`], [`SysdRequest::SysupdateApply`],
+//! [`SysdRequest::BootAssessmentStatus`], [`SysdRequest::UpdateRollback`],
 //! [`SysdRequest::FactoryReset`]) carry zero fields on purpose: for these
 //! the server never builds a command line by concatenating caller-supplied
 //! strings, it only ever runs a hardcoded argv literal per verb (see
@@ -117,6 +118,25 @@ pub enum SysdRequest {
     SysupdateStatus,
     /// `systemd-sysupdate update`.
     SysupdateApply,
+    /// `/usr/lib/systemd/systemd-bless-boot status` — reports
+    /// `good` / `bad` / `indeterminate` / `clean`. Read-only: it never
+    /// renames anything and never reboots, so the dashboard can ask "is a
+    /// rollback possible right now" without side effects.
+    ///
+    /// The distinction that matters: `clean` means this boot is **not**
+    /// being counted (either the entry was already blessed, or — the
+    /// dangerous case — boot counting is silently a no-op because the ESP
+    /// is unwritable). `indeterminate` means a counter is in flight.
+    BootAssessmentStatus,
+    /// Roll back to the previously-installed A/B slot, then reboot.
+    ///
+    /// Carries **no slot parameter on purpose**. This is a *relative*
+    /// operation ("not the one I am running"), never an absolute one
+    /// ("switch to slot N"): there is no slot arithmetic to get wrong, which
+    /// is the whole reason `device_ops::update_rollback` refused to exist
+    /// until this verb did. See `dispatch::dispatch_update_rollback` for the
+    /// two tiers and why the second one is needed.
+    UpdateRollback,
     /// Re-arm first-boot provisioning (`systemctl enable
     /// duduclaw-firstboot-provision.service`, best-effort) then
     /// `systemctl reboot`. Deliberately carries no path/param — wiping the
@@ -179,6 +199,8 @@ impl SysdRequest {
             SysdRequest::Poweroff => "poweroff",
             SysdRequest::SysupdateStatus => "sysupdate_status",
             SysdRequest::SysupdateApply => "sysupdate_apply",
+            SysdRequest::BootAssessmentStatus => "boot_assessment_status",
+            SysdRequest::UpdateRollback => "update_rollback",
             SysdRequest::FactoryReset => "factory_reset",
             SysdRequest::Hostname { .. } => "hostname",
             SysdRequest::SetTimezone { .. } => "set_timezone",
@@ -260,6 +282,8 @@ mod tests {
             SysdRequest::Poweroff,
             SysdRequest::SysupdateStatus,
             SysdRequest::SysupdateApply,
+            SysdRequest::BootAssessmentStatus,
+            SysdRequest::UpdateRollback,
             SysdRequest::FactoryReset,
         ] {
             let s = serde_json::to_string(&req).unwrap();

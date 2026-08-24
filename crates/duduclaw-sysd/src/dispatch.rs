@@ -33,12 +33,24 @@ const SYSTEMD_SYSUPDATE_BIN: &str = "/usr/lib/systemd/systemd-sysupdate";
 
 /// Absolute path to `systemd-bless-boot` (Debian package `systemd-boot`),
 /// which lives in the same not-on-`PATH` directory as
-/// [`SYSTEMD_SYSUPDATE_BIN`]. Nothing dispatches it yet — the
-/// `UpdateRollback` / `BootAssessmentStatus` verbs are H3f's job — but the
-/// constant is pinned here (and covered by a test) so the next verb cannot
-/// repeat the bare-name mistake this module just fixed.
-#[cfg_attr(not(test), allow(dead_code))]
+/// [`SYSTEMD_SYSUPDATE_BIN`]. Dispatched by the `BootAssessmentStatus` and
+/// `UpdateRollback` verbs (H3f).
 const SYSTEMD_BLESS_BOOT_BIN: &str = "/usr/lib/systemd/systemd-bless-boot";
+
+/// EFI vendor GUID systemd's boot-loader interface uses for every
+/// `Loader*` variable.
+const LOADER_VENDOR_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+
+/// efivarfs mount point. Every `Loader*` variable is world-readable here on
+/// a normal EFI boot; the whole tree is simply absent in a container, on a
+/// legacy-BIOS boot, and on a dev machine — all of which must degrade to an
+/// honest refusal rather than a guess.
+const EFIVARS_DIR: &str = "/sys/firmware/efi/efivars";
+
+/// Directory holding Type#2 unified kernel images inside the ESP. This
+/// image ships no Type#1 `loader/entries/`, so an entry id *is* a filename
+/// in here (see appliance/README.md's A/B section).
+const ESP_ENTRIES_SUBDIR: &str = "EFI/Linux";
 
 /// Absolute root of the system tz database. Debian (and effectively every
 /// Linux distro) ships tzdata here; this is also where [`timezone_exists`]
@@ -508,6 +520,457 @@ async fn dispatch_network_wired_config(
     })
 }
 
+// ---------------------------------------------------------------------------
+// H3f: boot assessment + manual rollback
+// ---------------------------------------------------------------------------
+
+/// The four states `systemd-bless-boot status` can report, plus an
+/// `Unknown` for output this version does not recognise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlessState {
+    /// A counter is in flight for this boot and has not been resolved yet.
+    Indeterminate,
+    /// This boot was blessed during *this* boot.
+    Good,
+    /// This boot's entry has already been marked bad.
+    Bad,
+    /// No counter is in flight. Either the entry was blessed on an earlier
+    /// boot (the steady state of a healthy machine — measured in the H3b
+    /// T1 probe), or boot counting is silently not running at all.
+    Clean,
+    Unknown,
+}
+
+/// Classify `systemd-bless-boot status` output.
+///
+/// Matches on whole words rather than substrings (project convention 2):
+/// the word `good` must not be found inside a sentence like "no good entry".
+pub fn parse_bless_status(text: &str) -> BlessState {
+    let mut seen = None;
+    for word in text.split(|c: char| !c.is_ascii_alphabetic()) {
+        let state = match word.to_ascii_lowercase().as_str() {
+            "indeterminate" => BlessState::Indeterminate,
+            "good" => BlessState::Good,
+            "bad" => BlessState::Bad,
+            "clean" => BlessState::Clean,
+            _ => continue,
+        };
+        // The tool prints exactly one state token; if output ever carried
+        // more, the first is the verdict and later words are prose.
+        if seen.is_none() {
+            seen = Some(state);
+        }
+    }
+    seen.unwrap_or(BlessState::Unknown)
+}
+
+/// Strip a boot-counting suffix from an entry filename.
+///
+/// `duduclaw-os_0.2.0+2-1.efi` → `("duduclaw-os_0.2.0", ".efi")`, and a
+/// name with no counter comes back unchanged. Per systemd-boot(7) the
+/// counter is `+` followed by one or two numbers separated by `-`, directly
+/// before the suffix — anything else (a `+` inside a version, say
+/// `1.0+deb13`) is not a counter and must be left alone.
+pub fn split_boot_counter(name: &str) -> Option<(String, String)> {
+    let stem = name.strip_suffix(".efi")?;
+    let Some((base, counter)) = stem.rsplit_once('+') else {
+        return Some((stem.to_string(), ".efi".to_string()));
+    };
+    let is_counter = match counter.split_once('-') {
+        Some((left, right)) => {
+            !left.is_empty()
+                && !right.is_empty()
+                && left.bytes().all(|b| b.is_ascii_digit())
+                && right.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()),
+    };
+    if is_counter {
+        Some((base.to_string(), ".efi".to_string()))
+    } else {
+        Some((stem.to_string(), ".efi".to_string()))
+    }
+}
+
+/// True when an entry filename is already in the exhausted (`tries_left == 0`)
+/// shape sd-boot sorts last.
+pub fn is_exhausted_entry(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".efi") else {
+        return false;
+    };
+    let Some((_, counter)) = stem.rsplit_once('+') else {
+        return false;
+    };
+    let left = counter.split('-').next().unwrap_or_default();
+    left == "0"
+}
+
+/// The name an entry takes once it is marked bad: `tries_left = 0`,
+/// `tries_done = 1`. Exactly the shape `systemd-bless-boot bad` produces,
+/// so both tiers of rollback leave the ESP in one state, not two.
+pub fn exhausted_name(name: &str) -> Option<String> {
+    let (base, suffix) = split_boot_counter(name)?;
+    Some(format!("{base}+0-1{suffix}"))
+}
+
+/// True when `name` is a plain `.efi` filename and nothing else — no
+/// separator, no traversal. Everything read out of an EFI variable goes
+/// through this before it is joined onto a path.
+pub fn is_entry_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.ends_with(".efi")
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && std::path::Path::new(name).file_name().and_then(|s| s.to_str()) == Some(name)
+}
+
+/// Decode an efivarfs value: 4 bytes of attributes, then a NUL-terminated
+/// UTF-16LE string.
+pub fn decode_efi_string(raw: &[u8]) -> Option<String> {
+    let body = raw.get(4..)?;
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|p| u16::from_le_bytes([p[0], p[1]]))
+        .take_while(|u| *u != 0)
+        .collect();
+    let s = String::from_utf16(&units).ok()?;
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Decide whether marking `selected` bad still leaves something to boot.
+///
+/// **Compares by counter-stripped stem, never by literal filename.** An
+/// entry's filename is the boot-assessment state machine's storage: the same
+/// installed version is `duduclaw-os_0.2.0+3-0.efi` when staged,
+/// `+2-1.efi` while it is being tried, and `duduclaw-os_0.2.0.efi` once
+/// blessed. Measured on the appliance: on the boot that blesses a new
+/// version, `LoaderBootCountPath` still names the pre-blessing
+/// `…+2-1.efi` while the file on the ESP has already been renamed — so a
+/// literal comparison reports "the running boot entry is not present in the
+/// ESP" about a machine that is running it. The stem (`duduclaw-os_0.2.0`)
+/// is the stable identity.
+///
+/// sd-boot's documented last-resort behaviour is that a bad entry is still
+/// booted when every other entry is also bad, so refusing here cannot brick
+/// a machine — but "the rollback silently did nothing useful" is still a lie
+/// to the operator, and refusing honestly is the whole point of the gate.
+pub fn check_rollback_target(entries: &[String], selected: &str) -> Result<(), String> {
+    let want = entry_stem(selected)
+        .ok_or_else(|| format!("unusable boot entry name ({selected})"))?;
+    if !entries.iter().any(|e| entry_stem(e).as_deref() == Some(want.as_str())) {
+        return Err(format!(
+            "the running boot entry ({selected}) is not present in the ESP"
+        ));
+    }
+    let alternatives: Vec<&String> = entries
+        .iter()
+        .filter(|e| {
+            entry_stem(e).as_deref() != Some(want.as_str()) && !is_exhausted_entry(e)
+        })
+        .collect();
+    if alternatives.is_empty() {
+        return Err(
+            "there is no other bootable version installed to fall back to".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The stable identity of a boot entry: its filename with any
+/// boot-counting suffix and the `.efi` extension removed.
+pub fn entry_stem(name: &str) -> Option<String> {
+    split_boot_counter(name).map(|(stem, _)| stem)
+}
+
+async fn bless_boot(arg: &'static str) -> DispatchResult {
+    let mut cmd = Command::new(SYSTEMD_BLESS_BOOT_BIN);
+    cmd.arg(arg);
+    run(cmd).await
+}
+
+/// Resolve the ESP mount point via `bootctl -p`, rather than hardcoding a
+/// path: systemd-gpt-auto-generator mounts this image's ESP at `/boot`
+/// while an empty, non-mounted `/efi` also exists — anything that guesses
+/// succeeds while writing to the root filesystem.
+async fn esp_entries_dir() -> Result<std::path::PathBuf, SysdError> {
+    let out = Command::new("bootctl")
+        .arg("-p")
+        .output()
+        .await
+        .map_err(|e| SysdError::unsupported(format!("cannot locate the ESP: {e}")))?;
+    if !out.status.success() {
+        return Err(SysdError::unsupported(
+            "cannot locate the ESP (bootctl -p failed)".to_string(),
+        ));
+    }
+    let esp = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if esp.is_empty() || !esp.starts_with('/') {
+        return Err(SysdError::unsupported(format!(
+            "bootctl reported an unusable ESP path: {esp:?}"
+        )));
+    }
+    let dir = std::path::Path::new(&esp).join(ESP_ENTRIES_SUBDIR);
+    if !dir.is_dir() {
+        return Err(SysdError::unsupported(format!(
+            "{} does not exist — this image has no Type#2 boot entries",
+            dir.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// `IMAGE_VERSION=` from the running image's os-release. Same field
+/// sysupdate's `ProtectVersion=%A` reads, so "which version am I" has one
+/// answer across the update chain.
+fn running_image_version() -> Option<String> {
+    for path in ["/usr/lib/os-release", "/etc/os-release"] {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(v) = line.trim().strip_prefix("IMAGE_VERSION=") {
+                let v = v.trim().trim_matches('"').trim_matches('\'');
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Filename of the entry sd-boot is counting this boot, from
+/// `LoaderBootCountPath`.
+///
+/// The variable holds an EFI-style path (`\EFI\Linux\name+2-1.efi`); only
+/// the last component is of interest, and it still has to look like an entry
+/// filename before it is used for anything.
+pub fn boot_count_path_basename(path: &str) -> Option<String> {
+    let name = path.rsplit(['\\', '/']).next()?;
+    if is_entry_filename(name) {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Which boot entry this machine is running, as a filename.
+///
+/// `LoaderEntrySelected` first: sd-boot sets it on every boot and reports the
+/// **stable** id (measured on the appliance: it reads
+/// `duduclaw-os_0.2.0.efi` even on the boot where the file on disk was
+/// `…+2-1.efi`). `LoaderBootCountPath` is the fallback — it exists only
+/// while a counter is in flight and can name a filename that blessing has
+/// already renamed, which is exactly why it is second and why every
+/// comparison downstream goes through `entry_stem`.
+fn running_entry_name() -> Option<String> {
+    read_efi_loader_string("LoaderEntrySelected")
+        .filter(|s| is_entry_filename(s))
+        .or_else(|| {
+            read_efi_loader_string("LoaderBootCountPath")
+                .as_deref()
+                .and_then(boot_count_path_basename)
+        })
+}
+
+/// The ESP's Type#2 boot entries: the directory plus every `*.efi` filename
+/// in it. One reader for both rollback tiers, so "what counts as an entry"
+/// is defined in exactly one place.
+async fn read_esp_entries() -> Result<(std::path::PathBuf, Vec<String>), SysdError> {
+    let dir = esp_entries_dir().await?;
+    let rd = std::fs::read_dir(&dir)
+        .map_err(|e| SysdError::io(format!("cannot list {}: {e}", dir.display())))?;
+    let mut entries: Vec<String> = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_entry_filename(&name) {
+            entries.push(name);
+        }
+    }
+    Ok((dir, entries))
+}
+
+fn read_efi_loader_string(name: &str) -> Option<String> {
+    let path = std::path::Path::new(EFIVARS_DIR).join(format!("{name}-{LOADER_VENDOR_GUID}"));
+    let raw = std::fs::read(path).ok()?;
+    decode_efi_string(&raw)
+}
+
+/// Roll back to the previous A/B slot, then reboot.
+///
+/// **Two tiers, both relative operations.**
+///
+/// *Tier 1 — a counter is in flight (`indeterminate`).* Hand the whole thing
+/// to `systemd-bless-boot bad`, which is what the design doc specifies
+/// (§4.5): it resolves "the entry I booted from" through the
+/// `LoaderBootCountPath` EFI variable and sets its `tries_left` to 0. No
+/// slot arithmetic, therefore nothing to get wrong.
+///
+/// *Tier 2 — no counter is in flight (`clean`).* Measured, and the reason
+/// tier 1 alone is not enough: once a version has been blessed, its entry
+/// carries no counter, `bless-boot status` answers `clean`, and
+/// `bless-boot bad` has nothing to act on (the H3b T1 probe asserts exactly
+/// this steady state). That is *also* the only state a user ever presses
+/// "roll back" in — the new version installed, booted, was blessed, and
+/// only then turned out to be wrong. So this tier reproduces the same
+/// outcome by the same mechanism sd-boot itself uses: rename the entry
+/// currently booted (read from `LoaderEntrySelected`, never computed) to
+/// the exhausted `+0-1` shape, which sd-boot sorts last. Still relative —
+/// the only entry ever touched is the one we are running from — and gated
+/// on there being another, non-exhausted entry to fall back to.
+///
+/// Refuses (and does NOT reboot) when the machine cannot support the
+/// operation at all: no EFI boot, no ESP, no second version installed. A
+/// rollback that quietly does nothing but reboots anyway is worse than an
+/// honest refusal.
+async fn dispatch_update_rollback() -> DispatchResult {
+    let status = bless_boot("status").await;
+    let state = match &status {
+        Ok(out) => parse_bless_status(&format!("{}{}", out.stdout, out.stderr)),
+        // The binary is absent (a dev host, a container). Not an error to
+        // paper over — there is no A/B machinery here at all.
+        Err(e) => {
+            return Err(SysdError::unsupported(format!(
+                "boot assessment is unavailable on this system: {}",
+                e.message
+            )));
+        }
+    };
+
+    // Both tiers need somewhere healthy to fall back to, and both apply the
+    // same test — only the way they identify "the entry I am running"
+    // differs. Tier 1 reads `LoaderBootCountPath` (set by sd-boot exactly
+    // when a counter is in flight, which is exactly when tier 1 applies);
+    // tier 2 reads `LoaderEntrySelected`. Neither computes a slot.
+    //
+    // Without this, a machine whose entries are ALL already exhausted would
+    // happily "roll back" — marking a bad entry bad again and spending a
+    // reboot to end up exactly where it started. Refusing is the honest
+    // answer, and it is the T7 case.
+    let (_dir, entries) = read_esp_entries().await?;
+    match running_entry_name() {
+        Some(running) => {
+            check_rollback_target(&entries, &running).map_err(SysdError::unsupported)?
+        }
+        // Nothing could tell us which entry we are. Fall back to the weaker
+        // "is there more than one at all", which still catches the case that
+        // matters: a single installed version, where rollback can only waste
+        // a reboot.
+        None if entries.len() < 2 => {
+            return Err(SysdError::unsupported(
+                "there is no other version installed to fall back to".to_string(),
+            ));
+        }
+        None => {}
+    }
+
+    let note = match state {
+        BlessState::Indeterminate => {
+            let marked = bless_boot("bad").await?;
+            if !marked.success {
+                return Err(SysdError::unsupported(format!(
+                    "could not mark the running version for rollback: {}",
+                    marked.stderr.trim()
+                )));
+            }
+            "marked the in-flight boot entry bad via systemd-bless-boot".to_string()
+        }
+        BlessState::Bad => {
+            "the running version was already marked bad; rebooting to complete the rollback"
+                .to_string()
+        }
+        BlessState::Good | BlessState::Clean | BlessState::Unknown => {
+            rollback_by_renaming_selected_entry().await?
+        }
+    };
+
+    let mut reboot_cmd = Command::new("systemctl");
+    reboot_cmd.arg("reboot");
+    let reboot = run(reboot_cmd).await?;
+    Ok(SysdOpOutput {
+        stdout: format!("{note}\n{}", reboot.stdout),
+        ..reboot
+    })
+}
+
+/// Tier 2 of [`dispatch_update_rollback`]. Returns a human-readable note on
+/// success; every failure path is a structured refusal that leaves the ESP
+/// untouched.
+async fn rollback_by_renaming_selected_entry() -> Result<String, SysdError> {
+    // First choice: ask the boot loader which entry it started, rather than
+    // working it out. `LoaderEntrySelected` is set by sd-boot on every boot
+    // (unlike `LoaderBootCountPath`, which only exists while a counter is in
+    // flight), and for a Type#2 image the entry id IS the filename.
+    let mut selected = running_entry_name();
+    let mut how = "the boot loader interface";
+
+    // Fallback: the running image's own IMAGE_VERSION. Still not a guess at
+    // *which slot* — it is this system reporting its own version, and this
+    // image names every entry `duduclaw-os_<version>.efi`. Used only when
+    // the firmware gave us nothing usable, and the entry it names still has
+    // to exist and still has to leave a healthy alternative behind.
+    if selected.is_none() {
+        if let Some(v) = running_image_version() {
+            selected = Some(format!("duduclaw-os_{v}.efi"));
+            how = "the running IMAGE_VERSION";
+        }
+    }
+    let selected = selected.ok_or_else(|| {
+        SysdError::unsupported(
+            "this system did not boot through systemd-boot, so there is no previous \
+             version to return to"
+                .to_string(),
+        )
+    })?;
+    if !is_entry_filename(&selected) {
+        return Err(SysdError::unsupported(format!(
+            "unusable boot entry name ({selected:?})"
+        )));
+    }
+    tracing::info!("[update_rollback] running entry resolved via {how}: {selected}");
+
+    let (dir, entries) = read_esp_entries().await?;
+    check_rollback_target(&entries, &selected).map_err(SysdError::unsupported)?;
+
+    // Rename the file that is ACTUALLY on the ESP for this version, not the
+    // name the firmware reported: the two differ whenever a counter is in
+    // flight (`…+2-1.efi` on disk vs the stable id in
+    // `LoaderEntrySelected`). Matching by stem is what makes both spellings
+    // resolve to the one real file.
+    let want = entry_stem(&selected)
+        .ok_or_else(|| SysdError::unsupported("unusable boot entry name".to_string()))?;
+    let on_disk = entries
+        .iter()
+        .find(|e| entry_stem(e).as_deref() == Some(want.as_str()))
+        .ok_or_else(|| {
+            SysdError::unsupported(format!("{selected} is not present in the ESP"))
+        })?
+        .clone();
+
+    let target = exhausted_name(&on_disk)
+        .ok_or_else(|| SysdError::unsupported("unusable boot entry name".to_string()))?;
+    if target == on_disk {
+        return Ok("the running version was already marked bad".to_string());
+    }
+    let from = dir.join(&on_disk);
+    let to = dir.join(&target);
+    std::fs::rename(&from, &to).map_err(|e| {
+        SysdError::io(format!(
+            "could not mark the running version for rollback ({}): {e}",
+            from.display()
+        ))
+    })?;
+    // FAT32 renames are not atomic and the ESP is the one thing that makes
+    // this machine bootable — flush before handing over to the reboot.
+    if let Ok(f) = std::fs::File::open(&dir) {
+        let _ = f.sync_all();
+    }
+    Ok(format!("marked {on_disk} bad (renamed to {target})"))
+}
+
 /// Dispatch one already-authorized, already-parsed request to its
 /// hardcoded command sequence.
 pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
@@ -532,6 +995,8 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
             cmd.arg("update");
             run(cmd).await
         }
+        SysdRequest::BootAssessmentStatus => bless_boot("status").await,
+        SysdRequest::UpdateRollback => dispatch_update_rollback().await,
         SysdRequest::FactoryReset => dispatch_factory_reset().await,
         SysdRequest::Hostname { set } => dispatch_hostname(set).await,
         SysdRequest::SetTimezone { timezone } => dispatch_set_timezone(timezone).await,
@@ -559,6 +1024,192 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn bless_status_is_classified_by_whole_word() {
+        assert_eq!(parse_bless_status("indeterminate\n"), BlessState::Indeterminate);
+        assert_eq!(parse_bless_status("good\n"), BlessState::Good);
+        assert_eq!(parse_bless_status("bad\n"), BlessState::Bad);
+        assert_eq!(parse_bless_status("clean\n"), BlessState::Clean);
+        assert_eq!(parse_bless_status(""), BlessState::Unknown);
+        assert_eq!(
+            parse_bless_status("Failed to open EFI variable: No such file"),
+            BlessState::Unknown,
+            "an error message must never be read as a state"
+        );
+        // Convention 2: no unanchored substring matching. "goodness" is not
+        // the token `good`.
+        assert_eq!(parse_bless_status("goodness gracious"), BlessState::Unknown);
+    }
+
+    #[test]
+    fn boot_counter_suffix_round_trip() {
+        assert_eq!(
+            split_boot_counter("duduclaw-os_0.2.0+2-1.efi"),
+            Some(("duduclaw-os_0.2.0".into(), ".efi".into()))
+        );
+        assert_eq!(
+            split_boot_counter("duduclaw-os_0.2.0+3.efi"),
+            Some(("duduclaw-os_0.2.0".into(), ".efi".into()))
+        );
+        assert_eq!(
+            split_boot_counter("duduclaw-os_0.2.0.efi"),
+            Some(("duduclaw-os_0.2.0".into(), ".efi".into()))
+        );
+        // A `+` that is NOT a counter (a Debian kernel version) must survive
+        // untouched — mangling it would rename an unrelated entry.
+        assert_eq!(
+            split_boot_counter("duduclaw-os-6.12.101+deb13-arm64.efi"),
+            Some(("duduclaw-os-6.12.101+deb13-arm64".into(), ".efi".into()))
+        );
+        assert_eq!(split_boot_counter("notaunifiedimage.txt"), None);
+    }
+
+    #[test]
+    fn exhausted_name_matches_what_bless_boot_would_write() {
+        assert_eq!(
+            exhausted_name("duduclaw-os_0.2.0.efi").as_deref(),
+            Some("duduclaw-os_0.2.0+0-1.efi")
+        );
+        assert_eq!(
+            exhausted_name("duduclaw-os_0.2.0+2-1.efi").as_deref(),
+            Some("duduclaw-os_0.2.0+0-1.efi")
+        );
+        assert!(is_exhausted_entry("duduclaw-os_0.2.0+0-1.efi"));
+        assert!(is_exhausted_entry("duduclaw-os_0.2.0+0-3.efi"));
+        assert!(!is_exhausted_entry("duduclaw-os_0.2.0+1-2.efi"));
+        assert!(!is_exhausted_entry("duduclaw-os_0.2.0.efi"));
+    }
+
+    #[test]
+    fn rollback_refuses_when_there_is_nothing_to_fall_back_to() {
+        let selected = "duduclaw-os_0.2.0.efi".to_string();
+        let alone = vec![selected.clone()];
+        assert!(check_rollback_target(&alone, &selected).is_err());
+
+        // T7's defence: the other version is already exhausted, so marking
+        // this one bad would leave zero healthy entries.
+        let both_bad = vec![selected.clone(), "duduclaw-os_0.1.0+0-3.efi".to_string()];
+        assert!(check_rollback_target(&both_bad, &selected).is_err());
+
+        let healthy = vec![selected.clone(), "duduclaw-os_0.1.0.efi".to_string()];
+        assert!(check_rollback_target(&healthy, &selected).is_ok());
+
+        // The case that actually broke T6 on hardware: on the boot that
+        // blesses a new version, LoaderBootCountPath still names the
+        // pre-blessing filename while the ESP already holds the renamed one.
+        // Identity is the stem, so this must resolve, not refuse.
+        let blessed = vec![
+            "duduclaw-os_0.2.0.efi".to_string(),
+            "duduclaw-os_0.1.0.efi".to_string(),
+        ];
+        assert!(
+            check_rollback_target(&blessed, "duduclaw-os_0.2.0+2-1.efi").is_ok(),
+            "a counted name must match the blessed file it became"
+        );
+        assert_eq!(entry_stem("duduclaw-os_0.2.0+2-1.efi").as_deref(), Some("duduclaw-os_0.2.0"));
+        assert_eq!(entry_stem("duduclaw-os_0.2.0.efi").as_deref(), Some("duduclaw-os_0.2.0"));
+
+        let missing = vec!["duduclaw-os_0.1.0.efi".to_string()];
+        assert!(check_rollback_target(&missing, &selected).is_err());
+    }
+
+    #[test]
+    fn boot_count_path_yields_the_entry_filename() {
+        assert_eq!(
+            boot_count_path_basename("\\EFI\\Linux\\duduclaw-os_0.2.0+2-1.efi").as_deref(),
+            Some("duduclaw-os_0.2.0+2-1.efi")
+        );
+        assert_eq!(
+            boot_count_path_basename("/EFI/Linux/duduclaw-os_0.2.0+3.efi").as_deref(),
+            Some("duduclaw-os_0.2.0+3.efi")
+        );
+        // Anything that is not a plain .efi filename is refused rather than
+        // joined onto a path.
+        for bad in ["", "\\EFI\\Linux\\", "loader/entries/foo.conf", "..\\..\\evil"] {
+            assert!(boot_count_path_basename(bad).is_none(), "must refuse {bad:?}");
+        }
+        // Traversal is neutralised by taking the basename, not by rejecting
+        // the string: the result is a plain filename that still has to be
+        // present in the ESP before check_rollback_target will act on it.
+        assert_eq!(
+            boot_count_path_basename("\\EFI\\Linux\\..\\..\\x.efi").as_deref(),
+            Some("x.efi")
+        );
+    }
+
+    /// The three ESP states the QEMU matrix actually produces, pinned so a
+    /// probe can never pass for the wrong reason. Every one of these was
+    /// observed on the appliance during the 2026-08-24 live-fire round.
+    #[test]
+    fn observed_esp_states_resolve_the_way_the_matrix_expects() {
+        // T6, steady state: the new version was blessed on an earlier boot,
+        // so both entries are counter-free. Rollback must be allowed.
+        let blessed = vec![
+            "duduclaw-os_0.1.0.efi".to_string(),
+            "duduclaw-os_0.2.0.efi".to_string(),
+        ];
+        assert!(check_rollback_target(&blessed, "duduclaw-os_0.2.0.efi").is_ok());
+        assert_eq!(
+            exhausted_name("duduclaw-os_0.2.0.efi").as_deref(),
+            Some("duduclaw-os_0.2.0+0-1.efi")
+        );
+
+        // T6, mid-assessment: the file on disk still carries a counter while
+        // the boot loader reports the stable id. Both must resolve to one
+        // entry — the literal-comparison version of this refused a machine
+        // that was running the entry it claimed was absent.
+        let counted = vec![
+            "duduclaw-os_0.1.0.efi".to_string(),
+            "duduclaw-os_0.2.0+2-1.efi".to_string(),
+        ];
+        assert!(check_rollback_target(&counted, "duduclaw-os_0.2.0.efi").is_ok());
+
+        // T7: every entry exhausted. Must refuse, and specifically for
+        // "nothing healthy left" — not for "I cannot find myself".
+        let all_bad = vec![
+            "duduclaw-os_0.1.0+0-3.efi".to_string(),
+            "duduclaw-os_0.2.0+0-3.efi".to_string(),
+        ];
+        let err = check_rollback_target(&all_bad, "duduclaw-os_0.2.0.efi").unwrap_err();
+        assert!(
+            err.contains("no other bootable version"),
+            "T7 must refuse for the right reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn entry_filenames_from_firmware_cannot_escape_the_esp() {
+        assert!(is_entry_filename("duduclaw-os_0.2.0.efi"));
+        for bad in [
+            "",
+            "../../../etc/passwd.efi",
+            "/EFI/Linux/x.efi",
+            "sub/dir.efi",
+            ".hidden.efi",
+            "no-extension",
+            "with\0nul.efi",
+        ] {
+            assert!(!is_entry_filename(bad), "must refuse {bad:?}");
+        }
+    }
+
+    #[test]
+    fn efi_variable_decoding_skips_attributes_and_stops_at_nul() {
+        let mut raw = vec![0x07, 0x00, 0x00, 0x00];
+        for ch in "duduclaw-os_0.2.0.efi".encode_utf16() {
+            raw.extend_from_slice(&ch.to_le_bytes());
+        }
+        raw.extend_from_slice(&[0, 0]);
+        raw.extend_from_slice(b"trailing garbage");
+        assert_eq!(
+            decode_efi_string(&raw).as_deref(),
+            Some("duduclaw-os_0.2.0.efi")
+        );
+        assert_eq!(decode_efi_string(&[]), None);
+        assert_eq!(decode_efi_string(&[1, 2, 3]), None);
+        assert_eq!(decode_efi_string(&[7, 0, 0, 0, 0, 0]), None);
+    }
 
     #[tokio::test]
     async fn hostname_rejects_empty_without_spawning() {
