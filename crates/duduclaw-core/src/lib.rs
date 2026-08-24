@@ -6,6 +6,7 @@ pub mod autostart;
 pub mod concurrency_gate;
 pub mod config;
 pub mod cron_tz;
+pub mod data_migrations;
 pub mod delegation_policy;
 pub mod department;
 pub mod dispatch_guard;
