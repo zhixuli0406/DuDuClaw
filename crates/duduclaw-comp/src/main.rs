@@ -48,6 +48,7 @@ mod layer_shell;
 mod minimize;
 mod render;
 mod seat_order;
+mod session_lock;
 mod shell_control;
 mod state;
 mod switcher;
@@ -122,7 +123,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // doc. No-op (reads nothing, registers nothing) unless
     // DUDUCLAW_CODRIVE_DEBUG_STDIN=1 is set; never set that in a real
     // deployment.
-    codrive::maybe_init_stdin_simulator(&mut event_loop);
+    //
+    // Q1 (2026-08-24): "never set that in a real deployment" is now enforced
+    // rather than advised. This simulator injects synthetic HUMAN-seat input
+    // — including `simulate_super_esc` (the agent emergency stop) and
+    // `simulate_super_enter` (hand control back) — which is exactly the
+    // provenance guarantee `input.rs`'s filter closure is built around, so a
+    // shipping binary must not carry the path at all. The gate is a Cargo
+    // feature (`debug-affordances`, off by default) rather than an env check,
+    // because the appliance's kiosk launcher sources
+    // `/etc/duduclaw/kiosk.env` with `set -a` into the session tree on a
+    // read-write root: one file write would otherwise re-enable it,
+    // persistently and invisibly. `codrive/` itself is untouched — the gate
+    // lives here, at the one call site.
+    //
+    // `if cfg!(...)` rather than `#[cfg(...)]` deliberately: the item stays
+    // REFERENCED, so gating it does not turn `maybe_init_stdin_simulator`
+    // (and everything reachable only from it) into a dead-code warning inside
+    // a module this round is not allowed to edit. The condition is a
+    // compile-time constant, so the call is folded away exactly as an
+    // attribute would fold it, and the simulator is never reached in a
+    // shipping build either way.
+    if cfg!(feature = "debug-affordances") {
+        codrive::maybe_init_stdin_simulator(&mut event_loop);
+    }
 
     // Spawn an optional test client so a run of this binary is
     // self-verifying: `-c/--command <client>` picks the wl client to launch

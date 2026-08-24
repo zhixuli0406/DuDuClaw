@@ -96,6 +96,10 @@ mod highlight;
 mod human_seat;
 mod keymap_ascii;
 mod listener;
+// A2 共駕復活 (2026-08-24): the driving-mode state machine and its
+// screen-edge indicator — see `mode.rs`'s module doc.
+mod mode;
+mod mode_indicator;
 mod protocol;
 mod rotation;
 mod shadow;
@@ -105,6 +109,11 @@ mod takeover;
 mod tests_listener;
 #[cfg(test)]
 mod tests_takeover;
+// A2: this file's own former `#[cfg(test)] mod tests` block moved out
+// verbatim — `mod.rs` is already over the 800-line cap and A2 must add
+// transition calls to it. Same split `tests_listener.rs` already used.
+#[cfg(test)]
+mod tests_token;
 mod watch;
 // WP-CD4b-fix (B3): the READ-ONLY `window_geometry` query — see that file's
 // module doc for the GTK4 `CoordType::Screen`-returns-zeros defect it
@@ -118,6 +127,13 @@ pub(crate) mod window_target;
 
 pub use cursor::build_agent_cursor_elements;
 pub use debug_sim::maybe_init_stdin_simulator;
+// A2. `DrivingMode` is what both backends pass to the two element builders;
+// `status_snapshot` is what `shell_control::codrive_ops` answers the human
+// side from — the SAME derivation the agent side uses, so the two channels
+// can never disagree about one desktop.
+pub use mode::{CodriveModeCache, DrivingMode, HandoverReason};
+pub use mode_indicator::build_mode_indicator_elements;
+pub(crate) use mode::{status_snapshot, CodriveStatusSnapshot};
 pub use protocol::InjectCmd;
 pub use shadow::{create_shadow_output, SHADOW_ORIGIN};
 // WP-A1 multi-window round: `CodriveShared` itself moved to `shared.rs`
@@ -374,6 +390,8 @@ impl DuduclawComp {
         if self.codrive_try_watch_resume() {
             return; // CD-3: this event itself IS the "still watching" signal.
         }
+        // A2: the trigger, recorded before the freeze (see `mode.rs`).
+        self.codrive_note_handover_reason(mode::HandoverReason::HumanInput);
         let was_frozen = self.codrive.frozen.swap(true, Ordering::SeqCst);
         if !was_frozen {
             self.codrive_freeze_set_at = Some(std::time::Instant::now());
@@ -384,6 +402,9 @@ impl DuduclawComp {
             // while already frozen (hence gated on `!was_frozen`).
             self.codrive.push_event(r#"{"event":"frozen"}"#);
         }
+        // A2: `codrive -> handover`, once per real transition (this is a
+        // no-op on the already-frozen repeat path above).
+        self.codrive_sync_mode();
     }
 
     /// Human-side "交還" (DESIGN §3.1: "『交還』是明確動作（按鈕/
@@ -415,6 +436,9 @@ impl DuduclawComp {
         // takeover and/or a stale watch-idle-pause flag either way.
         self.codrive_end_takeover_if_active("human_super_enter");
         self.codrive_end_watch_pause("human_super_enter", false);
+        // A2: `handover -> codrive` (the two helpers above already sync too;
+        // this covers the path where neither had anything to undo).
+        self.codrive_sync_mode();
     }
 
     /// Super+Esc (DESIGN §3.3.3 / §6.3): global emergency stop, not
@@ -448,6 +472,13 @@ impl DuduclawComp {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         }
+        // A2: cleared in lockstep with the `active_conn.take()` above, and
+        // unconditionally — "no connection" and "connection just killed"
+        // must both end at `false`.
+        self.codrive.session_active.store(false, Ordering::SeqCst);
+        // Then `-> human`: `terminated` already forces that, but the sync is
+        // what turns it into ONE audited `driving_mode` line + push event.
+        self.codrive_sync_mode();
     }
 
     /// Executes one already-validated (by `listener.rs`) agent command on
@@ -888,33 +919,7 @@ impl DuduclawComp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // `check_token`'s own tests moved to `shared.rs`'s test block alongside
-    // `CodriveShared` itself (WP-A1 multi-window round's file-size split —
-    // see that file's module doc). Only free-function tests for code that
-    // stayed in this file remain here.
-
-    #[test]
-    fn generate_token_bytes_returns_32_fresh_random_bytes() {
-        let a = generate_token_bytes().expect("failed to read /dev/urandom");
-        let b = generate_token_bytes().expect("failed to read /dev/urandom");
-        assert_eq!(a.len(), 32);
-        assert_ne!(a, b, "two consecutive reads of /dev/urandom must not collide");
-    }
-
-    #[test]
-    fn hex_encode_produces_lowercase_hex_of_expected_length() {
-        let bytes = [0u8, 1, 255, 16];
-        assert_eq!(hex_encode(&bytes), "0001ff10");
-        let token = hex_encode(&[7u8; 32]);
-        assert_eq!(token.len(), 64);
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-    }
-
-    // `rotate_token`'s own tests (CD-2 task brief item 1) live in the
-    // `rotation` submodule's test block, alongside the code they test — see
-    // this file's other "moved to `rotation`" notes above.
-}
+// This file's own `#[cfg(test)] mod tests` block moved to
+// `codrive/tests_token.rs` in the A2 round — see the `mod tests_token`
+// declaration above for why. `check_token`'s tests had already moved to
+// `shared.rs` (WP-A1) and `rotate_token`'s to `rotation.rs` (CD-2).

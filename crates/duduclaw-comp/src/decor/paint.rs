@@ -410,21 +410,35 @@ impl DuduclawComp {
             .get_keyboard()
             .and_then(|k| k.current_focus());
 
-        // WM-3: the Alt-Tab panel. Below the cursors (which stay on top of
-        // everything, as they must) and above every surface — it is a modal
-        // affordance for as long as it is on screen. Empty and cheap when no
-        // switcher session is open, which is almost always.
-        let switcher = self.build_switcher_elements(renderer, output_geo, scale);
-        overlays.extend(switcher);
+        // D9-bug4 (2026-08-24): a locked session paints layer surfaces and the
+        // cursor, and nothing else. The two affordances below are both
+        // window-derived — the switcher panel lists every open window's title
+        // and icon, and the IME candidate window can only be showing a
+        // composition started before the lock — so both are disclosure on a
+        // locked screen and both are skipped. See `crate::session_lock`.
+        //
+        // The switcher cannot be OPENED while locked either (`session_lock::
+        // gesture_allowed_while_locked` swallows Alt-Tab), so this only ever
+        // hides a session left open by the lock itself.
+        let locked = self.session_locked;
 
-        // D3-a: the IME candidate window. Above every window AND above every
-        // layer surface — it is transient input UI anchored to a caret, so a
-        // panel drawn over it would hide the very characters the user is
-        // choosing between. Below the Alt-Tab panel (which is modal while it
-        // is up) and below the cursors, which stay on top of everything.
-        // Empty and cheap whenever no composition is in flight, which is
-        // almost always.
-        overlays.extend(self.ime_popup_elements(renderer, output_geo, scale));
+        if !locked {
+            // WM-3: the Alt-Tab panel. Below the cursors (which stay on top of
+            // everything, as they must) and above every surface — it is a modal
+            // affordance for as long as it is on screen. Empty and cheap when no
+            // switcher session is open, which is almost always.
+            let switcher = self.build_switcher_elements(renderer, output_geo, scale);
+            overlays.extend(switcher);
+
+            // D3-a: the IME candidate window. Above every window AND above every
+            // layer surface — it is transient input UI anchored to a caret, so a
+            // panel drawn over it would hide the very characters the user is
+            // choosing between. Below the Alt-Tab panel (which is modal while it
+            // is up) and below the cursors, which stay on top of everything.
+            // Empty and cheap whenever no composition is in flight, which is
+            // almost always.
+            overlays.extend(self.ime_popup_elements(renderer, output_geo, scale));
+        }
 
         // WM-3: layer surfaces on the `overlay` and `top` layers, in that
         // order. See `layer_shell::geometry` for why this crate ranks the four
@@ -432,7 +446,17 @@ impl DuduclawComp {
         overlays.extend(self.layer_elements(renderer, output, scale, true));
 
         // Top of the stack first: `Space::elements()` yields back-to-front.
-        let windows: Vec<Window> = self.space.elements().rev().cloned().collect();
+        //
+        // D9-bug4: empty while locked — this is the whole visual half of the
+        // session lock. Deliberately only the ELEMENT list: both backends still
+        // call `send_frame` over `space.elements()` on every repaint, so clients
+        // keep receiving frame callbacks, keep animating, and reappear intact
+        // (rather than as a stalled last frame) the moment the shell unlocks.
+        let windows: Vec<Window> = if locked {
+            Vec::new()
+        } else {
+            self.space.elements().rev().cloned().collect()
+        };
 
         for window in windows {
             let (Some(content), Some(bbox), Some(location)) = (

@@ -175,6 +175,12 @@ pub struct DuduclawComp {
     /// DESIGN-codrive-desktop-2026-08.md §6.1.1 item ②. Main-thread-only
     /// `bool`, same as `codrive_shadow_active`/`codrive_takeover_active`.
     pub codrive_synthesizing: bool,
+    /// A2 (`codrive/mode.rs`): driving-mode transition bookkeeping — the last
+    /// observed mode plus the pending handover-trigger hint. NOT the source
+    /// of truth: the mode is always derived (`codrive::derive_mode`) from
+    /// `session_active`/`terminated`/`frozen`; this only lets
+    /// `codrive_sync_mode` tell a real transition from a per-frame no-op.
+    pub codrive_mode: codrive::CodriveModeCache,
     /// WP-comp-shell-ipc (2026-08-22): cross-thread state shared with the
     /// shell-control socket thread (`shell_control::init`) — a SEPARATE
     /// channel/trust-boundary from `codrive` above, see that module's own
@@ -191,6 +197,15 @@ pub struct DuduclawComp {
     /// leak — see `DuduclawComp::push_shell_intent`'s own doc for the
     /// drop-oldest-and-warn policy that enforces the bound.
     pub pending_shell_intents: std::collections::VecDeque<shell_control::ShellIntent>,
+    /// D9-bug3/D9-bug4 (2026-08-24): whether the session shell has declared
+    /// the screen LOCKED (`shell_control` op `set_session_locked`). Owns three
+    /// behaviours while true — windows are not painted, only layer surfaces
+    /// can take pointer input, and keys bypass the input method's keyboard
+    /// grab straight to the shell. See `crate::session_lock`'s module doc for
+    /// the whole rule and for the smithay source readings behind it. Never
+    /// inferred, only ever set by that op: comp has no way to know what the
+    /// shell is drawing.
+    pub session_locked: bool,
     /// WM-1 (2026-08-23): how much of the output `duduclaw-shell`'s own menu
     /// bar and dock occupy, and therefore how much an ordinary application
     /// window must stay out of. Read once at startup; see
@@ -469,8 +484,10 @@ impl DuduclawComp {
             codrive_watch_paused: false,
             codrive_last_human_activity: start_time,
             codrive_synthesizing: false,
+            codrive_mode: codrive::CodriveModeCache::default(),
             shell_control,
             pending_shell_intents: std::collections::VecDeque::new(),
+            session_locked: false,
             theme: crate::decor::Theme::default(),
             reserved_bands,
             shell_app_id,
@@ -590,17 +607,27 @@ impl DuduclawComp {
     /// layers get first refusal, then ordinary windows, then bottom and
     /// background. Routing has to agree with rendering or a panel drawn over a
     /// window would not receive the clicks that visibly land on it.
+    ///
+    /// D9-bug4 (2026-08-24): while [`Self::session_locked`], the window band
+    /// in the middle is skipped entirely — the same windows that are left out
+    /// of the frame must also be unreachable by the pointer, or a click on a
+    /// locked screen would land in an application nobody can see. Layer
+    /// surfaces on BOTH sides are still routed normally, which is what keeps
+    /// the lock screen's own power button (drawn on the shell's `Background`
+    /// surface) clickable. See `crate::session_lock`'s module doc.
     pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
         if let Some(hit) = self.layer_surface_under(pos, true) {
             return Some(hit);
         }
-        let window_hit = self.space.element_under(pos).and_then(|(window, location)| {
-            window
-                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                .map(|(s, p)| (s, (p + location).to_f64()))
-        });
-        if window_hit.is_some() {
-            return window_hit;
+        if !self.session_locked {
+            let window_hit = self.space.element_under(pos).and_then(|(window, location)| {
+                window
+                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                    .map(|(s, p)| (s, (p + location).to_f64()))
+            });
+            if window_hit.is_some() {
+                return window_hit;
+            }
         }
         self.layer_surface_under(pos, false)
     }

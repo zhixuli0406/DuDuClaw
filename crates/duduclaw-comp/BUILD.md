@@ -5941,11 +5941,16 @@ guard), `cargo clippy --all-targets -- -D warnings` clean. Binary in
 
 ### Honest gaps
 
-* **Chromium under synthesis** is still a VM step — the container has no
-  Chromium. Row 1/2 prove the mechanism against a real multi-seat-aware client
-  (`foot` binds both seats when allowed, which is exactly why hiding one broke
-  co-drive), but "the LINE extension responds to a synthesised click" is not
-  claimed here.
+* ~~**Chromium under synthesis** is still a VM step — the container has no
+  Chromium.~~ **CLOSED 2026-08-24 by the A2 acceptance round** (see the "A2
+  acceptance round" chapter at the end of this file): the rig image simply
+  installs `chromium` and runs it as a real Wayland client of comp under Xvfb,
+  and a synthesised `move`+`button`+`text` lands typed characters in the page's
+  own `<input>` — audited as `inject_via_human_seat … target=chromium`, with
+  the screenshot in `appliance/.vm/a2-evidence/04-typed-crop.png`. Row 1/2 here
+  already proved the mechanism against `foot`; this proves it against the
+  browser class of client. Still NOT claimed: that any specific web app (e.g. a
+  LINE extension) behaves correctly under it.
 * **The socket ack does not carry the refusal.** A dropped-at-the-main-thread
   command still answers `{"ok":true}` on the socket; only the audit trail
   records the drop. This is E1a-1's shape carried forward, not new — but it
@@ -5963,3 +5968,284 @@ guard), `cargo clippy --all-targets -- -D warnings` clean. Binary in
   structural ("no code path from a synthesised event into the human-input
   observer"), so there is no value to assert on, and a runtime test would need
   a live compositor with a GL context, which this suite does not build.
+
+## A2 (2026-08-24): the driving-mode state machine — who is holding the wheel
+
+CD-0 through CD-3 built every mechanism a co-drive session needs — a
+token-authenticated injection socket, freeze-on-human-input, `take_over`,
+watch-mode idle pause, Super+Esc — but never gave any of it a **name a human
+could see**. The compositor knew `frozen`, `terminated`, `takeover_active`;
+nobody outside it could ask the one question that matters when an agent shares
+your screen: *who is driving right now?* A2 answers that, on both sockets and
+on the screen itself.
+
+### The three modes, and why the mode is DERIVED
+
+`codrive/mode.rs` (new). One pure function, no second state machine:
+
+```
+derive_mode(session_active, terminated, frozen):
+    !session_active || terminated -> Human
+    frozen                        -> Handover
+    otherwise                     -> CoDrive
+```
+
+| mode | meaning |
+|---|---|
+| `human` | no co-drive session, or it was emergency-stopped. Zero agent driving authority |
+| `codrive` | authenticated session, agent seat not frozen — the agent drives, the human watches |
+| `handover` | session alive but agent seat frozen — the human holds the wheel. A pause, not a stop |
+
+The ordering is load-bearing and is pinned by its own test. An emergency stop
+deliberately leaves `frozen` latched `true` (§6 red line 3 — a fresh connection
+must not clear it), so a "frozen first" reading would report `handover` for a
+desktop with no session to hand anything back to. The full 2³ truth table is
+asserted exhaustively (`derive_mode_truth_table_is_exhaustive`).
+
+Nothing stores the mode as an independently-mutated field.
+`DuduclawComp::codrive_mode` is a `CodriveModeCache` whose only job is letting
+`codrive_sync_mode` tell a real transition from a per-frame no-op; every
+*reader* (both backends, both sockets) re-derives. **Shadow is deliberately not
+a fourth mode** — while the agent works on the CD-2 shadow output the human's
+own desktop is still theirs, so the mode stays `human` and the status block
+reports `shadow: true` beside it.
+
+### `session_active` — the flag that did not exist
+
+`derive_mode`'s first input had no representation. `CodriveShared::active_conn`
+implied it, but it is a `Mutex<Option<UnixStream>>` and both backends would have
+had to take that lock once per composited frame to colour a cursor. So
+`CodriveShared` gained `session_active: AtomicBool`, written in lockstep with
+`active_conn` at all three sites: `listener.rs`'s post-auth publish, its
+connection-teardown cleanup, and `mod.rs`'s `emergency_stop`. Same mirror
+discipline `shadow_active`/`takeover_active` already followed; `watch_active`,
+`watch_paused` and an `AtomicU8` `handover_reason` joined for the same reason
+(the `status` op must answer without a main-thread round trip, even
+mid-takeover).
+
+**It is set only past the auth gate**, and that is the round's red-line
+regression test: `unauthenticated_connection_does_not_set_session_active`
+mirrors CD-1's `…does_not_clear_terminated`. Without it, anything that could
+open the socket could make the compositor paint an amber "AI 駕駛中" frame
+around a screen no agent was driving.
+
+### `handover_reason` is recorded at the trigger, never inferred
+
+Four triggers, a closed enum, `human_input` / `agent_take_over` / `watch_idle` /
+`shell_take_wheel`. Each site records the reason *before* it freezes;
+`codrive_sync_mode` consumes it when the derived mode actually becomes
+`handover`, and a hint that never produced one is discarded rather than left to
+mislabel a later, unrelated handover. Inferring it afterwards from flag shapes
+was rejected outright: a watch-idle pause and a human touch leave **identical**
+flags, so a guess would put a confident wrong answer in an audit trail.
+
+**One observed consequence, from the acceptance round (2026-08-24).** A freeze
+that happens while there is no session yet — the winit backend emits a synthetic
+absolute pointer motion at startup, so a nested comp is frozen before anything
+connects — is recorded in `human` mode, where `codrive_sync_mode` discards the
+hint. If a session then authenticates while that freeze is still standing, the
+`human → handover` transition carries `reason=none`, seen live as
+`driving_mode detail="from=human; to=handover; reason=none"`. That is the
+discard rule working as written (honest silence over a guess), not a defect, and
+the acceptance run's own steps all pass a real Super+Enter first. Whether a
+still-standing freeze should keep its reason across a session boundary — i.e.
+scope the reason to the FREEZE rather than to the HANDOVER — is a genuine design
+question, and deliberately not answered here.
+
+### What is additive, and what is byte-identical
+
+* Codrive `{"op":"status"}` gained `mode` / `handover_reason` / `shadow` /
+  `watch_active` / `watch_paused`. **The pre-A2 `frozen` / `terminated` /
+  `takeover` keep their exact spelling and position** — `mode::status_reply_line`
+  is the single formatter and `status_reply_keeps_the_pre_a2_three_fields_first_and_verbatim`
+  pins the prefix byte-for-byte, because the gateway's shipped client parses it.
+* A new push event `{"event":"driving_mode","mode":…,"reason":…}`, emitted once
+  per real transition. No existing event was renamed, replaced or removed.
+* A new audit kind `driving_mode`, detail `from=<a>; to=<b>; reason=<r>`
+  (`reason=none` outside handover). Every existing kind is untouched — a
+  shell-driven `take_wheel` still writes the ordinary `freeze` line (with
+  `op=shell_take_wheel`) rather than inventing a parallel vocabulary that would
+  split every existing freeze query in two.
+
+### The human side: `codrive_status` / `codrive_drive`
+
+Two ops on the shell-control socket (`shell_control/codrive_ops.rs`, new).
+`codrive_status` is a READ (unaudited, like `list_windows`); `codrive_drive` is
+an ACTION (always audited) taking a closed `take_wheel` / `hand_back` set —
+refused with `invalid_codrive_action`, never coerced, and the error token never
+echoes the caller's string.
+
+`take_wheel` is **not** routed through `on_human_input`, even though the freeze
+it performs is the same. `on_human_input`'s first act is to treat any human
+event as proof of presence and *lift* a watch-mode idle pause — which would
+have turned the button into an un-freeze in exactly the situation (nobody was
+watching) where a person is most likely to press it. `hand_back` **is**
+`human_resume()`, reused rather than reimplemented so the shadow hand-back,
+takeover teardown and watch-pause clearing cannot drift from the Super+Enter
+path. Both refresh `codrive_last_human_activity`: a person clicking a button is
+human presence, and the keyboard path gets that for free from the key event
+itself.
+
+**Trust boundary, stated without hedging.** On the appliance the gateway runs
+`User=duduclaw` and the kiosk session runs `User=duduclaw-kiosk` (read from the
+two unit files, not assumed), and this socket authenticates by same-uid
+`SO_PEERCRED` — an agent process structurally cannot open it. A same-uid
+development machine has no such protection. Two things follow: `codrive_drive`
+is shaped so the dangerous direction does not exist (`take_wheel` only ever
+stops the agent; `hand_back` adds no path an agent did not already have, and the
+codrive socket's own `resume` stays unconditionally denied), and **Super+Esc
+remains the only stop that is structurally unreachable by the agent** — detected
+in the compositor's own human keyboard filter, which no injected event enters.
+That red line is unchanged.
+
+### On screen
+
+* **`build_agent_cursor_elements` now takes a `DrivingMode`, not a `bool` — and
+  `Human` draws NOTHING. This is a behavior change.** Before A2 the agent cross
+  was composited unconditionally, so a desktop with no session at all (or one
+  just emergency-stopped) still carried an agent pointer parked wherever the
+  last session left it. That is a lie in the most load-bearing possible place:
+  the element exists to say "something other than you can move a pointer right
+  now", and with no session nothing can. `is_frozen()` alone could never express
+  this — it cannot tell "frozen because a human touched it" from "frozen and the
+  session is gone".
+* **Ghost styling**: a near-black halo 2 px larger on each side (α 0.35) behind
+  a core cross at α 0.70, replacing the flat opaque cross. Core elements are
+  pushed FIRST because this crate's backends treat earlier custom elements as
+  nearer the viewer — pushed the other way round, the halo (which fully contains
+  the core) would hide the very cross it outlines. Still
+  `SolidColorRenderElement` only, zero new dependencies.
+* **`codrive/mode_indicator.rs`** (new): four 3 px edge bars framing each
+  output, amber in `codrive`, dark red in `handover`, absent in `human`. It takes
+  **no output offset**, unlike the highlight box: a highlight lives in the global
+  `Space` coordinate system and must be translated into the output being
+  rendered, whereas this frame is defined against the output's own origin and
+  mode size — which is already the space custom elements are interpreted in.
+  Applying `-output.loc` here would push a second monitor's frame off its own
+  screen. `decor::paint::build_output_elements` keeps custom elements ahead of
+  every window and layer surface, so a fullscreen client cannot paint over it.
+
+### The per-frame reconciliation
+
+`codrive_sync_mode()` runs beside the existing `codrive_check_watch_idle` call
+in the winit redraw arm, in `render_surface`, and in the udev housekeeping tick.
+That is not belt-and-braces: it is **the only place the main thread can observe
+the socket thread flipping `session_active`**. A connection arriving or dropping
+is not a main-thread event at all, so without this hook a session start or end
+would never produce a `driving_mode` line, a push event, or the redraw that
+paints (or removes) the frame. On the udev backend the 1 Hz housekeeping tick is
+the only clock an idle desktop has. No change ⇒ true no-op: no audit line, no
+event, no redraw.
+
+### File-size debt paid and incurred
+
+`codrive/mod.rs` was already at 920 lines (over this project's 800-line cap)
+before A2, and A2 had to add transition calls to three of its functions. Its own
+`#[cfg(test)] mod tests` block moved to `codrive/tests_token.rs` verbatim — the
+same split `tests_listener.rs`/`tests_takeover.rs` already established — leaving
+it at 924, +4 net. All new A2 logic went into new files (`codrive/mode.rs`,
+`codrive/mode_indicator.rs`, `shell_control/codrive_ops.rs`) using second `impl
+DuduclawComp` blocks rather than growing `mod.rs` or `shell_control/mod.rs`
+further. A2's `shell_control::listener::validate` tests live in
+`codrive_ops.rs` with the rest of A2's shell-side tests for the same reason.
+
+### Honest gaps
+
+* **Unit tests only.** Every pure function here is tested (the 2³ truth table,
+  both wire tokens, the `AtomicU8` round trip and its unknown-byte fallback, the
+  byte-exact status line and event line, the indicator geometry including
+  degenerate outputs, the action parser's near-miss refusals, and every response
+  shape). Nothing here has been exercised against a live compositor — the ghost
+  cursor, the edge frame and the end-to-end socket round trips are all
+  acceptance-side live-run work, per this crate's standing "pure logic
+  unit-tested, seat/space state live-run tested" split.
+* **`take_wheel` while already frozen is a no-op transition**, so the audit
+  trail records the *first* handover's reason, not the button press that
+  re-asserted it. That matches `on_human_input`'s own long-standing idempotency
+  and was not changed here.
+* **The gateway client is not updated by this round** (contract §6 is the
+  gateway package's work) — and the skew runs in exactly ONE direction, checked
+  rather than assumed. **Old client / new comp is already safe**: neither
+  `duduclaw-gateway::codrive::client::CodriveAck` nor the shell's
+  `CodriveState` carries `deny_unknown_fields` (grepped, 2026-08-24), and a
+  derived `Deserialize` ignores fields it does not know, so a pre-A2 client
+  reading the widened reply simply does not see the new keys. **New client /
+  old comp is the one that needs care**: a client compiled against A2's shape
+  reading a pre-A2 comp gets *absent* keys, which is why every new field on
+  both clients is `#[serde(default)]`. Do not add `deny_unknown_fields` to
+  either ack type — it would convert the safe direction into a hard error the
+  moment comp gains its next field.
+
+### A2 acceptance round (2026-08-24, acceptance side) — Xvfb + real Chromium
+
+The live half the implementation round left open. **Not the nested-weston rig
+every earlier co-drive round used**, and the swap is the point: `Xvfb :99` +
+the winit backend gives `import -window root` a real screenshot of comp's own
+composited output (the CUR-1 round established this route), `xdotool` drives
+**real X input through XTEST** — i.e. `input.rs::process_input_event`, not the
+`DUDUCLAW_CODRIVE_DEBUG_STDIN` simulator — and `chromium
+--ozone-platform=wayland` is a genuine third-party client that the E1a-1
+seat filter hides the agent seat from. So one container proves the pixels, the
+real-input freeze path, and the E1a-1a synthesis chain at once.
+
+Rig: `rust:bookworm` + `xvfb xdotool imagemagick x11-utils libxkbcommon-x11-0
+libxcb-xkb1 adwaita-icon-theme foot chromium`, everything run as a non-root
+user (chromium refuses root). Scripts stayed in the scratchpad, not the repo.
+
+**11/11 PASS**, each row an audit line + a `status` reply + a screenshot:
+
+| # | check | evidence |
+|---|---|---|
+| 1 | no session ⇒ `human`, and **nothing is drawn** | `codrive_status` → `mode:human, session_active:false`; edge probe: page background `#202028`, no frame |
+| 2 | an authenticated connection ⇒ `codrive` | push `{"event":"driving_mode","mode":"codrive"}`; `driving_mode from=human; to=codrive`; edge probe **`#FFA103` amber on all four edges** |
+| 3 | `watch enable` is orthogonal, not a mode | `watch_active:true` with `mode` still `codrive` |
+| 4 | the AI really drives real Chromium | 4× `inject_via_human_seat … target=chromium`; the page's `<input>` shows the typed string in the screenshot |
+| 5 | a real human mouse move ⇒ `handover(human_input)` | `freeze op=pointer_motion_absolute` → `driving_mode from=codrive; to=handover; reason=human_input`; edge probe flips to **`#AB2425` dark red** |
+| 6 | the SHELL BUTTON hands back (not Super+Enter) | `codrive_drive{action:hand_back}` → `resumed` + `driving_mode → codrive`; amber returns |
+| 7 | the agent hands over itself | `take_over` → `takeover_started` + `driving_mode … reason=agent_take_over`, `takeover:true`; dark red |
+| 8 | Super+Enter still works, unchanged | `resume op=human_super_enter` + `takeover_ended` → `codrive` |
+| 9 | the shell takes the wheel | `freeze op=shell_take_wheel` → `driving_mode … reason=shell_take_wheel`; dark red |
+| 10 | Super+Esc ⇒ `human`, session terminated | `emergency_stop detail=super+esc` → `session_ended` → `driving_mode → human`; client sees EOF; **frame gone** |
+| 11 | an unknown shell action is refused | `{"ok":false,"error":"invalid_codrive_action"}` |
+
+Colours read off the PPM, not eyeballed: `AGENT_COLOR_LIVE` composites to
+`#FFA103` and `AGENT_COLOR_FROZEN` to `#AB2425` over these backgrounds, and
+182/183 samples on every edge strip carry it.
+
+#### Three rig facts worth keeping (each cost a wrong result first)
+
+1. **comp serves ONE co-drive connection at a time.** A second client's
+   `connect()` returns immediately, but its auth ACK never comes — it is
+   sitting in the kernel backlog behind the live session, and it times out.
+   That IS the driving-seat exclusion working; the whole acceptance timeline
+   therefore rides a single stdin-fed client. First run mistook it for a bug.
+2. **`xdotool mousemove` to the pointer's CURRENT position emits no X motion
+   event at all.** Step 5 silently tested nothing and reported "a human touch
+   did not freeze it" — a false negative that looked exactly like a real
+   defect. Park the pointer somewhere known first.
+3. **`xdotool key super+Return` (the compound-chord form) re-freezes the seat
+   ~1 ms after the resume.** It emits a stray trailing keyboard event outside
+   the Logo-held window, which `is_system_gesture_tail` correctly declines to
+   exempt. Use the explicit `keydown super; key Return; keyup super` form —
+   which leaves `frozen:false`, confirming this is an xdotool artefact and not
+   a regression of the CD-2 real-hardware fix.
+
+Also: `import` grabs whatever is on screen at that microsecond, and a mode
+change queues a repaint rather than blocking on one, so a screenshot fired in
+the same breath as a transition can catch the previous frame (seen once on
+step 9). Settle before shooting; the transition itself is proven by the audit
+line, the screenshot is proving the pixels follow it.
+
+#### What this round did NOT prove
+
+* **udev/DRM backend.** Everything above is the winit backend under Xvfb. The
+  edge indicator's per-output geometry on real hardware (and on a second
+  output) is untested — the udev path takes each surface's own output size and
+  no offset, which is unit-tested but never rendered on a real panel.
+* **The shell's own UI.** The `codrive_status` / `codrive_drive` wire shapes
+  were exercised with a raw Python client; `duduclaw-shell`'s parser was
+  cross-checked field-by-field against these captured bytes, but the gpui row
+  itself has never been on screen.
+* **The gateway↔comp round trip for `codrive_status`.** Its `CodriveClient` is
+  the same one CD-1 already live-proved, and its serde shape is unit-pinned
+  against these exact bytes, but no gateway process talked to this comp.

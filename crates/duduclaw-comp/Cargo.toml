@@ -14,6 +14,20 @@ description = "Shell-S0 spike: a self-built Wayland compositor (smithay), adapte
 # crates/duduclaw-native-gui (gpui) and crates/duduclaw-shell (gpui shell).
 [workspace]
 
+# Q1 (2026-08-24): the shipping gate, matching `duduclaw-shell`'s feature of
+# the same name (see that crate's `src/shipping.rs`). Empty default on
+# purpose — `cargo build` with no flags, which is what the appliance image is
+# built from, produces a binary in which `codrive`'s stdin input simulator
+# (`DUDUCLAW_CODRIVE_DEBUG_STDIN`) is unreachable. That simulator injects
+# synthetic HUMAN-seat events, including the Super+Esc emergency stop and
+# Super+Enter resume, so it must not be reachable on a duty machine.
+#
+# Dev loop / spike verification: `cargo build --features debug-affordances`.
+# `cargo test` passes in both configurations.
+[features]
+default = []
+debug-affordances = []
+
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }

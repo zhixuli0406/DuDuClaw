@@ -100,6 +100,10 @@ impl DuduclawComp {
             return;
         }
         self.codrive_watch_active = enable;
+        // A2: lockstep mirror, so the socket thread can answer `status`'s
+        // `watch_active` field without a main-thread round trip (see
+        // `CodriveShared::watch_active`).
+        self.codrive.watch_active.store(enable, Ordering::SeqCst);
         if enable {
             // Module doc: avoid an immediate false-trigger right when
             // supervision starts.
@@ -128,11 +132,17 @@ impl DuduclawComp {
         if elapsed < watch_idle_threshold() {
             return;
         }
+        // A2: recorded BEFORE the freeze, so `codrive_sync_mode` below has
+        // the trigger available the moment the derived mode becomes
+        // `handover`. Never inferred afterwards from flag shapes — a
+        // watch-idle pause and a human touch leave identical flags.
+        self.codrive_note_handover_reason(super::mode::HandoverReason::WatchIdle);
         let was_frozen = self.codrive.frozen.swap(true, Ordering::SeqCst);
         if was_frozen {
             return; // already frozen for some other reason — nothing to do
         }
         self.codrive_watch_paused = true;
+        self.codrive.watch_paused.store(true, Ordering::SeqCst);
         tracing::info!(
             idle_secs = elapsed.as_secs(),
             "codrive: watch-mode idle timeout — auto-pausing the agent seat"
@@ -149,6 +159,8 @@ impl DuduclawComp {
             )),
         );
         self.codrive.push_event(r#"{"event":"watch_paused"}"#);
+        // A2: an idle auto-pause IS a `codrive -> handover` transition.
+        self.codrive_sync_mode();
     }
 
     /// Called from the TOP of `on_human_input` (`mod.rs`), before the
@@ -183,12 +195,19 @@ impl DuduclawComp {
             return;
         }
         self.codrive_watch_paused = false;
+        self.codrive.watch_paused.store(false, Ordering::SeqCst);
         if also_unfreeze {
             self.codrive.frozen.store(false, Ordering::SeqCst);
         }
         tracing::info!(trigger, "codrive: watch-idle pause ended");
         self.codrive.record("watch_resumed", None, None, None, Some(trigger.to_string()));
         self.codrive.push_event(r#"{"event":"watch_resumed"}"#);
+        // A2: `also_unfreeze` makes this a `handover -> codrive` transition;
+        // the other two callers (`human_resume`/`emergency_stop`) have
+        // already changed `frozen`/`terminated` themselves, and this call
+        // simply observes whatever they produced. A no-op when nothing
+        // actually moved.
+        self.codrive_sync_mode();
     }
 }
 

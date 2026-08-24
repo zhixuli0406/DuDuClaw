@@ -199,6 +199,13 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
             *guard = Some(clone);
         }
     }
+    // A2 (`codrive/mode.rs`): the lock-free twin of `active_conn`, set HERE
+    // and nowhere earlier — an unauthenticated connection must not be able to
+    // flip the compositor into `codrive` mode (the same "all session
+    // bookkeeping lives behind the auth gate" rule the `terminated` store
+    // above already follows, and which `tests_listener.rs`'s
+    // `unauthenticated_connection_does_not_*` pair pins).
+    shared.session_active.store(true, Ordering::SeqCst);
 
     let mut line = String::new();
     loop {
@@ -250,8 +257,6 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
         // its answer doesn't need to depend on `terminated` either).
         match cmd {
             InjectCmd::Status => {
-                let frozen = shared.frozen.load(Ordering::SeqCst);
-                let terminated = shared.terminated.load(Ordering::SeqCst);
                 // CD-3: `takeover` distinguishes an agent-initiated hand-off
                 // from an ordinary human-triggered freeze — both read
                 // `frozen:true`, but only a take_over also flips this. Still
@@ -259,11 +264,16 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
                 // "status 除外" — the one query op that always answers, even
                 // mid-takeover, so the driver's `wait_for_resume` poll keeps
                 // working).
-                let takeover = shared.takeover_active.load(Ordering::SeqCst);
-                let _ = writeln!(
-                    writer,
-                    r#"{{"ok":true,"frozen":{frozen},"terminated":{terminated},"takeover":{takeover}}}"#
-                );
+                //
+                // A2: the reply gained `mode`/`handover_reason` plus the
+                // `shadow`/`watch_active`/`watch_paused` mirrors. The three
+                // pre-A2 fields keep their exact spelling AND position — see
+                // `mode::status_reply_line`, which is the one place that
+                // formats this and is pinned byte-for-byte by its own tests.
+                // Still a pure atomic read needing no seat access, so it is
+                // still answered on this thread.
+                let snap = super::mode::status_snapshot(shared);
+                let _ = writeln!(writer, "{}", super::mode::status_reply_line(&snap));
                 continue;
             }
             InjectCmd::Resume => {
@@ -433,6 +443,11 @@ fn handle_conn(stream: UnixStream, shared: &Arc<CodriveShared>, tx: &calloop::ch
     if let Ok(mut guard) = shared.active_conn.lock() {
         *guard = None;
     }
+    // A2: cleared in lockstep with `active_conn` above. The main thread's
+    // per-frame `codrive_sync_mode` is what turns this into an observable
+    // `driving_mode` transition back to `human` — this thread cannot touch
+    // the audit-worthy transition itself, only the flag it derives from.
+    shared.session_active.store(false, Ordering::SeqCst);
     shared.record("session_ended", None, None, None, None);
 }
 

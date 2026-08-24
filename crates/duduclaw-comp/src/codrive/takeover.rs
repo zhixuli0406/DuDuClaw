@@ -84,10 +84,14 @@ impl DuduclawComp {
         // below is still the right shape to write — same "never trust an
         // upstream check alone" convention `handle_agent_inject` itself
         // documents — it just currently never takes the `true` branch.
+        // A2: recorded before the freeze so `codrive_sync_mode` below can
+        // attach the right trigger the moment the mode becomes `handover`.
+        self.codrive_note_handover_reason(super::mode::HandoverReason::AgentTakeOver);
         let was_frozen = self.codrive.frozen.swap(true, Ordering::SeqCst);
         self.codrive_takeover_active = true;
         self.codrive.takeover_active.store(true, Ordering::SeqCst);
         if was_frozen {
+            self.codrive_sync_mode();
             return;
         }
         self.codrive_freeze_set_at = Some(std::time::Instant::now());
@@ -100,6 +104,9 @@ impl DuduclawComp {
             Some(format!("reason={reason}; {FRAME_FEED_NOTE}")),
         );
         self.codrive.push_event(r#"{"event":"takeover_started"}"#);
+        // A2: an agent-initiated hand-off IS a `codrive -> handover`
+        // transition, with `reason=agent_take_over`.
+        self.codrive_sync_mode();
     }
 
     /// Shared "a takeover ends" transition — called from both `human_resume`
@@ -118,6 +125,9 @@ impl DuduclawComp {
         tracing::info!(trigger, "codrive: takeover ended");
         self.codrive.record("takeover_ended", None, None, None, Some(trigger.to_string()));
         self.codrive.push_event(r#"{"event":"takeover_ended"}"#);
+        // A2: observes whatever the caller (`human_resume`/`emergency_stop`)
+        // already did to `frozen`/`terminated`. A no-op when nothing moved.
+        self.codrive_sync_mode();
     }
 }
 

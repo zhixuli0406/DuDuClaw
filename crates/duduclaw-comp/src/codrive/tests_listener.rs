@@ -91,6 +91,86 @@ fn unauthenticated_connection_does_not_clear_terminated() {
     let _ = std::fs::remove_file(&sock_path);
 }
 
+/// A2's half of the same red line: `session_active` is what the driving-mode
+/// state machine derives `codrive` from (`codrive/mode.rs`), so an
+/// unauthenticated connection setting it would let anything that can open the
+/// socket claim the compositor is under agent control — an amber
+/// "AI 駕駛中" frame around a screen no agent is driving. Same shape as
+/// `unauthenticated_connection_does_not_clear_terminated` above.
+#[test]
+fn unauthenticated_connection_does_not_set_session_active() {
+    let sock_path = std::env::temp_dir()
+        .join(format!("duduclaw-codrive-test-badauth-session-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock_path);
+
+    let shared = Arc::new(CodriveShared::for_test(Some("expected-token".to_string())));
+    assert!(!shared.session_active.load(Ordering::SeqCst), "precondition");
+
+    let (tx, _rx) = calloop::channel::channel::<InjectCmd>();
+    spawn(sock_path.clone(), Arc::clone(&shared), tx).expect("test listener failed to bind");
+
+    let conn = UnixStream::connect(&sock_path).expect("test client failed to connect");
+    let mut writer = conn.try_clone().unwrap();
+    writeln!(writer, r#"{{"op":"auth","token":"definitely-wrong"}}"#).unwrap();
+
+    let mut reply = String::new();
+    BufReader::new(&conn).read_line(&mut reply).expect("no auth response from listener");
+    assert!(reply.contains("auth_failed"), "unexpected auth response: {reply}");
+
+    assert!(
+        !shared.session_active.load(Ordering::SeqCst),
+        "an unauthenticated connection must never publish a live co-drive session \
+         (A2 contract §2)"
+    );
+    // And the derived mode must still read `human` — the property the flag
+    // exists to support, asserted directly rather than only via the flag.
+    assert_eq!(
+        super::mode::status_snapshot(&shared).mode,
+        super::mode::DrivingMode::Human
+    );
+
+    let _ = std::fs::remove_file(&sock_path);
+}
+
+/// A2: the positive half — a connection that DOES authenticate publishes the
+/// session, and the status op it can then send reports `codrive`.
+#[test]
+fn authenticated_connection_publishes_the_session_and_status_reports_codrive() {
+    let sock_path = std::env::temp_dir()
+        .join(format!("duduclaw-codrive-test-session-active-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock_path);
+
+    let shared = Arc::new(CodriveShared::for_test(Some("right-token".to_string())));
+    let (tx, _rx) = calloop::channel::channel::<InjectCmd>();
+    spawn(sock_path.clone(), Arc::clone(&shared), tx).expect("test listener failed to bind");
+
+    let conn = UnixStream::connect(&sock_path).expect("test client failed to connect");
+    let mut writer = conn.try_clone().unwrap();
+    let mut reader = BufReader::new(&conn);
+
+    writeln!(writer, r#"{{"op":"auth","token":"right-token"}}"#).unwrap();
+    let mut reply = String::new();
+    reader.read_line(&mut reply).expect("no auth response from listener");
+    assert!(reply.contains(r#""authenticated":true"#), "unexpected auth response: {reply}");
+
+    writeln!(writer, r#"{{"op":"status"}}"#).unwrap();
+    let mut status = String::new();
+    reader.read_line(&mut status).expect("no status response from listener");
+    // The pre-A2 prefix, byte-for-byte — every already-shipped caller reads it.
+    assert!(
+        status.starts_with(r#"{"ok":true,"frozen":false,"terminated":false,"takeover":false,"#),
+        "unexpected status: {status}"
+    );
+    assert!(status.contains(r#""mode":"codrive""#), "unexpected status: {status}");
+    assert!(status.contains(r#""handover_reason":null"#), "unexpected status: {status}");
+    assert!(status.contains(r#""shadow":false"#), "unexpected status: {status}");
+    assert!(status.contains(r#""watch_active":false"#), "unexpected status: {status}");
+    assert!(status.contains(r#""watch_paused":false"#), "unexpected status: {status}");
+    assert!(shared.session_active.load(Ordering::SeqCst));
+
+    let _ = std::fs::remove_file(&sock_path);
+}
+
 #[test]
 fn correctly_authenticated_connection_is_accepted() {
     let sock_path =

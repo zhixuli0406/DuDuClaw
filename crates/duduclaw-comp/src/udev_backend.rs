@@ -485,6 +485,15 @@ pub fn init_udev(
             // is what stops the `ime_paused` mirror latching after the input
             // method exits.
             data.state.codrive_refresh_ime_pause();
+            // A2: the per-frame reconciliation the winit backend does in its
+            // redraw arm. On THIS backend it is the only clock an idle
+            // desktop has, and it is the only place the main thread can
+            // observe the socket thread flipping `session_active` — so a
+            // co-drive session starting or ending on an otherwise-still
+            // screen still produces its one `driving_mode` line, event, and
+            // redraw (the mode changes both the ghost cursor and the
+            // screen-edge indicator). Queues its own redraw when it fires.
+            data.state.codrive_sync_mode();
             if data.state.codrive.is_frozen() != frozen_before {
                 // A watch-mode idle auto-pause just flipped the agent
                 // cursor between amber and dimmed red (`codrive/cursor.rs`),
@@ -785,7 +794,10 @@ fn render_surface(
 
     let now = Instant::now();
     let agent_pos = state.agent_seat.get_pointer().unwrap().current_location() + offset;
-    let agent_frozen = state.codrive.is_frozen();
+    // A2: see the matching comment in `winit_backend.rs` — the mode decides
+    // whether an agent pointer is drawn at all, in what colour, and whether
+    // the screen-edge indicator appears.
+    let driving_mode = state.codrive_driving_mode();
 
     // CUR-1: the human cursor is built first so it sorts above every other
     // custom element, and it takes `offset` itself (it reads the pointer
@@ -793,7 +805,7 @@ fn render_surface(
     // agent cross below.
     let mut elements: Vec<CodriveElement> = state.build_human_cursor_elements(renderer, offset);
     elements.extend(
-        crate::codrive::build_agent_cursor_elements(agent_pos, agent_frozen)
+        crate::codrive::build_agent_cursor_elements(agent_pos, driving_mode)
             .into_iter()
             .map(CodriveElement::Solid),
     );
@@ -803,7 +815,28 @@ fn render_surface(
             .into_iter()
             .map(CodriveElement::Solid),
     );
+    // A2 (DESIGN §3.3.2(d)): the screen-edge frame, on EVERY output — a
+    // co-drive session is a property of the session, not of one monitor.
+    // Deliberately NOT offset by `-output.loc` the way the highlight box
+    // above is: the frame is defined in the output's OWN space (its origin,
+    // its mode size), which is already the space these elements are
+    // interpreted in — applying the global→local offset here would push a
+    // second monitor's frame off its own screen. See
+    // `codrive/mode_indicator.rs`'s "Coordinate space" section.
+    let indicator_size = output
+        .current_mode()
+        .map(|m| smithay::utils::Size::<i32, Logical>::from((m.size.w, m.size.h)))
+        .unwrap_or_default();
+    elements.extend(
+        crate::codrive::build_mode_indicator_elements(indicator_size, driving_mode)
+            .into_iter()
+            .map(CodriveElement::Solid),
+    );
     state.codrive_check_watch_idle(now);
+    // A2: same per-frame reconciliation as the housekeeping tick — a
+    // compositing desktop should not have to wait up to a second for the
+    // mode to catch up with a session that just started or ended.
+    state.codrive_sync_mode();
 
     // PiP preview of the shadow workspace goes on the first output only —
     // it is a single fixed-corner overlay, not a per-monitor decoration.

@@ -1,0 +1,419 @@
+//! D9-bug3 / D9-bug4 (2026-08-24): **compositor-side session lock**.
+//!
+//! ## What this is, and why it lives in the compositor
+//!
+//! `duduclaw-shell` draws its lock screen on the `duduclaw-shell-home`
+//! layer surface, which sits on the **`Background`** layer — under every
+//! ordinary application window. Locking the screen with Chromium open
+//! therefore left the operator looking at Chromium (`D9-bug4`), while the
+//! keyboard had already been handed to the shell. The two faces of "locked"
+//! disagreed, and the visible one said "not locked".
+//!
+//! A client cannot fix that: layer, keyboard interactivity and stacking are
+//! the compositor's to decide, and a lock screen that depends on one client
+//! painting over another is exactly the arrangement `ext-session-lock-v1`
+//! exists to replace. So the shell now *tells* comp when the session is
+//! locked (`shell_control` op `set_session_locked`), and comp enforces it:
+//!
+//! | face | while locked |
+//! |---|---|
+//! | **paint** | ordinary windows, the Alt-Tab panel and the IME candidate window are left out of the frame entirely (`decor::paint::build_output_elements`); only layer surfaces (the shell) and the cursor are drawn |
+//! | **keyboard** | keys go **straight to the shell's own layer surface**, bypassing the input method's keyboard grab (see below); every system gesture except the Super+Esc emergency stop is swallowed |
+//! | **pointer** | window surfaces, server-side decorations and the resize ring are unreachable — only layer surfaces can be entered, focused or clicked |
+//!
+//! ## Why the keyboard half is not "just focus"
+//!
+//! `D9-bug3`: with fcitx5 in 注音 mode, pressing a key on the locked screen
+//! did nothing at all — but Super combos still arrived. That asymmetry is
+//! the signature of an **input-method keyboard grab**, and reading smithay
+//! 0.7.0 confirms it exactly:
+//!
+//! * `zwp_input_method_v2::Request::GrabKeyboard` calls
+//!   `KeyboardHandle::set_grab` **once**, when fcitx5 creates its input
+//!   method object (`wayland/input_method/input_method_handle.rs`). The grab
+//!   is never released on text-input deactivation — it lives until the
+//!   `zwp_input_method_keyboard_grab_v2` object is destroyed. So "no text
+//!   field has focus" does **not** mean "fcitx5 is not holding the
+//!   keyboard": it always is.
+//! * `InputMethodKeyboardGrab::input` forwards the key to the input method
+//!   and **never** calls `KeyboardInnerHandle`
+//!   (`wayland/input_method/input_method_keyboard_grab.rs`), so no client
+//!   ever sees a key directly. Keys reach applications only because fcitx5
+//!   hands the ones it did not consume back through
+//!   `zwp_virtual_keyboard_v1`. In 注音 mode, after the Launcher overlay was
+//!   torn down, it stopped handing them back.
+//! * `KeyboardHandle::input` runs the compositor's filter closure
+//!   (`input_intercept`) **before** `input_forward` consults the grab
+//!   (`input/keyboard/mod.rs`) — which is precisely why Super+Esc kept
+//!   working while ordinary keys did not.
+//!
+//! That last fact is the fix. While locked, the filter closure short-circuits
+//! and delivers the key itself, straight to the focused **layer** surface via
+//! `KeyboardTarget` — the grab is never reached, so fcitx5 never sees a
+//! keystroke typed on the lock screen. Two things fall out of that, both
+//! wanted:
+//!
+//! 1. the "press any key to wake" gesture works in 注音 mode;
+//! 2. a password is typed as literal ASCII rather than being fed into a
+//!    Zhuyin composition — the same reason every mainstream lock screen
+//!    disables its input method.
+//!
+//! Nothing about fcitx5's own state is touched (no grab is unset, no context
+//! is deactivated), so composition on the desktop after unlocking is
+//! byte-identical to before. The alternative — unsetting the grab for the
+//! duration — was rejected because it is **not reversible from here**:
+//! smithay's `InputMethodKeyboardGrab` is only reachable through
+//! `InputMethodHandle`'s `pub(crate) inner`, so comp could unset the grab
+//! and would then have no way to put it back.
+//!
+//! ## Fail-closed choices
+//!
+//! * Keys are delivered **only** when keyboard focus is on a layer surface.
+//!   If it is on an ordinary window (which the layer-first focus rule in
+//!   [`crate::layer_shell`] should already prevent), the key is dropped
+//!   rather than typed into that application.
+//! * The lock state is per-process, not per-connection: a shell that dies
+//!   while locked leaves comp locked (windows stay hidden). That is the
+//!   safe direction; the cost is that a shell crash shows a blank screen
+//!   until the kiosk supervisor restarts it, and the restarted shell then
+//!   announces `locked=false` at boot. Comp cannot persist a lock across a
+//!   shell restart on its own — the credential check lives in the shell.
+//! * The Super+Esc emergency stop is the one gesture that survives locking.
+//!   A lock screen must never be able to trap the operator's only way to
+//!   stop the agent.
+
+use smithay::{
+    backend::input::KeyState,
+    desktop::WindowSurfaceType,
+    input::keyboard::{keysyms, FilterResult, KeyboardTarget, KeysymHandle, Keysym, ModifiersState},
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    utils::{IsAlive, Serial},
+};
+
+use crate::state::DuduclawComp;
+
+/// The compositor-level gestures `input.rs`'s human keyboard filter can
+/// observe, named so [`gesture_allowed_while_locked`] can be a pure,
+/// unit-testable decision instead of a chain of `if`s buried in the filter
+/// closure (this crate's standing convention — see `input.rs`'s
+/// `is_system_gesture_tail`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemGesture {
+    /// Super+Esc — freeze the agent seat.
+    EmergencyStop,
+    /// Super+Enter — the human hands control back to the agent.
+    HumanResume,
+    /// Alt-Tab / Super+Tab — the MRU window switcher.
+    Switcher,
+    /// Super+Q — politely close the focused window.
+    CloseWindow,
+    /// Super+K — open the shell's global 交辦欄.
+    TaskBar,
+}
+
+/// Which gestures still fire while the session is locked.
+///
+/// Only the emergency stop. The other four all act on, or reveal, the
+/// session behind the lock screen: the switcher panel lists every open
+/// window's title (disclosure), Super+Q closes an application, Super+K opens
+/// the task bar, and Super+Enter resumes agent control — none of which a
+/// person who has not authenticated should be able to do from the lock
+/// screen. Super+Esc is deliberately exempt: it only ever *stops* something.
+pub(crate) fn gesture_allowed_while_locked(gesture: SystemGesture) -> bool {
+    matches!(gesture, SystemGesture::EmergencyStop)
+}
+
+/// Which [`SystemGesture`], if any, this key press is — mirroring exactly the
+/// arms `input.rs`'s unlocked keyboard filter matches, using that module's own
+/// keysym predicates so the two cannot drift apart.
+///
+/// Deliberately a separate classifier rather than a refactor of that filter:
+/// the unlocked path also has to *act*, in a specific order, with an
+/// `&mut DuduclawComp` in hand. This one only has to *name* the gesture, which
+/// is what makes the locked policy a pure decision instead of a second copy of
+/// the dispatch chain.
+///
+/// A release is never a gesture (every binding in `input.rs` fires on
+/// `Pressed`), so callers pass presses only; `None` means "not one of the five"
+/// — including an unrecognised Logo/Alt chord, which [`DuduclawComp::
+/// locked_key_filter`] swallows anyway rather than guessing.
+pub(crate) fn classify_gesture(modifiers: &ModifiersState, sym: Keysym) -> Option<SystemGesture> {
+    use crate::input::{is_close_window_keysym, is_switcher_keysym, is_task_bar_keysym};
+
+    if modifiers.logo && sym == Keysym::new(keysyms::KEY_Escape) {
+        return Some(SystemGesture::EmergencyStop);
+    }
+    if modifiers.logo && sym == Keysym::new(keysyms::KEY_Return) {
+        return Some(SystemGesture::HumanResume);
+    }
+    if (modifiers.logo || modifiers.alt) && is_switcher_keysym(sym) {
+        return Some(SystemGesture::Switcher);
+    }
+    if modifiers.logo && is_close_window_keysym(sym) {
+        return Some(SystemGesture::CloseWindow);
+    }
+    if modifiers.logo && is_task_bar_keysym(sym) {
+        return Some(SystemGesture::TaskBar);
+    }
+    None
+}
+
+impl DuduclawComp {
+    /// Whether the session shell has declared the screen locked.
+    pub fn session_locked(&self) -> bool {
+        self.session_locked
+    }
+
+    /// Records the new lock state and re-settles anything that depends on it.
+    /// Returns `true` when the value actually changed.
+    ///
+    /// Two settles, both needed and both cheap:
+    ///
+    /// * **keyboard focus** — locking while an application window holds the
+    ///   keyboard must move it to the shell, or the first key on the locked
+    ///   screen would be dropped by [`Self::locked_key_target`]'s fail-closed
+    ///   check. [`crate::layer_shell::DuduclawComp::settle_layer_keyboard_focus`]
+    ///   already prefers layer surfaces, so this is the existing rule re-run,
+    ///   not a second policy.
+    /// * **pointer focus** — `PointerHandle` only learns about a new surface
+    ///   from a `motion`, so without this a press that lands where the pointer
+    ///   already sits would still be delivered to whatever window it had
+    ///   entered *before* the lock. Re-entering at the same position with the
+    ///   locked routing applied fixes that with no visible cursor movement.
+    pub(crate) fn set_session_locked(&mut self, locked: bool) -> bool {
+        if self.session_locked == locked {
+            return false;
+        }
+        self.session_locked = locked;
+        tracing::info!(locked, "session_lock: session lock state changed");
+        self.settle_layer_keyboard_focus(
+            if locked { "session_locked" } else { "session_unlocked" },
+            None,
+        );
+        self.resettle_pointer_focus();
+        self.queue_redraw();
+        true
+    }
+
+    /// Re-runs surface routing for the pointer at its current position.
+    ///
+    /// Split out of [`Self::set_session_locked`] only so the "why" fits in a
+    /// doc comment; it has no other caller. Uses the compositor's own clock
+    /// for the event timestamp, exactly like
+    /// `input::DuduclawComp::seed_absolute_pointer_position` — there is no
+    /// libinput event behind this motion.
+    fn resettle_pointer_focus(&mut self) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let pos = pointer.current_location();
+        let under = self.surface_under(pos);
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let time = self.start_time.elapsed().as_millis() as u32;
+        self.update_close_hover(pos);
+        pointer.motion(
+            self,
+            under,
+            &smithay::input::pointer::MotionEvent {
+                location: pos,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// The surface a key typed on the locked screen may be delivered to — the
+    /// currently focused surface, but **only** if it is a layer surface.
+    ///
+    /// Fail-closed by construction: an ordinary window (or no focus at all)
+    /// answers `None` and the key is dropped. Locking the screen must never
+    /// be the thing that types a password into a browser.
+    pub(crate) fn locked_key_target(&self) -> Option<WlSurface> {
+        let focused = self.seat.get_keyboard()?.current_focus()?;
+        if !focused.alive() {
+            return None;
+        }
+        self.is_layer_surface(&focused).then_some(focused)
+    }
+
+    /// The **entire** keyboard policy of a locked session, called from
+    /// `input.rs`'s human keyboard filter closure before any other arm.
+    ///
+    /// Always intercepts: nothing typed on a locked screen is ever forwarded
+    /// down smithay's ordinary path, because that path ends at the input
+    /// method's keyboard grab (see this module's doc). Three outcomes:
+    ///
+    /// 1. Super+Esc still freezes the agent seat — [`gesture_allowed_while_locked`];
+    /// 2. any other Logo/Alt chord is swallowed, so the switcher, Super+Q,
+    ///    Super+K and Super+Enter cannot be reached from the lock screen;
+    /// 3. every remaining key is delivered **directly** to the focused layer
+    ///    surface, or dropped if focus is not on one.
+    ///
+    /// `modifiers` is re-sent immediately before each key rather than only on
+    /// change: this path bypasses `KeyboardHandle::input_forward`, which is
+    /// what normally tracks `mods_changed`, and a lock screen that silently
+    /// lost Shift would reject every password containing a capital letter.
+    /// `wl_keyboard.modifiers` is idempotent, so re-sending costs one small
+    /// event per keystroke and cannot desynchronise anything.
+    pub(crate) fn locked_key_filter(
+        &mut self,
+        modifiers: &ModifiersState,
+        handle: KeysymHandle<'_>,
+        key_state: KeyState,
+        serial: Serial,
+        time: u32,
+    ) -> FilterResult<()> {
+        if key_state == KeyState::Pressed {
+            if let Some(gesture) = classify_gesture(modifiers, handle.modified_sym()) {
+                if gesture_allowed_while_locked(gesture) {
+                    match gesture {
+                        SystemGesture::EmergencyStop => self.emergency_stop("super+esc"),
+                        // Nothing else is on the allow list. Written as an
+                        // explicit arm rather than `_ => {}` inside an `if`
+                        // that already filtered: widening
+                        // `gesture_allowed_while_locked` without deciding what
+                        // the new gesture DOES here should be a compile error,
+                        // not a silent no-op.
+                        SystemGesture::HumanResume
+                        | SystemGesture::Switcher
+                        | SystemGesture::CloseWindow
+                        | SystemGesture::TaskBar => {
+                            tracing::warn!(
+                                ?gesture,
+                                "session_lock: gesture is on the locked allow list but has no \
+                                 action here — suppressed"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::debug!(?gesture, "session_lock: system gesture suppressed by the lock");
+                }
+                return FilterResult::Intercept(());
+            }
+        }
+        if modifiers.logo || modifiers.alt {
+            // An unrecognised Logo/Alt chord, plus every chord's trailing
+            // releases. Swallowed rather than delivered: a lock screen has no
+            // use for a modifier chord, and guessing at one this compositor
+            // does not bind would be inventing behaviour. The client never saw
+            // the press either, so its modifier bookkeeping stays consistent —
+            // and the explicit `modifiers` send below resynchronises it on the
+            // next ordinary key regardless.
+            return FilterResult::Intercept(());
+        }
+        let Some(surface) = self.locked_key_target() else {
+            tracing::debug!(
+                "session_lock: key dropped — keyboard focus is not on a layer surface"
+            );
+            return FilterResult::Intercept(());
+        };
+        // `Seat<D>` is a cheap `Arc`-backed handle (same reason
+        // `state::focus_window` takes a caller-owned clone), which is what lets
+        // this hold a seat and `&mut self` at the same time.
+        let seat = self.seat.clone();
+        KeyboardTarget::modifiers(&surface, &seat, self, *modifiers, serial);
+        KeyboardTarget::key(&surface, &seat, self, handle, key_state, serial, time);
+        FilterResult::Intercept(())
+    }
+
+    /// Is `surface` a mapped layer surface on any of this space's outputs?
+    ///
+    /// Walks every output rather than just [`Self::layout_output`]: the
+    /// answer must not depend on which screen the shell happened to map its
+    /// surface on. Each `layer_map_for_output` guard is taken and dropped
+    /// inside one loop iteration — see `layer_shell`'s module doc on why two
+    /// live guards for the same output deadlock.
+    fn is_layer_surface(&self, surface: &WlSurface) -> bool {
+        self.space.outputs().any(|output| {
+            smithay::desktop::layer_map_for_output(output)
+                .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                .is_some()
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_gesture, gesture_allowed_while_locked, SystemGesture};
+    use smithay::input::keyboard::{keysyms, Keysym, ModifiersState};
+
+    fn mods(logo: bool, alt: bool) -> ModifiersState {
+        ModifiersState { logo, alt, ..Default::default() }
+    }
+
+    #[test]
+    fn every_bound_chord_this_compositor_has_is_classified() {
+        let logo = mods(true, false);
+        for (sym, want) in [
+            (keysyms::KEY_Escape, SystemGesture::EmergencyStop),
+            (keysyms::KEY_Return, SystemGesture::HumanResume),
+            (keysyms::KEY_Tab, SystemGesture::Switcher),
+            (keysyms::KEY_q, SystemGesture::CloseWindow),
+            (keysyms::KEY_k, SystemGesture::TaskBar),
+        ] {
+            assert_eq!(
+                classify_gesture(&logo, Keysym::new(sym)),
+                Some(want),
+                "keysym {sym:#x} with Logo held must classify as {want:?}"
+            );
+        }
+        // Alt-Tab is the switcher too — `input.rs` widened that binding in
+        // WM-3, and this classifier has to agree or Alt-Tab would fall through
+        // to the "unrecognised chord" arm (still suppressed, but for the wrong
+        // reason and with no log line naming it).
+        assert_eq!(
+            classify_gesture(&mods(false, true), Keysym::new(keysyms::KEY_Tab)),
+            Some(SystemGesture::Switcher)
+        );
+        // xkb reports Shift+Tab as ISO_Left_Tab — the backwards direction.
+        assert_eq!(
+            classify_gesture(&logo, Keysym::new(keysyms::KEY_ISO_Left_Tab)),
+            Some(SystemGesture::Switcher)
+        );
+        // Upper case, for a Caps Lock / Shift-holding operator.
+        assert_eq!(classify_gesture(&logo, Keysym::new(keysyms::KEY_Q)), Some(SystemGesture::CloseWindow));
+        assert_eq!(classify_gesture(&logo, Keysym::new(keysyms::KEY_K)), Some(SystemGesture::TaskBar));
+    }
+
+    #[test]
+    fn an_ordinary_key_is_not_a_gesture_and_therefore_reaches_the_lock_screen() {
+        let none = mods(false, false);
+        for sym in [keysyms::KEY_a, keysyms::KEY_Escape, keysyms::KEY_Return, keysyms::KEY_Tab, keysyms::KEY_q, keysyms::KEY_k] {
+            assert_eq!(
+                classify_gesture(&none, Keysym::new(sym)),
+                None,
+                "keysym {sym:#x} with no modifier must be typed, not treated as a gesture"
+            );
+        }
+    }
+
+    /// Escape with no Logo is the ONE that matters most: it is the lock
+    /// screen's own "close the power menu" key, and misclassifying it as the
+    /// emergency stop would both freeze the agent seat and swallow the key.
+    #[test]
+    fn plain_escape_is_never_the_emergency_stop() {
+        assert_eq!(classify_gesture(&mods(false, false), Keysym::new(keysyms::KEY_Escape)), None);
+        assert_eq!(classify_gesture(&mods(false, true), Keysym::new(keysyms::KEY_Escape)), None);
+    }
+
+    #[test]
+    fn the_emergency_stop_survives_a_locked_session() {
+        assert!(gesture_allowed_while_locked(SystemGesture::EmergencyStop));
+    }
+
+    #[test]
+    fn every_other_system_gesture_is_suppressed_while_locked() {
+        for gesture in [
+            SystemGesture::HumanResume,
+            SystemGesture::Switcher,
+            SystemGesture::CloseWindow,
+            SystemGesture::TaskBar,
+        ] {
+            assert!(
+                !gesture_allowed_while_locked(gesture),
+                "{gesture:?} must not fire from a locked screen"
+            );
+        }
+    }
+}

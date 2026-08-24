@@ -36,7 +36,7 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc, Mutex,
     },
     time::Duration,
@@ -45,6 +45,7 @@ use std::{
 use smithay::reexports::calloop;
 
 use super::audit::AuditLog;
+use super::mode::HandoverReason;
 use super::window_geometry::{CodriveQuery, WindowGeometryReply, WindowGeometryRequest};
 
 /// Bounds how long the socket thread will block waiting for the calloop
@@ -66,6 +67,16 @@ pub struct CodriveShared {
     /// True after a Super+Esc emergency stop, until a *new* connection is
     /// accepted (see `listener.rs::handle_conn`).
     pub terminated: AtomicBool,
+    /// A2 (`mode.rs`): true while a connection that got PAST the auth gate
+    /// exists. Written in lockstep with [`Self::active_conn`] at all three
+    /// sites that touch it — `listener.rs`'s post-auth publish and its
+    /// connection-teardown cleanup, and `mod.rs`'s `emergency_stop`. It is an
+    /// `AtomicBool` and not just "is `active_conn` `Some`" because both
+    /// backends read it once per composited frame (to derive the driving
+    /// mode), and taking a `Mutex` on the render hot path to answer a boolean
+    /// would be the wrong trade — same mirror discipline `shadow_active` /
+    /// `takeover_active` already follow.
+    pub session_active: AtomicBool,
     /// WP-CD2-freeze-scope: mirror of `DuduclawComp::codrive_shadow_active`,
     /// kept ONLY for `listener.rs`'s optimistic pre-check (no `self.space`
     /// access there). Never authoritative — see `shadow::
@@ -73,6 +84,27 @@ pub struct CodriveShared {
     pub shadow_active: AtomicBool,
     /// CD-3 mirror of `codrive_takeover_active` — see `takeover.rs`.
     pub takeover_active: AtomicBool,
+    /// A2 mirror of `DuduclawComp::codrive_watch_active` (`watch.rs`), kept
+    /// so the socket thread can answer `status`'s `watch_active` field
+    /// without a main-thread round trip — `status` is the one op that must
+    /// answer even mid-takeover (see `listener.rs`), so it must never be
+    /// allowed to depend on the main loop being responsive.
+    pub watch_active: AtomicBool,
+    /// A2 mirror of `DuduclawComp::codrive_watch_paused` — same reasoning as
+    /// [`Self::watch_active`].
+    pub watch_paused: AtomicBool,
+    /// A2 mirror of the CURRENT handover's reason, encoded by
+    /// [`HandoverReason::to_wire_u8`] with `0` meaning "none recorded".
+    /// Written only by `DuduclawComp::codrive_sync_mode` on the main thread,
+    /// read by both sockets' status answers. An `AtomicU8` rather than a
+    /// `Mutex<Option<_>>` for the same render-hot-path reason as
+    /// [`Self::session_active`], and because a closed 4-value enum encodes
+    /// into one byte with no allocation.
+    ///
+    /// Readers must not report it outside [`super::mode::DrivingMode::
+    /// Handover`] — `mode::status_snapshot` enforces that in one place so a
+    /// stale value cannot leak into a `codrive`/`human` answer.
+    handover_reason: AtomicU8,
     /// D3-c backstop mirror: true while an input method holds a keyboard grab
     /// on the AGENT seat, which makes every injected keystroke disappear into
     /// a composition nobody reads (`crate::ime::seat_filter`'s module doc has
@@ -135,8 +167,12 @@ impl CodriveShared {
         Self {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
+            session_active: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            watch_active: AtomicBool::new(false),
+            watch_paused: AtomicBool::new(false),
+            handover_reason: AtomicU8::new(0),
             ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),
@@ -150,8 +186,12 @@ impl CodriveShared {
         Self {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
+            session_active: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            watch_active: AtomicBool::new(false),
+            watch_paused: AtomicBool::new(false),
+            handover_reason: AtomicU8::new(0),
             ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),
@@ -170,8 +210,12 @@ impl CodriveShared {
         Self {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
+            session_active: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            watch_active: AtomicBool::new(false),
+            watch_paused: AtomicBool::new(false),
+            handover_reason: AtomicU8::new(0),
             ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),
@@ -192,11 +236,31 @@ impl CodriveShared {
         }
     }
 
-    /// Convenience read of the freeze flag for callers outside this module
-    /// (e.g. `winit_backend.rs`'s redraw path, which needs it to pick the
-    /// agent cursor's frozen-vs-live color — see `cursor.rs`).
+    /// Convenience read of the freeze flag for callers outside this module.
+    ///
+    /// A2 note: this is NO LONGER what the render path uses to colour the
+    /// agent cursor — `frozen` alone cannot tell "frozen because a human
+    /// touched it, session still live" from "frozen and the session is gone",
+    /// and those are different pixels now. Both backends call
+    /// `DuduclawComp::codrive_driving_mode` (`mode.rs`) instead. This
+    /// accessor stays for the udev backend's housekeeping tick, which uses it
+    /// to notice a watch-idle freeze flip.
     pub fn is_frozen(&self) -> bool {
         self.frozen.load(Ordering::SeqCst)
+    }
+
+    /// A2: publishes the current handover reason to the socket thread. Called
+    /// only from `DuduclawComp::codrive_sync_mode`; `None` clears it.
+    pub(super) fn store_handover_reason(&self, reason: Option<HandoverReason>) {
+        self.handover_reason
+            .store(reason.map(HandoverReason::to_wire_u8).unwrap_or(0), Ordering::SeqCst);
+    }
+
+    /// A2: the mirrored handover reason, or `None` if nothing was recorded.
+    /// Callers must gate this on the derived mode actually being `Handover` —
+    /// `mode::status_snapshot` is the one place that does, deliberately.
+    pub(super) fn load_handover_reason(&self) -> Option<HandoverReason> {
+        HandoverReason::from_wire_u8(self.handover_reason.load(Ordering::SeqCst))
     }
 
     /// Best-effort constant-time-*ish* comparison against this run's
@@ -303,8 +367,12 @@ impl CodriveShared {
         Self {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
+            session_active: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            watch_active: AtomicBool::new(false),
+            watch_paused: AtomicBool::new(false),
+            handover_reason: AtomicU8::new(0),
             ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),
@@ -324,8 +392,12 @@ impl CodriveShared {
         Self {
             frozen: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
+            session_active: AtomicBool::new(false),
             shadow_active: AtomicBool::new(false),
             takeover_active: AtomicBool::new(false),
+            watch_active: AtomicBool::new(false),
+            watch_paused: AtomicBool::new(false),
+            handover_reason: AtomicU8::new(0),
             ime_paused: AtomicBool::new(false),
             active_conn: Mutex::new(None),
             query_tx: Mutex::new(None),

@@ -313,6 +313,13 @@
 //! leak — see `DuduclawComp::push_shell_intent`'s own doc.
 
 mod audit;
+// A2 共駕復活 (2026-08-24): the human side of the driving-mode contract —
+// `codrive_status` / `codrive_drive`, their action enum, their response
+// block, and the two `DuduclawComp` handlers behind them. A separate file
+// (with its own `impl DuduclawComp` block, the pattern `codrive/takeover.rs`
+// and `codrive/watch.rs` already established) rather than more of this one:
+// `mod.rs` is already past the project's 800-line per-file cap.
+mod codrive_ops;
 mod listener;
 mod protocol;
 
@@ -465,7 +472,30 @@ impl DuduclawComp {
             }
             ShellControlRequest::SetTheme { theme } => self.shell_control_set_theme(&theme),
             ShellControlRequest::TakeShellIntents => self.shell_control_take_shell_intents(),
+            // A2: both handlers live in `codrive_ops.rs` — see that module's
+            // doc for the trust boundary and the two actions' semantics.
+            ShellControlRequest::CodriveStatus => self.shell_control_codrive_status(),
+            ShellControlRequest::CodriveDrive { action } => self.shell_control_codrive_drive(&action),
+            ShellControlRequest::SetSessionLocked { locked } => {
+                self.shell_control_set_session_locked(locked)
+            }
         }
+    }
+
+    /// D9-bug3/D9-bug4: record the shell's lock state and re-settle everything
+    /// that depends on it.
+    ///
+    /// Audited unconditionally, unlike the cursor/theme setters which only
+    /// note whether they changed anything: this is the compositor's record of
+    /// when the machine was locked and unlocked, and an unlock that comp
+    /// already believed had happened is exactly the line a reader of that
+    /// trail would most want present. `changed` is still reported so a
+    /// re-announcement is distinguishable from a real transition.
+    fn shell_control_set_session_locked(&mut self, locked: bool) -> ShellControlResponse {
+        let changed = self.set_session_locked(locked);
+        self.shell_control
+            .record("set_session_locked", Some(format!("locked={locked} changed={changed}")));
+        ShellControlResponse::ok()
     }
 
     /// CUR-3: change the human pointer's size live, then persist the choice.

@@ -38,6 +38,8 @@ use smithay::output::Mode;
 
 use crate::cursor::CursorSourceInfo;
 
+use super::codrive_ops::CodriveStatusInfo;
+
 /// Socket file name, relative to `$XDG_RUNTIME_DIR` — see task brief.
 /// Deliberately a DIFFERENT file than `codrive`'s `duduclaw-codrive.sock`
 /// (`codrive/mod.rs::init`) — two sockets, two trust boundaries, see
@@ -308,6 +310,55 @@ pub enum ShellControlRequest {
     /// empty array on a quiet poll, never omitted) — see
     /// [`ShellControlResponse::intents`].
     TakeShellIntents,
+    /// A2. `{"op":"codrive_status"}` — who is driving this desktop right now
+    /// (`human` / `codrive` / `handover`), plus the raw flags that answer was
+    /// derived from. Read-only, never audited (same rule as `list_windows` /
+    /// `get_cursor_source` / `get_outputs` — a shell painting a status pill
+    /// polls this).
+    ///
+    /// Answers with the `codrive` block; see
+    /// [`super::codrive_ops::CodriveStatusInfo`] for the field semantics and
+    /// that module's own doc for the wire examples.
+    CodriveStatus,
+    /// A2. `{"op":"codrive_drive","params":{"action":"take_wheel"}}` — the
+    /// human takes the wheel back from the agent, or gives it back.
+    ///
+    /// `action` is the closed set `"take_wheel"` / `"hand_back"`
+    /// (`super::codrive_ops::CodriveDriveAction`); anything else is REFUSED
+    /// with `invalid_codrive_action`, never coerced. An ACTION, so it is
+    /// audited; the reply is the same `codrive` block `codrive_status`
+    /// returns, reflecting the state AFTER the action ran.
+    ///
+    /// Lives on this socket, not `codrive`'s, for the same reason every other
+    /// op here does — and with one consequence worth stating plainly: on the
+    /// appliance the agent runs as a different system user and structurally
+    /// cannot reach this socket, while on a same-uid development machine it
+    /// could. `codrive_ops.rs`'s module doc has the full trust boundary,
+    /// including why Super+Esc remains the only agent-unreachable stop.
+    CodriveDrive { action: String },
+    /// D9-bug3/D9-bug4 (2026-08-24).
+    /// `{"op":"set_session_locked","params":{"locked":true}}` — the session
+    /// shell tells comp whether its lock screen is up.
+    ///
+    /// comp has no way to work this out for itself (a lock screen is just
+    /// pixels on a layer surface), and three compositor-owned behaviours
+    /// depend on it: ordinary windows are not painted, only layer surfaces can
+    /// take pointer input, and keys bypass the input method's keyboard grab.
+    /// See `crate::session_lock`'s module doc for the full rule and for the
+    /// smithay source readings behind the keyboard half.
+    ///
+    /// This is an ACTION with a real, security-relevant effect, so it is
+    /// always audited — including the no-op case where the shell re-announces
+    /// a state comp already holds (the shell announces `false` at boot, and a
+    /// re-announcement after a comp restart is exactly the case an audit
+    /// reader wants to see).
+    ///
+    /// Like [`Self::SetTheme`] there is **no persistence** on comp's side: the
+    /// shell owns the credential check and re-announces at every boot, so comp
+    /// only tracks the live value for this process's lifetime. A shell that
+    /// dies while locked leaves comp locked, which is the safe direction —
+    /// see `session_lock`'s "Fail-closed choices".
+    SetSessionLocked { locked: bool },
 }
 
 impl ShellControlRequest {
@@ -325,6 +376,9 @@ impl ShellControlRequest {
             ShellControlRequest::SetOutputScale { .. } => "set_output_scale",
             ShellControlRequest::SetTheme { .. } => "set_theme",
             ShellControlRequest::TakeShellIntents => "take_shell_intents",
+            ShellControlRequest::CodriveStatus => "codrive_status",
+            ShellControlRequest::CodriveDrive { .. } => "codrive_drive",
+            ShellControlRequest::SetSessionLocked { .. } => "set_session_locked",
         }
     }
 }
@@ -463,34 +517,39 @@ pub struct ShellControlResponse {
     /// than being skipped like every other `Option` field here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intents: Option<Vec<String>>,
+    /// A2: populated by `codrive_status` / `codrive_drive` only. Additive —
+    /// every other constructor leaves it `None`, so no already-shipped
+    /// response shape changed a single byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codrive: Option<CodriveStatusInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl ShellControlResponse {
     pub fn windows(windows: Vec<ShellWindowInfo>) -> Self {
-        Self { ok: true, windows: Some(windows), matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, error: None }
+        Self { ok: true, windows: Some(windows), matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, codrive: None, error: None }
     }
 
     /// CUR-2: the `get_cursor_source` / `set_cursor_source` success shape.
     pub fn cursor(info: CursorSourceInfo) -> Self {
-        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: Some(info), outputs: None, intents: None, error: None }
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: Some(info), outputs: None, intents: None, codrive: None, error: None }
     }
 
     /// A `focus_window` hit — exactly one of `matched_app_id`/
     /// `matched_title_prefix` is `Some`, mirroring `codrive::window_target::
     /// WindowMatch`'s own two variants (never both, never neither).
     pub fn focused_by_app_id(app_id: String) -> Self {
-        Self { ok: true, windows: None, matched_app_id: Some(app_id), matched_title_prefix: None, cursor: None, outputs: None, intents: None, error: None }
+        Self { ok: true, windows: None, matched_app_id: Some(app_id), matched_title_prefix: None, cursor: None, outputs: None, intents: None, codrive: None, error: None }
     }
 
     pub fn focused_by_title_prefix(title: String) -> Self {
-        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: Some(title), cursor: None, outputs: None, intents: None, error: None }
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: Some(title), cursor: None, outputs: None, intents: None, codrive: None, error: None }
     }
 
     /// WP-comp-shell-display: the `get_outputs` success shape.
     pub fn outputs(outputs: Vec<ShellOutputInfo>) -> Self {
-        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: Some(outputs), intents: None, error: None }
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: Some(outputs), intents: None, codrive: None, error: None }
     }
 
     /// D2: the bare `set_theme` success shape — `{"ok":true}` and nothing
@@ -499,7 +558,7 @@ impl ShellControlResponse {
     /// response minimal is the exact wire contract the shell side was
     /// written against.
     pub fn ok() -> Self {
-        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, error: None }
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, codrive: None, error: None }
     }
 
     /// A1: the `take_shell_intents` success shape. Always `Some(intents)`,
@@ -511,11 +570,18 @@ impl ShellControlResponse {
     /// always be present on this op's response, unlike every other optional
     /// field on this envelope.
     pub fn intents(intents: Vec<String>) -> Self {
-        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: Some(intents), error: None }
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: Some(intents), codrive: None, error: None }
+    }
+
+    /// A2: the `codrive_status` / `codrive_drive` success shape. Both ops
+    /// answer with the same block, so a caller never has to branch on which
+    /// one it sent to read the state back.
+    pub fn codrive(info: CodriveStatusInfo) -> Self {
+        Self { ok: true, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, codrive: Some(info), error: None }
     }
 
     pub fn err(error: impl Into<String>) -> Self {
-        Self { ok: false, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, error: Some(error.into()) }
+        Self { ok: false, windows: None, matched_app_id: None, matched_title_prefix: None, cursor: None, outputs: None, intents: None, codrive: None, error: Some(error.into()) }
     }
 }
 
@@ -1090,6 +1156,57 @@ mod tests {
     #[test]
     fn take_shell_intents_op_name_is_stable() {
         assert_eq!(ShellControlRequest::TakeShellIntents.op_name(), "take_shell_intents");
+    }
+
+    // ── D9-bug3/D9-bug4 set_session_locked ──────────────────────────────
+
+    /// Pinned to the LITERAL wire line the shell's hand-mirrored client
+    /// builds (`duduclaw-shell/src/comp_client.rs::set_session_locked`),
+    /// for the same reason `params.rs`'s reserved-band test pins literal
+    /// numbers: the two crates cannot depend on each other, so this string
+    /// IS the contract.
+    #[test]
+    fn set_session_locked_wire_shape_is_what_the_shell_sends() {
+        for (locked, raw) in [
+            (true, r#"{"op":"set_session_locked","params":{"locked":true}}"#),
+            (false, r#"{"op":"set_session_locked","params":{"locked":false}}"#),
+        ] {
+            let req = ShellControlRequest::SetSessionLocked { locked };
+            assert_eq!(serde_json::to_string(&req).unwrap(), raw);
+            let back: ShellControlRequest = serde_json::from_str(raw).unwrap();
+            assert_eq!(back, req);
+        }
+    }
+
+    #[test]
+    fn set_session_locked_refuses_anything_that_is_not_a_bool() {
+        for raw in [
+            r#"{"op":"set_session_locked"}"#,
+            r#"{"op":"set_session_locked","params":{}}"#,
+            r#"{"op":"set_session_locked","params":{"locked":"true"}}"#,
+            r#"{"op":"set_session_locked","params":{"locked":1}}"#,
+            r#"{"op":"set_session_locked","params":{"locked":null}}"#,
+            // `deny_unknown_fields`: a typo'd extra key must not be ignored,
+            // or a caller could believe it had asked for something it hadn't.
+            r#"{"op":"set_session_locked","params":{"locked":true,"reason":"idle"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ShellControlRequest>(raw).is_err(),
+                "{raw} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn set_session_locked_op_name_is_stable() {
+        assert_eq!(
+            ShellControlRequest::SetSessionLocked { locked: true }.op_name(),
+            "set_session_locked"
+        );
+        assert_eq!(
+            ShellControlRequest::SetSessionLocked { locked: false }.op_name(),
+            "set_session_locked"
+        );
     }
 
     #[test]

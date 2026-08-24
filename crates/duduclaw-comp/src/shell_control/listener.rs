@@ -47,6 +47,7 @@ use super::protocol::{
     ShellControlRequest, ShellControlResponse, MAX_CURSOR_SOURCE_BYTES, MAX_OUTPUT_NAME_BYTES,
     MAX_QUERY_BYTES, MAX_REQUEST_LINE_BYTES, MAX_THEME_BYTES, OUTPUT_SCALE_STEPS,
 };
+use super::codrive_ops::{CodriveDriveAction, MAX_CODRIVE_ACTION_BYTES};
 use super::{ShellControlMsg, ShellControlShared};
 use crate::cursor::source::{cursor_size_from_wire, CursorSource};
 use crate::decor::Theme;
@@ -352,6 +353,36 @@ pub(super) fn validate(req: &ShellControlRequest) -> Result<(), String> {
         // A1: no params at all — same shape as `list_windows`/
         // `get_cursor_source`.
         ShellControlRequest::TakeShellIntents => Ok(()),
+        // A2: read-only, no params — same shape as `codrive`'s own `status`
+        // op, which is likewise answered without touching the seat.
+        ShellControlRequest::CodriveStatus => Ok(()),
+        // A2. Length first (so a pathological string is refused before it is
+        // parsed at all), then the strict, closed-set parse — exactly
+        // `set_cursor_source`'s ordering. `parse_strict` here is intentionally
+        // stricter than the appearance ops': it does not trim or case-fold,
+        // because this value is only ever sent by the shell's own button
+        // handler from a fixed string, so a near-miss is a caller bug rather
+        // than a person's typing.
+        ShellControlRequest::CodriveDrive { action } => {
+            if action.len() > MAX_CODRIVE_ACTION_BYTES {
+                return Err(format!("codrive_drive action exceeds {MAX_CODRIVE_ACTION_BYTES} bytes"));
+            }
+            if CodriveDriveAction::parse_strict(action).is_none() {
+                // Fixed token, no echo — same discipline as every other op
+                // here: a caller-controlled string never reaches a log line
+                // or a shell UI verbatim.
+                return Err("invalid_codrive_action".into());
+            }
+            Ok(())
+        }
+        // D9-bug3/D9-bug4: the one field is a `bool`, so serde has already
+        // done the entire validation this op admits of — anything that is not
+        // `true`/`false` fails to parse and never reaches here. There is
+        // deliberately no "is the caller allowed to unlock" check on this
+        // socket: the boundary is `SO_PEERCRED` same-uid (see this module's
+        // own doc), which is the same boundary that would let a caller kill
+        // and restart the shell anyway.
+        ShellControlRequest::SetSessionLocked { .. } => Ok(()),
     }
 }
 
@@ -635,6 +666,11 @@ mod tests {
     fn validate_accepts_take_shell_intents() {
         assert!(validate(&ShellControlRequest::TakeShellIntents).is_ok());
     }
+
+    // A2's `codrive_status`/`codrive_drive` validate tests live in
+    // `shell_control/codrive_ops.rs` alongside that round's action parser and
+    // wire-shape tests — one file per A2 concern, and this one was already
+    // past the 800-line cap before A2 touched it.
 
     // ── Pure auth predicate — the "agent cannot reach this socket" proof ──
     // (see this file's own `is_authorized_peer` doc comment for why the

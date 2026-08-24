@@ -172,8 +172,12 @@ pub fn init_winit(
                 // memory or a client-provided surface tree. Scoped like the
                 // PiP block below so `backend`'s borrow ends before
                 // `backend.bind()`.
+                // A2: the mode replaced the bare `is_frozen()` read — it is
+                // what decides whether an agent pointer is drawn at ALL (no
+                // session ⇒ none), which colour it takes, and whether the
+                // screen-edge indicator appears. See `codrive/mode.rs`.
                 let agent_pos = state.agent_seat.get_pointer().unwrap().current_location();
-                let agent_frozen = state.codrive.is_frozen();
+                let driving_mode = state.codrive_driving_mode();
                 let mut cursor_elements: Vec<CodriveElement> = {
                     let renderer = backend.renderer();
                     state.build_human_cursor_elements(renderer, Point::from((0.0, 0.0)))
@@ -183,9 +187,22 @@ pub fn init_winit(
                 // `render_elements!` invocation) so the PiP texture element
                 // below can share the same `custom_elements` slice.
                 cursor_elements.extend(
-                    crate::codrive::build_agent_cursor_elements(agent_pos, agent_frozen)
+                    crate::codrive::build_agent_cursor_elements(agent_pos, driving_mode)
                         .into_iter()
                         .map(CodriveElement::Solid),
+                );
+                // A2 (DESIGN §3.3.2(d) "系統級『共駕中』指示…不可隱藏"): the
+                // screen-edge frame. Output-local coordinates by
+                // construction, so unlike the highlight box it takes no
+                // offset — and this backend's single output sits at the
+                // origin anyway. See `codrive/mode_indicator.rs`.
+                cursor_elements.extend(
+                    crate::codrive::build_mode_indicator_elements(
+                        smithay::utils::Size::from((size.w, size.h)),
+                        driving_mode,
+                    )
+                    .into_iter()
+                    .map(CodriveElement::Solid),
                 );
                 // CD-1 (DESIGN §3.3.2(b) target highlight box): appended
                 // into the same custom-elements slice as the cursors —
@@ -205,6 +222,13 @@ pub fn init_winit(
                 // cheap `Instant`-only work, safe for this crate's tight
                 // unthrottled redraw loop.
                 state.codrive_check_watch_idle(std::time::Instant::now());
+                // A2: the per-frame reconciliation. This is the ONLY place
+                // the main thread can observe the socket thread flipping
+                // `session_active` (a connection arriving or dropping is not
+                // a main-thread event), so without it a session start/end
+                // would never produce a `driving_mode` audit line or event.
+                // A true no-op when the mode did not change.
+                state.codrive_sync_mode();
 
                 // D3-c backstop (`codrive_refresh_ime_pause`): keeps the
                 // socket thread's `ime_paused` mirror from latching `true`

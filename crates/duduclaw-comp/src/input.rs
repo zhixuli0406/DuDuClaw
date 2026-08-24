@@ -61,6 +61,21 @@ impl DuduclawComp {
                     |data, modifiers, handle| {
                         logo_held_now = modifiers.logo;
                         alt_held_now = modifiers.alt;
+                        // D9-bug3/D9-bug4 (2026-08-24): a locked session has
+                        // its own, much smaller keyboard policy, and it has
+                        // to run BEFORE every arm below — not as one more
+                        // `else if` at the end — because the whole point is
+                        // that nothing else applies. `locked_key_filter` owns
+                        // it (including the Super+Esc emergency stop, which is
+                        // the one gesture that still fires while locked); see
+                        // `crate::session_lock`'s module doc for why the key
+                        // has to be delivered from inside THIS closure rather
+                        // than forwarded normally.
+                        if data.session_locked() {
+                            return data.locked_key_filter(
+                                modifiers, handle, key_state, serial, time,
+                            );
+                        }
                         // Super+Esc global emergency stop (DESIGN
                         // §3.3.3/§6.3): the human keyboard's filter
                         // closure is the only code path that can ever
@@ -353,6 +368,26 @@ impl DuduclawComp {
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
                     let pos = pointer.current_location();
 
+                    // D9-bug4 (2026-08-24): a locked session routes presses to
+                    // LAYER SURFACES ONLY — the shell's lock screen (drawn on
+                    // its `Background` surface) still takes its own clicks, and
+                    // nothing else is reachable: no window focus, no title-bar
+                    // drag, no close/minimize button, no resize ring. The
+                    // decoration branch below is already dead here because
+                    // `frame_hit_at` answers `None` while locked, but the
+                    // window branches are not, which is why this arm comes
+                    // first rather than relying on that. See
+                    // `crate::session_lock`.
+                    if self.session_locked {
+                        let layer = self
+                            .layer_under_pointer(pos, true)
+                            .or_else(|| self.layer_under_pointer(pos, false))
+                            .filter(|l| l.can_receive_keyboard_focus());
+                        if let Some(layer) = layer {
+                            let surface = layer.wl_surface().clone();
+                            self.focus_layer_surface(&surface);
+                        }
+                    }
                     // WM-3: a layer surface on the `overlay`/`top` layers is
                     // drawn above every window, so it must also take the click
                     // that visibly lands on it — before the decoration hit test
@@ -361,7 +396,7 @@ impl DuduclawComp {
                     // through the ordinary `pointer.button` call further down;
                     // only keyboard focus is handled here, and only for a
                     // surface that said it wants it.
-                    if let Some(layer) = self.layer_under_pointer(pos, true) {
+                    else if let Some(layer) = self.layer_under_pointer(pos, true) {
                         if layer.can_receive_keyboard_focus() {
                             let surface = layer.wl_surface().clone();
                             tracing::debug!(
@@ -524,7 +559,17 @@ impl DuduclawComp {
     /// Returns `None` for a point on no window, on an undecorated window, or
     /// inside a decorated window's content area. All three cases mean the same
     /// thing to the caller: "carry on with the ordinary surface routing".
+    ///
+    /// D9-bug4 (2026-08-24): and `None` for **every** point while
+    /// [`crate::state::DuduclawComp::session_locked`]. Decorations belong to
+    /// windows that are not being painted at all on a locked screen, so a
+    /// press there must not start a drag or hit an invisible close button —
+    /// and the hover highlight in [`Self::update_close_hover`], which is this
+    /// function's other caller, must not light up either.
     pub(crate) fn frame_hit_at(&self, pos: Point<f64, Logical>) -> Option<(Window, FrameHit)> {
+        if self.session_locked {
+            return None;
+        }
         // WM-3: the resize ring lives OUTSIDE the frame, so it must be clipped
         // to the work area or a window near the top of it would put an 8 px
         // resize strip over the shell's menu bar. See `decor::edges`.
