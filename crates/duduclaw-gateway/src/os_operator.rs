@@ -150,6 +150,9 @@ fn tool_display_name(tool: OsTool) -> &'static str {
     match tool {
         OsTool::DeviceStatus => "查詢裝置狀態",
         OsTool::NetworkInfo => "查詢網路資訊",
+        OsTool::WifiStatus => "查詢 Wi-Fi 連線狀態",
+        OsTool::WifiScan => "掃描附近 Wi-Fi 網路",
+        OsTool::WifiConnect => "連上 Wi-Fi 網路",
         OsTool::BackupList => "查詢備份清單",
         OsTool::SystemStatus => "查詢系統狀態",
         OsTool::CheckUpdate => "檢查更新",

@@ -96,6 +96,21 @@ use crate::goal_intent::{classify_goal_intent, IntentGrade, T_GOAL_DEFAULT, T_GR
 pub enum OsTool {
     DeviceStatus,
     NetworkInfo,
+    /// Agent-body network vertical slice (Y2-3): rich Wi-Fi link/IP/
+    /// connectivity status (`network.status`) — NOT the same data as
+    /// [`OsTool::NetworkInfo`] (bare interface list, `device.network`). See
+    /// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §4.
+    WifiStatus,
+    /// Agent-body network vertical slice (Y2-3): nearby Wi-Fi networks
+    /// (`network.wifi_scan`).
+    WifiScan,
+    /// Agent-body network vertical slice (Y2-3): join a network by SSID,
+    /// structurally without a psk param (`network.wifi_connect(ssid, None)`)
+    /// — works for open networks and networks iwd already holds a stored
+    /// credential for; a `wrong_password` result is the signal to escalate
+    /// to a human-facing password prompt, never a reason for THIS router to
+    /// ask the model to retry with a guessed value. See the design doc §5.
+    WifiConnect,
     BackupList,
     SystemStatus,
     CheckUpdate,
@@ -112,6 +127,9 @@ impl OsTool {
         match self {
             OsTool::DeviceStatus => "os_device_status",
             OsTool::NetworkInfo => "os_network_info",
+            OsTool::WifiStatus => "os_wifi_status",
+            OsTool::WifiScan => "os_wifi_scan",
+            OsTool::WifiConnect => "os_wifi_connect",
             OsTool::BackupList => "os_backup_list",
             OsTool::SystemStatus => "os_system_status",
             OsTool::CheckUpdate => "os_check_update",
@@ -131,6 +149,9 @@ impl OsTool {
         match s {
             "os_device_status" => Some(OsTool::DeviceStatus),
             "os_network_info" => Some(OsTool::NetworkInfo),
+            "os_wifi_status" => Some(OsTool::WifiStatus),
+            "os_wifi_scan" => Some(OsTool::WifiScan),
+            "os_wifi_connect" => Some(OsTool::WifiConnect),
             "os_backup_list" => Some(OsTool::BackupList),
             "os_system_status" => Some(OsTool::SystemStatus),
             "os_check_update" => Some(OsTool::CheckUpdate),
@@ -143,9 +164,12 @@ impl OsTool {
         }
     }
 
-    const ALL: [OsTool; 10] = [
+    const ALL: [OsTool; 13] = [
         OsTool::DeviceStatus,
         OsTool::NetworkInfo,
+        OsTool::WifiStatus,
+        OsTool::WifiScan,
+        OsTool::WifiConnect,
         OsTool::BackupList,
         OsTool::SystemStatus,
         OsTool::CheckUpdate,
@@ -171,13 +195,15 @@ fn tool_gate(tool: OsTool) -> (bool, bool) {
         // an explicit human confirmation before invoking, even though
         // `os_apply_update`'s own O-0 schema has no `confirm` param (unlike
         // `os_power`) — see the task brief's explicit naming of all three.
-        OsTool::Power | OsTool::ApplyUpdate => (true, false),
+        OsTool::Power | OsTool::ApplyUpdate | OsTool::WifiConnect => (true, false),
         // Irreversible: confirm AND a live ApprovalBroker decision.
         OsTool::FactoryReset => (true, true),
         // Read-only or additive (backup create writes a new file, deletes
         // nothing) — no human gate needed beyond the tool's own admin scope.
         OsTool::DeviceStatus
         | OsTool::NetworkInfo
+        | OsTool::WifiStatus
+        | OsTool::WifiScan
         | OsTool::BackupList
         | OsTool::SystemStatus
         | OsTool::CheckUpdate
@@ -320,6 +346,18 @@ fn validate_params(tool: OsTool, candidate: Value) -> (Value, Vec<&'static str>)
             Some("system") => (json!({ "target": "system" }), vec![]),
             _ => (json!({}), vec!["target"]),
         },
+        // `ssid` is genuinely free text (any network name) — unlike
+        // Power/ApplyUpdate's small fixed enum, there is no closed value set
+        // to validate against here. This router only checks PRESENCE
+        // (non-empty string); `os_wifi_connect` itself re-validates and is
+        // the actual authority. Deliberately never accepts/echoes a `psk`
+        // field even if a caller supplies one — see the design doc §5 and
+        // `handle_os_wifi_connect`'s doc comment for why that parameter does
+        // not exist on this tool at all.
+        OsTool::WifiConnect => match candidate.get("ssid").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => (json!({ "ssid": s }), vec![]),
+            _ => (json!({}), vec!["ssid"]),
+        },
         // Every other tool takes no params.
         _ => (json!({}), vec![]),
     }
@@ -337,6 +375,9 @@ fn clarify_prompt_for(tool: OsTool, missing: &[&'static str]) -> Option<String> 
             "要更新哪一個：duduclaw 本體程式（system）還是裝置的 OS 影像（device）？請明確告訴我其中一個。"
                 .to_string(),
         ),
+        OsTool::WifiConnect => {
+            Some("要連上哪一個 Wi-Fi 網路？請告訴我網路名稱（SSID），或先說「附近有哪些 wifi」讓我掃描一次。".to_string())
+        }
         _ => None,
     }
 }
@@ -470,6 +511,53 @@ const NETWORK_INFO_PHRASES: &[PhraseEntry] = phrase_group!(
     "ip address",
 );
 
+/// Agent-body network vertical slice (Y2-3). Deliberately distinct phrasing
+/// from [`NETWORK_INFO_PHRASES`] (which fires on "network status/interfaces/
+/// IP address" — [`OsTool::NetworkInfo`]'s bare interface list): these
+/// phrases ask specifically about the Wi-Fi *link* — is it connected, to
+/// what, how strong — which only [`OsTool::WifiStatus`]'s richer facade
+/// (`network.status`) answers.
+const WIFI_STATUS_PHRASES: &[PhraseEntry] = phrase_group!(
+    OsTool::WifiStatus,
+    None,
+    "wifi狀態",
+    "wifi 狀態",
+    "wifi連線狀態",
+    "有沒有連上wifi",
+    "有沒有連上網路",
+    "網路連上了嗎",
+    "訊號怎麼樣",
+    "wifi status",
+    "wifi connection status",
+    "am i connected to wifi",
+);
+
+/// Agent-body network vertical slice (Y2-3). "幫我連 Wi-Fi" itself
+/// deliberately matches HERE (scan), not a nonexistent connect tool — L1
+/// resolves the sensing half immediately; the design doc's dialogue flow
+/// (§3) has the operator persona follow a successful scan with a
+/// `wifi_psk_prompt` artifact for the actual join, never an LLM-visible
+/// password param.
+const WIFI_SCAN_PHRASES: &[PhraseEntry] = phrase_group!(
+    OsTool::WifiScan,
+    None,
+    "掃描wifi",
+    "掃描 wifi",
+    "附近的wifi",
+    "附近有哪些wifi",
+    "有哪些網路可以連",
+    "幫我連wifi",
+    "幫我連 wifi",
+    "幫我連網路",
+    "連wifi",
+    "連 wifi",
+    "scan wifi",
+    "scan for wifi",
+    "nearby wifi networks",
+    "connect to wifi",
+    "connect wifi",
+);
+
 const BACKUP_LIST_PHRASES: &[PhraseEntry] = phrase_group!(
     OsTool::BackupList,
     None,
@@ -595,6 +683,8 @@ const DOCTOR_REPAIR_PHRASES: &[PhraseEntry] = phrase_group!(
 const ALL_PHRASE_GROUPS: &[&[PhraseEntry]] = &[
     DEVICE_STATUS_PHRASES,
     NETWORK_INFO_PHRASES,
+    WIFI_STATUS_PHRASES,
+    WIFI_SCAN_PHRASES,
     BACKUP_LIST_PHRASES,
     SYSTEM_STATUS_PHRASES,
     CHECK_UPDATE_PHRASES,
@@ -944,6 +1034,58 @@ mod tests {
         assert_eq!(sync_route("目前系統版本是多少").tool, Some(OsTool::SystemStatus));
     }
 
+    /// Agent-body network vertical slice (Y2-3): "幫我連 Wi-Fi" resolves to
+    /// the sensing tool (`WifiScan`), not a nonexistent connect tool — see
+    /// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §5 for why the
+    /// join step is deliberately NOT an O-1-routable tool call. Also checks
+    /// the new Wi-Fi phrase groups don't collide with `NetworkInfo`'s
+    /// existing interface/IP phrases (would show up here as a `Grey`
+    /// fallback to L2 instead of a clean L1 resolve).
+    #[test]
+    fn wifi_status_and_scan_resolve_distinctly_from_network_info() {
+        let status = sync_route("wifi 狀態如何");
+        assert_eq!(status.tool, Some(OsTool::WifiStatus));
+        assert!(!status.needs_confirm);
+        assert_eq!(status.source, OsIntentSource::L1);
+
+        let connect_request = sync_route("幫我連 wifi");
+        assert_eq!(connect_request.tool, Some(OsTool::WifiScan));
+        assert!(!connect_request.needs_confirm);
+        assert_eq!(connect_request.source, OsIntentSource::L1);
+
+        let scan = sync_route("附近有哪些wifi可以連");
+        assert_eq!(scan.tool, Some(OsTool::WifiScan));
+
+        // Unaffected: NetworkInfo's own interface/IP phrasing still resolves
+        // to itself.
+        assert_eq!(sync_route("網路狀態如何").tool, Some(OsTool::NetworkInfo));
+    }
+
+    /// Agent-body network vertical slice (Y2-3): `os_wifi_connect`'s param
+    /// validation only checks presence of a non-empty `ssid` (free text, no
+    /// closed enum to validate against) — and, critically, silently drops
+    /// any `psk` field a caller supplies rather than passing it through.
+    /// `validate_params` is the ONE place both L1 and L2 funnel through, so
+    /// pinning this here covers both paths.
+    #[test]
+    fn wifi_connect_params_require_ssid_and_never_carry_psk() {
+        let (params, missing) = validate_params(OsTool::WifiConnect, json!({}));
+        assert_eq!(missing, vec!["ssid"]);
+        assert_eq!(params, json!({}));
+
+        let (_params, missing) = validate_params(OsTool::WifiConnect, json!({"ssid": "  "}));
+        assert_eq!(missing, vec!["ssid"], "whitespace-only ssid must count as missing");
+
+        let (params, missing) =
+            validate_params(OsTool::WifiConnect, json!({"ssid": "DuDu-Office", "psk": "hunter2"}));
+        assert!(missing.is_empty());
+        assert_eq!(params, json!({"ssid": "DuDu-Office"}), "psk must never survive into resolved params");
+
+        let prompt = clarify_prompt_for(OsTool::WifiConnect, &["ssid"]);
+        assert!(prompt.is_some());
+        assert!(prompt.unwrap().contains("SSID"));
+    }
+
     #[test]
     fn doctor_repair_resolves() {
         let r = sync_route("幫我跑個診斷，系統怪怪的");
@@ -1125,12 +1267,15 @@ mod tests {
         // Destructive (confirm only): os_power, os_apply_update.
         assert_eq!(tool_gate(OsTool::Power), (true, false));
         assert_eq!(tool_gate(OsTool::ApplyUpdate), (true, false));
+        assert_eq!(tool_gate(OsTool::WifiConnect), (true, false));
         // Irreversible (confirm + approval): os_factory_reset.
         assert_eq!(tool_gate(OsTool::FactoryReset), (true, true));
         // Read-only / additive: no gate.
         for t in [
             OsTool::DeviceStatus,
             OsTool::NetworkInfo,
+            OsTool::WifiStatus,
+            OsTool::WifiScan,
             OsTool::BackupList,
             OsTool::SystemStatus,
             OsTool::CheckUpdate,

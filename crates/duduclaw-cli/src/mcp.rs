@@ -1945,6 +1945,38 @@ const TOOLS: &[ToolDef] = &[
         params: &[],
     },
     ToolDef {
+        name: "os_wifi_status",
+        description: "Read Wi-Fi link state, IP info, and internet/captive-portal connectivity. \
+            admin, appliance-only. Bridges the dashboard-only network.status RPC to agents (O-0, \
+            agent-body network vertical slice). NOT the same data as os_network_info (bare interface \
+            list) — this is the rich D4a facade.",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_wifi_scan",
+        description: "Scan for nearby Wi-Fi networks (SSID, signal bars, security type, already-known/\
+            connected flags). admin, appliance-only. Bridges the dashboard-only network.wifi_scan RPC \
+            to agents (O-0, agent-body network vertical slice). Read-only — there is no os_wifi_connect \
+            tool; joining a secured network requires a human to enter the passphrase directly, see \
+            commercial/docs/DESIGN-agent-body-network-2026-08.md §5.",
+        params: &[
+            ParamDef { name: "rescan", description: "Trigger a fresh iwd scan before reading results. Defaults to true.", required: false },
+        ],
+    },
+    ToolDef {
+        name: "os_wifi_connect",
+        description: "Join a Wi-Fi network by SSID. admin, appliance-only; destructive (changes the \
+            box's active network), requires confirm:true. Deliberately has NO psk/password parameter — \
+            it can only join an open network or one iwd already holds a stored credential for (see a \
+            prior os_wifi_scan's `known` flag). Fails with code \"wrong_password\" for a new secured \
+            network; that signal means a human must enter the passphrase directly, not this tool — see \
+            commercial/docs/DESIGN-agent-body-network-2026-08.md §5.",
+        params: &[
+            ParamDef { name: "ssid", description: "Network name to join", required: true },
+            ParamDef { name: "confirm", description: "Must be true — this changes the box's active network", required: true },
+        ],
+    },
+    ToolDef {
         name: "os_apply_update",
         description: "Apply an update. admin; destructive (changes running binary or OS image). \
             Requires `target`: \"device\" (appliance-only OS image update via duduclaw-sysd, no confirm \
@@ -10389,6 +10421,9 @@ pub(crate) async fn handle_tools_call(
             | "os_check_update"
             | "os_backup_list"
             | "os_network_info"
+            | "os_wifi_status"
+            | "os_wifi_scan"
+            | "os_wifi_connect"
             | "os_apply_update"
             | "os_backup_create"
             | "os_power"
@@ -10644,6 +10679,9 @@ pub(crate) async fn handle_tools_call(
         "os_check_update" => crate::mcp_os_ops::handle_os_check_update().await,
         "os_backup_list" => crate::mcp_os_ops::handle_os_backup_list(home_dir).await,
         "os_network_info" => crate::mcp_os_ops::handle_os_network_info().await,
+        "os_wifi_status" => crate::mcp_os_ops::handle_os_wifi_status().await,
+        "os_wifi_scan" => crate::mcp_os_ops::handle_os_wifi_scan(&arguments).await,
+        "os_wifi_connect" => crate::mcp_os_ops::handle_os_wifi_connect(&arguments, home_dir).await,
         "os_apply_update" => crate::mcp_os_ops::handle_os_apply_update(&arguments, home_dir).await,
         "os_backup_create" => crate::mcp_os_ops::handle_os_backup_create(home_dir).await,
         "os_power" => crate::mcp_os_ops::handle_os_power(&arguments).await,

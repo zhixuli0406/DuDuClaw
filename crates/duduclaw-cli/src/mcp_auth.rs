@@ -867,6 +867,9 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "os_check_update"
         | "os_backup_list"
         | "os_network_info"
+        | "os_wifi_status"
+        | "os_wifi_scan"
+        | "os_wifi_connect"
         | "os_apply_update"
         | "os_backup_create"
         | "os_power"
@@ -1273,6 +1276,9 @@ is_external = {is_external}
             "os_check_update",
             "os_backup_list",
             "os_network_info",
+            "os_wifi_status",
+            "os_wifi_scan",
+            "os_wifi_connect",
             "os_apply_update",
             "os_backup_create",
             "os_power",

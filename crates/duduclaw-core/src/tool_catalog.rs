@@ -665,6 +665,24 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "os",
     ),
     (
+        "os_wifi_status",
+        "Wi-Fi link state, IP info, and internet/captive-portal connectivity (agent-body network slice)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_wifi_scan",
+        "Scan for nearby Wi-Fi networks: SSID/signal/security/known (agent-body network slice)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_wifi_connect",
+        "Join a Wi-Fi network by SSID, no psk param (open/already-known credential only, destructive, confirm required)",
+        "admin",
+        "os",
+    ),
+    (
         "os_apply_update",
         "Apply an update (device OS image or duduclaw self-update)",
         "admin",

@@ -147,6 +147,135 @@ pub(crate) async fn handle_os_network_info() -> Value {
     }
 }
 
+/// `os_wifi_status` → `network.status` (D4a's rich link/IP/connectivity
+/// facade — NOT `device.network`/`os_network_info`'s bare interface list;
+/// see `duduclaw_gateway::network` module doc for why the two are
+/// deliberately separate). Cross-process-safe the same way `os_network_info`
+/// is: `network::status()` degrades every sub-source to an honest
+/// "unavailable"/"unknown" value rather than reading any live-gateway
+/// in-memory state, so it is always `Ok` and reachable from this out-of-
+/// process tool exactly like the dashboard RPC (`network.status`, no
+/// appliance gate on the dashboard side either — but this tool still applies
+/// one here, matching the other four `device.*`/`network.*`-backed read
+/// tools' `is_appliance()` gate for consistency, since Wi-Fi hardware only
+/// exists on the appliance in practice).
+///
+/// Agent-body vertical slice (Y2-3): this is the "eye" — a caller asks
+/// "what's my Wi-Fi doing right now" and gets link state / IP / captive-
+/// portal verdict in one call. See
+/// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §4.
+pub(crate) async fn handle_os_wifi_status() -> Value {
+    if !duduclaw_core::is_appliance() {
+        return not_appliance_error();
+    }
+    match duduclaw_gateway::network::status().await {
+        Ok(status) => match serde_json::to_value(&status) {
+            Ok(v) => os_ops_text(&v.to_string()),
+            Err(e) => os_ops_error(&format!("wifi status serialize failed: {e}")),
+        },
+        // `network::status()` never constructs an `Err` today (see its own
+        // doc), but the `Result` return type is real — degrade honestly
+        // rather than unwrap.
+        Err(err) => os_ops_error(&duduclaw_gateway::network::error_to_json(&err).to_string()),
+    }
+}
+
+/// `os_wifi_scan` → `network.wifi_scan`. `rescan` (optional, default `true`
+/// — same default the dashboard RPC uses) requests a fresh iwd scan before
+/// reading results; `false` reads whatever iwd already knows without
+/// triggering a new radio scan. Read-only: this tool can see networks, it
+/// cannot join one — see the design doc's §5 for why `os_wifi_connect` is
+/// deliberately NOT part of this tool face yet (the PSK never reaches an
+/// agent's context; the write path needs a dedicated human-facing secure
+/// channel, not a new MCP tool parameter).
+///
+/// Agent-body vertical slice (Y2-3): this is the other half of the "eye" —
+/// "what networks can I see, and how strong are they" (`WifiNetwork.ssid`/
+/// `signal_bars`/`security`/`known`), the exact data behind the "我看到 3
+/// 個網路，DuDu-Office 訊號最強" line in the design's dialogue flow.
+pub(crate) async fn handle_os_wifi_scan(args: &Value) -> Value {
+    if !duduclaw_core::is_appliance() {
+        return not_appliance_error();
+    }
+    let rescan = args.get("rescan").and_then(Value::as_bool).unwrap_or(true);
+    match duduclaw_gateway::network::wifi_scan(rescan).await {
+        Ok(result) => os_ops_text(&duduclaw_gateway::network::scan_result_to_json(&result).to_string()),
+        Err(err) => os_ops_error(&duduclaw_gateway::network::error_to_json(&err).to_string()),
+    }
+}
+
+/// `os_wifi_connect` → `network.wifi_connect`, **structurally without a
+/// `psk` parameter** — there is no code path in this function's signature
+/// that can accept, forward, log, or audit a plaintext Wi-Fi passphrase.
+/// This is deliberate, not an oversight (see
+/// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §5): a secret
+/// typed into a chat turn becomes part of the LLM's context, the transcript,
+/// and potentially `tool_calls.jsonl` — none of which this platform treats
+/// as a secret store. Calling `network::wifi_connect(ssid, None)` reuses
+/// iwd's OWN semantics for a missing psk: succeeds for an open network or a
+/// network iwd already holds a stored credential for (`WifiNetwork::known`
+/// from a prior `os_wifi_scan`), fails with `wrong_password` for a new
+/// secured network — that specific failure code is the intended signal for
+/// the operator persona (O-4) to hand off to a human-facing password entry
+/// surface instead of retrying with a guessed value.
+///
+/// Same `confirm: true` gate as `os_power` — connecting changes the box's
+/// active network, a real-world side effect worth one explicit human
+/// authorization even when no secret is involved (the design doc's dialogue
+/// flow's step 3 "授權點" applies to every connect, not only the
+/// password-required branch).
+pub(crate) async fn handle_os_wifi_connect(args: &Value, home_dir: &Path) -> Value {
+    if !duduclaw_core::is_appliance() {
+        return not_appliance_error();
+    }
+    if !confirm_flag(args) {
+        return confirm_required_error();
+    }
+    let ssid = match args.get("ssid").and_then(Value::as_str) {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => return os_ops_error("ssid 不可為空"),
+    };
+
+    let result = duduclaw_gateway::network::wifi_connect(&ssid, None).await;
+    audit_agent_wifi_event(home_dir, "wifi_connect", &ssid, &result);
+    match result {
+        Ok(()) => os_ops_text(&json!({ "state": "connected", "ssid": ssid }).to_string()),
+        Err(err) => os_ops_error(&duduclaw_gateway::network::error_to_json_with_ssid(&err, &ssid).to_string()),
+    }
+}
+
+/// Same audit shape as the dashboard's own `audit_wifi_event`
+/// (`{ssid, ok, code, source}`, no psk, no "was a psk even supplied" flag)
+/// but `source: "agent_mcp"` instead of `"dashboard"` — the audit trail can
+/// tell "an agent did this on a human's behalf" apart from "a human clicked
+/// it in Settings" without inventing a second schema. `home_dir` is threaded
+/// in by the caller rather than re-resolved here, matching every other
+/// `mcp_os_ops.rs` handler's convention (and keeping it consistent with a
+/// caller-supplied tempdir in tests).
+fn audit_agent_wifi_event(
+    home_dir: &Path,
+    event_type: &str,
+    ssid: &str,
+    result: &Result<(), duduclaw_gateway::network::WifiError>,
+) {
+    // Deliberately best-effort: an audit-write failure must never surface as
+    // a tool-call failure to the caller (the connect attempt itself already
+    // succeeded or failed on its own terms).
+    let (ok, code) = match result {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e.code.code())),
+    };
+    duduclaw_security::audit::append_audit_event(
+        home_dir,
+        &duduclaw_security::audit::AuditEvent::new(
+            event_type,
+            ssid,
+            duduclaw_security::audit::Severity::Info,
+            json!({ "ssid": ssid, "ok": ok, "code": code, "source": "agent_mcp" }),
+        ),
+    );
+}
+
 /// `os_backup_list` → `device.backup_list`. Same two calls
 /// (`backup_schedule::backups_dir` + `files_api::list_files`) as the
 /// dashboard handler — that handler is already a 3-line wrapper over these,
@@ -615,6 +744,9 @@ mod tests {
         let results = vec![
             handle_os_device_status(home.path()).await,
             handle_os_network_info().await,
+            handle_os_wifi_status().await,
+            handle_os_wifi_scan(&json!({})).await,
+            handle_os_wifi_connect(&json!({"ssid": "DuDu-Office", "confirm": true}), home.path()).await,
             handle_os_backup_list(home.path()).await,
             handle_os_backup_create(home.path()).await,
             handle_os_power(&json!({"action": "restart", "confirm": true})).await,
@@ -650,6 +782,41 @@ mod tests {
 
         let status = handle_os_system_status(home.path()).await;
         assert_ne!(status["isError"], true, "{status:?}");
+    }
+
+    /// Agent-body network vertical slice (Y2-3): the `rescan` param is
+    /// optional and defaults to `true` off-appliance too — the gate fires
+    /// before the param is ever read, so `{}` and an explicit `false` must
+    /// both refuse the same way, not diverge in error shape.
+    #[tokio::test]
+    async fn wifi_scan_rescan_param_is_optional_and_gate_fires_first() {
+        let default_rescan = handle_os_wifi_scan(&json!({})).await;
+        let explicit_no_rescan = handle_os_wifi_scan(&json!({"rescan": false})).await;
+        for v in [&default_rescan, &explicit_no_rescan] {
+            assert_eq!(v["isError"], true, "{v:?}");
+            assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+        }
+    }
+
+    /// Agent-body network vertical slice (Y2-3): `os_wifi_connect` has no
+    /// `psk` field in its schema at all — even a caller that supplies one
+    /// must see it silently ignored, never echoed back or forwarded. Off-
+    /// appliance the `is_appliance()` gate fires before any of that logic
+    /// runs (matching `os_power`'s gate ordering), so this only pins the
+    /// shape of the refusal, not the ssid/confirm logic — see
+    /// `appliance_gated_tools_fail_closed_off_appliance` above for that.
+    #[tokio::test]
+    async fn wifi_connect_ignores_a_smuggled_psk_argument_shape() {
+        let home = tmp_home();
+        let v = handle_os_wifi_connect(
+            &json!({"ssid": "DuDu-Office", "confirm": true, "psk": "should-be-ignored"}),
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["isError"], true);
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("appliance"));
+        assert!(!text.contains("should-be-ignored"), "a psk value must never round-trip into any response text");
     }
 
     #[tokio::test]
