@@ -3,7 +3,7 @@ import { useIntl } from 'react-intl';
 import { Download, Check, X, RotateCcw } from 'lucide-react';
 import { Button } from '@/components/mds';
 import { api } from '@/lib/api';
-import { toast, formatError } from '@/lib/toast';
+import { toast, formatError, formatDeviceOpDetail } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import type { UpdateConfirmArtifact } from './artifact-types';
 import { ArtifactShell } from './ArtifactShell';
@@ -73,7 +73,10 @@ export function UpdateConfirmCard({ payload }: { payload: UpdateConfirmArtifact[
     try {
       if (target === 'device') {
         const res = await api.device.updateApply();
-        const okDetail = [res.stdout, res.stderr].filter(Boolean).join('\n').trim() || null;
+        // no-linux-surface item 7: never render raw stdout/stderr — this
+        // classifies+masks it exactly like `formatError` does for a thrown
+        // error (see that helper's doc comment in `lib/toast.ts`).
+        const okDetail = formatDeviceOpDetail(res) || null;
         if (res.success) {
           setSuccess(true);
           setDetail(okDetail);

@@ -30,7 +30,7 @@ import {
   type DeviceBackupScheduleConfig,
   type DeviceBackupFileEntry,
 } from '@/lib/api';
-import { toast, formatError } from '@/lib/toast';
+import { toast, formatError, formatDeviceOpDetail } from '@/lib/toast';
 import { timeAgo } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import {
@@ -593,6 +593,11 @@ export function DevicePage() {
   // ── Danger zone: every action goes through a type-to-confirm or plain
   //    confirm modal — `confirm: true` is only ever sent once the user has
   //    gone through it, never inferred client-side ahead of time. ──
+  //
+  // `runDangerAction`/`runRestartAfterRestore` below are DESIGN.md §5.6's
+  // reference implementation for error display: `toast.error(formatError(e))`
+  // only, never a branch that renders `e.message` or a raw field. Any new
+  // page's `catch` block should look like this one, not reinvent it.
   const [confirmAction, setConfirmAction] = useState<DangerAction | null>(null);
   const [dangerBusy, setDangerBusy] = useState(false);
   // D4a-8: "一併清除網路設定" — defaults to false (keep saved Wi-Fi
@@ -788,7 +793,9 @@ export function DevicePage() {
                   </button>
                   {showUpdateLog && (
                     <pre className="max-h-48 overflow-auto rounded-lg border border-surface-border bg-muted/40 p-2.5 text-xs whitespace-pre-wrap text-muted-foreground">
-                      {[updateLog.stdout, updateLog.stderr].filter(Boolean).join('\n') || '—'}
+                      {/* no-linux-surface item 7: classified+masked, never the
+                          raw systemctl/systemd-sysupdate stdout/stderr. */}
+                      {formatDeviceOpDetail(updateLog) || '—'}
                     </pre>
                   )}
                 </div>

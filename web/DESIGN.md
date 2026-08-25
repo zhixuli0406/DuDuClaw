@@ -254,6 +254,7 @@ IA 稽核 14 組分散功能中至少 8 組是同一個形狀：A 頁可以編�
 3. **a11y 是預設而非附加。** WCAG 2.1 AA 對比雙主題；所有互動元件 `focus-visible` ring 統一 `ring-3 ring-ring/50`；鍵盤可達（Dialog 走 Esc + focus-trap、列表可 roving-selection）；canvas / SVG 容器 `role="img"` + `aria-label`、內層裝飾 SVG `aria-hidden`；文字 overflow 一律 truncate + `title`，表格 scroll-x，長 CJK wrap；每個 async 面都有 loading / empty / error 三態。
 4. **功能元件 vs 視覺原語的邊界。** mds 是**視覺原語**——只管長相與互動語彙，不含業務邏輯。功能元件（審批風險判定、世界舞台狀態機、圖表資料計算、角色生成）**組合** mds 原語但把邏輯留在自己身上；反過來不要把業務條件寫進 mds。頁面 compose 原語，不 re-style 原語。
 5. **保守遷移行為。** 重設計是換視覺 / 結構，**功能一個不減**：不動 store / api signature，行為 diff 保守。規格變更（如列表預設視圖改變）要同步更新對應 `*.test.tsx` 斷言（這是規格變更，非遷就實作）。
+6. **對外錯誤顯示標準範本（禁 `err.message` / 原始 stdout/stderr 直通）。** 任何一頁把 `catch (e)` 抓到的值、或後端 shell-out 結果的 `stdout`/`stderr`，原封不動塞進 toast / 錯誤欄，都是 bug（`DRAFT-no-linux-surface-2026-08.md` item 7 的最大缺口）——`err.message` 可能是「Request timeout: system.config」這種內部字串，appliance 的 `stdout`/`stderr` 可能是 `systemctl`/`bootctl`/`systemd-sysupdate` 的原始輸出，兩者都不是使用者該看到的東西。**標準範本**：`lib/toast.ts` 的 `formatError(err)`（分類成 `errorState.manage.short.*` 人話 clause ＋ `sanitizeErrorDetail` 遮罩／截斷的技術細節，`clause（detail）`）；appliance 的 `device.*` shell-out 結果（`DeviceOpResult { success, stdout, stderr }`）額外走同檔案的 `formatDeviceOpDetail(res)`（`success:false` 走 `formatError`；`success:true` 只留遮罩後的殘餘文字，供支援排查，絕不是原始 dump）。**參照實作**：`DevicePage.tsx` 電源選單（`runDangerAction` / `runRestartAfterRestore`）——`toast.error(formatError(e))`，沒有分支渲染 `e.message` 或任何原始欄位；同頁「更新中心」的「顯示詳情」欄（`formatDeviceOpDetail(updateLog)`）與對話卡 `UpdateConfirmCard` / `UpdateStatusCard` 是同一範本的三個套用點。新頁面看到 `catch` 區塊想直接顯示錯誤內容時，先看這裡，不要重新發明。
 
 ### 5.1 刻意殘留清單（**不是**待清理債務）
 
@@ -275,8 +276,9 @@ IA 稽核 14 組分散功能中至少 8 組是同一個形狀：A 頁可以編�
 4. i18n：字串走 `intl.formatMessage`，新 key 同 commit 進三語。
 5. 過 §4.2 三條規範：唯讀鏡像有「在〔X〕編輯」連結、頁面沒有變成第二個寫入點、每句文案通過白話測試；若新增導航項，先決定它落在一般層或進階層（§4.1）並照該層排序法則插入 `nav-model.ts`。
 6. 屬性 / 詳情走右欄 panel 或 split（§3.2 / §3.5）。
-7. Verify：`npm run build` + `npx vitest run` 綠；心中跑 a11y / 對比 / overflow / 鍵盤 / reduced-motion 一遍。
-8. 不動 store / api signature；規格變更同步改測試。
+7. 每個 `catch` 區塊過 §5.6：一律 `formatError(e)`（appliance shell-out 結果另加 `formatDeviceOpDetail`），禁止 `e.message` / 原始 `stdout`/`stderr` 直接進 toast 或錯誤欄。
+8. Verify：`npm run build` + `npx vitest run` 綠；心中跑 a11y / 對比 / overflow / 鍵盤 / reduced-motion 一遍。
+9. 不動 store / api signature；規格變更同步改測試。
 
 ---
 

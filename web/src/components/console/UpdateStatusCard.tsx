@@ -3,7 +3,7 @@ import { useIntl } from 'react-intl';
 import { Download, RotateCcw } from 'lucide-react';
 import { Badge, Button } from '@/components/mds';
 import { api } from '@/lib/api';
-import { toast, formatError } from '@/lib/toast';
+import { toast, formatError, formatDeviceOpDetail } from '@/lib/toast';
 import { cn } from '@/lib/utils';
 import type { UpdateStatusArtifact } from './artifact-types';
 import { ArtifactShell } from './ArtifactShell';
@@ -51,7 +51,10 @@ export function UpdateStatusCard({ payload }: { payload: UpdateStatusArtifact['p
 
   const { action, result, system } = payload;
   const title = t(action === 'apply' ? 'console.artifact.updateStatus.title.apply' : 'console.artifact.updateStatus.title.check');
-  const details = result ? [result.stdout, result.stderr].filter(Boolean).join('\n') : '';
+  // no-linux-surface item 7/11: never render raw systemd-sysupdate
+  // stdout/stderr — classify+mask it like `formatError` does for a thrown
+  // error (see `formatDeviceOpDetail`'s doc comment in `lib/toast.ts`).
+  const details = result ? formatDeviceOpDetail(result) : '';
   const systemError = system && 'error' in system ? system.error : null;
   const systemInfo = system && !('error' in system) ? system : null;
 
@@ -126,7 +129,10 @@ export function UpdateStatusCard({ payload }: { payload: UpdateStatusArtifact['p
         )}
         {systemError && (
           <p className="text-xs text-muted-foreground">
-            {t('console.artifact.updateStatus.system.checkFailed', { error: systemError })}
+            {/* no-linux-surface item 7/11: `updater::check_update()` returns
+                raw English error text (URLs, HTTP status) on failure — never
+                render it verbatim. */}
+            {t('console.artifact.updateStatus.system.checkFailed', { error: formatError(systemError) })}
           </p>
         )}
 

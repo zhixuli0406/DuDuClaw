@@ -49,7 +49,13 @@ describe('<UpdateStatusCard> — system (self-update) half', () => {
     expect(screen.getByText('v1.62.0 → v1.62.0')).toBeInTheDocument();
   });
 
-  it('renders a check-failed note (not the version card) when system is the error shape', () => {
+  it('renders a check-failed note (not the version card) when system is the error shape, classified through formatError rather than shown verbatim', () => {
+    // no-linux-surface item 7/11: `system.error` is `updater::check_update()`'s
+    // raw backend text — the card must run it through `formatError` (same
+    // classify+mask treatment a thrown error gets), never render it as-is.
+    // See `formatError`'s doc comment in `lib/toast.ts` for why "unknown"
+    // classification + verbatim (non-technical-looking) detail is the
+    // expected shape for a plain English sentence like this one.
     renderWithProviders(
       <UpdateStatusCard
         payload={{
@@ -59,7 +65,9 @@ describe('<UpdateStatusCard> — system (self-update) half', () => {
         }}
       />,
     );
-    expect(screen.getByText('Version check failed: GitHub API rate limited')).toBeInTheDocument();
+    expect(
+      screen.getByText('Version check failed: no response just now (GitHub API rate limited)'),
+    ).toBeInTheDocument();
     expect(screen.queryByText('DuDuClaw version')).not.toBeInTheDocument();
   });
 });

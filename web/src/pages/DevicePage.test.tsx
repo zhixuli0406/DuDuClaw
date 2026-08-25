@@ -84,7 +84,7 @@ describe('<DevicePage> — appliance device management', () => {
     expect(screen.queryByText('Danger zone')).not.toBeInTheDocument();
   });
 
-  it('checking for updates calls device.update_status and surfaces the raw log behind a disclosure', async () => {
+  it('checking for updates calls device.update_status and surfaces the classified log behind a disclosure', async () => {
     vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
     const updateStatus = vi
       .spyOn(api.device, 'updateStatus')
@@ -104,11 +104,72 @@ describe('<DevicePage> — appliance device management', () => {
     await user.click(await screen.findByRole('button', { name: 'Check for updates' }));
 
     await waitFor(() => expect(updateStatus).toHaveBeenCalledTimes(1));
-    // The raw log auto-opens right after a check/apply — no extra click needed.
+    // The disclosure now renders `formatDeviceOpDetail(updateLog)`
+    // (no-linux-surface item 7), not raw `stdout`/`stderr` — this short,
+    // secret-free, single-line JSON blob happens to sanitize to itself, so
+    // the visible text is unchanged; `a_long_or_sensitive_dump_never_shows_up_verbatim`
+    // and `a_failed_operation_leads_with_a_classified_human_clause` below
+    // are what actually exercise the masking/classification behavior.
     expect(await screen.findByText('{"available":false}')).toBeInTheDocument();
     // It can still be collapsed again.
     await user.click(screen.getByRole('button', { name: 'Hide details' }));
     expect(screen.queryByText('{"available":false}')).not.toBeInTheDocument();
+  });
+
+  it('a long/multi-line stdout dump never shows up verbatim in the details panel (no-linux-surface item 7)', async () => {
+    vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
+    const longFirstLine = `Transferring, please wait… ${'x'.repeat(200)}`;
+    vi.spyOn(api.device, 'updateStatus').mockResolvedValue({
+      success: true,
+      stdout: `${longFirstLine}\nsecond raw journal line should never reach the screen`,
+      stderr: '',
+    });
+    vi.spyOn(api.device, 'updateCheck').mockResolvedValue({
+      available: false,
+      current_version: '0.1.0',
+      latest_version: '0.1.0',
+    });
+
+    const { container } = renderWithProviders(<DevicePage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Check for updates' }));
+
+    await screen.findByRole('button', { name: 'Hide details' });
+    const pre = container.querySelector('pre');
+    expect(pre).not.toBeNull();
+    // Collapsed to one classified/capped line, not the raw multi-line dump:
+    // the second line is dropped entirely and the first is length-capped.
+    expect(pre!.textContent).not.toContain('second raw journal line');
+    expect(pre!.textContent!.length).toBeLessThan(longFirstLine.length);
+  });
+
+  it('a failed operation leads with a classified human clause instead of the bare backend string (no-linux-surface item 7)', async () => {
+    vi.spyOn(api.device, 'status').mockResolvedValue(FULL_STATUS as never);
+    vi.spyOn(api.device, 'updateStatus').mockResolvedValue({ success: true, stdout: '', stderr: '' });
+    vi.spyOn(api.device, 'updateCheck').mockResolvedValue({
+      available: true,
+      current_version: '0.1.0',
+      latest_version: '0.2.0',
+    });
+    // The exact shape `handlers.rs`'s own test fixture uses for a real
+    // systemd D-Bus refusal (see DRAFT-no-linux-surface-2026-08.md item 7).
+    vi.spyOn(api.device, 'updateApply').mockResolvedValue({
+      success: false,
+      stdout: '',
+      stderr: 'Call to Reboot failed: Access denied',
+    });
+
+    renderWithProviders(<DevicePage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Check for updates' }));
+    await user.click(await screen.findByRole('button', { name: 'Update now' }));
+
+    // A classified zh/en clause leads ("no permission…"); the raw D-Bus
+    // string only ever appears as the bounded, secondary detail behind it —
+    // never as the sole content of the details panel.
+    expect(
+      await screen.findByText('no permission, or the session expired (Call to Reboot failed: Access denied)'),
+    ).toBeInTheDocument();
   });
 
   it('device.update_check reports a real newer version from the configured source', async () => {

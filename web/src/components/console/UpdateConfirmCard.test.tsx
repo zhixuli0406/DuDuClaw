@@ -138,6 +138,26 @@ describe('<UpdateConfirmCard> — O-3 inline update confirmation', () => {
     expect(await screen.findByText('Update complete')).toBeInTheDocument();
   });
 
+  it('target=device: a settled success:false result classifies stdout/stderr instead of showing it bare (no-linux-surface item 7)', async () => {
+    // The exact shape `handlers.rs`'s own test fixture uses for a real
+    // systemd D-Bus refusal (DRAFT-no-linux-surface-2026-08.md item 7).
+    vi.spyOn(api.device, 'updateApply').mockResolvedValue({
+      success: false,
+      stdout: '',
+      stderr: 'Call to Reboot failed: Access denied',
+    });
+
+    renderWithProviders(<UpdateConfirmCard payload={{ target: 'device' }} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Apply update' }));
+
+    // A classified clause leads ("no permission…"); the raw D-Bus string
+    // only ever appears as the bounded, secondary detail behind it.
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'no permission, or the session expired (Call to Reboot failed: Access denied)',
+    );
+  });
+
   it('a settled success:false result (no thrown error) also allows an immediate retry', async () => {
     const applyUpdate = vi
       .spyOn(api.system, 'applyUpdate')

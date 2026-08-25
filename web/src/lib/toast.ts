@@ -153,3 +153,48 @@ export function formatError(err: unknown): string {
 export function formatErrorDetail(err: unknown): string {
   return sanitizeErrorDetail(err);
 }
+
+// ── formatDeviceOpDetail: the no-linux-surface item 7 fix ───────────────────
+//
+// `duduclaw-sysd/src/dispatch.rs` forwards systemctl / bootctl / hostnamectl /
+// timedatectl / networkctl / systemd-sysupdate's raw stdout/stderr verbatim
+// by design (see that module's own doc comment — parsing their schemas is
+// deliberately out of scope at the transport layer). That is fine as
+// machine-to-machine plumbing, but it used to reach the screen unfiltered too
+// — `UpdateConfirmCard` / `DevicePage` / `UpdateStatusCard` all rendered
+// `[res.stdout, res.stderr].filter(Boolean).join('\n')` directly into a
+// "顯示詳情" panel, the exact `err.message`-verbatim mistake `formatError`
+// above exists to prevent, just carried by a `DeviceOpResult` instead of a
+// thrown value (`commercial/docs/DRAFT-no-linux-surface-2026-08.md` item 7).
+//
+// This is the ONE place that raw shell-out text is allowed to reach a user,
+// and only after the same classification a thrown error gets. Full raw text
+// is not persisted anywhere by this change (duduclaw-sysd has no
+// journal/audit sink of its own yet) — that's the deferred "維修模式" ticket,
+// not this one; this function only stops the leak at render time.
+
+/** Shape shared by every whitelisted shell-out result rendered to a user —
+ *  matches `DeviceOpResult` in `lib/api.ts` structurally without importing
+ *  it, so this module keeps working outside the React tree. */
+interface DeviceOpLike {
+  success: boolean;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Human-safe rendering of a `device.*` shell-out result's stdout/stderr.
+ *
+ * `success: false` gets the full `formatError` treatment — the combined
+ * stdout+stderr is classified exactly like a thrown error's message, so a
+ * `systemctl reboot` polkit refusal ("Access denied") reads as "沒有權限"
+ * instead of a raw D-Bus string. `success: true` has nothing to classify
+ * (the caller already renders its own "完成" badge/toast) — this returns
+ * only the masked, length-capped residue as a supporting detail line, or ''
+ * when there is nothing worth showing.
+ */
+export function formatDeviceOpDetail(res: DeviceOpLike): string {
+  const combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
+  if (!combined.trim()) return '';
+  return res.success ? sanitizeErrorDetail(combined, TOAST_DETAIL_MAX_CHARS) : formatError(combined);
+}
