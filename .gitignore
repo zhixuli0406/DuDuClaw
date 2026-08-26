@@ -88,3 +88,4 @@ crates/*/target/
 /build/
 appliance/.yocto-cache/
 meta-openembedded/
+meta-duduclaw/.build/
