@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatError, formatErrorDetail, errorShortKey, lookupMessage } from './toast';
+import { formatError, formatErrorDetail, formatDeviceOpDetail, errorShortKey, lookupMessage } from './toast';
 
 /**
  * `formatError` is the string that reaches every toast in the dashboard. The
@@ -66,5 +66,52 @@ describe('formatErrorDetail', () => {
 
   it('returns an empty string when there is nothing to show', () => {
     expect(formatErrorDetail(undefined)).toBe('');
+  });
+});
+
+/**
+ * `DESIGN-maintenance-mode-2026-08.md` §2.6: `formatDeviceOpDetail`'s
+ * `maintenanceModeActive` parameter is the ENTIRE client-side wiring of the
+ * "顯示詳情" full-disclosure bypass — every existing call site keeps its
+ * prior behavior when it's omitted, and every field this test pins is what
+ * the design's §6 threat-4 fail-closed requirement depends on: redaction
+ * never turns off, only the classify/truncate/first-line-only layers do.
+ */
+describe('formatDeviceOpDetail — maintenance mode bypass', () => {
+  it('defaults to the classified single-line summary (unchanged prior behavior)', () => {
+    const multiline = { success: true, stdout: 'line one\nline two\nline three', stderr: '' };
+    const out = formatDeviceOpDetail(multiline);
+    expect(out).not.toContain('\n');
+    expect(out).toBe('line one');
+  });
+
+  it('with maintenanceModeActive=true, returns the full multi-line text instead of just the first line', () => {
+    const multiline = { success: true, stdout: 'line one\nline two\nline three', stderr: '' };
+    const out = formatDeviceOpDetail(multiline, true);
+    expect(out).toContain('line one');
+    expect(out).toContain('line two');
+    expect(out).toContain('line three');
+  });
+
+  it('the bypass never turns off secret redaction', () => {
+    const withToken = { success: true, stdout: `token=${'a1b2c3d4'.repeat(6)}`, stderr: '' };
+    const out = formatDeviceOpDetail(withToken, true);
+    expect(out).not.toContain('a1b2c3d4a1b2c3d4');
+    expect(out).toContain('***');
+  });
+
+  it('the bypass ignores success/failure — no classification clause is prepended', () => {
+    const failed = { success: false, stdout: '', stderr: 'permission denied\nsecond line' };
+    const out = formatDeviceOpDetail(failed, true);
+    expect(out).toBe('permission denied\nsecond line');
+    // Contrast: without the bypass, a failure gets formatError's classified
+    // clause prepended, so the raw text alone is no longer the whole output.
+    const classified = formatDeviceOpDetail(failed, false);
+    expect(classified).not.toBe('permission denied\nsecond line');
+  });
+
+  it('returns empty string when there is nothing to show, bypass or not', () => {
+    expect(formatDeviceOpDetail({ success: true, stdout: '', stderr: '' }, true)).toBe('');
+    expect(formatDeviceOpDetail({ success: true, stdout: '', stderr: '' }, false)).toBe('');
   });
 });

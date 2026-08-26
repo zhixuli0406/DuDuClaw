@@ -136,6 +136,29 @@ const URL_QUERY_RE = /(https?:\/\/[^\s"'<>]*?)\?[^\s"'<>]*/gi;
 
 const REDACTED = '***';
 
+/** Redact every secret-shaped substring in `text`, in place semantics (pure —
+ *  returns the redacted copy). Shared by `sanitizeErrorDetail` (single-line,
+ *  length-capped) and `sanitizeErrorDetailFull` (multi-line, generously
+ *  capped) so there is exactly ONE redaction ruleset — a maintenance-mode
+ *  "show the full raw text" disclosure must never skip a masking rule the
+ *  ordinary toast path applies (see that function's doc comment / DESIGN
+ *  §6 threat 4: "sanitizeErrorDetail 裡的機密遮罩層...不因維修模式而關閉"). */
+function redactSecrets(text: string): string {
+  let out = text.replace(URL_QUERY_RE, `$1?${REDACTED}`);
+  out = out.replace(BEARER_RE, `$1 ${REDACTED}`);
+  out = out.replace(SECRET_PAIR_RE, `$1${REDACTED}`);
+  out = out.replace(VENDOR_KEY_RE, REDACTED);
+  out = out.replace(OPAQUE_RUN_RE, REDACTED);
+  return out;
+}
+
+function stripHtml(text: string): string {
+  if (!/<[a-z!/][^>]*>/i.test(text)) return text;
+  let out = text.replace(HTML_TAG_RE, ' ');
+  for (const [re, to] of ENTITIES) out = out.replace(re, to);
+  return out;
+}
+
 /**
  * Turn any thrown value into a short, safe, single-line technical detail.
  *
@@ -147,25 +170,43 @@ export function sanitizeErrorDetail(err: unknown, maxChars = 240): string {
   let text = rawText(err);
   if (!text) return '';
 
-  if (/<[a-z!/][^>]*>/i.test(text)) {
-    text = text.replace(HTML_TAG_RE, ' ');
-    for (const [re, to] of ENTITIES) text = text.replace(re, to);
-  }
+  text = stripHtml(text);
 
   // Stack traces and multi-line backend dumps: the first line is the message.
   const firstLine = text.split(/\r?\n/).find((l) => l.trim().length > 0) ?? '';
   text = firstLine;
 
-  text = text.replace(URL_QUERY_RE, `$1?${REDACTED}`);
-  text = text.replace(BEARER_RE, `$1 ${REDACTED}`);
-  text = text.replace(SECRET_PAIR_RE, `$1${REDACTED}`);
-  text = text.replace(VENDOR_KEY_RE, REDACTED);
-  text = text.replace(OPAQUE_RUN_RE, REDACTED);
+  text = redactSecrets(text);
 
   text = text.replace(/\s+/g, ' ').trim();
   if (!text) return '';
 
   // Codepoint-wise so a truncation can't split a surrogate pair (emoji/CJK ext).
+  const chars = Array.from(text);
+  if (chars.length <= maxChars) return text;
+  return `${chars.slice(0, maxChars).join('').trimEnd()}…`;
+}
+
+/**
+ * Maintenance-mode-only counterpart to [`sanitizeErrorDetail`] — the
+ * "顯示詳情" full-disclosure path (`DESIGN-maintenance-mode-2026-08.md` §2.6):
+ * keeps EVERY line (not just the first) and allows a much larger length
+ * before truncating, since the whole point is showing the complete raw
+ * shell-out output an operator asked to see. What it does NOT relax is
+ * secret redaction — [`redactSecrets`] runs over the full multi-line text,
+ * same ruleset [`sanitizeErrorDetail`] uses, per DESIGN §6 threat 4's
+ * explicit requirement that the masking layer stays on even in maintenance
+ * mode. Never called on the normal (non-maintenance) render path.
+ */
+export function sanitizeErrorDetailFull(err: unknown, maxChars = 20000): string {
+  let text = rawText(err);
+  if (!text) return '';
+
+  text = stripHtml(text);
+  text = redactSecrets(text);
+  text = text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+  if (!text) return '';
+
   const chars = Array.from(text);
   if (chars.length <= maxChars) return text;
   return `${chars.slice(0, maxChars).join('').trimEnd()}…`;

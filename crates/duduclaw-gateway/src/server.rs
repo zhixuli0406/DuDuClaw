@@ -1546,6 +1546,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         );
     }
 
+    // ── Maintenance Mode — Entry A: boot-time-only reassert-closed ────
+    // `DESIGN-maintenance-mode-2026-08.md` §2.4: a gateway process restart
+    // force-closes any in-flight maintenance window, unconditionally (even
+    // with TTL time left) — stricter than `resume_on_restart=pause` above,
+    // which still offers an `auto` mode; maintenance mode has no such
+    // option at all. Called exactly once, here, at boot — never from a hot
+    // reload path, mirroring `pause_inflight_goal_tasks_on_restart`'s own
+    // contract. Runs unconditionally (no feature gate): a stale open window
+    // surviving an in-memory-state wipe is exactly the orphan-window
+    // scenario this call exists to close.
+    if crate::maintenance::reassert_closed_on_boot(&home_dir).await > 0 {
+        warn!("maintenance mode was open before this restart — force-closed (revoke_reason=gateway_restart)");
+    }
+
     // ── D5: semi-automatic topology evolution (human-gated) ───
     // Independent of the dispatch engine: a slow background driver that mines
     // per-(agent, task_class) MAV reject / needs_human / oscillation evidence,

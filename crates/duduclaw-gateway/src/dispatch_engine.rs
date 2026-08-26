@@ -1559,6 +1559,19 @@ impl DispatchEngine {
                 }
             }
         }
+
+        // 4) Maintenance-mode Entry A (`DESIGN-maintenance-mode-2026-08.md`
+        // §2.4): TTL sweep. Same "piggy-back on the existing tick, no new
+        // timer" reasoning as the capability-grant sweep above — this is the
+        // ONE other place in the codebase the design doc explicitly names as
+        // a home for this ("唯二現成的 TTL sweep 宿主之一"). Absolute-time
+        // comparison lives inside `expire_stale` itself; a sweep failure here
+        // never fails the tick (the active-window read already excludes
+        // expired rows on its own, so a missed sweep only delays the close
+        // action + audit line, never lets `status()` lie about being active).
+        if let Some(home) = &self.home_dir {
+            crate::maintenance::sweep_expired_maintenance_window(home).await;
+        }
         Ok(())
     }
 

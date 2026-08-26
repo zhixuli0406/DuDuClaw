@@ -7255,6 +7255,39 @@ impl MethodHandler {
                 self.handle_network_wired_config(params).await
             }
 
+            // ── Maintenance Mode — Entry A ────────────────────
+            // `commercial/docs/DESIGN-maintenance-mode-2026-08.md` §2. Same
+            // gate as the rest of the `device.*`/`network.*` appliance-only
+            // family (Admin-only + appliance-only): the whole point of this
+            // feature is to widen what an appliance's dashboard operator can
+            // see/reach, so it is meaningless (and, per §1, out of scope) on
+            // a desktop/dev install that already has a full shell.
+            "maintenance.enable" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_maintenance_enable(params, ctx).await
+            }
+            "maintenance.disable" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_maintenance_disable(params, ctx).await
+            }
+            "maintenance.status" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_maintenance_status().await
+            }
+            "maintenance.history" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_maintenance_history(params)
+            }
+            "maintenance.log_access" => {
+                require_admin!();
+                require_appliance!();
+                self.handle_maintenance_log_access(params, ctx).await
+            }
+
             unknown => WsFrame::error_response("", &format!("Unknown method: {unknown}")),
         }
     }
@@ -7535,6 +7568,10 @@ impl MethodHandler {
                     { "name": "device.timedate_set", "description": "Set timezone and/or enable/disable NTP (admin, appliance-only, audited)" },
                     { "name": "network.wired_status", "description": "Wired (Ethernet) link state, IP info, and the persisted desired static config, if any (admin, appliance-only)" },
                     { "name": "network.wired_config", "description": "Set the wired interface to DHCP or a static IPv4 config (admin, appliance-only, audited)" },
+                    { "name": "maintenance.enable", "description": "Turn on maintenance mode for a bounded TTL (unlocks SSH and/or full raw diagnostic detail) (admin, appliance-only, destructive: requires confirm + re-auth)" },
+                    { "name": "maintenance.disable", "description": "Turn off maintenance mode immediately (admin, appliance-only, audited)" },
+                    { "name": "maintenance.status", "description": "Whether maintenance mode is currently active, remaining time, and which sub-capabilities are unlocked (admin, appliance-only, read-only)" },
+                    { "name": "maintenance.history", "description": "Paginated maintenance-mode audit history (admin, appliance-only, read-only)" },
                 ]
             }),
         )
@@ -44262,7 +44299,16 @@ impl MethodHandler {
     /// `network.wifi_connect` — success AND failure are audited (design
     /// §3.2); the psk itself, and even whether one was supplied, never
     /// reaches the audit payload (password-shaped information).
+    ///
+    /// T1 (`DESIGN-agent-body-network-2026-08.md` §12): an optional `source`
+    /// param (read BEFORE `params` is consumed by `WifiConnectRequest`'s
+    /// deserialization, which silently ignores unknown fields) lets the
+    /// operator-console password card (`WifiPasswordRequestCard.tsx`)
+    /// distinguish itself from an ordinary Settings-page connect in the
+    /// audit trail — see [`wifi_connect_audit_source`] for the closed
+    /// allowlist that keeps a caller from forging an arbitrary audit label.
     async fn handle_network_wifi_connect(&self, params: Value) -> WsFrame {
+        let source = Self::wifi_connect_audit_source(params.get("source"));
         let req: crate::network::WifiConnectRequest = match serde_json::from_value(params) {
             Ok(r) => r,
             Err(e) => return WsFrame::error_response("", &format!("invalid params: {e}")),
@@ -44272,7 +44318,7 @@ impl MethodHandler {
         }
 
         let result = crate::network::wifi_connect(&req.ssid, req.psk.as_deref()).await;
-        self.audit_wifi_event("wifi_connect", &req.ssid, &result);
+        self.audit_wifi_event("wifi_connect", &req.ssid, &result, source);
 
         match result {
             Ok(()) => WsFrame::ok_response("", json!({ "state": "connected", "ssid": req.ssid })),
@@ -44293,7 +44339,7 @@ impl MethodHandler {
         };
 
         let result = crate::network::wifi_forget(&ssid).await;
-        self.audit_wifi_event("wifi_forget", &ssid, &result);
+        self.audit_wifi_event("wifi_forget", &ssid, &result, "dashboard");
 
         match result {
             Ok(()) => WsFrame::ok_response("", json!({ "forgotten": true, "ssid": ssid })),
@@ -44317,10 +44363,38 @@ impl MethodHandler {
         }
     }
 
+    /// Design T1 (`DESIGN-agent-body-network-2026-08.md` §12): distinguish
+    /// an operator-console-guided password submission (the
+    /// `wifi_password_request` card, §5.2 — the browser calls this RPC
+    /// directly after an agent's `os_wifi_connect` failed with
+    /// `wrong_password`) from an ordinary dashboard Settings-page connect,
+    /// in the audit trail's `source` field. A closed two-value allowlist:
+    /// any other value, wrong type, or missing field degrades to the
+    /// pre-existing `"dashboard"` — never let a client-supplied string
+    /// reach the audit log verbatim (that would let a caller forge an audit
+    /// attribution label). `&'static str` return keeps this a pure
+    /// classification with no allocation.
+    fn wifi_connect_audit_source(raw: Option<&Value>) -> &'static str {
+        match raw.and_then(Value::as_str) {
+            Some("operator_console_prompted") => "operator_console_prompted",
+            _ => "dashboard",
+        }
+    }
+
     /// Design §3.2: append ONE audit row per `wifi_connect`/`wifi_forget`
     /// call, success or failure — `{ssid, ok, code, source}` only. No psk,
     /// no "psk_supplied" flag (that alone is password-shaped metadata).
-    fn audit_wifi_event(&self, event_type: &str, ssid: &str, result: &Result<(), crate::network::WifiError>) {
+    /// `source` is caller-resolved ([`wifi_connect_audit_source`] for
+    /// `wifi_connect`, a literal `"dashboard"` for `wifi_forget`) — this
+    /// function never re-derives or validates it, so every call site is
+    /// responsible for passing an already-vetted closed value.
+    fn audit_wifi_event(
+        &self,
+        event_type: &str,
+        ssid: &str,
+        result: &Result<(), crate::network::WifiError>,
+        source: &str,
+    ) {
         let (ok, code) = match result {
             Ok(()) => (true, None),
             Err(e) => (false, Some(e.code.code())),
@@ -44331,7 +44405,7 @@ impl MethodHandler {
                 event_type,
                 ssid,
                 duduclaw_security::audit::Severity::Info,
-                json!({ "ssid": ssid, "ok": ok, "code": code, "source": "dashboard" }),
+                json!({ "ssid": ssid, "ok": ok, "code": code, "source": source }),
             ),
         );
     }
@@ -45117,6 +45191,135 @@ impl MethodHandler {
             ),
         );
     }
+
+    // ── Maintenance Mode — Entry A ────────────────────────────
+    // `commercial/docs/DESIGN-maintenance-mode-2026-08.md` §2. Dispatch gates
+    // (Admin-only + appliance-only) live in `dispatch()`'s method match, same
+    // as every other `device.*`/`network.*` handler; these methods are the
+    // orchestration + re-auth/confirm checks specific to this RPC family.
+
+    /// `maintenance.enable` — §2.1 two layers of confirmation ON TOP OF the
+    /// dispatch-level Admin-only gate: an exact type-to-confirm string
+    /// (mirrors `device.factory_reset`'s `"RESET"` convention) AND a
+    /// step-up re-auth (the caller's OWN current password, verified via the
+    /// same `UserDb::verify_password` `users.change_password` already uses —
+    /// §8 Q1 resolved in favor of requiring it, since the mechanism turned
+    /// out to already exist rather than needing new session-model surgery).
+    async fn handle_maintenance_enable(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let confirm_text = params.get("confirm_text").and_then(Value::as_str).unwrap_or("");
+        if confirm_text != crate::maintenance::CONFIRM_TEXT {
+            return WsFrame::error_response(
+                "",
+                &format!("confirm_text must be exactly \"{}\"", crate::maintenance::CONFIRM_TEXT),
+            );
+        }
+
+        let reauth_password = params.get("reauth_password").and_then(Value::as_str).unwrap_or("");
+        let db = match self.user_db.read().await.as_ref() {
+            Some(db) => db.clone(),
+            None => return WsFrame::error_response("", "user system not initialized"),
+        };
+        if db.verify_password(&ctx.email, reauth_password).is_err() {
+            let _ = db.log_action(
+                Some(&ctx.user_id),
+                "maintenance.enable_reauth_failed",
+                Some(&ctx.user_id),
+                None,
+                None,
+            );
+            return WsFrame::error_response("", "re-auth password is incorrect");
+        }
+
+        let ttl_hours = params
+            .get("ttl_hours")
+            .and_then(Value::as_i64)
+            .unwrap_or(crate::maintenance::DEFAULT_TTL_HOURS);
+        let sub_capabilities: Vec<String> = params
+            .get("sub_capabilities")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+
+        match crate::maintenance::enable(self.home_dir(), &ctx.user_id, &ctx.email, ttl_hours, &sub_capabilities)
+            .await
+        {
+            Ok(window) => {
+                let status = crate::maintenance::status_json(self.home_dir())
+                    .await
+                    .unwrap_or_else(|_| json!({"active": true}));
+                self.broadcast_event("maintenance.status_changed", status).await;
+                WsFrame::ok_response("", json!({ "window": window }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `maintenance.disable` — no confirm/re-auth: turning OFF a sensitive
+    /// mode is the safe direction, matching every other danger-zone RPC in
+    /// this codebase (only the destructive/opening action requires
+    /// confirmation).
+    async fn handle_maintenance_disable(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let reason = params.get("reason").and_then(Value::as_str);
+        match crate::maintenance::disable(self.home_dir(), &ctx.user_id, reason).await {
+            Ok(window) => {
+                let status = crate::maintenance::status_json(self.home_dir())
+                    .await
+                    .unwrap_or_else(|_| json!({"active": false}));
+                self.broadcast_event("maintenance.status_changed", status).await;
+                WsFrame::ok_response("", json!({ "window": window }))
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `maintenance.status` — current state + the live SSH probe. Read-only,
+    /// no confirm needed.
+    async fn handle_maintenance_status(&self) -> WsFrame {
+        match crate::maintenance::status_json(self.home_dir()).await {
+            Ok(status) => WsFrame::ok_response("", status),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `maintenance.history` — paginated JSONL audit trail (§2.8: `limit`
+    /// default 100, capped at 1000, mirroring the `cloud-control-plane`
+    /// `audit::list` convention this design cites).
+    fn handle_maintenance_history(&self, params: Value) -> WsFrame {
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| v.min(1000) as usize)
+            .unwrap_or(100);
+        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        match crate::maintenance::history_json(self.home_dir(), limit, offset) {
+            Ok(history) => WsFrame::ok_response("", history),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `maintenance.log_access` — §2.3's "每一次「顯示詳情」還原原文...各自
+    /// 獨立記一筆" requirement. Called by the dashboard the moment an
+    /// operator expands a `device.*` op's full raw output while maintenance
+    /// mode's `show_details` sub-capability is unlocked; refuses (via
+    /// `maintenance::log_access`'s own fail-closed check) if that is not
+    /// actually true, so a stray call cannot manufacture a false audit line.
+    async fn handle_maintenance_log_access(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let operation = params.get("operation").and_then(Value::as_str).unwrap_or("unknown");
+        let mut fields = serde_json::Map::new();
+        fields.insert("operation".to_string(), json!(operation));
+        match crate::maintenance::log_access(
+            self.home_dir(),
+            &ctx.user_id,
+            &ctx.email,
+            "access_view_detail",
+            fields,
+        )
+        .await
+        {
+            Ok(()) => WsFrame::ok_response("", json!({"logged": true})),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
 }
 
 /// Outcome of [`create_device_backup_archive`] — every branch the original
@@ -45431,6 +45634,73 @@ mod device_rpc_tests {
     fn network_write_detection_gates_static_ip_params() {
         assert!(crate::device::is_network_write_request(&json!({"static_ip": "10.0.0.5"})));
         assert!(!crate::device::is_network_write_request(&json!({})));
+    }
+
+    // ── T1 (DESIGN-agent-body-network-2026-08.md §12): wifi_connect audit source ──
+
+    /// `network.wifi_connect`'s audit row must carry `source:
+    /// "operator_console_prompted"` only when the caller says so with that
+    /// exact string — every other value, wrong JSON type, or missing field
+    /// degrades to the pre-existing `"dashboard"`. A client can never forge
+    /// an arbitrary audit attribution label through this field.
+    #[test]
+    fn wifi_connect_audit_source_is_a_closed_allowlist() {
+        assert_eq!(
+            MethodHandler::wifi_connect_audit_source(Some(&json!("operator_console_prompted"))),
+            "operator_console_prompted"
+        );
+        assert_eq!(MethodHandler::wifi_connect_audit_source(None), "dashboard");
+        assert_eq!(
+            MethodHandler::wifi_connect_audit_source(Some(&json!("settings_page"))),
+            "dashboard"
+        );
+        assert_eq!(MethodHandler::wifi_connect_audit_source(Some(&json!(42))), "dashboard");
+        assert_eq!(MethodHandler::wifi_connect_audit_source(Some(&Value::Null)), "dashboard");
+    }
+
+    /// End-to-end: calling the handler METHOD directly (bypassing the
+    /// `require_appliance!()` dispatch gate — same convention
+    /// `mcp_os_ops.rs`'s O-0 tool tests use for `handle_os_wifi_connect`)
+    /// with `source: "operator_console_prompted"` in params must produce an
+    /// audit row carrying that source. Off-Linux this call always fails at
+    /// the `network::wifi_connect` facade (`non_linux_error`) — irrelevant
+    /// here, since success/failure of the connect itself is orthogonal to
+    /// which `source` label the audit row carries (`audit_wifi_event` is
+    /// called on both the `Ok` and `Err` arms).
+    #[tokio::test]
+    async fn wifi_connect_audit_row_carries_operator_console_source() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let _ = handler
+            .handle_network_wifi_connect(json!({
+                "ssid": "iPhone-Sam",
+                "source": "operator_console_prompted",
+            }))
+            .await;
+
+        let events = duduclaw_security::audit::read_recent_events(home.path(), 10);
+        let row = events
+            .iter()
+            .find(|e| e.event_type == "wifi_connect")
+            .expect("wifi_connect audit row must exist");
+        assert_eq!(row.details["source"], "operator_console_prompted");
+        assert_eq!(row.details["ssid"], "iPhone-Sam");
+        // No psk, no "was a psk supplied" flag anywhere in the row.
+        assert!(row.details.get("psk").is_none());
+    }
+
+    /// A caller that omits `source` entirely (every pre-T1 caller, e.g. a
+    /// human using the dashboard's own network Settings page) must keep
+    /// getting `"dashboard"` — byte-identical to before this change.
+    #[tokio::test]
+    async fn wifi_connect_audit_row_defaults_to_dashboard_source() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let _ = handler.handle_network_wifi_connect(json!({ "ssid": "DuDu-Office" })).await;
+
+        let events = duduclaw_security::audit::read_recent_events(home.path(), 10);
+        let row = events.iter().find(|e| e.event_type == "wifi_connect").unwrap();
+        assert_eq!(row.details["source"], "dashboard");
     }
 }
 

@@ -41,7 +41,17 @@ import type {
  *    read-only `os_*` tool call a `system_operator` agent actually made this
  *    turn to `device_status` / `update_status` / `backup_result` /
  *    `network_info` — the RESULT half, as opposed to `marker_to_artifact`'s
- *    PENDING-confirmation half. `approval_request` still has no production
+ *    PENDING-confirmation half.
+ *  - `extract_wifi_password_request_artifact` (T1,
+ *    `commercial/docs/DESIGN-agent-body-network-2026-08.md` §5.2/§12) maps
+ *    the turn's LATEST `os_wifi_connect` call, when it failed with
+ *    `wrong_password`, to `wifi_password_request` — a THIRD source
+ *    alongside the two above, triggered by one specific FAILURE of a write
+ *    tool rather than a pre-decided pending confirmation or a successful
+ *    read. See `WifiPasswordRequestArtifact`'s own doc comment for the
+ *    security design this card exists to enforce.
+ *
+ *    `approval_request` still has no production
  *    producer and remains proven only against `./fixtures.ts` and component
  *    tests. `assistant_chunk` (streaming) and `historyToMessages`
  *    (resumed-conversation history) still never set it — only the settled
@@ -55,7 +65,8 @@ export type ChatArtifactType =
   | 'network_info'
   | 'confirm_action'
   | 'update_confirm'
-  | 'approval_request';
+  | 'approval_request'
+  | 'wifi_password_request';
 
 interface ChatArtifactBase<T extends ChatArtifactType> {
   readonly type: T;
@@ -174,6 +185,31 @@ export interface ApprovalRequestArtifact extends ChatArtifactBase<'approval_requ
   readonly payload: ApprovalItem;
 }
 
+/**
+ * T1 (`commercial/docs/DESIGN-agent-body-network-2026-08.md` §5/§12): renders
+ * as `WifiPasswordRequestCard` — a masked password field + connect button
+ * handed off from a `system_operator` agent's `os_wifi_connect` failing with
+ * `wrong_password` (a new secured network `known: false` from a prior
+ * `os_wifi_scan`, per design §3.3). This is the platform's ONE hard security
+ * boundary in the whole O-3 family: the payload is DELIBERATELY minimal
+ * (`ssid` only, no `security` label — see the card's own doc comment for
+ * why that's a considered omission, not a missed field) because the
+ * password itself must NEVER be constructible from, or ever touch, anything
+ * that flows through an agent's context. The card's submit button calls the
+ * `network.wifi_connect` dashboard RPC DIRECTLY from the browser — the same
+ * already-authenticated admin WebSocket `/console` itself runs on — never
+ * routing the passphrase through a chat message, a tool-call argument, or
+ * any store this module's sibling artifacts share. See
+ * `WifiPasswordRequestCard.tsx` for the full security review.
+ */
+export interface WifiPasswordRequestPayload {
+  readonly ssid: string;
+}
+
+export interface WifiPasswordRequestArtifact extends ChatArtifactBase<'wifi_password_request'> {
+  readonly payload: WifiPasswordRequestPayload;
+}
+
 /** The full discriminated union `ChatArtifactCard` dispatches on. */
 export type ChatArtifact =
   | DeviceStatusArtifact
@@ -182,4 +218,5 @@ export type ChatArtifact =
   | NetworkInfoArtifact
   | ConfirmActionArtifact
   | UpdateConfirmArtifact
-  | ApprovalRequestArtifact;
+  | ApprovalRequestArtifact
+  | WifiPasswordRequestArtifact;

@@ -6,6 +6,7 @@ import { NetworkInfoCard } from './NetworkInfoCard';
 import { ConfirmActionCard } from './ConfirmActionCard';
 import { UpdateConfirmCard } from './UpdateConfirmCard';
 import { ApprovalRequestCard } from './ApprovalRequestCard';
+import { WifiPasswordRequestCard } from './WifiPasswordRequestCard';
 
 /**
  * ChatArtifactCard — the single dispatch point O-1/O-4 render through: given
@@ -33,6 +34,8 @@ export function ChatArtifactCard({ artifact }: { artifact: ChatArtifact }) {
       return <UpdateConfirmCard payload={artifact.payload} />;
     case 'approval_request':
       return <ApprovalRequestCard payload={artifact.payload} />;
+    case 'wifi_password_request':
+      return <WifiPasswordRequestCard payload={artifact.payload} />;
     default: {
       const exhaustive: never = artifact;
       console.warn('[ChatArtifactCard] unknown artifact type', exhaustive);

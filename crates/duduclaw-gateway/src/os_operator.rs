@@ -449,6 +449,77 @@ pub fn extract_readonly_result_artifact(events: &[NativeToolEvent]) -> Option<Va
     })
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// T1 (`commercial/docs/DESIGN-agent-body-network-2026-08.md` §5.2/§12): the
+// THIRD O-4→O-3 artifact source. Neither `marker_to_artifact` (a PENDING
+// confirmation decided BEFORE any tool call, from static `OsIntentResult`
+// params) nor `extract_readonly_result_artifact` (a SUCCESSFUL read-only
+// tool result) fits this case: `os_wifi_connect` is a write tool, and the
+// signal that matters here is one SPECIFIC FAILURE of that write —
+// `wrong_password` — which means "hand off to a secure human-facing input
+// surface", never "report the error and stop" (see `os_wifi_connect`'s own
+// doc comment in `mcp_os_ops.rs` for why). This module still never calls an
+// MCP tool handler or does any I/O — same guardrail as the rest of the
+// file — it only reads back the already-masked `NativeToolEvent` evidence
+// the CLI's own stream already captured.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Scan one turn's captured [`NativeToolEvent`]s for the LATEST
+/// `os_wifi_connect` call, and — only if that latest attempt failed with
+/// `wrong_password` — map it to the `wifi_password_request` O-3
+/// chat-artifact (`web/src/components/console/WifiPasswordRequestCard.tsx`):
+/// the card that lets a human type the passphrase directly into a masked
+/// field wired to the `network.wifi_connect` dashboard RPC, never through
+/// this agent's context (design §5.2). The payload carries ONLY `ssid` —
+/// never a password, and never anything the original failed tool call
+/// didn't already know structurally (`os_wifi_connect`'s MCP schema has no
+/// `psk` field at all, so there is nothing secret in `ev.input_text` to
+/// accidentally forward here even in principle).
+///
+/// Deliberately does NOT "keep scanning backward" past a non-matching
+/// latest `os_wifi_connect` call the way [`extract_readonly_result_artifact`]
+/// skips past an unrelated failed tool: only the FRESHEST connect attempt's
+/// outcome is ever eligible. If that freshest attempt already succeeded (or
+/// failed for a different reason), an EARLIER `wrong_password` failure in
+/// the same turn must never resurface as a stale prompt — the human may
+/// already be past that point. Every other tool call in the turn is simply
+/// irrelevant to this extractor (it does not compete with
+/// `extract_readonly_result_artifact` for "last qualifying event overall";
+/// the caller in `channel_reply.rs` tries this extractor first and falls
+/// back to the readonly one).
+///
+/// Fail-closed to `None` at every step (never guesses):
+///  - no `os_wifi_connect` call this turn, or the latest one succeeded →
+///    `None`.
+///  - result text missing/unparseable, or its `code` isn't literally
+///    `"wrong_password"` → `None`.
+///  - input text missing/unparseable, or its `ssid` isn't a non-empty
+///    string → `None` (never renders a card with no network name to show).
+pub fn extract_wifi_password_request_artifact(events: &[NativeToolEvent]) -> Option<Value> {
+    let last_connect = events.iter().rev().find(|ev| {
+        let bare = ev.tool_name.rsplit("__").next().unwrap_or(&ev.tool_name);
+        bare == "os_wifi_connect"
+    })?;
+    if last_connect.success {
+        return None;
+    }
+    let result_text = last_connect.result_text.as_deref()?;
+    let result_json: Value = serde_json::from_str(result_text).ok()?;
+    if result_json.get("code").and_then(Value::as_str) != Some("wrong_password") {
+        return None;
+    }
+    let input_text = last_connect.input_text.as_deref()?;
+    let input_json: Value = serde_json::from_str(input_text).ok()?;
+    let ssid = input_json.get("ssid").and_then(Value::as_str)?;
+    if ssid.trim().is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "wifi_password_request",
+        "payload": { "ssid": ssid },
+    }))
+}
+
 /// Build the directive appended to the dynamic (never-cached) tail of the
 /// system prompt for a resolved, non-destructive `SystemOp` — guidance
 /// only, never a substitute for the tool's own gate: if the tool call is
@@ -1170,5 +1241,149 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "system_operator_intent");
         assert_eq!(events[0].agent_id, "sysop");
+    }
+
+    // ── T1: extract_wifi_password_request_artifact ─────────────────────────
+
+    /// Test helper: a masked-text-carrying `NativeToolEvent` that also sets
+    /// `input_text` (unlike [`native_ev`] above, which always leaves it
+    /// `None` — none of the pre-T1 tests needed a tool CALL's arguments).
+    fn native_ev_with_input(
+        tool_name: &str,
+        success: bool,
+        result_text: Option<&str>,
+        input_text: Option<&str>,
+    ) -> NativeToolEvent {
+        NativeToolEvent {
+            tool_name: tool_name.to_string(),
+            success,
+            result_text: result_text.map(str::to_string),
+            input_text: input_text.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn wifi_password_request_fires_on_wrong_password() {
+        let events = vec![native_ev_with_input(
+            "mcp__duduclaw__os_wifi_connect",
+            false,
+            Some(r#"{"code":"wrong_password","message":"密碼不正確，請重新輸入"}"#),
+            Some(r#"{"ssid":"iPhone-Sam","confirm":true}"#),
+        )];
+        let artifact = extract_wifi_password_request_artifact(&events).unwrap();
+        assert_eq!(artifact["type"], "wifi_password_request");
+        assert_eq!(artifact["payload"]["ssid"], "iPhone-Sam");
+        // No other field — never a psk, never a guessed security label.
+        assert_eq!(artifact["payload"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wifi_password_request_bare_name_matches_unqualified_too() {
+        let events = vec![native_ev_with_input(
+            "os_wifi_connect",
+            false,
+            Some(r#"{"code":"wrong_password","message":"x"}"#),
+            Some(r#"{"ssid":"DuDu-Guest"}"#),
+        )];
+        assert!(extract_wifi_password_request_artifact(&events).is_some());
+    }
+
+    #[test]
+    fn wifi_password_request_never_fires_on_other_error_codes() {
+        for code in ["out_of_range", "not_found", "backend_unavailable", "no_adapter"] {
+            let events = vec![native_ev_with_input(
+                "mcp__duduclaw__os_wifi_connect",
+                false,
+                Some(&format!(r#"{{"code":"{code}","message":"x"}}"#)),
+                Some(r#"{"ssid":"DuDu-Office"}"#),
+            )];
+            assert!(
+                extract_wifi_password_request_artifact(&events).is_none(),
+                "code {code} must never trigger a password prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn wifi_password_request_never_fires_on_success() {
+        let events = vec![native_ev_with_input(
+            "mcp__duduclaw__os_wifi_connect",
+            true,
+            Some(r#"{"state":"connected","ssid":"DuDu-Office"}"#),
+            Some(r#"{"ssid":"DuDu-Office"}"#),
+        )];
+        assert!(extract_wifi_password_request_artifact(&events).is_none());
+    }
+
+    #[test]
+    fn wifi_password_request_missing_ssid_is_none() {
+        let events = vec![native_ev_with_input(
+            "mcp__duduclaw__os_wifi_connect",
+            false,
+            Some(r#"{"code":"wrong_password","message":"x"}"#),
+            Some(r#"{"confirm":true}"#), // no ssid — malformed/truncated input
+        )];
+        assert!(extract_wifi_password_request_artifact(&events).is_none());
+    }
+
+    #[test]
+    fn wifi_password_request_missing_input_text_is_none() {
+        let events = vec![native_ev_with_input(
+            "mcp__duduclaw__os_wifi_connect",
+            false,
+            Some(r#"{"code":"wrong_password","message":"x"}"#),
+            None,
+        )];
+        assert!(extract_wifi_password_request_artifact(&events).is_none());
+    }
+
+    #[test]
+    fn wifi_password_request_ignores_smuggled_psk_in_input_text() {
+        // Defence in depth: even if some future bug let a `psk`-shaped key
+        // leak into the masked input text, this extractor must never read
+        // or forward it — only `ssid` is ever pulled out.
+        let events = vec![native_ev_with_input(
+            "mcp__duduclaw__os_wifi_connect",
+            false,
+            Some(r#"{"code":"wrong_password","message":"x"}"#),
+            Some(r#"{"ssid":"iPhone-Sam","psk":"should-never-appear"}"#),
+        )];
+        let artifact = extract_wifi_password_request_artifact(&events).unwrap();
+        assert!(!artifact.to_string().contains("should-never-appear"));
+        assert_eq!(artifact["payload"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wifi_password_request_only_considers_the_latest_connect_attempt() {
+        // A stale earlier failure must never resurface once a LATER attempt
+        // in the same turn settled (success here) — see this function's own
+        // doc comment for why it deliberately does NOT "keep scanning
+        // backward" past a non-matching latest attempt.
+        let events = vec![
+            native_ev_with_input(
+                "mcp__duduclaw__os_wifi_connect",
+                false,
+                Some(r#"{"code":"wrong_password","message":"x"}"#),
+                Some(r#"{"ssid":"iPhone-Sam"}"#),
+            ),
+            native_ev_with_input(
+                "mcp__duduclaw__os_wifi_connect",
+                true,
+                Some(r#"{"state":"connected","ssid":"DuDu-Office"}"#),
+                Some(r#"{"ssid":"DuDu-Office"}"#),
+            ),
+        ];
+        assert!(extract_wifi_password_request_artifact(&events).is_none());
+    }
+
+    #[test]
+    fn wifi_password_request_empty_events_is_none() {
+        assert!(extract_wifi_password_request_artifact(&[]).is_none());
+    }
+
+    #[test]
+    fn wifi_password_request_unrelated_tool_only_is_none() {
+        let events = vec![native_ev_with_input("Bash", false, Some("x"), Some("{}"))];
+        assert!(extract_wifi_password_request_artifact(&events).is_none());
     }
 }

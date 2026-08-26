@@ -90,7 +90,7 @@ export const toast = {
 // message id directly — callers outside the React tree keep working.
 
 import { messages, useLocaleStore } from '@/i18n';
-import { classifyError, sanitizeErrorDetail } from './error-message';
+import { classifyError, sanitizeErrorDetail, sanitizeErrorDetailFull } from './error-message';
 
 /** Short clause key for a classified error (`errorState.manage.short.*`). */
 export function errorShortKey(err: unknown): string {
@@ -192,9 +192,28 @@ interface DeviceOpLike {
  * (the caller already renders its own "完成" badge/toast) — this returns
  * only the masked, length-capped residue as a supporting detail line, or ''
  * when there is nothing worth showing.
+ *
+ * `maintenanceModeActive` (`DESIGN-maintenance-mode-2026-08.md` §2.6): while
+ * maintenance mode's `show_details` sub-capability is unlocked, this bypasses
+ * the classify/truncate layer entirely and returns the COMPLETE multi-line
+ * stdout+stderr instead — the design's whole point is that an operator who
+ * explicitly unlocked this (Admin-only, type-to-confirm, re-auth, hard TTL)
+ * gets to see what a shell-out actually printed, not a 120-char summary.
+ * Secret redaction is NOT relaxed either way (§6 threat 4) — see
+ * `sanitizeErrorDetailFull`'s doc comment. Every existing call site keeps its
+ * exact prior behavior when this parameter is omitted or `false`.
+ *
+ * This function does the text formatting ONLY. The caller is responsible for
+ * (a) knowing maintenance mode is actually active with `show_details`
+ * unlocked before passing `true` (typically from a `maintenance.status()`
+ * read), (b) prefixing/labelling the panel as "維修模式資訊" so a user is
+ * never confused about why they suddenly see more than usual, and (c) firing
+ * the `maintenance.logAccess` audit call — this module stays outside the
+ * React tree and has no RPC client to call it with.
  */
-export function formatDeviceOpDetail(res: DeviceOpLike): string {
+export function formatDeviceOpDetail(res: DeviceOpLike, maintenanceModeActive = false): string {
   const combined = [res.stdout, res.stderr].filter(Boolean).join('\n');
   if (!combined.trim()) return '';
+  if (maintenanceModeActive) return sanitizeErrorDetailFull(combined);
   return res.success ? sanitizeErrorDetail(combined, TOAST_DETAIL_MAX_CHARS) : formatError(combined);
 }

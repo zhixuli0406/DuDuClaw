@@ -249,6 +249,24 @@ pub enum SysdRequest {
     /// comment above for why that is enough to keep this verb out of the
     /// argv/path-injection hazard the rest of this file documents.
     ClearExhaustedUpdateTarget { version: String },
+    /// `systemctl start ssh.service`. Fieldless — the unit name is a fixed
+    /// literal, never a caller-supplied string, so there is no way to point
+    /// this verb at an arbitrary unit (see `dispatch.rs`'s module doc for the
+    /// "every argv is a literal" rule this mirrors).
+    ///
+    /// Maintenance-mode Entry A (`commercial/docs/DESIGN-maintenance-mode-2026-08.md`
+    /// §2.6): the ONE verb that actually changes the device's network attack
+    /// surface, gated dashboard-side by Admin-only + type-to-confirm + a hard
+    /// TTL. This daemon has no opinion about TTL/authorization policy at all
+    /// — it only ever runs the literal command; the gateway decides when to
+    /// send it.
+    SshServiceStart,
+    /// `systemctl stop ssh.service` — the close side of [`SysdRequest::SshServiceStart`].
+    /// Idempotent: stopping an already-stopped unit is still `success: true`
+    /// (systemd's own behavior), which is exactly what the maintenance-mode
+    /// TTL sweep / gateway-restart reassert-closed path relies on — calling
+    /// this when SSH was never started must never be an error.
+    SshServiceStop,
 }
 
 impl SysdRequest {
@@ -270,6 +288,8 @@ impl SysdRequest {
             SysdRequest::SetNtp { .. } => "set_ntp",
             SysdRequest::NetworkWiredConfig { .. } => "network_wired_config",
             SysdRequest::ClearExhaustedUpdateTarget { .. } => "clear_exhausted_update_target",
+            SysdRequest::SshServiceStart => "ssh_service_start",
+            SysdRequest::SshServiceStop => "ssh_service_stop",
         }
     }
 }
@@ -350,11 +370,24 @@ mod tests {
             SysdRequest::UpdateRollback,
             SysdRequest::FactoryReset,
             SysdRequest::ClearNetworkCredentials,
+            SysdRequest::SshServiceStart,
+            SysdRequest::SshServiceStop,
         ] {
             let s = serde_json::to_string(&req).unwrap();
             let back: SysdRequest = serde_json::from_str(&s).unwrap();
             assert_eq!(req, back, "round-trip mismatch for {s}");
         }
+    }
+
+    #[test]
+    fn ssh_service_verbs_have_the_documented_stable_wire_shape() {
+        let s = serde_json::to_string(&SysdRequest::SshServiceStart).unwrap();
+        assert_eq!(s, r#"{"verb":"ssh_service_start"}"#);
+        assert_eq!(SysdRequest::SshServiceStart.verb_name(), "ssh_service_start");
+
+        let s = serde_json::to_string(&SysdRequest::SshServiceStop).unwrap();
+        assert_eq!(s, r#"{"verb":"ssh_service_stop"}"#);
+        assert_eq!(SysdRequest::SshServiceStop.verb_name(), "ssh_service_stop");
     }
 
     #[test]

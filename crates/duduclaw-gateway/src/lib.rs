@@ -133,6 +133,7 @@ pub mod expert_admin;
 pub mod expert_generate;
 pub mod capability;
 pub mod capability_grants;
+pub mod maintenance;
 pub mod growth;
 pub mod custom_skills;
 pub mod custom_widgets;

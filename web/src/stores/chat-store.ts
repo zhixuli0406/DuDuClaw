@@ -361,6 +361,7 @@ const KNOWN_ARTIFACT_TYPES: ReadonlySet<ChatArtifactType> = new Set([
   'confirm_action',
   'update_confirm',
   'approval_request',
+  'wifi_password_request',
 ]);
 
 /**

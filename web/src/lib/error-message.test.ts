@@ -3,6 +3,7 @@ import {
   classifyError,
   errorReasonKey,
   sanitizeErrorDetail,
+  sanitizeErrorDetailFull,
 } from './error-message';
 
 describe('classifyError', () => {
@@ -136,5 +137,49 @@ describe('sanitizeErrorDetail', () => {
 
   it('collapses whitespace', () => {
     expect(sanitizeErrorDetail('a\t\t  b   c')).toBe('a b c');
+  });
+});
+
+/**
+ * `sanitizeErrorDetailFull` — the maintenance-mode "顯示詳情" full-disclosure
+ * primitive (`DESIGN-maintenance-mode-2026-08.md` §2.6/§6 threat 4). Keeps
+ * every line and a much larger cap than `sanitizeErrorDetail`, but must run
+ * through the EXACT same redaction ruleset — that's the whole point of
+ * `redactSecrets` being a shared internal helper rather than two copies.
+ */
+describe('sanitizeErrorDetailFull', () => {
+  it('keeps every line, unlike sanitizeErrorDetail (first-line-only)', () => {
+    const text = 'first line\nsecond line\nthird line';
+    expect(sanitizeErrorDetail(text)).toBe('first line');
+    const full = sanitizeErrorDetailFull(text);
+    expect(full).toContain('first line');
+    expect(full).toContain('second line');
+    expect(full).toContain('third line');
+  });
+
+  it('still redacts secrets across every line, not just the first', () => {
+    const text = `line one\ntoken=${'a1b2c3d4'.repeat(6)}\nline three`;
+    const out = sanitizeErrorDetailFull(text);
+    expect(out).not.toContain('a1b2c3d4a1b2c3d4');
+    expect(out).toContain('token=***');
+    expect(out).toContain('line three');
+  });
+
+  it('still strips HTML and redacts a bearer token', () => {
+    const out = sanitizeErrorDetailFull('<p>error</p> Authorization: Bearer abcd1234efgh5678');
+    expect(out).not.toContain('<p>');
+    expect(out).toContain('Bearer ***');
+  });
+
+  it('truncates by codepoint at a much larger default cap than sanitizeErrorDetail', () => {
+    const long = 'a'.repeat(30000);
+    const out = sanitizeErrorDetailFull(long);
+    expect(Array.from(out).length).toBeLessThanOrEqual(20001);
+    expect(out.endsWith('…')).toBe(true);
+  });
+
+  it('returns an empty string when there is nothing to show', () => {
+    expect(sanitizeErrorDetailFull(undefined)).toBe('');
+    expect(sanitizeErrorDetailFull('')).toBe('');
   });
 });

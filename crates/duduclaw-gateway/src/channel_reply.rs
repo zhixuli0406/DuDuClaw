@@ -1012,9 +1012,16 @@ pub async fn build_reply_for_agent(
 /// Task C (O-4 Guide-path result cards): run [`build_reply_with_session_inner`]
 /// inside a fresh [`crate::runtime::NATIVE_TOOL_COLLECTOR`] scope and pair its
 /// raw text with any read-only `os_*` result artifact captured during the
-/// turn (`os_operator::extract_readonly_result_artifact`). Unconditional and
-/// cheap for every caller: a non-`system_operator` agent's turn never
-/// populates the collector at all (the capture hook inside
+/// turn (`os_operator::extract_readonly_result_artifact`) — OR, per T1
+/// (`commercial/docs/DESIGN-agent-body-network-2026-08.md` §5.2/§12), a
+/// `wifi_password_request` artifact when the turn's LATEST `os_wifi_connect`
+/// call failed with `wrong_password`
+/// (`os_operator::extract_wifi_password_request_artifact`). The password
+/// prompt is tried FIRST — it is time-sensitive and actionable in a way a
+/// generic status card is not, so it wins even if the same turn also called
+/// a qualifying read-only tool (e.g. a status check made before the connect
+/// attempt). Unconditional and cheap for every caller: a non-`system_operator`
+/// agent's turn never populates the collector at all (the capture hook inside
 /// `spawn_claude_cli_with_env` is itself capability-gated), so this costs one
 /// empty `Vec` allocation and is otherwise behavior-neutral — the returned
 /// artifact is `None` exactly as often as before this existed.
@@ -1041,10 +1048,10 @@ async fn build_reply_with_session_inner_capturing_operator_result(
             ),
         )
         .await;
-    let operator_result_artifact = collector
-        .lock()
-        .ok()
-        .and_then(|events| crate::os_operator::extract_readonly_result_artifact(&events));
+    let operator_result_artifact = collector.lock().ok().and_then(|events| {
+        crate::os_operator::extract_wifi_password_request_artifact(&events)
+            .or_else(|| crate::os_operator::extract_readonly_result_artifact(&events))
+    });
     (raw, operator_result_artifact)
 }
 
@@ -11512,6 +11519,48 @@ mod pty_operator_result_capture_tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].success);
         assert!(crate::os_operator::extract_readonly_result_artifact(&events).is_some());
+    }
+
+    /// T1 end-to-end: a real stream-json `os_wifi_connect` failure
+    /// (`isError: true`, `code: "wrong_password"`) buffered exactly like
+    /// PTY-pool's one-shot `output.stdout` would carry it — must pair and
+    /// then map to the `wifi_password_request` O-3 artifact via
+    /// `os_operator::extract_wifi_password_request_artifact`, the SAME
+    /// function `build_reply_with_session_inner_capturing_operator_result`
+    /// now tries first.
+    #[test]
+    fn wifi_connect_wrong_password_pairs_and_yields_password_request_artifact() {
+        let stdout = String::new()
+            + &line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"os_wifi_connect","input":{"ssid":"iPhone-Sam","confirm":true}}]}}"#,
+            )
+            + &line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","is_error":true,"content":"{\"code\":\"wrong_password\",\"message\":\"密碼不正確，請重新輸入\"}"}]}}"#,
+            );
+        let events = collect_operator_native_events_from_stdout(&stdout);
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].success);
+
+        let artifact = crate::os_operator::extract_wifi_password_request_artifact(&events)
+            .expect("wrong_password os_wifi_connect failure must map to an artifact");
+        assert_eq!(artifact["type"], "wifi_password_request");
+        assert_eq!(artifact["payload"]["ssid"], "iPhone-Sam");
+    }
+
+    /// A successful `os_wifi_connect` (known network / open network, per
+    /// design §3.3) must never produce a password-request card — the whole
+    /// point of that path is that no password was ever needed.
+    #[test]
+    fn wifi_connect_success_yields_no_password_request_artifact() {
+        let stdout = String::new()
+            + &line(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"os_wifi_connect","input":{"ssid":"DuDu-Office","confirm":true}}]}}"#,
+            )
+            + &line(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","is_error":false,"content":"{\"state\":\"connected\",\"ssid\":\"DuDu-Office\"}"}]}}"#,
+            );
+        let events = collect_operator_native_events_from_stdout(&stdout);
+        assert!(crate::os_operator::extract_wifi_password_request_artifact(&events).is_none());
     }
 }
 

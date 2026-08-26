@@ -1262,6 +1262,16 @@ pub async fn dispatch(req: &SysdRequest) -> DispatchResult {
         SysdRequest::ClearExhaustedUpdateTarget { version } => {
             dispatch_clear_exhausted_update_target(version).await
         }
+        SysdRequest::SshServiceStart => {
+            let mut cmd = Command::new("systemctl");
+            cmd.args(["start", "ssh.service"]);
+            run(cmd).await
+        }
+        SysdRequest::SshServiceStop => {
+            let mut cmd = Command::new("systemctl");
+            cmd.args(["stop", "ssh.service"]);
+            run(cmd).await
+        }
     }
 }
 

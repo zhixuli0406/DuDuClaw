@@ -22,6 +22,8 @@ export type {
   UpdateConfirmTarget,
   UpdateConfirmPayload,
   ApprovalRequestArtifact,
+  WifiPasswordRequestArtifact,
+  WifiPasswordRequestPayload,
 } from './artifact-types';
 export { ChatArtifactCard } from './ChatArtifactCard';
 export { ArtifactShell } from './ArtifactShell';
@@ -33,3 +35,4 @@ export { NetworkInfoCard } from './NetworkInfoCard';
 export { ConfirmActionCard } from './ConfirmActionCard';
 export { UpdateConfirmCard } from './UpdateConfirmCard';
 export { ApprovalRequestCard } from './ApprovalRequestCard';
+export { WifiPasswordRequestCard } from './WifiPasswordRequestCard';

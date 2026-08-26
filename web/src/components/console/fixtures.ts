@@ -158,6 +158,15 @@ export const FIXTURE_APPROVAL_REQUEST: ChatArtifact = {
   },
 };
 
+/** T1 (`DESIGN-agent-body-network-2026-08.md` §5.2/§12) — the payload is
+ *  deliberately just `{ssid}`, see `WifiPasswordRequestArtifact`'s own doc
+ *  comment for why that's a considered omission, not a missed field. */
+export const FIXTURE_WIFI_PASSWORD_REQUEST: ChatArtifact = {
+  type: 'wifi_password_request',
+  id: 'fixture-wifi-password-request',
+  payload: { ssid: 'iPhone-Sam' },
+};
+
 /** Every fixture, keyed by a stable id — used by the showcase test to render
  *  one of each artifact type in a single pass. */
 export const ALL_FIXTURES: readonly ChatArtifact[] = [
@@ -173,4 +182,5 @@ export const ALL_FIXTURES: readonly ChatArtifact[] = [
   FIXTURE_UPDATE_CONFIRM_DEVICE,
   FIXTURE_UPDATE_CONFIRM_SYSTEM,
   FIXTURE_APPROVAL_REQUEST,
+  FIXTURE_WIFI_PASSWORD_REQUEST,
 ];

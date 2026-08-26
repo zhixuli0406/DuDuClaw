@@ -2538,6 +2538,65 @@ export interface DeviceNetworkInterface {
   addresses: string[];
 }
 
+/** D4a `network.wifi_scan` — one nearby (or already-known) Wi-Fi network.
+ *  `security` is a closed vocabulary (`"open" | "wep" | "psk" | "8021x" |
+ *  "unknown"`, `crates/duduclaw-gateway/src/network/mod.rs`'s `WifiNetwork`
+ *  doc), kept as `string` here rather than a TS union so an unrecognized
+ *  future value degrades to an unstyled label instead of a type error.
+ *  `known: true` means iwd already holds a stored credential for this SSID
+ *  (a prior successful connect) — `os_wifi_connect`/`network.wifi_connect`
+ *  can join it with no `psk` at all. */
+export interface WifiNetwork {
+  ssid: string;
+  signal_bars: number;
+  security: string;
+  connected: boolean;
+  known: boolean;
+  hidden: boolean;
+}
+
+export interface WifiScanResult {
+  networks: WifiNetwork[];
+  scanning: boolean;
+}
+
+/** One `maintenance_windows` row (`DESIGN-maintenance-mode-2026-08.md` §2.4).
+ *  `remaining_seconds` is `null` once revoked — mirrors the Rust
+ *  `MaintenanceWindow::remaining_seconds` contract. */
+export interface MaintenanceWindow {
+  id: string;
+  enabled_by: string;
+  enabled_by_email: string;
+  enabled_at: string;
+  ttl_seconds: number;
+  expires_at: string;
+  sub_capabilities: string[];
+  remaining_seconds: number | null;
+}
+
+/** `maintenance.status` payload. `ssh_observed_active` is a LIVE probe
+ *  (`systemctl is-active ssh.service`), deliberately separate from
+ *  `window`'s ledger state — a mismatch (e.g. `active: false` but
+ *  `ssh_observed_active: true`) means a close action failed and SSH is
+ *  still actually reachable; see §6 fail-closed principle #2. `null` = no
+ *  live signal available (off-appliance, or the probe itself failed). */
+export interface MaintenanceStatus {
+  active: boolean;
+  window: MaintenanceWindow | null;
+  ssh_observed_active: boolean | null;
+}
+
+/** One line from `maintenance_audit.jsonl`, surfaced via `maintenance.history`.
+ *  `kind` is one of: `enabled` / `disabled` / `ttl_expired` /
+ *  `gateway_restart_revoked` / `reminder_sent` / `access_view_detail` /
+ *  `enable_failed` / `enable_race_rolled_back`. Extra fields vary by kind, so
+ *  this is intentionally loose beyond the two always-present columns. */
+export interface MaintenanceAuditEvent {
+  ts_ms: number;
+  kind: string;
+  [key: string]: unknown;
+}
+
 /** `device.status` payload. Every field but `cpu_cores`/`network_interfaces`
  *  is `null` when the underlying sensor can't be read (off-appliance-Linux
  *  dev host, or hardware with no exposed sensor) — `null` is a normal, honest
@@ -6212,5 +6271,61 @@ export const api = {
      *  gateway actually restarts. */
     backupRestore: (path: string) =>
       client.call('device.backup_restore', { path, confirm: true }) as Promise<DeviceBackupRestoreResult>,
+  },
+  // ── Maintenance Mode — Entry A (`DESIGN-maintenance-mode-2026-08.md` §2) ──
+  // Admin + appliance-only, same gate as `device.*` above. `enable` requires
+  // BOTH an exact type-to-confirm string AND the caller's own current
+  // password (step-up re-auth) — see `MaintenanceModeCard.tsx`.
+  maintenance: {
+    enable: (params: {
+      ttlHours: number;
+      subCapabilities: string[];
+      confirmText: string;
+      reauthPassword: string;
+    }) =>
+      client.call('maintenance.enable', {
+        ttl_hours: params.ttlHours,
+        sub_capabilities: params.subCapabilities,
+        confirm_text: params.confirmText,
+        reauth_password: params.reauthPassword,
+      }) as Promise<{ window: MaintenanceWindow }>,
+    disable: (reason?: string) =>
+      client.call('maintenance.disable', { reason }) as Promise<{ window: MaintenanceWindow | null }>,
+    status: () => client.call('maintenance.status') as Promise<MaintenanceStatus>,
+    history: (limit = 100, offset = 0) =>
+      client.call('maintenance.history', { limit, offset }) as Promise<{ events: MaintenanceAuditEvent[] }>,
+    /** Fired by the dashboard the moment an operator expands a `device.*`
+     *  op's full raw output while `show_details` is unlocked — the
+     *  per-access audit line §2.3 requires. `operation` is the RPC method
+     *  name of the op whose detail was viewed (e.g. `"device.update_apply"`). */
+    logAccess: (operation: string) =>
+      client.call('maintenance.log_access', { operation }) as Promise<{ logged: true }>,
+  },
+  // ── D4a: network settings (Wi-Fi over iwd D-Bus) — admin + appliance-only,
+  // same gate as `device.*` above. `wifiConnect` is the ONE call site in the
+  // whole dashboard client allowed to carry a plaintext Wi-Fi passphrase —
+  // see `WifiPasswordRequestCard.tsx` (T1,
+  // `commercial/docs/DESIGN-agent-body-network-2026-08.md` §5.2/§12) for why
+  // that card, and only that card, is ever expected to call it with a `psk`.
+  network: {
+    /** `rescan` defaults to `true` server-side when omitted; `false` reads
+     *  iwd's already-known list without triggering a fresh radio scan. */
+    wifiScan: (rescan?: boolean) =>
+      client.call('network.wifi_scan', { rescan }) as Promise<WifiScanResult>,
+    /**
+     * `psk` omitted/undefined connects to an open network or one iwd already
+     * holds a stored credential for (`WifiNetwork.known`) — never guessed,
+     * never defaulted to an empty string. `source: 'operator_console_prompted'`
+     * is the ONE non-default value the gateway's closed audit-source
+     * allowlist recognizes (`wifi_connect_audit_source` in `handlers.rs`);
+     * omitting it (every other caller) keeps the audit trail's pre-existing
+     * `"dashboard"` label — passing anything else here would silently do the
+     * same thing, so the type only offers the one meaningful value.
+     */
+    wifiConnect: (ssid: string, psk?: string, source?: 'operator_console_prompted') =>
+      client.call('network.wifi_connect', { ssid, psk, source }) as Promise<{
+        state: string;
+        ssid: string;
+      }>,
   },
 };

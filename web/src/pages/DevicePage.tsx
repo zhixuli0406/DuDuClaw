@@ -60,6 +60,8 @@ import {
   DialogFooter,
 } from '@/components/mds';
 import { DangerZone, ConfirmDialog } from '@/components/settings/controls';
+import { MaintenanceModeCard } from '@/components/settings/MaintenanceModeCard';
+import { useMaintenanceStore, showDetailsUnlocked } from '@/stores/maintenance-store';
 
 /**
  * DevicePage (WP-C, 2026-08) — "裝置": the appliance hardware-management
@@ -268,6 +270,13 @@ export function DevicePage() {
     if (connectionState !== 'authenticated' || notAppliance) return;
     fetchNetwork();
   }, [connectionState, notAppliance, fetchNetwork]);
+
+  // ── Maintenance Mode — Entry A: drives the "顯示詳情" full-disclosure
+  // bypass below (§2.6). Store is shared/live (see `maintenance-store.ts`),
+  // so this page doesn't need its own fetch effect — `MaintenanceModeCard`
+  // (rendered further down) owns the initial fetch + 30s poll.
+  const maintenanceStatus = useMaintenanceStore((s) => s.status);
+  const maintenanceShowDetailsUnlocked = showDetailsUnlocked(maintenanceStatus);
 
   // ── Update center ──
   const [checking, setChecking] = useState(false);
@@ -786,17 +795,40 @@ export function DevicePage() {
                 <div className="space-y-1.5">
                   <button
                     type="button"
-                    onClick={() => setShowUpdateLog((v) => !v)}
+                    onClick={() => {
+                      const next = !showUpdateLog;
+                      setShowUpdateLog(next);
+                      // §2.3: every "顯示詳情" reveal under an unlocked
+                      // maintenance window is its own audit line — fire on
+                      // expand only (not on collapse), best-effort (a failed
+                      // audit call must never block the UI toggle itself).
+                      if (next && maintenanceShowDetailsUnlocked) {
+                        void api.maintenance.logAccess('device.update_apply').catch((e) => {
+                          console.warn('[maintenance] logAccess failed', e);
+                        });
+                      }
+                    }}
                     className="text-xs font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
                   >
                     {showUpdateLog ? t('device.update.details.hide') : t('device.update.details')}
                   </button>
                   {showUpdateLog && (
-                    <pre className="max-h-48 overflow-auto rounded-lg border border-surface-border bg-muted/40 p-2.5 text-xs whitespace-pre-wrap text-muted-foreground">
-                      {/* no-linux-surface item 7: classified+masked, never the
-                          raw systemctl/systemd-sysupdate stdout/stderr. */}
-                      {formatDeviceOpDetail(updateLog) || '—'}
-                    </pre>
+                    <div className="space-y-1">
+                      {maintenanceShowDetailsUnlocked && (
+                        <Badge variant="secondary" className="bg-amber-500/15 text-amber-600 dark:text-amber-400">
+                          {t('device.maintenance.infoLabel')}
+                        </Badge>
+                      )}
+                      <pre className="max-h-48 overflow-auto rounded-lg border border-surface-border bg-muted/40 p-2.5 text-xs whitespace-pre-wrap text-muted-foreground">
+                        {/* no-linux-surface item 7: classified+masked by
+                            default, never the raw systemctl/systemd-sysupdate
+                            stdout/stderr — UNLESS maintenance mode's
+                            show_details sub-capability is unlocked, in which
+                            case the full (still secret-redacted) text is
+                            shown, per DESIGN-maintenance-mode-2026-08.md §2.6. */}
+                        {formatDeviceOpDetail(updateLog, maintenanceShowDetailsUnlocked) || '—'}
+                      </pre>
+                    </div>
                   )}
                 </div>
               )}
@@ -1009,7 +1041,10 @@ export function DevicePage() {
             </div>
           </Panel>
 
-          {/* ⑥ 危險區 */}
+          {/* ⑥ 維修模式（Entry A，DESIGN-maintenance-mode-2026-08.md §2） */}
+          <MaintenanceModeCard />
+
+          {/* ⑦ 危險區 */}
           <DangerZone title={t('device.section.danger')} description={t('device.section.danger.desc')}>
             <div className="space-y-3">
               {(['factoryReset', 'restart', 'shutdown'] as const).map((action) => (
