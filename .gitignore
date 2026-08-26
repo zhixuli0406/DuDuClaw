@@ -87,3 +87,4 @@ crates/*/target/
 /meta-yocto/
 /build/
 appliance/.yocto-cache/
+meta-openembedded/
