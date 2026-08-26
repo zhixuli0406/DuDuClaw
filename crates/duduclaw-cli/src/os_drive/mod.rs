@@ -99,8 +99,8 @@ pub async fn system_ntp_set(home_dir: &Path, enabled: bool) -> Result<()> {
     finish(system::ntp_set(home_dir, enabled).await)
 }
 
-pub async fn system_update_check() -> Result<()> {
-    finish(system::update_check().await)
+pub async fn system_update_check(home_dir: &Path) -> Result<()> {
+    finish(system::update_check(home_dir).await)
 }
 
 // ── network ──────────────────────────────────────────────────────────────

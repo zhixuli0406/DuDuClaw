@@ -14,7 +14,7 @@
 //!   `is_appliance()` + `confirm:true` + `ApprovalBroker` for
 //!   `os_factory_reset`) — this router adds a new front door, not a looser
 //!   one.
-//! - **Never a shell.** [`OsTool`] is a closed enum mirroring the 10 `os_*`
+//! - **Never a shell.** [`OsTool`] is a closed enum mirroring the 15 `os_*`
 //!   tool names byte-for-byte; there is no code path in this module that can
 //!   produce a free-form command string as output. A message that reads as
 //!   "run this shell command" is refused outright (see
@@ -44,7 +44,7 @@
 //!   (folded into the same pass as L1 below — there is no separate function,
 //!   matching `situation_classifier.rs`'s "Layer 1 deterministic" naming,
 //!   which also folds its own hard-exclusion checks in).
-//! - **L1** — deterministic phrase-table matching against the 10 O-0 tools
+//! - **L1** — deterministic phrase-table matching against the O-0 tools
 //!   ([`TOOL_PHRASES`]). Every phrase is a multi-character compound already
 //!   disambiguated by verb (e.g. "檢查更新" vs "套用更新") specifically so a
 //!   single generic token like "更新" or "備份" alone never decides a tool on
@@ -87,7 +87,7 @@ use crate::goal_intent::{classify_goal_intent, IntentGrade, T_GOAL_DEFAULT, T_GR
 // The closed tool enum — the ONLY vocabulary this module can output
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Mirrors the 10 `os_*` MCP tool names in
+/// Mirrors the 15 `os_*` MCP tool names in
 /// `duduclaw-cli/src/mcp_os_ops.rs`/`mcp.rs` byte-for-byte. Deliberately a
 /// closed Rust enum, not a `String` — this is what makes "this module can
 /// never emit a shell command" a structural guarantee rather than a
@@ -116,6 +116,17 @@ pub enum OsTool {
     CheckUpdate,
     BackupCreate,
     ApplyUpdate,
+    /// Agent-body update vertical slice (Y5-3): read systemd's automatic
+    /// boot assessment for the running version (`device.boot_assessment`) —
+    /// the tool an agent uses to answer "did the update I applied actually
+    /// take" across a reboot. See
+    /// `commercial/docs/DESIGN-agent-body-update-2026-08.md` §4.
+    BootAssessment,
+    /// Agent-body update vertical slice (Y5-3): roll back to the previously
+    /// installed A/B slot, then reboot (`device.update_rollback`) —
+    /// completes the agent-reachable check→apply→boot-assess→roll-back
+    /// lifecycle.
+    UpdateRollback,
     Power,
     FactoryReset,
     DoctorRepair,
@@ -135,6 +146,8 @@ impl OsTool {
             OsTool::CheckUpdate => "os_check_update",
             OsTool::BackupCreate => "os_backup_create",
             OsTool::ApplyUpdate => "os_apply_update",
+            OsTool::BootAssessment => "os_boot_assessment",
+            OsTool::UpdateRollback => "os_update_rollback",
             OsTool::Power => "os_power",
             OsTool::FactoryReset => "os_factory_reset",
             OsTool::DoctorRepair => "os_doctor_repair",
@@ -157,6 +170,8 @@ impl OsTool {
             "os_check_update" => Some(OsTool::CheckUpdate),
             "os_backup_create" => Some(OsTool::BackupCreate),
             "os_apply_update" => Some(OsTool::ApplyUpdate),
+            "os_boot_assessment" => Some(OsTool::BootAssessment),
+            "os_update_rollback" => Some(OsTool::UpdateRollback),
             "os_power" => Some(OsTool::Power),
             "os_factory_reset" => Some(OsTool::FactoryReset),
             "os_doctor_repair" => Some(OsTool::DoctorRepair),
@@ -164,7 +179,7 @@ impl OsTool {
         }
     }
 
-    const ALL: [OsTool; 13] = [
+    const ALL: [OsTool; 15] = [
         OsTool::DeviceStatus,
         OsTool::NetworkInfo,
         OsTool::WifiStatus,
@@ -175,6 +190,8 @@ impl OsTool {
         OsTool::CheckUpdate,
         OsTool::BackupCreate,
         OsTool::ApplyUpdate,
+        OsTool::BootAssessment,
+        OsTool::UpdateRollback,
         OsTool::Power,
         OsTool::FactoryReset,
         OsTool::DoctorRepair,
@@ -192,10 +209,16 @@ fn tool_gate(tool: OsTool) -> (bool, bool) {
     match tool {
         // Destructive (changes running binary / OS image / powers the
         // device off) but recoverable — the dialogue layer should still get
-        // an explicit human confirmation before invoking, even though
-        // `os_apply_update`'s own O-0 schema has no `confirm` param (unlike
-        // `os_power`) — see the task brief's explicit naming of all three.
+        // an explicit human confirmation before invoking. `os_apply_update`'s
+        // O-0 schema now DOES require `confirm:true` (Y5-3 closed a gap where
+        // it previously did not — see `mcp_os_ops.rs`'s doc comment), so this
+        // flag and the tool's own gate finally agree.
         OsTool::Power | OsTool::ApplyUpdate | OsTool::WifiConnect => (true, false),
+        // Agent-body update vertical slice (Y5-3): same tier as
+        // Power/ApplyUpdate — rolling back to the previous A/B slot is the
+        // platform's own designed recovery path, not irreversible (the slot
+        // rolled back FROM is still on disk).
+        OsTool::UpdateRollback => (true, false),
         // Irreversible: confirm AND a live ApprovalBroker decision.
         OsTool::FactoryReset => (true, true),
         // Read-only or additive (backup create writes a new file, deletes
@@ -208,6 +231,7 @@ fn tool_gate(tool: OsTool) -> (bool, bool) {
         | OsTool::SystemStatus
         | OsTool::CheckUpdate
         | OsTool::BackupCreate
+        | OsTool::BootAssessment
         | OsTool::DoctorRepair => (false, false),
     }
 }
@@ -630,6 +654,35 @@ const APPLY_UPDATE_TARGET_DEVICE_PHRASES: &[&str] =
 const APPLY_UPDATE_TARGET_SYSTEM_PHRASES: &[&str] =
     &["duduclaw 本體", "duduclaw本體", "本體程式", "程式本身"];
 
+/// Agent-body update vertical slice (Y5-3). A layperson asks this AFTER a
+/// reboot that followed an update, not as a cold-open request — but it still
+/// deserves zero-LLM-cost resolution when it does come up in conversation.
+const BOOT_ASSESSMENT_PHRASES: &[PhraseEntry] = phrase_group!(
+    OsTool::BootAssessment,
+    None,
+    "開機評估",
+    "這次更新成功了嗎",
+    "更新有沒有成功",
+    "剛剛重開機系統還好嗎",
+    "boot assessment",
+    "did the update work",
+);
+
+/// Agent-body update vertical slice (Y5-3). Deliberately distinct compound
+/// phrasing from [`APPLY_UPDATE_PHRASES`] (verb is "回退/復原", not "套用/
+/// 安裝") so the two never collide on a shared generic token.
+const UPDATE_ROLLBACK_PHRASES: &[PhraseEntry] = phrase_group!(
+    OsTool::UpdateRollback,
+    None,
+    "回退更新",
+    "復原上一版",
+    "還原到上一個版本",
+    "更新出問題幫我復原",
+    "rollback the update",
+    "roll back update",
+    "revert to previous version",
+);
+
 const POWER_RESTART_PHRASES: &[PhraseEntry] = phrase_group!(
     OsTool::Power,
     Some(("action", "restart")),
@@ -690,6 +743,8 @@ const ALL_PHRASE_GROUPS: &[&[PhraseEntry]] = &[
     CHECK_UPDATE_PHRASES,
     BACKUP_CREATE_PHRASES,
     APPLY_UPDATE_PHRASES,
+    BOOT_ASSESSMENT_PHRASES,
+    UPDATE_ROLLBACK_PHRASES,
     POWER_RESTART_PHRASES,
     POWER_SHUTDOWN_PHRASES,
     FACTORY_RESET_PHRASES,

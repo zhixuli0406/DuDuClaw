@@ -343,9 +343,10 @@ pub(crate) async fn handle_os_system_status(home_dir: &Path) -> Value {
 }
 
 /// `os_check_update` → `system.check_update` (always) + `device.update_status`
-/// (only when `is_appliance()` — omitted, not hard-blocked, when not, since
-/// this tool intentionally combines two independently-scoped RPCs into one
-/// read and the system half is universally available).
+/// + `device.update_check` (both only when `is_appliance()` — omitted, not
+/// hard-blocked, when not, since this tool intentionally combines three
+/// independently-scoped RPCs into one read and the system half is
+/// universally available).
 ///
 /// Deliberately omits `download_url`/`checksum_url` from the `system` half
 /// (present in the dashboard RPC's response): `os_apply_update`'s `system`
@@ -353,7 +354,20 @@ pub(crate) async fn handle_os_system_status(home_dir: &Path) -> Value {
 /// from a caller (including this tool's own prior output) — see that
 /// function's doc comment for the M2 "never trust a caller-supplied URL"
 /// invariant this preserves.
-pub(crate) async fn handle_os_check_update() -> Value {
+///
+/// `device_check` (Y5-3, agent-body update vertical slice): before this
+/// field existed, an agent asking "有沒有新版本可以更新" only ever saw
+/// `device.update_status` (`systemd-sysupdate list`'s view of the LOCAL
+/// staging directory — empty until a `device.update_apply` call has already
+/// downloaded something) and could not tell whether the CONFIGURED source
+/// actually has something newer. This mirrors exactly what the dashboard's
+/// own "check for update" button does (`DevicePage.tsx`'s `runUpdateCheck`
+/// calls BOTH `device.update_status` and `device.update_check` in parallel) —
+/// an agent asking the same question deserves the same answer, not a weaker
+/// one. Additive only: `device` is unchanged, so
+/// `os_operator::readonly_result_to_artifact`'s existing `update_status` card
+/// (which only reads `device`/`system`) is untouched.
+pub(crate) async fn handle_os_check_update(home_dir: &Path) -> Value {
     let system = match duduclaw_gateway::updater::check_update().await {
         Ok(info) => json!({
             "available": info.available,
@@ -366,18 +380,28 @@ pub(crate) async fn handle_os_check_update() -> Value {
         }),
         Err(e) => json!({ "error": e }),
     };
-    let device = if duduclaw_core::is_appliance() {
-        match duduclaw_gateway::device_ops::select_device_ops()
+    let (device, device_check) = if duduclaw_core::is_appliance() {
+        let device = match duduclaw_gateway::device_ops::select_device_ops()
             .update_status()
             .await
         {
             Ok(out) => json!({ "success": out.success, "stdout": out.stdout, "stderr": out.stderr }),
             Err(e) => json!({ "error": e.to_string() }),
-        }
+        };
+        let device_check = match duduclaw_gateway::os_update::check_update(home_dir).await {
+            Ok(report) => json!({
+                "available": report.available,
+                "current_version": report.current_version,
+                "latest_version": report.latest_version,
+            }),
+            Err(e) => json!({ "error": { "code": e.code(), "message": e.user_message() } }),
+        };
+        (device, device_check)
     } else {
-        json!({ "note": "非 appliance 安裝，無 OS image 更新可查（device.update_status 僅限 appliance）。" })
+        let note = json!({ "note": "非 appliance 安裝，無 OS image 更新可查（僅限 appliance）。" });
+        (note.clone(), note)
     };
-    os_ops_text(&json!({ "system": system, "device": device }).to_string())
+    os_ops_text(&json!({ "system": system, "device": device, "device_check": device_check }).to_string())
 }
 
 /// `os_doctor_repair` — reduced counterpart to `system.doctor_repair`.
@@ -575,15 +599,37 @@ async fn require_factory_reset_approval_via(
 /// `os_apply_update` — bridges TWO independent RPCs behind one `target`
 /// param (required — the two operations have very different blast radii, so
 /// this tool never silently guesses which one was meant):
-/// - `"device"` → `device.update_apply` (appliance-only OS image update via
-///   `systemd-sysupdate`, through `duduclaw-sysd` on a real appliance). Same
-///   admin + appliance gate as the RPC; the RPC itself has no confirm, so
-///   neither does this.
+/// - `"device"` → the SAME verify→stage→backup→ESP-clear→install→
+///   confirm-slot→cleanup pipeline `device.update_apply` runs
+///   ([`duduclaw_gateway::handlers::stage_and_apply_device_update`] — see
+///   that function's doc comment for the gap this closed: an earlier version
+///   of this branch called the bare `device_ops::update_apply()` sysupdate
+///   wrapper directly, skipping H3d's manifest signature verification
+///   entirely). Same admin + appliance gate as the RPC.
 /// - `"system"` → `system.apply_update` (duduclaw's own binary self-update).
 ///   Same admin-only gate as the RPC (no appliance requirement — this works
 ///   on every install). See [`apply_system_update`] for how it preserves the
 ///   RPC's "never trust a caller-supplied URL" invariant without the
 ///   cross-process `pending_update` cache.
+///
+/// **`confirm: true` required for BOTH targets** (Y5-3, agent-body update
+/// vertical slice — a fix, not a pre-existing behavior): neither
+/// `device.update_apply` nor `system.apply_update` requires a `confirm` param
+/// at the dashboard-RPC layer, because a human already clicked a real button
+/// to get there. An agent has no such button — the model calling this tool
+/// IS the decision — so, exactly like `os_factory_reset`'s doc comment
+/// argues for approval, this tool requires an explicit signal a model cannot
+/// emit by accident. Recoverable (A/B rollback + boot assessment exists for
+/// `device`; `os_check_update`/`os_apply_update` themselves are retriable for
+/// `system`), so confirm-only — same tier as `os_power`, not
+/// `os_factory_reset`'s ApprovalBroker. This was a real gap: unlike
+/// `os_power`/`os_wifi_connect`/`os_factory_reset`, this handler previously
+/// had NO `confirm_flag` check at all, even though `os_intent.rs`'s
+/// `tool_gate` already classified `ApplyUpdate` as needing one — the router
+/// only gates the FIRST message of an NL-matched turn, not every tool call
+/// deeper in an autonomous/multi-step task (see
+/// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §6.2), so the
+/// actual enforcement has to live here.
 pub(crate) async fn handle_os_apply_update(args: &Value, home_dir: &Path) -> Value {
     let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
     match target {
@@ -591,13 +637,30 @@ pub(crate) async fn handle_os_apply_update(args: &Value, home_dir: &Path) -> Val
             if !duduclaw_core::is_appliance() {
                 return not_appliance_error();
             }
-            device_op_result_text(
-                duduclaw_gateway::device_ops::select_device_ops()
-                    .update_apply()
-                    .await,
-            )
+            if !confirm_flag(args) {
+                return confirm_required_error();
+            }
+            match duduclaw_gateway::handlers::stage_and_apply_device_update(home_dir).await {
+                duduclaw_gateway::handlers::DeviceUpdateApplyOutcome::StageFailed(e) => {
+                    os_ops_error(&json!({ "code": e.code(), "message": e.user_message() }).to_string())
+                }
+                duduclaw_gateway::handlers::DeviceUpdateApplyOutcome::EspPrepareFailed(message) => {
+                    os_ops_error(&json!({ "code": "esp_prepare_failed", "message": message }).to_string())
+                }
+                duduclaw_gateway::handlers::DeviceUpdateApplyOutcome::SlotMismatch(message) => {
+                    os_ops_error(&json!({ "code": "slot_mismatch", "message": message }).to_string())
+                }
+                duduclaw_gateway::handlers::DeviceUpdateApplyOutcome::Applied(applied) => {
+                    device_op_result_text(applied)
+                }
+            }
         }
-        "system" => apply_system_update(home_dir).await,
+        "system" => {
+            if !confirm_flag(args) {
+                return confirm_required_error();
+            }
+            apply_system_update(home_dir).await
+        }
         _ => os_ops_error(
             "target 必須是 \"device\"（appliance OS image 更新，經 duduclaw-sysd）或 \
              \"system\"（duduclaw 本體自我更新）。",
@@ -656,6 +719,56 @@ async fn apply_system_update(home_dir: &Path) -> Value {
         },
         Err(e) => os_ops_error(&format!("更新套用失敗：{e}")),
     }
+}
+
+/// `os_boot_assessment` → `device.boot_assessment`. Read-only view of
+/// systemd's automatic boot assessment (`good`/`bad`/`indeterminate`/`clean`)
+/// for the currently-running version — same call
+/// (`device_ops::boot_assessment_status`) the dashboard RPC handler makes.
+///
+/// Agent-body update vertical slice (Y5-3): this is the tool the
+/// cross-restart reporting design (`commercial/docs/DESIGN-agent-body-
+/// update-2026-08.md` §4) depends on — after an OS-image update reboot, an
+/// agent needs a way to answer "did the update I just applied actually take,
+/// or did the box roll itself back" without a human having to ask. Before
+/// this tool existed, `device.boot_assessment` was dashboard-only; an agent
+/// had no way to read it at all, appliance or not.
+pub(crate) async fn handle_os_boot_assessment() -> Value {
+    if !duduclaw_core::is_appliance() {
+        return not_appliance_error();
+    }
+    device_op_result_text(
+        duduclaw_gateway::device_ops::select_device_ops()
+            .boot_assessment_status()
+            .await,
+    )
+}
+
+/// `os_update_rollback` → `device.update_rollback`. Same admin + appliance +
+/// confirm gate as the dashboard RPC (`require_admin!()` +
+/// `require_appliance!()` + `require_confirm!()`) — same tier as `os_power`,
+/// NOT `os_factory_reset`'s ApprovalBroker: rolling back to the previously-
+/// installed A/B slot is the platform's own designed recovery path, not a
+/// destructive action in the irreversible sense (the slot being rolled back
+/// FROM is still on disk, not wiped).
+///
+/// Agent-body update vertical slice (Y5-3): completes the agent-reachable
+/// A/B lifecycle (check → apply → boot-assess → roll back) — before this
+/// tool existed, an agent that saw a bad boot assessment (via
+/// `os_boot_assessment`) or a user reporting "更新後系統怪怪的" had no way to
+/// help recover; the human had to be walked through the dashboard instead.
+pub(crate) async fn handle_os_update_rollback(args: &Value) -> Value {
+    if !duduclaw_core::is_appliance() {
+        return not_appliance_error();
+    }
+    if !confirm_flag(args) {
+        return confirm_required_error();
+    }
+    device_op_result_text(
+        duduclaw_gateway::device_ops::select_device_ops()
+            .update_rollback()
+            .await,
+    )
 }
 
 #[cfg(test)]
@@ -751,7 +864,9 @@ mod tests {
             handle_os_backup_create(home.path()).await,
             handle_os_power(&json!({"action": "restart", "confirm": true})).await,
             handle_os_factory_reset(&json!({"confirm": true}), home.path(), "sysop").await,
-            handle_os_apply_update(&json!({"target": "device"}), home.path()).await,
+            handle_os_apply_update(&json!({"target": "device", "confirm": true}), home.path()).await,
+            handle_os_boot_assessment().await,
+            handle_os_update_rollback(&json!({"confirm": true})).await,
         ];
         for v in &results {
             assert_eq!(v["isError"], true, "{v:?}");
@@ -828,6 +943,68 @@ mod tests {
 
         let missing = handle_os_apply_update(&json!({}), home.path()).await;
         assert_eq!(missing["isError"], true);
+    }
+
+    /// Y5-3 (agent-body update vertical slice) regression: `os_apply_update`
+    /// previously had NO `confirm_flag` check at all for either target —
+    /// the `"device"` branch's missing check was masked by the appliance
+    /// gate firing first in every off-appliance test (see
+    /// `appliance_gated_tools_fail_closed_off_appliance` above), but the
+    /// `"system"` branch has NO appliance gate, so it is the one path that
+    /// can prove the confirm check exists and fires BEFORE any network call
+    /// (`apply_system_update` would otherwise reach a live
+    /// `updater::check_update()` call, which this test must never trigger).
+    #[tokio::test]
+    async fn apply_update_system_target_requires_confirm_before_any_network_call() {
+        let home = tmp_home();
+        let v = handle_os_apply_update(&json!({"target": "system"}), home.path()).await;
+        assert_eq!(v["isError"], true, "{v:?}");
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("confirm"), "unexpected message: {text}");
+    }
+
+    /// The `"device"` branch's appliance gate must run BEFORE its confirm
+    /// gate (matching `os_power`/`os_wifi_connect`'s existing ordering) —
+    /// confirm:true present must NOT change the off-appliance refusal shape.
+    #[tokio::test]
+    async fn apply_update_device_target_appliance_gate_fires_even_with_confirm() {
+        let home = tmp_home();
+        let v = handle_os_apply_update(&json!({"target": "device", "confirm": true}), home.path()).await;
+        assert_eq!(v["isError"], true, "{v:?}");
+        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+    }
+
+    /// Agent-body update vertical slice (Y5-3): `os_check_update`'s new
+    /// `device_check` field must be present in every response shape (even
+    /// off-appliance, where it degrades to the same honest `note` `device`
+    /// already used) — the field is additive, so this also pins that
+    /// `device`/`system` are untouched (no accidental shape drift for
+    /// `os_operator::readonly_result_to_artifact`'s existing card logic).
+    #[tokio::test]
+    async fn check_update_includes_device_check_field_off_appliance() {
+        let home = tmp_home();
+        let v = handle_os_check_update(home.path()).await;
+        let text = v["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(parsed.get("system").is_some());
+        assert!(parsed.get("device").is_some());
+        assert!(parsed.get("device_check").is_some(), "{parsed:?}");
+        // Off-appliance: both `device` and `device_check` are the same
+        // honest "note" shape, never a fabricated freshness answer.
+        assert!(parsed["device_check"].get("note").is_some());
+    }
+
+    #[tokio::test]
+    async fn boot_assessment_and_update_rollback_are_appliance_gated() {
+        let boot = handle_os_boot_assessment().await;
+        assert_eq!(boot["isError"], true);
+        assert!(boot["content"][0]["text"].as_str().unwrap().contains("appliance"));
+
+        let rollback_no_confirm = handle_os_update_rollback(&json!({})).await;
+        assert_eq!(rollback_no_confirm["isError"], true);
+        // Off-appliance: the appliance gate fires first, same ordering as
+        // `os_power`/`os_wifi_connect`/`os_apply_update`'s device branch.
+        assert!(rollback_no_confirm["content"][0]["text"].as_str().unwrap().contains("appliance"));
     }
 
     // ── ApprovalBroker gate for os_factory_reset ────────────────────────

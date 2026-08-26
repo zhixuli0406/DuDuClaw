@@ -176,6 +176,23 @@ pub enum StageError {
 }
 
 impl StageError {
+    /// Stable machine-readable error code — the SAME string both
+    /// `handlers.rs`'s `device.update_check`/`device.update_apply` RPCs and
+    /// `mcp_os_ops.rs`'s `os_check_update` agent tool return in their
+    /// `{"code": ...}` failure shape. Factored out (Y5-3, agent-body update
+    /// vertical slice) so a third call site doesn't re-derive a THIRD copy of
+    /// this match — the two RPC handlers previously each hand-wrote an
+    /// identical `match e { StageError::NotConfigured => "not_configured", ... }`.
+    pub fn code(&self) -> &'static str {
+        match self {
+            StageError::NotConfigured => "not_configured",
+            StageError::UpToDate(_) => "up_to_date",
+            StageError::Rejected(_) => "verification_failed",
+            StageError::Network(_) => "network_error",
+            StageError::Io(_) => "io_error",
+        }
+    }
+
     /// zh-TW copy for the dashboard. Internal nouns (sysupdate, PARTUUID,
     /// slot numbers) stay out of the user-facing half; the technical detail
     /// rides along only where it is the actual diagnosis.

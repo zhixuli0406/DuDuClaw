@@ -87,6 +87,8 @@ const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
     "os_wifi_scan",
     "os_wifi_connect",
     "os_apply_update",
+    "os_boot_assessment",
+    "os_update_rollback",
     "os_backup_create",
     "os_power",
     "os_factory_reset",
@@ -1518,10 +1520,11 @@ effect = "forbid"
     // ── O-4: system-operator capability gate ────────────────────────────────
     //
     // Mirrors the OS-native / recording gate tests above exactly: absent,
-    // explicit-false, and true, each exercised across all ten `os_*` system-
-    // operation tools listed in `SYSTEM_OPERATOR_TOOLS`.
+    // explicit-false, and true, each exercised across every `os_*` system-
+    // operation tool listed in `SYSTEM_OPERATOR_TOOLS` (15 as of Y5-3's
+    // agent-body update vertical slice).
 
-    /// All ten `os_*` tools with the capability absent (no agent.toml) are
+    /// All `os_*` tools with the capability absent (no agent.toml) are
     /// denied fail-closed, even though `Scope::Admin` clears the scope check.
     #[tokio::test]
     async fn system_operator_tools_denied_when_capability_absent() {

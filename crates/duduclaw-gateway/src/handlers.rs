@@ -44444,16 +44444,7 @@ impl MethodHandler {
                 id: String::new(),
                 ok: false,
                 payload: None,
-                error: Some(json!({
-                    "code": match e {
-                        crate::os_update::StageError::NotConfigured => "not_configured",
-                        crate::os_update::StageError::UpToDate(_) => "up_to_date",
-                        crate::os_update::StageError::Rejected(_) => "verification_failed",
-                        crate::os_update::StageError::Network(_) => "network_error",
-                        crate::os_update::StageError::Io(_) => "io_error",
-                    },
-                    "message": e.user_message(),
-                })),
+                error: Some(json!({ "code": e.code(), "message": e.user_message() })),
             },
         }
     }
@@ -44475,113 +44466,27 @@ impl MethodHandler {
     /// closes. `UpToDate` is likewise reported honestly instead of being
     /// dressed up as an install.
     async fn handle_device_update_apply(&self) -> WsFrame {
-        let staged = match crate::os_update::stage_update(self.home_dir()).await {
-            Ok(report) => {
-                tracing::info!(
-                    "[device.update_apply] staged {} for {} ({} bytes)",
-                    report.version,
-                    report.destination_partuuid,
-                    report.bytes_downloaded
-                );
-                report
-            }
-            Err(e) => {
-                return WsFrame::Response {
-                    id: String::new(),
-                    ok: false,
-                    payload: None,
-                    error: Some(json!({
-                        "code": match e {
-                            crate::os_update::StageError::NotConfigured => "not_configured",
-                            crate::os_update::StageError::UpToDate(_) => "up_to_date",
-                            crate::os_update::StageError::Rejected(_) => "verification_failed",
-                            crate::os_update::StageError::Network(_) => "network_error",
-                            crate::os_update::StageError::Io(_) => "io_error",
-                        },
-                        "message": e.user_message(),
-                    })),
-                };
-            }
-        };
-
-        // H3d §11.5 item 2: best-effort pre-update /data snapshot — never
-        // blocks the update itself (see `pre_update_backup` module doc for
-        // the "automatic, narrow, best-effort" reasoning). A failure here
-        // is logged and the flow continues exactly as before this step
-        // existed.
-        match crate::pre_update_backup::snapshot_before_update(self.home_dir(), &staged.version) {
-            Ok(report) => tracing::info!(
-                "[device.update_apply] pre-update snapshot: {} file(s), {} bytes, in {}",
-                report.files_copied,
-                report.bytes_copied,
-                report.dir.display()
-            ),
-            Err(e) => tracing::warn!(
-                "[device.update_apply] pre-update snapshot failed (continuing with the update): {e}"
-            ),
+        match stage_and_apply_device_update(self.home_dir()).await {
+            DeviceUpdateApplyOutcome::StageFailed(e) => WsFrame::Response {
+                id: String::new(),
+                ok: false,
+                payload: None,
+                error: Some(json!({ "code": e.code(), "message": e.user_message() })),
+            },
+            DeviceUpdateApplyOutcome::EspPrepareFailed(message) => WsFrame::Response {
+                id: String::new(),
+                ok: false,
+                payload: None,
+                error: Some(json!({ "code": "esp_prepare_failed", "message": message })),
+            },
+            DeviceUpdateApplyOutcome::SlotMismatch(message) => WsFrame::Response {
+                id: String::new(),
+                ok: false,
+                payload: None,
+                error: Some(json!({ "code": "slot_mismatch", "message": message })),
+            },
+            DeviceUpdateApplyOutcome::Applied(applied) => device_op_result_frame(applied),
         }
-
-        // H3d §11.7: clear a stale exhausted ESP entry for the version we
-        // are about to install, BEFORE calling sysupdate. Without this, a
-        // version that was manually rolled back (device.update_rollback's
-        // tier 2) can never be reinstalled: its exhausted ESP entry and its
-        // unchanged partition label both already satisfy
-        // systemd-sysupdate's InstancesMax accounting, so `update apply`
-        // silently writes nothing and still reports success — "rolled back
-        // once, uninstallable forever, and lies about it." Idempotent
-        // (no-op when there is nothing stale), so this runs unconditionally
-        // rather than only after a detected rollback.
-        //
-        // Off-appliance (no sysd reachable) there is no ESP at all —
-        // `select_sysd_ops()` is `None` and this step is skipped entirely;
-        // `update_apply()` below degrades the same way it always has there.
-        // On-appliance, a genuine failure here is treated as fatal to the
-        // whole apply rather than best-effort: proceeding anyway risks
-        // reproducing the exact "reports success but did nothing" bug this
-        // step exists to close.
-        if let Some(sysd) = crate::device_ops::select_sysd_ops() {
-            if let Err(e) = sysd.clear_exhausted_update_target(&staged.version).await {
-                tracing::error!(
-                    "[device.update_apply] could not prepare the ESP for {}: {e}",
-                    staged.version
-                );
-                return WsFrame::Response {
-                    id: String::new(),
-                    ok: false,
-                    payload: None,
-                    error: Some(json!({
-                        "code": "esp_prepare_failed",
-                        "message": format!(
-                            "更新檔已驗證，但清理舊開機項目失敗，安裝已中止（裝置未被更動）：{e}"
-                        ),
-                    })),
-                };
-            }
-        }
-
-        let applied = crate::device_ops::select_device_ops().update_apply().await;
-        // Only when sysupdate actually succeeded: confirm from the live GPT
-        // that it wrote the slot the kernel image was bound to, and reclaim
-        // the ~4 GiB of payload now that the partition label is the ledger.
-        // A mismatch is surfaced as a failure even though the install
-        // "worked" — rebooting into a kernel/root pair from two different
-        // versions is the failure this whole package exists to prevent.
-        if matches!(&applied, Ok(out) if out.success) {
-            if let Err(why) = crate::os_update::confirm_installed_slot(&staged).await {
-                tracing::error!("[device.update_apply] slot mismatch after install: {why}");
-                return WsFrame::Response {
-                    id: String::new(),
-                    ok: false,
-                    payload: None,
-                    error: Some(json!({
-                        "code": "slot_mismatch",
-                        "message": format!("更新已寫入，但寫入的位置與預期不符，請勿重新開機並聯絡技術支援：{why}"),
-                    })),
-                };
-            }
-            crate::os_update::cleanup_staged(&staged);
-        }
-        device_op_result_frame(applied)
     }
 
     async fn handle_device_update_rollback(&self) -> WsFrame {
@@ -45392,6 +45297,128 @@ pub async fn create_device_backup_archive(home_dir: &Path) -> DeviceBackupOutcom
     }
 
     DeviceBackupOutcome::Created { filename, stdout: out.stdout, stderr: out.stderr }
+}
+
+/// Outcome of [`stage_and_apply_device_update`] — every branch the original
+/// `device.update_apply` RPC handler could reach, factored out of
+/// `MethodHandler::handle_device_update_apply` (now a thin match over this,
+/// same pattern as [`DeviceBackupOutcome`]/[`create_device_backup_archive`]
+/// above) so the O-0 `os_apply_update` MCP tool
+/// (`duduclaw-cli::mcp_os_ops::handle_os_apply_update`) reuses the EXACT same
+/// verify→stage→backup→ESP-clear→install→confirm-slot→cleanup pipeline
+/// instead of calling the bare `device_ops::update_apply()` sysupdate wrapper
+/// directly.
+///
+/// Y5-3 (agent-body update vertical slice) found and fixed a real gap here:
+/// before this extraction, `os_apply_update(target="device")` called ONLY
+/// `device_ops::update_apply()` — skipping the H3d manifest signature
+/// verification, the pre-update `/data` snapshot, the stale-ESP-entry clear,
+/// AND the post-install slot-mismatch confirmation entirely. Per this
+/// module's own doc comment on `handle_device_update_apply` (below), staging
+/// is "the only thing standing between a payload and the boot chain" on this
+/// appliance's `Type=regular-file` sysupdate source — an agent-triggered
+/// device update had strictly weaker safety properties than a
+/// dashboard-triggered one, violating the O-0 design's core invariant
+/// ("同一套能力，兩種前門，同一組閘", `DESIGN-agent-os-native-apps-2026-08.md`
+/// §6.1). This function is the fix: one implementation, two callers.
+pub enum DeviceUpdateApplyOutcome {
+    /// Verification/staging failed before touching the boot chain at all.
+    StageFailed(crate::os_update::StageError),
+    /// The ESP could not be prepared for the staged version — install
+    /// aborted, device untouched. Carries a ready-to-display zh-TW message.
+    EspPrepareFailed(String),
+    /// `sysupdate` ran; success or failure, exactly the shape
+    /// `device_op_result_frame`/`device_op_result_text` already render.
+    Applied(crate::device_ops::OpResult),
+    /// `sysupdate` reported success, but the installed slot didn't match
+    /// what was staged — a failure even though the op itself "succeeded".
+    /// Carries a ready-to-display zh-TW message.
+    SlotMismatch(String),
+}
+
+/// `device.update_apply`'s verify→stage→backup→ESP-clear→install→
+/// confirm-slot→cleanup pipeline — the part both the dashboard RPC and the
+/// agent-facing `os_apply_update` MCP tool share. See
+/// [`DeviceUpdateApplyOutcome`]'s doc comment for why this was extracted.
+/// Every step here is a free function taking only `home_dir`/plain args —
+/// none of it touches `MethodHandler`'s in-memory state — so it is exactly as
+/// reachable from the separate `duduclaw mcp-server` process as
+/// [`create_device_backup_archive`] already is.
+pub async fn stage_and_apply_device_update(home_dir: &Path) -> DeviceUpdateApplyOutcome {
+    let staged = match crate::os_update::stage_update(home_dir).await {
+        Ok(report) => {
+            tracing::info!(
+                "[stage_and_apply_device_update] staged {} for {} ({} bytes)",
+                report.version,
+                report.destination_partuuid,
+                report.bytes_downloaded
+            );
+            report
+        }
+        Err(e) => return DeviceUpdateApplyOutcome::StageFailed(e),
+    };
+
+    // H3d §11.5 item 2: best-effort pre-update /data snapshot — never blocks
+    // the update itself (see `pre_update_backup` module doc for the
+    // "automatic, narrow, best-effort" reasoning). A failure here is logged
+    // and the flow continues exactly as before this step existed.
+    match crate::pre_update_backup::snapshot_before_update(home_dir, &staged.version) {
+        Ok(report) => tracing::info!(
+            "[stage_and_apply_device_update] pre-update snapshot: {} file(s), {} bytes, in {}",
+            report.files_copied,
+            report.bytes_copied,
+            report.dir.display()
+        ),
+        Err(e) => tracing::warn!(
+            "[stage_and_apply_device_update] pre-update snapshot failed (continuing with the update): {e}"
+        ),
+    }
+
+    // H3d §11.7: clear a stale exhausted ESP entry for the version we are
+    // about to install, BEFORE calling sysupdate. Without this, a version
+    // that was manually rolled back (device.update_rollback's tier 2) can
+    // never be reinstalled: its exhausted ESP entry and its unchanged
+    // partition label both already satisfy systemd-sysupdate's InstancesMax
+    // accounting, so `update apply` silently writes nothing and still
+    // reports success — "rolled back once, uninstallable forever, and lies
+    // about it." Idempotent (no-op when there is nothing stale), so this
+    // runs unconditionally rather than only after a detected rollback.
+    //
+    // Off-appliance (no sysd reachable) there is no ESP at all —
+    // `select_sysd_ops()` is `None` and this step is skipped entirely;
+    // `update_apply()` below degrades the same way it always has there.
+    // On-appliance, a genuine failure here is treated as fatal to the whole
+    // apply rather than best-effort: proceeding anyway risks reproducing the
+    // exact "reports success but did nothing" bug this step exists to close.
+    if let Some(sysd) = crate::device_ops::select_sysd_ops() {
+        if let Err(e) = sysd.clear_exhausted_update_target(&staged.version).await {
+            tracing::error!(
+                "[stage_and_apply_device_update] could not prepare the ESP for {}: {e}",
+                staged.version
+            );
+            return DeviceUpdateApplyOutcome::EspPrepareFailed(format!(
+                "更新檔已驗證，但清理舊開機項目失敗，安裝已中止（裝置未被更動）：{e}"
+            ));
+        }
+    }
+
+    let applied = crate::device_ops::select_device_ops().update_apply().await;
+    // Only when sysupdate actually succeeded: confirm from the live GPT that
+    // it wrote the slot the kernel image was bound to, and reclaim the
+    // ~4 GiB of payload now that the partition label is the ledger. A
+    // mismatch is surfaced as a failure even though the install "worked" —
+    // rebooting into a kernel/root pair from two different versions is the
+    // failure this whole package exists to prevent.
+    if matches!(&applied, Ok(out) if out.success) {
+        if let Err(why) = crate::os_update::confirm_installed_slot(&staged).await {
+            tracing::error!("[stage_and_apply_device_update] slot mismatch after install: {why}");
+            return DeviceUpdateApplyOutcome::SlotMismatch(format!(
+                "更新已寫入，但寫入的位置與預期不符，請勿重新開機並聯絡技術支援：{why}"
+            ));
+        }
+        crate::os_update::cleanup_staged(&staged);
+    }
+    DeviceUpdateApplyOutcome::Applied(applied)
 }
 
 #[cfg(test)]

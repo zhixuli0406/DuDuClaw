@@ -1929,7 +1929,10 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "os_check_update",
         description: "Check for an available duduclaw self-update AND (appliance only) an available \
-            OS image update. admin. Bridges system.check_update + device.update_status to agents (O-0).",
+            OS image update. admin. Bridges system.check_update + device.update_status + \
+            device.update_check to agents (O-0). `device_check` is the REAL upstream freshness \
+            signal (signed manifest, not local staging) — prefer it over `device` for \"is there a \
+            new version\" questions.",
         params: &[],
     },
     ToolDef {
@@ -1978,12 +1981,33 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "os_apply_update",
-        description: "Apply an update. admin; destructive (changes running binary or OS image). \
-            Requires `target`: \"device\" (appliance-only OS image update via duduclaw-sysd, no confirm \
-            required — mirrors device.update_apply) or \"system\" (duduclaw self-update, no confirm \
-            required — mirrors system.apply_update). Bridges both RPCs to agents (O-0).",
+        description: "Apply an update. admin; destructive (changes running binary or OS image); \
+            requires confirm:true (a NEW gate beyond the dashboard RPCs — an agent has no button a \
+            human physically clicked, see mcp_os_ops.rs's doc comment). Requires `target`: \"device\" \
+            (appliance-only OS image update, runs the SAME verify/stage/backup/install pipeline as \
+            device.update_apply) or \"system\" (duduclaw self-update, mirrors system.apply_update).",
         params: &[
             ParamDef { name: "target", description: "\"device\" or \"system\" — which update to apply", required: true },
+            ParamDef { name: "confirm", description: "Must be true — this is destructive", required: true },
+        ],
+    },
+    ToolDef {
+        name: "os_boot_assessment",
+        description: "Read systemd's automatic boot assessment (good/bad/indeterminate/clean) for the \
+            currently-running version. admin, appliance-only, read-only. Bridges the dashboard-only \
+            device.boot_assessment RPC to agents (O-0, agent-body update vertical slice) — the tool an \
+            agent uses to check whether an update it applied actually took, including across a reboot.",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_update_rollback",
+        description: "Roll back to the previously-installed A/B slot, then reboot. admin, \
+            appliance-only, destructive: requires confirm:true (mirrors device.update_rollback's \
+            require_confirm!() gate exactly — recoverable, same tier as os_power, not os_factory_reset's \
+            ApprovalBroker). Bridges the dashboard-only device.update_rollback RPC to agents (O-0, \
+            agent-body update vertical slice).",
+        params: &[
+            ParamDef { name: "confirm", description: "Must be true — this is destructive", required: true },
         ],
     },
     ToolDef {
@@ -10425,6 +10449,8 @@ pub(crate) async fn handle_tools_call(
             | "os_wifi_scan"
             | "os_wifi_connect"
             | "os_apply_update"
+            | "os_boot_assessment"
+            | "os_update_rollback"
             | "os_backup_create"
             | "os_power"
             | "os_factory_reset"
@@ -10676,13 +10702,15 @@ pub(crate) async fn handle_tools_call(
         // see `mcp_os_ops.rs` module doc.
         "os_device_status" => crate::mcp_os_ops::handle_os_device_status(home_dir).await,
         "os_system_status" => crate::mcp_os_ops::handle_os_system_status(home_dir).await,
-        "os_check_update" => crate::mcp_os_ops::handle_os_check_update().await,
+        "os_check_update" => crate::mcp_os_ops::handle_os_check_update(home_dir).await,
         "os_backup_list" => crate::mcp_os_ops::handle_os_backup_list(home_dir).await,
         "os_network_info" => crate::mcp_os_ops::handle_os_network_info().await,
         "os_wifi_status" => crate::mcp_os_ops::handle_os_wifi_status().await,
         "os_wifi_scan" => crate::mcp_os_ops::handle_os_wifi_scan(&arguments).await,
         "os_wifi_connect" => crate::mcp_os_ops::handle_os_wifi_connect(&arguments, home_dir).await,
         "os_apply_update" => crate::mcp_os_ops::handle_os_apply_update(&arguments, home_dir).await,
+        "os_boot_assessment" => crate::mcp_os_ops::handle_os_boot_assessment().await,
+        "os_update_rollback" => crate::mcp_os_ops::handle_os_update_rollback(&arguments).await,
         "os_backup_create" => crate::mcp_os_ops::handle_os_backup_create(home_dir).await,
         "os_power" => crate::mcp_os_ops::handle_os_power(&arguments).await,
         "os_factory_reset" => {

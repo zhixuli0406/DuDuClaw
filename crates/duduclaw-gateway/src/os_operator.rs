@@ -158,6 +158,8 @@ fn tool_display_name(tool: OsTool) -> &'static str {
         OsTool::CheckUpdate => "檢查更新",
         OsTool::BackupCreate => "建立備份",
         OsTool::ApplyUpdate => "套用更新",
+        OsTool::BootAssessment => "查詢開機評估狀態",
+        OsTool::UpdateRollback => "回退到上一個系統版本",
         OsTool::Power => "電源操作（重開機／關機）",
         OsTool::FactoryReset => "回復原廠設定",
         OsTool::DoctorRepair => "系統診斷",

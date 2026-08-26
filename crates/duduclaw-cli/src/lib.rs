@@ -2583,7 +2583,7 @@ async fn cmd_os(
             }
             OsSystemCommands::NtpGet => os_drive::system_ntp_get().await,
             OsSystemCommands::NtpSet { enabled } => os_drive::system_ntp_set(home_dir, enabled).await,
-            OsSystemCommands::UpdateCheck => os_drive::system_update_check().await,
+            OsSystemCommands::UpdateCheck => os_drive::system_update_check(home_dir).await,
         },
         OsCommands::Network { command } => match command {
             OsNetworkCommands::Status => os_drive::network_status().await,

@@ -96,14 +96,23 @@ pub async fn ntp_set(home_dir: &Path, enabled: bool) -> Result<String, String> {
 }
 
 /// Reuses `mcp_os_ops::handle_os_check_update`'s exact logic shape (system
-/// self-update check always; appliance OS image update status only when
-/// `is_appliance()`) — duplicated here rather than calling that
-/// `pub(crate)` MCP-shaped function directly because its return type is an
-/// MCP tool-result envelope (`{"content":[...],"isError":...}`), not
-/// something a plain CLI print wants; the underlying calls
-/// (`updater::check_update()` / `device_ops::select_device_ops().
-/// update_status()`) are the SAME ones, called the same way.
-pub async fn update_check() -> Result<String, String> {
+/// self-update check always; appliance OS image update status + real
+/// upstream freshness check only when `is_appliance()`) — duplicated here
+/// rather than calling that `pub(crate)` MCP-shaped function directly
+/// because its return type is an MCP tool-result envelope
+/// (`{"content":[...],"isError":...}`), not something a plain CLI print
+/// wants; the underlying calls (`updater::check_update()` /
+/// `device_ops::select_device_ops().update_status()` /
+/// `os_update::check_update()`) are the SAME ones, called the same way.
+///
+/// `device_check` (Y5-3, agent-body update vertical slice): this third front
+/// door had the SAME gap `handle_os_check_update` was found to have — only
+/// `device.update_status`'s local-staging-only view, never the real
+/// `device.update_check` upstream-freshness signal `DevicePage.tsx`'s own
+/// "check for update" button asks for. Fixed here too so the three front
+/// doors (dashboard RPC / MCP tool / this CLI) answer the same question the
+/// same way, not two correct answers and one stale one.
+pub async fn update_check(home_dir: &Path) -> Result<String, String> {
     let system = match duduclaw_gateway::updater::check_update().await {
         Ok(info) => json!({
             "available": info.available,
@@ -113,15 +122,25 @@ pub async fn update_check() -> Result<String, String> {
         }),
         Err(e) => json!({ "error": e }),
     };
-    let device = if duduclaw_core::is_appliance() {
-        match duduclaw_gateway::device_ops::select_device_ops().update_status().await {
+    let (device, device_check) = if duduclaw_core::is_appliance() {
+        let device = match duduclaw_gateway::device_ops::select_device_ops().update_status().await {
             Ok(out) => json!({ "success": out.success, "stdout": out.stdout, "stderr": out.stderr }),
             Err(e) => json!({ "error": e.to_string() }),
-        }
+        };
+        let device_check = match duduclaw_gateway::os_update::check_update(home_dir).await {
+            Ok(report) => json!({
+                "available": report.available,
+                "current_version": report.current_version,
+                "latest_version": report.latest_version,
+            }),
+            Err(e) => json!({ "error": { "code": e.code(), "message": e.user_message() } }),
+        };
+        (device, device_check)
     } else {
-        json!({ "note": "非 appliance 安裝，無 OS image 更新可查。" })
+        let note = json!({ "note": "非 appliance 安裝，無 OS image 更新可查。" });
+        (note.clone(), note)
     };
-    serde_json::to_string_pretty(&json!({ "system": system, "device": device }))
+    serde_json::to_string_pretty(&json!({ "system": system, "device": device, "device_check": device_check }))
         .map_err(|e| format!("序列化失敗：{e}"))
 }
 
@@ -164,8 +183,13 @@ mod tests {
     /// it must succeed off-appliance, not refuse.
     #[tokio::test]
     async fn update_check_works_off_appliance() {
-        let result = update_check().await;
+        let home = tempfile::tempdir().unwrap();
+        let result = update_check(home.path()).await;
         assert!(result.is_ok(), "{result:?}");
-        assert!(result.unwrap().contains("\"system\""));
+        let text = result.unwrap();
+        assert!(text.contains("\"system\""));
+        // Off-appliance: `device_check` degrades to the same honest `note`
+        // shape as `device` — never a fabricated freshness answer.
+        assert!(text.contains("\"device_check\""));
     }
 }

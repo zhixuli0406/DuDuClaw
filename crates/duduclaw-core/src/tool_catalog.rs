@@ -684,7 +684,19 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "os_apply_update",
-        "Apply an update (device OS image or duduclaw self-update)",
+        "Apply an update (device OS image or duduclaw self-update, destructive, confirm required)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_boot_assessment",
+        "Read systemd's automatic boot assessment for the running version (agent-body update slice)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_update_rollback",
+        "Roll back to the previous A/B slot and reboot (destructive, confirm required, agent-body update slice)",
         "admin",
         "os",
     ),

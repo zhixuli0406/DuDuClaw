@@ -871,6 +871,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "os_wifi_scan"
         | "os_wifi_connect"
         | "os_apply_update"
+        | "os_boot_assessment"
+        | "os_update_rollback"
         | "os_backup_create"
         | "os_power"
         | "os_factory_reset"
@@ -1280,6 +1282,8 @@ is_external = {is_external}
             "os_wifi_scan",
             "os_wifi_connect",
             "os_apply_update",
+            "os_boot_assessment",
+            "os_update_rollback",
             "os_backup_create",
             "os_power",
             "os_factory_reset",
@@ -1309,6 +1313,8 @@ is_external = {is_external}
             "os_factory_reset",
             "os_power",
             "os_apply_update",
+            "os_boot_assessment",
+            "os_update_rollback",
         ] {
             assert!(
                 !external_tool_allowed(tool, &principal),
