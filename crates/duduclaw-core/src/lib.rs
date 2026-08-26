@@ -244,6 +244,18 @@ pub const ENV_REPLY_CHANNEL: &str = "DUDUCLAW_REPLY_CHANNEL";
 pub const ENV_TRUST_TURN_ID: &str = "DUDUCLAW_TURN_ID";
 pub const ENV_TRUST_SESSION_ID: &str = "DUDUCLAW_SESSION_ID";
 
+/// `working_state` key used for the agent-body update vertical slice's
+/// cross-restart result report handshake (Y8-3, T1 —
+/// `commercial/docs/DESIGN-agent-body-update-2026-08.md` §13). Shared here
+/// (rather than hardcoded as the same string literal in two crates) because
+/// both the writer (`duduclaw-cli`'s `mcp_os_ops.rs`, inside the per-session
+/// `duduclaw mcp-server` subprocess) and the reader (`duduclaw-gateway`'s
+/// `update_report_reconcile.rs`, inside the long-running gateway process)
+/// already depend on `duduclaw-core` — a single string constant is the
+/// simplest common ground two different crates' JSON-shaped `working_state`
+/// values can share without inventing a cross-crate struct for a single key.
+pub const WORKING_STATE_KEY_PENDING_UPDATE_REPORT: &str = "pending_update_report";
+
 /// Channel types supported for delegation callback forwarding.
 /// Used by both the MCP `send_to_agent` tool and the channel_reply session filter.
 pub const SUPPORTED_CHANNEL_TYPES: &[&str] = &[

@@ -10741,7 +10741,9 @@ pub(crate) async fn handle_tools_call(
         "os_wifi_status" => crate::mcp_os_ops::handle_os_wifi_status().await,
         "os_wifi_scan" => crate::mcp_os_ops::handle_os_wifi_scan(&arguments).await,
         "os_wifi_connect" => crate::mcp_os_ops::handle_os_wifi_connect(&arguments, home_dir).await,
-        "os_apply_update" => crate::mcp_os_ops::handle_os_apply_update(&arguments, home_dir).await,
+        "os_apply_update" => {
+            crate::mcp_os_ops::handle_os_apply_update(&arguments, home_dir, default_agent).await
+        }
         "os_boot_assessment" => crate::mcp_os_ops::handle_os_boot_assessment().await,
         "os_update_rollback" => crate::mcp_os_ops::handle_os_update_rollback(&arguments).await,
         "os_backup_create" => crate::mcp_os_ops::handle_os_backup_create(home_dir).await,

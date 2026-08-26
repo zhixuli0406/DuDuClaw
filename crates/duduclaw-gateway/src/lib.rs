@@ -356,6 +356,10 @@ pub mod local_models;
 //        dependency unlock / goal-mode judge acceptance) ──
 pub mod dispatch_engine;
 
+// ── Y8-3 T1: agent-body update vertical slice — cross-restart update result
+//        reconciliation sweep, piggy-backed on `dispatch_engine`'s tick ──
+pub mod update_report_reconcile;
+
 // ── P1: autonomous goal loop — outer-loop driver that dispatches goal_mode
 //        tasks, enforces iteration/wall-clock/concurrency caps, and re-dispatches
 //        judge-rejected tasks with feedback ──

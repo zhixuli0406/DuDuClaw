@@ -630,7 +630,18 @@ async fn require_factory_reset_approval_via(
 /// deeper in an autonomous/multi-step task (see
 /// `commercial/docs/DESIGN-agent-body-network-2026-08.md` §6.2), so the
 /// actual enforcement has to live here.
-pub(crate) async fn handle_os_apply_update(args: &Value, home_dir: &Path) -> Value {
+///
+/// **Cross-restart result report handshake (Y8-3, T1 —
+/// `commercial/docs/DESIGN-agent-body-update-2026-08.md` §3.4/§13)**: both
+/// success branches below call [`record_pending_update_report`] before
+/// returning. This is a deterministic, handler-side write — not a
+/// system-prompt instruction hoping the model remembers to call
+/// `working_state_set` itself — because no such "tool call auto-chains
+/// another tool call" mechanism exists on this platform (`os_operator.rs`
+/// never calls an MCP handler). See that function's doc comment for what
+/// gets written and why; see `update_report_reconcile.rs` (`duduclaw-
+/// gateway`) for who reads it back after the restart.
+pub(crate) async fn handle_os_apply_update(args: &Value, home_dir: &Path, default_agent: &str) -> Value {
     let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
     match target {
         "device" => {
@@ -651,6 +662,7 @@ pub(crate) async fn handle_os_apply_update(args: &Value, home_dir: &Path) -> Val
                     os_ops_error(&json!({ "code": "slot_mismatch", "message": message }).to_string())
                 }
                 duduclaw_gateway::handlers::DeviceUpdateApplyOutcome::Applied(applied) => {
+                    record_pending_update_report(home_dir, default_agent, "device", None).await;
                     device_op_result_text(applied)
                 }
             }
@@ -659,12 +671,75 @@ pub(crate) async fn handle_os_apply_update(args: &Value, home_dir: &Path) -> Val
             if !confirm_flag(args) {
                 return confirm_required_error();
             }
-            apply_system_update(home_dir).await
+            apply_system_update(home_dir, default_agent).await
         }
         _ => os_ops_error(
             "target 必須是 \"device\"（appliance OS image 更新，經 duduclaw-sysd）或 \
              \"system\"（duduclaw 本體自我更新）。",
         ),
+    }
+}
+
+/// Best-effort write of the cross-restart report handshake (Y8-3, T1) —
+/// `pending_update_report` in `working_state`, read back by `duduclaw-
+/// gateway`'s `update_report_reconcile::sweep` on a later `DispatchEngine`
+/// tick (possibly after this very process, and the machine/gateway it ran
+/// on top of, have both restarted).
+///
+/// Uses [`duduclaw_gateway::working_state::set_entry`] directly — the same
+/// pure Rust API the `working_state_set` MCP tool wraps — rather than making
+/// a second MCP round-trip, because this handler already knows everything
+/// that write needs and a second tool call would just be indirection with
+/// nowhere to indirect to (there is no MCP client on the other end of this
+/// stdio connection that would relay a call back to `duduclaw mcp-server`
+/// itself).
+///
+/// `report_channel`/`report_chat_id` are NOT accepted as arguments the model
+/// could supply — they are read from `DUDUCLAW_REPLY_CHANNEL`
+/// (`duduclaw_core::ENV_REPLY_CHANNEL`), the same env var
+/// `channel_reply.rs` already threads down into this subprocess so
+/// `send_to_agent`/install-approval flows can find their way back to the
+/// originating chat (see `decision_notify::origin_target`'s doc comment on
+/// the `duduclaw-gateway` side). A console/dashboard-triggered call (no
+/// channel context) simply omits it — `update_report_reconcile.rs` falls
+/// back to the agent's own default `[proactive]` notify destination.
+///
+/// Failure here (unknown agent id, key-cap exceeded, disk error) is logged
+/// and swallowed: the update itself already succeeded by the time this
+/// runs, and losing the bookkeeping write must never turn a successful
+/// `os_apply_update` call into an error response.
+async fn record_pending_update_report(
+    home_dir: &Path,
+    agent_id: &str,
+    target: &str,
+    expected_version: Option<&str>,
+) {
+    let reply_channel_raw = std::env::var(duduclaw_core::ENV_REPLY_CHANNEL)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let value = json!({
+        "target": target,
+        "expected_version": expected_version,
+        "initiated_at": chrono::Utc::now().to_rfc3339(),
+        "reply_channel_raw": reply_channel_raw,
+        "restart_triggered": false,
+        "restart_triggered_at": serde_json::Value::Null,
+    })
+    .to_string();
+    let reason = format!("觸發 os_apply_update(target={target})，需要跨重啟回報結果");
+    let home = home_dir.to_path_buf();
+    let agent = agent_id.to_string();
+    let key = duduclaw_core::WORKING_STATE_KEY_PENDING_UPDATE_REPORT;
+    let result = tokio::task::spawn_blocking(move || {
+        duduclaw_gateway::working_state::set_entry(&home, &agent, key, &value, &reason, Some(4.0), None)
+    })
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(agent = agent_id, target, error = %e, "pending_update_report 寫入失敗（更新本身已成功，僅跨重啟回報這一步受影響）");
+        }
+        Err(e) => tracing::warn!(agent = agent_id, target, error = %e, "pending_update_report 寫入 join 失敗"),
     }
 }
 
@@ -683,7 +758,7 @@ pub(crate) async fn handle_os_apply_update(args: &Value, home_dir: &Path) -> Val
 /// default GitHub/control-plane channel instead. Reaching the extension's
 /// provider would require exposing its resolution to a cross-process
 /// reader, which is out of scope for the O-0 tool-face skeleton.
-async fn apply_system_update(home_dir: &Path) -> Value {
+async fn apply_system_update(home_dir: &Path, default_agent: &str) -> Value {
     let info = match duduclaw_gateway::updater::check_update().await {
         Ok(info) => info,
         Err(e) => return os_ops_error(&format!("更新檢查失敗：{e}")),
@@ -713,10 +788,13 @@ async fn apply_system_update(home_dir: &Path) -> Value {
     )
     .await
     {
-        Ok(res) => match serde_json::to_value(&res) {
-            Ok(v) => os_ops_text(&json!({ "applied": true, "version": info.latest_version, "result": v }).to_string()),
-            Err(e) => os_ops_text(&format!("更新已套用（version={}），但結果序列化失敗：{e}", info.latest_version)),
-        },
+        Ok(res) => {
+            record_pending_update_report(home_dir, default_agent, "system", Some(&info.latest_version)).await;
+            match serde_json::to_value(&res) {
+                Ok(v) => os_ops_text(&json!({ "applied": true, "version": info.latest_version, "result": v }).to_string()),
+                Err(e) => os_ops_text(&format!("更新已套用（version={}），但結果序列化失敗：{e}", info.latest_version)),
+            }
+        }
         Err(e) => os_ops_error(&format!("更新套用失敗：{e}")),
     }
 }
@@ -909,7 +987,7 @@ mod tests {
             handle_os_backup_create(home.path()).await,
             handle_os_power(&json!({"action": "restart", "confirm": true})).await,
             handle_os_factory_reset(&json!({"confirm": true}), home.path(), "sysop").await,
-            handle_os_apply_update(&json!({"target": "device", "confirm": true}), home.path()).await,
+            handle_os_apply_update(&json!({"target": "device", "confirm": true}), home.path(), "test-agent").await,
             handle_os_boot_assessment().await,
             handle_os_update_rollback(&json!({"confirm": true})).await,
             handle_os_display_get().await,
@@ -1015,11 +1093,11 @@ mod tests {
     #[tokio::test]
     async fn apply_update_rejects_unknown_or_missing_target() {
         let home = tmp_home();
-        let unknown = handle_os_apply_update(&json!({"target": "nonsense"}), home.path()).await;
+        let unknown = handle_os_apply_update(&json!({"target": "nonsense"}), home.path(), "test-agent").await;
         assert_eq!(unknown["isError"], true);
         assert!(unknown["content"][0]["text"].as_str().unwrap().contains("target"));
 
-        let missing = handle_os_apply_update(&json!({}), home.path()).await;
+        let missing = handle_os_apply_update(&json!({}), home.path(), "test-agent").await;
         assert_eq!(missing["isError"], true);
     }
 
@@ -1035,7 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn apply_update_system_target_requires_confirm_before_any_network_call() {
         let home = tmp_home();
-        let v = handle_os_apply_update(&json!({"target": "system"}), home.path()).await;
+        let v = handle_os_apply_update(&json!({"target": "system"}), home.path(), "test-agent").await;
         assert_eq!(v["isError"], true, "{v:?}");
         let text = v["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("confirm"), "unexpected message: {text}");
@@ -1047,9 +1125,68 @@ mod tests {
     #[tokio::test]
     async fn apply_update_device_target_appliance_gate_fires_even_with_confirm() {
         let home = tmp_home();
-        let v = handle_os_apply_update(&json!({"target": "device", "confirm": true}), home.path()).await;
+        let v = handle_os_apply_update(&json!({"target": "device", "confirm": true}), home.path(), "test-agent").await;
         assert_eq!(v["isError"], true, "{v:?}");
         assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+    }
+
+    // ── Y8-3 T1: cross-restart report handshake write ───────────────────
+    //
+    // `handle_os_apply_update`'s success branches are unreachable off-
+    // appliance (device) / without live network (system) in this test
+    // process — see `appliance_gated_tools_fail_closed_off_appliance` and
+    // `apply_update_system_target_requires_confirm_before_any_network_call`'s
+    // own doc comments for why those two paths are deliberately not
+    // exercised end-to-end here. `record_pending_update_report` is exercised
+    // directly instead — it is the one new piece of production logic this
+    // ticket adds to this crate, and it needs no appliance/network access.
+
+    #[tokio::test]
+    async fn record_pending_update_report_writes_a_parseable_working_state_entry() {
+        let home = tmp_home();
+        std::fs::create_dir_all(home.path().join("agents").join("sysop")).unwrap();
+
+        record_pending_update_report(home.path(), "sysop", "system", Some("1.63.0")).await;
+
+        let full = duduclaw_gateway::working_state::read_full(home.path(), "sysop", 0).unwrap();
+        let entry = &full["states"][duduclaw_core::WORKING_STATE_KEY_PENDING_UPDATE_REPORT];
+        assert_ne!(*entry, serde_json::Value::Null, "{full:?}");
+        let value: serde_json::Value =
+            serde_json::from_str(entry["value"].as_str().unwrap()).unwrap();
+        assert_eq!(value["target"], "system");
+        assert_eq!(value["expected_version"], "1.63.0");
+        assert_eq!(value["restart_triggered"], false);
+        assert!(value["restart_triggered_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn record_pending_update_report_omits_expected_version_for_device_target() {
+        let home = tmp_home();
+        std::fs::create_dir_all(home.path().join("agents").join("sysop")).unwrap();
+
+        record_pending_update_report(home.path(), "sysop", "device", None).await;
+
+        let full = duduclaw_gateway::working_state::read_full(home.path(), "sysop", 0).unwrap();
+        let value: serde_json::Value = serde_json::from_str(
+            full["states"][duduclaw_core::WORKING_STATE_KEY_PENDING_UPDATE_REPORT]["value"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["target"], "device");
+        assert!(value["expected_version"].is_null());
+    }
+
+    /// An unresolvable agent id must not panic or propagate an error to the
+    /// caller — the update already succeeded by the time this runs; the
+    /// bookkeeping write is best-effort (see the function's own doc comment).
+    #[tokio::test]
+    async fn record_pending_update_report_unknown_agent_fails_open_silently() {
+        let home = tmp_home();
+        // No `agents/ghost` directory created — `working_state::set_entry`
+        // will refuse with "unknown agent", which must be swallowed, not
+        // panic this test.
+        record_pending_update_report(home.path(), "ghost", "system", Some("1.63.0")).await;
     }
 
     /// Agent-body update vertical slice (Y5-3): `os_check_update`'s new

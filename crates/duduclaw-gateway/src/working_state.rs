@@ -627,6 +627,25 @@ pub fn set_handoff(
     .map_err(|e| format!("working state 寫入失敗：{e}"))?
 }
 
+/// Single-key read of the *live* (non-expired) entry, if any.
+///
+/// Unlike [`read_full`] (built for the `working_state_get` MCP tool — whole
+/// state + history, expiry flagged rather than hidden, since that surface is
+/// meant for debugging), this is the narrow read a deterministic gateway-side
+/// sweep wants: one key, and an expired entry must read exactly the same as
+/// a missing one (a sweep that "found" an expired report and acted on it
+/// would violate the whole point of the TTL). Used by
+/// `update_report_reconcile.rs` (Y8-3, T1) to read
+/// `pending_update_report` without going through the MCP tool round-trip —
+/// same "pure Rust API alongside the MCP handler" shape [`set_entry`]/
+/// [`clear_entry`] already have.
+pub fn get_entry(home_dir: &Path, agent_id: &str, key: &str) -> Option<StateEntry> {
+    let state_dir = resolve_state_dir(home_dir, agent_id)?;
+    let state = load(&state_dir);
+    let now = now_rfc3339();
+    state.states.get(key).filter(|e| !is_expired(e, &now)).cloned()
+}
+
 /// Full read for the `working_state_get` MCP tool: current state (expired
 /// entries flagged, not hidden — the read tool is the debugging surface)
 /// plus the most recent history records.
@@ -899,6 +918,36 @@ mod tests {
         assert!(!section.contains("day_rule"));
         let full = read_full(home.path(), "trader", 5).unwrap();
         assert_eq!(full["states"]["day_rule"]["expired"], true);
+    }
+
+    // ── get_entry (Y8-3 T1 sweep read) ──────────────────────────
+
+    #[test]
+    fn get_entry_returns_live_value() {
+        let home = mk_home("trader");
+        set_entry(home.path(), "trader", "pending_update_report", "{\"target\":\"system\"}", "r", Some(4.0), None)
+            .unwrap();
+        let entry = get_entry(home.path(), "trader", "pending_update_report").unwrap();
+        assert_eq!(entry.value, "{\"target\":\"system\"}");
+    }
+
+    #[test]
+    fn get_entry_hides_expired_value_same_as_missing() {
+        let home = mk_home("trader");
+        set_entry(home.path(), "trader", "day_rule", "262", "今日", Some(0.01), None).unwrap();
+        let state_dir = home.path().join("agents/trader/state");
+        let mut st = load(&state_dir);
+        st.states.get_mut("day_rule").unwrap().expires_at =
+            Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+        persist(&state_dir, &st).unwrap();
+        assert!(get_entry(home.path(), "trader", "day_rule").is_none());
+    }
+
+    #[test]
+    fn get_entry_missing_key_or_unknown_agent_is_none() {
+        let home = mk_home("trader");
+        assert!(get_entry(home.path(), "trader", "nope").is_none());
+        assert!(get_entry(home.path(), "no-such-agent", "nope").is_none());
     }
 
     #[test]

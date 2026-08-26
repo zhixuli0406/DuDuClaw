@@ -1434,6 +1434,14 @@ pub struct DispatchEngine {
     /// caller-side wiring notes in `handlers.rs`) so both hooks read/write
     /// the same in-memory statistical-bucket cache.
     forward_model: Option<Arc<crate::prediction::task_forward_store::TaskForwardModel>>,
+    /// HTTP client for the Y8-3 T1 update-report reconciliation sweep's
+    /// channel notification delivery (`reminder_scheduler::send_channel_
+    /// message`). Reused across ticks rather than constructed per-sweep —
+    /// same reasoning as any other long-lived `reqwest::Client` in this
+    /// codebase (connection pooling), just newly relevant here because this
+    /// is the first thing `DispatchEngine` does that makes an outbound HTTP
+    /// call.
+    http: reqwest::Client,
 }
 
 impl DispatchEngine {
@@ -1448,7 +1456,16 @@ impl DispatchEngine {
             home_dir: None,
             soft_cap: DEFAULT_SOFT_CAP,
             forward_model: None,
+            http: reqwest::Client::new(),
         }
+    }
+
+    /// Inject a specific `reqwest::Client` (tests / a caller that wants
+    /// connection-pool sharing with another subsystem). Omit to keep the
+    /// default `reqwest::Client::new()` built in [`Self::new`].
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
     }
 
     /// H1: wire the cheap first-stage evaluator. Omit (default `None`) to keep
@@ -1571,6 +1588,20 @@ impl DispatchEngine {
         // action + audit line, never lets `status()` lie about being active).
         if let Some(home) = &self.home_dir {
             crate::maintenance::sweep_expired_maintenance_window(home).await;
+        }
+
+        // 5) Y8-3 T1 (`commercial/docs/DESIGN-agent-body-update-2026-08.md`
+        // §3.4/§13): agent-body update vertical slice's cross-restart result
+        // reconciliation. Same "piggy-back on the existing tick, no new
+        // timer" reasoning as steps 3/4 above — this is also the module that
+        // actually triggers the gateway's own self-restart for an
+        // agent-initiated `system`-target update (the MCP tool path runs in
+        // a different, short-lived process and cannot do that itself; see
+        // `update_report_reconcile.rs`'s module doc for the full chain of
+        // reasoning). Best-effort: failures are logged inside the sweep
+        // itself and never propagate here.
+        if let Some(home) = &self.home_dir {
+            crate::update_report_reconcile::sweep(home, &self.http).await;
         }
         Ok(())
     }
