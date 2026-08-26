@@ -724,6 +724,18 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "admin",
         "os",
     ),
+    (
+        "os_display_get",
+        "Read display appearance: cursor size/source, comp's theme, primary screen scale (A7c agent→display bridge)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_display_set",
+        "Change one display appearance field live (cursor_size/cursor_source/theme/output_scale — A7c \"make text bigger\" backend)",
+        "admin",
+        "os",
+    ),
     // ── Office document scripting (skill:execute) ────────────────────────
     (
         "office_script",

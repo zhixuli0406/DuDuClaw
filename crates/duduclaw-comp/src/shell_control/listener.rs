@@ -66,6 +66,7 @@ const MAIN_THREAD_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 pub fn spawn(
     sock_path: PathBuf,
     own_uid: u32,
+    agent_uid: Option<u32>,
     shared: Arc<ShellControlShared>,
     tx: calloop::channel::Sender<ShellControlMsg>,
 ) -> std::io::Result<()> {
@@ -79,17 +80,25 @@ pub fn spawn(
     tracing::info!(
         path = %sock_path.display(),
         own_uid,
+        agent_uid,
         "shell_control: shell-control socket listening (one-shot request/response, \
-         same-uid SO_PEERCRED auth — see this module's doc comment)"
+         same-uid SO_PEERCRED auth plus the A7c agent-authority carve-out — see \
+         this module's and `classify_peer`'s doc comments)"
     );
 
     std::thread::Builder::new()
         .name("shell-control".into())
-        .spawn(move || accept_loop(listener, own_uid, shared, tx))
+        .spawn(move || accept_loop(listener, own_uid, agent_uid, shared, tx))
         .map(|_handle| ())
 }
 
-fn accept_loop(listener: UnixListener, own_uid: u32, shared: Arc<ShellControlShared>, tx: calloop::channel::Sender<ShellControlMsg>) {
+fn accept_loop(
+    listener: UnixListener,
+    own_uid: u32,
+    agent_uid: Option<u32>,
+    shared: Arc<ShellControlShared>,
+    tx: calloop::channel::Sender<ShellControlMsg>,
+) {
     loop {
         let (stream, _addr) = match listener.accept() {
             Ok(pair) => pair,
@@ -98,7 +107,7 @@ fn accept_loop(listener: UnixListener, own_uid: u32, shared: Arc<ShellControlSha
                 return;
             }
         };
-        handle_connection(stream, own_uid, &shared, &tx);
+        handle_connection(stream, own_uid, agent_uid, &shared, &tx);
     }
 }
 
@@ -144,19 +153,99 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     Ok(cred.uid)
 }
 
-/// True iff `peer_uid` (as reported by the kernel via `SO_PEERCRED`) equals
-/// `own_uid` (this compositor process's own uid). Pure function — see
-/// `mod.rs`'s tests for the "agent cannot reach this socket" proof: since a
-/// real different-uid peer can't be spawned without root in a test, the
-/// established convention in this codebase (`duduclaw-sysd::server`'s own
-/// `mismatched_uid_is_rejected` test) is to vary the CONFIGURED side
-/// instead — exactly what this function's own signature makes easy to test
-/// directly, no socket needed.
-pub(crate) fn is_authorized_peer(peer_uid: Option<u32>, own_uid: u32) -> bool {
-    matches!(peer_uid, Some(p) if p == own_uid)
+/// A7c: what a connecting peer is authorized to do, derived purely from its
+/// kernel-reported uid (`SO_PEERCRED`) — never anything the peer sends.
+///
+/// `Human` is the ORIGINAL, unchanged trust tier this module's own doc
+/// comment describes: same-uid-as-comp, full op set, unaudited-queries/
+/// audited-actions exactly as before A7c.
+///
+/// `Agent` is new (A7c, `commercial/docs/DESIGN-os-self-drive-2026-08.md`'s
+/// follow-on ticket): a caller this socket now recognizes as "the
+/// platform's own agent-facing process", restricted to
+/// [`super::protocol::ShellControlRequest::agent_allowed`]'s closed
+/// allowlist (`handle_connection` enforces this — never assume the caller
+/// checks). Two ways to earn it:
+/// - `peer_uid == 0` (root). On the Yocto bring-up image `duduclaw-gateway.
+///   service` has no `User=` line yet (`meta-duduclaw/recipes-duduclaw/
+///   duduclaw-cli/files/duduclaw-gateway.service`'s own comment: "this
+///   Yocto image doesn't provision a non-root service user ... yet") — the
+///   gateway, and every agent CLI subprocess it spawns without a privilege
+///   drop, IS root today. Trusting root here adds no real incremental
+///   power: root already has unrestricted filesystem/process access to
+///   this machine (it could read comp's memory, kill it, or rewrite its
+///   config directly), so refusing root on this ONE socket would be
+///   security theater, not a boundary. This is the standard Unix daemon
+///   convention (root is implicitly trusted by definition), not a new
+///   invention.
+/// - `peer_uid == agent_uid` (an explicitly configured second uid, `None`
+///   by default). Forward-compatible with the Debian appliance model
+///   (`duduclaw-gateway.service` there DOES run `User=duduclaw`, a
+///   DIFFERENT uid from `duduclaw-kiosk`) and with the day the Yocto image
+///   de-roots gateway per that same unit file's "product-layer work for a
+///   later ticket" comment — at that point `own_uid` is neither the
+///   caller's real uid (0) NOR necessarily set, so a configured `agent_uid`
+///   is the only way this socket can keep recognizing that caller. Read
+///   once at `mod.rs::init` from `DUDUCLAW_SHELL_CONTROL_AGENT_UID`; unset/
+///   unparseable degrades to `None`, which means "no second identity is
+///   trusted" — fail-closed, not fail-open, exactly like every other
+///   config-driven gate in this codebase (coding convention #4).
+///
+/// Never let a peerself-declare its authority — the ENTIRE point of using
+/// `SO_PEERCRED` (kernel-verified, unspoofable) instead of a request field
+/// is that nothing the connecting process writes can influence this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerAuthority {
+    Human,
+    Agent,
+    Denied,
 }
 
-fn handle_connection(stream: UnixStream, own_uid: u32, shared: &Arc<ShellControlShared>, tx: &calloop::channel::Sender<ShellControlMsg>) {
+/// Pure function — see `mod.rs`'s tests for the "agent cannot reach the
+/// human-only ops" proof: since a real different-uid peer can't be spawned
+/// without root in a test, the established convention in this codebase
+/// (`duduclaw-sysd::server`'s own `mismatched_uid_is_rejected` test) is to
+/// vary the CONFIGURED side instead — exactly what this function's own
+/// signature makes easy to test directly, no socket needed.
+pub(crate) fn classify_peer(peer_uid: Option<u32>, own_uid: u32, agent_uid: Option<u32>) -> PeerAuthority {
+    match peer_uid {
+        Some(p) if p == own_uid => PeerAuthority::Human,
+        // Root is checked before the configured `agent_uid` comparison so
+        // `own_uid == 0` (comp somehow running as root itself) is still
+        // caught by the FIRST arm above and correctly classified `Human` —
+        // this arm only ever fires for peers that are NOT comp's own uid.
+        Some(0) => PeerAuthority::Agent,
+        Some(p) if agent_uid == Some(p) => PeerAuthority::Agent,
+        _ => PeerAuthority::Denied,
+    }
+}
+
+impl PeerAuthority {
+    /// Stable audit-line label — `mod.rs`'s mutating handlers prefix their
+    /// `detail` string with this so a reader of the (single, shared)
+    /// shell-control audit trail can tell a human's own preference change
+    /// apart from an agent-driven one without cross-referencing a second
+    /// file. `Denied` is never actually recorded through this path (a
+    /// denied connection never reaches `mod.rs` at all), but is spelled out
+    /// rather than `unreachable!()` — a defensive label costs nothing and a
+    /// panic here would be a strictly worse failure mode than a
+    /// (impossible in practice) misleading log line.
+    pub(crate) fn audit_label(self) -> &'static str {
+        match self {
+            PeerAuthority::Human => "human",
+            PeerAuthority::Agent => "agent",
+            PeerAuthority::Denied => "denied",
+        }
+    }
+}
+
+fn handle_connection(
+    stream: UnixStream,
+    own_uid: u32,
+    agent_uid: Option<u32>,
+    shared: &Arc<ShellControlShared>,
+    tx: &calloop::channel::Sender<ShellControlMsg>,
+) {
     let peer_uid = match peer_uid(&stream) {
         Ok(uid) => Some(uid),
         Err(e) => {
@@ -173,8 +262,9 @@ fn handle_connection(stream: UnixStream, own_uid: u32, shared: &Arc<ShellControl
         }
     };
 
-    if !is_authorized_peer(peer_uid, own_uid) {
-        tracing::warn!(peer_uid = ?peer_uid, own_uid, "shell_control: rejected connection — caller uid is not this process's own uid");
+    let authority = classify_peer(peer_uid, own_uid, agent_uid);
+    if authority == PeerAuthority::Denied {
+        tracing::warn!(peer_uid = ?peer_uid, own_uid, agent_uid, "shell_control: rejected connection — caller uid is not this process's own uid, root, or the configured agent uid");
         shared.record("auth_denied", Some(format!("peer_uid={peer_uid:?} own_uid={own_uid}")));
         let _ = write_response(&mut writer, &ShellControlResponse::err("unauthorized"));
         // Same "read error before auth" non-issue `codrive::listener`
@@ -218,7 +308,23 @@ fn handle_connection(stream: UnixStream, own_uid: u32, shared: &Arc<ShellControl
         return;
     }
 
-    tracing::debug!(op = req.op_name(), "shell_control: dispatching to the main thread");
+    // A7c: an Agent-authority peer is authenticated, but only for the
+    // narrow appearance-preference allowlist — never assume the human-only
+    // ops are unreachable just because comp's own uid check passed above.
+    // Denied BEFORE the main-thread round trip, same "malformed/oversized
+    // never reaches the channel" discipline `validate`'s own rejections
+    // just used above.
+    if authority == PeerAuthority::Agent && !req.agent_allowed() {
+        tracing::warn!(
+            op = req.op_name(),
+            "shell_control: agent-authority peer attempted a human-only op — denying"
+        );
+        shared.record("agent_forbidden", Some(format!("op={}", req.op_name())));
+        let _ = write_response(&mut writer, &ShellControlResponse::err("forbidden_for_agent"));
+        return;
+    }
+
+    tracing::debug!(op = req.op_name(), actor = ?authority, "shell_control: dispatching to the main thread");
 
     // Bridge to the calloop main thread (the only thread allowed to touch
     // `self.space`/`self.seat`) via a oneshot `std::sync::mpsc` reply
@@ -227,7 +333,7 @@ fn handle_connection(stream: UnixStream, own_uid: u32, shared: &Arc<ShellControl
     // caller genuinely needs the real computed answer, not an
     // immediately-knowable ack).
     let (reply_tx, reply_rx) = mpsc::channel::<ShellControlResponse>();
-    if tx.send(ShellControlMsg { req, reply_tx }).is_err() {
+    if tx.send(ShellControlMsg { req, actor: authority, reply_tx }).is_err() {
         tracing::error!("shell_control: request channel closed — compositor event loop gone");
         let _ = write_response(&mut writer, &ShellControlResponse::err("compositor_unavailable"));
         return;
@@ -672,34 +778,64 @@ mod tests {
     // wire-shape tests — one file per A2 concern, and this one was already
     // past the 800-line cap before A2 touched it.
 
-    // ── Pure auth predicate — the "agent cannot reach this socket" proof ──
-    // (see this file's own `is_authorized_peer` doc comment for why the
+    // ── Pure auth predicate — the "human vs agent vs denied" proof ────────
+    // (see this file's own `classify_peer` doc comment for why the
     // CONFIGURED side, not the real peer, is varied here — same strategy
     // `duduclaw-sysd::server::tests::mismatched_uid_is_rejected` already
     // establishes as this codebase's accepted way to test this property
     // without root.)
 
     #[test]
-    fn is_authorized_peer_accepts_matching_uid() {
-        assert!(is_authorized_peer(Some(1000), 1000));
+    fn classify_peer_accepts_matching_uid_as_human() {
+        assert_eq!(classify_peer(Some(1000), 1000, None), PeerAuthority::Human);
     }
 
     #[test]
-    fn is_authorized_peer_rejects_a_different_uid() {
-        // Stands in for an agent CLI subprocess: on the appliance, agents
-        // run as `duduclaw` (uid 1000, `duduclaw-gateway.service`) while
-        // this compositor and its shell client both run as `duduclaw-kiosk`
-        // (a DIFFERENT system user — `appliance/postinst.d/
-        // 20-users-and-units.sh`) — so a same-uid check is a REAL boundary
-        // between the two, not just a naming convention.
-        assert!(!is_authorized_peer(Some(1000), 1001));
+    fn classify_peer_denies_an_unrelated_different_uid() {
+        // Stands in for an ordinary different-uid process that is neither
+        // comp's own uid, root, nor the configured agent uid.
+        assert_eq!(classify_peer(Some(1000), 1001, None), PeerAuthority::Denied);
     }
 
     #[test]
-    fn is_authorized_peer_rejects_unreadable_peer_credentials() {
+    fn classify_peer_denies_unreadable_peer_credentials() {
         // `peer_cred()` failing (e.g. an exotic platform) must fail closed,
         // never fail open.
-        assert!(!is_authorized_peer(None, 1000));
+        assert_eq!(classify_peer(None, 1000, None), PeerAuthority::Denied);
+    }
+
+    #[test]
+    fn classify_peer_trusts_root_as_agent_even_with_no_configured_agent_uid() {
+        // A7c: the Yocto bring-up image's gateway runs as root today
+        // (`meta-duduclaw/recipes-duduclaw/duduclaw-cli/files/
+        // duduclaw-gateway.service`'s own comment) — this is what makes the
+        // display bridge reachable from that gateway without any new
+        // per-appliance config.
+        assert_eq!(classify_peer(Some(0), 1000, None), PeerAuthority::Agent);
+    }
+
+    #[test]
+    fn classify_peer_root_is_human_when_comps_own_uid_is_also_root() {
+        // The FIRST match arm (peer == own_uid) must win over the
+        // root-is-agent carve-out — a comp that somehow runs as root itself
+        // still gets the full Human op set for its own uid, not the
+        // restricted Agent allowlist.
+        assert_eq!(classify_peer(Some(0), 0, None), PeerAuthority::Human);
+    }
+
+    #[test]
+    fn classify_peer_trusts_the_configured_agent_uid() {
+        // Forward-compat: once gateway de-roots to a real `duduclaw` uid
+        // (Debian appliance model, or a future de-rooted Yocto image), that
+        // uid is trusted only when explicitly configured — never inferred.
+        assert_eq!(classify_peer(Some(1000), 999, Some(1000)), PeerAuthority::Agent);
+    }
+
+    #[test]
+    fn classify_peer_denies_an_unconfigured_would_be_agent_uid() {
+        // `agent_uid: None` (the default — nothing configured) must not
+        // silently trust ANY non-root, non-own uid. Fail-closed.
+        assert_eq!(classify_peer(Some(1000), 999, None), PeerAuthority::Denied);
     }
 
     // ── Socket-level round trip (transport only — business logic is
@@ -761,7 +897,7 @@ mod tests {
         let canned = ShellControlResponse::focused_by_app_id("foot-A".to_string());
         let (seen, stop_tx) = spawn_fake_main_thread(rx, canned);
 
-        spawn(sock_path.clone(), current_uid(), Arc::clone(&shared), tx).expect("listener failed to bind");
+        spawn(sock_path.clone(), current_uid(), None, Arc::clone(&shared), tx).expect("listener failed to bind");
 
         let conn = UnixStream::connect(&sock_path).expect("client failed to connect");
         let mut writer = conn.try_clone().unwrap();
@@ -791,31 +927,43 @@ mod tests {
         // The listener believes its OWN uid is `current_uid() + 1` — i.e.
         // this test process (whatever its real uid is) is treated exactly
         // like a different-uid caller would be, same test strategy this
-        // file's own `is_authorized_peer_rejects_a_different_uid` and
+        // file's own `classify_peer_denies_an_unrelated_different_uid` and
         // `duduclaw-sysd::server::tests::mismatched_uid_is_rejected` use.
+        // No `agent_uid` configured.
         let wrong_own_uid = current_uid().wrapping_add(1);
-        spawn(sock_path.clone(), wrong_own_uid, Arc::clone(&shared), tx).expect("listener failed to bind");
+        spawn(sock_path.clone(), wrong_own_uid, None, Arc::clone(&shared), tx).expect("listener failed to bind");
 
         let conn = UnixStream::connect(&sock_path).expect("client failed to connect");
         let mut writer = conn.try_clone().unwrap();
-        // Deliberately NOT `.unwrap()`: this is the REJECTION path, so the
-        // listener is racing us to close the connection the moment it reads
-        // the peer's credentials — it owes an unauthorized caller nothing and
-        // does not wait for the request line. When it wins that race our write
-        // lands on a closed socket and returns EPIPE, which made this test
-        // flake at roughly 1-in-15 (measured over a 15-run loop, 2026-08-22).
-        // Whether the write itself succeeds is not what is under test; the
-        // assertions below are, and both hold either way — the listener still
-        // answers `ok:false`/`unauthorized` and still never reaches the main
-        // thread. Swallowing the error here removes the flake without weakening
-        // a single assertion.
+        // `list_windows` is deliberately a HUMAN-only op (never in
+        // `agent_allowed`) — if this test process happens to run as root
+        // (e.g. a Docker-based CI container), `classify_peer` correctly
+        // classifies it `Agent` (A7c's root carve-out) rather than
+        // `Denied`, and the rejection this test cares about happens one
+        // step later, at the agent-verb allowlist instead of the uid gate.
+        // Both are asserted below rather than assuming a specific error
+        // token, so this test is honest under either executing uid.
+        //
+        // Deliberately NOT `.unwrap()` on the write: this is the REJECTION
+        // path, so the listener is racing us to close the connection the
+        // moment it reads the peer's credentials — it owes a denied caller
+        // nothing and does not wait for the request line. When it wins
+        // that race our write lands on a closed socket and returns EPIPE,
+        // which made this test flake at roughly 1-in-15 (measured over a
+        // 15-run loop, 2026-08-22). Whether the write itself succeeds is
+        // not what is under test; the assertions below are, and both hold
+        // either way. Swallowing the error here removes the flake without
+        // weakening a single assertion.
         let _ = writeln!(writer, r#"{{"op":"list_windows"}}"#);
 
         let mut reply = String::new();
         BufReader::new(&conn).read_line(&mut reply).expect("no response from listener");
         assert!(reply.contains(r#""ok":false"#), "unexpected response: {reply}");
-        assert!(reply.contains("unauthorized"), "unexpected response: {reply}");
-        assert_eq!(seen.load(Ordering::SeqCst), 0, "an unauthorized peer's request must never reach the main thread");
+        assert!(
+            reply.contains("unauthorized") || reply.contains("forbidden_for_agent"),
+            "unexpected response: {reply}"
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "a denied/forbidden peer's request must never reach the main thread");
 
         let _ = stop_tx.send(());
         let _ = std::fs::remove_file(&sock_path);
@@ -831,7 +979,7 @@ mod tests {
         let canned = ShellControlResponse::windows(vec![]);
         let (seen, stop_tx) = spawn_fake_main_thread(rx, canned);
 
-        spawn(sock_path.clone(), current_uid(), Arc::clone(&shared), tx).expect("listener failed to bind");
+        spawn(sock_path.clone(), current_uid(), None, Arc::clone(&shared), tx).expect("listener failed to bind");
 
         let conn = UnixStream::connect(&sock_path).expect("client failed to connect");
         let mut writer = conn.try_clone().unwrap();
@@ -853,11 +1001,80 @@ mod tests {
         let _ = std::fs::remove_file(&sock_path);
         let shared = Arc::new(ShellControlShared::for_test());
         let (tx, _rx) = calloop::channel::channel::<ShellControlMsg>();
-        spawn(sock_path.clone(), current_uid(), shared, tx).expect("listener failed to bind");
+        spawn(sock_path.clone(), current_uid(), None, shared, tx).expect("listener failed to bind");
         // Give the listener thread a moment to bind before checking.
         std::thread::sleep(Duration::from_millis(100));
         let mode = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    // ── A7c: agent-authority integration — proves the allowlist is
+    // enforced at the SOCKET level, not just in the pure `agent_allowed`
+    // unit tests. ───────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_authority_peer_can_reach_an_allowed_appearance_op() {
+        let sock_path = temp_socket_path("agentok");
+        let _ = std::fs::remove_file(&sock_path);
+        let shared = Arc::new(ShellControlShared::for_test());
+
+        let (tx, rx) = calloop::channel::channel::<ShellControlMsg>();
+        let canned = ShellControlResponse::ok();
+        let (seen, stop_tx) = spawn_fake_main_thread(rx, canned);
+
+        // `own_uid` is set to something the test process's real uid cannot
+        // possibly equal (`current_uid() + 1`), so the ONLY way this
+        // connection is authorized is via the `agent_uid` configured
+        // below to equal the test process's actual uid — proving the
+        // FORWARD-COMPAT path (a configured second uid, not just "root"),
+        // independent of whatever uid this test happens to run as.
+        let wrong_own_uid = current_uid().wrapping_add(1);
+        spawn(sock_path.clone(), wrong_own_uid, Some(current_uid()), Arc::clone(&shared), tx)
+            .expect("listener failed to bind");
+
+        let conn = UnixStream::connect(&sock_path).expect("client failed to connect");
+        let mut writer = conn.try_clone().unwrap();
+        writeln!(writer, r#"{{"op":"set_theme","params":{{"theme":"dark"}}}}"#).unwrap();
+
+        let mut reply = String::new();
+        BufReader::new(&conn).read_line(&mut reply).expect("no response from listener");
+        assert!(reply.contains(r#""ok":true"#), "unexpected response: {reply}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "an allowed op from an agent-authority peer must reach the main thread");
+
+        let _ = stop_tx.send(());
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn agent_authority_peer_is_refused_a_human_only_op_before_the_main_thread() {
+        let sock_path = temp_socket_path("agentbad");
+        let _ = std::fs::remove_file(&sock_path);
+        let shared = Arc::new(ShellControlShared::for_test());
+
+        let (tx, rx) = calloop::channel::channel::<ShellControlMsg>();
+        let canned = ShellControlResponse::windows(vec![]);
+        let (seen, stop_tx) = spawn_fake_main_thread(rx, canned);
+
+        let wrong_own_uid = current_uid().wrapping_add(1);
+        spawn(sock_path.clone(), wrong_own_uid, Some(current_uid()), Arc::clone(&shared), tx)
+            .expect("listener failed to bind");
+
+        let conn = UnixStream::connect(&sock_path).expect("client failed to connect");
+        let mut writer = conn.try_clone().unwrap();
+        // `list_windows` is authenticated (agent_uid matches) but NOT in
+        // `agent_allowed` — must be refused with `forbidden_for_agent`,
+        // never `unauthorized` (that token means the UID gate failed, which
+        // it did not here), and never reach the main thread.
+        writeln!(writer, r#"{{"op":"list_windows"}}"#).unwrap();
+
+        let mut reply = String::new();
+        BufReader::new(&conn).read_line(&mut reply).expect("no response from listener");
+        assert!(reply.contains(r#""ok":false"#), "unexpected response: {reply}");
+        assert!(reply.contains("forbidden_for_agent"), "unexpected response: {reply}");
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "a human-only op from an agent-authority peer must never reach the main thread");
+
+        let _ = stop_tx.send(());
         let _ = std::fs::remove_file(&sock_path);
     }
 }

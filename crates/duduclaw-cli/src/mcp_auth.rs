@@ -876,7 +876,9 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "os_backup_create"
         | "os_power"
         | "os_factory_reset"
-        | "os_doctor_repair" => Some(Scope::Admin),
+        | "os_doctor_repair"
+        | "os_display_get"
+        | "os_display_set" => Some(Scope::Admin),
         // Server-side office-document script execution (docx/xlsx/pptx/pdf).
         // Its own least-privilege scope instead of the Admin `execute_program`
         // uses: the tool is constrained to the four bundled skills' vetted

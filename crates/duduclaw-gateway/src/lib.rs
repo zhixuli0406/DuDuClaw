@@ -41,6 +41,9 @@ pub mod device_about;
 pub mod device_ops;
 pub mod os_update;
 pub mod pre_update_backup;
+// ── A7c: agent→display gateway bridge (comp's shell_control display group,
+// reachable from an agent identity via A7c's PeerAuthority::Agent tier) ──
+pub mod display_bridge;
 // ── H3g-b: surface a failed /data migration (H3g) to the dashboard ───────
 pub mod migration_alert;
 // ── D4a: network settings (Wi-Fi over iwd D-Bus) — `network.*` RPCs +

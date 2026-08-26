@@ -465,8 +465,24 @@ impl ShellControlShared {
 /// the REAL computed answer, not an immediately-knowable ack).
 pub(crate) struct ShellControlMsg {
     pub(crate) req: ShellControlRequest,
+    /// A7c: which trust tier `listener::classify_peer` assigned this
+    /// connection — `Denied` never reaches this struct (the socket thread
+    /// answers and closes before ever sending). Threaded through so the
+    /// mutating handlers below can label their audit line correctly
+    /// instead of the trail silently implying every action was human.
+    pub(crate) actor: listener::PeerAuthority,
     pub(crate) reply_tx: std::sync::mpsc::Sender<ShellControlResponse>,
 }
+
+/// A7c: optional env var naming a second uid `listener::classify_peer`
+/// trusts as `PeerAuthority::Agent`, read once at [`init`]. Unset by
+/// default — the Yocto bring-up image needs no config at all today (its
+/// gateway runs as root, and `classify_peer`'s root carve-out covers that
+/// unconditionally); this exists for the day gateway de-roots (the Debian
+/// appliance model, `duduclaw` uid — `appliance/mkosi.extra/etc/systemd/
+/// system/duduclaw-gateway.service`'s `User=duduclaw`) and needs an
+/// explicit second identity instead.
+const SHELL_CONTROL_AGENT_UID_ENV: &str = "DUDUCLAW_SHELL_CONTROL_AGENT_UID";
 
 /// Starts the shell-control socket listener + audit log and wires its
 /// request channel into the event loop. Called from `DuduclawComp::new`,
@@ -495,15 +511,38 @@ pub fn init(event_loop: &mut EventLoop<CalloopData>) -> Arc<ShellControlShared> 
 
     let shared = Arc::new(ShellControlShared::new(audit));
 
-    // This process's own uid — the entire auth policy (see this module's
-    // doc comment for why "same uid as me" is sufficient and correct
-    // here, unlike `codrive`'s bearer token).
+    // This process's own uid — the entire auth policy for the ORIGINAL
+    // (Human) trust tier (see this module's doc comment for why "same uid
+    // as me" is sufficient and correct here, unlike `codrive`'s bearer
+    // token).
     // SAFETY: `getuid()` has no preconditions and cannot fail.
     let own_uid = unsafe { libc::getuid() };
 
+    // A7c: the forward-compat second identity (`listener::PeerAuthority::
+    // Agent`) for the day gateway de-roots to a real non-zero uid — see
+    // `listener::classify_peer`'s doc comment for the full reasoning,
+    // including why root (uid 0) needs no config at all. Fail-closed on a
+    // missing or unparseable value: `None` means "no second identity is
+    // trusted", never "trust everyone" — coding convention #4.
+    let agent_uid = match std::env::var(SHELL_CONTROL_AGENT_UID_ENV) {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(uid) => Some(uid),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    value = %raw,
+                    "shell_control: {SHELL_CONTROL_AGENT_UID_ENV} is set but not a valid uid — \
+                     ignoring (fail-closed: no second identity is trusted this run)"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
     let (tx, rx) = calloop::channel::channel::<ShellControlMsg>();
 
-    if let Err(e) = listener::spawn(sock_path, own_uid, Arc::clone(&shared), tx) {
+    if let Err(e) = listener::spawn(sock_path, own_uid, agent_uid, Arc::clone(&shared), tx) {
         tracing::error!(error = %e, "shell_control: failed to start the shell-control socket listener — dock/window queries will fail this run");
     }
 
@@ -511,7 +550,7 @@ pub fn init(event_loop: &mut EventLoop<CalloopData>) -> Arc<ShellControlShared> 
         .handle()
         .insert_source(rx, |event, _, data: &mut CalloopData| {
             if let calloop::channel::Event::Msg(msg) = event {
-                let resp = data.state.handle_shell_control_request(msg.req);
+                let resp = data.state.handle_shell_control_request(msg.req, msg.actor);
                 // Best-effort: if the socket thread already gave up
                 // waiting (`listener::MAIN_THREAD_REPLY_TIMEOUT` elapsed)
                 // the receiver is gone and this send simply fails — no
@@ -533,24 +572,32 @@ impl DuduclawComp {
     /// `codrive::handle_agent_inject`. No freeze/terminated check here at
     /// all — see this module's own doc comment for why that is correct,
     /// not an oversight.
-    pub(crate) fn handle_shell_control_request(&mut self, req: ShellControlRequest) -> ShellControlResponse {
+    pub(crate) fn handle_shell_control_request(
+        &mut self,
+        req: ShellControlRequest,
+        actor: listener::PeerAuthority,
+    ) -> ShellControlResponse {
         match req {
             ShellControlRequest::ListWindows => ShellControlResponse::windows(self.shell_control_list_windows()),
             ShellControlRequest::FocusWindow { query } => self.shell_control_focus_window(query),
             ShellControlRequest::GetCursorSource => ShellControlResponse::cursor(self.cursor_source_info()),
-            ShellControlRequest::SetCursorSource { source } => self.shell_control_set_cursor_source(&source),
-            ShellControlRequest::SetCursorSize { size } => self.shell_control_set_cursor_size(size),
+            ShellControlRequest::SetCursorSource { source } => {
+                self.shell_control_set_cursor_source(&source, actor)
+            }
+            ShellControlRequest::SetCursorSize { size } => self.shell_control_set_cursor_size(size, actor),
             ShellControlRequest::GetOutputs => ShellControlResponse::outputs(self.shell_control_get_outputs()),
             ShellControlRequest::SetOutputMode { output, width, height, refresh_mhz } => {
                 self.shell_control_set_output_mode(&output, width, height, refresh_mhz)
             }
             ShellControlRequest::SetOutputScale { output, scale_pct } => {
-                self.shell_control_set_output_scale(&output, scale_pct)
+                self.shell_control_set_output_scale(&output, scale_pct, actor)
             }
-            ShellControlRequest::SetTheme { theme } => self.shell_control_set_theme(&theme),
+            ShellControlRequest::SetTheme { theme } => self.shell_control_set_theme(&theme, actor),
             ShellControlRequest::TakeShellIntents => self.shell_control_take_shell_intents(),
             // A2: both handlers live in `codrive_ops.rs` — see that module's
             // doc for the trust boundary and the two actions' semantics.
+            // Human-only (never `agent_allowed`), so `actor` is always
+            // `Human` here — no need to thread it further.
             ShellControlRequest::CodriveStatus => self.shell_control_codrive_status(),
             ShellControlRequest::CodriveDrive { action } => self.shell_control_codrive_drive(&action),
             ShellControlRequest::SetSessionLocked { locked } => {
@@ -589,13 +636,20 @@ impl DuduclawComp {
     /// passed as a `u32` because the wire type is `i64` and the parse is the
     /// boundary. A validation gap therefore lands on a real error response,
     /// not a panic and not an unvalidated write.
-    fn shell_control_set_cursor_size(&mut self, size: i64) -> ShellControlResponse {
+    fn shell_control_set_cursor_size(
+        &mut self,
+        size: i64,
+        actor: listener::PeerAuthority,
+    ) -> ShellControlResponse {
         let Some(px) = crate::cursor::source::cursor_size_from_wire(size) else {
             tracing::error!(
                 "shell_control: set_cursor_size reached the main thread with a value \
                  listener::validate should have refused — refusing here too"
             );
-            self.shell_control.record("set_cursor_size_failed", Some("invalid_cursor_size".to_string()));
+            self.shell_control.record(
+                "set_cursor_size_failed",
+                Some(format!("actor={} error=invalid_cursor_size", actor.audit_label())),
+            );
             return ShellControlResponse::err("invalid_cursor_size");
         };
 
@@ -623,11 +677,14 @@ impl DuduclawComp {
         // Audited: an ACTION with a user-visible effect. `effective` is in the
         // line on purpose — "the user asked for 96 and the theme drew 64" is a
         // support answer that must be recoverable from the trail, not only
-        // from a live socket query.
+        // from a live socket query. `actor` (A7c) is first in the line so a
+        // reader can tell a human's own preference apart from an agent-driven
+        // one without cross-referencing a second file.
         self.shell_control.record(
             "set_cursor_size",
             Some(format!(
-                "size={px} effective_size={} theme={:?} changed={changed} persisted={persisted}{}",
+                "actor={} size={px} effective_size={} theme={:?} changed={changed} persisted={persisted}{}",
+                actor.audit_label(),
                 info.effective_size,
                 info.theme,
                 match &persist_error {
@@ -657,13 +714,20 @@ impl DuduclawComp {
     /// boundary. The `unreachable`-style fallback is written as a real error
     /// response, not a panic — a validation gap must not take the compositor
     /// down.
-    fn shell_control_set_cursor_source(&mut self, source: &str) -> ShellControlResponse {
+    fn shell_control_set_cursor_source(
+        &mut self,
+        source: &str,
+        actor: listener::PeerAuthority,
+    ) -> ShellControlResponse {
         let Some(requested) = crate::cursor::source::CursorSource::parse_strict(source) else {
             tracing::error!(
                 "shell_control: set_cursor_source reached the main thread with a value \
                  listener::validate should have refused — refusing here too"
             );
-            self.shell_control.record("set_cursor_source_failed", Some("invalid_cursor_source".to_string()));
+            self.shell_control.record(
+                "set_cursor_source_failed",
+                Some(format!("actor={} error=invalid_cursor_source", actor.audit_label())),
+            );
             return ShellControlResponse::err("invalid_cursor_source");
         };
 
@@ -692,11 +756,13 @@ impl DuduclawComp {
         // `list_windows`/`get_cursor_source`. The detail records the outcome
         // (including the fail-safe's effective value and a persistence
         // failure), not just the request — "what did the machine actually do"
-        // is what an audit line is for.
+        // is what an audit line is for. `actor` (A7c) leads the line for the
+        // same reason `set_cursor_size` above records it.
         self.shell_control.record(
             "set_cursor_source",
             Some(format!(
-                "requested={requested} effective={} theme={:?} changed={changed} persisted={persisted}{}",
+                "actor={} requested={requested} effective={} theme={:?} changed={changed} persisted={persisted}{}",
+                actor.audit_label(),
                 info.source,
                 info.theme,
                 match &persist_error {
@@ -858,11 +924,19 @@ impl DuduclawComp {
     /// `render::output_render_scale` as the single source every one of them
     /// now reads. Audited regardless of outcome, same reasoning as
     /// `shell_control_set_output_mode` above.
-    fn shell_control_set_output_scale(&mut self, output_name: &str, scale_pct: i64) -> ShellControlResponse {
+    fn shell_control_set_output_scale(
+        &mut self,
+        output_name: &str,
+        scale_pct: i64,
+        actor: listener::PeerAuthority,
+    ) -> ShellControlResponse {
         let Some(output) = self.shell_control_find_output(output_name).cloned() else {
             self.shell_control.record(
                 "set_output_scale_failed",
-                Some(format!("output={output_name:?} error=unknown_output")),
+                Some(format!(
+                    "actor={} output={output_name:?} error=unknown_output",
+                    actor.audit_label()
+                )),
             );
             return ShellControlResponse::err("unknown_output");
         };
@@ -877,7 +951,10 @@ impl DuduclawComp {
             );
             self.shell_control.record(
                 "set_output_scale_failed",
-                Some(format!("output={output_name:?} scale_pct={scale_pct} error=invalid_scale")),
+                Some(format!(
+                    "actor={} output={output_name:?} scale_pct={scale_pct} error=invalid_scale",
+                    actor.audit_label()
+                )),
             );
             return ShellControlResponse::err("invalid_scale");
         }
@@ -926,11 +1003,13 @@ impl DuduclawComp {
         // Apply-first-persist-second, same ordering (and the same reasoning)
         // as `shell_control_set_cursor_source`: the switch itself cannot
         // fail, writing the preference file can, and a write failure must
-        // never take back a live change that already succeeded.
+        // never take back a live change that already succeeded. `actor`
+        // (A7c) leads the line — this is the op "把字放大" actually drives.
         self.shell_control.record(
             "set_output_scale",
             Some(format!(
-                "output={output_name:?} scale_pct={scale_pct} persisted={persisted}{}",
+                "actor={} output={output_name:?} scale_pct={scale_pct} persisted={persisted}{}",
+                actor.audit_label(),
                 match &persist_error {
                     Some(e) => format!(" persist_error={e:?}"),
                     None => String::new(),
@@ -957,23 +1036,31 @@ impl DuduclawComp {
     /// `crate::decor::Theme`'s doc), and the success reply is deliberately the
     /// bare `{"ok":true}` shape (`ShellControlResponse::ok`) — the shell's own
     /// client only reads `ok`.
-    fn shell_control_set_theme(&mut self, theme: &str) -> ShellControlResponse {
+    fn shell_control_set_theme(
+        &mut self,
+        theme: &str,
+        actor: listener::PeerAuthority,
+    ) -> ShellControlResponse {
         let Some(requested) = crate::decor::Theme::parse_strict(theme) else {
             tracing::error!(
                 "shell_control: set_theme reached the main thread with a value \
                  listener::validate should have refused — refusing here too"
             );
-            self.shell_control.record("set_theme_failed", Some("invalid_theme".to_string()));
+            self.shell_control.record(
+                "set_theme_failed",
+                Some(format!("actor={} error=invalid_theme", actor.audit_label())),
+            );
             return ShellControlResponse::err("invalid_theme");
         };
 
         let changed = self.set_theme(requested);
 
         // Audited: an ACTION with a real, user-visible effect, same as
-        // `set_cursor_source`/`set_cursor_size` above.
+        // `set_cursor_source`/`set_cursor_size` above. `actor` (A7c) leads
+        // the line for the same reason.
         self.shell_control.record(
             "set_theme",
-            Some(format!("requested={} changed={changed}", requested.as_str())),
+            Some(format!("actor={} requested={} changed={changed}", actor.audit_label(), requested.as_str())),
         );
 
         ShellControlResponse::ok()

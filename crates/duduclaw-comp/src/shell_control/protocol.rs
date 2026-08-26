@@ -382,6 +382,35 @@ impl ShellControlRequest {
             ShellControlRequest::SetSessionLocked { .. } => "set_session_locked",
         }
     }
+
+    /// A7c: true iff this op may be reached by an AGENT-authority peer
+    /// (`listener::PeerAuthority::Agent` — comp's own uid still authorizes
+    /// the full set as `Human`, unchanged). Closed allowlist, deliberately
+    /// narrower than the full op set: exactly the appearance-preference ops
+    /// A7a's design doc (`commercial/docs/DESIGN-os-self-drive-2026-08.md`
+    /// §5) already rated `requires_approval=false` (cursor size/source,
+    /// theme, output scale) plus their read-only counterpart
+    /// `get_outputs`. Everything else stays Human-only:
+    /// `list_windows`/`focus_window` are a HUMAN-facing dock surface,
+    /// `codrive_status`/`codrive_drive` are the co-drive handover verbs
+    /// (agent reaching those would let it hand the wheel to/from itself),
+    /// `take_shell_intents` drains a HUMAN global-hotkey queue, and
+    /// `set_session_locked` is a security-relevant signal the session shell
+    /// alone should ever send. `set_output_mode` is also excluded even
+    /// though it always refuses today (see `mod.rs`'s doc) — narrowest
+    /// allowlist that satisfies the task, not "whatever happens to be
+    /// harmless right now".
+    pub fn agent_allowed(&self) -> bool {
+        matches!(
+            self,
+            ShellControlRequest::GetCursorSource
+                | ShellControlRequest::SetCursorSource { .. }
+                | ShellControlRequest::SetCursorSize { .. }
+                | ShellControlRequest::GetOutputs
+                | ShellControlRequest::SetOutputScale { .. }
+                | ShellControlRequest::SetTheme { .. }
+        )
+    }
 }
 
 /// WP-comp-shell-display: one entry in a `get_outputs` output's `modes`
@@ -1278,5 +1307,48 @@ mod tests {
         assert!(!mode_request_matches(9_999_999_999_999, 1080, 60000, &modes));
         assert!(!mode_request_matches(1920, i64::MIN, 60000, &modes));
         assert!(!mode_request_matches(1920, 1080, i64::MAX, &modes));
+    }
+
+    // ── A7c: agent_allowed — the closed allowlist an Agent-authority peer
+    // (root during Yocto bring-up, or a future explicitly-configured
+    // `agent_uid` once gateway de-roots — see `listener::PeerAuthority`)
+    // may reach. Enumerated exhaustively both ways so a future op added to
+    // this enum forces a conscious decision here instead of silently
+    // inheriting `false` (or `true`) by omission. ──────────────────────────
+
+    #[test]
+    fn agent_allowed_covers_exactly_the_appearance_ops() {
+        let allowed = [
+            ShellControlRequest::GetCursorSource,
+            ShellControlRequest::SetCursorSource { source: "brand".into() },
+            ShellControlRequest::SetCursorSize { size: 48 },
+            ShellControlRequest::GetOutputs,
+            ShellControlRequest::SetOutputScale { output: "Virtual-1".into(), scale_pct: 150 },
+            ShellControlRequest::SetTheme { theme: "dark".into() },
+        ];
+        for req in &allowed {
+            assert!(req.agent_allowed(), "{:?} must be agent-allowed", req.op_name());
+        }
+    }
+
+    #[test]
+    fn agent_allowed_excludes_every_human_only_op() {
+        let denied = [
+            ShellControlRequest::ListWindows,
+            ShellControlRequest::FocusWindow { query: "foot-A".into() },
+            ShellControlRequest::SetOutputMode {
+                output: "Virtual-1".into(),
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60000,
+            },
+            ShellControlRequest::TakeShellIntents,
+            ShellControlRequest::CodriveStatus,
+            ShellControlRequest::CodriveDrive { action: "take_wheel".into() },
+            ShellControlRequest::SetSessionLocked { locked: true },
+        ];
+        for req in &denied {
+            assert!(!req.agent_allowed(), "{:?} must NOT be agent-allowed", req.op_name());
+        }
     }
 }

@@ -2044,6 +2044,37 @@ const TOOLS: &[ToolDef] = &[
             (O-0) — omits the dashboard's container_runtime/grok_cli probes (non-gate-relevant, heavier).",
         params: &[],
     },
+    // ── A7c: agent→display bridge (comp's shell_control `display` group —
+    // cursor size/source, comp's own decoration theme, output scale). admin,
+    // appliance-only, requires_approval=false for both (A7a design doc §5:
+    // appearance preferences are reversible, low-risk — same tier as
+    // os_wifi_scan, not os_power/os_factory_reset). See
+    // `duduclaw_gateway::display_bridge`'s module doc for why this is the
+    // one O-0 pair that makes a real (stateless, one-shot) socket call
+    // instead of a pure/file-based read, and
+    // commercial/docs/DESIGN-os-self-drive-2026-08.md for the uid-boundary
+    // finding this closes.
+    ToolDef {
+        name: "os_display_get",
+        description: "Read the appliance's current display appearance: cursor size/source (+ effective \
+            size, theme, persistence), and the primary screen's UI scale percentage — the \"現況\" half \
+            of a \"把字放大\" request. admin, appliance-only, read-only.",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_display_set",
+        description: "Change one display appearance field, live, no restart — the backend \"把字放大\" \
+            actually drives (WP-comp-shell-display D4b-3's real output-scale apply). admin, \
+            appliance-only, requires_approval=false (reversible appearance preference, not destructive). \
+            `field` is one of cursor_size (24/32/48/64/96) / cursor_source (\"system\"/\"brand\") / theme \
+            (\"light\"/\"dark\") / output_scale (100/125/150/175/200, applied to the primary screen — \
+            150 or 200 is \"make the text bigger\"). `value` is always a string; an out-of-set value is \
+            refused, never clamped to the nearest step (comp's own closed-set validation).",
+        params: &[
+            ParamDef { name: "field", description: "cursor_size | cursor_source | theme | output_scale", required: true },
+            ParamDef { name: "value", description: "The new value, as a string (e.g. \"150\" for output_scale)", required: true },
+        ],
+    },
     // ── Recording → skill (WP3.3; requires [capabilities] recording = true) ──
     ToolDef {
         name: "browser_record_start",
@@ -10455,6 +10486,8 @@ pub(crate) async fn handle_tools_call(
             | "os_power"
             | "os_factory_reset"
             | "os_doctor_repair"
+            | "os_display_get"
+            | "os_display_set"
     );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
@@ -10717,6 +10750,8 @@ pub(crate) async fn handle_tools_call(
             crate::mcp_os_ops::handle_os_factory_reset(&arguments, home_dir, caller_client_id).await
         }
         "os_doctor_repair" => crate::mcp_os_ops::handle_os_doctor_repair(home_dir).await,
+        "os_display_get" => crate::mcp_os_ops::handle_os_display_get().await,
+        "os_display_set" => crate::mcp_os_ops::handle_os_display_set(&arguments).await,
         // Recording → skill tools (WP3.3). The [capabilities] recording gate +
         // Scope::Recording are enforced upstream in mcp_dispatch (fail-closed);
         // these handlers are the mechanism. Recording ownership follows the

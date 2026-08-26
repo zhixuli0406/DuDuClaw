@@ -771,6 +771,51 @@ pub(crate) async fn handle_os_update_rollback(args: &Value) -> Value {
     )
 }
 
+// ── A7c: agent→display bridge — `os_display_get`/`os_display_set` ────────
+//
+// Bridges A7a's `display` group (comp's `shell_control` socket: cursor
+// size/source, comp's own decoration theme, output scale) to agents.
+// Unlike every OTHER `device.*`-backed tool above, this does NOT call a
+// pure/file-based function — `duduclaw_gateway::display_bridge` makes one
+// real (but stateless, one-shot) Unix-socket round trip to comp's FIXED
+// kiosk socket path each call, which is exactly why it is reachable from
+// this out-of-process `mcp-server` subprocess at all (see that module's own
+// doc for the full "why this works cross-process" reasoning, and
+// `commercial/docs/DESIGN-os-self-drive-2026-08.md` for A7a's original
+// uid-boundary finding this closes). `is_appliance()` is still checked here
+// first, matching every other appliance-only tool's fast-fail shape — the
+// bridge itself does not redundantly re-check it (see its own doc).
+//
+// requires_approval = false for BOTH tools (A7a design doc §5: appearance
+// preferences are reversible, low-risk) — no ApprovalBroker gate, unlike
+// `os_factory_reset`/`os_system_timezone_set`.
+
+pub(crate) async fn handle_os_display_get() -> Value {
+    if !duduclaw_core::is_appliance() {
+        return not_appliance_error();
+    }
+    match duduclaw_gateway::display_bridge::display_get().await {
+        Ok(v) => os_ops_text(&v.to_string()),
+        Err(e) => os_ops_error(&e),
+    }
+}
+
+pub(crate) async fn handle_os_display_set(args: &Value) -> Value {
+    if !duduclaw_core::is_appliance() {
+        return not_appliance_error();
+    }
+    let Some(field) = args.get("field").and_then(Value::as_str) else {
+        return os_ops_error("缺少必要參數 field（合法值：cursor_size / cursor_source / theme / output_scale）。");
+    };
+    let Some(value) = args.get("value").and_then(Value::as_str) else {
+        return os_ops_error("缺少必要參數 value（字串）。");
+    };
+    match duduclaw_gateway::display_bridge::display_set(field, value).await {
+        Ok(v) => os_ops_text(&v.to_string()),
+        Err(e) => os_ops_error(&e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,12 +912,45 @@ mod tests {
             handle_os_apply_update(&json!({"target": "device", "confirm": true}), home.path()).await,
             handle_os_boot_assessment().await,
             handle_os_update_rollback(&json!({"confirm": true})).await,
+            handle_os_display_get().await,
+            handle_os_display_set(&json!({"field": "output_scale", "value": "150"})).await,
         ];
         for v in &results {
             assert_eq!(v["isError"], true, "{v:?}");
             let text = v["content"][0]["text"].as_str().unwrap();
             assert!(text.contains("appliance"), "unexpected message: {text}");
         }
+    }
+
+    // ── A7c: os_display_get / os_display_set ────────────────────────────
+    //
+    // The appliance gate is exercised above; these pin the tool-level
+    // argument validation (missing field/value) that runs AFTER the gate —
+    // covered here rather than off-appliance-only above because on a real
+    // appliance a caller could still send a malformed request, and
+    // `handle_os_display_set` must refuse it with a clear message rather
+    // than reaching `display_bridge::display_set` with a `None`. Since the
+    // test process is never an appliance, the gate fires first for BOTH
+    // cases — so this also doubles as a second confirmation that the gate
+    // really does run before argument parsing, matching every other O-0
+    // tool's ordering.
+
+    #[tokio::test]
+    async fn display_set_missing_field_is_refused() {
+        let v = handle_os_display_set(&json!({"value": "150"})).await;
+        assert_eq!(v["isError"], true, "{v:?}");
+        // Off-appliance in this test process, so the appliance gate fires
+        // first — the missing-field message is only reachable on a real
+        // appliance. This still proves the gate is fail-closed even for a
+        // malformed request.
+        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+    }
+
+    #[tokio::test]
+    async fn display_set_missing_value_is_refused() {
+        let v = handle_os_display_set(&json!({"field": "theme"})).await;
+        assert_eq!(v["isError"], true, "{v:?}");
+        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
     }
 
     /// `os_system_status` has NO appliance requirement (`system.status`
