@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- **[OS] DuDuClaw OS Yocto 基底 bring-up（Y 線，`meta-duduclaw/`，MAP-agent-native-os-2026-08.md 裁決⑥）**：去 Debian 化的新基底重建線開工——layer 骨架＋kas 設定＋UKI/systemd-boot 接通，QEMU 開機驗證到 login prompt（Y1-1）；`duduclaw-cli`／`duduclaw-sysd` 兩顆 Rust binary 的 cargo class recipe 完成並實際建置出 RPM（Y2-1／Y2-3，`duduclaw-comp` recipe 已寫但未 build-verified）；真機 genericx86-64 kernel provider 接通＋建置成功（Y2-2／Y2-3）；QEMU 雙驗證（sysd socket＋gateway `/healthz`）全綠。**同版同發工程形態**（Y3-3）：OS 版本單一源機制上線——`meta-duduclaw/conf/distro/include/duduclaw-platform-version.inc` 為唯一數字源（由 `scripts/release.sh` 通用 bump 迴圈同步，新增 `yocto_inc`／`yocto_bb` 兩種 manifest kind），`DISTRO_VERSION` 改為 `${DUDUCLAW_PLATFORM_VERSION}-y1-bringup`（里程碑後綴維持人工維護），`duduclaw-cli`/`duduclaw-sysd`/`duduclaw-comp` 三顆 recipe 的檔名版號（Yocto `<pn>_<pv>.bb` 慣例）由 release 腳本 `git mv` 同步；順帶修正 `duduclaw-comp` 版號孤兒漂移（Cargo.toml/Cargo.lock 停留在 spike 期 `0.1.0`，已正規化到平台版號 `1.62.0`，並補上 release.sh 對所有 workspace-excluded crate 自身 Cargo.lock 版號條目的通用同步，堵住這類漂移的機制性缺口）；OS image 的實際建置／簽章／發佈是獨立、不隨每次平台 release 自動觸發的人工步驟（`scripts/release-os.sh audit/plan/package`，見 `commercial/docs/DESIGN-unified-release-2026-08.md`）。**尚未出貨**：本節記錄的是 Y 線目前的 bring-up 狀態，不代表有可安裝的 OS image 存在。
+
 ### Fixed
 - **sysd 拒絕未授權連線時，拒絕回應可能被 Linux RST 摧毀**：server 對 uid 不符的 peer 寫完 `unauthorized` 回應後直接關閉，socket 收件佇列裡未讀的 request 使 close 變成 RST——client 收到 `ECONNRESET` 而非結構化錯誤（macOS 語義不同從未在本機重現，只在 Linux CI 以 `mismatched_uid_is_rejected` 閃失敗現形）。現在回應寫出後做尺寸與時間雙重上限（500ms）的 bounded drain 再關閉，未授權 peer 也無法藉此拖住連線。
 - **`resolve_duduclaw_bin_from_exe` 測試在 Windows 矩陣必失敗**：解析器在 Windows 探測的是 `duduclaw.exe`（與實際出貨檔名一致，生產行為正確），但測試 fixture 用無副檔名檔名。fixture 改依平台命名。

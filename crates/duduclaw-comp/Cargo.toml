@@ -1,6 +1,14 @@
 [package]
 name = "duduclaw-comp"
-version = "0.1.0"
+# Y3-3 (2026-08-25): normalized onto the platform release train (matches
+# duduclaw-shell / duduclaw-native-gui, the other two workspace-excluded
+# crates in this same category — both already track this number). Was
+# "0.1.0" (a leftover from this crate's Shell-S0 spike origin) while the
+# platform had long since moved to 1.62.0; `scripts/release.sh audit`
+# flags exactly this kind of drift. Kept in sync going forward by that
+# script's generic crates/*/Cargo.toml bump loop (same mechanism as shell/
+# native-gui) — see its "cargo|pyproject" bump case.
+version = "1.62.0"
 edition = "2021"
 publish = false
 description = "Shell-S0 spike: a self-built Wayland compositor (smithay), adapted from the smithay `smallvil` example."

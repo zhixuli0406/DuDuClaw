@@ -19,10 +19,21 @@
 # the miss invisible). This script bumps EVERY manifest from one place and then
 # ASSERTS they all reached the new version, so no platform can be left behind.
 #
+# Since Y3-3 (2026-08-25, MAP-agent-native-os-2026-08.md decision⑥ "同版同發
+# ＝單 repo＋OS 進主版本流"): "every manifest" now includes the DuDuClaw OS
+# Yocto layer (meta-duduclaw/) — the yocto_inc / yocto_bb kinds in
+# platform_manifests() below. The OS image ships vX.Y.Z on the SAME number as
+# everything else in this list; see commercial/docs/DESIGN-unified-release-
+# 2026-08.md for the full design and commercial/docs/TODO-agent-first-os-
+# 2026-08.md "Y 線" for what still needs a real Yocto build to land (this
+# script only owns the version METADATA sync — kas/bitbake image build +
+# artifact packaging + signing is a separate, deliberately-manual step, see
+# scripts/release-os.sh, NOT auto-invoked here).
+#
 # Steps (bump mode):
 #   1. Validate working tree is clean
 #   2. Pre-flight audit: print every platform's current version + flag drift
-#   3. Bump version in all manifests (Cargo / crates / npm / pyproject / READMEs)
+#   3. Bump version in all manifests (Cargo / crates / npm / pyproject / READMEs / OS)
 #   4. POST-BUMP ASSERT: every platform manifest now reads the new version, else abort
 #   5. Update CHANGELOG.md
 #   6. cargo check
@@ -78,6 +89,24 @@ platform_manifests() {
     # releases because this file was bumped by hand and the desktop-v* tag was
     # a separate manual step nobody ran).
     if [[ -f src-tauri/tauri.conf.json ]]; then echo "tauri|src-tauri/tauri.conf.json"; fi
+    # DuDuClaw OS (Yocto layer, meta-duduclaw/). MAP-agent-native-os-2026-08.md
+    # decision⑥: the OS image ships on the SAME release train as the platform
+    # — vX.Y.Z everywhere, one release.sh run. Two kinds:
+    #   yocto_inc  the single numeric source of truth every OS-side version
+    #              point derives from (see that file's own header comment).
+    #   yocto_bb   the duduclaw-cli/duduclaw-sysd/duduclaw-comp recipe files
+    #              -- Yocto's `<pn>_<pv>.bb` filename convention means PV
+    #              lives in the FILENAME, not the file's contents, so the
+    #              "bump" for this kind is a rename (git mv), not a sed.
+    if [[ -f meta-duduclaw/conf/distro/include/duduclaw-platform-version.inc ]]; then
+        echo "yocto_inc|meta-duduclaw/conf/distro/include/duduclaw-platform-version.inc"
+    fi
+    local yb
+    for yb in meta-duduclaw/recipes-duduclaw/duduclaw-cli/duduclaw-cli_*.bb \
+              meta-duduclaw/recipes-duduclaw/duduclaw-sysd/duduclaw-sysd_*.bb \
+              meta-duduclaw/recipes-duduclaw/duduclaw-comp/duduclaw-comp_*.bb; do
+        [[ -f "$yb" ]] && echo "yocto_bb|$yb"
+    done
 }
 
 # --- Read the current version out of a manifest, by kind. (Never fails: empty on miss.) ---
@@ -107,6 +136,15 @@ extract_version() {
         installer_ps1)
             { grep -m1 -E "^\\\$FallbackVersion = \"$SEMVER\"" "$file" \
                 | sed -E "s/^\\\$FallbackVersion = \"($SEMVER)\".*/\1/"; } 2>/dev/null || true
+            ;;
+        yocto_inc)
+            { grep -m1 -E "^DUDUCLAW_PLATFORM_VERSION = \"$SEMVER\"" "$file" \
+                | sed -E "s/^DUDUCLAW_PLATFORM_VERSION = \"($SEMVER)\".*/\1/"; } 2>/dev/null || true
+            ;;
+        yocto_bb)
+            # PV lives in the FILENAME (Yocto <pn>_<pv>.bb convention), not
+            # inside the file's contents.
+            { basename "$file" .bb | grep -oE "_$SEMVER\$" | sed -E "s/^_($SEMVER)\$/\1/"; } 2>/dev/null || true
             ;;
     esac
 }
@@ -384,6 +422,47 @@ while IFS='|' read -r kind file; do
     case "$kind" in
         cargo|pyproject)
             sed -i '' -E "s/^version = \"$SEMVER\"/version = \"$NEW_VERSION\"/" "$file"
+            # A workspace-EXCLUDED crate (duduclaw-shell / duduclaw-native-gui /
+            # duduclaw-comp -- see the root Cargo.toml `[workspace] exclude`
+            # list) carries its OWN standalone Cargo.lock with a self-
+            # referential `[[package]] name = "<crate>" version = "..."`
+            # entry (workspace-member crates don't -- they resolve through
+            # the ONE root Cargo.lock, already staged separately below).
+            # This script bumps the crate's Cargo.toml above but, until this
+            # fix, never touched that sibling Cargo.lock -- `cargo build
+            # --locked` (what cargo.bbclass runs for duduclaw-comp's Yocto
+            # recipe, and what CI would run for shell/native-gui) then
+            # hard-fails on a lock/manifest version mismatch. duduclaw-shell
+            # and duduclaw-native-gui happened to stay in sync historically
+            # only because they're buildable on macOS and got a local
+            # `cargo build` at some point after their last hand-edit, which
+            # silently re-synced their Cargo.lock; duduclaw-comp CANNOT be
+            # built on this host (smithay's Linux-only system deps -- see
+            # meta-duduclaw/recipes-duduclaw/duduclaw-comp/refresh-src.sh),
+            # so it had no such self-healing path and was caught genuinely
+            # stale by `release.sh audit` (0.1.0 while everything else was
+            # already at 1.62.0). Fixed at the mechanism level here, for
+            # every such crate, not just duduclaw-comp.
+            if [[ "$file" =~ ^crates/([^/]+)/Cargo\.toml$ ]]; then
+                _crate_name="${BASH_REMATCH[1]}"
+                _crate_lock="crates/${_crate_name}/Cargo.lock"
+                if [[ -f "$_crate_lock" ]] && grep -qE "^name = \"${_crate_name}\"\$" "$_crate_lock"; then
+                    # Only rewrite the version line immediately following this
+                    # crate's own `name = "..."` line (its self-entry), never
+                    # a dependency pinned to the same old version number.
+                    awk -v name="$_crate_name" -v newv="$NEW_VERSION" '
+                        BEGIN { in_self = 0 }
+                        /^name = / { in_self = ($0 == "name = \"" name "\"") }
+                        in_self && /^version = / {
+                            print "version = \"" newv "\""
+                            in_self = 0
+                            next
+                        }
+                        { print }
+                    ' "$_crate_lock" > "${_crate_lock}.tmp" && mv "${_crate_lock}.tmp" "$_crate_lock"
+                    echo "  Updated: $_crate_lock (self version entry only)"
+                fi
+            fi
             ;;
         pyinit)
             sed -i '' -E "s/^([[:space:]]*)__version__ = \"$SEMVER\"/\1__version__ = \"$NEW_VERSION\"/" "$file"
@@ -405,8 +484,29 @@ while IFS='|' read -r kind file; do
         installer_ps1)
             sed -i '' -E "s/^(\\\$FallbackVersion = \")$SEMVER(\")/\1$NEW_VERSION\2/" "$file"
             ;;
+        yocto_inc)
+            sed -i '' -E "s/^DUDUCLAW_PLATFORM_VERSION = \"$SEMVER\"/DUDUCLAW_PLATFORM_VERSION = \"$NEW_VERSION\"/" "$file"
+            ;;
+        yocto_bb)
+            # PV lives in the filename, not the contents -- "bump" = rename.
+            # Discover the new path from the OLD one rather than assuming
+            # the recipe was already at CURRENT_VERSION (it may not have
+            # been -- e.g. duduclaw-comp sat at a stale "0.1.0" while the
+            # platform had long since moved to 1.62.0; see the crate-lock
+            # comment above for why that recipe drifted independently).
+            _bb_dir="$(dirname "$file")"
+            _bb_pn="$(basename "$file" | sed -E "s/_${SEMVER}\.bb\$//")"
+            _bb_new="${_bb_dir}/${_bb_pn}_${NEW_VERSION}.bb"
+            if [[ "$file" != "$_bb_new" ]]; then
+                git mv "$file" "$_bb_new"
+            fi
+            ;;
     esac
-    echo "  Updated: $file"
+    if [[ "$kind" == "yocto_bb" ]]; then
+        echo "  Updated: $_bb_new (renamed from $(basename "$file"))"
+    else
+        echo "  Updated: $file"
+    fi
 done < <(platform_manifests)
 
 # --- POST-BUMP ASSERT: every manifest must now read NEW_VERSION (the real fix) ---
@@ -424,7 +524,14 @@ if [[ $ASSERT_FAIL -eq 1 ]]; then
     echo ""
     echo "Aborting: not every platform reached $NEW_VERSION (PyPI/npm would silently"
     echo "freeze). Reverting all changes."
-    git checkout -- .
+    # `git reset --hard HEAD`, not `git checkout -- .`: the yocto_bb kind
+    # above may have already `git mv`-ed a recipe file, and `git checkout --
+    # .` only re-syncs the working tree to the INDEX (which already has the
+    # rename staged) -- it would NOT undo the rename. HEAD is exactly where
+    # the pre-flight check at the top of this script verified the working
+    # tree was clean, so resetting to it is a full, correct undo of
+    # everything this run has done so far (no commit has happened yet).
+    git reset --hard HEAD
     exit 1
 fi
 echo "  All platforms synchronized at $NEW_VERSION."
@@ -511,7 +618,9 @@ echo ""
 echo "Running cargo check..."
 if ! cargo check --workspace 2>/dev/null; then
     echo "Error: cargo check failed. Reverting version bump."
-    git checkout -- .
+    # See the ASSERT_FAIL revert above for why this is `reset --hard HEAD`
+    # and not `checkout -- .` (a possible yocto_bb recipe rename).
+    git reset --hard HEAD
     exit 1
 fi
 
@@ -526,7 +635,9 @@ if [ -d "commercial/duduclaw-pro-gateway" ]; then
     if ! cargo check --manifest-path commercial/duduclaw-pro-gateway/Cargo.toml 2>/dev/null; then
         echo "Error: duduclaw-pro-gateway no longer compiles against this workspace."
         echo "       Fix the commercial tree first (it is not covered by --workspace)."
-        git checkout -- .
+        # See the ASSERT_FAIL revert above for why this is `reset --hard
+        # HEAD` and not `checkout -- .` (a possible yocto_bb recipe rename).
+        git reset --hard HEAD
         exit 1
     fi
 fi
@@ -543,6 +654,15 @@ echo "Creating git commit and tag..."
 STAGE_FILES=()
 while IFS='|' read -r _kind file; do
     STAGE_FILES+=("$file")
+    # Workspace-excluded crates' own sibling Cargo.lock (self version entry
+    # patched above, in the same case arm that bumps their Cargo.toml) —
+    # not returned by platform_manifests() itself (that enumerates bump
+    # TARGETS, and this file is a side effect of bumping one), so it must be
+    # staged explicitly here or it silently rides along uncommitted.
+    if [[ "$file" =~ ^crates/([^/]+)/Cargo\.toml$ ]]; then
+        _lock="crates/${BASH_REMATCH[1]}/Cargo.lock"
+        [[ -f "$_lock" ]] && STAGE_FILES+=("$_lock")
+    fi
 done < <(platform_manifests)
 [[ -f Cargo.lock ]] && STAGE_FILES+=("Cargo.lock")
 STAGE_FILES+=("CHANGELOG.md")
@@ -771,7 +891,7 @@ fi
 echo ""
 echo "================================================"
 echo " Release v$NEW_VERSION prepared successfully!"
-echo " All platforms synchronized: Cargo / pyproject (PyPI) / npm / READMEs"
+echo " All platforms synchronized: Cargo / pyproject (PyPI) / npm / READMEs / OS metadata"
 echo "================================================"
 echo ""
 echo "Next steps:"
@@ -787,4 +907,11 @@ echo "     (this catches a PyPI/npm 'skip-existing' silent miss)"
 echo "     The cloud console's enterprise version dropdown picks the new"
 echo "     version up automatically once the GitHub Release exists AND the"
 echo "     duduclaw-pro:v$NEW_VERSION image is in the registry (built above)."
+echo "  5. DuDuClaw OS image (meta-duduclaw/) was NOT built or published by"
+echo "     this run — only its version metadata was synced (recipe PVs +"
+echo "     DISTRO_VERSION's numeric prefix). When the Y-line is ready to cut"
+echo "     an OS image for this version:"
+echo "       ./scripts/release-os.sh package v$NEW_VERSION"
+echo "     (requires a completed kas/bitbake build first; see that script's"
+echo "     own --help and commercial/docs/DESIGN-unified-release-2026-08.md)."
 echo ""

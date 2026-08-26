@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-comp"
-version = "0.1.0"
+version = "1.62.0"
 dependencies = [
  "ab_glyph",
  "bitflags 2.13.1",
