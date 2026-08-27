@@ -736,6 +736,18 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "admin",
         "os",
     ),
+    (
+        "os_audio_get",
+        "Read current audio state: volume percentage, mute, and every output device (Y10-1 agent→audio bridge)",
+        "admin",
+        "os",
+    ),
+    (
+        "os_audio_set",
+        "Change one audio field live (volume 0-100 / mute toggle / output device id — Y10-1 \"turn it up / mute\" backend)",
+        "admin",
+        "os",
+    ),
     // ── Office document scripting (skill:execute) ────────────────────────
     (
         "office_script",

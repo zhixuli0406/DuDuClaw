@@ -44,6 +44,9 @@ pub mod pre_update_backup;
 // ── A7c: agent→display gateway bridge (comp's shell_control display group,
 // reachable from an agent identity via A7c's PeerAuthority::Agent tier) ──
 pub mod display_bridge;
+// ── Y10-1: agent→audio gateway bridge (wpctl/PipeWire volume/mute/output —
+// never touches duduclaw-comp at all, see this module's own doc for why) ──
+pub mod audio_bridge;
 // ── H3g-b: surface a failed /data migration (H3g) to the dashboard ───────
 pub mod migration_alert;
 // ── D4a: network settings (Wi-Fi over iwd D-Bus) — `network.*` RPCs +

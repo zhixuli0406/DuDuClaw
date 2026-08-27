@@ -109,6 +109,50 @@ pub const ALL_COMMANDS: &[CommandSpec] = &[
         hidden: false,
         requires_approval: false,
     },
+    // ── audio (duduclaw_gateway::audio_bridge — plain wpctl subprocess,
+    //    never comp's socket, see that module's own doc) ──────────────────
+    CommandSpec {
+        route: "os audio get",
+        group: "audio",
+        verb: "get",
+        summary: "讀取目前音量/靜音狀態＋每個輸出裝置（gateway audio_bridge::audio_get，純 wpctl 子行程）。",
+        args: "",
+        examples: &["duduclaw os audio get"],
+        hidden: false,
+        requires_approval: false,
+    },
+    CommandSpec {
+        route: "os audio volume-set",
+        group: "audio",
+        verb: "volume-set",
+        summary: "設定輸出音量，0-100（gateway audio_bridge::audio_set field=volume）。",
+        args: "<0-100>",
+        examples: &["duduclaw os audio volume-set 70"],
+        hidden: false,
+        requires_approval: false,
+    },
+    CommandSpec {
+        route: "os audio mute-toggle",
+        group: "audio",
+        verb: "mute-toggle",
+        summary: "切換預設輸出裝置的靜音狀態，僅支援 toggle（沒有明確的 on/off，見 audio_bridge::\
+                  toggle_mute 文件）。",
+        args: "",
+        examples: &["duduclaw os audio mute-toggle"],
+        hidden: false,
+        requires_approval: false,
+    },
+    CommandSpec {
+        route: "os audio output-set",
+        group: "audio",
+        verb: "output-set",
+        summary: "切換預設輸出裝置，id 來自 `os audio get` 的 outputs[].id（gateway audio_bridge::\
+                  set_default_output）。",
+        args: "<裝置 id>",
+        examples: &["duduclaw os audio output-set 53"],
+        hidden: false,
+        requires_approval: false,
+    },
     // ── system (gateway device_about / device_ops(sysd) reuse) ──────────
     CommandSpec {
         route: "os system about",
@@ -250,14 +294,16 @@ mod tests {
     use std::collections::HashSet;
 
     // Tripwire: keep in sync with the actual OsDisplayCommands/
-    // OsSystemCommands/OsNetworkCommands variant counts in lib.rs (5 + 6 + 3
-    // + 1 introspection = 15) — the real enforcement of "every clap command
-    // has metadata" is code review + this count; the exhaustive `match` in
-    // `cmd_os_drive` (no wildcard arm) is what actually guarantees dispatch
-    // coverage, this is a second, independent tripwire for the metadata side.
+    // OsAudioCommands/OsSystemCommands/OsNetworkCommands variant counts in
+    // lib.rs (5 display + 4 audio + 6 system + 3 network + 1 introspection =
+    // 19, up from 15 at Y10-1's own agent→audio bridge) — the real
+    // enforcement of "every clap command has metadata" is code review + this
+    // count; the exhaustive `match` in `cmd_os_drive` (no wildcard arm) is
+    // what actually guarantees dispatch coverage, this is a second,
+    // independent tripwire for the metadata side.
     #[test]
     fn command_count_matches_the_designed_surface() {
-        assert_eq!(ALL_COMMANDS.len(), 15, "did you add/remove a verb without updating this table?");
+        assert_eq!(ALL_COMMANDS.len(), 19, "did you add/remove a verb without updating this table?");
     }
 
     #[test]

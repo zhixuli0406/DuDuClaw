@@ -1085,6 +1085,16 @@ enum OsCommands {
         command: OsDisplayCommands,
     },
 
+    /// Y10-1: self-drive audio group — volume/mute/output device, via
+    /// `duduclaw-gateway`'s `audio_bridge` (a plain `wpctl` subprocess call,
+    /// no `duduclaw-comp` socket involved at all — see that module's own
+    /// doc for why audio was never a compositor-owned resource the way
+    /// display's cursor/theme/output-scale are).
+    Audio {
+        #[command(subcommand)]
+        command: OsAudioCommands,
+    },
+
     /// A7a: self-drive system group — device identity/timezone/ntp/
     /// update-check, reusing the same `duduclaw-gateway` functions the
     /// dashboard `device.*`/`system.*` RPCs call (no WS, no admin session —
@@ -1137,6 +1147,31 @@ enum OsDisplayCommands {
     /// value; the shell is the source of truth and re-announces at boot).
     ThemeSet {
         theme: String,
+    },
+}
+
+/// Y10-1 audio group verbs. Every request is a plain `wpctl` subprocess
+/// call (see `duduclaw_gateway::audio_bridge`'s module doc) — no comp
+/// socket, no `$XDG_RUNTIME_DIR` fallback split at this layer (the bridge
+/// already tries the calling process's own environment first internally).
+#[derive(Subcommand)]
+enum OsAudioCommands {
+    /// Read current volume/mute + every output device.
+    Get,
+    /// Set the output volume, 0-100 (clamped by wpctl, never rejected for
+    /// being merely large — out-of-`u8`-range values are rejected by clap
+    /// itself before this ever runs).
+    VolumeSet {
+        pct: u8,
+    },
+    /// Toggle mute on the default output. No explicit on/off verb exists —
+    /// read the current state with `get` first if you need a specific
+    /// target (see `duduclaw_gateway::audio_bridge::toggle_mute`'s doc).
+    MuteToggle,
+    /// Switch the default output device — id comes from `get`'s
+    /// `outputs[].id`.
+    OutputSet {
+        id: u32,
     },
 }
 
@@ -1237,6 +1272,17 @@ mod os_drive_help_never_executes_tests {
     fn help_on_a_system_write_command_never_executes_it() {
         assert_help_short_circuits(&["os", "system", "timezone-set", "Asia/Taipei", "--help"]);
         assert_help_short_circuits(&["os", "system", "ntp-set", "true", "--help"]);
+    }
+
+    #[test]
+    fn help_on_an_audio_write_command_never_executes_it() {
+        // Same class of guard as the display/system tests above — if this
+        // parsed into a runnable command instead of short-circuiting, the
+        // next step would be a real `wpctl set-volume`/`set-mute` subprocess
+        // call (`duduclaw_gateway::audio_bridge`).
+        assert_help_short_circuits(&["os", "audio", "volume-set", "70", "--help"]);
+        assert_help_short_circuits(&["os", "audio", "mute-toggle", "--help"]);
+        assert_help_short_circuits(&["os", "audio", "--help"]);
     }
 
     #[test]
@@ -2574,6 +2620,12 @@ async fn cmd_os(
             OsDisplayCommands::CursorSourceGet => os_drive::cursor_source_get().await,
             OsDisplayCommands::CursorSourceSet { source } => os_drive::cursor_source_set(&source).await,
             OsDisplayCommands::ThemeSet { theme } => os_drive::theme_set(&theme).await,
+        },
+        OsCommands::Audio { command } => match command {
+            OsAudioCommands::Get => os_drive::audio_get().await,
+            OsAudioCommands::VolumeSet { pct } => os_drive::audio_volume_set(pct).await,
+            OsAudioCommands::MuteToggle => os_drive::audio_mute_toggle().await,
+            OsAudioCommands::OutputSet { id } => os_drive::audio_output_set(id).await,
         },
         OsCommands::System { command } => match command {
             OsSystemCommands::About => os_drive::system_about().await,

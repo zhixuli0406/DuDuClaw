@@ -95,6 +95,10 @@ const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
     "os_doctor_repair",
     "os_display_get",
     "os_display_set",
+    // Y10-1: agent→audio bridge (wpctl volume/mute/output) — same
+    // deny-by-default tier as os_display_get/set.
+    "os_audio_get",
+    "os_audio_set",
 ];
 
 /// The human-machine co-drive MCP tool face gated by the `[capabilities]
@@ -1523,9 +1527,9 @@ effect = "forbid"
     //
     // Mirrors the OS-native / recording gate tests above exactly: absent,
     // explicit-false, and true, each exercised across every `os_*` system-
-    // operation tool listed in `SYSTEM_OPERATOR_TOOLS` (17 as of A7c's
-    // agent→display bridge — was 15 at Y5-3's agent-body update vertical
-    // slice).
+    // operation tool listed in `SYSTEM_OPERATOR_TOOLS` (19 as of Y10-1's
+    // agent→audio bridge — was 17 at A7c's agent→display bridge, 15 at
+    // Y5-3's agent-body update vertical slice).
 
     /// All `os_*` tools with the capability absent (no agent.toml) are
     /// denied fail-closed, even though `Scope::Admin` clears the scope check.

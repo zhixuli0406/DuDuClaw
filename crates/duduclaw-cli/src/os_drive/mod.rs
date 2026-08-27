@@ -12,6 +12,7 @@
 //! shared hotspot other in-flight work also touches this round.
 
 pub mod approval;
+mod audio;
 mod display;
 mod network;
 pub mod spec;
@@ -136,6 +137,30 @@ pub async fn theme_set(theme: &str) -> Result<()> {
         )
         .await,
     )
+}
+
+// ── audio ────────────────────────────────────────────────────────────────
+//
+// Y10-1: thin wrappers over `duduclaw_gateway::audio_bridge` — no
+// `with_gateway_display_fallback`-style split here, because
+// `audio_bridge`'s own `run_wpctl` already does the ambient-then-fixed-path
+// retry internally (see `os_drive::audio`'s module doc for why one function
+// covers both attempts for audio, unlike display's two hand-rolled copies).
+
+pub async fn audio_get() -> Result<()> {
+    finish(audio::get().await)
+}
+
+pub async fn audio_volume_set(pct: u8) -> Result<()> {
+    finish(audio::volume_set(pct).await)
+}
+
+pub async fn audio_mute_toggle() -> Result<()> {
+    finish(audio::mute_toggle().await)
+}
+
+pub async fn audio_output_set(id: u32) -> Result<()> {
+    finish(audio::output_set(id).await)
 }
 
 // ── system ───────────────────────────────────────────────────────────────

@@ -2075,6 +2075,33 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "value", description: "The new value, as a string (e.g. \"150\" for output_scale)", required: true },
         ],
     },
+    // ── Y10-1: agent→audio bridge (wpctl volume/mute/output device). admin,
+    // appliance-only, requires_approval=false for both (audio twin of A7c's
+    // display pair above — reversible, low-risk preferences, not destructive
+    // machine operations). See `duduclaw_gateway::audio_bridge`'s module doc
+    // for why this NEVER touches duduclaw-comp (audio was never a
+    // compositor-owned resource — the shell's own volume slider already
+    // talks to `wpctl` directly).
+    ToolDef {
+        name: "os_audio_get",
+        description: "Read the appliance's current audio state: volume percentage, mute, and every \
+            output device (id/name/is_default) — the \"現況\" half of a \"把聲音調大\"/\"靜音\" request. \
+            admin, appliance-only, read-only.",
+        params: &[],
+    },
+    ToolDef {
+        name: "os_audio_set",
+        description: "Change one audio field live — the backend \"把聲音調大\"/\"靜音\" actually drives. \
+            admin, appliance-only, requires_approval=false (reversible preference, not destructive). \
+            `field` is one of volume (0-100, e.g. \"70\") / mute (\"toggle\" only — read the current \
+            state with os_audio_get first if you need a specific target) / output (a device id from \
+            os_audio_get's outputs[].id, switches the default output). `value` is always a string; an \
+            out-of-range or unparseable value is refused before any subprocess call.",
+        params: &[
+            ParamDef { name: "field", description: "volume | mute | output", required: true },
+            ParamDef { name: "value", description: "The new value, as a string (e.g. \"70\" for volume, \"toggle\" for mute)", required: true },
+        ],
+    },
     // ── Recording → skill (WP3.3; requires [capabilities] recording = true) ──
     ToolDef {
         name: "browser_record_start",
@@ -10488,6 +10515,10 @@ pub(crate) async fn handle_tools_call(
             | "os_doctor_repair"
             | "os_display_get"
             | "os_display_set"
+            // Y10-1: agent→audio bridge — same "audit every os_* call on
+            // success" rule as the rest of the O-0 system-operator face.
+            | "os_audio_get"
+            | "os_audio_set"
     );
     let result = match tool_name {
         "send_message" => handle_send_message(&arguments, home_dir, http, default_agent).await,
@@ -10754,6 +10785,8 @@ pub(crate) async fn handle_tools_call(
         "os_doctor_repair" => crate::mcp_os_ops::handle_os_doctor_repair(home_dir).await,
         "os_display_get" => crate::mcp_os_ops::handle_os_display_get().await,
         "os_display_set" => crate::mcp_os_ops::handle_os_display_set(&arguments).await,
+        "os_audio_get" => crate::mcp_os_ops::handle_os_audio_get().await,
+        "os_audio_set" => crate::mcp_os_ops::handle_os_audio_set(&arguments).await,
         // Recording → skill tools (WP3.3). The [capabilities] recording gate +
         // Scope::Recording are enforced upstream in mcp_dispatch (fail-closed);
         // these handlers are the mechanism. Recording ownership follows the

@@ -894,6 +894,45 @@ pub(crate) async fn handle_os_display_set(args: &Value) -> Value {
     }
 }
 
+// ── Y10-1: agent→audio bridge — `os_audio_get`/`os_audio_set` ────────────
+//
+// The audio twin of A7c's `os_display_get`/`os_display_set` pair directly
+// above, built on the same "same capability, two front doors, same gate
+// set" convention — but bridging `duduclaw_gateway::audio_bridge` (a plain
+// `wpctl` subprocess call) instead of a comp socket round trip. See that
+// module's own doc for why audio never goes through `duduclaw-comp` at all.
+//
+// requires_approval = false for BOTH tools — volume/mute/output-device are
+// reversible, low-risk preferences, same tier as os_display_get/set (A7a
+// design doc §5's spirit), not destructive machine operations. No
+// ApprovalBroker gate.
+
+pub(crate) async fn handle_os_audio_get() -> Value {
+    if !duduclaw_core::is_appliance() {
+        return not_appliance_error();
+    }
+    match duduclaw_gateway::audio_bridge::audio_get().await {
+        Ok(v) => os_ops_text(&v.to_string()),
+        Err(e) => os_ops_error(&e),
+    }
+}
+
+pub(crate) async fn handle_os_audio_set(args: &Value) -> Value {
+    if !duduclaw_core::is_appliance() {
+        return not_appliance_error();
+    }
+    let Some(field) = args.get("field").and_then(Value::as_str) else {
+        return os_ops_error("缺少必要參數 field（合法值：volume / mute / output）。");
+    };
+    let Some(value) = args.get("value").and_then(Value::as_str) else {
+        return os_ops_error("缺少必要參數 value（字串）。");
+    };
+    match duduclaw_gateway::audio_bridge::audio_set(field, value).await {
+        Ok(v) => os_ops_text(&v.to_string()),
+        Err(e) => os_ops_error(&e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,6 +1031,8 @@ mod tests {
             handle_os_update_rollback(&json!({"confirm": true})).await,
             handle_os_display_get().await,
             handle_os_display_set(&json!({"field": "output_scale", "value": "150"})).await,
+            handle_os_audio_get().await,
+            handle_os_audio_set(&json!({"field": "volume", "value": "70"})).await,
         ];
         for v in &results {
             assert_eq!(v["isError"], true, "{v:?}");
@@ -1027,6 +1068,27 @@ mod tests {
     #[tokio::test]
     async fn display_set_missing_value_is_refused() {
         let v = handle_os_display_set(&json!({"field": "theme"})).await;
+        assert_eq!(v["isError"], true, "{v:?}");
+        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+    }
+
+    // ── Y10-1: os_audio_get / os_audio_set ──────────────────────────────
+    //
+    // Same ordering rationale as the display pair's own tests above: the
+    // test process is never an appliance, so the gate fires before argument
+    // parsing for every case here too — this still proves the gate really
+    // does run first, matching every other O-0 tool.
+
+    #[tokio::test]
+    async fn audio_set_missing_field_is_refused() {
+        let v = handle_os_audio_set(&json!({"value": "70"})).await;
+        assert_eq!(v["isError"], true, "{v:?}");
+        assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
+    }
+
+    #[tokio::test]
+    async fn audio_set_missing_value_is_refused() {
+        let v = handle_os_audio_set(&json!({"field": "volume"})).await;
         assert_eq!(v["isError"], true, "{v:?}");
         assert!(v["content"][0]["text"].as_str().unwrap().contains("appliance"));
     }
