@@ -88,7 +88,16 @@ mod selections;
 mod state;
 mod steps;
 mod ui_state;
-mod widgets;
+/// Y20-P2 (2026-08-29): `pub(crate)`, not private — `crate::live_install`
+/// (the live-image installer wizard, a SEPARATE root-render mode from OOBE,
+/// see that module's own header comment) reuses this module's
+/// `card`/`step_button`/`progress_dots`/`title`/`subtitle` helpers directly
+/// as `crate::oobe::widgets::*` rather than re-deriving near-identical
+/// copies. The module's own contents stay exactly as visible as before this
+/// change for every existing `oobe::*` call site — only the module path
+/// itself widened, and only specific items inside it were promoted (see
+/// `widgets.rs`'s own header comment for which).
+pub(crate) mod widgets;
 
 /// `main.rs` needs `AccountFields` to create the `AccountCreate` step's two
 /// real text-input entities at window-open time and store them on

@@ -102,6 +102,12 @@ mod global_task;
 mod home;
 mod i18n;
 mod icons;
+/// Y20-P2 (2026-08-29): the live-image graphical installer skeleton — a
+/// FIFTH mutually-exclusive root-render mode alongside OOBE/lockscreen/Home,
+/// checked first when `/etc/duduclaw-live` is present. See its own module
+/// doc for the full design and why it is a separate state machine from
+/// `oobe`, not another `OobeStep`.
+mod live_install;
 mod lockscreen;
 /// D6 (2026-08-23): the shell's own `org.freedesktop.Notifications` daemon —
 /// see its module doc for why the shell serves this itself rather than the
@@ -489,6 +495,15 @@ pub struct ShellView {
     /// `surface`/`overlay_ui` above are mutually exclusive presentation
     /// modes, never combined.
     pub(crate) oobe: Option<oobe::OobeFlow>,
+    /// `Some` while a live-image boot's graphical installer wizard owns the
+    /// whole screen — Y20-P2 (2026-08-29). Checked BEFORE `oobe` in
+    /// `Render::render`'s if-else chain (see that call site's own comment):
+    /// a live-boot session never reaches normal OOBE, the lockscreen, or
+    /// Home at all. `None` on every non-live appliance boot (the
+    /// overwhelming majority) — see this field's own boot-time
+    /// initialization in `main()` for the unconditional (never `shipping::
+    /// debug_env`-gated) `/etc/duduclaw-live` check that decides this.
+    pub(crate) live_install: Option<live_install::LiveInstallFlow>,
     /// Ephemeral OOBE-only UI state (e.g. the language step's accessibility
     /// panel toggle) — see `oobe::OobeUiState`'s own doc comment for why
     /// this is separate from `oobe`'s persisted `OobeState`.
@@ -1352,7 +1367,17 @@ impl ShellView {
         // entirely). OOBE still overwrites this with the flow's own palette
         // on the branch below, so its behavior is unchanged.
         cx.set_global(home_palette);
-        root = if let Some(flow) = &self.oobe {
+        root = if let Some(flow) = &self.live_install {
+            // Y20-P2 (2026-08-29): checked FIRST, ahead of `oobe` — a
+            // live-image boot never reaches normal OOBE, the lockscreen, or
+            // Home at all. Same "root's ENTIRE child, no app chrome
+            // underneath" shape the `oobe` branch just below establishes;
+            // see `live_install/mod.rs`'s own header comment for why this is
+            // a separate, fifth root-render mode rather than a fork inside
+            // OOBE's own flow. The `oobe` branch itself is untouched by this
+            // addition.
+            root.child(live_install::render(flow, cx))
+        } else if let Some(flow) = &self.oobe {
             root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, &self.oobe_network_fields, cx))
         } else if self.lockscreen.is_locked() {
             // Shell-S4-lock: same "takes over the root's ENTIRE child, no
@@ -1624,6 +1649,25 @@ fn main() {
         // keeping this binding unconditional would be a dead, unused `let`
         // on that path.
 
+        // Y20-P2 (2026-08-29): live-image installer entry. `/etc/duduclaw-
+        // live` is baked into the live image's rootfs at BUILD time
+        // (`appliance/mkosi.extra`'s marker file — verified MARKER_OK in
+        // Y20-P1) and is absent from every normal (non-live) appliance
+        // image. This is a compile-time-baked FACT about which image this
+        // binary is running from, not an operator-tunable override — it
+        // must NEVER go through `shipping::debug_env`'s gate below (see
+        // that module's own header comment): gating this the same way
+        // `FORCE_OOBE`/`SKIP_OOBE` are gated would mean a live image built
+        // WITHOUT the `debug-affordances` feature — i.e. every real
+        // shipping build — could never reach its own installer, which
+        // defeats Y20's entire purpose. A plain, always-live `Path::
+        // exists()` check, resolved before `oobe`'s own boot resolution
+        // just below so both are decided up front, before `ShellView` is
+        // constructed — no post-open "flash of Home then swap" for either.
+        let live_install_marker = std::path::Path::new("/etc/duduclaw-live").exists();
+        let initial_live_install = live_install_marker.then(live_install::LiveInstallFlow::new);
+        eprintln!("[main] live-install marker /etc/duduclaw-live present: {live_install_marker}");
+
         // OOBE boot-entry resolution — see `oobe::resolve_boot_flow`'s own
         // doc comment for the exact priority rules (task brief: FORCE_OOBE
         // > SKIP_OOBE > a recognized DEBUG_OOBE_STEP > the persisted
@@ -1721,6 +1765,7 @@ fn main() {
             launcher_query_field,
             operator_name: initial_operator_name,
             oobe: initial_oobe,
+            live_install: initial_live_install,
             oobe_ui: oobe::OobeUiState::default(),
             oobe_account_fields,
             oobe_network_fields,

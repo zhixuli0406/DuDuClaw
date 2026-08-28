@@ -35,11 +35,24 @@ use duduclaw_native_gui::theme;
 
 use crate::palette::ShellPalette;
 
-pub(super) fn title(text: &'static str, palette: ShellPalette) -> Div {
+// Y20-P2 (2026-08-29): `title`/`subtitle`/`card`/`step_button`/
+// `progress_dots`/`StepButtonVariant` are promoted `pub(super)` ->
+// `pub(crate)` here so `crate::live_install` (the live-image installer
+// wizard's own separate 4-step flow — see that module's own header comment
+// for why it's a SEPARATE state machine from `OobeFlow`, not another
+// `OobeStep`) can reuse these visual primitives instead of re-deriving
+// near-identical copies. They already take plain `ShellPalette`/`&str`/
+// `usize` parameters with zero `OobeFlow`/`OobeStep` coupling (see this
+// file's own header comment), so widening reach is the only change — no
+// signature or behavior differs for any existing `oobe::*` call site.
+// `subtitle_dynamic`/`toggle_pill`/the `OobeTextField` family stay
+// `pub(super)`/`pub(crate)` at their prior scope: nothing outside `oobe`
+// needs them yet.
+pub(crate) fn title(text: &'static str, palette: ShellPalette) -> Div {
     div().text_size(px(theme::TEXT_2XL)).font_weight(FontWeight::BOLD).text_color(theme::alpha(palette.foreground, 1.0)).child(text)
 }
 
-pub(super) fn subtitle(text: &'static str, palette: ShellPalette) -> Div {
+pub(crate) fn subtitle(text: &'static str, palette: ShellPalette) -> Div {
     div().text_size(px(theme::TEXT_BASE)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(text)
 }
 
@@ -55,7 +68,7 @@ pub(super) fn subtitle_dynamic(text: String, palette: ShellPalette) -> Div {
 /// `surface_shadow()` + `RADIUS_XL` + `border()` recipe `overlay/
 /// notifications.rs`'s own floating panel uses, just full-width within the
 /// step's centered column instead of docked to a screen edge.
-pub(super) fn card(content: impl IntoElement, palette: ShellPalette) -> Div {
+pub(crate) fn card(content: impl IntoElement, palette: ShellPalette) -> Div {
     div()
         .w_full()
         .bg(theme::alpha(palette.surface, 1.0))
@@ -71,7 +84,7 @@ pub(super) fn card(content: impl IntoElement, palette: ShellPalette) -> Div {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StepButtonVariant {
+pub(crate) enum StepButtonVariant {
     Primary,
     Secondary,
     Ghost,
@@ -82,7 +95,7 @@ pub(super) enum StepButtonVariant {
 /// just a visual dim), matching that facade's own documented disabled
 /// contract (`duduclaw-native-gui/src/mds_gpui/button.rs`: "no hover/active
 /// styles and NO click handler attached at all").
-pub(super) fn step_button(
+pub(crate) fn step_button(
     id: &'static str,
     label: &'static str,
     variant: StepButtonVariant,
@@ -141,7 +154,7 @@ pub(super) fn step_button(
 /// nowhere to put one — and rendering it as VISIBLE text would be a
 /// different design than the board's, not an implementation of it. Left
 /// undone and reported, rather than faked.
-pub(super) fn progress_dots(current_index: usize, total: usize, palette: ShellPalette) -> Div {
+pub(crate) fn progress_dots(current_index: usize, total: usize, palette: ShellPalette) -> Div {
     let mut row = div().flex().items_center().justify_center().gap(px(8.));
     for i in 0..total {
         let active = i == current_index;
