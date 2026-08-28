@@ -28,17 +28,30 @@
 // duduclaw-live` existence check that decides whether this flow, instead of
 // normal OOBE, is what a fresh boot lands on.
 //
-// `DiskSelect`/`Progress` are HONEST PLACEHOLDERS this round — no real disk
-// enumeration, no real `dd`/write progress. Both are explicitly deferred to
-// P3 per the task brief ("真實列碟/dd 進度留 P3"); see each step's own
-// header comment in `steps/`.
+// `DiskSelect`/`Progress` were HONEST PLACEHOLDERS in P2 — no real disk
+// enumeration, no real `dd`/write progress. See "Y20-P3" below for what
+// replaces them.
+//
+// ── Y20-P3 (2026-08-29): the real end-to-end flow ──────────────────────────
+// `disk_select`/`confirm`/`progress` are now wired to real I/O: a
+// background-thread `lsblk` scan feeds `DiskSelect`'s pick list, `Confirm`'s
+// destructive-write checkbox gates the shared bottom-nav action, and that
+// same action (relabeled "開始安裝"/"重新開機" per step — see `render.rs`'s
+// own header comment) drives the actual `duduclaw-os-install` child process
+// and, once it reports success, a real reboot. The new `install_runner`
+// module owns that child-process lifecycle (spawn, streamed
+// `DUDUCLAW_PROGRESS:` parsing, the terminal reboot) — kept OUT of
+// `steps::progress`, which stays pure rendering of whatever `LiveInstallFlow
+// ::install()` currently says, same "state machine vs. the I/O that drives
+// it" split `steps::disk_select`'s own scan already follows.
 
+mod install_runner;
 mod render;
 mod state;
 mod steps;
 
 pub(crate) use render::render;
-pub(crate) use state::{LiveInstallFlow, LiveInstallStep};
+pub(crate) use state::{DiskInfo, DiskScanState, InstallState, LiveInstallFlow, LiveInstallStep};
 
 #[cfg(test)]
 mod tests {
