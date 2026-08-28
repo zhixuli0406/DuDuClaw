@@ -132,6 +132,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/build-your-own-pack.md](guides/build-your-own-pack.md) | Expert pack 創作教學（最小可用包 10 分鐘、本機測試迴路、團隊/wiki/requires 進階、convert-teams/claude-plugin 轉出、品質建議） | Current |
 | [guides/shortcuts-and-wearables.md](guides/shortcuts-and-wearables.md) | 手腕與穿戴：Apple Watch 捷徑打 HTTP API、Bee=外部 MCP 純設定、Omi/Plaud webhook→`/ingest/transcript` 直灌記憶 | Current |
 | [guides/remote-mcp.md](guides/remote-mcp.md) | Remote MCP：claude.ai 自訂連接器直連自家 DuDuClaw（標準 `/mcp` 端點＋OAuth 2.1 流程、scope 收斂模型、tunnel 部署與撤銷） | Current |
+| [guides/hardware-requirements.md](guides/hardware-requirements.md) | DuDuClaw OS 硬體需求與消費級選機指南（硬性條件 x86-64+AVX2／UEFI／SSD、最低/建議/舒適配置表、推薦迷你主機 N100/N305/8845HS、驅動缺口 MT7927/RTL8125、為何不能用 ARM/Mac 模擬、燒 USB 而非光碟） | Current |
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
