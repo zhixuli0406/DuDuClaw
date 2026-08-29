@@ -34,12 +34,17 @@ use duduclaw_native_gui::ime_input::{ImeTextInput, TextInputStyle};
 use duduclaw_native_gui::theme;
 
 use crate::palette::ShellPalette;
+// Only needed by `theme_preview` below (promoted here from `oobe/steps/
+// theme.rs` — see that fn's own doc comment) — `super::` since `widgets` is
+// a direct child of `oobe`, the module that re-exports this type.
+use super::ThemeChoice;
 
 // Y20-P2 (2026-08-29): `title`/`subtitle`/`card`/`step_button`/
 // `progress_dots`/`StepButtonVariant` are promoted `pub(super)` ->
 // `pub(crate)` here so `crate::live_install` (the live-image installer
-// wizard's own separate 4-step flow — see that module's own header comment
-// for why it's a SEPARATE state machine from `OobeFlow`, not another
+// wizard's own separate flow, 4 steps at the time of this promotion, 6 as of
+// installer-settings-integration WP1 below — see that module's own header
+// comment for why it's a SEPARATE state machine from `OobeFlow`, not another
 // `OobeStep`) can reuse these visual primitives instead of re-deriving
 // near-identical copies. They already take plain `ShellPalette`/`&str`/
 // `usize` parameters with zero `OobeFlow`/`OobeStep` coupling (see this
@@ -48,6 +53,13 @@ use crate::palette::ShellPalette;
 // `subtitle_dynamic`/`toggle_pill`/the `OobeTextField` family stay
 // `pub(super)`/`pub(crate)` at their prior scope: nothing outside `oobe`
 // needs them yet.
+//
+// Installer-settings-integration WP1 (2026-08-29): `theme_preview` (the
+// `Theme` step's two mini-desktop illustration cards) is promoted the same
+// way, moved bodily from `oobe/steps/theme.rs` — see that fn's own doc
+// comment below for the full "why literal hex, not palette" reasoning it
+// carries with it. `crate::live_install::steps::theme` is the new consumer;
+// `oobe::steps::theme::render` keeps calling it too, unchanged.
 pub(crate) fn title(text: &'static str, palette: ShellPalette) -> Div {
     div().text_size(px(theme::TEXT_2XL)).font_weight(FontWeight::BOLD).text_color(theme::alpha(palette.foreground, 1.0)).child(text)
 }
@@ -128,6 +140,76 @@ pub(crate) fn step_button(
     }
 
     el
+}
+
+/// The fixed light/dark mini-desktop illustration used by the `Theme` step's
+/// two option cards — promoted here from `oobe/steps/theme.rs`
+/// (installer-settings-integration WP1, 2026-08-29) so `live_install::steps::
+/// theme` can reuse it verbatim instead of re-deriving a near-identical copy,
+/// same "promote to `widgets` for crate-wide reuse" precedent this file's own
+/// header comment already sets for `title`/`subtitle`/`card`/`step_button`/
+/// `progress_dots` (Y20-P2). `oobe::steps::theme::render` now calls this same
+/// fn rather than owning its own private copy — behavior is byte-identical
+/// for every existing OOBE call site, only the fn's address moved.
+///
+/// See the ORIGINAL file's header comment (still accurate, reproduced here
+/// since the illustration's own reasoning travels with the code, not the
+/// call site) for why every color below is a literal hex/rgba, never
+/// `palette`/`theme::light::*`/`theme::dark::*`:
+///
+/// The two mini-desktop PREVIEWS inside each option card are a fixed
+/// side-by-side illustration of what light/dark look like — not live chrome.
+/// They stay pixel-identical to the design board regardless of which theme
+/// is currently active: the dark preview must still look dark even while the
+/// operator is ON the light theme (and vice versa), since showing both
+/// options side by side at once is the entire point of this screen. So this
+/// fn uses literal hex/rgba copied straight from the board, never
+/// `palette`/`theme::light::*`/`theme::dark::*` — including two spots where
+/// the board itself does NOT reuse the exact semantic token: the dark
+/// preview's window-pane border is authored as `rgba(255,255,255,0.12)`,
+/// distinct from the top-bar hairline's `rgba(255,255,255,0.10)`
+/// (`theme::dark::SURFACE_BORDER_ALPHA`) — two different translucent-white
+/// weights in the same illustration, both kept exactly as drawn — and BOTH
+/// previews' brand pill is the LIGHT theme's brand hex `#2171cc`, never
+/// `theme::dark::BRAND`'s brighter `#4390ee` (the board's own dark-preview
+/// swatch was authored with the light brand color, so that is what ships
+/// here too).
+pub(crate) fn theme_preview(choice: ThemeChoice) -> Div {
+    let (bg, bar_bg, bar_border, pane_bg, pane_border, line1, line2) = match choice {
+        ThemeChoice::Light => (
+            theme::alpha(0xf3f3f4, 1.0),
+            theme::alpha(0xffffff, 1.0),
+            theme::alpha(0xececef, 1.0),
+            theme::alpha(0xffffff, 1.0),
+            theme::alpha(0xe4e4e7, 1.0),
+            theme::alpha(0xe4e4e7, 1.0),
+            theme::alpha(0xececef, 1.0),
+        ),
+        ThemeChoice::Dark => (
+            theme::alpha(0x0c0c0e, 1.0),
+            theme::alpha(0x18181b, 1.0),
+            theme::alpha(0xffffff, 0.10),
+            theme::alpha(0x18181b, 1.0),
+            theme::alpha(0xffffff, 0.12),
+            theme::alpha(0xffffff, 0.22),
+            theme::alpha(0xffffff, 0.12),
+        ),
+    };
+    // Same literal in both branches on purpose — see this fn's own doc
+    // comment ("both previews' brand pill is the LIGHT theme's brand hex").
+    let brand_pill = theme::alpha(0x2171cc, 1.0);
+
+    div()
+        .relative()
+        .h(px(140.))
+        .rounded(px(8.))
+        .overflow_hidden()
+        .bg(bg)
+        .child(div().absolute().top(px(0.)).left(px(0.)).right(px(0.)).h(px(14.)).bg(bar_bg).border_b_1().border_color(bar_border))
+        .child(div().absolute().top(px(26.)).left(px(22.)).w(px(160.)).h(px(86.)).rounded(px(6.)).bg(pane_bg).border_1().border_color(pane_border))
+        .child(div().absolute().top(px(40.)).left(px(34.)).w(px(90.)).h(px(6.)).rounded(px(3.)).bg(line1))
+        .child(div().absolute().top(px(54.)).left(px(34.)).w(px(60.)).h(px(6.)).rounded(px(3.)).bg(line2))
+        .child(div().absolute().top(px(78.)).left(px(34.)).w(px(44.)).h(px(12.)).rounded(px(6.)).bg(brand_pill))
 }
 
 /// Low-key step-progress dots (task brief: "進度指示（低調 dots）"). Kept

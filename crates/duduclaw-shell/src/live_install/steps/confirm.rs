@@ -50,7 +50,13 @@ fn target_summary(flow: &LiveInstallFlow, palette: ShellPalette) -> Div {
     match flow.selected_disk() {
         Some(disk) => {
             let detail = if disk.model.is_empty() { disk.size.clone() } else { format!("{}  ·  {}", disk.size, disk.model) };
+            // Bug fix (DESIGN-installer-settings-integration-2026-08.md §6): same
+            // undefined-width flex_col-child overflow as `warning_banner` below —
+            // this div is a direct child of `body`'s flex_col with no explicit
+            // width, and `disk.model` from lsblk can be an arbitrarily long
+            // hardware string. `.w_full()` gives it a real width to wrap inside.
             div()
+                .w_full()
                 .flex()
                 .flex_col()
                 .gap(px(4.))
@@ -58,6 +64,7 @@ fn target_summary(flow: &LiveInstallFlow, palette: ShellPalette) -> Div {
                 .child(div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(detail))
         }
         None => div()
+            .w_full()
             .text_size(px(theme::TEXT_SM))
             .text_color(theme::alpha(palette.destructive, 1.0))
             .child("尚未選擇磁碟，請返回上一步 · No disk selected — go back"),
@@ -66,6 +73,11 @@ fn target_summary(flow: &LiveInstallFlow, palette: ShellPalette) -> Div {
 
 fn warning_banner(palette: ShellPalette) -> Div {
     div()
+        // Bug fix (DESIGN-installer-settings-integration-2026-08.md §6): without
+        // an explicit width the banner shrinks to its text's natural size inside
+        // the flex-col parent, so the bilingual warning line overflows `widgets::card`
+        // instead of wrapping inside the card's own bounds.
+        .w_full()
         .px(px(12.))
         .py(px(8.))
         .rounded(px(theme::RADIUS_LG))
@@ -113,11 +125,25 @@ fn confirm_checkbox_row(flow: &LiveInstallFlow, cx: &mut Context<ShellView>) -> 
     let mut row = div()
         .id("live-install-confirm-checkbox")
         .flex()
-        .items_center()
+        // items_start (not items_center): once the text below wraps to a second
+        // line, center-alignment would float the checkbox to the vertical middle
+        // of both lines instead of lining up with the first line's glyph.
+        .items_start()
         .gap(px(10.))
         .py(px(4.))
         .child(box_el)
-        .child(div().text_size(px(theme::TEXT_SM)).child("我了解此操作將清除目標磁碟上的所有資料 · I understand this erases all data on the target disk"));
+        .child(
+            // Bug fix (DESIGN-installer-settings-integration-2026-08.md §6): flex
+            // row's classic `min-width:auto` overflow — a text child with no
+            // `min_w(px(0.))` refuses to shrink below its content width, so this
+            // bilingual line pushes past `widgets::card`'s edge instead of wrapping.
+            // Template: `settings/widgets.rs` `value_row` (`.flex_1().min_w(px(0.))`).
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_size(px(theme::TEXT_SM))
+                .child("我了解此操作將清除目標磁碟上的所有資料 · I understand this erases all data on the target disk"),
+        );
 
     if disk_ready {
         row = row.cursor_pointer().on_click(on_click);
@@ -128,4 +154,29 @@ fn confirm_checkbox_row(flow: &LiveInstallFlow, cx: &mut Context<ShellView>) -> 
         row = row.opacity(0.55);
     }
     row
+}
+
+#[cfg(test)]
+mod tests {
+    // DESIGN-installer-settings-integration-2026-08.md §6: source-scan
+    // regression guard for the text-overflow fix — same "crude but
+    // load-bearing" shape `live_install/render.rs`'s and `oobe/steps/
+    // account.rs`'s own test modules already use for behavior a gpui
+    // `cx.listener` closure can't otherwise be driven from without a live
+    // window (see those files' own header comments).
+
+    #[test]
+    fn confirm_checkbox_text_has_the_min_width_zero_overflow_fix() {
+        let source = include_str!("confirm.rs");
+        let start = source.find("fn confirm_checkbox_row(").expect("confirm_checkbox_row not found in confirm.rs");
+        let window = &source[start..(start + 2000).min(source.len())];
+        assert!(
+            window.contains(".flex_1()") && window.contains(".min_w(px(0.))"),
+            "the checkbox row's text child must keep `.flex_1().min_w(px(0.))` — \
+             without it, flex row's default `min-width: auto` refuses to shrink the \
+             bilingual confirmation text below its content width, and it overflows \
+             `widgets::card` instead of wrapping (DESIGN-installer-settings-\
+             integration-2026-08.md §6)"
+        );
+    }
 }

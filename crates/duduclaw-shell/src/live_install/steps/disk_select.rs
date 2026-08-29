@@ -93,7 +93,15 @@ fn failed_panel(flow: &LiveInstallFlow, message: &str, cx: &mut Context<ShellVie
         .gap(px(12.))
         .py(px(8.))
         .child(
+            // Bug fix (DESIGN-installer-settings-integration-2026-08.md §6): same
+            // undefined-width flex_col-child overflow as `confirm.rs`'s
+            // `warning_banner` — `message` is real `lsblk` stderr, unbounded
+            // length, so this div needs an explicit width to wrap instead of
+            // running past the card. Trades the parent's `.items_center()`
+            // centering for this one child (acceptable: an overflowing error
+            // message is worse than a left-aligned one).
             div()
+                .w_full()
                 .text_size(px(theme::TEXT_SM))
                 .text_color(theme::alpha(palette.destructive, 1.0))
                 .child(format!("掃描失敗 · Scan failed：{message}")),
@@ -170,7 +178,15 @@ fn disk_row(disk: &DiskInfo, index: usize, selected: bool, palette: ShellPalette
         .border_color(if selected { theme::alpha(palette.brand, 1.0) } else { palette.surface_border })
         .hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0)))
         .child(
+            // Bug fix (DESIGN-installer-settings-integration-2026-08.md §6): flex
+            // row main-axis `min-width:auto` overflow — this text column sits
+            // beside the "已選取" tag inside a `justify_between` row, and without
+            // `.flex_1().min_w(px(0.))` it refuses to shrink below `disk.model`'s
+            // content width (lsblk model strings can be long). Template:
+            // `settings/widgets.rs` `value_row`.
             div()
+                .flex_1()
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
                 .child(div().text_size(px(theme::TEXT_SM)).font_weight(FontWeight::MEDIUM).child(format!("/dev/{}", disk.name)))
@@ -181,6 +197,10 @@ fn disk_row(disk: &DiskInfo, index: usize, selected: bool, palette: ShellPalette
     if selected {
         row = row.child(
             div()
+                // Companion to the text column's `.flex_1()` above: pins the tag to
+                // its content width so it can never be squeezed by the now-growing
+                // text column on the other side of `justify_between`.
+                .flex_none()
                 .text_size(px(theme::TEXT_XS))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::alpha(palette.success, 1.0))

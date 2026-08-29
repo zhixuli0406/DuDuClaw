@@ -514,6 +514,23 @@ pub struct ShellView {
     /// plain data with no gpui types) and why they're created once,
     /// unconditionally, at window-open time rather than lazily.
     pub(crate) oobe_account_fields: oobe::AccountFields,
+    /// The live-install wizard's OWN `Account` step's two real text-input
+    /// entities — installer-settings-integration WP1 (2026-08-29,
+    /// `commercial/docs/DESIGN-installer-settings-integration-2026-08.md`
+    /// §3.1). A SEPARATE `oobe::AccountFields` instance from
+    /// `oobe_account_fields` above, not a shared one: `live_install` and
+    /// `oobe` are two independent state machines that can never both be
+    /// active in the same process run (see `live_install`'s own doc comment
+    /// just above — a live-boot session never reaches normal OOBE at all),
+    /// but sharing the ENTITY itself would still be the wrong call even so —
+    /// each field bundle's typed content is scoped to its own wizard's
+    /// lifetime, and `oobe::AccountFields::new` already reuses the plain
+    /// `oobe::widgets::OobeTextField` primitive (see that type's own doc
+    /// comment) rather than gpui state that's expensive to duplicate.
+    /// Created the same way and at the same call site as `oobe_account_
+    /// fields` (`AccountFields::new(cx)`, window-open time) — see that
+    /// field's own construction site for the precedent this mirrors.
+    pub(crate) live_install_account_fields: oobe::AccountFields,
     /// The `Network` step's real PSK entry field (Shell-S3, 2026-08-21) —
     /// same reasoning as `oobe_account_fields` just above (created once,
     /// unconditionally, at window-open time — see `oobe::NetworkFields`'s
@@ -1376,7 +1393,7 @@ impl ShellView {
             // a separate, fifth root-render mode rather than a fork inside
             // OOBE's own flow. The `oobe` branch itself is untouched by this
             // addition.
-            root.child(live_install::render(flow, cx))
+            root.child(live_install::render(flow, &self.live_install_account_fields, cx))
         } else if let Some(flow) = &self.oobe {
             root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, &self.oobe_network_fields, cx))
         } else if self.lockscreen.is_locked() {
@@ -1736,6 +1753,13 @@ fn main() {
         // one's own signature in `oobe/widgets.rs`), so moving them to here,
         // before any window exists, changes nothing about what they do.
         let oobe_account_fields = oobe::AccountFields::new(cx);
+        // Installer-settings-integration WP1 (2026-08-29): the live-install
+        // wizard's OWN `Account` step needs its own `AccountFields` instance
+        // — see that field's own doc comment on `ShellView` for why this
+        // isn't shared with `oobe_account_fields` just above. Same call
+        // site, same "create once, unconditionally, at window-open time"
+        // reasoning as every other field bundle here.
+        let live_install_account_fields = oobe::AccountFields::new(cx);
         let oobe_network_fields = oobe::NetworkFields::new(cx);
         let lockscreen_password_field = oobe::LockPasswordField::new(cx);
         let launcher_query_field = oobe::LauncherQueryField::new(cx);
@@ -1768,6 +1792,7 @@ fn main() {
             live_install: initial_live_install,
             oobe_ui: oobe::OobeUiState::default(),
             oobe_account_fields,
+            live_install_account_fields,
             oobe_network_fields,
             theme: initial_theme,
             focus_handle: cx.focus_handle(),

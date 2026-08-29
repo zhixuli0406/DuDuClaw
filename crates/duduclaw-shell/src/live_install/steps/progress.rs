@@ -61,7 +61,14 @@ fn progress_bar(percent: Option<u8>, palette: ShellPalette) -> Div {
 }
 
 fn status_line(text: &str, palette: ShellPalette) -> Div {
-    div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(text.to_string())
+    // Bug fix (DESIGN-installer-settings-integration-2026-08.md §6): same
+    // undefined-width flex_col-child overflow as `confirm.rs`'s
+    // `warning_banner` — this div is a direct child of each body's flex_col
+    // with no explicit width, and `running_body` feeds it an arbitrary
+    // `duduclaw-os-install.sh` log line (the single most likely line in this
+    // whole step to overflow). `.w_full()` gives it a real width to wrap
+    // inside, matching `progress_bar` above (which already has `.w_full()`).
+    div().w_full().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(text.to_string())
 }
 
 fn idle_body(palette: ShellPalette) -> Div {
@@ -91,7 +98,12 @@ fn failed_body(message: &str, palette: ShellPalette) -> Div {
         .flex_col()
         .gap(px(8.))
         .child(
+            // Bug fix (DESIGN-installer-settings-integration-2026-08.md §6): same
+            // class as `status_line` above — `message` is an arbitrary install
+            // failure reason with no length bound, direct flex_col child with no
+            // explicit width otherwise.
             div()
+                .w_full()
                 .text_size(px(theme::TEXT_SM))
                 .text_color(theme::alpha(palette.destructive, 1.0))
                 .child(format!("安裝失敗 · Install failed：{message}")),

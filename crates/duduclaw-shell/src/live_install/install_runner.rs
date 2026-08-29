@@ -30,13 +30,48 @@
 // change only has to update this fn and the shell script's own emitter.
 
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
 use gpui::Context;
 
 use super::{InstallState, LiveInstallStep};
+use crate::oobe::{LanguageChoice, OobeSelections, OobeState, OobeStep, ThemeChoice};
 use crate::ShellView;
+
+// ── Settings injection (WP2, 2026-08-29, `DESIGN-installer-settings-
+// integration-2026-08.md` §3.2/§4/§8/§9) ───────────────────────────────────
+// Two NEW env vars join `DUDUCLAW_INSTALL_TARGET`/`_YES`/`_PROGRESS`/
+// `_POWEROFF` above, both consumed by `duduclaw-os-install.sh` (see that
+// script's own header comment for the target-side half of this contract):
+//
+//   DUDUCLAW_INSTALL_OOBE_STATE_FILE     -> copied onto the target disk's
+//                                            /data as duduclaw-kiosk/shell/
+//                                            oobe_state.json
+//   DUDUCLAW_INSTALL_PENDING_ACCOUNT_FILE -> copied onto /data as
+//                                            duduclaw/pending-account.json
+//
+// Both files are built HERE, by `build_oobe_state_json`/
+// `build_pending_account_json` below, via `crate::oobe::OobeState`'s own
+// `serde::Serialize` impl and `serde_json::json!` respectively — never
+// hand-formatted shell strings — precisely so the shell script only ever
+// has to `cp` bytes it doesn't understand onto the target disk, and the ONE
+// place the on-disk shape can drift out of sync with what
+// `oobe::persistence::load_state` expects to read back stays inside this
+// same binary (design doc §8.2, "格式漂移"). `start_install` snapshots the
+// live wizard's language/theme/operator-name/password BEFORE handing off
+// to the background write thread, writes both files to `std::env::
+// temp_dir()` (this crate's own convention for anything meant to live only
+// as long as this one process — see `write_pending_settings_files`'s own
+// doc comment), and sets neither env var when a name+password pair isn't
+// both present — the script then skips its whole injection section,
+// byte-identical to before this round (design doc §9's own "installer 未帶
+// SETTINGS_FILE 時... 向後相容" invariant, extended to these two vars).
+// `run_install` best-effort deletes both scratch files once the child
+// process exits (success OR failure) — a plaintext password has no
+// business surviving on live tmpfs past the one install run that needed it
+// (design doc §8 risk 1).
 
 /// The installer's own executable name — installed at `${sbindir}/
 /// duduclaw-os-install` by `duduclaw-os-installer.bb`'s `do_install`, which
@@ -48,6 +83,134 @@ enum InstallEvent {
     Progress(u8),
     Status(String),
     Finished(Result<(), String>),
+}
+
+/// Builds `oobe_state.json`'s content the SAME way a real OOBE run would
+/// produce it — by constructing `crate::oobe::OobeState` through its own
+/// `serde::Serialize` impl, never by hand-formatting a JSON string. This is
+/// the whole point of doing this in Rust rather than in
+/// `duduclaw-os-install.sh` (design doc §8.2, "oobe_state.json 格式漂移"):
+/// the shell script only ever `cp`s bytes it doesn't parse, so the ONE
+/// place this shape can drift out of sync with what `oobe::persistence::
+/// load_state` expects to read back on the target machine's first boot
+/// stays right here, next to the struct definition it mirrors.
+///
+/// `completed: true` + `current_step: OobeStep::Finish` is what makes
+/// `resolve_boot_flow` (untouched by this round — design doc §9) return
+/// `None` on that first boot: straight to Home, no second OOBE. Every other
+/// `OobeSelections` field not named in this fn's signature is left at
+/// `OobeSelections::default()` — network/runtime-auth/privacy/template
+/// choices, none of which this round's live wizard collects yet (design
+/// doc §5 defers Wi-Fi collection to a later stage).
+fn build_oobe_state_json(language: LanguageChoice, theme: ThemeChoice, operator_name: Option<&str>) -> String {
+    let selections = OobeSelections {
+        language,
+        theme,
+        operator_name: operator_name.map(str::to_string),
+        account_created: true,
+        ..OobeSelections::default()
+    };
+    let state = OobeState { completed: true, current_step: OobeStep::Finish, selections };
+    serde_json::to_string_pretty(&state).unwrap_or_else(|e| {
+        // `OobeState` has no field that can fail to serialize (no map with
+        // non-string keys, no NaN float, nothing gpui-specific) — this arm
+        // should be unreachable in practice. Degrading to an empty string
+        // rather than panicking keeps a serializer regression from taking
+        // down the whole install: `duduclaw-os-install.sh` would then copy
+        // an empty (invalid) JSON file, which `load_state()`'s own
+        // corrupt-JSON fail-open turns into "target machine re-runs OOBE" —
+        // an honest, visible degradation, not a crashed installer.
+        eprintln!("[live_install] could not serialize oobe state: {e}");
+        String::new()
+    })
+}
+
+/// `pending-account.json`'s content — the `password` key matches
+/// `duduclaw-gateway`'s own `FirstRunClaimRequest` (`server.rs`'s
+/// `handle_first_run_claim`), which is what the target system's gateway
+/// will eventually read this file with on first boot (design doc §4;
+/// that gateway-side consumer is a separate work package). `serde_json::
+/// json!` rather than a hand-written `format!("{{\"password\":\"{p}\"}}")`
+/// for the same "let a real serializer own escaping" reason
+/// `build_oobe_state_json` above uses full struct serialization — a
+/// password containing a `"` or `\` must not corrupt the file.
+fn build_pending_account_json(password: &str) -> String {
+    serde_json::json!({ "password": password }).to_string()
+}
+
+/// Absolute paths to the two scratch files `write_pending_settings_files`
+/// writes — see this file's own header comment for what each one carries
+/// and which env var hands its path to `duduclaw-os-install.sh`.
+struct PendingSettingsFiles {
+    oobe_state: PathBuf,
+    pending_account: PathBuf,
+}
+
+/// Writes `content` to `path`, then (on Unix — this crate also builds for
+/// macOS dev machines, see `Cargo.toml`, even though the live installer
+/// itself only ever RUNS on the Linux kiosk target) tightens permissions to
+/// owner-read/write only. Both scratch files this round writes can carry a
+/// plaintext password or a full OOBE selections snapshot; "secrets get
+/// 0600" is this project's standing discipline for anything like that, not
+/// a live-image-specific carve-out.
+fn write_scratch_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Bridges what the live wizard collected (`LiveInstallFlow::{language,
+/// theme_choice, operator_name, account_password}` — the language accessor
+/// already existed, the other three are WP1's own accessors landing
+/// alongside this file) into the two scratch files
+/// `duduclaw-os-install.sh` copies onto the target disk (this file's own
+/// header comment has the full env-var contract). Both files land under
+/// `std::env::temp_dir()` — the live image's tmpfs, nothing here is meant
+/// to survive past this one install run — with this process's own pid in
+/// the filename so two concurrent installer runs (not reachable through
+/// this UI today, but cheap insurance) can never collide.
+///
+/// `None` on any write failure, AND on a partial failure (the first file
+/// wrote but the second didn't — cleans the first back up rather than
+/// leaving an orphaned oobe_state.json with no matching pending-account.json
+/// for the caller to find). `start_install` then sets NEITHER env var, the
+/// exact same degraded path as "the operator never filled in an account" —
+/// design doc §9's backward-compat invariant.
+fn write_pending_settings_files(language: LanguageChoice, theme: ThemeChoice, operator_name: &str, password: &str) -> Option<PendingSettingsFiles> {
+    let pid = std::process::id();
+    let oobe_state_path = std::env::temp_dir().join(format!("duduclaw-install-oobe-state-{pid}.json"));
+    let pending_account_path = std::env::temp_dir().join(format!("duduclaw-install-pending-account-{pid}.json"));
+
+    let oobe_state_json = build_oobe_state_json(language, theme, Some(operator_name));
+    if let Err(e) = write_scratch_file(&oobe_state_path, &oobe_state_json) {
+        eprintln!("[live_install] could not write oobe state scratch file {}: {e}", oobe_state_path.display());
+        return None;
+    }
+
+    let pending_account_json = build_pending_account_json(password);
+    if let Err(e) = write_scratch_file(&pending_account_path, &pending_account_json) {
+        eprintln!("[live_install] could not write pending account scratch file {}: {e}", pending_account_path.display());
+        let _ = std::fs::remove_file(&oobe_state_path);
+        return None;
+    }
+
+    Some(PendingSettingsFiles { oobe_state: oobe_state_path, pending_account: pending_account_path })
+}
+
+/// Best-effort cleanup of both scratch files — called from `run_install`
+/// once the child process has exited, on EVERY exit path (spawn failure,
+/// normal completion, non-zero exit) so a plaintext password never
+/// outlives the one install attempt that needed it. `Option<&_>` (not
+/// `Option<_>`) so the caller can still use `settings_files` for the env
+/// vars first and pass a borrow here afterward.
+fn cleanup_pending_settings_files(files: Option<&PendingSettingsFiles>) {
+    let Some(files) = files else { return };
+    let _ = std::fs::remove_file(&files.oobe_state);
+    let _ = std::fs::remove_file(&files.pending_account);
 }
 
 /// The Confirm step's own bottom-nav action (`render.rs`'s `button_row`,
@@ -84,13 +247,35 @@ pub(super) fn start_install(view: &mut ShellView, cx: &mut Context<ShellView>) {
         return;
     };
 
+    // WP2 (2026-08-29): snapshot the wizard's settings BEFORE the step
+    // advances/the background thread spawns — `flow` borrows `view`
+    // mutably and cannot cross the `std::thread::spawn` boundary below,
+    // same reason `disk_name` a few lines down is `.clone()`d out of `disk`
+    // rather than captured by reference. See this file's own header
+    // comment + `write_pending_settings_files`'s doc comment for what
+    // happens with these four values.
+    let language = flow.language();
+    let theme = flow.theme_choice();
+    let operator_name = flow.operator_name().map(str::to_string);
+    let account_password = flow.account_password().map(str::to_string);
+
     flow.set_install_running(None, "準備安裝…".to_string());
     flow.next();
     cx.notify();
 
+    // Both halves present -> write the two scratch files and wire the env
+    // vars; either missing (design doc §9: "理論上 UI 閘擋住到不了" — the
+    // account step's own gate should never let Confirm be reached without
+    // both) -> `None`, and `run_install` below sets neither env var, which
+    // is byte-identical to this round never having happened.
+    let settings_files = match (operator_name, account_password) {
+        (Some(name), Some(password)) => write_pending_settings_files(language, theme, &name, &password),
+        _ => None,
+    };
+
     let (tx, rx) = mpsc::channel::<InstallEvent>();
     let disk_name = disk.name.clone();
-    std::thread::spawn(move || run_install(&disk_name, &tx));
+    std::thread::spawn(move || run_install(&disk_name, &tx, settings_files));
 
     cx.spawn(async move |weak, cx| loop {
         let mut finished = false;
@@ -149,7 +334,7 @@ pub(super) fn start_install(view: &mut ShellView, cx: &mut Context<ShellView>) {
 /// finishes with exactly one `Finished` sentinel — see this file's own
 /// header comment for why this shape (not `kick_off_scan`'s one-shot) is
 /// needed.
-fn run_install(disk_name: &str, tx: &mpsc::Sender<InstallEvent>) {
+fn run_install(disk_name: &str, tx: &mpsc::Sender<InstallEvent>, settings_files: Option<PendingSettingsFiles>) {
     let mut command = Command::new(INSTALL_BIN);
     command
         .env("DUDUCLAW_INSTALL_TARGET", disk_name)
@@ -158,10 +343,18 @@ fn run_install(disk_name: &str, tx: &mpsc::Sender<InstallEvent>) {
         .env("DUDUCLAW_INSTALL_POWEROFF", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(files) = &settings_files {
+        // See this file's own header comment for the full env-var contract
+        // these two feed `duduclaw-os-install.sh`.
+        command
+            .env("DUDUCLAW_INSTALL_OOBE_STATE_FILE", &files.oobe_state)
+            .env("DUDUCLAW_INSTALL_PENDING_ACCOUNT_FILE", &files.pending_account);
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
+            cleanup_pending_settings_files(settings_files.as_ref());
             let _ = tx.send(InstallEvent::Finished(Err(format!("無法啟動 {INSTALL_BIN}：{e}"))));
             return;
         }
@@ -188,6 +381,10 @@ fn run_install(disk_name: &str, tx: &mpsc::Sender<InstallEvent>) {
         Ok(status) => Err(format!("{INSTALL_BIN} 結束碼異常：{status:?}")),
         Err(e) => Err(format!("等待 {INSTALL_BIN} 結束時失敗：{e}")),
     };
+    // Best-effort cleanup on EVERY exit path (success or failure) — a
+    // plaintext password has no business surviving on live tmpfs past the
+    // one install attempt that needed it (design doc §8 risk 1).
+    cleanup_pending_settings_files(settings_files.as_ref());
     let _ = tx.send(InstallEvent::Finished(result));
 }
 
@@ -307,6 +504,73 @@ pub(super) fn start_reboot(view: &mut ShellView, _cx: &mut Context<ShellView>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── build_oobe_state_json / build_pending_account_json (WP2) ─────────
+
+    #[test]
+    fn build_oobe_state_json_round_trips_into_a_completed_state_at_finish() {
+        let json = build_oobe_state_json(LanguageChoice::En, ThemeChoice::Dark, Some("Louis"));
+        let parsed: OobeState = serde_json::from_str(&json).expect("must deserialize back into OobeState");
+
+        assert!(parsed.completed, "the target machine must skip OOBE on first boot");
+        assert_eq!(parsed.current_step, OobeStep::Finish);
+        assert_eq!(parsed.selections.language, LanguageChoice::En);
+        assert_eq!(parsed.selections.theme, ThemeChoice::Dark);
+        assert_eq!(parsed.selections.operator_name.as_deref(), Some("Louis"));
+        assert!(parsed.selections.account_created);
+    }
+
+    /// The whole point of building this via `serde::Serialize` rather than
+    /// a hand-formatted string (design doc §8.2): the resulting state must
+    /// actually make `resolve_boot_flow` — untouched, still the same
+    /// function 11 existing OOBE tests already lock down — resolve to
+    /// `None`, i.e. "go straight to Home", exactly the outcome the whole
+    /// design hinges on.
+    #[test]
+    fn build_oobe_state_json_resolves_straight_to_home_on_boot() {
+        let json = build_oobe_state_json(LanguageChoice::ZhTw, ThemeChoice::Light, Some("操作員"));
+        let parsed: OobeState = serde_json::from_str(&json).expect("must deserialize back into OobeState");
+
+        assert_eq!(
+            crate::oobe::resolve_boot_flow(None, None, None, parsed),
+            None,
+            "a fresh target machine reading this file must land directly on Home, never re-run OOBE"
+        );
+    }
+
+    #[test]
+    fn build_oobe_state_json_defaults_every_other_selection() {
+        // Nothing this round's live wizard collects yet (network/runtime
+        // auth/privacy/templates — design doc §5 defers Wi-Fi) must come
+        // through as the same honest "not yet chosen" defaults a real OOBE
+        // run would leave behind if those steps were never reached.
+        let json = build_oobe_state_json(LanguageChoice::ZhTw, ThemeChoice::Light, None);
+        let parsed: OobeState = serde_json::from_str(&json).expect("must deserialize back into OobeState");
+
+        assert_eq!(parsed.selections, OobeSelections {
+            language: LanguageChoice::ZhTw,
+            theme: ThemeChoice::Light,
+            account_created: true,
+            operator_name: None,
+            ..OobeSelections::default()
+        });
+    }
+
+    #[test]
+    fn build_pending_account_json_carries_the_password_key_gateway_expects() {
+        let json = build_pending_account_json("hunter2-but-longer");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+        assert_eq!(parsed["password"], "hunter2-but-longer");
+    }
+
+    #[test]
+    fn build_pending_account_json_escapes_special_characters_safely() {
+        // A hand-formatted `format!("{{\"password\":\"{p}\"}}")` would
+        // corrupt on a `"` in the password — `serde_json::json!` must not.
+        let json = build_pending_account_json("has\"quote\\and\nnewline");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must still be valid JSON");
+        assert_eq!(parsed["password"], "has\"quote\\and\nnewline");
+    }
 
     #[test]
     fn parses_a_plain_progress_line() {

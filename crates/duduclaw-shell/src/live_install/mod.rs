@@ -44,6 +44,21 @@
 // `steps::progress`, which stays pure rendering of whatever `LiveInstallFlow
 // ::install()` currently says, same "state machine vs. the I/O that drives
 // it" split `steps::disk_select`'s own scan already follows.
+//
+// ── Installer-settings-integration WP1 (2026-08-29): 4 steps -> 6 ─────────
+// `commercial/docs/DESIGN-installer-settings-integration-2026-08.md` §3.1 —
+// two new steps, `Account` and `Theme`, are inserted right after `Language`
+// (`steps::account`/`steps::theme`, new this round). Both reuse `oobe`'s own
+// pure types/widgets (`oobe::widgets::AccountFields`, `oobe::ThemeChoice`)
+// exactly the way `steps::language` already reuses `oobe::LanguageChoice` —
+// a thin, separately-wired UI layer over shared plain data, per this file's
+// own "SEPARATE state machine, not another `OobeStep`" stance above. Neither
+// new step performs any I/O (no gateway call, no disk write) — see
+// `LiveInstallStep::Account`'s own doc comment in `state.rs` for why, and
+// for the later round (`install_runner`) that will actually serialize what
+// they collect. `steps::render`'s dispatcher signature grew a `fields`
+// parameter for this (`Account` is the only consumer; every other step
+// ignores it) — see `steps/mod.rs`'s own header comment.
 
 mod install_runner;
 mod render;
@@ -51,7 +66,7 @@ mod state;
 mod steps;
 
 pub(crate) use render::render;
-pub(crate) use state::{DiskInfo, DiskScanState, InstallState, LiveInstallFlow, LiveInstallStep};
+pub(crate) use state::{AccountError, DiskInfo, DiskScanState, InstallState, LiveInstallFlow, LiveInstallStep};
 
 #[cfg(test)]
 mod tests {

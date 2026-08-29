@@ -35,10 +35,27 @@
 // process) lives in `steps::disk_select`/`install_runner`, never here — this
 // file stays pure data + pure transitions, same discipline `oobe::state`
 // holds itself to.
+//
+// ── Installer-settings-integration WP1 (2026-08-29): Account + Theme ──────
+// `commercial/docs/DESIGN-installer-settings-integration-2026-08.md` §3.1 —
+// the live installer grows from 4 steps to 6, inserting `Account` and
+// `Theme` right after `Language` (the two OOBE steps this design's phase 1
+// pulls forward into the install-time flow; `Network` is phase 2, explicitly
+// out of scope here — see the design doc's own §5). Both new steps are PURE
+// DATA COLLECTION: no gateway call happens at click time (see `Account`'s
+// own doc comment below for why — it mirrors §4's "pending file + gateway
+// first-boot claim" decision, not OOBE's own live `oobe::claim::
+// create_account` round-trip), and no disk write happens either — a LATER
+// round (`install_runner`) is what serializes whatever this struct holds
+// into the JSON `duduclaw-os-install.sh` injects onto the target `/data`
+// partition. `AccountError`/the `operator_name`/`account_password`/
+// `account_error`/`theme` fields below, and their accessors, are that later
+// round's read surface — the exact signatures the design doc's own §3.1
+// commits to as a fixed contract with the parallel `install_runner`/
+// `render.rs` work.
+use crate::oobe::{LanguageChoice, ThemeChoice};
 
-use crate::oobe::LanguageChoice;
-
-/// The four live-install wizard steps, in fixed linear order — no branching,
+/// The six live-install wizard steps, in fixed linear order — no branching,
 /// same "step order is data, not a runtime decision" discipline `oobe::
 /// state::OobeStep` follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +65,29 @@ pub(crate) enum LiveInstallStep {
     /// `steps::language`'s own header comment for why the two can't share a
     /// click handler even though the visual row is the same shape.
     Language,
+    /// Installer-settings-integration WP1: collects the operator's display
+    /// name + password INTO `LiveInstallState` only — no gateway round trip
+    /// at click time (unlike OOBE's own `AccountCreate`, which calls
+    /// `oobe::claim::create_account` immediately because a real gateway is
+    /// always reachable at `127.0.0.1:18789` once OOBE is running post-boot).
+    /// A live-install session has no such gateway to call (the live image
+    /// "carries no gateway payload" — see the design doc's own §4), so this
+    /// step's whole job is to hold the two typed values until a later round
+    /// (`install_runner`) serializes them into a `pending-account.json` the
+    /// TARGET system's own first-boot gateway claims. See `steps::account`'s
+    /// own header comment for the full "why no submit button, why no I/O"
+    /// writeup.
+    Account,
+    /// WP1: appearance pick — reuses `oobe::ThemeChoice`, the exact enum
+    /// OOBE's own `Theme` step already persists (`oobe::selections::
+    /// ThemeChoice`), so a later round's `install_runner` can serialize this
+    /// flow's pick straight into the same `oobe_state.json` shape the target
+    /// system's `resolve_boot_flow` already knows how to read (see the
+    /// design doc's §3 diagram: "寫 oobe_state.json (completed:true + 語言/
+    /// 主題)"). Unlike `Account`, THIS step's pick also reskins the
+    /// remaining wizard screens live, on this very live session — see
+    /// `Self::palette`'s own doc comment below.
+    Theme,
     /// Y20-P3: real `lsblk` block-device enumeration + a single-select pick
     /// that gates `can_advance` — see `steps::disk_select`'s own header
     /// comment for the scan/select flow.
@@ -64,8 +104,14 @@ pub(crate) enum LiveInstallStep {
 }
 
 impl LiveInstallStep {
-    pub(crate) const ALL: [LiveInstallStep; 4] =
-        [LiveInstallStep::Language, LiveInstallStep::DiskSelect, LiveInstallStep::Confirm, LiveInstallStep::Progress];
+    pub(crate) const ALL: [LiveInstallStep; 6] = [
+        LiveInstallStep::Language,
+        LiveInstallStep::Account,
+        LiveInstallStep::Theme,
+        LiveInstallStep::DiskSelect,
+        LiveInstallStep::Confirm,
+        LiveInstallStep::Progress,
+    ];
 
     pub(crate) fn index(self) -> usize {
         Self::ALL.iter().position(|s| *s == self).expect("LiveInstallStep::ALL is exhaustive over every variant")
@@ -82,6 +128,28 @@ impl LiveInstallStep {
     pub(crate) fn prev(self) -> Option<Self> {
         self.index().checked_sub(1).and_then(Self::from_index)
     }
+}
+
+/// The two ways `Account`'s click-time validation (`render.rs`'s
+/// `button_row`, the Account arm of its `continue_click` match) can refuse
+/// to advance — mirrors OOBE's own `AccountClaimFailureKind::
+/// PasswordTooShort` rule (`< 8 chars`, itself mirroring the gateway's
+/// `handle_first_run_claim`) plus the empty-fields case OOBE splits into a
+/// separate `ui.account_validation_error` bool. This flow folds both into
+/// ONE `Option<AccountError>` on `LiveInstallState` instead of two separate
+/// booleans/enums — there is exactly one status slot on this step
+/// (`steps::account::render`'s own status line), so one nullable value is
+/// the whole story; no call site needs to distinguish "empty AND too short"
+/// from "just empty", since the empty-fields check always runs first and
+/// returns before the length check is ever reached (see `render.rs`'s own
+/// Account arm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccountError {
+    /// Name and/or password were empty at submit time.
+    EmptyFields,
+    /// Password was non-empty but under the 8-character floor
+    /// `handle_first_run_claim` (`duduclaw-gateway/src/server.rs`) enforces.
+    PasswordTooShort,
 }
 
 /// One candidate install-target disk (Y20-P3). Mirrors what
@@ -152,6 +220,24 @@ struct LiveInstallState {
     current_step: LiveInstallStep,
     completed: bool,
     language: LanguageChoice,
+    /// WP1: the `Account` step's typed name — `None` until a validated
+    /// `set_account` call. See `LiveInstallStep::Account`'s own doc comment
+    /// for why this never reaches a gateway from THIS struct directly.
+    operator_name: Option<String>,
+    /// WP1: the `Account` step's typed password, held in plain memory for
+    /// the same reason `oobe::widgets::OobeTextField`'s masked fields are —
+    /// this flow is the one place it lives until `install_runner` writes it
+    /// out (a later round; see this file's own header comment) and the
+    /// process exits.
+    account_password: Option<String>,
+    /// WP1: set by `render.rs`'s click-time validation on a rejected submit,
+    /// cleared by a subsequent successful `set_account`. See `AccountError`'s
+    /// own doc comment for why this is one nullable value, not two booleans.
+    account_error: Option<AccountError>,
+    /// WP1: the `Theme` step's pick — `#[default] Light`, same "the very
+    /// first frame already shows this as selected" honesty `ThemeChoice::
+    /// default()`'s own doc comment establishes for OOBE's identical field.
+    theme: ThemeChoice,
     disk_scan: DiskScanState,
     selected_disk: Option<DiskInfo>,
     confirm_checked: bool,
@@ -164,6 +250,10 @@ impl Default for LiveInstallState {
             current_step: LiveInstallStep::Language,
             completed: false,
             language: LanguageChoice::default(),
+            operator_name: None,
+            account_password: None,
+            account_error: None,
+            theme: ThemeChoice::default(),
             disk_scan: DiskScanState::default(),
             selected_disk: None,
             confirm_checked: false,
@@ -219,6 +309,53 @@ impl LiveInstallFlow {
     /// render call reflects it, without itself advancing the step.
     pub(crate) fn set_language(&mut self, language: LanguageChoice) {
         self.state.language = language;
+    }
+
+    // ── Account (installer-settings-integration WP1) ───────────────────
+
+    pub(crate) fn operator_name(&self) -> Option<&str> {
+        self.state.operator_name.as_deref()
+    }
+
+    pub(crate) fn account_password(&self) -> Option<&str> {
+        self.state.account_password.as_deref()
+    }
+
+    pub(crate) fn account_error(&self) -> Option<AccountError> {
+        self.state.account_error
+    }
+
+    /// Records BOTH typed fields at once — unlike `set_language`'s
+    /// single-field click-to-record, this flow's only caller is `render.rs`'s
+    /// click-time validation (see that file's own header comment and
+    /// `steps::account`'s for why validation happens there, not here): by
+    /// the time this is called, both values have already passed validation
+    /// TOGETHER, so there is no partial/invalid state worth a setter for.
+    /// Clears any previously-set `account_error` — a validated submit
+    /// supersedes whatever the LAST attempt complained about, same
+    /// "success clears the prior failure" contract OOBE's own
+    /// `apply_claim_result` establishes for `AccountClaimState`.
+    pub(crate) fn set_account(&mut self, name: String, password: String) {
+        self.state.operator_name = Some(name);
+        self.state.account_password = Some(password);
+        self.state.account_error = None;
+    }
+
+    pub(crate) fn set_account_error(&mut self, err: AccountError) {
+        self.state.account_error = Some(err);
+    }
+
+    // ── Theme (installer-settings-integration WP1) ─────────────────────
+
+    pub(crate) fn theme_choice(&self) -> ThemeChoice {
+        self.state.theme
+    }
+
+    /// Click-to-record, same split every other setter in this file uses —
+    /// see `Self::palette` below for how this pick reaches the screen on
+    /// the very next render call.
+    pub(crate) fn set_theme(&mut self, theme: ThemeChoice) {
+        self.state.theme = theme;
     }
 
     // ── DiskSelect (Y20-P3) ─────────────────────────────────────────────
@@ -315,11 +452,15 @@ impl LiveInstallFlow {
     /// Y20-P3: each step now has a REAL precondition (P2 left this
     /// unconditionally `true` for every step — an honest placeholder, see
     /// this file's header comment). `Language` still has none of its own;
-    /// the other three read exactly the state their own step's render
+    /// `Theme` (WP1) has none either — it has a default (`Light`), same
+    /// reasoning `oobe::state::OobeFlow::can_advance` gives `Theme` there.
+    /// The other four read exactly the state their own step's render
     /// module is responsible for populating.
     pub(crate) fn can_advance(&self) -> bool {
         match self.state.current_step {
             LiveInstallStep::Language => true,
+            LiveInstallStep::Account => self.state.operator_name.is_some() && self.state.account_password.is_some(),
+            LiveInstallStep::Theme => true,
             LiveInstallStep::DiskSelect => self.state.selected_disk.is_some(),
             LiveInstallStep::Confirm => self.state.confirm_checked,
             LiveInstallStep::Progress => matches!(self.state.install, InstallState::Done),
@@ -354,14 +495,20 @@ impl LiveInstallFlow {
         }
     }
 
-    /// P2 always resolves the default (light) palette — this wizard has no
-    /// `Theme` step of its own (unlike OOBE), and a live-install session has
-    /// no persisted operator theme pick to read yet either. `pub(crate)`
-    /// (not `pub(super)`): `live_install::render`/`steps::*` are siblings of
-    /// this file within `live_install`, same reach `OobeFlow::palette()`'s
-    /// own doc comment explains for its own `pub(super)`.
+    /// Installer-settings-integration WP1: resolves against the operator's
+    /// OWN `Theme` step pick instead of P2/P3's unconditional light default
+    /// — same "selecting a theme reskins every OTHER screen on the very
+    /// next render call" live-repaint discipline `oobe::state::OobeFlow::
+    /// palette()` already establishes for OOBE (see that method's own doc
+    /// comment): nothing here caches a palette across renders, it is
+    /// resolved fresh from `self.state.theme` on every call, so a click on
+    /// `Theme` reskins the wizard's remaining steps starting the very next
+    /// frame. `pub(crate)` (not `pub(super)`): `live_install::render`/
+    /// `steps::*` are siblings of this file within `live_install`, same
+    /// reach `OobeFlow::palette()`'s own doc comment explains for its own
+    /// `pub(super)`.
     pub(crate) fn palette(&self) -> crate::palette::ShellPalette {
-        crate::palette::ShellPalette::default()
+        crate::palette::ShellPalette::for_choice(self.state.theme)
     }
 }
 
@@ -378,12 +525,14 @@ mod tests {
     // ── step ordering / indices ──────────────────────────────────────
 
     #[test]
-    fn all_has_four_steps_in_declared_order() {
-        assert_eq!(LiveInstallStep::ALL.len(), 4);
+    fn all_has_six_steps_in_declared_order() {
+        assert_eq!(LiveInstallStep::ALL.len(), 6);
         assert_eq!(LiveInstallStep::ALL[0], LiveInstallStep::Language);
-        assert_eq!(LiveInstallStep::ALL[1], LiveInstallStep::DiskSelect);
-        assert_eq!(LiveInstallStep::ALL[2], LiveInstallStep::Confirm);
-        assert_eq!(LiveInstallStep::ALL[3], LiveInstallStep::Progress);
+        assert_eq!(LiveInstallStep::ALL[1], LiveInstallStep::Account);
+        assert_eq!(LiveInstallStep::ALL[2], LiveInstallStep::Theme);
+        assert_eq!(LiveInstallStep::ALL[3], LiveInstallStep::DiskSelect);
+        assert_eq!(LiveInstallStep::ALL[4], LiveInstallStep::Confirm);
+        assert_eq!(LiveInstallStep::ALL[5], LiveInstallStep::Progress);
     }
 
     #[test]
@@ -394,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn next_walks_forward_through_all_four_steps_in_declared_order() {
+    fn next_walks_forward_through_all_six_steps_in_declared_order() {
         let mut step = LiveInstallStep::Language;
         let mut seen = vec![step];
         while let Some(n) = step.next() {
@@ -414,9 +563,22 @@ mod tests {
         assert_eq!(LiveInstallStep::Language.prev(), None);
     }
 
+    /// WP1 moved `DiskSelect` from index 1 to index 3 — its `prev()` is now
+    /// `Theme`, not `Language`. This replaces the P3-era
+    /// `disk_select_prev_is_language` test, which pinned the STALE order.
     #[test]
-    fn disk_select_prev_is_language() {
-        assert_eq!(LiveInstallStep::DiskSelect.prev(), Some(LiveInstallStep::Language));
+    fn disk_select_prev_is_theme() {
+        assert_eq!(LiveInstallStep::DiskSelect.prev(), Some(LiveInstallStep::Theme));
+    }
+
+    #[test]
+    fn account_prev_is_language() {
+        assert_eq!(LiveInstallStep::Account.prev(), Some(LiveInstallStep::Language));
+    }
+
+    #[test]
+    fn theme_prev_is_account() {
+        assert_eq!(LiveInstallStep::Theme.prev(), Some(LiveInstallStep::Account));
     }
 
     // ── LiveInstallFlow: next / back / complete ────────────────────────
@@ -428,14 +590,22 @@ mod tests {
         assert!(!flow.completed());
     }
 
-    /// Y20-P3: `next()` now genuinely gates on each step's own precondition
-    /// (P2's `can_advance` was unconditionally `true` — see that method's
-    /// own doc comment). This walks the full happy path, satisfying each
-    /// gate in turn — exactly what an operator's real clicks would supply.
+    /// Y20-P3 (extended WP1): `next()` genuinely gates on each step's own
+    /// precondition. This walks the full happy path, satisfying each gate in
+    /// turn — exactly what an operator's real clicks would supply — now
+    /// through all six steps including the two WP1 inserts.
     #[test]
-    fn next_advances_through_all_four_steps_once_each_gate_is_satisfied() {
+    fn next_advances_through_all_six_steps_once_each_gate_is_satisfied() {
         let mut flow = LiveInstallFlow::new();
-        assert!(flow.next(), "Language -> DiskSelect has no precondition");
+        assert!(flow.next(), "Language -> Account has no precondition");
+        assert_eq!(flow.current(), LiveInstallStep::Account);
+
+        assert!(!flow.next(), "Account must refuse to advance with no name/password set");
+        flow.set_account("operator".to_string(), "hunter2-pw".to_string());
+        assert!(flow.next());
+        assert_eq!(flow.current(), LiveInstallStep::Theme);
+
+        assert!(flow.next(), "Theme has a default pick, so it never blocks advancing");
         assert_eq!(flow.current(), LiveInstallStep::DiskSelect);
 
         assert!(!flow.next(), "DiskSelect must refuse to advance with no disk picked");
@@ -469,27 +639,34 @@ mod tests {
         assert_eq!(flow.current(), LiveInstallStep::Language);
     }
 
-    /// Y20-P3: rewritten from P2's unconditional four-step walk — walking
-    /// all the way back now needs each forward gate satisfied first, same
-    /// as `next_advances_through_all_four_steps_once_each_gate_is_satisfied`
-    /// above.
+    /// WP1 extends P3's rewrite — walking all the way back now needs all
+    /// five forward gates satisfied first (Account/Theme included), and
+    /// walking back all the way to `Language` takes five `back()` calls
+    /// instead of three.
     #[test]
     fn back_walks_all_the_way_from_progress_to_language_once_forward_gates_are_satisfied() {
         let mut flow = LiveInstallFlow::new();
-        flow.next();
+        flow.next(); // Language -> Account
+        flow.set_account("operator".to_string(), "hunter2-pw".to_string());
+        flow.next(); // Account -> Theme
+        flow.next(); // Theme -> DiskSelect
         flow.select_disk(DiskInfo { name: "vda".to_string(), size: "20G".to_string(), model: String::new() });
-        flow.next();
+        flow.next(); // DiskSelect -> Confirm
         flow.set_confirm_checked(true);
-        flow.next();
+        flow.next(); // Confirm -> Progress
         flow.set_install_done();
-        flow.next();
+        flow.next(); // Progress -> completed
         assert!(flow.completed());
         assert_eq!(flow.current(), LiveInstallStep::Progress, "current step stays put once completed");
-        // `completed()` has no effect on `back()` — same P2 invariant, unchanged.
+        // `completed()` has no effect on `back()` — same P2/P3 invariant, unchanged.
         assert!(flow.back());
         assert_eq!(flow.current(), LiveInstallStep::Confirm);
         assert!(flow.back());
         assert_eq!(flow.current(), LiveInstallStep::DiskSelect);
+        assert!(flow.back());
+        assert_eq!(flow.current(), LiveInstallStep::Theme);
+        assert!(flow.back());
+        assert_eq!(flow.current(), LiveInstallStep::Account);
         assert!(flow.back());
         assert_eq!(flow.current(), LiveInstallStep::Language);
         assert!(!flow.back());
@@ -499,6 +676,9 @@ mod tests {
     fn next_on_progress_completes_the_flow() {
         let mut flow = LiveInstallFlow::new();
         flow.next();
+        flow.set_account("operator".to_string(), "hunter2-pw".to_string());
+        flow.next();
+        flow.next(); // Theme -> DiskSelect
         flow.select_disk(DiskInfo { name: "vda".to_string(), size: "20G".to_string(), model: String::new() });
         flow.next();
         flow.set_confirm_checked(true);
@@ -515,6 +695,9 @@ mod tests {
     fn next_is_a_noop_once_completed() {
         let mut flow = LiveInstallFlow::new();
         flow.next();
+        flow.set_account("operator".to_string(), "hunter2-pw".to_string());
+        flow.next();
+        flow.next(); // Theme -> DiskSelect
         flow.select_disk(DiskInfo { name: "vda".to_string(), size: "20G".to_string(), model: String::new() });
         flow.next();
         flow.set_confirm_checked(true);
@@ -525,14 +708,21 @@ mod tests {
         assert!(!flow.next());
     }
 
-    /// Y20-P3 replaces P2's `can_advance_is_always_true_at_p2_scope` — the
-    /// exact placeholder that test's own name flagged as temporary. Each
-    /// step now has a real precondition; this walks all four, confirming
-    /// each is `false` before its gate is satisfied and `true` after.
+    /// WP1 replaces P3's `can_advance_reflects_each_steps_own_precondition`
+    /// — now walks all six steps, including the two new gates (`Account`
+    /// starts blocked, `Theme` never blocks).
     #[test]
     fn can_advance_reflects_each_steps_own_precondition() {
         let mut flow = LiveInstallFlow::new();
         assert!(flow.can_advance(), "Language has no precondition");
+        flow.next();
+
+        assert!(!flow.can_advance(), "Account starts with no name/password set");
+        flow.set_account("operator".to_string(), "hunter2-pw".to_string());
+        assert!(flow.can_advance());
+        flow.next();
+
+        assert!(flow.can_advance(), "Theme has a default pick, so it is never blocked");
         flow.next();
 
         assert!(!flow.can_advance(), "DiskSelect starts with nothing picked");
@@ -574,6 +764,69 @@ mod tests {
         assert_eq!(flow.locale(), crate::i18n::Locale::JaJp);
     }
 
+    // ── Account (installer-settings-integration WP1) ───────────────────
+
+    #[test]
+    fn account_fields_start_empty() {
+        let flow = LiveInstallFlow::new();
+        assert_eq!(flow.operator_name(), None);
+        assert_eq!(flow.account_password(), None);
+        assert_eq!(flow.account_error(), None);
+    }
+
+    #[test]
+    fn set_account_records_both_fields_without_advancing() {
+        let mut flow = LiveInstallFlow::new();
+        flow.next(); // -> Account
+        flow.set_account("operator".to_string(), "hunter2-pw".to_string());
+        assert_eq!(flow.operator_name(), Some("operator"));
+        assert_eq!(flow.account_password(), Some("hunter2-pw"));
+        assert_eq!(flow.current(), LiveInstallStep::Account, "recording the account must not itself advance");
+    }
+
+    #[test]
+    fn set_account_clears_a_prior_error() {
+        let mut flow = LiveInstallFlow::new();
+        flow.next(); // -> Account
+        flow.set_account_error(AccountError::EmptyFields);
+        assert_eq!(flow.account_error(), Some(AccountError::EmptyFields));
+        flow.set_account("operator".to_string(), "hunter2-pw".to_string());
+        assert_eq!(flow.account_error(), None, "a validated submit must clear whatever the prior attempt complained about");
+    }
+
+    #[test]
+    fn set_account_error_records_without_advancing() {
+        let mut flow = LiveInstallFlow::new();
+        flow.next(); // -> Account
+        flow.set_account_error(AccountError::PasswordTooShort);
+        assert_eq!(flow.account_error(), Some(AccountError::PasswordTooShort));
+        assert_eq!(flow.current(), LiveInstallStep::Account);
+    }
+
+    // ── Theme (installer-settings-integration WP1) ─────────────────────
+
+    #[test]
+    fn theme_defaults_to_light() {
+        let flow = LiveInstallFlow::new();
+        assert_eq!(flow.theme_choice(), ThemeChoice::Light);
+    }
+
+    #[test]
+    fn set_theme_records_the_choice_without_advancing() {
+        let mut flow = LiveInstallFlow::new();
+        flow.set_theme(ThemeChoice::Dark);
+        assert_eq!(flow.theme_choice(), ThemeChoice::Dark);
+        assert_eq!(flow.current(), LiveInstallStep::Language, "click-to-record must not itself advance");
+    }
+
+    #[test]
+    fn palette_follows_the_selected_theme() {
+        let mut flow = LiveInstallFlow::new();
+        assert_eq!(flow.palette(), crate::palette::ShellPalette::for_choice(ThemeChoice::Light));
+        flow.set_theme(ThemeChoice::Dark);
+        assert_eq!(flow.palette(), crate::palette::ShellPalette::for_choice(ThemeChoice::Dark));
+    }
+
     // ── DiskSelect (Y20-P3) ────────────────────────────────────────────
 
     #[test]
@@ -596,8 +849,7 @@ mod tests {
 
     #[test]
     fn select_disk_records_without_advancing() {
-        let mut flow = LiveInstallFlow::new();
-        flow.next(); // -> DiskSelect
+        let mut flow = disk_select_flow();
         assert!(flow.selected_disk().is_none());
         flow.select_disk(DiskInfo { name: "vda".to_string(), size: "20G".to_string(), model: String::new() });
         assert_eq!(flow.selected_disk().map(|d| d.name.as_str()), Some("vda"));
@@ -657,5 +909,22 @@ mod tests {
         assert!(!flow.install_failed());
         flow.set_install_failed("x".to_string());
         assert!(flow.install_failed());
+    }
+
+    // ── helpers: walk to a given step, satisfying preconditions ──────
+    // Same shape `oobe::state`'s own test module establishes for its
+    // multi-precondition walk-throughs (`runtime_auth_flow`/`templates_flow`
+    // et al.) — see that module's own test section for the pattern this
+    // mirrors.
+
+    fn disk_select_flow() -> LiveInstallFlow {
+        let mut flow = LiveInstallFlow::new();
+        while flow.current() != LiveInstallStep::DiskSelect {
+            if flow.current() == LiveInstallStep::Account {
+                flow.set_account("operator".to_string(), "hunter2-pw".to_string());
+            }
+            flow.next();
+        }
+        flow
     }
 }

@@ -629,37 +629,52 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         ))
     })?);
     // Ensure a default admin exists on first run
-    match user_db.ensure_default_admin() {
-        Ok(Some(password)) => {
-            // First-run bootstrap. The dashboard's first-open screen lets a
-            // LOOPBACK operator SET the admin password directly (the
-            // `/api/first-run/claim` flow), so on a localhost bind the
-            // generated one-time password is a stale second path — printing
-            // it just confuses the setup. Only a non-loopback bind (where the
-            // loopback-only claim endpoint is unreachable from the operator's
-            // browser) still needs the printed value to get in at all.
-            let loopback_only = matches!(config.bind.as_str(), "127.0.0.1" | "::1" | "localhost");
-            if loopback_only {
-                println!(
-                    "\n  🔑 First-run setup: open the dashboard and set the admin password there (admin@local)."
-                );
-                println!();
-                let _ = password; // superseded by the dashboard claim flow
-            } else {
-                println!(
-                    "\n  🔑 First-run admin — log in with this, you'll be asked to change it:"
-                );
-                println!("     Email:    admin@local");
-                println!("     Password: {password}");
-                println!();
-            }
-        }
-        Ok(None) => {} // Admin already exists
+    let bootstrap_password = match user_db.ensure_default_admin() {
+        Ok(password) => password, // Some(..) on first run, None if an admin already existed
         Err(e) => {
             // C2 fix: fail hard if we can't create admin — don't silently continue
             return Err(duduclaw_core::error::DuDuClawError::Gateway(format!(
                 "Failed to initialize user database: {e}"
             )));
+        }
+    };
+
+    // WP3 (DESIGN-installer-settings-integration-2026-08.md §4): land an
+    // installer-written pending-account.json, if the graphical installer ran
+    // on this machine and left one. MUST run before the first-run print
+    // block below — a successful land invalidates `bootstrap_password` (the
+    // one-time password `ensure_default_admin` just generated no longer
+    // matches the now-claimed row), so printing has to check the
+    // POST-landing claim state, not just whether this was a first run.
+    crate::pending_account::land_pending_account(&user_db, &home_dir);
+
+    if bootstrap_password.is_some() && user_db.is_unclaimed_default_admin() {
+        // First-run bootstrap, and still unclaimed after the landing attempt
+        // above (no installer pending file existed, or landing it failed —
+        // in both cases the original first-run guidance still applies). The
+        // dashboard's first-open screen lets a LOOPBACK operator SET the
+        // admin password directly (the `/api/first-run/claim` flow), so on
+        // a localhost bind the generated one-time password is a stale
+        // second path — printing it just confuses the setup. Only a
+        // non-loopback bind (where the loopback-only claim endpoint is
+        // unreachable from the operator's browser) still needs the printed
+        // value to get in at all.
+        let loopback_only = matches!(config.bind.as_str(), "127.0.0.1" | "::1" | "localhost");
+        if loopback_only {
+            println!(
+                "\n  🔑 First-run setup: open the dashboard and set the admin password there (admin@local)."
+            );
+            println!();
+        } else {
+            println!(
+                "\n  🔑 First-run admin — log in with this, you'll be asked to change it:"
+            );
+            println!("     Email:    admin@local");
+            println!(
+                "     Password: {}",
+                bootstrap_password.as_deref().unwrap_or_default()
+            );
+            println!();
         }
     }
     let jwt_config = Arc::new(JwtConfig::load_or_generate(&home_dir).map_err(|e| {

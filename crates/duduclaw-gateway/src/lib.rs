@@ -194,6 +194,7 @@ pub mod line;
 pub mod local_llm;
 pub mod install_notify;
 pub mod install_requests;
+pub(crate) mod pending_account;
 pub mod mcp_oauth;
 pub mod mcp_scan;
 pub mod mail;
