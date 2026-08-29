@@ -198,8 +198,22 @@ fn run_install(disk_name: &str, tx: &mpsc::Sender<InstallEvent>) {
 /// `map_while(Result::ok)` is the same "one malformed line costs that line,
 /// not the whole read" discipline `audio/wpctl.rs`'s parsers document for
 /// reading another process's output.
+///
+/// Y20-P4 (2026-08-29): every line is passed through `strip_ansi_sgr` first.
+/// `duduclaw-os-install.sh`'s own `log()`/`warn()`/`err()`/`ok()` helpers
+/// (its own header comment, `c_info`/`c_warn`/`c_err`/`c_ok`/`c_off`) wrap
+/// every status line in an SGR color escape for a real terminal — this
+/// crate's `steps::progress` status line is a plain gpui text run, not a
+/// terminal, so the raw escape bytes were rendering as literal `▌[1;36m…`
+/// noise instead of color. Stripping here (not in `steps::progress`) keeps
+/// the fix at the single ingestion point for BOTH consumers of a pumped
+/// line — `InstallEvent::Status` (displayed verbatim) and
+/// `parse_progress_line` (matched exact-prefix) — even though the script's
+/// own `DUDUCLAW_PROGRESS:` emitter never wraps its own line in color today;
+/// a future change to that emitter can't silently regress this.
 fn pump_lines(stream: impl std::io::Read, tx: &mpsc::Sender<InstallEvent>) {
     for line in BufReader::new(stream).lines().map_while(Result::ok) {
+        let line = strip_ansi_sgr(&line);
         match parse_progress_line(&line) {
             Some(pct) => {
                 let _ = tx.send(InstallEvent::Progress(pct));
@@ -209,6 +223,52 @@ fn pump_lines(stream: impl std::io::Read, tx: &mpsc::Sender<InstallEvent>) {
             }
         }
     }
+}
+
+/// Strips ANSI CSI "Select Graphic Rendition" escape sequences
+/// (`\x1b[<params>m`, e.g. `\x1b[1;36m` / `\x1b[0m`) from a single line of
+/// text. Hand-rolled rather than pulling in the `regex` crate for one fixed
+/// three-byte-prefix pattern — this crate has no other regex need (see
+/// `Cargo.toml`'s own dependency list), and the shape is narrow enough
+/// (`ESC` `[` then ASCII digits/`;` then a literal `m`) to scan by hand
+/// without the risk a hand-rolled *parser* usually carries: an unrecognized
+/// or truncated escape (missing final `m`, non-numeric params) is left
+/// byte-for-byte in the output rather than guessed at or silently eaten —
+/// same "don't invent structure that isn't there" discipline
+/// `parse_progress_line`'s own doc comment holds itself to.
+fn strip_ansi_sgr(line: &str) -> String {
+    const ESC: char = '\u{1b}';
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ESC || chars.peek() != Some(&'[') {
+            out.push(c);
+            continue;
+        }
+        // Tentatively consume `ESC '['` plus every following digit/`;`,
+        // stopping at the first character that is neither. Only a
+        // sequence that ends in a literal `m` is an SGR code we recognize
+        // and drop; anything else (an unterminated escape at EOF, or a CSI
+        // sequence ending in some other final byte, e.g. cursor-movement
+        // `H`/`K`) is restored verbatim into `out` rather than swallowed.
+        let mut rest = chars.clone();
+        rest.next(); // consume the '[' already peeked
+        let terminated_m = loop {
+            match rest.next() {
+                Some(next) if next.is_ascii_digit() || next == ';' => continue,
+                Some('m') => break true,
+                _ => break false,
+            }
+        };
+        if terminated_m {
+            chars = rest;
+        } else {
+            // Not a recognized SGR sequence — keep the ESC and let the
+            // outer loop re-examine `[` and everything after it normally.
+            out.push(ESC);
+        }
+    }
+    out
 }
 
 /// Decodes ONE line of `duduclaw-os-install.sh`'s `DUDUCLAW_PROGRESS:<pct>`
@@ -294,5 +354,65 @@ mod tests {
     #[test]
     fn rejects_a_negative_looking_value() {
         assert_eq!(parse_progress_line("DUDUCLAW_PROGRESS:-5"), None);
+    }
+
+    // ── strip_ansi_sgr (Y20-P4) ──────────────────────────────────────────
+
+    #[test]
+    fn strips_the_exact_info_color_the_installer_script_emits() {
+        // `duduclaw-os-install.sh`'s own `log()`: `${c_info}[installer]${c_off} %s`
+        // == "\x1b[1;36m[installer]\x1b[0m 正在寫入映像到 /dev/vda...".
+        let raw = "\u{1b}[1;36m[installer]\u{1b}[0m 正在寫入映像到 /dev/vda...";
+        assert_eq!(strip_ansi_sgr(raw), "[installer] 正在寫入映像到 /dev/vda...");
+    }
+
+    #[test]
+    fn strips_warn_err_and_ok_colors_too() {
+        assert_eq!(strip_ansi_sgr("\u{1b}[1;33m[installer]\u{1b}[0m warn text"), "[installer] warn text");
+        assert_eq!(strip_ansi_sgr("\u{1b}[1;31m[installer] 錯誤:\u{1b}[0m err text"), "[installer] 錯誤: err text");
+        assert_eq!(strip_ansi_sgr("\u{1b}[1;32m[installer]\u{1b}[0m ok text"), "[installer] ok text");
+    }
+
+    #[test]
+    fn a_line_with_no_escape_codes_is_unchanged() {
+        assert_eq!(strip_ansi_sgr("DUDUCLAW_PROGRESS:42"), "DUDUCLAW_PROGRESS:42");
+        assert_eq!(strip_ansi_sgr("plain log line, no color at all"), "plain log line, no color at all");
+    }
+
+    #[test]
+    fn strips_a_bare_reset_with_no_digits() {
+        assert_eq!(strip_ansi_sgr("\u{1b}[mreset"), "reset");
+    }
+
+    #[test]
+    fn an_unterminated_escape_at_end_of_line_is_preserved_not_swallowed() {
+        // Truncated mid-sequence (e.g. a line split across a read boundary)
+        // — must not eat real content on the theory that it "looks like" an
+        // escape. See `strip_ansi_sgr`'s own doc comment.
+        let raw = "before\u{1b}[1;36";
+        assert_eq!(strip_ansi_sgr(raw), raw);
+    }
+
+    #[test]
+    fn a_csi_sequence_not_ending_in_m_is_preserved_not_swallowed() {
+        // e.g. cursor-position `\x1b[2K` (erase line) — a real CSI sequence,
+        // but not an SGR color code, so this fn has no business dropping it.
+        let raw = "\u{1b}[2Ktext";
+        assert_eq!(strip_ansi_sgr(raw), raw);
+    }
+
+    #[test]
+    fn a_lone_escape_not_followed_by_bracket_is_preserved() {
+        let raw = "a\u{1b}b";
+        assert_eq!(strip_ansi_sgr(raw), raw);
+    }
+
+    #[test]
+    fn pump_lines_strips_color_before_classifying_a_progress_sample() {
+        // Defensive: even though the shell script's own DUDUCLAW_PROGRESS
+        // emitter never wraps its line in color today, stripping happens
+        // BEFORE `parse_progress_line` runs, so a future change to the
+        // emitter that added color could not silently break parsing.
+        assert_eq!(parse_progress_line(&strip_ansi_sgr("\u{1b}[1;36mDUDUCLAW_PROGRESS:42\u{1b}[0m")), Some(42));
     }
 }
