@@ -93,6 +93,14 @@ const ALL_KEYS: &[Key] = &[
     Key::AccountPasswordTooShortError,
     Key::AccountAlreadyClaimedInfo,
     Key::AccountUnreachableError,
+    Key::LiveWifiTitle,
+    Key::LiveWifiSubtitle,
+    Key::LiveWifiSsidLabel,
+    Key::LiveWifiPskLabel,
+    Key::LiveWifiOptionalHint,
+    Key::LiveWifiErrSsidMissing,
+    Key::LiveWifiErrSsidTooLong,
+    Key::LiveWifiErrPskLength,
     Key::RuntimeAuthTitle,
     Key::RuntimeAuthSubtitle,
     Key::RuntimeAuthAuthorized,
@@ -229,11 +237,13 @@ fn all_keys_has_the_expected_count_and_no_duplicates() {
     // `ALL_KEYS` silently drifting out of sync with a newly added `Key`
     // variant (the compiler won't catch THAT half; only the per-locale
     // match arms are compiler-enforced).
-    // 194 as of D6 (2026-08-23), which added the eleven
+    // 202 as of installer-settings-integration WP3 (2026-08-29), which added
+    // the eight `LiveWifi*` keys for the live installer's own `Network`
+    // step; 194 as of D6 (2026-08-23), which added the eleven
     // `org.freedesktop.Notifications` panel keys (`NotifAppSectionLabel` …
     // `NotifAgeDays`); 183 before that, from D4a §6's
     // `NetworkPortalOpenButton`.
-    assert_eq!(ALL_KEYS.len(), 194);
+    assert_eq!(ALL_KEYS.len(), 202);
     let mut seen = std::collections::HashSet::new();
     for key in ALL_KEYS {
         assert!(seen.insert(key), "duplicate key in ALL_KEYS: {key:?}");

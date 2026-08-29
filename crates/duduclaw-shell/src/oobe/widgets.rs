@@ -549,6 +549,58 @@ impl NetworkFields {
     }
 }
 
+/// The LIVE INSTALLER's own Wi-Fi step (installer-settings-integration WP3,
+/// 2026-08-29, `commercial/docs/DESIGN-installer-settings-integration-2026-08.md`
+/// §5 plan (b)) — two real text-input entities bundled the same "one bundle
+/// per step, `main.rs` only needs one field on `ShellView`" shape
+/// `AccountFields`/`NetworkFields` establish above.
+///
+/// NOT a reuse of `NetworkFields` just above — that bundle backs OOBE's own
+/// `Network` step, which SCANS for nearby networks and only ever needs a
+/// typed PASSWORD once a row from that scan is clicked (the SSID itself is
+/// never typed, it's picked). This flow does no scanning at all (`steps::
+/// network`'s own header comment explains why — design doc §5 plan (b)
+/// deliberately avoids rebuilding the live image's `iwd`/D-Bus stack), so
+/// the SSID has to be a THIRD kind of typed field this crate didn't have
+/// before: unmasked like `AccountFields.name`, but — unlike that field —
+/// legitimately non-ASCII.
+pub(crate) struct LiveWifiFields {
+    pub(crate) ssid: Entity<OobeTextField>,
+    pub(crate) psk: Entity<OobeTextField>,
+}
+
+impl LiveWifiFields {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        Self {
+            // `ascii_only: false` — the ONE deliberate difference from
+            // `AccountFields.name`, which is also unmasked and also a short
+            // identifier field but sets `ascii_only: true` because a Linux
+            // account name is restricted to ASCII by this project's own
+            // account-creation rule. A Wi-Fi SSID has no such restriction —
+            // it is an arbitrary, operator-chosen (or router-factory-set)
+            // network name, and CJK SSIDs are common in the wild (see
+            // `oobe::fake_data::FAKE_WIFI_NETWORKS`'s own "iPhone 的個人熱點"
+            // entry for an in-repo example of exactly that). Setting this
+            // `true` would mean the field proactively switches fcitx5 OUT of
+            // `chewing` on every focus (W7-3's `ime_focus` behavior,
+            // `OobeTextField::ascii_only`'s own doc comment) — exactly wrong
+            // for a field whose real-world content is disproportionately
+            // NOT ASCII, and the one case this crate's IME-focus discipline
+            // must not blanket-apply to every short text field on sight.
+            // Placeholder: a neutral English example SSID, same literal
+            // `fake_data::FAKE_WIFI_NETWORKS[0].ssid` uses for OOBE's own
+            // demo scan list — reused as a plain string here (not routed
+            // through that table) since this field has no scan list to stay
+            // consistent with, just a shape hint for an empty box.
+            ssid: OobeTextField::new(cx, "DuDu-Office", false, false, FieldChrome::Boxed),
+            // A WPA2 passphrase is 8-63 printable-ASCII characters by
+            // definition (same rule `NetworkFields.psk`/`SettingsFields.
+            // wifi_psk` already encode) — masked, `ascii_only: true`.
+            psk: OobeTextField::new(cx, super::fake_data::FAKE_ACCOUNT_PASSWORD_MASK, true, true, FieldChrome::Boxed),
+        }
+    }
+}
+
 /// The lockscreen surface's password entry field (WP-lock-pw, 2026-08-22) —
 /// same "bundle the one-per-surface `Entity<OobeTextField>` so `main.rs`
 /// only needs one field on `ShellView`" shape `AccountFields`/`NetworkFields`

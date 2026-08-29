@@ -48,7 +48,9 @@
 // ── Installer-settings-integration WP1 (2026-08-29): 4 steps -> 6 ─────────
 // `commercial/docs/DESIGN-installer-settings-integration-2026-08.md` §3.1 —
 // two new steps, `Account` and `Theme`, are inserted right after `Language`
-// (`steps::account`/`steps::theme`, new this round). Both reuse `oobe`'s own
+// (`steps::account`/`steps::theme`, new this round; STALE as of WP3 below —
+// `Network` now sits between `Language` and `Account`, kept here as the
+// honest historical record of what WP1 itself did). Both reuse `oobe`'s own
 // pure types/widgets (`oobe::widgets::AccountFields`, `oobe::ThemeChoice`)
 // exactly the way `steps::language` already reuses `oobe::LanguageChoice` —
 // a thin, separately-wired UI layer over shared plain data, per this file's
@@ -59,6 +61,26 @@
 // they collect. `steps::render`'s dispatcher signature grew a `fields`
 // parameter for this (`Account` is the only consumer; every other step
 // ignores it) — see `steps/mod.rs`'s own header comment.
+//
+// ── Installer-settings-integration WP3 (2026-08-29): 6 steps -> 7 ─────────
+// §5 plan (b) — one more new step, `Network`, inserted between `Language`
+// and `Account` (`steps::network`, new this round; see that module's own
+// header comment for the full "collect, don't connect" reasoning). Same
+// shape WP1 already established for `Account`/`Theme`: a thin UI layer over
+// plain `LiveInstallState` fields, no I/O of any kind, serialized by a LATER
+// round of `install_runner` into a third scratch file. Unlike `Account`,
+// `Network` is genuinely OPTIONAL (see `LiveInstallStep::Network`'s own doc
+// comment in `state.rs`), so its own `steps::render` dispatch and click
+// handling had to answer a different question than `Account`'s did — not
+// "how do I gate Continue on this step's own state" (that's still `Account`
+// alone) but "how do I let an empty submission through while still catching
+// a PARTIALLY-filled one" (`NetworkError`'s own doc comment). `steps::
+// render`'s `fields` parameter is unchanged in TYPE (`&AccountFields`, only
+// `Account` reads it) — `Network` needs its own field bundle, `LiveWifiFields`
+// (`oobe::widgets`), threaded through as a SECOND dispatcher parameter rather
+// than folded into the existing one, since the two bundles have unrelated
+// shapes (one name+password pair vs. one ssid+psk pair) and unrelated
+// step ownership.
 
 mod install_runner;
 mod render;
@@ -66,7 +88,7 @@ mod state;
 mod steps;
 
 pub(crate) use render::render;
-pub(crate) use state::{AccountError, DiskInfo, DiskScanState, InstallState, LiveInstallFlow, LiveInstallStep};
+pub(crate) use state::{AccountError, DiskInfo, DiskScanState, InstallState, LiveInstallFlow, LiveInstallStep, NetworkError};
 
 #[cfg(test)]
 mod tests {

@@ -41,7 +41,11 @@
 // the live installer grows from 4 steps to 6, inserting `Account` and
 // `Theme` right after `Language` (the two OOBE steps this design's phase 1
 // pulls forward into the install-time flow; `Network` is phase 2, explicitly
-// out of scope here — see the design doc's own §5). Both new steps are PURE
+// out of scope here — see the design doc's own §5). STALE as of WP3 below:
+// `Network` now sits between `Language` and `Account` (design doc §3's own
+// step-ordering diagram), so `Account` no longer directly follows
+// `Language` — kept here as the honest historical record of what WP1 itself
+// did, not corrected in place. Both new steps are PURE
 // DATA COLLECTION: no gateway call happens at click time (see `Account`'s
 // own doc comment below for why — it mirrors §4's "pending file + gateway
 // first-boot claim" decision, not OOBE's own live `oobe::claim::
@@ -53,11 +57,34 @@
 // round's read surface — the exact signatures the design doc's own §3.1
 // commits to as a fixed contract with the parallel `install_runner`/
 // `render.rs` work.
+//
+// ── Installer-settings-integration WP3 (2026-08-29): Network (Wi-Fi) ──────
+// §5 plan (b) (the option the design doc recommends and the one implemented
+// here, over plan (a) — see `steps::network`'s own header comment for the
+// full "why not scan/connect live" writeup): a SEVENTH step, `Network`,
+// inserted between `Language` and `Account` (design doc §3's own ordering
+// diagram: "語言 → 網路(Wi-Fi) → 帳號 → 主題 → 選碟 → 確認 → 安裝"). Same
+// PURE DATA COLLECTION discipline `Account`/`Theme` already established
+// above: no `iwd`/D-Bus call of any kind happens from this crate at all (the
+// live image does not even carry that stack — plan (a) was rejected
+// specifically because rebuilding it into the live squashfs is unverified,
+// high-risk work), just two more typed values held on `LiveInstallState`
+// until `install_runner` serializes them into a THIRD scratch file the
+// target system's own first-boot `iwd` setup consumes. Unlike `Account`,
+// this step is OPTIONAL — an operator with no Wi-Fi to configure yet (wired
+// network, or "I'll connect later from Settings") must be able to skip it
+// with nothing typed at all, so `can_advance` for `Network` is
+// unconditionally `true` (see that method's own updated doc comment below)
+// and validation happens entirely inside `render.rs`'s click-time submit,
+// same shape `Account`'s own `validate_and_set_account` already uses, just
+// gating the OPPOSITE direction (empty is fine; PARTIALLY filled is the
+// error case) — see `NetworkError`'s own doc comment for the three ways a
+// non-empty submission can still be rejected.
 use crate::oobe::{LanguageChoice, ThemeChoice};
 
-/// The six live-install wizard steps, in fixed linear order — no branching,
-/// same "step order is data, not a runtime decision" discipline `oobe::
-/// state::OobeStep` follows.
+/// The seven live-install wizard steps, in fixed linear order — no
+/// branching, same "step order is data, not a runtime decision" discipline
+/// `oobe::state::OobeStep` follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveInstallStep {
     /// Same three-`LanguageChoice` picker `oobe::steps::language` offers,
@@ -65,6 +92,12 @@ pub(crate) enum LiveInstallStep {
     /// `steps::language`'s own header comment for why the two can't share a
     /// click handler even though the visual row is the same shape.
     Language,
+    /// Installer-settings-integration WP3: an OPTIONAL SSID + passphrase
+    /// pure-form step — see this file's own header comment ("WP3") for why
+    /// it sits right after `Language` (design doc §3's ordering) and why it
+    /// collects rather than connects. See `steps::network`'s own header
+    /// comment for the full write-up.
+    Network,
     /// Installer-settings-integration WP1: collects the operator's display
     /// name + password INTO `LiveInstallState` only — no gateway round trip
     /// at click time (unlike OOBE's own `AccountCreate`, which calls
@@ -104,8 +137,9 @@ pub(crate) enum LiveInstallStep {
 }
 
 impl LiveInstallStep {
-    pub(crate) const ALL: [LiveInstallStep; 6] = [
+    pub(crate) const ALL: [LiveInstallStep; 7] = [
         LiveInstallStep::Language,
+        LiveInstallStep::Network,
         LiveInstallStep::Account,
         LiveInstallStep::Theme,
         LiveInstallStep::DiskSelect,
@@ -128,6 +162,34 @@ impl LiveInstallStep {
     pub(crate) fn prev(self) -> Option<Self> {
         self.index().checked_sub(1).and_then(Self::from_index)
     }
+}
+
+/// The three ways `Network`'s click-time validation (`render.rs`'s
+/// `validate_and_set_wifi`) can refuse to advance — unlike `AccountError`
+/// below, EMPTY is not one of them (an operator who types nothing at all is
+/// skipping Wi-Fi, a legal outcome — see `LiveInstallStep::Network`'s own
+/// doc comment). All three only fire once the operator has typed SOMETHING:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkError {
+    /// A passphrase was typed but the SSID field was left empty — an iwd
+    /// connection profile needs a network name to attach the passphrase to,
+    /// so this combination can never be turned into a valid
+    /// `pending-network.json` (see `install_runner::build_pending_network_json`'s
+    /// own doc comment).
+    SsidMissingWithPsk,
+    /// The typed SSID exceeds the 802.11 SSID limit — 32 **bytes**, not
+    /// characters (`ssid.len()`, not `.chars().count()`; see
+    /// `render.rs`'s own `validate_and_set_wifi` for why this one field uses
+    /// the byte count while the passphrase check just below uses a char
+    /// count).
+    SsidTooLong,
+    /// The typed passphrase is non-empty but outside the WPA-PSK 8..=63
+    /// **character** range `duduclaw-gateway::network::validate_psk`
+    /// enforces on the target system's own `iwd` connect path
+    /// (`network/mod.rs`, `network/iwd.rs`) — mirrored here as the exact
+    /// same client-side pre-check `AccountError::PasswordTooShort` already
+    /// mirrors `handle_first_run_claim`'s own floor.
+    PskLengthInvalid,
 }
 
 /// The two ways `Account`'s click-time validation (`render.rs`'s
@@ -220,6 +282,23 @@ struct LiveInstallState {
     current_step: LiveInstallStep,
     completed: bool,
     language: LanguageChoice,
+    /// WP3: the `Network` step's typed SSID — `None` while empty/never
+    /// visited, same "nothing pre-fills this" honesty `operator_name` below
+    /// establishes. `Some(ssid) + psk == None` is a deliberately LEGAL
+    /// combination — an open (unsecured) network — not a half-filled error
+    /// state; see `set_wifi`'s own doc comment.
+    wifi_ssid: Option<String>,
+    /// WP3: the `Network` step's typed passphrase. `None` covers BOTH "no
+    /// Wi-Fi typed at all" and "an open network was typed" — the two are
+    /// disambiguated by `wifi_ssid` being `None` or `Some` respectively, same
+    /// as `install_runner::build_pending_network_json`'s own `Option<&str>`
+    /// parameter.
+    wifi_psk: Option<String>,
+    /// WP3: set by `render.rs`'s click-time validation on a rejected
+    /// `Network` submit, cleared by a subsequent `set_wifi`/`clear_wifi`
+    /// call — same one-nullable-value shape `account_error` below uses for
+    /// `AccountError`.
+    network_error: Option<NetworkError>,
     /// WP1: the `Account` step's typed name — `None` until a validated
     /// `set_account` call. See `LiveInstallStep::Account`'s own doc comment
     /// for why this never reaches a gateway from THIS struct directly.
@@ -250,6 +329,9 @@ impl Default for LiveInstallState {
             current_step: LiveInstallStep::Language,
             completed: false,
             language: LanguageChoice::default(),
+            wifi_ssid: None,
+            wifi_psk: None,
+            network_error: None,
             operator_name: None,
             account_password: None,
             account_error: None,
@@ -309,6 +391,51 @@ impl LiveInstallFlow {
     /// render call reflects it, without itself advancing the step.
     pub(crate) fn set_language(&mut self, language: LanguageChoice) {
         self.state.language = language;
+    }
+
+    // ── Network (installer-settings-integration WP3) ───────────────────
+
+    pub(crate) fn wifi_ssid(&self) -> Option<&str> {
+        self.state.wifi_ssid.as_deref()
+    }
+
+    pub(crate) fn wifi_psk(&self) -> Option<&str> {
+        self.state.wifi_psk.as_deref()
+    }
+
+    pub(crate) fn network_error(&self) -> Option<NetworkError> {
+        self.state.network_error
+    }
+
+    /// Records a validated `Network` submission — called from `render.rs`'s
+    /// `validate_and_set_wifi` ONLY after every `NetworkError` case has
+    /// already been ruled out (see that fn's own doc comment). `psk: None`
+    /// is the honest "open network" outcome (an operator can legitimately
+    /// type an SSID and leave the passphrase blank); it is NOT how "nothing
+    /// was typed at all" is represented — that path goes through
+    /// `clear_wifi` instead, never this fn. Clears any previously-set
+    /// `network_error`, same "success clears the prior failure" contract
+    /// `set_account` establishes for `account_error` below.
+    pub(crate) fn set_wifi(&mut self, ssid: String, psk: Option<String>) {
+        self.state.wifi_ssid = Some(ssid);
+        self.state.wifi_psk = psk;
+        self.state.network_error = None;
+    }
+
+    /// The "operator is skipping Wi-Fi" outcome — both typed fields go back
+    /// to `None` (whether they were already empty, or the operator typed
+    /// something and then cleared it before advancing) and any stale error
+    /// is cleared too, so a later re-visit of `Network` (via `back()`) never
+    /// shows a validation complaint left over from a submission that was
+    /// ultimately abandoned in favor of skipping.
+    pub(crate) fn clear_wifi(&mut self) {
+        self.state.wifi_ssid = None;
+        self.state.wifi_psk = None;
+        self.state.network_error = None;
+    }
+
+    pub(crate) fn set_network_error(&mut self, err: NetworkError) {
+        self.state.network_error = Some(err);
     }
 
     // ── Account (installer-settings-integration WP1) ───────────────────
@@ -454,11 +581,23 @@ impl LiveInstallFlow {
     /// this file's header comment). `Language` still has none of its own;
     /// `Theme` (WP1) has none either — it has a default (`Light`), same
     /// reasoning `oobe::state::OobeFlow::can_advance` gives `Theme` there.
-    /// The other four read exactly the state their own step's render
-    /// module is responsible for populating.
+    /// WP3's `Network` is ALSO unconditionally `true` — but for a different
+    /// reason than `Theme`: it is genuinely OPTIONAL (see
+    /// `LiveInstallStep::Network`'s own doc comment), not merely defaulted,
+    /// so an empty step must be allowed through exactly as freely as a
+    /// filled one. This is defense in depth only — `render.rs`'s
+    /// `continue_disabled` never actually reads this arm either (same
+    /// "click-time validation, not a live-content-driven disabled state"
+    /// shape `Account`'s own arm already established, see that file's own
+    /// header comment) — real rejection happens inside
+    /// `validate_and_set_wifi`, which calls `LiveInstallFlow::next()`
+    /// only once it has already decided the submission is valid. The other
+    /// four read exactly the state their own step's render module is
+    /// responsible for populating.
     pub(crate) fn can_advance(&self) -> bool {
         match self.state.current_step {
             LiveInstallStep::Language => true,
+            LiveInstallStep::Network => true,
             LiveInstallStep::Account => self.state.operator_name.is_some() && self.state.account_password.is_some(),
             LiveInstallStep::Theme => true,
             LiveInstallStep::DiskSelect => self.state.selected_disk.is_some(),
@@ -525,14 +664,15 @@ mod tests {
     // ── step ordering / indices ──────────────────────────────────────
 
     #[test]
-    fn all_has_six_steps_in_declared_order() {
-        assert_eq!(LiveInstallStep::ALL.len(), 6);
+    fn all_has_seven_steps_in_declared_order() {
+        assert_eq!(LiveInstallStep::ALL.len(), 7);
         assert_eq!(LiveInstallStep::ALL[0], LiveInstallStep::Language);
-        assert_eq!(LiveInstallStep::ALL[1], LiveInstallStep::Account);
-        assert_eq!(LiveInstallStep::ALL[2], LiveInstallStep::Theme);
-        assert_eq!(LiveInstallStep::ALL[3], LiveInstallStep::DiskSelect);
-        assert_eq!(LiveInstallStep::ALL[4], LiveInstallStep::Confirm);
-        assert_eq!(LiveInstallStep::ALL[5], LiveInstallStep::Progress);
+        assert_eq!(LiveInstallStep::ALL[1], LiveInstallStep::Network);
+        assert_eq!(LiveInstallStep::ALL[2], LiveInstallStep::Account);
+        assert_eq!(LiveInstallStep::ALL[3], LiveInstallStep::Theme);
+        assert_eq!(LiveInstallStep::ALL[4], LiveInstallStep::DiskSelect);
+        assert_eq!(LiveInstallStep::ALL[5], LiveInstallStep::Confirm);
+        assert_eq!(LiveInstallStep::ALL[6], LiveInstallStep::Progress);
     }
 
     #[test]
@@ -543,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn next_walks_forward_through_all_six_steps_in_declared_order() {
+    fn next_walks_forward_through_all_seven_steps_in_declared_order() {
         let mut step = LiveInstallStep::Language;
         let mut seen = vec![step];
         while let Some(n) = step.next() {
@@ -563,22 +703,32 @@ mod tests {
         assert_eq!(LiveInstallStep::Language.prev(), None);
     }
 
-    /// WP1 moved `DiskSelect` from index 1 to index 3 — its `prev()` is now
-    /// `Theme`, not `Language`. This replaces the P3-era
-    /// `disk_select_prev_is_language` test, which pinned the STALE order.
+    /// WP1 moved `DiskSelect` from index 1 to index 3; WP3 shifts it again
+    /// (index 3 -> index 4) by inserting `Network` ahead of `Account` — its
+    /// `prev()` is still `Theme`, unaffected by where THIS test's own step
+    /// sits relative to `Network`.
     #[test]
     fn disk_select_prev_is_theme() {
         assert_eq!(LiveInstallStep::DiskSelect.prev(), Some(LiveInstallStep::Theme));
     }
 
+    /// WP3 replaces the P3/WP1-era `account_prev_is_language` — `Network`
+    /// now sits between the two, so `Account`'s `prev()` changes from
+    /// `Language` to `Network`.
     #[test]
-    fn account_prev_is_language() {
-        assert_eq!(LiveInstallStep::Account.prev(), Some(LiveInstallStep::Language));
+    fn account_prev_is_network() {
+        assert_eq!(LiveInstallStep::Account.prev(), Some(LiveInstallStep::Network));
     }
 
     #[test]
     fn theme_prev_is_account() {
         assert_eq!(LiveInstallStep::Theme.prev(), Some(LiveInstallStep::Account));
+    }
+
+    /// WP3's own insert: `Network` sits directly after `Language`.
+    #[test]
+    fn network_prev_is_language() {
+        assert_eq!(LiveInstallStep::Network.prev(), Some(LiveInstallStep::Language));
     }
 
     // ── LiveInstallFlow: next / back / complete ────────────────────────
@@ -590,14 +740,19 @@ mod tests {
         assert!(!flow.completed());
     }
 
-    /// Y20-P3 (extended WP1): `next()` genuinely gates on each step's own
-    /// precondition. This walks the full happy path, satisfying each gate in
-    /// turn — exactly what an operator's real clicks would supply — now
-    /// through all six steps including the two WP1 inserts.
+    /// Y20-P3 (extended WP1, extended WP3): `next()` genuinely gates on each
+    /// step's own precondition. This walks the full happy path, satisfying
+    /// each gate in turn — exactly what an operator's real clicks would
+    /// supply — now through all seven steps. `Network` never refuses (see
+    /// `can_advance`'s own doc comment) — this walk-through passes through
+    /// it with nothing typed at all, the "skip Wi-Fi" outcome.
     #[test]
-    fn next_advances_through_all_six_steps_once_each_gate_is_satisfied() {
+    fn next_advances_through_all_seven_steps_once_each_gate_is_satisfied() {
         let mut flow = LiveInstallFlow::new();
-        assert!(flow.next(), "Language -> Account has no precondition");
+        assert!(flow.next(), "Language -> Network has no precondition");
+        assert_eq!(flow.current(), LiveInstallStep::Network);
+
+        assert!(flow.next(), "Network is optional, so it never blocks advancing even with nothing typed");
         assert_eq!(flow.current(), LiveInstallStep::Account);
 
         assert!(!flow.next(), "Account must refuse to advance with no name/password set");
@@ -639,14 +794,15 @@ mod tests {
         assert_eq!(flow.current(), LiveInstallStep::Language);
     }
 
-    /// WP1 extends P3's rewrite — walking all the way back now needs all
-    /// five forward gates satisfied first (Account/Theme included), and
-    /// walking back all the way to `Language` takes five `back()` calls
-    /// instead of three.
+    /// WP1 extends P3's rewrite; WP3 extends it again — walking all the way
+    /// back now needs all six forward gates satisfied first (`Network`
+    /// included, though it needs nothing typed), and walking back all the
+    /// way to `Language` takes six `back()` calls instead of five.
     #[test]
     fn back_walks_all_the_way_from_progress_to_language_once_forward_gates_are_satisfied() {
         let mut flow = LiveInstallFlow::new();
-        flow.next(); // Language -> Account
+        flow.next(); // Language -> Network
+        flow.next(); // Network -> Account
         flow.set_account("operator".to_string(), "hunter2-pw".to_string());
         flow.next(); // Account -> Theme
         flow.next(); // Theme -> DiskSelect
@@ -668,6 +824,8 @@ mod tests {
         assert!(flow.back());
         assert_eq!(flow.current(), LiveInstallStep::Account);
         assert!(flow.back());
+        assert_eq!(flow.current(), LiveInstallStep::Network);
+        assert!(flow.back());
         assert_eq!(flow.current(), LiveInstallStep::Language);
         assert!(!flow.back());
     }
@@ -675,7 +833,8 @@ mod tests {
     #[test]
     fn next_on_progress_completes_the_flow() {
         let mut flow = LiveInstallFlow::new();
-        flow.next();
+        flow.next(); // Language -> Network
+        flow.next(); // Network -> Account
         flow.set_account("operator".to_string(), "hunter2-pw".to_string());
         flow.next();
         flow.next(); // Theme -> DiskSelect
@@ -694,7 +853,8 @@ mod tests {
     #[test]
     fn next_is_a_noop_once_completed() {
         let mut flow = LiveInstallFlow::new();
-        flow.next();
+        flow.next(); // Language -> Network
+        flow.next(); // Network -> Account
         flow.set_account("operator".to_string(), "hunter2-pw".to_string());
         flow.next();
         flow.next(); // Theme -> DiskSelect
@@ -708,13 +868,17 @@ mod tests {
         assert!(!flow.next());
     }
 
-    /// WP1 replaces P3's `can_advance_reflects_each_steps_own_precondition`
-    /// — now walks all six steps, including the two new gates (`Account`
-    /// starts blocked, `Theme` never blocks).
+    /// WP1 replaces P3's `can_advance_reflects_each_steps_own_precondition`;
+    /// WP3 extends it again — now walks all seven steps, including
+    /// `Network`, which (like `Theme`) never blocks, but for the different
+    /// "genuinely optional" reason `can_advance`'s own doc comment explains.
     #[test]
     fn can_advance_reflects_each_steps_own_precondition() {
         let mut flow = LiveInstallFlow::new();
         assert!(flow.can_advance(), "Language has no precondition");
+        flow.next();
+
+        assert!(flow.can_advance(), "Network is optional, so it is never blocked even with nothing typed");
         flow.next();
 
         assert!(!flow.can_advance(), "Account starts with no name/password set");
@@ -764,6 +928,79 @@ mod tests {
         assert_eq!(flow.locale(), crate::i18n::Locale::JaJp);
     }
 
+    // ── Network (installer-settings-integration WP3) ───────────────────
+
+    #[test]
+    fn wifi_fields_start_empty() {
+        let flow = LiveInstallFlow::new();
+        assert_eq!(flow.wifi_ssid(), None);
+        assert_eq!(flow.wifi_psk(), None);
+        assert_eq!(flow.network_error(), None);
+    }
+
+    #[test]
+    fn set_wifi_records_ssid_and_psk_without_advancing() {
+        let mut flow = LiveInstallFlow::new();
+        flow.next(); // -> Network
+        flow.set_wifi("DuDu-Office".to_string(), Some("hunter2-pw".to_string()));
+        assert_eq!(flow.wifi_ssid(), Some("DuDu-Office"));
+        assert_eq!(flow.wifi_psk(), Some("hunter2-pw"));
+        assert_eq!(flow.current(), LiveInstallStep::Network, "recording Wi-Fi must not itself advance");
+    }
+
+    /// `Some(ssid) + None` is the legal "open network" combination — see
+    /// `set_wifi`'s own doc comment. Distinct from `wifi_fields_start_empty`
+    /// above, where BOTH are `None`.
+    #[test]
+    fn set_wifi_with_no_psk_records_an_open_network() {
+        let mut flow = LiveInstallFlow::new();
+        flow.next(); // -> Network
+        flow.set_wifi("DuDu-Guest".to_string(), None);
+        assert_eq!(flow.wifi_ssid(), Some("DuDu-Guest"));
+        assert_eq!(flow.wifi_psk(), None);
+    }
+
+    #[test]
+    fn set_wifi_clears_a_prior_error() {
+        let mut flow = LiveInstallFlow::new();
+        flow.next(); // -> Network
+        flow.set_network_error(NetworkError::SsidTooLong);
+        assert_eq!(flow.network_error(), Some(NetworkError::SsidTooLong));
+        flow.set_wifi("DuDu-Office".to_string(), Some("hunter2-pw".to_string()));
+        assert_eq!(flow.network_error(), None, "a validated submit must clear whatever the prior attempt complained about");
+    }
+
+    #[test]
+    fn set_network_error_records_without_advancing() {
+        let mut flow = LiveInstallFlow::new();
+        flow.next(); // -> Network
+        flow.set_network_error(NetworkError::PskLengthInvalid);
+        assert_eq!(flow.network_error(), Some(NetworkError::PskLengthInvalid));
+        assert_eq!(flow.current(), LiveInstallStep::Network);
+    }
+
+    /// `clear_wifi` is the "skip Wi-Fi" outcome — both fields go back to
+    /// `None`, whether or not anything had been typed, and any stale error
+    /// from an abandoned submission is dropped too.
+    #[test]
+    fn clear_wifi_resets_both_fields_and_any_error() {
+        let mut flow = LiveInstallFlow::new();
+        flow.next(); // -> Network
+        flow.set_wifi("DuDu-Office".to_string(), Some("hunter2-pw".to_string()));
+        flow.set_network_error(NetworkError::SsidTooLong);
+        flow.clear_wifi();
+        assert_eq!(flow.wifi_ssid(), None);
+        assert_eq!(flow.wifi_psk(), None);
+        assert_eq!(flow.network_error(), None);
+    }
+
+    #[test]
+    fn network_can_advance_even_with_nothing_typed() {
+        let mut flow = LiveInstallFlow::new();
+        flow.next(); // -> Network
+        assert!(flow.can_advance(), "Network is optional — an empty step must not block advancing");
+    }
+
     // ── Account (installer-settings-integration WP1) ───────────────────
 
     #[test]
@@ -777,7 +1014,8 @@ mod tests {
     #[test]
     fn set_account_records_both_fields_without_advancing() {
         let mut flow = LiveInstallFlow::new();
-        flow.next(); // -> Account
+        flow.next(); // Language -> Network
+        flow.next(); // Network -> Account
         flow.set_account("operator".to_string(), "hunter2-pw".to_string());
         assert_eq!(flow.operator_name(), Some("operator"));
         assert_eq!(flow.account_password(), Some("hunter2-pw"));
@@ -787,7 +1025,8 @@ mod tests {
     #[test]
     fn set_account_clears_a_prior_error() {
         let mut flow = LiveInstallFlow::new();
-        flow.next(); // -> Account
+        flow.next(); // Language -> Network
+        flow.next(); // Network -> Account
         flow.set_account_error(AccountError::EmptyFields);
         assert_eq!(flow.account_error(), Some(AccountError::EmptyFields));
         flow.set_account("operator".to_string(), "hunter2-pw".to_string());
@@ -797,7 +1036,8 @@ mod tests {
     #[test]
     fn set_account_error_records_without_advancing() {
         let mut flow = LiveInstallFlow::new();
-        flow.next(); // -> Account
+        flow.next(); // Language -> Network
+        flow.next(); // Network -> Account
         flow.set_account_error(AccountError::PasswordTooShort);
         assert_eq!(flow.account_error(), Some(AccountError::PasswordTooShort));
         assert_eq!(flow.current(), LiveInstallStep::Account);

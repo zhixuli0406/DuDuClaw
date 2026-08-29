@@ -67,18 +67,38 @@
 // case where `can_back`'s sibling, the disabled/enabled state, does NOT
 // come from `LiveInstallFlow::can_advance()` directly — see `button_row`'s
 // own `continue_disabled` for why.
+//
+// ── Installer-settings-integration WP3 (2026-08-29): Network (Wi-Fi) ──────
+// `render`'s own signature grows a `wifi_fields: &LiveWifiFields` parameter,
+// threaded straight through to `steps::render` (see that dispatcher's own
+// header comment — only `steps::network` reads it). `Network`'s Continue
+// click needs the SAME click-time-validation shape `Account`'s does (typed
+// content can only be read at click time, for the identical
+// not-subscribed-to-child-entity reason) — `validate_and_set_wifi` below,
+// called from the `Network` arm of `continue_click`'s match. The one real
+// difference from `Account`: `Network`'s button is NEVER disabled (joins
+// `Account` in `continue_disabled`'s exemption list below), and for a
+// DIFFERENT reason than `Account` is exempted — `Account` is exempted
+// because `can_advance()` would read as permanently blocked before any
+// click (nothing pre-fills it); `Network` is exempted because
+// `can_advance()` for that step is unconditionally `true` in the first
+// place (see `LiveInstallFlow::can_advance`'s own doc comment) — an EMPTY
+// submission is legal here, so there is no gate to reflect onto the button
+// even in principle. Both land in the same `matches!` arm below because the
+// end result — "never disabled, validate at click time" — is identical,
+// even though the reason differs.
 
 use gpui::{div, prelude::*, px, Context, Div, Stateful};
 
 use duduclaw_native_gui::theme;
 
 use super::steps;
-use super::{AccountError, LiveInstallFlow, LiveInstallStep};
+use super::{AccountError, LiveInstallFlow, LiveInstallStep, NetworkError};
 use crate::i18n::{t, Key};
-use crate::oobe::widgets::{self, AccountFields, StepButtonVariant};
+use crate::oobe::widgets::{self, AccountFields, LiveWifiFields, StepButtonVariant};
 use crate::ShellView;
 
-pub(crate) fn render(flow: &LiveInstallFlow, fields: &AccountFields, cx: &mut Context<ShellView>) -> Stateful<Div> {
+pub(crate) fn render(flow: &LiveInstallFlow, fields: &AccountFields, wifi_fields: &LiveWifiFields, cx: &mut Context<ShellView>) -> Stateful<Div> {
     let step = flow.current();
     let palette = flow.palette();
     // Same "publish the ambient `ShellPalette` global BEFORE any surface
@@ -105,7 +125,7 @@ pub(crate) fn render(flow: &LiveInstallFlow, fields: &AccountFields, cx: &mut Co
                 .justify_center()
                 .gap(px(28.))
                 .px(px(48.))
-                .child(div().w(px(640.)).flex().flex_col().gap(px(20.)).child(steps::render(step, flow, fields, cx))),
+                .child(div().w(px(640.)).flex().flex_col().gap(px(20.)).child(steps::render(step, flow, fields, wifi_fields, cx))),
         )
         .child(button_row(step, flow, cx))
 }
@@ -145,6 +165,7 @@ fn button_row(step: LiveInstallStep, flow: &LiveInstallFlow, cx: &mut Context<Sh
         LiveInstallStep::Confirm => super::install_runner::start_install(view, cx),
         LiveInstallStep::Progress => super::install_runner::start_reboot(view, cx),
         LiveInstallStep::Account => validate_and_set_account(view, cx),
+        LiveInstallStep::Network => validate_and_set_wifi(view, cx),
         LiveInstallStep::Language | LiveInstallStep::Theme | LiveInstallStep::DiskSelect => {
             if let Some(flow) = view.live_install.as_mut() {
                 flow.next();
@@ -163,23 +184,28 @@ fn button_row(step: LiveInstallStep, flow: &LiveInstallFlow, cx: &mut Context<Sh
     let continue_label: &'static str = match step {
         LiveInstallStep::Confirm => "開始安裝 · Start install",
         LiveInstallStep::Progress => "重新開機 · Reboot",
-        LiveInstallStep::Language | LiveInstallStep::Account | LiveInstallStep::Theme | LiveInstallStep::DiskSelect => {
+        LiveInstallStep::Language | LiveInstallStep::Network | LiveInstallStep::Account | LiveInstallStep::Theme | LiveInstallStep::DiskSelect => {
             t(locale, Key::NavContinue)
         }
     };
 
-    // WP1: `Account`'s Continue button is never disabled by `can_advance`
-    // directly. `LiveInstallFlow::can_advance()` for `Account` reads whether
-    // `set_account` has ALREADY run — which is never true before any click,
-    // since nothing pre-fills the two fields. If this button read that gate
-    // the same way every other step's does, it would render permanently
-    // disabled on first arrival, with no other affordance able to move the
-    // flow forward. Validation happens at CLICK time instead
-    // (`validate_and_set_account` below) — `LiveInstallFlow::next()`'s own
-    // internal `can_advance()` check stays as defense in depth (it still
-    // refuses to advance if `set_account` was somehow never reached), it
-    // just isn't ALSO what disables this button.
-    let continue_disabled = if step == LiveInstallStep::Account { false } else { !can_advance };
+    // WP1 (extended WP3): `Account`'s Continue button is never disabled by
+    // `can_advance` directly. `LiveInstallFlow::can_advance()` for `Account`
+    // reads whether `set_account` has ALREADY run — which is never true
+    // before any click, since nothing pre-fills the two fields. If this
+    // button read that gate the same way every other step's does, it would
+    // render permanently disabled on first arrival, with no other
+    // affordance able to move the flow forward. Validation happens at CLICK
+    // time instead (`validate_and_set_account` below) — `LiveInstallFlow::
+    // next()`'s own internal `can_advance()` check stays as defense in
+    // depth (it still refuses to advance if `set_account` was somehow never
+    // reached), it just isn't ALSO what disables this button. `Network`
+    // joins this exemption for the DIFFERENT reason this file's own header
+    // comment spells out (its `can_advance()` is unconditionally `true` in
+    // the first place — there is no gate to reflect even in principle), but
+    // lands in the same `matches!` arm since the button behavior is
+    // identical either way.
+    let continue_disabled = if matches!(step, LiveInstallStep::Account | LiveInstallStep::Network) { false } else { !can_advance };
 
     // Same three-column layout `oobe/render.rs`'s `NAV_COLUMN_WIDTH` uses —
     // fixed-width outer columns keep the progress dots centered on the
@@ -258,6 +284,73 @@ fn validate_and_set_account(view: &mut ShellView, cx: &mut Context<ShellView>) {
     cx.notify();
 }
 
+/// The `Network` step's click-time validation — installer-settings-
+/// integration WP3. Same "validate at click time, not via a
+/// live-content-driven `disabled` state" discipline `validate_and_set_account`
+/// above documents, and the same "no gateway round trip, single synchronous
+/// fn" shape — but the DIRECTION of the gate is inverted: an empty
+/// submission is the HAPPY path here (see this file's own header comment,
+/// "Network (Wi-Fi)"), so the very first branch below is "both fields
+/// blank -> skip", not an error.
+fn validate_and_set_wifi(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    let ssid = view.live_install_wifi_fields.ssid.read(cx).content(cx).trim().to_string();
+    let psk = view.live_install_wifi_fields.psk.read(cx).content(cx);
+
+    if ssid.is_empty() && psk.is_empty() {
+        // The "skip Wi-Fi" outcome — legal, not an error. `clear_wifi`
+        // (rather than a bare `flow.next()`) so a stale error from an
+        // earlier, abandoned submission on this same visit is dropped too.
+        if let Some(flow) = view.live_install.as_mut() {
+            flow.clear_wifi();
+            flow.next();
+        }
+        cx.notify();
+        return;
+    }
+
+    if ssid.is_empty() {
+        // A passphrase was typed with no network name to attach it to — see
+        // `NetworkError::SsidMissingWithPsk`'s own doc comment.
+        if let Some(flow) = view.live_install.as_mut() {
+            flow.set_network_error(NetworkError::SsidMissingWithPsk);
+        }
+        cx.notify();
+        return;
+    }
+
+    if ssid.len() > 32 {
+        // 802.11's own SSID limit is 32 BYTES, not characters — same
+        // `.len()` (not `.chars().count()`) `NetworkError::SsidTooLong`'s
+        // own doc comment specifies.
+        if let Some(flow) = view.live_install.as_mut() {
+            flow.set_network_error(NetworkError::SsidTooLong);
+        }
+        cx.notify();
+        return;
+    }
+
+    if !psk.is_empty() && !(8..=63).contains(&psk.chars().count()) {
+        // Mirrors `duduclaw-gateway::network::validate_psk`'s own 8..=63
+        // CHARACTER range (`network/mod.rs`), the exact rule the target
+        // system's own `iwd` connect path enforces — same client-side
+        // pre-check `validate_and_set_account`'s password-length branch
+        // above mirrors `handle_first_run_claim`'s floor. An EMPTY psk skips
+        // this check entirely — that is the legal "open network" case, not
+        // a too-short passphrase.
+        if let Some(flow) = view.live_install.as_mut() {
+            flow.set_network_error(NetworkError::PskLengthInvalid);
+        }
+        cx.notify();
+        return;
+    }
+
+    if let Some(flow) = view.live_install.as_mut() {
+        flow.set_wifi(ssid, if psk.is_empty() { None } else { Some(psk) });
+        flow.next();
+    }
+    cx.notify();
+}
+
 #[cfg(test)]
 mod tests {
     // Y20-P3: guards the Confirm/Progress step-specific wiring that a gpui
@@ -298,6 +391,22 @@ mod tests {
             "the Account step's bottom-nav Continue click must dispatch to validate_and_set_account \
              — a bare flow.next() here would advance past Account without ever validating or \
              recording the typed name/password"
+        );
+    }
+
+    /// Installer-settings-integration WP3: `Network`'s Continue click must
+    /// route to click-time validation, not a bare `flow.next()` — a bare
+    /// advance here would skip past the step without ever reading, or
+    /// recording, the typed SSID/passphrase, and without ever catching the
+    /// three inconsistent-submission cases `NetworkError` enumerates.
+    #[test]
+    fn network_step_routes_the_continue_click_to_click_time_validation() {
+        let source = include_str!("render.rs");
+        assert!(
+            source.contains("LiveInstallStep::Network => validate_and_set_wifi(view, cx)"),
+            "the Network step's bottom-nav Continue click must dispatch to validate_and_set_wifi \
+             — a bare flow.next() here would advance past Network without ever validating or \
+             recording the typed SSID/passphrase"
         );
     }
 }

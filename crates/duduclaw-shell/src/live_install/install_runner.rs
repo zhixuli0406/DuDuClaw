@@ -72,6 +72,27 @@ use crate::ShellView;
 // process exits (success OR failure) — a plaintext password has no
 // business surviving on live tmpfs past the one install run that needed it
 // (design doc §8 risk 1).
+//
+// ── Settings injection, Wi-Fi (installer-settings-integration WP3,
+// 2026-08-29, §3.2/§5/§9 plan (b)) ─────────────────────────────────────────
+// A THIRD env var joins the two above, same shell-side contract shape:
+//
+//   DUDUCLAW_INSTALL_PENDING_NETWORK_FILE -> copied onto /data as
+//                                             duduclaw/pending-network.json
+//
+// Built by `build_pending_network_json` below (same "let `serde_json::
+// json!` own the escaping" discipline as `build_pending_account_json`).
+// Whether this file gets written is gated on `wifi_ssid()` alone, NOT
+// folded into a three-way all-or-nothing outcome with the account pair —
+// the `Network` step is optional (unlike `Account`), so a Wi-Fi write
+// failure must never roll back the account files, and vice versa
+// — `write_pending_settings_files`'s own doc comment below has the exact
+// per-component semantics (including the one asymmetry: the account pair
+// still gates the whole call, since `Account` itself is required to reach
+// `Confirm` at all). Same 0600 + `std::env::temp_dir()` + pid-in-filename +
+// best-effort-delete-on-every-exit-path discipline as the other two scratch
+// files (a Wi-Fi passphrase is just as much a secret as an account
+// password).
 
 /// The installer's own executable name — installed at `${sbindir}/
 /// duduclaw-os-install` by `duduclaw-os-installer.bb`'s `do_install`, which
@@ -138,12 +159,30 @@ fn build_pending_account_json(password: &str) -> String {
     serde_json::json!({ "password": password }).to_string()
 }
 
-/// Absolute paths to the two scratch files `write_pending_settings_files`
+/// `pending-network.json`'s content — `ssid`/`psk` are the key names the
+/// target system's own first-boot `iwd` setup reads (a separate work
+/// package, same relationship this file's own header comment describes for
+/// `build_pending_account_json`'s `password` key). `psk: None` serializes to
+/// a JSON `null` (`Option<&str>`'s own `Serialize` impl, exercised through
+/// `serde_json::json!` exactly like `build_pending_account_json` above) —
+/// the honest "open network" shape, not an omitted key or an empty string,
+/// so the consumer can distinguish "no password" from "empty password
+/// typed" without a second field.
+fn build_pending_network_json(ssid: &str, psk: Option<&str>) -> String {
+    serde_json::json!({ "ssid": ssid, "psk": psk }).to_string()
+}
+
+/// Absolute paths to the scratch files `write_pending_settings_files`
 /// writes — see this file's own header comment for what each one carries
 /// and which env var hands its path to `duduclaw-os-install.sh`.
+/// `pending_network` is `Option` (unlike the other two): the `Network` step
+/// is optional, so there may be nothing to write at all — see
+/// `write_pending_settings_files`'s own doc comment for the exact
+/// per-component semantics.
 struct PendingSettingsFiles {
     oobe_state: PathBuf,
     pending_account: PathBuf,
+    pending_network: Option<PathBuf>,
 }
 
 /// Writes `content` to `path`, then (on Unix — this crate also builds for
@@ -166,24 +205,46 @@ fn write_scratch_file(path: &std::path::Path, content: &str) -> std::io::Result<
 /// Bridges what the live wizard collected (`LiveInstallFlow::{language,
 /// theme_choice, operator_name, account_password}` — the language accessor
 /// already existed, the other three are WP1's own accessors landing
-/// alongside this file) into the two scratch files
-/// `duduclaw-os-install.sh` copies onto the target disk (this file's own
-/// header comment has the full env-var contract). Both files land under
-/// `std::env::temp_dir()` — the live image's tmpfs, nothing here is meant
-/// to survive past this one install run — with this process's own pid in
-/// the filename so two concurrent installer runs (not reachable through
-/// this UI today, but cheap insurance) can never collide.
+/// alongside this file — PLUS WP3's own `wifi_ssid`/`wifi_psk`) into the
+/// scratch files `duduclaw-os-install.sh` copies onto the target disk (this
+/// file's own header comment has the full env-var contract). Every file
+/// lands under `std::env::temp_dir()` — the live image's tmpfs, nothing
+/// here is meant to survive past this one install run — with this
+/// process's own pid in the filename so two concurrent installer runs (not
+/// reachable through this UI today, but cheap insurance) can never collide.
 ///
-/// `None` on any write failure, AND on a partial failure (the first file
-/// wrote but the second didn't — cleans the first back up rather than
-/// leaving an orphaned oobe_state.json with no matching pending-account.json
-/// for the caller to find). `start_install` then sets NEITHER env var, the
-/// exact same degraded path as "the operator never filled in an account" —
-/// design doc §9's backward-compat invariant.
-fn write_pending_settings_files(language: LanguageChoice, theme: ThemeChoice, operator_name: &str, password: &str) -> Option<PendingSettingsFiles> {
+/// ── The account pair still gates the whole call; Wi-Fi is independent
+/// UNDERNEATH that gate, not a third leg of the same all-or-nothing outcome
+/// ──────────────────────────────────────────────────────────────────────
+/// `account: Option<(&str, &str)>` keeps its P2/WP1 behavior byte-identical:
+/// `None` short-circuits the whole fn to `None` (nothing reachable in
+/// practice — `Account`'s own `can_advance` gate should never let `Confirm`
+/// be reached without both halves set, same "理論上 UI 閘擋住到不了" defensive
+/// case `start_install`'s own disk-selection check documents), and a
+/// PARTIAL account failure (the first file wrote but the second didn't)
+/// cleans the first back up rather than leaving an orphaned oobe_state.json
+/// with no matching pending-account.json — `start_install` then sets
+/// NEITHER of those two env vars, design doc §9's backward-compat
+/// invariant. Once past that gate, `wifi` (`Option<(&str, Option<&str>)>`)
+/// is deliberately NOT folded into the SAME all-or-nothing outcome: WP3's
+/// `Network` step is optional (unlike `Account`), so a Wi-Fi write failure
+/// must never roll back the account files this fn has already committed —
+/// it only ever degrades `pending_network` to `None` (this fn still returns
+/// `Some(..)` for the account half), and `start_install` then simply
+/// doesn't set `DUDUCLAW_INSTALL_PENDING_NETWORK_FILE`, the exact same
+/// degraded path as "the operator typed no Wi-Fi at all".
+fn write_pending_settings_files(
+    language: LanguageChoice,
+    theme: ThemeChoice,
+    account: Option<(&str, &str)>,
+    wifi: Option<(&str, Option<&str>)>,
+) -> Option<PendingSettingsFiles> {
     let pid = std::process::id();
     let oobe_state_path = std::env::temp_dir().join(format!("duduclaw-install-oobe-state-{pid}.json"));
     let pending_account_path = std::env::temp_dir().join(format!("duduclaw-install-pending-account-{pid}.json"));
+    let pending_network_path = std::env::temp_dir().join(format!("duduclaw-install-pending-network-{pid}.json"));
+
+    let (operator_name, password) = account?;
 
     let oobe_state_json = build_oobe_state_json(language, theme, Some(operator_name));
     if let Err(e) = write_scratch_file(&oobe_state_path, &oobe_state_json) {
@@ -198,19 +259,40 @@ fn write_pending_settings_files(language: LanguageChoice, theme: ThemeChoice, op
         return None;
     }
 
-    Some(PendingSettingsFiles { oobe_state: oobe_state_path, pending_account: pending_account_path })
+    // Wi-Fi: independent of the account pair above (see this fn's own doc
+    // comment) — a write failure here only ever costs the Wi-Fi file, never
+    // the account files this fn has already committed to disk.
+    let pending_network = match wifi {
+        Some((ssid, psk)) => {
+            let pending_network_json = build_pending_network_json(ssid, psk);
+            match write_scratch_file(&pending_network_path, &pending_network_json) {
+                Ok(()) => Some(pending_network_path),
+                Err(e) => {
+                    eprintln!("[live_install] could not write pending network scratch file {}: {e}", pending_network_path.display());
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    Some(PendingSettingsFiles { oobe_state: oobe_state_path, pending_account: pending_account_path, pending_network })
 }
 
-/// Best-effort cleanup of both scratch files — called from `run_install`
-/// once the child process has exited, on EVERY exit path (spawn failure,
-/// normal completion, non-zero exit) so a plaintext password never
-/// outlives the one install attempt that needed it. `Option<&_>` (not
-/// `Option<_>`) so the caller can still use `settings_files` for the env
-/// vars first and pass a borrow here afterward.
+/// Best-effort cleanup of every scratch file this round may have written —
+/// called from `run_install` once the child process has exited, on EVERY
+/// exit path (spawn failure, normal completion, non-zero exit) so a
+/// plaintext password/passphrase never outlives the one install attempt
+/// that needed it. `Option<&_>` (not `Option<_>`) so the caller can still
+/// use `settings_files` for the env vars first and pass a borrow here
+/// afterward.
 fn cleanup_pending_settings_files(files: Option<&PendingSettingsFiles>) {
     let Some(files) = files else { return };
     let _ = std::fs::remove_file(&files.oobe_state);
     let _ = std::fs::remove_file(&files.pending_account);
+    if let Some(pending_network) = &files.pending_network {
+        let _ = std::fs::remove_file(pending_network);
+    }
 }
 
 /// The Confirm step's own bottom-nav action (`render.rs`'s `button_row`,
@@ -253,25 +335,32 @@ pub(super) fn start_install(view: &mut ShellView, cx: &mut Context<ShellView>) {
     // same reason `disk_name` a few lines down is `.clone()`d out of `disk`
     // rather than captured by reference. See this file's own header
     // comment + `write_pending_settings_files`'s doc comment for what
-    // happens with these four values.
+    // happens with these values. WP3 (2026-08-29) adds the last two
+    // (`wifi_ssid`/`wifi_psk`) — same snapshot-before-spawn reasoning.
     let language = flow.language();
     let theme = flow.theme_choice();
     let operator_name = flow.operator_name().map(str::to_string);
     let account_password = flow.account_password().map(str::to_string);
+    let wifi_ssid = flow.wifi_ssid().map(str::to_string);
+    let wifi_psk = flow.wifi_psk().map(str::to_string);
 
     flow.set_install_running(None, "準備安裝…".to_string());
     flow.next();
     cx.notify();
 
-    // Both halves present -> write the two scratch files and wire the env
-    // vars; either missing (design doc §9: "理論上 UI 閘擋住到不了" — the
-    // account step's own gate should never let Confirm be reached without
-    // both) -> `None`, and `run_install` below sets neither env var, which
-    // is byte-identical to this round never having happened.
-    let settings_files = match (operator_name, account_password) {
-        (Some(name), Some(password)) => write_pending_settings_files(language, theme, &name, &password),
-        _ => None,
-    };
+    // Both halves present -> write the account's two scratch files and wire
+    // their env vars; either missing (design doc §9: "理論上 UI 閘擋住到不了"
+    // — the account step's own gate should never let Confirm be reached
+    // without both) -> `None` account pair, and `run_install` below sets
+    // NONE of the three env vars in that case (the same unreachable-in-
+    // practice fallback P2/WP1 already had, now also covering Wi-Fi — see
+    // `write_pending_settings_files`'s own doc comment for exactly why).
+    // Once past that gate, the Wi-Fi pair is independent (WP3): `wifi_ssid`
+    // alone decides whether a THIRD scratch file gets written, and a Wi-Fi
+    // write failure never rolls back the account files.
+    let account = operator_name.as_deref().zip(account_password.as_deref());
+    let wifi = wifi_ssid.as_deref().map(|ssid| (ssid, wifi_psk.as_deref()));
+    let settings_files = write_pending_settings_files(language, theme, account, wifi);
 
     let (tx, rx) = mpsc::channel::<InstallEvent>();
     let disk_name = disk.name.clone();
@@ -349,6 +438,15 @@ fn run_install(disk_name: &str, tx: &mpsc::Sender<InstallEvent>, settings_files:
         command
             .env("DUDUCLAW_INSTALL_OOBE_STATE_FILE", &files.oobe_state)
             .env("DUDUCLAW_INSTALL_PENDING_ACCOUNT_FILE", &files.pending_account);
+        // WP3: a THIRD, independent env var — only set when the operator
+        // actually typed a Wi-Fi SSID (`pending_network` is `None` for both
+        // "nothing typed" and "the scratch write failed"; either way this
+        // is the exact same "no Wi-Fi injected" outcome as before WP3
+        // existed at all — see `write_pending_settings_files`'s own doc
+        // comment).
+        if let Some(pending_network) = &files.pending_network {
+            command.env("DUDUCLAW_INSTALL_PENDING_NETWORK_FILE", pending_network);
+        }
     }
 
     let mut child = match command.spawn() {
@@ -570,6 +668,38 @@ mod tests {
         let json = build_pending_account_json("has\"quote\\and\nnewline");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("must still be valid JSON");
         assert_eq!(parsed["password"], "has\"quote\\and\nnewline");
+    }
+
+    // ── build_pending_network_json (WP3) ──────────────────────────────
+
+    #[test]
+    fn build_pending_network_json_round_trips_ssid_and_psk() {
+        let json = build_pending_network_json("DuDu-Office", Some("hunter2-but-longer"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+        assert_eq!(parsed["ssid"], "DuDu-Office");
+        assert_eq!(parsed["psk"], "hunter2-but-longer");
+    }
+
+    /// `psk: None` (the open-network case) must serialize to a JSON `null`,
+    /// not an omitted key or an empty string — the target-side consumer
+    /// needs to tell "no password" apart from "empty password typed".
+    #[test]
+    fn build_pending_network_json_serializes_no_psk_as_null() {
+        let json = build_pending_network_json("DuDu-Guest", None);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+        assert_eq!(parsed["ssid"], "DuDu-Guest");
+        assert!(parsed["psk"].is_null());
+    }
+
+    #[test]
+    fn build_pending_network_json_escapes_special_characters_safely() {
+        // Same "let serde_json own the escaping" reasoning
+        // `build_pending_account_json_escapes_special_characters_safely`
+        // documents above — a hand-formatted string would corrupt on a `"`.
+        let json = build_pending_network_json("has\"quote\\ssid", Some("has\"quote\\and\nnewline"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must still be valid JSON");
+        assert_eq!(parsed["ssid"], "has\"quote\\ssid");
+        assert_eq!(parsed["psk"], "has\"quote\\and\nnewline");
     }
 
     #[test]

@@ -648,6 +648,16 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // POST-landing claim state, not just whether this was a first run.
     crate::pending_account::land_pending_account(&user_db, &home_dir);
 
+    // Stage 2 (design doc §5 plan (b)): land an installer-written
+    // pending-network.json the same way — the live installer only
+    // COLLECTS Wi-Fi SSID/passphrase (it never scans/connects live, no
+    // gateway payload ships in the live image), so the TARGET system's own
+    // gateway is what actually joins the network, on its own first boot.
+    // Runs in the background (bounded retries — Wi-Fi hardware/iwd may not
+    // be ready this early) and never blocks startup; independent of the
+    // account landing above, so ordering between the two doesn't matter.
+    crate::pending_network::spawn_pending_network_landing(home_dir.clone());
+
     if bootstrap_password.is_some() && user_db.is_unclaimed_default_admin() {
         // First-run bootstrap, and still unclaimed after the landing attempt
         // above (no installer pending file existed, or landing it failed —

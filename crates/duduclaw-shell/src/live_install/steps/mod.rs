@@ -22,23 +22,39 @@
 // parameter every step signature carries, most ignore" shape `oobe::steps::
 // render`'s own dispatcher already established for `AccountFields`/
 // `NetworkFields` there.
+//
+// Installer-settings-integration WP3 (2026-08-29): a third new step,
+// `network` (see that module's own header comment). Rather than fold its
+// field bundle into the existing `fields: &AccountFields` parameter (the two
+// bundles have unrelated shapes — a name+password pair vs. an ssid+psk pair
+// — and unrelated step ownership), this dispatcher grows a SECOND ignored-
+// by-most parameter, `wifi_fields: &LiveWifiFields`, following the exact
+// same "most arms ignore it" precedent `fields` itself set a moment earlier.
 
 mod account;
 mod confirm;
 mod disk_select;
 mod language;
+mod network;
 mod progress;
 mod theme;
 
 use gpui::{Context, Div};
 
 use super::{LiveInstallFlow, LiveInstallStep};
-use crate::oobe::widgets::AccountFields;
+use crate::oobe::widgets::{AccountFields, LiveWifiFields};
 use crate::ShellView;
 
-pub(super) fn render(step: LiveInstallStep, flow: &LiveInstallFlow, fields: &AccountFields, cx: &mut Context<ShellView>) -> Div {
+pub(super) fn render(
+    step: LiveInstallStep,
+    flow: &LiveInstallFlow,
+    fields: &AccountFields,
+    wifi_fields: &LiveWifiFields,
+    cx: &mut Context<ShellView>,
+) -> Div {
     match step {
         LiveInstallStep::Language => language::render(flow, cx),
+        LiveInstallStep::Network => network::render(flow, wifi_fields, cx),
         LiveInstallStep::Account => account::render(flow, fields, cx),
         LiveInstallStep::Theme => theme::render(flow, cx),
         LiveInstallStep::DiskSelect => disk_select::render(flow, cx),

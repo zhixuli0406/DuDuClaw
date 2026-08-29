@@ -531,6 +531,20 @@ pub struct ShellView {
     /// fields` (`AccountFields::new(cx)`, window-open time) — see that
     /// field's own construction site for the precedent this mirrors.
     pub(crate) live_install_account_fields: oobe::AccountFields,
+    /// The live-install wizard's OWN `Network` step's two real text-input
+    /// entities — installer-settings-integration WP3 (2026-08-29,
+    /// `commercial/docs/DESIGN-installer-settings-integration-2026-08.md`
+    /// §5). Same "created once, unconditionally, at window-open time" shape
+    /// `live_install_account_fields` just above establishes, and the same
+    /// reason it's a SEPARATE bundle from `oobe_network_fields` below (not
+    /// only different lifetimes — the two flows can never both be active in
+    /// the same process run at all, see `live_install`'s own doc comment) —
+    /// but ALSO a different TYPE (`oobe::LiveWifiFields`, not
+    /// `oobe::NetworkFields`): this step types its own SSID rather than
+    /// picking one from a scan, so it needs a field OOBE's own bundle has no
+    /// equivalent of. See `oobe::widgets::LiveWifiFields`'s own doc comment
+    /// for the full "why not reuse `NetworkFields`" writeup.
+    pub(crate) live_install_wifi_fields: oobe::LiveWifiFields,
     /// The `Network` step's real PSK entry field (Shell-S3, 2026-08-21) —
     /// same reasoning as `oobe_account_fields` just above (created once,
     /// unconditionally, at window-open time — see `oobe::NetworkFields`'s
@@ -1393,7 +1407,7 @@ impl ShellView {
             // a separate, fifth root-render mode rather than a fork inside
             // OOBE's own flow. The `oobe` branch itself is untouched by this
             // addition.
-            root.child(live_install::render(flow, &self.live_install_account_fields, cx))
+            root.child(live_install::render(flow, &self.live_install_account_fields, &self.live_install_wifi_fields, cx))
         } else if let Some(flow) = &self.oobe {
             root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, &self.oobe_network_fields, cx))
         } else if self.lockscreen.is_locked() {
@@ -1760,6 +1774,14 @@ fn main() {
         // site, same "create once, unconditionally, at window-open time"
         // reasoning as every other field bundle here.
         let live_install_account_fields = oobe::AccountFields::new(cx);
+        // Installer-settings-integration WP3 (2026-08-29): the live-install
+        // wizard's OWN `Network` step needs its own field bundle — see that
+        // field's own doc comment on `ShellView` for why this is a
+        // DIFFERENT type from `oobe_network_fields` just below, not only a
+        // separate instance. Same call site, same "create once,
+        // unconditionally, at window-open time" reasoning as every other
+        // field bundle here.
+        let live_install_wifi_fields = oobe::LiveWifiFields::new(cx);
         let oobe_network_fields = oobe::NetworkFields::new(cx);
         let lockscreen_password_field = oobe::LockPasswordField::new(cx);
         let launcher_query_field = oobe::LauncherQueryField::new(cx);
@@ -1793,6 +1815,7 @@ fn main() {
             oobe_ui: oobe::OobeUiState::default(),
             oobe_account_fields,
             live_install_account_fields,
+            live_install_wifi_fields,
             oobe_network_fields,
             theme: initial_theme,
             focus_handle: cx.focus_handle(),

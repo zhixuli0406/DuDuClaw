@@ -62,7 +62,7 @@ use crate::ShellView;
 
 use super::super::{AccountError, LiveInstallFlow};
 
-pub(super) fn render(flow: &LiveInstallFlow, fields: &AccountFields, cx: &mut Context<ShellView>) -> Div {
+pub(super) fn render(flow: &LiveInstallFlow, fields: &AccountFields, _cx: &mut Context<ShellView>) -> Div {
     let locale = flow.locale();
     let palette = flow.palette();
 

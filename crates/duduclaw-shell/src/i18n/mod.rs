@@ -204,6 +204,33 @@ pub enum Key {
     /// `oobe::AccountClaimFailureKind`'s own doc comment for why).
     AccountUnreachableError,
 
+    /// Installer-settings-integration WP3 (2026-08-29): the LIVE
+    /// installer's own `Network` step (`live_install::steps::network`) — a
+    /// pure SSID/passphrase COLLECTION form, not OOBE's own `Network` step
+    /// above (which scans/connects for real). Deliberately named `LiveWifi*`
+    /// rather than reusing the `Network*` keys above, even though both
+    /// screens show an SSID + password: the two steps have unrelated status
+    /// vocabularies (this one never scans, never connects, never shows a
+    /// signal bar) and sharing a key prefix would blur that distinction in
+    /// the catalog itself.
+    LiveWifiTitle,
+    LiveWifiSubtitle,
+    LiveWifiSsidLabel,
+    LiveWifiPskLabel,
+    /// The step's "this is optional" hint line — see `steps::network`'s own
+    /// header comment for why an empty submission is a legal outcome here,
+    /// unlike `Account`'s `AccountValidationError` just above.
+    LiveWifiOptionalHint,
+    /// `NetworkError::SsidMissingWithPsk` — a passphrase was typed but the
+    /// SSID field was left empty.
+    LiveWifiErrSsidMissing,
+    /// `NetworkError::SsidTooLong` — the typed SSID exceeds the 802.11
+    /// 32-byte limit.
+    LiveWifiErrSsidTooLong,
+    /// `NetworkError::PskLengthInvalid` — the typed passphrase is non-empty
+    /// but outside the WPA-PSK 8..=63 character range.
+    LiveWifiErrPskLength,
+
     RuntimeAuthTitle,
     RuntimeAuthSubtitle,
     RuntimeAuthAuthorized,
@@ -603,6 +630,15 @@ fn zh_tw(key: Key) -> &'static str {
         Key::AccountAlreadyClaimedInfo => "此裝置已完成初始設定，沿用既有的管理者帳號。",
         Key::AccountUnreachableError => "無法連線到本機服務，請稍後重試。",
 
+        Key::LiveWifiTitle => "設定 Wi-Fi",
+        Key::LiveWifiSubtitle => "裝完首次開機會自動連線，留空可跳過",
+        Key::LiveWifiSsidLabel => "網路名稱（SSID）",
+        Key::LiveWifiPskLabel => "Wi-Fi 密碼",
+        Key::LiveWifiOptionalHint => "此步可留空：有線網路或稍後在設定中連線",
+        Key::LiveWifiErrSsidMissing => "輸入了密碼但沒有網路名稱",
+        Key::LiveWifiErrSsidTooLong => "網路名稱過長",
+        Key::LiveWifiErrPskLength => "Wi-Fi 密碼長度須為 8–63 字元",
+
         Key::RuntimeAuthTitle => "AI Runtime 授權",
         Key::RuntimeAuthSubtitle => "這台機器的 AI runtime 需要授權才能開始工作",
         Key::RuntimeAuthAuthorized => "已授權，可以繼續",
@@ -833,6 +869,15 @@ fn en(key: Key) -> &'static str {
         Key::AccountAlreadyClaimedInfo => "This device has already been set up. Using the existing administrator account.",
         Key::AccountUnreachableError => "Couldn't reach the local service. Please try again shortly.",
 
+        Key::LiveWifiTitle => "Set up Wi-Fi",
+        Key::LiveWifiSubtitle => "The target system connects automatically on first boot. Leave blank to skip.",
+        Key::LiveWifiSsidLabel => "Network name (SSID)",
+        Key::LiveWifiPskLabel => "Wi-Fi password",
+        Key::LiveWifiOptionalHint => "This step is optional: use a wired connection, or connect later from Settings",
+        Key::LiveWifiErrSsidMissing => "A password was entered, but no network name",
+        Key::LiveWifiErrSsidTooLong => "The network name is too long",
+        Key::LiveWifiErrPskLength => "The Wi-Fi password must be 8–63 characters",
+
         Key::RuntimeAuthTitle => "Authorize AI runtime",
         Key::RuntimeAuthSubtitle => "This device's AI runtime needs authorization before it can start working",
         Key::RuntimeAuthAuthorized => "Authorized. Ready to continue.",
@@ -1062,6 +1107,15 @@ fn ja_jp(key: Key) -> &'static str {
         Key::AccountPasswordTooShortError => "パスワードは8文字以上で入力してください",
         Key::AccountAlreadyClaimedInfo => "この端末はすでにセットアップ済みです。既存の管理者アカウントを使用します。",
         Key::AccountUnreachableError => "ローカルサービスに接続できません。しばらくしてから再試行してください。",
+
+        Key::LiveWifiTitle => "Wi-Fi を設定",
+        Key::LiveWifiSubtitle => "インストール完了後、初回起動時に自動接続します。空欄のままでスキップできます。",
+        Key::LiveWifiSsidLabel => "ネットワーク名（SSID）",
+        Key::LiveWifiPskLabel => "Wi-Fi パスワード",
+        Key::LiveWifiOptionalHint => "このステップは省略できます：有線接続を使うか、後で設定から接続してください",
+        Key::LiveWifiErrSsidMissing => "パスワードは入力されましたが、ネットワーク名がありません",
+        Key::LiveWifiErrSsidTooLong => "ネットワーク名が長すぎます",
+        Key::LiveWifiErrPskLength => "Wi-Fi パスワードは8〜63文字で入力してください",
 
         Key::RuntimeAuthTitle => "AI ランタイムの認証",
         Key::RuntimeAuthSubtitle => "この端末の AI ランタイムを使い始めるには認証が必要です",

@@ -111,6 +111,13 @@ pub(crate) use widgets::AccountFields;
 /// `Network` step's PSK entry (Shell-S3) is the second, and so far only
 /// other, OOBE screen with a real typed field.
 pub(crate) use widgets::NetworkFields;
+/// `crate::live_install` needs `LiveWifiFields` for the same reason
+/// `main.rs` needs `AccountFields` above — installer-settings-integration
+/// WP3 (2026-08-29), the live installer's own `Network` step. See that
+/// type's own doc comment in `widgets.rs` for why it is NOT a reuse of
+/// `NetworkFields` just above (an SSID typed field vs. an SSID picked from a
+/// scan).
+pub(crate) use widgets::LiveWifiFields;
 /// `crate::lockscreen` needs `LockPasswordField` for the same reason
 /// `main.rs` needs `AccountFields`/`NetworkFields` above — see that type's
 /// own doc comment in `widgets.rs` (WP-lock-pw, 2026-08-22).
