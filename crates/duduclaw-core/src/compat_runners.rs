@@ -314,7 +314,13 @@ fn parse_runner_file(path: &Path) -> Result<RunnerDecl, String> {
 /// whole semantics), so it must not itself depend on an external `which`
 /// binary that could be the very thing that's missing on a minimal image.
 /// No new dependency either way — `std::env::split_paths` is std.
-fn tool_on_path(tool: &str) -> bool {
+///
+/// `pub` (not scan-internal) so other CLI surfaces that need the exact
+/// same "does this binary actually resolve" honesty check can reuse it
+/// instead of re-implementing a second PATH walk — e.g.
+/// `duduclaw-cli`'s `compat_windows_vm` module picks between the
+/// `xfreerdp3`/`xfreerdp` binary names with this same function (CP-2/B3).
+pub fn tool_on_path(tool: &str) -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };

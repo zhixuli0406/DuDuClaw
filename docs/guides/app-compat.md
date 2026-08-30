@@ -34,13 +34,15 @@ duduclaw compat list
 輸出範例：
 
 ```
-相容層 runner（2 個）：
+相容層 runner（3 個）：
 
-ID             名稱                         來源系統        狀態
+ID             名稱                             來源系統        狀態
 ------------------------------------------------------------------
-bottles        Bottles（Windows 應用轉譯）    windows-app     ready
-waydroid       Waydroid（Android 應用容器）   android         missing: waydroid, lxc-start
+bottles        Bottles（Windows 應用轉譯）        windows-app     ready
+waydroid       Waydroid（Android 應用容器）       android         missing: waydroid, lxc-start
                → 見 docs/guides/app-compat.md 的 Waydroid 自裝入口段：...
+windows-vm     Windows 應用程式（完整 Windows 虛擬機） windows-app     missing: docker, xfreerdp3
+               → 尚未設定：先執行 `duduclaw compat windows-vm setup`（會走過資源門檻建議、硬體虛擬化檢查、授權責任揭露，再啟動容器）。
 ```
 
 `狀態`欄誠實反映現況：
@@ -76,7 +78,65 @@ flatpak install flathub com.usebottles.bottles
 - LINE Windows 版
 - AutoCAD 2018 以後版本
 
-這些應用程式即使裝了 Bottles，實測結果也大機率無法正常使用。若你需要這類軟體 100% 相容，正確路線是「真的一台 Windows」——DuDuClaw OS 之後會提供自包裝的虛擬機方案（尚未出貨），而不是勉強用 Bottles 硬跑。
+這些應用程式即使裝了 Bottles，實測結果也大機率無法正常使用。若你需要這類軟體 100% 相容，正確路線是「真的一台 Windows」——見下一節「Windows 應用程式（完整虛擬機）」，而不是勉強用 Bottles 硬跑。
+
+## Windows 應用程式（完整虛擬機）
+
+Bottles 只轉譯 Windows API，遇到近三年的 Microsoft 365、AutoCAD 2018 以後版本、需要印表機或 USB 憑證載具的記帳／ERP 軟體，一律不承諾能用（見上一節）。這一類軟體需要「真的一台 Windows」，DuDuClaw OS 為此內建另一條路線：在本機建立一台完整的 Windows 虛擬機，透過無縫視窗（看起來就像一般應用程式的視窗，不是整台電腦的畫面）執行單一 Windows 應用程式。
+
+**這不是預裝的功能**：DuDuClaw 不隨機出貨、不代購、不代管任何 Windows 授權金鑰，也不預先下載 Windows 安裝映像。整套流程一鍵引導，但每一步都由你觸發、你確認。
+
+### 硬體需求
+
+| 項目 | 下限 | 建議 |
+|---|---|---|
+| 本機（值班機）總記憶體 | — | 16GB 以上 |
+| 虛擬機常駐記憶體 | 4GB | 8GB |
+| 虛擬機磁碟空間 | 32GB | 依應用程式需求（Windows 本身＋安裝的軟體） |
+
+本機記憶體低於建議門檻時，`duduclaw compat windows-vm setup` 只會印出提醒，不會擋下你繼續——這是建議值，不是硬性限制。
+
+### 授權責任揭露
+
+在你執行 `setup` 之前，請先確認以下三點——這不是 DuDuClaw 的條款，是真實的授權現況：
+
+1. **你需要自備 Windows 11 Pro 以上版本的合法授權。** 這台虛擬機安裝的是 Windows，授權責任由你自行承擔，DuDuClaw 不提供、也不附贈授權。
+2. **Home 版不支援 RemoteApp 無縫視窗。** 這是上游 WinApps 專案文件明文列出的硬性需求，不是 DuDuClaw 的限制——用 Home 版授權，應用程式仍可能裝得起來，但「無縫視窗」這個體驗跑不出來。
+3. **你電腦／筆電隨附的 OEM 授權，通常不含虛擬化使用權利。** 這是 Microsoft 官方授權條款的原文立場——用機器原廠內建的 Windows 授權裝進這台虛擬機，可能違反授權條款。
+
+`setup` 執行時會完整印出這份揭露，並要求你明確確認（互動終端機輸入確認字樣，或帶 `--yes` 代表你已閱讀並同意）才會繼續往下走。
+
+### 使用流程
+
+```bash
+# 1. 引導設定：資源門檻建議 → 硬體虛擬化檢查 → 授權揭露確認 → 產生設定 → 啟動容器
+duduclaw compat windows-vm setup
+
+# 可調整資源與 Windows 版本（皆有預設值，不帶也可以）：
+duduclaw compat windows-vm setup --ram 16 --disk 128 --version 11
+
+# 非互動環境（腳本/CI）：--yes 代表你已閱讀並同意上述授權責任
+duduclaw compat windows-vm setup --yes
+
+# 2. 查看容器狀態
+duduclaw compat windows-vm status
+
+# 3. 安裝完成後，以無縫視窗啟動一個 Windows 應用程式
+duduclaw compat windows-vm app winword.exe --name "Word"
+```
+
+`setup` 只會啟動一個空的 Windows 虛擬機容器——**Windows 安裝映像不會預先下載或內建**，容器第一次啟動後才會自行觸發下載，你可以用瀏覽器打開 `http://127.0.0.1:8006` 監看安裝進度（首次安裝需要一段時間，實際長短依網路狀況與你選擇的 Windows 版本而定）。安裝完成前，`compat windows-vm app` 還無法正常連線。
+
+`app` 子命令透過 FreeRDP 3 的 RemoteApp（RAIL）模式連線，需要在有 X11／XWayland 顯示的圖形工作階段內執行（跟 Bottles／Wine 一樣的前提）；密碼一律經由標準輸入傳遞給 RDP 用戶端，不會出現在指令列參數或處理程序清單裡。
+
+### 硬體虛擬化（KVM）是硬性要求
+
+這條路線需要本機支援硬體虛擬化（CPU 的 VT-x／AMD-V 功能，Linux 核心需啟用並載入 `kvm` 模組）。`setup` 會在授權揭露之前先檢查 `/dev/kvm` 是否存在——找不到就直接失敗並說明原因，不會退回軟體模擬（那樣的效能不具實用性，dockur/windows 本身也沒有這個備援）。
+
+### 已知限制（本版）
+
+- `duduclaw compat windows-vm` 目前是命令列引導流程；「應用程式一鍵出現在圖形介面的啟動器（launcher）」是後續版本的整合工作。
+- Windows VM 實際能不能開機、無縫視窗好不好用，只能在真實硬體或雲端主機驗證——QEMU 測試環境本身通常沒有巢狀虛擬化，會被上面的 KVM 檢查誠實擋下。
 
 ## Android 應用程式：Waydroid
 

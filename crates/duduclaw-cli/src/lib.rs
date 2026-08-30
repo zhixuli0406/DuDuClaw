@@ -10,6 +10,7 @@ use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
 mod compat_cmd;            // CP-1/A3: `duduclaw compat` — compat.d declarative runner registry CLI surface
+mod compat_windows_vm;     // CP-2/B3: `duduclaw compat windows-vm` — self-packaged Windows VM + RemoteApp bootstrap CLI
 mod data_migrate;         // H3g: `duduclaw data-migrate` — /data forward-only settings migrator CLI front door
 mod docs_cmd;              // Stripe-style `duduclaw docs [<topic>]` (E12) — GitHub doc links, browser hand-off
 mod eval;                 // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
@@ -1409,10 +1410,11 @@ enum PresetCommands {
     },
 }
 
-/// CP-1/A3 — `duduclaw compat`: read-only front door onto the `compat.d`
-/// declarative app-compatibility runner registry
-/// (`duduclaw_core::compat_runners`). Nothing under this subcommand
-/// launches a runner's `entrypoint` in this wave — see `compat_cmd` module
+/// CP-1/A3 — `duduclaw compat`: front door onto the `compat.d` declarative
+/// app-compatibility runner registry (`duduclaw_core::compat_runners`).
+/// `List` is read-only (see `compat_cmd` module docs); `WindowsVm` is
+/// CP-2/B3's write-capable bootstrap for the self-packaged Windows VM +
+/// RemoteApp bridge (design §2.3 路 B) — see `compat_windows_vm` module
 /// docs.
 #[derive(Subcommand)]
 enum CompatCommands {
@@ -1424,6 +1426,59 @@ enum CompatCommands {
         /// the human table.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Self-packaged Windows VM + RemoteApp bridge (design §2.3 路 B):
+    /// bootstrap, check, and launch seamless Windows applications through
+    /// a locally-run `dockur/windows` container.
+    #[command(name = "windows-vm")]
+    WindowsVm {
+        #[command(subcommand)]
+        command: CompatWindowsVmCommands,
+    },
+}
+
+/// CP-2/B3 — `duduclaw compat windows-vm` subcommands. See
+/// `crates/duduclaw-cli/src/compat_windows_vm.rs` module docs and
+/// `commercial/docs/DESIGN-app-compat-layer-2026-08.md` §2.3.
+#[derive(Subcommand)]
+enum CompatWindowsVmCommands {
+    /// Bootstrap the Windows VM: resource-threshold advisory → KVM
+    /// fail-closed check → license-responsibility disclosure (must be
+    /// acknowledged unless `--yes`) → `compose.yaml` generation →
+    /// `docker compose up -d`.
+    Setup {
+        /// Skip the interactive confirmation prompt — passing this flag
+        /// itself stands in for having read and accepted the license
+        /// disclosure printed just before it.
+        #[arg(long)]
+        yes: bool,
+        /// VM RAM in GB (floor 4, practical default 8 — design §2.3).
+        #[arg(long)]
+        ram: Option<u64>,
+        /// VM primary disk size in GB (floor 32, dockur's own default 64).
+        #[arg(long)]
+        disk: Option<u64>,
+        /// `dockur/windows`'s `VERSION` value (e.g. `11`, `11l`, `10`,
+        /// `2025`) — defaults to `11` (Windows 11 Pro, dockur's own
+        /// default).
+        #[arg(long, default_value = "11")]
+        version: String,
+    },
+
+    /// Show the Windows VM container's current state via `docker compose
+    /// ps` (honest "尚未 setup" when no compose file exists yet).
+    Status,
+
+    /// Launch one Windows executable as a seamless RemoteApp window via
+    /// `xfreerdp3`.
+    App {
+        /// Path or alias of the Windows executable inside the VM (e.g.
+        /// `winword.exe`, `C:\Program Files\...\app.exe`).
+        exe: String,
+        /// Display name shown for the window/taskbar entry.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -2048,6 +2103,15 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         },
         Commands::Compat { command } => match command {
             CompatCommands::List { json } => compat_cmd::cmd_compat_list(json),
+            CompatCommands::WindowsVm { command } => match command {
+                CompatWindowsVmCommands::Setup { yes, ram, disk, version } => {
+                    compat_windows_vm::cmd_compat_windows_vm_setup(yes, ram, disk, version).await
+                }
+                CompatWindowsVmCommands::Status => compat_windows_vm::cmd_compat_windows_vm_status().await,
+                CompatWindowsVmCommands::App { exe, name } => {
+                    compat_windows_vm::cmd_compat_windows_vm_app(exe, name).await
+                }
+            },
         },
         Commands::Service { command } => {
             match command {
