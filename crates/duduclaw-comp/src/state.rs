@@ -8,7 +8,7 @@ use smithay::{
     input::{Seat, SeatState},
     output::Output,
     reexports::{
-        calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
+        calloop::{generic::Generic, EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction},
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
             protocol::wl_surface::WlSurface,
@@ -20,7 +20,7 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState},
         cursor_shape::CursorShapeManagerState,
         output::OutputManagerState,
-        selection::data_device::DataDeviceState,
+        selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
         seat::WaylandFocus,
         shell::{
             wlr_layer::WlrLayerShellState,
@@ -57,6 +57,30 @@ pub struct DuduclawComp {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<DuduclawComp>,
     pub data_device_state: DataDeviceState,
+    /// CP-1 X11 clipboard/primary-selection follow-up (this round): the
+    /// `zwp_primary_selection_v1` global — a SECOND selection alongside the
+    /// ordinary clipboard (`data_device_state` above), conventionally driven
+    /// by a middle-click paste. X11 apps commonly use PRIMARY for exactly
+    /// that, so forwarding only `data_device_state`'s CLIPBOARD selection
+    /// (the pre-existing global) would leave middle-click paste broken for
+    /// any Wayland-native app pasting X11-selected text and vice versa. See
+    /// `crate::xwayland`'s `XwmHandler` selection methods and
+    /// `handlers/mod.rs`'s `SelectionHandler` impl for the two-way wiring
+    /// this global exists to support.
+    pub primary_selection_state: PrimarySelectionState,
+    /// CP-1 X11 clipboard follow-up: a clone of this process's own calloop
+    /// loop handle, needed ONLY so `SelectionHandler::send_selection`
+    /// (`handlers/mod.rs`) can call `X11Wm::send_selection::<CalloopData>`
+    /// (X11 wants to read a Wayland-owned selection — that call registers a
+    /// calloop source for the async fd-write transfer). `DuduclawComp` held
+    /// no loop handle before this round because nothing else needed one;
+    /// `CalloopData`, not `DuduclawComp`, is what `crate::xwayland::spawn`
+    /// actually drives `X11Wm`/`XwmHandler` against (see that module's own
+    /// doc for why), so the type parameter here is `CalloopData` to match,
+    /// not `Self`. `LoopHandle` is a cheap `Clone` (calloop's own doc), same
+    /// as the clone `crate::xwayland::spawn` already takes for `X11Wm::
+    /// start_wm`.
+    pub loop_handle: LoopHandle<'static, CalloopData>,
     /// CUR-1: the `wp_cursor_shape_manager_v1` global. Held only to keep the
     /// global alive for the process lifetime — every request it receives is
     /// dispatched by smithay straight into `SeatHandler::cursor_image`
@@ -326,6 +350,16 @@ impl DuduclawComp {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        // CP-1 X11 clipboard follow-up: advertise `zwp_primary_selection_v1`.
+        // Same "must exist before any client binds" constraint as every other
+        // protocol global in this constructor. See the field's own doc.
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
+        // CP-1 X11 clipboard follow-up: captured here (before anything below
+        // could plausibly consume `event_loop` in a way that would make this
+        // awkward) purely so `Self { .. }` below has a value for the
+        // `loop_handle` field. See that field's own doc for what it is used
+        // for and why the type parameter is `CalloopData`.
+        let loop_handle = event_loop.handle();
         // CUR-1: advertise `wp_cursor_shape_manager_v1`. Must exist before
         // any client binds, i.e. before `init_wayland_listener` below opens
         // the socket — hence its construction here with the other protocol
@@ -494,6 +528,8 @@ impl DuduclawComp {
             output_manager_state,
             seat_state,
             data_device_state,
+            primary_selection_state,
+            loop_handle,
             cursor_shape_manager_state,
             xdg_decoration_state,
             layer_shell_state,

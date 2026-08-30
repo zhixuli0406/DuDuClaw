@@ -17,9 +17,13 @@ use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::{
     set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
-use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::primary_selection::{
+    set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
+};
+use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::tablet_manager::TabletSeatHandler;
-use smithay::{delegate_cursor_shape, delegate_data_device, delegate_output};
+use smithay::{delegate_cursor_shape, delegate_data_device, delegate_output, delegate_primary_selection};
+use std::os::unix::io::OwnedFd;
 
 impl SeatHandler for DuduclawComp {
     type KeyboardFocus = WlSurface;
@@ -62,7 +66,13 @@ impl SeatHandler for DuduclawComp {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let dh = &self.display_handle;
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
-        set_data_device_focus(dh, seat, client);
+        set_data_device_focus(dh, seat, client.clone());
+        // CP-1 X11 clipboard follow-up: the ordinary clipboard's focus
+        // tracking (above) has always run here; PRIMARY selection needs the
+        // identical "which client is now focused on this seat" update or a
+        // middle-click paste target would never learn about a focus change
+        // that happened after `primary_selection_state`'s global was added.
+        set_primary_focus(dh, seat, client);
     }
 }
 
@@ -97,8 +107,68 @@ delegate_cursor_shape!(DuduclawComp);
 // Wl Data Device
 //
 
+/// CP-1 X11 clipboard follow-up (this round): the two-way bridge between
+/// this compositor's OWN clipboard/primary-selection state (this trait) and
+/// Xwayland's X11-side selection ownership (`crate::xwayland`'s `XwmHandler`
+/// selection methods — `allow_selection_access`/`send_selection`/
+/// `new_selection`/`cleared_selection`). The two directions are:
+///
+/// * **Wayland → X11**: a genuine Wayland client claims the clipboard or
+///   primary selection → [`Self::new_selection`] below fires → forwarded to
+///   `X11Wm::new_selection`, which makes Xwayland claim the matching X11
+///   selection on the Wayland side's behalf.
+/// * **X11 → Wayland**: `crate::xwayland`'s `XwmHandler::new_selection`
+///   (X11 claimed a selection) calls `set_data_device_selection`/
+///   `set_primary_selection`, which makes THIS compositor the announced
+///   Wayland-side owner. When some Wayland client then tries to read it,
+///   [`Self::send_selection`] below fires — and reads the actual bytes back
+///   FROM Xwayland via `X11Wm::send_selection` (the "X11 → Wayland" fetch;
+///   see [`crate::state::DuduclawComp::loop_handle`]'s own doc for why a
+///   loop handle is needed here).
+///
+/// Neither direction can feed back into itself: `set_data_device_selection`/
+/// `set_primary_selection` (the X11 → Wayland setter, called from
+/// `crate::xwayland`) does NOT re-invoke [`Self::new_selection`] — verified
+/// against smithay 0.7.0's own `wayland::selection::seat_data::SeatData::
+/// set_clipboard_selection`, which updates internal state and offers to the
+/// focused client directly, never through this trait's callback — so there
+/// is no X11 → Wayland → X11 → … loop.
 impl SelectionHandler for DuduclawComp {
     type SelectionUserData = ();
+
+    fn new_selection(&mut self, ty: SelectionTarget, source: Option<SelectionSource>, _seat: Seat<Self>) {
+        let mime_types = source.map(|s| s.mime_types());
+        let Some(wm) = self.xwm_mut() else {
+            // Xwayland not spawned, or not yet attached as a WM — nothing to
+            // forward to. Fail-open to Wayland-only, same posture as every
+            // other `crate::xwayland` integration point.
+            return;
+        };
+        if let Err(err) = wm.new_selection(ty, mime_types) {
+            tracing::warn!(error = %err, ?ty, "xwayland: failed to forward a Wayland selection to Xwayland");
+        }
+    }
+
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        // Cloned before the `xwm_mut()` borrow starts: `LoopHandle` is a
+        // cheap handle clone (see the field's own doc), and borrowing
+        // `self.loop_handle` and `self.xwayland` at once through two
+        // separate field accesses would otherwise need splitting anyway.
+        let loop_handle = self.loop_handle.clone();
+        let Some(wm) = self.xwm_mut() else {
+            return;
+        };
+        if let Err(err) = wm.send_selection(ty, mime_type, fd, loop_handle) {
+            tracing::warn!(error = %err, ?ty, "xwayland: failed to read Xwayland's selection for a Wayland client");
+        }
+    }
 }
 
 impl DataDeviceHandler for DuduclawComp {
@@ -111,6 +181,18 @@ impl ClientDndGrabHandler for DuduclawComp {}
 impl ServerDndGrabHandler for DuduclawComp {}
 
 delegate_data_device!(DuduclawComp);
+
+//
+// Wl Primary Selection (CP-1 X11 clipboard follow-up)
+//
+
+impl PrimarySelectionHandler for DuduclawComp {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+delegate_primary_selection!(DuduclawComp);
 
 //
 // Wl Output & Xdg Output

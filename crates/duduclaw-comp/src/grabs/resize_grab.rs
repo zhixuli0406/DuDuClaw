@@ -7,7 +7,7 @@ use crate::{
     DuduclawComp,
 };
 use smithay::{
-    desktop::{Space, Window},
+    desktop::{Space, Window, WindowSurface},
     input::pointer::{
         AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
         GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
@@ -19,6 +19,7 @@ use smithay::{
     },
     utils::{Logical, Point, Rectangle, Size},
     wayland::{compositor, shell::xdg::SurfaceCachedState},
+    xwayland::xwm::ResizeEdge as X11ResizeEdge,
 };
 use std::cell::RefCell;
 
@@ -42,6 +43,34 @@ impl From<xdg_toplevel::ResizeEdge> for ResizeEdge {
     #[inline]
     fn from(x: xdg_toplevel::ResizeEdge) -> Self {
         Self::from_bits(x as u32).unwrap()
+    }
+}
+
+/// CP-1/A4 follow-up (interactive X11 move/resize, this round): the X11
+/// window manager protocol's own edge enum — `XwmHandler::resize_request`'s
+/// `resize_edge` parameter — mapped onto the same bitflags
+/// `xdg_toplevel::ResizeEdge`/`decor::FrameEdge` already convert into.
+/// Verified against anvil's own table (`anvil/src/shell/grabs.rs`,
+/// `impl From<X11ResizeEdge> for ResizeEdge`, MIT, `v0.7.0` tag) rather than
+/// assumed: X11's `ResizeEdge` has no numeric representation of its own to
+/// derive a mapping FROM (unlike `xdg_toplevel::ResizeEdge`, which is a wire
+/// enum with explicit discriminants this crate's other `From` impl re-uses
+/// via `from_bits`), so a hand-written per-variant match is the only option
+/// and anvil's table is the one hand already proven correct against a real
+/// X11 client.
+impl From<X11ResizeEdge> for ResizeEdge {
+    #[inline]
+    fn from(edge: X11ResizeEdge) -> Self {
+        match edge {
+            X11ResizeEdge::Top => Self::TOP,
+            X11ResizeEdge::Bottom => Self::BOTTOM,
+            X11ResizeEdge::Left => Self::LEFT,
+            X11ResizeEdge::Right => Self::RIGHT,
+            X11ResizeEdge::TopLeft => Self::TOP_LEFT,
+            X11ResizeEdge::TopRight => Self::TOP_RIGHT,
+            X11ResizeEdge::BottomLeft => Self::BOTTOM_LEFT,
+            X11ResizeEdge::BottomRight => Self::BOTTOM_RIGHT,
+        }
     }
 }
 
@@ -176,18 +205,34 @@ pub fn clamp_resize_size(
     Size::from((w, h))
 }
 
-/// A4 (CP-1, XWayland) invariant this whole `impl` block relies on: `window`
-/// is always xdg-toplevel-backed, so its several `.toplevel().unwrap()`
-/// calls stay safe without individually guarding each one. This grab is only
-/// ever constructed from `XdgShellHandler::resize_request` (xdg-only by
-/// definition) or `input.rs::begin_edge_resize`, and the latter is only
-/// reached through `frame_hit_at`'s decoration hit-testing, which is keyed
-/// off `DecorState::frames` — a map an X11 window is never entered into
-/// (`window_uses_ssd` returns `false` for one, so `apply_window_policy`'s
-/// decoration/frame bookkeeping never runs for it; `crate::xwayland`'s own
-/// placement path doesn't touch `DecorState::frames` either). If a future
-/// round gives X11 windows interactive resize, this invariant is exactly
-/// what has to change first.
+/// CP-1/A4 follow-up (interactive X11 resize, this round): `window` may now
+/// be EITHER an xdg-toplevel-backed or an X11-backed [`Window`] — this whole
+/// `impl` block branches on [`Window::underlying_surface`] at every point
+/// that used to assume `.toplevel().unwrap()` was safe (a real A4 invariant,
+/// documented here until this round changed it — see this type's own
+/// `start`/`motion`/`button` for the two branches).
+///
+/// Two call sites construct this grab: `XdgShellHandler::resize_request`
+/// (`handlers/xdg_shell.rs`, always xdg — a client can only ever ask
+/// `xdg_toplevel.resize` for its OWN toplevel) and `input.rs::
+/// begin_edge_resize` (the compositor's own edge-drag, reached through
+/// `frame_hit_at`'s decoration hit-testing — keyed off `DecorState::frames`,
+/// a map an X11 window is never entered into, since `window_uses_ssd`
+/// returns `false` for one — so THAT call site is still xdg-only in
+/// practice). The THIRD call site, `XwmHandler::resize_request`
+/// (`crate::xwayland`, this round), is the only one that can ever hand this
+/// type an X11-backed `Window`.
+///
+/// The X11 branch settles synchronously, entirely inside this grab (in
+/// `button()`, on release) rather than reusing [`ResizeSurfaceState`]'s
+/// wl_surface-commit-driven "wait for the client to ack, then correct the
+/// TOP/LEFT anchor" dance: `X11Surface::configure()` applies immediately —
+/// there is no separate ack/commit round trip for the WM side to wait on the
+/// way `xdg_toplevel`'s `ack_configure` + `wl_surface.commit` requires — so
+/// there is nothing async to defer the correction until. Matches anvil's own
+/// `PointerResizeSurfaceGrab` X11 branch (`anvil/src/shell/grabs.rs`, MIT,
+/// `v0.7.0` tag), which settles at the identical point for the identical
+/// reason.
 pub struct ResizeSurfaceGrab {
     start_data: PointerGrabStartData<DuduclawComp>,
     window: Window,
@@ -211,9 +256,16 @@ impl ResizeSurfaceGrab {
     ) -> Self {
         let initial_rect = initial_window_rect;
 
-        ResizeSurfaceState::with(window.toplevel().unwrap().wl_surface(), |state| {
-            *state = ResizeSurfaceState::Resizing { edges, initial_rect };
-        });
+        // xdg only: arms the commit-driven "wait for the client to ack, then
+        // correct the TOP/LEFT anchor" state machine `handle_commit` below
+        // consumes. An X11-backed `window` has no `toplevel()` (`None`) and
+        // needs none of this — see this type's own doc for why its resize
+        // settles synchronously in `button()` instead.
+        if let Some(toplevel) = window.toplevel() {
+            ResizeSurfaceState::with(toplevel.wl_surface(), |state| {
+                *state = ResizeSurfaceState::Resizing { edges, initial_rect };
+            });
+        }
 
         Self {
             start_data,
@@ -258,12 +310,25 @@ impl PointerGrab<DuduclawComp> for ResizeSurfaceGrab {
             new_window_height = (self.initial_rect.size.h as f64 + delta.y) as i32;
         }
 
-        let (min_size, max_size) =
-            compositor::with_states(self.window.toplevel().unwrap().wl_surface(), |states| {
+        // CP-1/A4 follow-up: min/max size comes from wherever this window
+        // kind actually declares it — the xdg-shell cached surface state for
+        // a Wayland toplevel, or the ICCCM `WM_NORMAL_HINTS` min/max for an
+        // X11 window (`X11Surface::min_size`/`max_size`, already in the same
+        // `Size<i32, Logical>` unit — the surface itself converts from
+        // client-scale pixels). `None` (no hint declared) maps onto `(0, 0)`,
+        // the same "0 means unset" convention xdg-shell's own `SurfaceCachedState`
+        // already uses here.
+        let (min_size, max_size) = match self.window.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => compositor::with_states(toplevel.wl_surface(), |states| {
                 let mut guard = states.cached_state.get::<SurfaceCachedState>();
                 let data = guard.current();
                 (data.min_size, data.max_size)
-            });
+            }),
+            WindowSurface::X11(x11) => (
+                x11.min_size().unwrap_or(Size::from((0, 0))),
+                x11.max_size().unwrap_or(Size::from((0, 0))),
+            ),
+        };
 
         // WM-3: the client limits, this compositor's 320x240 floor and the
         // work-area cap now live in one pure, tested function. With
@@ -278,13 +343,27 @@ impl PointerGrab<DuduclawComp> for ResizeSurfaceGrab {
             self.clamp,
         );
 
-        let xdg = self.window.toplevel().unwrap();
-        xdg.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Resizing);
-            state.size = Some(self.last_window_size);
-        });
-
-        xdg.send_pending_configure();
+        match self.window.underlying_surface() {
+            WindowSurface::Wayland(xdg) => {
+                xdg.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Resizing);
+                    state.size = Some(self.last_window_size);
+                });
+                xdg.send_pending_configure();
+            }
+            WindowSurface::X11(x11) => {
+                // No ack/commit round trip to wait for — live-resize the X11
+                // window right now. The location is left as wherever it
+                // currently sits; a TOP/LEFT drag's anchor correction is
+                // deferred to `button()` on release (this type's own doc
+                // explains why), matching anvil's own X11 resize `motion()`.
+                let loc = data
+                    .space
+                    .element_location(&self.window)
+                    .unwrap_or(self.initial_rect.loc);
+                let _ = x11.configure(Rectangle::new(loc, self.last_window_size));
+            }
+        }
     }
 
     fn relative_motion(
@@ -313,20 +392,53 @@ impl PointerGrab<DuduclawComp> for ResizeSurfaceGrab {
             // No more buttons are pressed, release the grab.
             handle.unset_grab(self, data, event.serial, event.time, true);
 
-            let xdg = self.window.toplevel().unwrap();
-            xdg.with_pending_state(|state| {
-                state.states.unset(xdg_toplevel::State::Resizing);
-                state.size = Some(self.last_window_size);
-            });
+            match self.window.underlying_surface() {
+                WindowSurface::Wayland(xdg) => {
+                    xdg.with_pending_state(|state| {
+                        state.states.unset(xdg_toplevel::State::Resizing);
+                        state.size = Some(self.last_window_size);
+                    });
 
-            xdg.send_pending_configure();
+                    xdg.send_pending_configure();
 
-            ResizeSurfaceState::with(xdg.wl_surface(), |state| {
-                *state = ResizeSurfaceState::WaitingForLastCommit {
-                    edges: self.edges,
-                    initial_rect: self.initial_rect,
-                };
-            });
+                    ResizeSurfaceState::with(xdg.wl_surface(), |state| {
+                        *state = ResizeSurfaceState::WaitingForLastCommit {
+                            edges: self.edges,
+                            initial_rect: self.initial_rect,
+                        };
+                    });
+                }
+                WindowSurface::X11(x11) => {
+                    // CP-1/A4 follow-up: no ack/commit round trip for X11 —
+                    // settle the size AND, for a TOP/LEFT drag, the
+                    // anchor-correcting location right here, synchronously.
+                    // Uses `self.last_window_size` (already the final size
+                    // `motion()` computed) rather than re-reading
+                    // `self.window.geometry()` — `X11Surface::configure`
+                    // applies synchronously, so by this point the two are
+                    // equal anyway, and this avoids depending on that timing
+                    // fact holding. Mirrors anvil's own X11 resize-release
+                    // path (`anvil/src/shell/grabs.rs`, MIT, `v0.7.0` tag).
+                    let mut loc = data
+                        .space
+                        .element_location(&self.window)
+                        .unwrap_or(self.initial_rect.loc);
+                    if self.edges.intersects(ResizeEdge::TOP_LEFT) {
+                        if self.edges.intersects(ResizeEdge::LEFT) {
+                            loc.x = self.initial_rect.loc.x
+                                + (self.initial_rect.size.w - self.last_window_size.w);
+                        }
+                        if self.edges.intersects(ResizeEdge::TOP) {
+                            loc.y = self.initial_rect.loc.y
+                                + (self.initial_rect.size.h - self.last_window_size.h);
+                        }
+                    }
+                    if let Err(err) = x11.configure(Rectangle::new(loc, self.last_window_size)) {
+                        tracing::warn!(error = %err, "grabs::resize: X11 resize-release configure failed");
+                    }
+                    data.space.map_element(self.window.clone(), loc, false);
+                }
+            }
         }
     }
 
@@ -563,6 +675,33 @@ mod tests {
         ResizeClamp {
             work: work(),
             insets: DecorInsets::SSD,
+        }
+    }
+
+    #[test]
+    fn every_x11_resize_edge_maps_onto_the_matching_resize_edge_bits() {
+        // CP-1/A4 follow-up: the mapping table verified against anvil's own
+        // `impl From<X11ResizeEdge> for ResizeEdge` (`anvil/src/shell/
+        // grabs.rs`, MIT, `v0.7.0` tag) — see this file's `impl
+        // From<X11ResizeEdge> for ResizeEdge` for the full citation.
+        use X11ResizeEdge as E;
+        assert_eq!(ResizeEdge::from(E::Top), ResizeEdge::TOP);
+        assert_eq!(ResizeEdge::from(E::Bottom), ResizeEdge::BOTTOM);
+        assert_eq!(ResizeEdge::from(E::Left), ResizeEdge::LEFT);
+        assert_eq!(ResizeEdge::from(E::Right), ResizeEdge::RIGHT);
+        // Same "corners must carry BOTH bits" requirement as the xdg/decor
+        // conversions below — `handle_commit`'s xdg path AND this grab's own
+        // X11 button()-release path both branch on `ResizeEdge::TOP_LEFT`,
+        // and a single-bit corner would only correct one axis.
+        for (x11_edge, expected) in [
+            (E::TopLeft, ResizeEdge::TOP_LEFT),
+            (E::TopRight, ResizeEdge::TOP_RIGHT),
+            (E::BottomLeft, ResizeEdge::BOTTOM_LEFT),
+            (E::BottomRight, ResizeEdge::BOTTOM_RIGHT),
+        ] {
+            let got = ResizeEdge::from(x11_edge);
+            assert_eq!(got, expected, "{x11_edge:?}");
+            assert_eq!(got.iter().count(), 2, "{x11_edge:?} must set two bits");
         }
     }
 
