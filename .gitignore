@@ -89,3 +89,8 @@ crates/*/target/
 appliance/.yocto-cache/
 meta-openembedded/
 meta-duduclaw/.build/
+# A5 (2026-08-30, Waydroid/lxc chain): same kas-cloned-upstream-repo
+# convention as the four entries above — meta-virtualization lands at repo
+# root the same way, see meta-duduclaw/kas/duduclaw-os.yml's own A5 header
+# comment for the pin.
+/meta-virtualization/
