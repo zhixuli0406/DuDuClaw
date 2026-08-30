@@ -67,6 +67,8 @@ flatpak install flathub com.usebottles.bottles
 
 安裝完成後，`duduclaw compat list` 會把 `bottles` 的狀態從 `missing: flatpak`（或元件本身未安裝）轉為 `ready`。
 
+也可以直接在桌面圖形啟動器（Launcher）的「可安裝」分類裡找到 Bottles，點「安裝」走同一套確認流程（顯示下載大小與安裝位置），不必打指令列。這個分類的相容性標示是「Partial」（能用但明列缺什麼）：Bottles 本身在 DuDuClaw OS 上實測可跑（QEMU 活測：從 Flathub 裝進系統、GUI 正常開啟、wine 跑起真的 Windows 執行檔 notepad 並畫出視窗），標示之所以不是「已驗證」，是因為這個等級說的是「拿它跑 Windows 軟體」這件事的整體可用範圍——下方明列的不支援清單（新版 Office、LINE、AutoCAD 2018+）依然成立。
+
 **Bottles 適用範圍請照實看待**——它只承諾：
 
 - 舊版本、單機版、綠色版工具
@@ -129,14 +131,36 @@ duduclaw compat windows-vm app winword.exe --name "Word"
 
 `app` 子命令透過 FreeRDP 3 的 RemoteApp（RAIL）模式連線，需要在有 X11／XWayland 顯示的圖形工作階段內執行（跟 Bottles／Wine 一樣的前提）；密碼一律經由標準輸入傳遞給 RDP 用戶端，不會出現在指令列參數或處理程序清單裡。
 
+### 把 Windows 應用程式釘進啟動器
+
+裝好某個 Windows 應用程式後，用 `app-add` 把它釘進桌面的圖形啟動器（Launcher），不用每次都打指令列：
+
+```bash
+# 釘選一個應用程式（<執行檔> 跟 setup 完成後 app 子命令用的路徑寫法相同）
+duduclaw compat windows-vm app-add winword.exe --name "Word"
+
+# 查看目前釘了哪些
+duduclaw compat windows-vm app-list
+
+# 移除釘選（<執行檔> 必須跟當初 app-add 輸入的完全一致，不支援模糊比對）
+duduclaw compat windows-vm app-remove winword.exe
+```
+
+釘選成功後，最長等 60 秒（Launcher 背景重新掃描的週期）就會以「<名稱>（Windows）」的樣式出現在啟動器的「應用程式」清單裡；點下去會在背景執行 `duduclaw compat windows-vm app <執行檔>` 幫你把無縫視窗開起來——跟你手動在指令列打是同一條路徑，只是省了打字，圖示則沿用一般安裝程式找不到專屬圖示時的通用樣式（尚未有一輪視覺設計把 Bottles／Windows VM 這類項目的專屬圖示畫出來）。
+
+**還沒執行過 `setup` 的機器，啟動器完全不會出現任何 Windows 項目**——這是刻意的誠實靜默：`app-add`/`app-list` 讀寫的登記檔（`~/.duduclaw/windows-vm/apps.toml`）在 `setup` 都還沒跑過的機器上根本不存在，啟動器不會因此顯示錯誤或空白區塊，就是完全不出現這個分類。
+
+再次對同一個執行檔執行 `app-add` 會覆蓋原本的顯示名稱，不會產生重複項目。
+
 ### 硬體虛擬化（KVM）是硬性要求
 
 這條路線需要本機支援硬體虛擬化（CPU 的 VT-x／AMD-V 功能，Linux 核心需啟用並載入 `kvm` 模組）。`setup` 會在授權揭露之前先檢查 `/dev/kvm` 是否存在——找不到就直接失敗並說明原因，不會退回軟體模擬（那樣的效能不具實用性，dockur/windows 本身也沒有這個備援）。
 
 ### 已知限制（本版）
 
-- `duduclaw compat windows-vm` 目前是命令列引導流程；「應用程式一鍵出現在圖形介面的啟動器（launcher）」是後續版本的整合工作。
+- `setup`／`status` 本身仍是命令列流程（授權揭露確認、資源門檻建議這類需要人親自確認的步驟不適合塞進圖形精靈的一次性彈窗）；「應用程式一鍵出現在圖形介面的啟動器」這部分已經做了——見上一節「把 Windows 應用程式釘進啟動器」。
 - Windows VM 實際能不能開機、無縫視窗好不好用，只能在真實硬體或雲端主機驗證——QEMU 測試環境本身通常沒有巢狀虛擬化，會被上面的 KVM 檢查誠實擋下。
+- 釘進啟動器的 Windows 項目目前沿用通用圖示（沒有專屬的 Windows／Bottles 視覺圖示），是後續設計工作。
 
 ## Android 應用程式：Waydroid
 

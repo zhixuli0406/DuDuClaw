@@ -23,11 +23,18 @@
 // ── The bar for an entry ────────────────────────────────────────────────
 // Every field here is a checkable claim about a real thing, not a design
 // sketch. An entry needs a real flatpak application id, a real remote it is
-// actually published on, and a `verified` tier backed by evidence. Today
-// exactly one entry clears that bar (Chromium — A2's own container PASS,
-// cited below); the five design-board icons that had no app behind them are
-// deleted rather than demoted, because a catalog of things that cannot be
-// installed is the same lie in a different section.
+// actually published on, and a `verified` tier backed by evidence — but
+// "evidence" does not always mean "we personally watched it launch on this
+// OS": `VerifiedTier` has FOUR real tiers (see `apps.rs`'s own doc comment),
+// and a documented, checkable SCOPE claim (what a component is already
+// known — from a cited, textual source — to handle and not handle) is
+// enough to clear `Partial`'s bar. Two entries clear the bar today:
+// Chromium (A2's own container PASS, cited below — `Works`) and Bottles
+// (CP-2 wave-2, cited below — `Partial`: a live QEMU launch IS recorded,
+// but the tier grades usability-for-purpose and Bottles' own documented
+// scope holes cap it). The five original design-board icons that had no app
+// behind them at all are deleted rather than demoted, because a catalog of
+// things that cannot be installed is the same lie in a different section.
 //
 // The Launcher renders this as its own clearly-separated 「可安裝」section,
 // filtered to entries that are NOT already installed, so it can never be
@@ -59,23 +66,56 @@ pub(crate) struct CatalogApp {
     pub verified: VerifiedTier,
 }
 
-pub(crate) const INSTALL_CATALOG: &[CatalogApp] = &[CatalogApp {
-    id: "catalog-chromium",
-    glyph: "網",
-    label: "瀏覽器",
-    search_key: "browser chromium chrome web 瀏覽器",
-    // A2 investigation (`research/native-os-2026-08/flatpak-portal-scope-
-    // 2026-08.md` §3): a real container-level PASS — zero portal backend,
-    // the window still mapped into duduclaw-comp's space and closed
-    // cleanly. The only app in this crate with real launch evidence.
-    flatpak_id: "org.chromium.Chromium",
-    // Where A2's own PASS pulled this exact ref from — recorded, not
-    // assumed. Deliberately per-entry rather than a crate-wide "flathub"
-    // default: "which remote does this come from" is data, and defaulting
-    // it would be inventing a fact about every future entry.
-    flatpak_remote: "flathub",
-    verified: VerifiedTier::Works,
-}];
+pub(crate) const INSTALL_CATALOG: &[CatalogApp] = &[
+    CatalogApp {
+        id: "catalog-chromium",
+        glyph: "網",
+        label: "瀏覽器",
+        search_key: "browser chromium chrome web 瀏覽器",
+        // A2 investigation (`research/native-os-2026-08/flatpak-portal-scope-
+        // 2026-08.md` §3): a real container-level PASS — zero portal backend,
+        // the window still mapped into duduclaw-comp's space and closed
+        // cleanly. The only app in this crate with real launch evidence.
+        flatpak_id: "org.chromium.Chromium",
+        // Where A2's own PASS pulled this exact ref from — recorded, not
+        // assumed. Deliberately per-entry rather than a crate-wide "flathub"
+        // default: "which remote does this come from" is data, and defaulting
+        // it would be inventing a fact about every future entry.
+        flatpak_remote: "flathub",
+        verified: VerifiedTier::Works,
+    },
+    CatalogApp {
+        id: "catalog-bottles",
+        // "轉" ("translate/convert") — the same one-character-summarizes-
+        // the-concept convention `catalog-chromium`'s "網" uses, picked for
+        // "Windows 應用轉譯" (`docs/guides/app-compat.md`'s own name for
+        // what Bottles does), the exact label string below.
+        glyph: "轉",
+        label: "Bottles（Windows 應用轉譯）",
+        search_key: "bottles wine windows compat 相容 應用轉譯",
+        // `com.usebottles.bottles` @ flathub — the same real ref
+        // `docs/guides/app-compat.md`'s own Bottles section already
+        // documents installing (`flatpak install flathub
+        // com.usebottles.bottles`), and the same id `duduclaw compat list`'s
+        // `compat.d/bottles.toml` declaration resolves against.
+        flatpak_id: "com.usebottles.bottles",
+        flatpak_remote: "flathub",
+        // CP-2 wave-2 (2026-08-30): a live DuDuClaw-OS run IS now recorded —
+        // the wave2-C QEMU live-fire (TODO-compat-cp2's wave-2 log) installed
+        // this exact ref from flathub onto the appliance, screendumped the
+        // GTK4 onboarding first-paint on duduclaw-comp, and watched wine
+        // execute its bundled notepad (a real Windows PE binary, rendered
+        // through XWayland — menu bar and status line visible in the dump).
+        // The tier is still `Partial`, NOT `Works`/`Verified`, because the
+        // tiers grade USABILITY-FOR-PURPOSE, not launch evidence: Bottles'
+        // own usable scope has documented holes regardless of how well the
+        // app itself runs — `docs/guides/app-compat.md`'s Bottles section
+        // (Wine AppDB Silver-or-above, with recent Microsoft Office, LINE
+        // Windows, and AutoCAD 2018+ named as NOT working). "能用但明列缺
+        // 什麼" describes that exactly; a checkable claim, not a guess.
+        verified: VerifiedTier::Partial,
+    },
+];
 
 /// Case-insensitive substring search over the catalog, same shape
 /// `apps::search` uses for the installed list. An empty query matches
@@ -146,6 +186,23 @@ mod tests {
         assert_eq!(verified_tier("org.chromium"), VerifiedTier::Unrated);
         assert_eq!(verified_tier("firefox"), VerifiedTier::Unrated);
         assert_eq!(verified_tier(""), VerifiedTier::Unrated);
+    }
+
+    #[test]
+    fn bottles_is_findable_by_its_ascii_alias_and_its_cjk_label() {
+        assert!(search("bottles").iter().any(|a| a.id == "catalog-bottles"));
+        assert!(search("wine").iter().any(|a| a.id == "catalog-bottles"));
+        assert!(search("轉譯").iter().any(|a| a.id == "catalog-bottles"));
+    }
+
+    #[test]
+    fn bottles_is_rated_partial_not_unrated_and_not_overstated_as_verified_or_works() {
+        // Partial ("能用但明列缺什麼") is the honest tier for a documented
+        // scope claim with no DuDuClaw-OS launch evidence yet — see this
+        // file's header comment and the entry's own doc comment for why
+        // `Works`/`Verified` would overstate it.
+        assert_eq!(verified_tier("com.usebottles.bottles"), VerifiedTier::Partial);
+        assert_eq!(verified_tier("COM.USEBOTTLES.BOTTLES"), VerifiedTier::Partial);
     }
 
     /// The catalog is about INSTALLING, so every entry has to survive the

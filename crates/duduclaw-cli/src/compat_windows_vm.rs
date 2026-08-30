@@ -4,6 +4,14 @@
 //! `commercial/docs/TODO-compat-cp2-2026-08.md`'s B3 row, and
 //! `docs/guides/app-compat.md`.
 //!
+//! CP-2 wave-2 (2026-08-30) added `app-add`/`app-remove`/`app-list`: a
+//! small operator-maintained registry (`<DUDUCLAW_HOME>/windows-vm/
+//! apps.toml`, see this file's own "RemoteApp registry" section below) so a
+//! pinned Windows executable appears as an ordinary tile in
+//! `duduclaw-shell`'s Launcher — the "一鍵出現在圖形介面的啟動器" integration
+//! `docs/guides/app-compat.md`'s "已知限制" section used to list as future
+//! work.
+//!
 //! Wraps `dockur/windows` (a Docker-Compose-driven Windows-in-a-container
 //! VM, <https://github.com/dockur/windows>, image `ghcr.io/dockur/windows`)
 //! + FreeRDP 3 RemoteApp (`/app:` RAIL mode) so a single Windows
@@ -39,6 +47,7 @@ use std::process::Stdio;
 
 use console::style;
 use duduclaw_core::error::{DuDuClawError, Result};
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt as _;
 
 // ── Resource thresholds (design §2.3, one-hand-verified 2026-08-30 against
@@ -324,6 +333,311 @@ fn windows_vm_dir(home: &Path) -> PathBuf {
 
 fn compose_path(home: &Path) -> PathBuf {
     windows_vm_dir(home).join("compose.yaml")
+}
+
+// ── RemoteApp registry (`apps.toml`) — CP-2 wave-2 (2026-08-30) ─────────
+//
+// An operator-maintained list of Windows executables inside the VM that
+// should appear as tiles in the shell's Launcher. `app-add`/`app-remove`/
+// `app-list` below read and write `<DUDUCLAW_HOME>/windows-vm/apps.toml`;
+// `duduclaw-shell`'s own `apps::windows_vm` module reads the SAME file from
+// a fixed, hardcoded path (never `$HOME`-relative — see that module's
+// header comment), because it runs as a different OS user (the
+// unprivileged `kiosk` account, home `/data/duduclaw-kiosk`) than this CLI
+// (whatever account owns `/data/duduclaw`, where `duduclaw_home()`
+// resolves on the appliance).
+//
+// ── Why `0644`/`0755`, not `compose.yaml`'s `0600` ───────────────────────
+// `compose.yaml` is treated as sensitive-by-default (see
+// `write_compose_file_0600`'s own doc comment) even though today's wave
+// carries no secret in it, because it configures a locally-reachable RDP
+// endpoint. `apps.toml` carries no comparable claim — just a display name
+// and an in-VM executable path, both already visible to anyone who can see
+// the resulting Launcher tile itself — and it specifically MUST be
+// cross-user readable: the shell process that reads it runs as `kiosk`, a
+// different OS account than whatever owns `/data/duduclaw`, so `0600`
+// (owner-only) would make the file silently invisible to its only real
+// reader, and a Windows app pinned via `app-add` would never show up in the
+// Launcher with no error anywhere to explain why. `0755` on the parent
+// directory for the same reason: it must stay traversable by `kiosk` even
+// though only this CLI's account ever writes into it.
+//
+// ── Hand-rolled writer, on THIS side too — not `toml::to_string_pretty` ──
+// The obvious design would read "this CLI already depends on the `toml`
+// crate, so just `toml::to_string_pretty` a typed `Vec<RemoteAppEntry>` and
+// let `duduclaw-shell`'s hand-rolled reader (which deliberately carries no
+// `toml` dependency — see `apps/windows_vm.rs`'s own header comment) parse
+// the result." That was this section's FIRST implementation, and it was
+// wrong: empirically checked (a standalone scratch build against this exact
+// pinned `toml = "0.8"`, 2026-08-30) against `toml::to_string_pretty`'s
+// actual output, an `exe` value with a backslash — i.e. every real Windows
+// path — serializes as a LITERAL string (`exe = 'C:\Program Files\...'`,
+// single-quoted, no escape processing) rather than the escaped
+// double-quoted form `apps/windows_vm.rs`'s parser was written against; a
+// display name containing BOTH `'` and `"` serializes as a triple-quoted
+// multi-line basic string (`"""..."""`); one containing an apostrophe AND a
+// backslash serializes as a triple-quoted multi-line LITERAL string
+// (`'''...'''`). `toml_edit`'s serializer picks whichever representation
+// needs the least escaping — a real feature for a human editing the file by
+// hand, and exactly the kind of variability a narrow hand-rolled reader on
+// the OTHER end cannot absorb: any of those three forms would have silently
+// dropped the field (`parse_toml_basic_string` only recognizes a leading
+// AND trailing single `"`), which means a pinned exe with a Windows path —
+// the overwhelmingly common case — would never actually reach the Launcher.
+//
+// The fix is [`toml_basic_string`]/[`render_apps_toml`] below: this file
+// hand-formats the TOML text itself, ALWAYS as escaped double-quoted basic
+// strings (the exact form `apps/windows_vm.rs::parse_toml_basic_string`
+// understands), instead of delegating the choice to `toml_edit`'s
+// pretty-printer. `toml::from_str` (used by [`read_apps_registry`], the
+// READ side) is unaffected by any of this — a real parser handles every
+// legal TOML string form regardless of which one produced it, so reading
+// stays exactly as robust as depending on the `toml` crate promises. Only
+// the WRITE side needed to give up "let the library decide" for "control
+// the exact bytes," because the reader on the other end of this contract
+// is not a full TOML parser.
+
+/// Windows' own documented `MAX_PATH` limit (`GetFullPathNameA` etc.) — the
+/// real-world ceiling for an in-VM executable path, not an invented
+/// DuDuClaw number.
+pub const MAX_EXE_LEN: usize = 260;
+
+/// Display-name cap. No OS-mandated number exists for a RemoteApp window
+/// title — this is a generous UI cap so a pathological string cannot blow
+/// up the Launcher tile layout, not a citation of anyone else's limit.
+pub const MAX_DISPLAY_NAME_LEN: usize = 128;
+
+/// One pinned Windows RemoteApp — the exact shape `apps.toml` serializes
+/// (`[[apps]] name = "..." exe = "..."`) and the exact shape
+/// `duduclaw-shell`'s `apps::windows_vm` module hand-parses back out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteAppEntry {
+    pub name: String,
+    pub exe: String,
+}
+
+/// The registry file's whole-document shape, for the READ side only (see
+/// this section's header comment on why writing does not go through this
+/// struct's `Serialize` at all). `#[serde(default)]` so an empty or
+/// apps-key-absent file parses as an empty registry rather than an error —
+/// including a completely empty document, which is what [`render_apps_toml`]
+/// produces for zero entries.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RemoteAppsFile {
+    #[serde(default)]
+    apps: Vec<RemoteAppEntry>,
+}
+
+fn apps_toml_path(home: &Path) -> PathBuf {
+    windows_vm_dir(home).join("apps.toml")
+}
+
+/// Rejects a CR/LF or over-length exe path before it ever reaches the
+/// registry file. A raw newline here would break both this file's own
+/// line-oriented writer expectations AND `duduclaw-shell`'s hand-rolled
+/// line-based reader (see that module's header comment), and there is no
+/// legitimate Windows executable path that ever needs one — CLAUDE.md's
+/// "validate at system boundaries" convention, applied at the one point
+/// operator-typed text enters this registry.
+pub fn sanitize_exe(exe: &str) -> std::result::Result<String, String> {
+    let trimmed = exe.trim();
+    if trimmed.is_empty() {
+        return Err("執行檔路徑不可為空".to_string());
+    }
+    if trimmed.contains('\r') || trimmed.contains('\n') {
+        return Err("執行檔路徑不可包含換行字元".to_string());
+    }
+    let len = trimmed.chars().count();
+    if len > MAX_EXE_LEN {
+        return Err(format!("執行檔路徑過長（{len} 字元，上限 {MAX_EXE_LEN}，即 Windows 的 MAX_PATH）"));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Same shape as [`sanitize_exe`] for the display name — see that fn's doc
+/// comment.
+pub fn sanitize_display_name(name: &str) -> std::result::Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("顯示名稱不可為空".to_string());
+    }
+    if trimmed.contains('\r') || trimmed.contains('\n') {
+        return Err("顯示名稱不可包含換行字元".to_string());
+    }
+    let len = trimmed.chars().count();
+    if len > MAX_DISPLAY_NAME_LEN {
+        return Err(format!("顯示名稱過長（{len} 字元，上限 {MAX_DISPLAY_NAME_LEN}）"));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Reads the registry. A missing file is an honest EMPTY registry (the
+/// ordinary "windows-vm was never set up, or nothing has been pinned yet"
+/// state — matches `duduclaw-shell`'s own `apps::windows_vm` "no file =
+/// empty list, honestly and silently" contract on the read side); a file
+/// that EXISTS but fails to parse as TOML is a real error, never silently
+/// treated as empty — `app-add`/`app-remove` must not risk overwriting a
+/// registry the parser merely failed to read with a single new entry.
+pub fn read_apps_registry(path: &Path) -> std::result::Result<Vec<RemoteAppEntry>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("讀取 {} 失敗：{e}", path.display())),
+    };
+    toml::from_str::<RemoteAppsFile>(&content).map(|f| f.apps).map_err(|e| format!("解析 {}（TOML 格式錯誤）：{e}", path.display()))
+}
+
+/// Encodes `value` as a TOML basic (double-quoted) string, ALWAYS — never
+/// `toml_edit`'s pretty-printer's automatic literal-string/multi-line-string
+/// picking. See this section's header comment for the empirical finding
+/// that made this necessary and non-optional: `apps/windows_vm.rs`'s
+/// hand-rolled reader on the other end of this contract only understands
+/// this ONE representation, so this is the one this file must always emit.
+/// Escape table matches `duduclaw_core::preset.rs::toml_string`'s (this
+/// crate's own established "hand-escape rather than trust the library's
+/// choice of form" precedent) — `"`, `\`, `\n`, `\r`, `\t`, and any other
+/// control byte via `\u{:04x}`. `sanitize_exe`/`sanitize_display_name`
+/// already refuse `\r`/`\n` before a value ever reaches here, so those two
+/// branches are unreachable in practice through this file's own call sites
+/// — kept anyway because this fn's contract is "produce valid TOML for ANY
+/// `&str`," not "for whatever `sanitize_*` already screened."
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Pure renderer, split out so a test can pin the exact byte shape without
+/// touching the filesystem. `[]` entries render to an empty string (not
+/// `"apps = []\n"` — no reader on either end of this contract needs the key
+/// spelled out for the empty case: `toml::from_str`'s `#[serde(default)]`
+/// and `apps/windows_vm.rs::parse_apps_toml` both already treat a document
+/// with no `[[apps]]` blocks at all as an empty registry).
+fn render_apps_toml(entries: &[RemoteAppEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        out.push_str("[[apps]]\n");
+        out.push_str("name = ");
+        out.push_str(&toml_basic_string(&entry.name));
+        out.push('\n');
+        out.push_str("exe = ");
+        out.push_str(&toml_basic_string(&entry.exe));
+        out.push('\n');
+        out.push('\n');
+    }
+    out
+}
+
+/// Atomic write (sibling temp file + rename, same shape
+/// `write_compose_file_0600` and `duduclaw_core::org_store`/`preset`'s own
+/// `write_atomic` use) with `0644`/`0755` — see this section's header
+/// comment for why that departs from `write_compose_file_0600`'s stricter
+/// mode.
+fn write_apps_registry_0644(path: &Path, entries: &[RemoteAppEntry]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    let content = render_apps_toml(entries);
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// `duduclaw compat windows-vm app-add <exe> --name <顯示名>`.
+///
+/// **Upsert semantics on `exe`, chosen and documented rather than left
+/// implicit**: running `app-add` again for an `exe` already in the registry
+/// REPLACES its display name in place, rather than appending a second row.
+/// The alternative (refuse when the exe already exists) would make renaming
+/// a pinned app a two-step `app-remove` + `app-add` dance for no safety
+/// benefit — nothing irreversible happens either way, and a registry with
+/// two rows for the same launch command would just need this exact same
+/// dedup logic later, on the read side, for no reason (`duduclaw-shell`'s
+/// `apps::installed::merge_windows_vm` already documents that it collapses
+/// duplicates defensively, but the registry itself should not normally
+/// produce them). Matching is EXACT and case-SENSITIVE on `exe` — Windows
+/// paths are case-preserving even though the filesystem underneath is
+/// usually case-insensitive, and guessing at case-folding here risks
+/// silently merging two operator-intended distinct entries.
+pub async fn cmd_compat_windows_vm_app_add(exe: String, name: String) -> Result<()> {
+    let exe = sanitize_exe(&exe).map_err(DuDuClawError::Config)?;
+    let name = sanitize_display_name(&name).map_err(DuDuClawError::Config)?;
+    let home = crate::duduclaw_home();
+    let path = apps_toml_path(&home);
+    let mut entries = read_apps_registry(&path).map_err(DuDuClawError::Config)?;
+    let existed = entries.iter().any(|e| e.exe == exe);
+    entries.retain(|e| e.exe != exe);
+    entries.push(RemoteAppEntry { name: name.clone(), exe: exe.clone() });
+    write_apps_registry_0644(&path, &entries).map_err(|e| DuDuClawError::Config(format!("寫入 {} 失敗：{e}", path.display())))?;
+    if existed {
+        println!("✓ 已更新：{exe} → 「{name}」（原有項目的顯示名稱已覆蓋）");
+    } else {
+        println!("✓ 已加入啟動器：{exe} → 「{name}」");
+    }
+    println!("下一步：桌面啟動器（Launcher）下次掃描（最長 60 秒）後會出現這個項目。");
+    Ok(())
+}
+
+/// `duduclaw compat windows-vm app-remove <exe>`. Exact match on `exe`
+/// (never a substring/prefix — this codebase's coding convention 2), and
+/// honest about whether anything was actually removed rather than a
+/// blanket "done" that would mask a typo'd exe.
+pub async fn cmd_compat_windows_vm_app_remove(exe: String) -> Result<()> {
+    let home = crate::duduclaw_home();
+    let path = apps_toml_path(&home);
+    let mut entries = read_apps_registry(&path).map_err(DuDuClawError::Config)?;
+    let before = entries.len();
+    entries.retain(|e| e.exe != exe);
+    if entries.len() == before {
+        return Err(DuDuClawError::Config(format!(
+            "找不到 {exe}——目前啟動器沒有這個項目（用 `duduclaw compat windows-vm app-list` 查看目前清單）。"
+        )));
+    }
+    write_apps_registry_0644(&path, &entries).map_err(|e| DuDuClawError::Config(format!("寫入 {} 失敗：{e}", path.display())))?;
+    println!("✓ 已從啟動器移除：{exe}");
+    Ok(())
+}
+
+/// `duduclaw compat windows-vm app-list`.
+pub async fn cmd_compat_windows_vm_app_list() -> Result<()> {
+    let home = crate::duduclaw_home();
+    let path = apps_toml_path(&home);
+    let entries = read_apps_registry(&path).map_err(DuDuClawError::Config)?;
+    if entries.is_empty() {
+        println!("目前沒有釘選任何 Windows 應用程式。用 `duduclaw compat windows-vm app-add <執行檔> --name <顯示名>` 加入一個。");
+        return Ok(());
+    }
+    println!("已釘選 {} 個 Windows 應用程式（{}）：", entries.len(), path.display());
+    for entry in &entries {
+        println!("  • {} — {}", entry.name, entry.exe);
+    }
+    Ok(())
 }
 
 // ── RemoteApp launch (xfreerdp3) ────────────────────────────────────────
@@ -791,6 +1105,207 @@ mod tests {
         assert!(yaml.contains("DISK_SIZE: \"128G\""));
         assert!(yaml.contains("CPU_CORES: \"4\""));
         assert!(yaml.contains("/data/windows-vm/storage:/storage"));
+    }
+
+    // ── RemoteApp registry (`apps.toml`) — CP-2 wave-2 ────────────────
+
+    #[test]
+    fn sanitize_exe_rejects_empty_cr_lf_and_over_length() {
+        assert!(sanitize_exe("").is_err());
+        assert!(sanitize_exe("   ").is_err());
+        // EMBEDDED CR/LF is the dangerous case (survives `trim`, would break
+        // both line-oriented registry ends); an edge newline is ordinary
+        // copy-paste residue and is trimmed like any other edge whitespace —
+        // the "trims surrounding whitespace" assertion below pins that.
+        assert!(sanitize_exe("win\nword.exe").is_err());
+        assert!(sanitize_exe("win\rword.exe").is_err());
+        assert_eq!(sanitize_exe("winword.exe\n"), Ok("winword.exe".to_string()), "an edge newline is trimmed, not rejected");
+        assert!(sanitize_exe(&"x".repeat(MAX_EXE_LEN + 1)).is_err());
+        assert_eq!(sanitize_exe(&"x".repeat(MAX_EXE_LEN)), Ok("x".repeat(MAX_EXE_LEN)));
+        assert_eq!(sanitize_exe("  winword.exe  "), Ok("winword.exe".to_string()), "trims surrounding whitespace");
+        assert_eq!(sanitize_exe(r"C:\Program Files\Office\winword.exe"), Ok(r"C:\Program Files\Office\winword.exe".to_string()));
+    }
+
+    #[test]
+    fn sanitize_display_name_rejects_empty_cr_lf_and_over_length() {
+        assert!(sanitize_display_name("").is_err());
+        assert!(sanitize_display_name("Wo\nrd").is_err(), "embedded LF — see sanitize_exe's test for the edge-vs-embedded contract");
+        assert!(sanitize_display_name(&"字".repeat(MAX_DISPLAY_NAME_LEN + 1)).is_err());
+        assert_eq!(sanitize_display_name("  Word  "), Ok("Word".to_string()));
+        assert_eq!(sanitize_display_name("記帳軟體"), Ok("記帳軟體".to_string()), "CJK names are accepted verbatim");
+    }
+
+    #[test]
+    fn read_apps_registry_on_a_missing_file_is_an_empty_registry_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist").join("apps.toml");
+        assert_eq!(read_apps_registry(&path), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn read_apps_registry_on_malformed_toml_is_an_error_not_a_silent_empty_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apps.toml");
+        std::fs::write(&path, "this is not [ valid toml").unwrap();
+        assert!(read_apps_registry(&path).is_err(), "a broken file must never be indistinguishable from an empty one");
+    }
+
+    // ── toml_basic_string / render_apps_toml: the actual bug this section's
+    // header comment documents, pinned so it cannot silently come back ────
+
+    #[test]
+    fn toml_basic_string_always_uses_double_quotes_never_the_pretty_printers_literal_form() {
+        // The regression this whole rewrite exists for: `toml::
+        // to_string_pretty` picks a SINGLE-quoted literal string for any
+        // value containing a backslash (empirically verified against this
+        // crate's pinned `toml = "0.8"`, 2026-08-30) — which is every real
+        // Windows path — and `apps/windows_vm.rs`'s hand-rolled reader on
+        // the other end only understands double-quoted basic strings.
+        assert_eq!(toml_basic_string(r"C:\Program Files\Office\winword.exe"), r#""C:\\Program Files\\Office\\winword.exe""#);
+        assert!(!toml_basic_string(r"C:\a").starts_with('\''), "must never fall back to a literal (single-quoted) string");
+    }
+
+    #[test]
+    fn toml_basic_string_escapes_quotes_backslashes_and_control_characters() {
+        assert_eq!(toml_basic_string("plain"), "\"plain\"");
+        assert_eq!(toml_basic_string("Say \"Hi\""), "\"Say \\\"Hi\\\"\"");
+        assert_eq!(toml_basic_string("It's"), "\"It's\"", "an apostrophe needs no escaping in a basic string");
+        assert_eq!(toml_basic_string("Both \" and ' here"), "\"Both \\\" and ' here\"", "must stay ONE double-quoted line, never the pretty-printer's triple-quote form");
+        assert_eq!(toml_basic_string("Tab\tHere"), "\"Tab\\tHere\"");
+        assert_eq!(toml_basic_string("記帳軟體"), "\"記帳軟體\"", "CJK is never escaped");
+    }
+
+    #[test]
+    fn render_apps_toml_produces_the_exact_shape_the_shell_side_parser_expects() {
+        let entries =
+            vec![RemoteAppEntry { name: "Word".to_string(), exe: "winword.exe".to_string() }, RemoteAppEntry { name: "Excel".to_string(), exe: "excel.exe".to_string() }];
+        assert_eq!(render_apps_toml(&entries), "[[apps]]\nname = \"Word\"\nexe = \"winword.exe\"\n\n[[apps]]\nname = \"Excel\"\nexe = \"excel.exe\"\n\n");
+    }
+
+    #[test]
+    fn render_apps_toml_of_an_empty_registry_is_an_empty_string() {
+        assert_eq!(render_apps_toml(&[]), "");
+    }
+
+    #[test]
+    fn write_then_read_apps_registry_round_trips_including_cjk_backslashes_and_mixed_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("windows-vm").join("apps.toml");
+        let entries = vec![
+            RemoteAppEntry { name: "Word".to_string(), exe: r"C:\Program Files\Office\winword.exe".to_string() },
+            RemoteAppEntry { name: "記帳軟體".to_string(), exe: "ledger.exe".to_string() },
+            // The exact case that broke `toml::to_string_pretty` (triple-
+            // quoted multi-line form) — must still round-trip through
+            // `toml::from_str` on THIS side of the contract.
+            RemoteAppEntry { name: "Both \" and ' here".to_string(), exe: "a.exe".to_string() },
+        ];
+        write_apps_registry_0644(&path, &entries).unwrap();
+        assert_eq!(read_apps_registry(&path).unwrap(), entries);
+        // And the bytes actually on disk are the controlled shape, not
+        // whatever `toml_edit`'s pretty-printer would have chosen. Checking
+        // for a bare `'` anywhere would be wrong — the third entry's name
+        // legitimately CONTAINS one as ordinary content — so this checks
+        // for the literal-string DELIMITER pattern specifically (a value
+        // starting with `'` right after `=`), which must never appear.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#"exe = "C:\\Program Files\\Office\\winword.exe""#));
+        assert!(!raw.contains("= '"), "must never use a single-quoted (literal) TOML string as a value delimiter");
+        assert!(!raw.contains(r#"""""#), "must never use a triple-quoted (multi-line) TOML string");
+    }
+
+    #[test]
+    fn write_apps_registry_sets_0644_on_the_file_and_0755_on_the_directory() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let vm_dir = dir.path().join("windows-vm");
+            let path = vm_dir.join("apps.toml");
+            write_apps_registry_0644(&path, &[RemoteAppEntry { name: "Word".to_string(), exe: "winword.exe".to_string() }]).unwrap();
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            let dir_mode = std::fs::metadata(&vm_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o644, "must be cross-user readable — see this section's header comment");
+            assert_eq!(dir_mode, 0o755);
+        }
+    }
+
+    #[test]
+    fn apps_toml_lives_under_the_windows_vm_directory_next_to_compose_yaml() {
+        let home = Path::new("/home/duduclaw/.duduclaw");
+        assert_eq!(apps_toml_path(home), home.join("windows-vm").join("apps.toml"));
+    }
+
+    #[tokio::test]
+    async fn app_add_then_list_then_remove_round_trips_end_to_end() {
+        // `DUDUCLAW_HOME` is process-wide — shares this file's own
+        // `ENV_LOCK` with the KVM-device-path override test above, same
+        // "serialize + always restore" discipline `oobe/claim.rs` (in
+        // `duduclaw-shell`) documents for the identical hazard.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("DUDUCLAW_HOME");
+        unsafe { std::env::set_var("DUDUCLAW_HOME", dir.path()) };
+
+        let add_result = cmd_compat_windows_vm_app_add("winword.exe".to_string(), "Word".to_string()).await;
+        let entries_after_add = read_apps_registry(&apps_toml_path(&crate::duduclaw_home()));
+        let remove_missing_result = cmd_compat_windows_vm_app_remove("does-not-exist.exe".to_string()).await;
+        let remove_result = cmd_compat_windows_vm_app_remove("winword.exe".to_string()).await;
+        let entries_after_remove = read_apps_registry(&apps_toml_path(&crate::duduclaw_home()));
+
+        unsafe {
+            match &prev {
+                Some(v) => std::env::set_var("DUDUCLAW_HOME", v),
+                None => std::env::remove_var("DUDUCLAW_HOME"),
+            }
+        }
+
+        assert!(add_result.is_ok());
+        assert_eq!(entries_after_add, Ok(vec![RemoteAppEntry { name: "Word".to_string(), exe: "winword.exe".to_string() }]));
+        assert!(remove_missing_result.is_err(), "removing an exe that was never added must be an honest error");
+        assert!(remove_result.is_ok());
+        assert_eq!(entries_after_remove, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn app_add_twice_for_the_same_exe_upserts_rather_than_duplicating() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("DUDUCLAW_HOME");
+        unsafe { std::env::set_var("DUDUCLAW_HOME", dir.path()) };
+
+        let _ = cmd_compat_windows_vm_app_add("winword.exe".to_string(), "Word (old)".to_string()).await;
+        let _ = cmd_compat_windows_vm_app_add("winword.exe".to_string(), "Word".to_string()).await;
+        let entries = read_apps_registry(&apps_toml_path(&crate::duduclaw_home()));
+
+        unsafe {
+            match &prev {
+                Some(v) => std::env::set_var("DUDUCLAW_HOME", v),
+                None => std::env::remove_var("DUDUCLAW_HOME"),
+            }
+        }
+
+        assert_eq!(entries, Ok(vec![RemoteAppEntry { name: "Word".to_string(), exe: "winword.exe".to_string() }]), "the second app-add must replace, not append");
+    }
+
+    #[tokio::test]
+    async fn app_add_rejects_a_newline_in_exe_before_touching_the_registry() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("DUDUCLAW_HOME");
+        unsafe { std::env::set_var("DUDUCLAW_HOME", dir.path()) };
+
+        let result = cmd_compat_windows_vm_app_add("win\nword.exe".to_string(), "Word".to_string()).await;
+        let path_exists = apps_toml_path(&crate::duduclaw_home()).exists();
+
+        unsafe {
+            match &prev {
+                Some(v) => std::env::set_var("DUDUCLAW_HOME", v),
+                None => std::env::remove_var("DUDUCLAW_HOME"),
+            }
+        }
+
+        assert!(result.is_err());
+        assert!(!path_exists, "a rejected exe must never reach the registry file at all");
     }
 
     // ── xfreerdp RemoteApp argv building ─────────────────────────────

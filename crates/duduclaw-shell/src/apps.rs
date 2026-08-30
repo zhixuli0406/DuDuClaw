@@ -15,12 +15,16 @@
 //   * **What is installed** — `apps::installed::scan()`, a real enumeration
 //     of `flatpak list --app` plus the XDG `.desktop` directories, merged
 //     and deduplicated (`apps/installed.rs`; `apps/flatpak_list.rs` and
-//     `apps/desktop_entry.rs` are its two parsers). Held in
-//     `apps::feed::InstalledAppsFeed`, scanned on a cadence off the render
-//     thread. `search()` below filters THAT. There is no fallback to canned
-//     data anywhere on this path: a machine with nothing installed renders
-//     an empty list with an honest message, and a failed enumeration says
-//     so rather than substituting a catalog.
+//     `apps/desktop_entry.rs` are its two parsers). CP-2 wave-2
+//     (2026-08-30) added a THIRD source, `apps/windows_vm.rs`: Windows
+//     RemoteApp executables the operator pinned via `duduclaw compat
+//     windows-vm app-add` on the CLI side, read from a fixed cross-user
+//     path (see that module's own header comment for why it is not
+//     `$HOME`-relative). Held in `apps::feed::InstalledAppsFeed`, scanned on
+//     a cadence off the render thread. `search()` below filters THAT. There
+//     is no fallback to canned data anywhere on this path: a machine with
+//     nothing installed renders an empty list with an honest message, and a
+//     failed enumeration says so rather than substituting a catalog.
 //   * **What could be installed** — `apps::catalog::INSTALL_CATALOG`, a
 //     curated list of apps this shell knows a real flatpak ref and remote
 //     for. That is not derivable from scanning a machine that does not have
@@ -48,6 +52,7 @@ pub(crate) mod flatpak_list;
 pub(crate) mod icon_resolve;
 pub(crate) mod icon_theme;
 pub(crate) mod installed;
+pub(crate) mod windows_vm;
 
 use installed::InstalledApp;
 

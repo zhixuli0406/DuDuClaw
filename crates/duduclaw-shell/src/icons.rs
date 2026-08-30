@@ -825,15 +825,36 @@ mod tests {
         }
     }
 
-    /// The catalog is small and hand-authored, so "every entry has an icon"
-    /// is a claim worth holding to — an entry added without one silently
-    /// falls back to a CJK character, which is the state this whole work
-    /// package exists to end.
+    /// Every catalog entry must render SOMETHING real — either a registered
+    /// icon or `CatalogApp::glyph`'s own documented fallback (that field's
+    /// doc comment in `apps/catalog.rs`: "this is what shows if that lookup
+    /// finds nothing" — the type was always designed to allow this, not an
+    /// oversight this test should treat as one).
+    ///
+    /// This test used to require a REGISTERED ICON for every entry with no
+    /// exception — true by coincidence back when Chromium (which has real
+    /// board artwork, A2's own container PASS) was the only entry, and
+    /// worth holding onto as long as it stayed true for free. CP-2 wave-2
+    /// (2026-08-30) added Bottles with no board icon behind it — logic/
+    /// backend work landed first, a visual design pass for its tile is a
+    /// deliberate follow-up, not an oversight; the glyph "轉" is the honest
+    /// interim state — so the blanket claim is no longer true and this test
+    /// now checks what the type actually guarantees instead: no entry falls
+    /// all the way through to an EMPTY glyph, which would render an
+    /// invisible tile.
+    /// `apps/catalog.rs::every_catalog_entry_names_a_real_ref_a_real_remote_
+    /// and_a_rated_tier` already pins the glyph non-empty at the source; this
+    /// is the cross-module confirmation that the render path actually agrees.
     #[test]
-    fn every_catalog_entry_has_an_icon() {
+    fn every_catalog_entry_renders_a_real_icon_or_a_documented_glyph_fallback() {
         let palette = ShellPalette::light();
         for entry in crate::apps::catalog::INSTALL_CATALOG {
-            assert!(catalog_layers(entry.id, palette).is_some(), "catalog entry {} has no icon mapping", entry.id);
+            let has_icon = catalog_layers(entry.id, palette).is_some();
+            assert!(
+                has_icon || !entry.glyph.is_empty(),
+                "catalog entry {} has neither a registered icon nor a non-empty glyph fallback — its tile would render empty",
+                entry.id
+            );
         }
     }
 

@@ -1480,6 +1480,33 @@ enum CompatWindowsVmCommands {
         #[arg(long)]
         name: Option<String>,
     },
+
+    /// CP-2 wave-2: pin a Windows executable so it appears as an ordinary
+    /// tile in `duduclaw-shell`'s Launcher — writes
+    /// `<DUDUCLAW_HOME>/windows-vm/apps.toml`, the same registry
+    /// `duduclaw-shell`'s `apps::windows_vm` module reads. Running this
+    /// again for an `exe` already pinned replaces its display name rather
+    /// than adding a duplicate row.
+    #[command(name = "app-add")]
+    AppAdd {
+        /// Path or alias of the Windows executable inside the VM — same
+        /// shape `app` above launches.
+        exe: String,
+        /// Display name shown on the Launcher tile.
+        #[arg(long)]
+        name: String,
+    },
+
+    /// Un-pin a Windows executable from the Launcher (exact match on `exe`,
+    /// as it was given to `app-add`).
+    #[command(name = "app-remove")]
+    AppRemove {
+        exe: String,
+    },
+
+    /// List every currently-pinned Windows executable.
+    #[command(name = "app-list")]
+    AppList,
 }
 
 #[derive(Subcommand)]
@@ -2111,6 +2138,13 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
                 CompatWindowsVmCommands::App { exe, name } => {
                     compat_windows_vm::cmd_compat_windows_vm_app(exe, name).await
                 }
+                CompatWindowsVmCommands::AppAdd { exe, name } => {
+                    compat_windows_vm::cmd_compat_windows_vm_app_add(exe, name).await
+                }
+                CompatWindowsVmCommands::AppRemove { exe } => {
+                    compat_windows_vm::cmd_compat_windows_vm_app_remove(exe).await
+                }
+                CompatWindowsVmCommands::AppList => compat_windows_vm::cmd_compat_windows_vm_app_list().await,
             },
         },
         Commands::Service { command } => {

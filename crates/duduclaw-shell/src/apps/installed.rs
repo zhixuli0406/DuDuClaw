@@ -44,12 +44,17 @@ use std::path::{Path, PathBuf};
 use super::desktop_entry::{self, XdgEnv};
 use super::flatpak_list;
 use super::icon_resolve::{self, AppIcon, IconMiss};
+use super::windows_vm;
 
 /// Which enumeration an entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum AppSource {
     Flatpak,
     Desktop,
+    /// CP-2 wave-2 (2026-08-30) — an operator-pinned Windows RemoteApp
+    /// executable, from `apps/windows_vm.rs`. See that module's header
+    /// comment for the registry it reads.
+    WindowsVm,
 }
 
 /// How one source's enumeration went. See this file's header comment for
@@ -156,16 +161,94 @@ const MAX_DEPTH: usize = 3;
 const MAX_FILES: usize = 2000;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 
-/// BLOCKING. Enumerates both sources and merges them. Never returns an
+/// BLOCKING. Enumerates all sources and merges them. Never returns an
 /// error: a source that is missing or broken is recorded as such and
 /// contributes nothing (see this file's header comment).
+///
+/// Three sources, two different merge shapes: flatpak and desktop go
+/// through `merge` (id collisions between THOSE two are expected and
+/// meaningful — see that fn's own doc comment), and the windows-vm registry
+/// (CP-2 wave-2) is folded in afterward by `merge_windows_vm`, which needs
+/// no such heuristic — see that fn's own doc comment for why.
 pub(crate) fn scan() -> ScanOutcome {
     let env = xdg_env_from_process();
     let (flatpak_apps, flatpak) = scan_flatpak();
     let (desktop_apps, desktop) = scan_desktop(&env);
     let mut apps = merge(flatpak_apps, desktop_apps);
+    apps = merge_windows_vm(apps, scan_windows_vm());
     resolve_icons(&mut apps, &env);
     ScanOutcome { apps, flatpak, desktop }
+}
+
+/// The windows-vm source (CP-2 wave-2, 2026-08-30) — see `apps/
+/// windows_vm.rs`'s own header comment for why it carries no `SourceStatus`
+/// of its own: there is no subprocess here that can fail independently of
+/// "the registry file is readable or it isn't", so a missing/unreadable
+/// file just contributes zero rows, silently, the same way an `Absent`
+/// flatpak/desktop source does.
+fn scan_windows_vm() -> Vec<InstalledApp> {
+    windows_vm::scan().into_iter().map(from_windows_vm_entry).collect()
+}
+
+/// One registry row becomes one Launcher row. The display name gets a
+/// `（Windows）` suffix so a RemoteApp tile is visually distinguishable from
+/// a native one without a new UI affordance — same "the name IS the
+/// signal" approach `apps::catalog`'s own entries use for their labels.
+/// `exec_argv` is `windows_vm::launch_argv`, which reuses `apps::launch`'s
+/// ALREADY-generic exec_argv branch — no new launch code path is added
+/// anywhere for this source.
+fn from_windows_vm_entry(entry: windows_vm::WindowsVmApp) -> InstalledApp {
+    let id = format!("windows-vm:{}", entry.exe);
+    let search_key = search_key_from(&[&entry.name, &entry.exe, "windows", "remoteapp"]);
+    let exec_argv = windows_vm::launch_argv(&entry);
+    InstalledApp {
+        name: format!("{}（Windows）", entry.name),
+        id,
+        source: AppSource::WindowsVm,
+        // No icon source exists for a RemoteApp pin (there is no local
+        // `.desktop`/`Icon=` for an executable that lives inside a VM) —
+        // `resolve_icons` below resolves this the same honest way it
+        // resolves a flatpak row with no exported icon: the generic
+        // application icon, never an invented one.
+        icon: None,
+        resolved_icon: None,
+        exec_argv: Some(exec_argv),
+        flatpak_id: None,
+        terminal: false,
+        search_key,
+        origin: format!("windows-vm registry: {}", entry.exe),
+    }
+}
+
+/// Folds the windows-vm source (CP-2 wave-2) into the already-merged
+/// flatpak+desktop list. This is NOT `merge`'s own id-collision heuristic —
+/// it does not need one. Every windows-vm row's id is prefixed
+/// `windows-vm:<exe>` (`from_windows_vm_entry`), a namespace neither a
+/// flatpak reverse-DNS id nor an XDG desktop-file id can ever produce (both
+/// are validated/derived formats that cannot contain a literal `:`
+/// immediately after `windows-vm`), so collision with the other two
+/// sources is impossible by construction. The only dedup this performs is
+/// AMONG windows-vm rows themselves, by that same id, case-insensitively —
+/// the same key `merge` uses above — so a hand-edited `apps.toml` with two
+/// rows for the same `exe` still produces exactly one Launcher tile (last
+/// one in the file wins, matching the CLI-side registry's own
+/// upsert-on-`exe` write contract — see `compat_windows_vm.rs::
+/// cmd_compat_windows_vm_app_add`'s doc comment).
+fn merge_windows_vm(base: Vec<InstalledApp>, windows_vm_apps: Vec<InstalledApp>) -> Vec<InstalledApp> {
+    if windows_vm_apps.is_empty() {
+        return base;
+    }
+    let mut by_id: BTreeMap<String, InstalledApp> = BTreeMap::new();
+    for app in windows_vm_apps {
+        by_id.insert(app.id.to_lowercase(), app);
+    }
+    let mut apps = base;
+    // Same belt-and-suspenders `launchable()` filter `merge` enforces at
+    // its own single production point — see that fn's own comment on why
+    // this filters nothing today but must stay.
+    apps.extend(by_id.into_values().filter(|app| app.launchable()));
+    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id.cmp(&b.id)));
+    apps
 }
 
 /// ICON-2 (2026-08-22). Turns every merged app's `Icon=` into a drawable
@@ -196,7 +279,7 @@ fn resolve_icons(apps: &mut [InstalledApp], env: &XdgEnv) {
                 app.resolved_icon = None;
                 let message = match miss {
                     IconMiss::NoIconKey => format!(
-                        "[app-icon] {}: no Icon= to resolve (a flatpak app with no reachable exported .desktop file, or an entry that declares none) — drawing the generic application icon",
+                        "[app-icon] {}: no Icon= to resolve (a flatpak app with no reachable exported .desktop file, a windows-vm RemoteApp pin — which has no local icon source at all, see apps/windows_vm.rs — or an entry that declares none) — drawing the generic application icon",
                         app.id
                     ),
                     IconMiss::Unresolved => format!(
@@ -684,6 +767,66 @@ mod tests {
     #[test]
     fn merging_nothing_with_nothing_is_an_empty_list_not_a_fallback_catalog() {
         assert!(merge(Vec::new(), Vec::new()).is_empty());
+    }
+
+    // ── windows-vm source (CP-2 wave-2) ────────────────────────────────────
+
+    fn windows_vm_entry(name: &str, exe: &str) -> windows_vm::WindowsVmApp {
+        windows_vm::WindowsVmApp { name: name.to_string(), exe: exe.to_string() }
+    }
+
+    #[test]
+    fn a_windows_vm_entry_becomes_a_launchable_row_with_a_windows_suffixed_name() {
+        let app = from_windows_vm_entry(windows_vm_entry("Word", "winword.exe"));
+        assert_eq!(app.source, AppSource::WindowsVm);
+        assert_eq!(app.id, "windows-vm:winword.exe");
+        assert_eq!(app.name, "Word（Windows）");
+        assert_eq!(app.flatpak_id, None, "launch goes through exec_argv, not flatpak run");
+        assert!(app.launchable());
+        assert_eq!(app.icon, None, "no local icon source exists for a RemoteApp pin — never invented");
+        assert!(app.search_key.contains("word"));
+        assert!(app.search_key.contains("windows"));
+    }
+
+    #[test]
+    fn a_windows_vm_entrys_launch_command_is_the_real_cli_invocation() {
+        let app = from_windows_vm_entry(windows_vm_entry("Word", "winword.exe"));
+        assert_eq!(app.exec_argv.as_deref(), Some(["duduclaw", "compat", "windows-vm", "app", "winword.exe", "--name", "Word"].map(str::to_string).as_slice()));
+    }
+
+    #[test]
+    fn merge_windows_vm_appends_without_disturbing_flatpak_and_desktop_rows() {
+        let base = merge(vec![flatpak_app("org.chromium.Chromium", "Chromium")], Vec::new());
+        let windows_vm_apps = vec![from_windows_vm_entry(windows_vm_entry("Word", "winword.exe"))];
+        let merged = merge_windows_vm(base, windows_vm_apps);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|a| a.id == "org.chromium.Chromium"));
+        assert!(merged.iter().any(|a| a.id == "windows-vm:winword.exe"));
+    }
+
+    #[test]
+    fn merge_windows_vm_is_a_no_op_when_the_registry_is_empty() {
+        let base = merge(vec![flatpak_app("org.chromium.Chromium", "Chromium")], Vec::new());
+        let merged = merge_windows_vm(base.clone(), Vec::new());
+        assert_eq!(merged, base, "an empty (or never-set-up) windows-vm registry must not perturb the rest of the list");
+    }
+
+    #[test]
+    fn merge_windows_vm_dedups_two_rows_naming_the_same_exe_case_insensitively() {
+        let windows_vm_apps = vec![from_windows_vm_entry(windows_vm_entry("Word (old)", "WinWord.exe")), from_windows_vm_entry(windows_vm_entry("Word", "winword.exe"))];
+        let merged = merge_windows_vm(Vec::new(), windows_vm_apps);
+        assert_eq!(merged.len(), 1, "two registry rows for the same exe, differing only by case, must collapse to one tile");
+    }
+
+    #[test]
+    fn windows_vm_ids_can_never_collide_with_flatpak_or_desktop_ids() {
+        // The dedup-free-by-construction claim `merge_windows_vm`'s own doc
+        // comment makes, pinned: a real flatpak id and a real desktop-file
+        // id can never start with the `windows-vm:` prefix.
+        let base = merge(vec![flatpak_app("org.chromium.Chromium", "Chromium")], vec![desktop_app("zed", "[Desktop Entry]\nType=Application\nName=Zed\nExec=zed\n")]);
+        for app in &base {
+            assert!(!app.id.to_lowercase().starts_with("windows-vm:"));
+        }
     }
 
     // ── source status ───────────────────────────────────────────────────
