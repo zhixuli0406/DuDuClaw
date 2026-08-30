@@ -3,6 +3,7 @@ pub mod agent_rename;
 pub mod agent_toml;
 pub mod appliance;
 pub mod autostart;
+pub mod compat_runners;
 pub mod concurrency_gate;
 pub mod config;
 pub mod cron_tz;

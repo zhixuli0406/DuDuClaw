@@ -9,6 +9,7 @@ use duduclaw_agent::AgentRunner;
 use duduclaw_core::error::DuDuClawError;
 use duduclaw_core::types::CheckStatus;
 mod acp;
+mod compat_cmd;            // CP-1/A3: `duduclaw compat` — compat.d declarative runner registry CLI surface
 mod data_migrate;         // H3g: `duduclaw data-migrate` — /data forward-only settings migrator CLI front door
 mod docs_cmd;              // Stripe-style `duduclaw docs [<topic>]` (E12) — GitHub doc links, browser hand-off
 mod eval;                 // Harness-level agent behavior eval / regression suite (`duduclaw eval`)
@@ -300,6 +301,14 @@ enum Commands {
     Preset {
         #[command(subcommand)]
         command: PresetCommands,
+    },
+
+    /// Inspect installed app-compatibility runners (`compat.d` declarative
+    /// registry — SteamOS-style Windows/Android/macOS-remote bridge layer).
+    /// See `docs/guides/app-compat.md`.
+    Compat {
+        #[command(subcommand)]
+        command: CompatCommands,
     },
 
     /// Manage the DuDuClaw background service
@@ -1400,6 +1409,24 @@ enum PresetCommands {
     },
 }
 
+/// CP-1/A3 — `duduclaw compat`: read-only front door onto the `compat.d`
+/// declarative app-compatibility runner registry
+/// (`duduclaw_core::compat_runners`). Nothing under this subcommand
+/// launches a runner's `entrypoint` in this wave — see `compat_cmd` module
+/// docs.
+#[derive(Subcommand)]
+enum CompatCommands {
+    /// List every discovered runner (shipped layer + data-layer overrides,
+    /// merged by id) with its readiness: `ready`, `missing: <tools>`, or
+    /// `malformed`.
+    List {
+        /// Emit a single machine-readable JSON array on stdout instead of
+        /// the human table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum ServiceCommands {
     /// Install DuDuClaw as a system service
@@ -2018,6 +2045,9 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             PresetCommands::Unbind { agent, reason } => preset_cmd::cmd_preset_unbind(&agent, &reason).await,
             PresetCommands::Status { agent } => preset_cmd::cmd_preset_status(&agent),
             PresetCommands::InstallBuiltin { force } => preset_cmd::cmd_preset_install_builtin(force),
+        },
+        Commands::Compat { command } => match command {
+            CompatCommands::List { json } => compat_cmd::cmd_compat_list(json),
         },
         Commands::Service { command } => {
             match command {

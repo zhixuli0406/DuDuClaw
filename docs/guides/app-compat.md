@@ -1,0 +1,106 @@
+# app 相容層：在 DuDuClaw OS 上跑 Windows / Android 應用程式
+
+DuDuClaw OS 本身是一套 Linux 基底的作業系統，但很多人手上仍有離不開的 Windows 或 Android 應用程式。**app 相容層**就是為此而生：透過一組可插拔的「相容層元件（runner）」，讓這些應用程式能在 DuDuClaw OS 上安裝、執行。做法參考 SteamOS 讓 Windows 遊戲能在 Linux 上跑的方式（Proton），並把同一套架構延伸到 Windows 桌面應用程式與 Android 應用程式。
+
+**先設定期望**：這不是「什麼應用程式都保證能跑」。每一個相容層元件都誠實標示自己「支援什麼、不支援什麼、目前缺什麼」，而不是含糊地說「應該可以」。
+
+## compat.d 是什麼
+
+`compat.d` 是相容層元件的**登記目錄**。每個元件（例如 Bottles、Waydroid）在這裡放一份宣告檔，描述：
+
+- 這個元件是從哪個系統把應用程式接進來的（Windows 遊戲／Windows 應用程式／Android／「連回你自己的 Mac」）
+- 怎麼啟動它
+- 需要哪些工具才能運作
+
+宣告檔分兩層存放，**後者可覆蓋前者**：
+
+| 層級 | 位置 | 誰寫入 |
+|---|---|---|
+| 出貨層 | `/usr/share/duduclaw/compat.d/` | 系統映像出廠內建 |
+| 資料層 | `~/.duduclaw/compat.d/`（或你設定的資料目錄） | 你自己或維運人員手動放入的覆蓋版本 |
+
+同一個元件 ID 若兩層都有，以資料層為準——這讓你不用重灌系統就能覆寫、微調一個元件的設定。
+
+第三方也能用同一套規則掛入自己的相容層元件（例如社群維護的 Proton 替代版本），不需要 DuDuClaw 額外支援。
+
+> 這一版（CP-1）只做「登記與健檢」：`duduclaw compat list` 會告訴你有哪些元件、缺什麼工具，但還不會幫你一鍵啟動應用程式本身——這是後續版本的工作。
+
+## 查看目前有哪些相容層元件
+
+```bash
+duduclaw compat list
+```
+
+輸出範例：
+
+```
+相容層 runner（2 個）：
+
+ID             名稱                         來源系統        狀態
+------------------------------------------------------------------
+bottles        Bottles（Windows 應用轉譯）    windows-app     ready
+waydroid       Waydroid（Android 應用容器）   android         missing: waydroid, lxc-start
+               → 見 docs/guides/app-compat.md 的 Waydroid 自裝入口段：...
+```
+
+`狀態`欄誠實反映現況：
+
+- `ready`：需要的工具都在，元件可用
+- `missing: <工具名>`：元件已登記，但還缺某些必要工具（見下方每個元件的說明）
+- `malformed`：宣告檔本身寫壞了（通常是維運端手動編輯出錯），不影響其他元件正常顯示
+
+需要機器可讀格式（例如寫腳本判斷）時加 `--json`：
+
+```bash
+duduclaw compat list --json
+```
+
+## Windows 桌面應用程式：Bottles
+
+Bottles 透過 Wine 相容層執行 Windows 應用程式，走 Flathub 通道安裝：
+
+```bash
+flatpak install flathub com.usebottles.bottles
+```
+
+安裝完成後，`duduclaw compat list` 會把 `bottles` 的狀態從 `missing: flatpak`（或元件本身未安裝）轉為 `ready`。
+
+**Bottles 適用範圍請照實看待**——它只承諾：
+
+- 舊版本、單機版、綠色版工具
+- 在 Wine 相容性資料庫（AppDB）上被評為「Silver」以上等級的軟體（例如舊版 Photoshop CC、舊版 Acrobat）
+
+**明確不承諾能跑（社群實測結果一致判定不可用）**：
+
+- 近三年（2023 年後）的 Microsoft Office
+- LINE Windows 版
+- AutoCAD 2018 以後版本
+
+這些應用程式即使裝了 Bottles，實測結果也大機率無法正常使用。若你需要這類軟體 100% 相容，正確路線是「真的一台 Windows」——DuDuClaw OS 之後會提供自包裝的虛擬機方案（尚未出貨），而不是勉強用 Bottles 硬跑。
+
+## Android 應用程式：Waydroid
+
+Waydroid 是一個 Android 應用程式容器，讓你在 DuDuClaw OS 上安裝、執行手機 App（例如 LINE）。
+
+### 為什麼需要自己動手裝
+
+DuDuClaw OS **出廠不內建** Google 服務框架（GApps）與 ARM 應用程式轉譯元件。原因很直接：這些元件的來源不透明（源自對 Windows Subsystem for Android 的逆向工程），DuDuClaw 沒有合法散布權利，因此不會、也不能預先幫你裝好。
+
+這表示：
+
+1. 你需要自己完成 **Google Play 裝置認證**（每台裝置認證一次即可）——這是 Google 官方提供的自助流程，跟在一般 Android 裝置上刷機後认证的步驟相同，不是 DuDuClaw 特製的東西。
+2. 若你要跑的應用程式只有 x86/x86_64 沒有的 ARM 版本，需要自行加裝 ARM 轉譯元件；這類元件品質與相容性因來源而異，DuDuClaw 無法替你把關。
+
+`duduclaw compat list` 顯示 `waydroid` 缺件是正常現象，不是系統壞掉——它誠實反映「容器本體已登記，但底層依賴（`waydroid`／`lxc-start`）或你自己要補的認證/轉譯元件還沒到位」。
+
+### 已知能跑的案例
+
+LINE 已在 arm64 硬體上完整驗證過「安裝 → 啟動 → 掃碼登入」全流程可行（使用 LINE 的「副裝置（Sub device）」模式，讓你的手機保持原本登入狀態）。這是目前唯一有實測證據支持的案例；其他應用程式請自行評估，不代表全面保證。
+
+## macOS 應用程式：我們不做本機執行
+
+**DuDuClaw OS 永遠不會、也不能讓你在非 Apple 硬體上直接執行 macOS 應用程式**——這不是技術選擇，是 Apple 軟體授權條款與美國判例法（Apple v. Psystar）劃下的法律紅線，DuDuClaw 不會踩。
+
+我們提供的是另一條合法、實用的路：**內建遠端連線工具，讓你從 DuDuClaw OS 桌面直接操作你自己那台 Mac**（Mac 需保持開機、你本人登入中）。你在 Mac 上的專屬軟體還是跑在你的 Mac 上，DuDuClaw OS 只是多一個操作視窗。
+
+換句話說：DuDuClaw OS 與你的 Mac **無縫協作**，而不是取代它。
