@@ -27,6 +27,19 @@ impl CompositorHandler for DuduclawComp {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        // A4 live-fire fix (CP-1, 2026-08-30): the spawned XWayland server
+        // ITSELF connects to this compositor as an ordinary Wayland client,
+        // but smithay's `XWayland::spawn` inserts ITS client data as
+        // `XWaylandClientData` — never this crate's `ClientState`. The old
+        // bare `unwrap()` therefore panicked the whole compositor ~15s
+        // after boot, the instant Xwayland's connection issued its first
+        // commit (live QEMU journal signature: "panicked at
+        // src/handlers/compositor.rs:30", duduclaw-kiosk NRestarts=6
+        // crash-loop). Two-branch shape is smithay's own anvil reference
+        // (`anvil/src/handlers/compositor.rs`), not an invention.
+        if let Some(data) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+            return &data.compositor_state;
+        }
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
@@ -41,11 +54,14 @@ impl CompositorHandler for DuduclawComp {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            if let Some(window) = self
-                .space
-                .elements()
-                .find(|w| w.toplevel().unwrap().wl_surface() == &root)
-            {
+            // A4 (CP-1, XWayland): fires on every commit, including an X11
+            // client's continuous buffer commits once its window is mapped.
+            // `self.toplevel_window_for` (`window_policy.rs`) only ever
+            // matches an xdg toplevel by design, so `window.on_commit()`
+            // below (which refreshes `Window`'s Wayland-only bbox cache — an
+            // X11 window's `bbox()` reads from `X11Surface` directly instead,
+            // see `desktop/wayland/window.rs`) is never reached for one.
+            if let Some(window) = self.toplevel_window_for(&root) {
                 window.on_commit();
             }
         };

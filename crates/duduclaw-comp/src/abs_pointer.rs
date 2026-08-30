@@ -259,6 +259,7 @@ impl<I: LibinputInterface> LibinputInterface for RecordingInterface<I> {
 mod tests {
     use super::*;
     use smithay::utils::Size;
+    use std::os::fd::FromRawFd;
 
     #[test]
     fn eviocgabs_matches_the_kernel_macro() {
@@ -394,8 +395,17 @@ mod tests {
         // Uses a pipe read end as a stand-in fd: the table's bookkeeping is
         // pure `HashMap` work and does not care what the fd points at (the
         // `EVIOCGABS` on it fails, which is the honest `None` below).
-        let (r, _w) = std::io::pipe().expect("pipe");
-        let fd = OwnedFd::from(r);
+        //
+        // Not `std::io::pipe()` (stabilized in rustc 1.87, this crate's
+        // pinned container toolchain is 1.85.0 — see `BUILD.md`'s "Why
+        // Docker" section) — `libc` is already a direct dependency (`Cargo.
+        // toml`'s CD-2 entry), so a raw `libc::pipe` call needs no new one.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        unsafe {
+            libc::close(fds[1]);
+        }
         let key = fd.as_raw_fd();
         let dup = fd.try_clone().expect("dup");
         let t = AbsPointerTable::default();

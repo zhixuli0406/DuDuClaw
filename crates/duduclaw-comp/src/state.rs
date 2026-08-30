@@ -21,12 +21,14 @@ use smithay::{
         cursor_shape::CursorShapeManagerState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
+        seat::WaylandFocus,
         shell::{
             wlr_layer::WlrLayerShellState,
             xdg::{decoration::XdgDecorationState, XdgShellState},
         },
         shm::ShmState,
         socket::ListeningSocketSource,
+        xwayland_shell::XWaylandShellState,
     },
 };
 
@@ -73,6 +75,15 @@ pub struct DuduclawComp {
     /// not live here: smithay keeps one `LayerMap` per `Output`, in that
     /// output's own `UserDataMap`. See `crate::layer_shell`'s module doc.
     pub layer_shell_state: WlrLayerShellState,
+    /// A4 (CP-1, XWayland): the `xwayland_shell_v1` global. Same "must exist
+    /// before any client binds" constraint as the other protocol globals in
+    /// this struct — `Xwayland` itself is a Wayland CLIENT (see
+    /// `crate::xwayland::spawn`) and needs this bound before it can pair an
+    /// `X11Surface` with a `wl_surface`. See `crate::xwayland`'s module doc.
+    pub xwayland_shell_state: XWaylandShellState,
+    /// A4: the running XWayland instance's negotiated X11 window manager
+    /// (once ready) plus its display number. See `crate::xwayland`.
+    pub xwayland: crate::xwayland::XWaylandState,
     /// D3-a (2026-08-23): the three input-method globals plus the live
     /// candidate window. See `crate::ime`'s module doc for why all three
     /// globals are mandatory and why the popup is not optional.
@@ -299,7 +310,12 @@ pub struct DuduclawComp {
 }
 
 impl DuduclawComp {
-    pub fn new(event_loop: &mut EventLoop<CalloopData>, display: Display<Self>) -> Self {
+    // A4 (CP-1, XWayland): `EventLoop<'static, CalloopData>` rather than the
+    // elided form every OTHER function taking an `EventLoop` in this crate
+    // still uses — this one calls `crate::xwayland::spawn`, which needs that
+    // concrete bound. See `main.rs`'s matching root-declaration comment and
+    // `crate::xwayland::spawn`'s own doc for why.
+    pub fn new(event_loop: &mut EventLoop<'static, CalloopData>, display: Display<Self>) -> Self {
         let start_time = std::time::Instant::now();
 
         let dh = display.handle();
@@ -326,6 +342,11 @@ impl DuduclawComp {
         // safe with no client using it — nothing changes until something binds
         // (see `crate::layer_shell`'s scope note).
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        // A4 (CP-1, XWayland): advertise `xwayland_shell_v1`. Same "must
+        // exist before any client binds" constraint as the globals above —
+        // `Xwayland` itself is spawned as a client a few lines down, and its
+        // binding of this global must find it already there.
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
         let popups = PopupManager::default();
 
         // A4-5: the ORDER these two `wl_seat` globals are created in is the
@@ -381,6 +402,15 @@ impl DuduclawComp {
         // is available; grouped here, right after `codrive::init`, since
         // both are "the compositor's IPC surfaces" set up in one place.
         let shell_control = shell_control::init(event_loop);
+
+        // A4 (CP-1, XWayland): started here, alongside the other two
+        // "extra IPC/protocol surface" constructors above — needs `&dh` (to
+        // insert the XWayland client) and `event_loop` (to register its
+        // ready-event source), both already in scope. See
+        // `crate::xwayland::spawn`'s own doc for the startup-not-lazy
+        // rationale and the fail-open-to-Wayland-only behaviour on spawn
+        // failure.
+        crate::xwayland::spawn(&dh, event_loop);
 
         let mut space = Space::default();
 
@@ -467,6 +497,8 @@ impl DuduclawComp {
             cursor_shape_manager_state,
             xdg_decoration_state,
             layer_shell_state,
+            xwayland_shell_state,
+            xwayland: crate::xwayland::XWaylandState::default(),
             ime,
             popups,
             seat,
@@ -683,6 +715,12 @@ impl DuduclawComp {
             if activate {
                 activated_count += 1;
             }
+            // `Window::set_activated` (smithay `desktop/wayland/window.rs`)
+            // already dispatches on the underlying surface kind internally —
+            // xdg_toplevel's `Activated` state for a Wayland window,
+            // `X11Surface::set_activated` for an X11 one (A4, CP-1
+            // XWayland) — so this call needed no change to stay safe once
+            // X11 windows started sharing this space.
             element.set_activated(activate);
         }
         // Debug-level, not info: this runs on every click, not just
@@ -692,18 +730,33 @@ impl DuduclawComp {
         // "exactly one window activated, matching the focus target" —
         // the specific invariant the WP-A1 fix restored — without needing
         // pixel/screenshot access to a headless container.
+        //
+        // A4 (CP-1, XWayland): `w.toplevel().unwrap()` used to be safe here
+        // because every `Window` this crate ever mapped came from
+        // `Window::new_wayland_window`. An X11 window's `.toplevel()` is
+        // always `None` (see `Window::toplevel`'s own doc), so this — and
+        // every other lookup below — now goes through the generic
+        // `WaylandFocus::wl_surface()` accessor, which resolves for BOTH
+        // window kinds (an X11 window's once XWayland has paired one).
         tracing::debug!(
-            target_surface_id = ?window.map(|w| w.toplevel().unwrap().wl_surface().id()),
+            target_surface_id = ?window.and_then(|w| w.wl_surface()).map(|s| s.id()),
             activated_count,
             total_windows = self.space.elements().len(),
             "focus: activation set"
         );
         if let Some(keyboard) = seat.get_keyboard() {
-            let target = window.map(|w| w.toplevel().unwrap().wl_surface().clone());
+            let target = window.and_then(|w| w.wl_surface()).map(|s| s.into_owned());
             keyboard.set_focus(self, target, serial);
         }
         self.space.elements().for_each(|w| {
-            w.toplevel().unwrap().send_pending_configure();
+            // Only an xdg toplevel has a "pending configure" to send — an
+            // X11 window's activation notification already went out
+            // synchronously inside `Window::set_activated` above
+            // (`X11Surface::set_activated` performs the X11 property/message
+            // round-trip itself, it does not defer to a later configure).
+            if let Some(toplevel) = w.toplevel() {
+                toplevel.send_pending_configure();
+            }
         });
     }
 
@@ -730,7 +783,7 @@ impl DuduclawComp {
             // topmost survivor, exactly "Z 序次高者".
             let next = self.space.elements().next_back().cloned();
             tracing::info!(
-                next_surface_id = ?next.as_ref().map(|w| w.toplevel().unwrap().wl_surface().id()),
+                next_surface_id = ?next.as_ref().and_then(|w| w.wl_surface()).map(|s| s.id()),
                 "focus: closed window held focus — reassigning to the new topmost window"
             );
             let serial = SERIAL_COUNTER.next_serial();

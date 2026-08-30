@@ -47,6 +47,7 @@ use smithay::{
     desktop::Window,
     reexports::wayland_server::{backend::ObjectId, Resource},
     utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform, SERIAL_COUNTER},
+    wayland::seat::WaylandFocus,
 };
 
 use crate::{
@@ -163,21 +164,45 @@ impl DuduclawComp {
     /// would just take keyboard focus away from every application while
     /// changing nothing visible.
     fn switcher_candidates(&self) -> Vec<Window> {
+        // A4 (CP-1, XWayland): an X11 window is a legitimate switcher
+        // candidate too (it can never BE the session shell — that role is
+        // only ever claimed by app_id, and X11 windows have no xdg app_id —
+        // so `is_session_shell_surface` would answer `false` for one anyway),
+        // but `w.toplevel().unwrap()` panics for one. The generic
+        // `WaylandFocus::wl_surface()` accessor resolves for BOTH window
+        // kinds, so this filter now requires it up front — a window with no
+        // resolvable `wl_surface` at all (in practice: an X11 window whose
+        // XWayland pairing hasn't landed yet) is excluded here rather than
+        // further down, which is what keeps `present` and `ids` below in
+        // guaranteed 1:1 correspondence without a second, possibly-shorter
+        // filter pass desyncing the index lookup two blocks down.
         let mut present: Vec<Window> = self
             .space
             .elements()
             .rev()
             .filter(|w| {
-                let surface = w.toplevel().unwrap().wl_surface();
-                !self.is_session_shell_surface(surface) && !self.window_is_in_shadow_public(w)
+                let Some(surface) = w.wl_surface() else {
+                    return false;
+                };
+                !self.is_session_shell_surface(&surface) && !self.window_is_in_shadow_public(w)
             })
             .cloned()
             .collect();
         present.extend(self.minimized.iter().cloned());
 
+        // Every entry in `present` is guaranteed to have `wl_surface().
+        // is_some()`: the space half was filtered above, and the minimized
+        // half is always Wayland-backed (X11 windows are never minimized —
+        // see `crate::minimize`'s module doc, `minimize_window`/
+        // `unminimize_window` both early-return on a `Window` with no
+        // `toplevel()`).
         let ids: Vec<ObjectId> = present
             .iter()
-            .map(|w| w.toplevel().unwrap().wl_surface().id())
+            .map(|w| {
+                w.wl_surface()
+                    .expect("filtered to wl_surface-bearing windows above")
+                    .id()
+            })
             .collect();
         let ordered = switch_order(&self.focus_mru, &ids);
         ordered

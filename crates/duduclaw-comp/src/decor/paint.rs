@@ -81,6 +81,7 @@ use smithay::{
     output::Output,
     reexports::wayland_server::{backend::ObjectId, Resource},
     utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform},
+    wayland::seat::WaylandFocus,
 };
 
 use crate::{render::CodriveElement, state::DuduclawComp};
@@ -277,22 +278,35 @@ fn memory(
 /// (smithay 0.7.0 `desktop/space/wayland/window.rs`) split in two, and the two
 /// halves are copied verbatim from it — same call, same arguments, same
 /// `Kind`. The split exists only so the decoration can be layered *between*
-/// them; see the comment at the call site. The `xwayland` arm of the original
-/// is dropped because this crate has no XWayland support (`main.rs`'s "what
-/// this spike deliberately does not carry over" list), so `underlying_surface`
-/// is always the Wayland one.
+/// them; see the comment at the call site.
+///
+/// A4 (CP-1, 2026-08-30, XWayland): the `xwayland` arm of the original is
+/// back. It used to be dropped here with the note "this crate has no
+/// XWayland support, so `underlying_surface` is always the Wayland one" —
+/// which meant an X11 window, once `crate::xwayland` started mapping one
+/// into `space`, would receive frame callbacks and take up screen real
+/// estate while painting literally nothing (this function returned an empty
+/// `Vec` for it, unconditionally). Read at the source
+/// (`desktop/space/wayland/x11.rs`'s `impl AsRenderElements for X11Surface`),
+/// smithay's own X11 arm is JUST `render_elements_from_surface_tree` over the
+/// X11 window's own paired `wl_surface` — no X11-specific rendering exists;
+/// XWayland attaches ordinary `wl_buffer`s to that surface exactly like any
+/// other Wayland client. So rather than re-deriving the `WindowSurface::X11`
+/// branch by hand, this now goes through the SAME generic
+/// `WaylandFocus::wl_surface()` accessor `Window::wl_surface()` itself uses
+/// internally to resolve either case — one call, both window kinds.
 fn toplevel_elements(
     renderer: &mut GlesRenderer,
     window: &Window,
     location: Point<i32, Physical>,
     scale: Scale<f64>,
 ) -> Vec<CodriveElement> {
-    let Some(toplevel) = window.toplevel() else {
+    let Some(surface) = window.wl_surface() else {
         return Vec::new();
     };
     render_elements_from_surface_tree(
         renderer,
-        toplevel.wl_surface(),
+        &surface,
         location,
         scale,
         1.0,

@@ -110,16 +110,35 @@ fn match_window_query<'a>(
     None
 }
 
-/// Reads a mapped toplevel's current xdg-shell `app_id`/`title` in one lock
-/// acquisition. Mirrors `handlers/xdg_shell.rs::handle_commit`'s existing
-/// `with_states` + `XdgToplevelSurfaceData` access pattern (including its
-/// `.unwrap()`s — every `Window` this crate maps comes from
-/// `Window::new_wayland_window`, so `toplevel()` and the `data_map` entry
-/// are always present; this crate has no X11 window support to make either
-/// `None`, same assumption every other `w.toplevel().unwrap()` call site in
-/// this codebase already relies on).
+/// Reads a mapped window's current identity — `app_id`/`title` for an xdg
+/// toplevel, `class`/`title` for an X11 window (A4, CP-1 XWayland: X11's
+/// `WM_CLASS` "class" is the closest analogue to an xdg `app_id` — both are
+/// the stable, machine-facing name an app registers, as opposed to its
+/// human-facing, often-changing window title) — in one lock acquisition for
+/// the xdg case. Mirrors `handlers/xdg_shell.rs::handle_commit`'s existing
+/// `with_states` + `XdgToplevelSurfaceData` access pattern for that branch.
+///
+/// Before A4, this crate had no X11 window support at all, so `window.
+/// toplevel().unwrap()` was safe here — every `Window` this crate ever
+/// mapped came from `Window::new_wayland_window`. That assumption no longer
+/// holds; every OTHER `w.toplevel().unwrap()` call site in this codebase that
+/// predates A4 relied on the same one and has been fixed alongside this one.
 pub(crate) fn window_identity(window: &Window) -> (Option<String>, Option<String>) {
-    let toplevel = window.toplevel().unwrap();
+    if let Some(x11) = window.x11_surface() {
+        // `X11Surface::class()`/`title()` return `String`, defaulting to
+        // empty (never absent) when the client set no `WM_CLASS`/`WM_NAME` —
+        // normalised to `None` here so callers see the exact same "unset"
+        // shape they already handle for the xdg case.
+        let class = x11.class();
+        let title = x11.title();
+        return (
+            (!class.is_empty()).then_some(class),
+            (!title.is_empty()).then_some(title),
+        );
+    }
+    let toplevel = window
+        .toplevel()
+        .expect("a Window is either xdg-toplevel-backed or X11-backed (see WindowSurface)");
     with_states(toplevel.wl_surface(), |states| {
         let attrs = states
             .data_map

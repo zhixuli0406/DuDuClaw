@@ -20,7 +20,15 @@
 //!   exclusive zones feeding the window work area, and pointer routing on both
 //!   sides of the window stack. `duduclaw-shell` does not use it yet; see that
 //!   module's scope note.
-//! - No XWayland support.
+//! - ~~No XWayland support.~~ — **A4 (CP-1, 2026-08-30) added it**
+//!   (`crate::xwayland`): `Xwayland` is spawned at startup and this
+//!   compositor plays its X11 window manager (`XwmHandler` +
+//!   `XWaylandShellHandler`), so an X11-only client (e.g.
+//!   `chromium --ozone-platform=x11`) maps into `space` and renders like any
+//!   other window. See that module's doc for exactly what does and does not
+//!   get "the same treatment as an xdg toplevel" in this pass (no interactive
+//!   move/resize, no maximize/fullscreen, no server-side decoration, no
+//!   clipboard forwarding — all documented, not silently missing).
 //! - No screen-copy protocols.
 //!
 //! **A4-1 (2026-08-22) ended the "nested backend only" limitation** stated in
@@ -56,6 +64,7 @@ mod switcher;
 mod udev_backend;
 mod window_policy;
 mod winit_backend;
+mod xwayland;
 
 use smithay::reexports::{
     calloop::EventLoop,
@@ -86,7 +95,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt().init();
     }
 
-    let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
+    // A4 (CP-1, XWayland): pinned to `'static` (calloop 0.14's `EventLoop<'l,
+    // Data>` lifetime parameter, added to support borrowed non-'static event
+    // sources — a capability nothing in this crate uses) rather than left
+    // elided. `crate::xwayland::spawn` needs to capture a `calloop::
+    // LoopHandle` inside a `'static` callback closure (to start the X11
+    // window manager later, once `XWaylandEvent::Ready` fires off the main
+    // calloop dispatch) — `LoopHandle<'l, Data>: 'static` requires `'l:
+    // 'static`, and `EventLoop`/`LoopHandle` are INVARIANT over `'l` (no
+    // widening via subtyping), so that bound has to be true from this root
+    // declaration downward, not asserted later. See `crate::xwayland::spawn`'s
+    // own doc for the full reasoning. Every other calloop source this crate
+    // registers already used a plain owned/`'static` closure (nothing here
+    // ever borrowed non-'static data into an event source), so this changes
+    // nothing observable — it only makes explicit a bound the existing code
+    // already relied on implicitly.
+    let mut event_loop: EventLoop<'static, CalloopData> = EventLoop::try_new()?;
 
     let display: Display<DuduclawComp> = Display::new()?;
     let display_handle = display.handle();

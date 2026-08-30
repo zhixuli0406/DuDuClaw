@@ -282,6 +282,9 @@ impl DuduclawComp {
     /// **confirmed** does *not* steal it: a shell that opens an auxiliary
     /// toplevel must not get a second full-screen window.
     fn classify_shell_window(&mut self, window: &Window) -> bool {
+        // Safe: `apply_window_policy` (this function's only caller) already
+        // returned early for a `Window` with no `toplevel()` (A4, CP-1
+        // XWayland) before reaching here.
         let surface = window.toplevel().unwrap().wl_surface().clone();
         let matches_app_id = Self::window_app_id(window).as_deref() == Some(self.shell_app_id.as_str());
 
@@ -346,7 +349,19 @@ impl DuduclawComp {
             return;
         };
         let in_shadow = self.window_is_in_shadow(window);
-        let toplevel = window.toplevel().unwrap();
+        // A4 (CP-1, XWayland): this whole reserved-band/decoration/cascade
+        // policy is xdg-toplevel-specific by construction (initial-configure
+        // sequencing, `xdg_toplevel` pending state, the decoration
+        // negotiation) — an X11 window has none of that (`Window::toplevel()`
+        // is always `None` for one) and gets its OWN, much simpler placement
+        // from `crate::xwayland::DuduclawComp::x11_placement` at map time
+        // instead. `reapply_window_policy_all` iterates every mapped window
+        // unconditionally on an output resize, so this early return is what
+        // keeps an X11 window from being silently skipped over versus
+        // crashing outright — see this function's callers.
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
         if in_shadow && toplevel.is_initial_configure_sent() {
             // An already-configured shadow window: hands off entirely.
             return;
@@ -474,6 +489,9 @@ impl DuduclawComp {
         work: Rectangle<i32, Logical>,
     ) -> Rectangle<i32, Logical> {
         let insets = self.window_insets(window);
+        // Safe: only reached from `apply_window_policy`'s non-shell,
+        // non-shadow branch, which already bailed out for a `Window` with no
+        // `toplevel()` (A4, CP-1 XWayland) before getting here.
         let id = window.toplevel().unwrap().wl_surface().id();
 
         if self.decor.maximized.contains(&id) {
@@ -593,12 +611,7 @@ impl DuduclawComp {
     /// by `Window` — used by the demotion path in `classify_shell_window`,
     /// which only holds the superseded surface.
     fn reapply_window_policy_for_surface(&mut self, surface: &WlSurface) {
-        let Some(window) = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == surface)
-            .cloned()
-        else {
+        let Some(window) = self.toplevel_window_for(surface) else {
             return;
         };
         self.apply_window_policy(&window);
@@ -714,10 +727,20 @@ impl DuduclawComp {
         toplevel.send_close();
     }
 
+    /// The mapped xdg-toplevel `Window` whose surface is `surface`, or `None`
+    /// — including when `surface` belongs to an X11 window (A4, CP-1
+    /// XWayland: every call site here wants xdg-toplevel-specific behaviour —
+    /// move/resize grabs, close, maximize, decoration — none of which apply
+    /// to an X11 window, so this deliberately does NOT use the generic
+    /// `WaylandFocus::wl_surface()` accessor that would also match one).
+    /// `.is_some_and` short-circuits `false` for a `Window` with no
+    /// `toplevel()` instead of panicking while scanning past it — the same
+    /// idiom `codrive/shadow.rs` already established for this exact class of
+    /// lookup.
     pub(crate) fn toplevel_window_for(&self, surface: &WlSurface) -> Option<Window> {
         self.space
             .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == surface)
+            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
             .cloned()
     }
 }

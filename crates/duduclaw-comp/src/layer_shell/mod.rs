@@ -576,7 +576,13 @@ impl DuduclawComp {
             keyboard.set_focus(self, Some(surface.clone()), SERIAL_COUNTER.next_serial());
         }
         self.space.elements().for_each(|w| {
-            w.toplevel().unwrap().send_pending_configure();
+            // A4 (CP-1, XWayland): only an xdg toplevel has a "pending
+            // configure" to send — see `state.rs::focus_window`'s identical
+            // guard for the same reasoning (an X11 window's activation
+            // notification is synchronous, not deferred to a configure).
+            if let Some(toplevel) = w.toplevel() {
+                toplevel.send_pending_configure();
+            }
         });
     }
 

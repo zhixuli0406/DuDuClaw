@@ -790,7 +790,15 @@ impl DuduclawComp {
             .iter()
             .map(|w| {
                 let (app_id, title) = codrive::window_target::window_identity(w);
-                let focused = focused_surface.as_ref() == Some(w.toplevel().unwrap().wl_surface());
+                // A4 (CP-1, XWayland): `w.toplevel().unwrap()` panicked the
+                // moment an X11 `Window` reached this list. `.is_some_and`
+                // keeps this xdg-only comparison — an X11 window always
+                // reports `focused: false` here, a documented known
+                // limitation (`crate::xwayland`'s module doc) rather than a
+                // crash.
+                let focused = w
+                    .toplevel()
+                    .is_some_and(|t| focused_surface.as_ref() == Some(t.wl_surface()));
                 ShellWindowInfo {
                     app_id,
                     title,

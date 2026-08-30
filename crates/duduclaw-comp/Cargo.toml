@@ -102,17 +102,31 @@ ab_glyph = "0.2"
 # Feature names are smithay 0.7.0's own (verified against the published
 # crate's `[features]` table, not from memory):
 #   backend_drm             -> DrmDevice/DrmSurface/vblank event source
-#   backend_gbm             -> GbmDevice/GbmAllocator (pulls backend_drm)
-#   backend_egl             -> EGLDisplay/EGLContext (already implied by
+#   backend_gbm              -> GbmDevice/GbmAllocator (pulls backend_drm)
+#   backend_egl              -> EGLDisplay/EGLContext (already implied by
 #                              backend_winit, listed explicitly for clarity)
 #   backend_libinput        -> LibinputInputBackend + the `input` reexport
 #   backend_udev            -> UdevBackend/primary_gpu/all_gpus
 #   backend_session_libseat -> LibSeatSession (seatd/logind via libseat)
 #   renderer_gl             -> GlesRenderer (already implied by backend_winit)
+#   xwayland                -> XWayland/X11Wm/XwmHandler/X11Surface + pulls
+#                              x11rb (pure-Rust X11 protocol client — no
+#                              libxcb/system X11 dev headers needed to BUILD;
+#                              the `Xwayland` binary itself is a RUNTIME
+#                              dependency only, looked up on `PATH` when
+#                              `XWayland::spawn` execs it, same as any other
+#                              subprocess this crate launches)
 #
 # System build dependencies this adds beyond the original
 # pkg-config/libwayland-dev/libxkbcommon-dev trio: libinput-dev, libudev-dev,
 # libseat-dev, libgbm-dev, libdrm-dev. See BUILD.md.
+#
+# A4 (CP-1, 2026-08-30): added "xwayland" — see `src/xwayland.rs`'s module
+# doc for the XwmHandler/XWaylandShellHandler wiring this unlocks. x11rb's
+# default "rust-connection" backend is pure Rust (no libxcb FFI feature
+# enabled), so in principle no new system -dev package is needed beyond the
+# trio above — see BUILD.md's XWayland section for what the container build
+# actually required.
 [dependencies.smithay]
 version = "0.7.0"
 default-features = false
@@ -127,6 +141,7 @@ features = [
     "renderer_gl",
     "wayland_frontend",
     "desktop",
+    "xwayland",
 ]
 
 [[bin]]

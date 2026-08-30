@@ -108,12 +108,14 @@ impl XdgShellHandler for DuduclawComp {
         if let Some(start_data) = check_grab(&seat, wl_surface, serial) {
             let pointer = seat.get_pointer().unwrap();
 
-            let window = self
-                .space
-                .elements()
-                .find(|w| w.toplevel().unwrap().wl_surface() == wl_surface)
-                .unwrap()
-                .clone();
+            // A4 (CP-1, XWayland): `self.toplevel_window_for` — the shared,
+            // X11-safe "find the xdg toplevel with this surface" lookup
+            // (`window_policy.rs`) — replaces the raw `.find` that used to
+            // panic while scanning past any X11 window in `space`. The
+            // `.unwrap()` after it is preserved: `wl_surface` here is
+            // literally the surface of the `ToplevelSurface` this very
+            // request arrived on, so it is always found.
+            let window = self.toplevel_window_for(wl_surface).unwrap();
             let initial_window_location = self.space.element_location(&window).unwrap();
 
             let grab = MoveSurfaceGrab {
@@ -150,12 +152,9 @@ impl XdgShellHandler for DuduclawComp {
         if let Some(start_data) = check_grab(&seat, wl_surface, serial) {
             let pointer = seat.get_pointer().unwrap();
 
-            let window = self
-                .space
-                .elements()
-                .find(|w| w.toplevel().unwrap().wl_surface() == wl_surface)
-                .unwrap()
-                .clone();
+            // A4 (CP-1, XWayland): see the identical fix (and its comment)
+            // in `move_request` above.
+            let window = self.toplevel_window_for(wl_surface).unwrap();
             let initial_window_location = self.space.element_location(&window).unwrap();
             let initial_window_size = window.geometry().size;
 
@@ -237,10 +236,12 @@ impl XdgShellHandler for DuduclawComp {
             tracing::debug!("xdg_shell: grab request for a popup with no resolvable root surface — ignoring");
             return;
         };
-        let root_is_toplevel = self
-            .space
-            .elements()
-            .any(|w| w.toplevel().unwrap().wl_surface() == &root);
+        // A4 (CP-1, XWayland): see `move_request`'s identical fix above — a
+        // popup can never legitimately root at an X11 window (X11 has no
+        // xdg_popup), so `toplevel_window_for`'s X11-safe-but-xdg-only
+        // lookup is exactly the right narrowing here too, not just a safety
+        // patch.
+        let root_is_toplevel = self.toplevel_window_for(&root).is_some();
         // WM-3: a layer surface is a legitimate popup root now (a panel's own
         // menu). Before layer-shell existed this branch could only ever mean
         // "already closed", which is why the original comment said so.
@@ -315,11 +316,8 @@ impl XdgShellHandler for DuduclawComp {
         // at this statement's `;` — `if let`'s scrutinee temporaries are
         // otherwise kept alive for the whole `if let` block, which would
         // conflict with the `&mut self.space` `unmap_elem` call below.
-        let window_to_remove = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == &wl_surface)
-            .cloned();
+        // A4 (CP-1, XWayland): see `move_request`'s identical fix above.
+        let window_to_remove = self.toplevel_window_for(&wl_surface);
         // WM-3: a MINIMIZED window is not in the space, so the lookup above
         // misses it — but the switcher may well be pointing at it. Resolve
         // against both sets before anything is unmapped.
@@ -371,11 +369,8 @@ impl XdgShellHandler for DuduclawComp {
     /// Upstream's default is a no-op, so nothing was listening before.
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface().clone();
-        let window = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == &wl_surface)
-            .cloned();
+        // A4 (CP-1, XWayland): see `move_request`'s identical fix above.
+        let window = self.toplevel_window_for(&wl_surface);
         if let Some(window) = window {
             self.apply_window_policy(&window);
         }
@@ -681,11 +676,15 @@ pub fn handle_commit(state: &mut DuduclawComp, surface: &WlSurface) {
     // immutable borrow of `state.space` taken by `elements()` would still be
     // alive at the `state.apply_window_policy(&window)` call below. Same
     // pattern (and the same reason) as `toplevel_destroyed` above.
-    let committed_window = state
-        .space
-        .elements()
-        .find(|w| w.toplevel().unwrap().wl_surface() == surface)
-        .cloned();
+    // A4 (CP-1, XWayland): `handle_commit` runs on EVERY `WlSurface::commit`
+    // (`handlers/compositor.rs::commit` calls it unconditionally) — including
+    // an X11 client's continuous buffer commits once its window is mapped.
+    // `state.toplevel_window_for` (`window_policy.rs`) only ever matches an
+    // xdg toplevel by design (see its own doc), which is exactly what this
+    // whole function's `initial_configure_sent`/`XdgToplevelSurfaceData`
+    // logic below assumes — an X11-backed surface has neither, and would
+    // panic on the very next line if this lookup ever matched one.
+    let committed_window = state.toplevel_window_for(surface);
     if let Some(window) = committed_window {
         let initial_configure_sent = with_states(surface, |states| {
             states
@@ -807,12 +806,15 @@ impl DuduclawComp {
 
         // The parent's geometry, in GLOBAL coordinates — a layer map's own
         // geometry is output-local, hence the `+ output_geo.loc`.
-        let parent_geo = match self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == &root)
-        {
-            Some(window) => self.space.element_geometry(window),
+        //
+        // A4 (CP-1, XWayland): `self.toplevel_window_for` — see
+        // `move_request`'s identical fix earlier in this file — replaces the
+        // raw `.find` that used to panic while scanning past any X11 window
+        // in `space`. A popup can never root at an X11 window anyway (no
+        // xdg_popup on X11), so the `None` branch below (falling through to
+        // "maybe it's a layer surface's popup instead") is unaffected.
+        let parent_geo = match self.toplevel_window_for(&root) {
+            Some(window) => self.space.element_geometry(&window),
             None => {
                 let map = layer_map_for_output(&output);
                 map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)

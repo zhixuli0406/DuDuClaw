@@ -176,6 +176,18 @@ pub fn clamp_resize_size(
     Size::from((w, h))
 }
 
+/// A4 (CP-1, XWayland) invariant this whole `impl` block relies on: `window`
+/// is always xdg-toplevel-backed, so its several `.toplevel().unwrap()`
+/// calls stay safe without individually guarding each one. This grab is only
+/// ever constructed from `XdgShellHandler::resize_request` (xdg-only by
+/// definition) or `input.rs::begin_edge_resize`, and the latter is only
+/// reached through `frame_hit_at`'s decoration hit-testing, which is keyed
+/// off `DecorState::frames` — a map an X11 window is never entered into
+/// (`window_uses_ssd` returns `false` for one, so `apply_window_policy`'s
+/// decoration/frame bookkeeping never runs for it; `crate::xwayland`'s own
+/// placement path doesn't touch `DecorState::frames` either). If a future
+/// round gives X11 windows interactive resize, this invariant is exactly
+/// what has to change first.
 pub struct ResizeSurfaceGrab {
     start_data: PointerGrabStartData<DuduclawComp>,
     window: Window,
@@ -471,9 +483,17 @@ pub fn handle_commit(space: &mut Space<Window>, surface: &WlSurface) -> bool {
 }
 
 fn handle_commit_inner(space: &mut Space<Window>, surface: &WlSurface) -> Option<bool> {
+    // A4 (CP-1, XWayland): this runs on EVERY `WlSurface::commit`
+    // (`handlers/compositor.rs::commit` calls it unconditionally after
+    // `xdg_shell::handle_commit`) — including an X11 client's continuous
+    // buffer commits once its window is mapped. `.is_some_and` short-
+    // circuits `false` for a `Window` with no `toplevel()` instead of
+    // panicking while scanning past it (this resize-tracking state is
+    // xdg-toplevel-specific — `ResizeSurfaceState`/`xdg_toplevel.resize` has
+    // no X11 equivalent reached through this path).
     let window = space
         .elements()
-        .find(|w| w.toplevel().unwrap().wl_surface() == surface)
+        .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
         .cloned()?;
 
     let mut window_loc = space.element_location(&window)?;
