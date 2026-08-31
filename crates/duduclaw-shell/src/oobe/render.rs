@@ -137,22 +137,57 @@ fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Contex
         }
         cx.notify();
     });
+    // D4a-7 (2026-08-31, QEMU wired-only OOBE deadlock): this closure now
+    // handles TWO more outcomes beyond "advanced"/"completed" — see `oobe/
+    // steps/network.rs`'s own header comment ("D4a-7") for the full root
+    // cause and fix shape this backs. Both new branches call OUT to
+    // `steps::on_network_step_entered`/`steps::on_network_continue_blocked`
+    // (thin `pub(super)` bridges in `steps/mod.rs`) AFTER the `if let Some
+    // (flow) = view.oobe.as_mut()` block below fully closes — `flow`'s
+    // borrow of `view.oobe` has already ended by then (its last use is
+    // inside that block), so these whole-`view` calls need no further
+    // borrow-splitting.
     let continue_click = cx.listener(|view, _ev, _window, cx| {
         // D4a-5: read fresh at click time (not captured at render time) —
         // same "re-borrow `view.oobe`/`view.oobe_ui` at invocation" pattern
         // this closure already follows for `view.oobe`, see this fn's own
         // header comment.
         let wired_online = view.oobe_ui.wired_online();
+        let mut entered_network = false;
+        let mut blocked_on_network = false;
         if let Some(flow) = view.oobe.as_mut() {
-            flow.next_with_wired(wired_online);
+            let step_before = flow.current();
+            let advanced = flow.next_with_wired(wired_online);
             super::save_state(flow.state());
-            if flow.completed() {
-                // D2-b: see this fn's header comment just above `skip_
-                // click` for why these two lines must run here too.
-                view.theme = flow.state().selections.theme;
-                crate::notify_comp_theme(view.theme);
-                view.oobe = None;
+            if advanced {
+                if flow.completed() {
+                    // D2-b: see this fn's header comment just above `skip_
+                    // click` for why these two lines must run here too.
+                    view.theme = flow.state().selections.theme;
+                    crate::notify_comp_theme(view.theme);
+                    view.oobe = None;
+                } else if flow.current() == OobeStep::Network {
+                    // Entered `Network` from the PREVIOUS step's own
+                    // Continue click — still click-triggered I/O (the
+                    // operator's own click, just landing on the NEXT
+                    // step), not a render-time side effect.
+                    entered_network = true;
+                }
+            } else if step_before == OobeStep::Network {
+                // Blocked ON `Network`'s own precondition. Only reachable
+                // at all because `button_row`'s Continue button below is
+                // built through `widgets::step_button_ex` with `clickable_
+                // while_disabled: true` for exactly this step — every other
+                // step's disabled Continue never attaches `on_click` at
+                // all, so this closure can't even fire for them while
+                // blocked.
+                blocked_on_network = true;
             }
+        }
+        if entered_network {
+            steps::on_network_step_entered(view, cx);
+        } else if blocked_on_network {
+            steps::on_network_continue_blocked(view, cx);
         }
         cx.notify();
     });
@@ -178,7 +213,7 @@ fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Contex
         .when(skippable, |el| {
             el.child(widgets::step_button("oobe-skip", t(locale, Key::NavSkip), StepButtonVariant::Secondary, false, palette, skip_click))
         })
-        .child(widgets::step_button(
+        .child(widgets::step_button_ex(
             "oobe-continue",
             // Task brief step 8: 「開始使用」→ completed=true 存檔 → 進
             // Home" — this SAME button (no separate in-card duplicate; see
@@ -188,6 +223,12 @@ fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Contex
             if is_finish { t(locale, Key::NavGetStarted) } else { t(locale, Key::NavContinue) },
             StepButtonVariant::Primary,
             !can_advance,
+            // D4a-7 (2026-08-31): ONLY the `Network` step keeps its
+            // Continue button click-attached while disabled — see `widgets
+            // ::step_button_ex`'s own doc comment for the full argument.
+            // Every other step's disabled Continue stays exactly as inert
+            // as plain `step_button` always made it.
+            step == OobeStep::Network,
             palette,
             continue_click,
         ));
@@ -248,5 +289,48 @@ mod tests {
                 "{name} completes OOBE without telling comp the new theme via notify_comp_theme"
             );
         }
+    }
+
+    // ── D4a-7 (2026-08-31): the wired-only-machine Continue deadlock fix ──
+    // Same source-scan shape as the theme test above — see its own doc
+    // comment for why (no `TestAppContext` window round-trip for these
+    // assertions). These two lock the two halves of the fix independently:
+    // the button must stay click-attached while disabled ONLY for
+    // `Network`, and the click handler must actually reach both new hooks.
+
+    #[test]
+    fn the_continue_button_is_click_attached_while_disabled_only_for_the_network_step() {
+        let source = include_str!("render.rs");
+        let start = source
+            .find("widgets::step_button_ex(\n            \"oobe-continue\",")
+            .unwrap_or_else(|| panic!("oobe-continue must be built via widgets::step_button_ex(...) in oobe/render.rs — \
+                 plain widgets::step_button never attaches on_click while disabled, which is \
+                 exactly the QEMU wired-only deadlock (a blocked click on Network must still fire)"));
+        let window = &source[start..(start + 1100).min(source.len())];
+        assert!(
+            window.contains("step == OobeStep::Network,"),
+            "the Continue button's `clickable_while_disabled` argument must be `step == \
+             OobeStep::Network` — every OTHER step's disabled Continue must stay fully inert, \
+             unchanged from before this fix"
+        );
+    }
+
+    #[test]
+    fn continue_click_reaches_both_network_step_hooks() {
+        let source = include_str!("render.rs");
+        let start = source.find("let continue_click =").unwrap_or_else(|| panic!("continue_click closure not found in oobe/render.rs"));
+        let window = &source[start..(start + 2400).min(source.len())];
+        assert!(
+            window.contains("steps::on_network_step_entered(view, cx)"),
+            "continue_click must trigger a scan/status recheck on entering `Network` from the \
+             PREVIOUS step's Continue click — otherwise a wired-only machine still never sees \
+             `wired_online()` become true until it happens to click 「掃描 Wi-Fi」 itself"
+        );
+        assert!(
+            window.contains("steps::on_network_continue_blocked(view, cx)"),
+            "continue_click must handle a BLOCKED click on `Network` itself — otherwise the \
+             `step_button_ex` widening above lets the click through with nothing to catch it, \
+             same dead-end UX as before, just one click later"
+        );
     }
 }

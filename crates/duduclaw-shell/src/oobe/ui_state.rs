@@ -141,6 +141,21 @@ pub struct OobeUiState {
     /// being unplugged between renders must be re-observed on the next
     /// scan, never remembered from an earlier point in this process's life.
     pub net_status: Option<network::NetworkStatus>,
+    /// D4a-7 (2026-08-31, QEMU wired-only OOBE deadlock): set when the
+    /// operator clicks Continue on the `Network` step while `OobeFlow::
+    /// can_advance_with_wired` is still false — see `render.rs`'s
+    /// `continue_click` (the one setter, via `steps::network::handle_
+    /// blocked_continue`) and `steps::network::continue_blocked_notice` (the
+    /// one reader, gated through `should_show_net_continue_blocked_notice`
+    /// below) for the two call sites. Deliberately a real ui_state field,
+    /// NOT re-derived purely from `can_advance_with_wired` at render time —
+    /// the notice must stay silent on the step's very first frame (before
+    /// any click), only appearing once a click has actually been blocked.
+    /// Reset back to `false` on a fresh visit to the step
+    /// (`steps::network::on_step_entered`) so a stale notice from an
+    /// EARLIER visit never reappears before this visit's own first blocked
+    /// click.
+    pub net_continue_blocked: bool,
 }
 
 impl OobeUiState {
@@ -254,6 +269,35 @@ impl OobeUiState {
     /// unplugged.
     pub fn wired_online(&self) -> bool {
         self.net_status.as_ref().is_some_and(|s| s.internet.counts_as_connected() && s.has_ip)
+    }
+
+    /// D4a-7 (2026-08-31): the ONE mutator for `net_continue_blocked` — see
+    /// that field's own doc comment for the two call sites this backs
+    /// (`steps::network::handle_blocked_continue` sets it `true`,
+    /// `steps::network::on_step_entered` clears it back to `false` on a
+    /// fresh visit).
+    pub fn set_net_continue_blocked(&mut self, on: bool) {
+        self.net_continue_blocked = on;
+    }
+
+    /// Pure render-time gate for `steps::network::continue_blocked_notice` —
+    /// split out from that fn so the decision itself (not just the two
+    /// message strings it picks between) is unit-testable without a `gpui::
+    /// Context`. `network_connected` is threaded in rather than read from
+    /// `OobeFlow` here (this type has no `OobeFlow` dependency, same
+    /// boundary `network_ui.rs`'s enums already keep) — the caller already
+    /// has `flow.selections().network_connected` in hand.
+    ///
+    /// A `true` `net_continue_blocked` flag from an EARLIER blocked click
+    /// stops being shown the instant either escape route resolves (a Wi-Fi
+    /// join completes, or a wired/portal connection comes up) — the flag
+    /// itself is only cleared explicitly on a fresh step visit (see `set_
+    /// net_continue_blocked`'s own doc comment), but there is no reason to
+    /// keep showing a now-stale "you're not connected" notice for the one
+    /// render frame between the connection resolving and the operator's
+    /// next click actually advancing past the step.
+    pub fn should_show_net_continue_blocked_notice(&self, network_connected: bool) -> bool {
+        self.net_continue_blocked && !network_connected && !self.wired_online()
     }
 }
 
@@ -447,5 +491,64 @@ mod tests {
 
         ui.net_status = Some(network::NetworkStatus { internet: network::InternetState::Online, has_ip: false, wifi_ssid: None, portal_url: None });
         assert!(!ui.wired_online(), "online with no IP address is a contradiction, not trusted blindly");
+    }
+
+    // ── D4a-7: net_continue_blocked / should_show_net_continue_blocked_notice ──
+
+    #[test]
+    fn net_continue_blocked_defaults_to_false() {
+        let ui = OobeUiState::default();
+        assert!(!ui.net_continue_blocked);
+    }
+
+    #[test]
+    fn set_net_continue_blocked_round_trips() {
+        let mut ui = OobeUiState::default();
+        ui.set_net_continue_blocked(true);
+        assert!(ui.net_continue_blocked);
+        ui.set_net_continue_blocked(false);
+        assert!(!ui.net_continue_blocked);
+    }
+
+    #[test]
+    fn continue_blocked_notice_is_silent_before_any_blocked_click() {
+        // The step's very first frame — no click yet — must never show the
+        // notice, even though every OTHER condition (`network_connected:
+        // false`, no wired signal) already matches. Only an actual blocked
+        // click may set `net_continue_blocked`.
+        let ui = OobeUiState::default();
+        assert!(!ui.should_show_net_continue_blocked_notice(false));
+    }
+
+    #[test]
+    fn continue_blocked_notice_shows_once_blocked_with_no_escape_route_yet() {
+        let mut ui = OobeUiState::default();
+        ui.set_net_continue_blocked(true);
+        assert!(ui.should_show_net_continue_blocked_notice(false));
+    }
+
+    #[test]
+    fn continue_blocked_notice_hides_once_a_wifi_join_is_persisted() {
+        let mut ui = OobeUiState::default();
+        ui.set_net_continue_blocked(true);
+        assert!(
+            !ui.should_show_net_continue_blocked_notice(true),
+            "a completed Wi-Fi join must silence a stale blocked-click notice, not just the ORIGINAL click's own next attempt"
+        );
+    }
+
+    #[test]
+    fn continue_blocked_notice_hides_once_wired_online_becomes_true() {
+        let mut ui = OobeUiState {
+            net_continue_blocked: true,
+            net_status: Some(network::NetworkStatus { internet: network::InternetState::Online, has_ip: true, wifi_ssid: None, portal_url: None }),
+            ..Default::default()
+        };
+        assert!(!ui.should_show_net_continue_blocked_notice(false));
+        // Flipping the wired signal back off (cable unplugged again) must
+        // bring the still-`true` flag's notice right back — this fn is a
+        // pure re-derivation every render call, never a one-shot latch.
+        ui.net_status = None;
+        assert!(ui.should_show_net_continue_blocked_notice(false));
     }
 }

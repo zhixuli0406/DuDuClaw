@@ -172,6 +172,23 @@ pub enum Key {
     /// backend is `NetBackendKind::Unavailable` — a distinct, more specific
     /// line than the generic `NetworkScanFailedStatus` retry message.
     NetworkUnavailableHint,
+    /// D4a-7 (2026-08-31, QEMU wired-only OOBE deadlock): shown when the
+    /// operator clicks Continue on the `Network` step while `can_advance_
+    /// with_wired` is still false — see `OobeUiState::net_continue_blocked`'s
+    /// own doc comment for the field this reads, and `steps::network::
+    /// continue_blocked_notice` for the one call site. Names BOTH escape
+    /// routes (pick a Wi-Fi row, or plug in a cable) since this fires for
+    /// EITHER a wireless-only or a wired-only machine — the step has no way
+    /// to know which the operator has in front of them.
+    NetworkContinueBlockedNotice,
+    /// Same trigger as `NetworkContinueBlockedNotice` above, shown instead
+    /// of it while the background recheck THAT SAME blocked click kicked
+    /// off (`steps::network::handle_blocked_continue`) is still in flight —
+    /// deliberately worded around "network status", not "Wi-Fi", since this
+    /// recheck is fetching `NetworkBackend::network_status()` (wired
+    /// awareness), not just the Wi-Fi scan list `NetworkScanningStatus`
+    /// already covers.
+    NetworkStatusCheckingNotice,
 
     UpdateTitle,
     UpdateChecking,
@@ -613,6 +630,8 @@ fn zh_tw(key: Key) -> &'static str {
         Key::NetworkBackendUnavailableError => "網路服務未啟動，請重新開機或聯絡支援",
         Key::NetworkUnsupportedSecurityError => "這個網路使用過舊的加密方式（WEP），系統不支援",
         Key::NetworkUnavailableHint => "找不到網路服務，請改用網路線繼續設定，或重新開機後再試一次",
+        Key::NetworkContinueBlockedNotice => "尚未偵測到網路連線——選擇 Wi-Fi，或接上網路線後再按一次繼續",
+        Key::NetworkStatusCheckingNotice => "正在確認網路狀態…",
 
         Key::UpdateTitle => "系統更新",
         Key::UpdateChecking => "正在檢查更新…",
@@ -852,6 +871,8 @@ fn en(key: Key) -> &'static str {
         Key::NetworkBackendUnavailableError => "The network service isn't running. Please restart, or contact support",
         Key::NetworkUnsupportedSecurityError => "This network uses an outdated encryption method (WEP), which isn't supported",
         Key::NetworkUnavailableHint => "Couldn't reach the network service. Please use a wired connection to continue setup, or restart and try again",
+        Key::NetworkContinueBlockedNotice => "No network connection detected yet — choose a Wi-Fi network, or plug in a cable and press Continue again",
+        Key::NetworkStatusCheckingNotice => "Checking network status…",
 
         Key::UpdateTitle => "System update",
         Key::UpdateChecking => "Checking for updates…",
@@ -1091,6 +1112,8 @@ fn ja_jp(key: Key) -> &'static str {
         Key::NetworkBackendUnavailableError => "ネットワークサービスが起動していません。再起動するか、サポートにご連絡ください",
         Key::NetworkUnsupportedSecurityError => "このネットワークは古い暗号化方式（WEP）を使用しており、対応していません",
         Key::NetworkUnavailableHint => "ネットワークサービスに接続できません。有線接続でセットアップを続けるか、再起動してもう一度お試しください",
+        Key::NetworkContinueBlockedNotice => "ネットワーク接続がまだ検出されていません。Wi-Fi を選択するか、ケーブルを接続してからもう一度「続ける」を押してください",
+        Key::NetworkStatusCheckingNotice => "ネットワークの状態を確認しています…",
 
         Key::UpdateTitle => "システムアップデート",
         Key::UpdateChecking => "アップデートを確認しています…",

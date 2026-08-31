@@ -62,6 +62,51 @@
 //      doc comment for why: this crate has no reusable "open an arbitrary
 //      URL" path today, and the task brief for this round explicitly says
 //      not to invent one).
+//
+// ── D4a-7 (2026-08-31): the wired-only-machine Continue deadlock ──────────
+// D4a-5 above deliberately left ONE gap, called out in `kick_off_scan`'s own
+// doc comment at the time as "a known limitation, not silently worked
+// around": `net_status` (and therefore `OobeUiState::wired_online()`) only
+// ever gets fetched from a CLICK on "掃描 Wi-Fi"/"重新整理" — a machine with
+// only a wired connection and no Wi-Fi adapter worth scanning has no reason
+// to ever click that button, so `wired_online()` stayed `None`-derived
+// `false` forever and the Continue button — built `disabled` whenever
+// `!can_advance_with_wired`, and `widgets::step_button`'s documented
+// contract is to drop `on_click` ENTIRELY while `disabled` — never
+// responded to a click at all. A real QEMU wired-only activity run
+// reproduced exactly this: two clicks on Continue, zero visible reaction,
+// indistinguishable from a hang.
+//
+// This round closes the gap WITHOUT breaking the "I/O is always
+// click-triggered, never a render-time side effect" rule stated above, by
+// finding two clicks that were already happening and were not yet doing
+// anything with this step:
+//   1. `oobe/render.rs`'s Continue-button handler already runs a click
+//      every time it advances the PREVIOUS step onto `Network` (`flow.
+//      next_with_wired` succeeding with the new `flow.current() ==
+//      OobeStep::Network`). That success IS a click event — the operator's
+//      own click on the prior step's Continue — so triggering a scan/
+//      status fetch from inside that same handler (`on_step_entered`
+//      below) is exactly as click-triggered as `kick_off_scan` already is
+//      from the "掃描 Wi-Fi" button, just a different click. This also
+//      covers 返回→再繼續 re-entering `Network`: `back()` never touches
+//      `net_scan`/`net_status`, and the SAME `continue_click` closure fires
+//      again on re-entry, since it does not distinguish a first visit from
+//      a return visit.
+//   2. `widgets::step_button_ex` (see that fn's own doc comment in
+//      `widgets.rs`) lets THIS ONE Continue button keep its `on_click`
+//      attached even while `disabled` — so a blocked click is a REAL click
+//      too, not a swallowed one. `handle_blocked_continue` below is what
+//      that click now runs: one more scan/status fetch (guarded against a
+//      still-in-flight one), plus flipping `OobeUiState::net_continue_
+//      blocked` so the next render shows an honest reason instead of
+//      nothing (`continue_blocked_notice`).
+//
+// Enter-key parity (`main.rs`'s `on_oobe_next` / `OobeFlow::enter_outcome`)
+// is deliberately NOT touched this round — `enter_outcome` already treats a
+// blocked `Network` step as a legitimate silent `Blocked` no-op (task brief
+// scope was the mouse Continue button specifically, where the QEMU repro
+// lived), tracked as follow-up, not silently worked around either.
 
 use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 
@@ -112,6 +157,15 @@ pub(super) fn render(flow: &OobeFlow, ui: &OobeUiState, fields: &NetworkFields, 
 
     if ui.net_backend_kind == Some(network::NetBackendKind::Fake) {
         column = column.child(demo_mode_notice(locale, palette));
+    }
+
+    // D4a-7 (2026-08-31): the blocked-Continue-click notice — see
+    // `OobeUiState::should_show_net_continue_blocked_notice`'s own doc
+    // comment for why this is a pure re-derivation every render call (not a
+    // one-shot latch) and `continue_blocked_notice`'s own doc comment for
+    // the two messages it picks between.
+    if ui.should_show_net_continue_blocked_notice(connected) {
+        column = column.child(continue_blocked_notice(locale, palette, ui));
     }
 
     // D4a §6 (2026-08-23): captive-portal notice — independent of which row
@@ -197,6 +251,41 @@ fn demo_mode_notice(locale: crate::i18n::Locale, palette: ShellPalette) -> Div {
         .text_size(px(theme::TEXT_XS))
         .text_color(theme::alpha(palette.warning, 1.0))
         .child(t(locale, Key::NetworkDemoModeNotice))
+}
+
+/// D4a-7 (2026-08-31): honest feedback for a Continue click that hit
+/// `can_advance_with_wired == false` — the render side of `OobeUiState::
+/// net_continue_blocked` (see that field's own doc comment for the setter,
+/// `handle_blocked_continue` below, and the render-time gate,
+/// `should_show_net_continue_blocked_notice`, that decides WHETHER this fn
+/// gets called at all). Same visual shape as `demo_mode_notice` just above
+/// (warning-tinted single-line banner) — this crate has exactly one "soft
+/// warning" notice style, reused rather than inventing a second.
+fn continue_blocked_notice(locale: crate::i18n::Locale, palette: ShellPalette, ui: &OobeUiState) -> Div {
+    div()
+        .w_full()
+        .px(px(12.))
+        .py(px(8.))
+        .rounded(px(theme::RADIUS_LG))
+        .bg(theme::alpha(palette.warning, 0.14))
+        .text_size(px(theme::TEXT_XS))
+        .text_color(theme::alpha(palette.warning, 1.0))
+        .child(t(locale, continue_blocked_notice_key(ui.net_scan == NetScanState::Scanning)))
+}
+
+/// Pure — split out of `continue_blocked_notice` above purely so the
+/// message-choosing DECISION is unit-testable without a `ShellPalette`/
+/// `Locale`/render call. `scanning` is true while the background recheck
+/// `handle_blocked_continue` itself kicked off (or one already in flight)
+/// hasn't settled yet: in that window the honest thing to say is "still
+/// checking", not "you're not connected" — the second half of that claim
+/// might already be stale by the time it's on screen.
+fn continue_blocked_notice_key(scanning: bool) -> crate::i18n::Key {
+    if scanning {
+        Key::NetworkStatusCheckingNotice
+    } else {
+        Key::NetworkContinueBlockedNotice
+    }
 }
 
 fn scan_body(flow: &OobeFlow, ui: &OobeUiState, fields: &NetworkFields, cx: &mut Context<ShellView>) -> Div {
@@ -599,12 +688,17 @@ fn message_line_dynamic(text: String, color: u32) -> Div {
 /// call for, piggybacked on the operator's existing "掃描 Wi-Fi"/"重新整
 /// 理" click rather than a new click-triggered path, per this crate's own
 /// "I/O is always click-triggered, never a render-time side effect"
-/// discipline (see this file's own header comment). Deliberately does NOT
-/// auto-fire when the `Network` step is first rendered without a click —
-/// that would be exactly the render-time I/O this crate's convention rules
-/// out; a machine relying purely on a wired connection still needs one
-/// "掃描 Wi-Fi" click before `wired_online()`/the portal notice reflect
-/// reality (recorded as a known limitation, not silently worked around).
+/// discipline (see this file's own header comment).
+///
+/// D4a-7 (2026-08-31): this fn used to auto-fire ONLY from the "掃描
+/// Wi-Fi"/"重新整理" buttons, which left a wired-only machine (no reason to
+/// ever click either) with `wired_online()` stuck `false` forever — this
+/// file's own header comment records the full QEMU repro and the fix.
+/// `kick_off_scan` ITSELF is unchanged (still exactly one background round
+/// trip, still only reachable from a real click's handler — nothing here
+/// runs at render time); what changed is which clicks reach it: `on_step_
+/// entered` and `handle_blocked_continue` below are two MORE click-driven
+/// callers, on top of the pre-existing scan/rescan buttons.
 fn kick_off_scan(view: &mut ShellView, cx: &mut Context<ShellView>) {
     view.oobe_ui.set_net_scanning();
     cx.notify();
@@ -669,6 +763,67 @@ fn kick_off_scan(view: &mut ShellView, cx: &mut Context<ShellView>) {
         cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
     })
     .detach();
+}
+
+/// `kick_off_scan`, guarded against firing a SECOND background round trip
+/// while one is already in flight — the two new call sites below
+/// (`on_step_entered`, `handle_blocked_continue`) both need this: a fast
+/// double-click on the previous step's Continue button, or a Continue click
+/// on `Network` landing right after step-entry already kicked one off, must
+/// never race two threads writing `oobe_ui.net_scan`/`net_status` out of
+/// order. The pre-existing scan/rescan buttons (`never_scanned_panel`,
+/// `failed_panel`, `empty_panel`, `loaded_panel`'s rescan) don't need this
+/// guard themselves — each only ever renders (and is clickable) while
+/// `net_scan` is settled (`Failed`/`Loaded(_)`), never while `Scanning`
+/// (that state renders `scanning_panel`, with no button at all) — so they
+/// keep calling `kick_off_scan` directly, unchanged.
+fn kick_off_scan_if_idle(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    if view.oobe_ui.net_scan == NetScanState::Scanning {
+        return;
+    }
+    kick_off_scan(view, cx);
+}
+
+/// D4a-7 (2026-08-31): fires when a click on the PREVIOUS step's own
+/// Continue button lands ON `Network` — see this file's own header comment
+/// for why that's still a real click event, not render-time I/O, and
+/// `render.rs`'s `continue_click` for the one call site (via `steps::
+/// on_network_step_entered`, the thin visibility-bridging wrapper `steps/
+/// mod.rs` needs since `render.rs` is a SIBLING of this module, not a
+/// descendant — same shape `handle_enter_submit` already establishes for
+/// crossing that same boundary).
+///
+/// Clears `net_continue_blocked` FIRST — a stale notice from an earlier
+/// visit to this step must never flash on screen for even one frame before
+/// this visit's own fresh scan settles — then kicks the guarded scan/status
+/// recheck.
+pub(super) fn on_step_entered(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    view.oobe_ui.set_net_continue_blocked(false);
+    kick_off_scan_if_idle(view, cx);
+}
+
+/// D4a-7 (2026-08-31): the `Network` step's OWN Continue-button handler when
+/// `OobeFlow::can_advance_with_wired` is still false — reachable at all only
+/// because `render.rs`'s `button_row` builds this ONE Continue button
+/// through `widgets::step_button_ex` with `clickable_while_disabled: true`
+/// instead of plain `step_button` (see that fn's own doc comment in
+/// `widgets.rs`); every other step's disabled Continue stays fully inert,
+/// unchanged.
+///
+/// (a) kicks the guarded background rescan+status recheck — this click IS
+/// the trigger, same "I/O is click-triggered" discipline this file's header
+/// comment states; (b) flips `net_continue_blocked` so the very next render
+/// shows an honest reason (`continue_blocked_notice`) instead of nothing.
+/// Does NOT itself re-check `can_advance_with_wired` or attempt to advance
+/// — this fn only runs from the branch of `render.rs`'s `continue_click`
+/// where `next_with_wired` already just returned `false`; if the recheck
+/// this kicks off later flips `wired_online()` true, the OPERATOR'S NEXT
+/// click is what advances (`button_row` recomputes `can_advance` fresh every
+/// render — see that fn's own header comment), never this one automatically.
+pub(super) fn handle_blocked_continue(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    view.oobe_ui.set_net_continue_blocked(true);
+    kick_off_scan_if_idle(view, cx);
+    cx.notify();
 }
 
 /// Kicks off a connect attempt on a background thread — same bridge shape
@@ -759,5 +914,25 @@ fn apply_connect_result(view: &mut ShellView, ssid: &str, secured: bool, result:
             let kind = if secured { NetConnectFailureKind::WrongPassword } else { NetConnectFailureKind::Unreachable };
             view.oobe_ui.set_net_connect_failed(kind);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── D4a-7: continue_blocked_notice_key ─────────────────────────────
+    // Pure logic only, same style every other `network_ui`/`ui_state` test
+    // in this crate already uses — no `gpui::Context`, no background
+    // thread, no `ShellView` needed for this one decision.
+
+    #[test]
+    fn continue_blocked_notice_key_picks_the_checking_message_while_scanning() {
+        assert_eq!(continue_blocked_notice_key(true), Key::NetworkStatusCheckingNotice);
+    }
+
+    #[test]
+    fn continue_blocked_notice_key_picks_the_not_connected_message_when_idle() {
+        assert_eq!(continue_blocked_notice_key(false), Key::NetworkContinueBlockedNotice);
     }
 }

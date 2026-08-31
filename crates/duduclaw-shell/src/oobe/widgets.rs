@@ -106,12 +106,50 @@ pub(crate) enum StepButtonVariant {
 /// `mds_gpui::button()`. `disabled` drops the click handler entirely (not
 /// just a visual dim), matching that facade's own documented disabled
 /// contract (`duduclaw-native-gui/src/mds_gpui/button.rs`: "no hover/active
-/// styles and NO click handler attached at all").
+/// styles and NO click handler attached at all"). A thin wrapper over
+/// `step_button_ex` below with `clickable_while_disabled: false` — byte-
+/// identical behavior to before that fn existed, for every call site except
+/// the one that opts into the widened contract explicitly.
 pub(crate) fn step_button(
     id: &'static str,
     label: &'static str,
     variant: StepButtonVariant,
     disabled: bool,
+    palette: ShellPalette,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    step_button_ex(id, label, variant, disabled, false, palette, on_click)
+}
+
+/// D4a-7 (2026-08-31, QEMU wired-only OOBE deadlock): same as `step_button`
+/// above, plus one more knob — `clickable_while_disabled`. Exists for
+/// exactly ONE call site today: `oobe/render.rs`'s `button_row` Continue
+/// button on the `Network` step. That step's own precondition
+/// (`OobeFlow::can_advance_with_wired`) can go unmet on a machine with only
+/// a wired connection and no Wi-Fi adapter worth scanning — a real QEMU
+/// activity run reproduced exactly this: the operator has no reason to ever
+/// click "掃描 Wi-Fi" on a wired box, so `OobeUiState::net_status` stays
+/// `None` forever and Continue never enables. Plain `step_button`'s
+/// contract (no `on_click` attached at all while `disabled`) means that
+/// Continue button was not just gated, it was COMPLETELY inert — a click on
+/// it produced zero signal of any kind, indistinguishable from a hang.
+///
+/// `clickable_while_disabled: true` keeps the exact same MUTED visual
+/// treatment (colors below are still keyed only on `disabled`, unchanged)
+/// but still attaches `on_click`, so `render.rs`'s `continue_click` runs and
+/// can (a) kick a background status recheck and (b) render an honest reason
+/// instead of nothing — see that closure's own doc comment for the full
+/// argument this is still click-triggered I/O, not a render-time side
+/// effect. Every OTHER disabled button in this crate (`AccountCreate`'s own
+/// Continue, the Network connect/cancel/rescan buttons while busy, …) keeps
+/// calling plain `step_button` and stays exactly as inert as before this
+/// fn existed — widening only the one call site that needed it.
+pub(crate) fn step_button_ex(
+    id: &'static str,
+    label: &'static str,
+    variant: StepButtonVariant,
+    disabled: bool,
+    clickable_while_disabled: bool,
     palette: ShellPalette,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
@@ -137,6 +175,11 @@ pub(crate) fn step_button(
 
     if !disabled {
         el = el.cursor_pointer().hover(move |style| style.bg(theme::alpha(bg_hover, 0.90))).on_click(on_click);
+    } else if clickable_while_disabled {
+        // Deliberately NO `.cursor_pointer()`/`.hover(...)` here — the
+        // button must still LOOK disabled (see this fn's own doc comment);
+        // only the click wiring differs from the `!disabled` branch above.
+        el = el.on_click(on_click);
     }
 
     el

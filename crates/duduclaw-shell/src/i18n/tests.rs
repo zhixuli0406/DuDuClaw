@@ -79,6 +79,8 @@ const ALL_KEYS: &[Key] = &[
     Key::NetworkBackendUnavailableError,
     Key::NetworkUnsupportedSecurityError,
     Key::NetworkUnavailableHint,
+    Key::NetworkContinueBlockedNotice,
+    Key::NetworkStatusCheckingNotice,
     Key::UpdateTitle,
     Key::UpdateChecking,
     Key::UpdateUpToDate,
@@ -237,13 +239,15 @@ fn all_keys_has_the_expected_count_and_no_duplicates() {
     // `ALL_KEYS` silently drifting out of sync with a newly added `Key`
     // variant (the compiler won't catch THAT half; only the per-locale
     // match arms are compiler-enforced).
-    // 202 as of installer-settings-integration WP3 (2026-08-29), which added
-    // the eight `LiveWifi*` keys for the live installer's own `Network`
-    // step; 194 as of D6 (2026-08-23), which added the eleven
-    // `org.freedesktop.Notifications` panel keys (`NotifAppSectionLabel` …
-    // `NotifAgeDays`); 183 before that, from D4a §6's
-    // `NetworkPortalOpenButton`.
-    assert_eq!(ALL_KEYS.len(), 202);
+    // 204 as of D4a-7 (2026-08-31), which added `NetworkContinueBlockedNotice`
+    // /`NetworkStatusCheckingNotice` for the wired-only-machine Continue
+    // deadlock fix; 202 as of installer-settings-integration WP3
+    // (2026-08-29), which added the eight `LiveWifi*` keys for the live
+    // installer's own `Network` step; 194 as of D6 (2026-08-23), which added
+    // the eleven `org.freedesktop.Notifications` panel keys
+    // (`NotifAppSectionLabel` … `NotifAgeDays`); 183 before that, from D4a
+    // §6's `NetworkPortalOpenButton`.
+    assert_eq!(ALL_KEYS.len(), 204);
     let mut seen = std::collections::HashSet::new();
     for key in ALL_KEYS {
         assert!(seen.insert(key), "duplicate key in ALL_KEYS: {key:?}");

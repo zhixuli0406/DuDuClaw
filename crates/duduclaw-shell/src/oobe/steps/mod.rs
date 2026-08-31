@@ -83,3 +83,19 @@ pub(crate) fn handle_enter_submit(outcome: EnterOutcome, view: &mut ShellView, c
         EnterOutcome::Advance | EnterOutcome::Blocked => {}
     }
 }
+
+/// D4a-7 (2026-08-31): thin `pub(super)` forwarders so `render.rs`'s
+/// Continue-button handler — a SIBLING of this module (`oobe::render`,
+/// under `oobe`), not a descendant of `oobe::steps` — can reach the
+/// `Network` step's own step-entry / blocked-continue hooks. Same
+/// "thin re-export bridges a visibility gap between siblings" shape
+/// `handle_enter_submit` just above already establishes for `EnterOutcome::
+/// Submit*`; `pub(super)` (not `pub(crate)`) is enough here since only
+/// `oobe` itself, not the whole crate, needs to reach these.
+pub(super) fn on_network_step_entered(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    network::on_step_entered(view, cx);
+}
+
+pub(super) fn on_network_continue_blocked(view: &mut ShellView, cx: &mut Context<ShellView>) {
+    network::handle_blocked_continue(view, cx);
+}
