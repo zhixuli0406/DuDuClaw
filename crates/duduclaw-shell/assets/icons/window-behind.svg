@@ -1,0 +1,40 @@
+<!--
+  Windows-pin source-level icon — CP-2 wave-2 (2026-08-31, 「疊窗案」拍板).
+
+  Drawn for `apps::installed::AppSource::WindowsVm`: a RemoteApp pin from
+  `apps/windows_vm.rs`'s registry has no local `.desktop`/`Icon=` to ever
+  resolve (the program lives inside the VM, not on this machine — see
+  `InstalledApp::resolved_icon`'s own doc comment), so EVERY row from this
+  source hits the icon-resolution fallback, always. The board's own ruling
+  ③ settled the logic before the artwork: rather than inventing a fake
+  per-app icon for a program this shell has never seen, one honest
+  SOURCE-LEVEL glyph stands in for every pinned Windows app
+  (`src/icons.rs::fallback_icon_for_source`, keyed on `AppSource`, is the
+  mapping that binds it — replacing the plain `APP_GENERIC` fallback for
+  this one source only).
+
+  SOURCE: `commercial/design/duduclaw-launcher-compat-icons/Main.html`,
+  option "B · 疊窗" (`optfile: window-behind.svg`) — path data taken
+  VERBATIM from the board, same discipline `src/icons.rs`'s header comment
+  establishes for every asset in this directory. Two overlapping windows:
+  the back pane is the program's real window, running on the other machine;
+  the front pane is what actually reaches this screen. Chosen over the
+  board's other two options (a single bottle-style "another machine"
+  monitor glyph, and a plain generic-window shape) for having the most
+  distinct silhouette against this family's existing rectangle-heavy set —
+  see the board's own family read-together section. ORIGINAL line art: no
+  Windows flag, no vendor mark — the board's trademark red line rules that
+  out, and this draws the CONCEPT ("this runs through a pinned window
+  elsewhere"), not any vendor's brand.
+
+  Standard family geometry: 24x24 canvas, stroke-width 2, round caps, round
+  joins, centred stroke — no exception here (contrast `bottles-pair.svg`,
+  which does have one).
+
+  The stroke colour written here is INERT at runtime — `gpui::svg()`
+  rasterizes to an alpha mask and tints it with the caller's own palette
+  token (see `src/icons.rs`'s header comment). Kept at the board's own
+  light-mode value (`#52525c`) purely so the file still looks right in a
+  browser/editor.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#52525c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-2"/><rect x="3" y="7" width="14" height="14" rx="2"/><path d="M3 11h14"/></svg>

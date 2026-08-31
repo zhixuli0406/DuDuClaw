@@ -450,6 +450,7 @@ fn app_tile(glyph: &str, layers: &[icons::Layer], palette: ShellPalette) -> Div 
 fn installed_app_tile(app: &InstalledApp, palette: ShellPalette) -> Div {
     app_tile_shell(palette).child(icons::app_icon_element(
         app.resolved_icon.as_ref().and_then(|icon| icon.for_container(icon_theme::TILE_ROW_PX)),
+        app.source,
         icon_theme::TILE_ROW_PX,
         ROW_TILE_RADIUS_PX,
         app_tile_content_color(palette).into(),

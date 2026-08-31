@@ -1,0 +1,37 @@
+<!--
+  Bottles catalog tile — CP-2 wave-2 (2026-08-31, 「雙瓶案」拍板).
+
+  Drawn for `apps::catalog::INSTALL_CATALOG`'s "catalog-bottles" entry (the
+  Launcher's 可安裝 row AND the install-confirmation sheet, which share one
+  `id -> layers` lookup — see `src/icons.rs::catalog_layers`). Before this
+  file existed the entry had no board artwork and rendered its "轉" glyph
+  fallback instead (see `apps/catalog.rs`'s own entry comment); this is the
+  round that draws it for real.
+
+  SOURCE: `commercial/design/duduclaw-launcher-compat-icons/Main.html`,
+  option "B · 雙瓶" (`optfile: bottles-pair.svg`) — path data taken
+  VERBATIM from the board, same discipline `src/icons.rs`'s header comment
+  establishes for every asset in this directory. The board's own "建議案"
+  tag sat on option A (single bottle); the operator ratified B instead (two
+  bottles, one tall/one short) as the closer match to Bottles' own name —
+  "one bottle" reads as any generic drink container, "two" reads as
+  Bottles' own plural. ORIGINAL line art, not the app's real (multi-color)
+  logo — the board's own trademark red line rules out copying Bottles'
+  official three-bottle mark or Microsoft's four-pane flag; this draws the
+  CONCEPT (bottles = Wine bottling = Windows compat layer), not the brand.
+
+  GEOMETRY EXCEPTION: `stroke-width="1.8"`, not this family's usual `2`.
+  Known and accepted at ratification time, recorded here rather than
+  silently fixed: two bottles side by side in a 21px tile read as cramped
+  at stroke-width 2, and thinning the line by 0.2 was the board's own
+  documented trade-off for keeping both bottles legible (see the board's
+  "optnote" for option B). Every other 24x24 canvas rule this family follows
+  (>=1px padding, round caps, round joins, centred stroke) is unchanged.
+
+  The stroke colour written here is INERT at runtime — `gpui::svg()`
+  rasterizes to an alpha mask and tints it with the caller's own palette
+  token (see `src/icons.rs`'s header comment and `src/palette.rs`'s
+  `icon_*` methods). Kept at the board's own light-mode value (`#52525c`)
+  purely so the file still looks right in a browser/editor.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#52525c" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5.6 3h3.8"/><path d="M6.5 3v2.6c0 1.6-2.5 2.3-2.5 4.6V19a1.8 1.8 0 0 0 1.8 1.8h3.4a1.8 1.8 0 0 0 1.8-1.8v-8.8c0-2.3-2.5-3-2.5-4.6V3"/><path d="M14.6 6.5h3.8"/><path d="M15.5 6.5v2.1c0 1.4-2.3 2-2.3 4V19a1.8 1.8 0 0 0 1.8 1.8h2.8a1.8 1.8 0 0 0 1.8-1.8v-6.4c0-2-2.3-2.6-2.3-4V6.5"/></svg>

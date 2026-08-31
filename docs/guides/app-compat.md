@@ -146,7 +146,7 @@ duduclaw compat windows-vm app-list
 duduclaw compat windows-vm app-remove winword.exe
 ```
 
-釘選成功後，最長等 60 秒（Launcher 背景重新掃描的週期）就會以「<名稱>（Windows）」的樣式出現在啟動器的「應用程式」清單裡；點下去會在背景執行 `duduclaw compat windows-vm app <執行檔>` 幫你把無縫視窗開起來——跟你手動在指令列打是同一條路徑，只是省了打字，圖示則沿用一般安裝程式找不到專屬圖示時的通用樣式（尚未有一輪視覺設計把 Bottles／Windows VM 這類項目的專屬圖示畫出來）。
+釘選成功後，最長等 60 秒（Launcher 背景重新掃描的週期）就會以「<名稱>（Windows）」的樣式出現在啟動器的「應用程式」清單裡；點下去會在背景執行 `duduclaw compat windows-vm app <執行檔>` 幫你把無縫視窗開起來——跟你手動在指令列打是同一條路徑，只是省了打字。這類項目有自己的「疊窗」圖示（前後兩層視窗，代表程式在虛擬機裡、以無縫視窗投到桌面）；因為虛擬機內的程式拿不到真實圖檔，所有釘選項共用這一枚誠實的來源標記，不逐項偽造。
 
 **還沒執行過 `setup` 的機器，啟動器完全不會出現任何 Windows 項目**——這是刻意的誠實靜默：`app-add`/`app-list` 讀寫的登記檔（`~/.duduclaw/windows-vm/apps.toml`）在 `setup` 都還沒跑過的機器上根本不存在，啟動器不會因此顯示錯誤或空白區塊，就是完全不出現這個分類。
 
@@ -160,7 +160,7 @@ duduclaw compat windows-vm app-remove winword.exe
 
 - `setup`／`status` 本身仍是命令列流程（授權揭露確認、資源門檻建議這類需要人親自確認的步驟不適合塞進圖形精靈的一次性彈窗）；「應用程式一鍵出現在圖形介面的啟動器」這部分已經做了——見上一節「把 Windows 應用程式釘進啟動器」。
 - Windows VM 實際能不能開機、無縫視窗好不好用，只能在真實硬體或雲端主機驗證——QEMU 測試環境本身通常沒有巢狀虛擬化，會被上面的 KVM 檢查誠實擋下。
-- 釘進啟動器的 Windows 項目目前沿用通用圖示（沒有專屬的 Windows／Bottles 視覺圖示），是後續設計工作。
+- 釘進啟動器的 Windows 項目共用一枚「疊窗」來源圖示、Bottles 在可安裝清單裡是「雙瓶」圖示（2026-08-31 設計輪拍板）；虛擬機內個別程式的真實圖檔仍拿不到，屬平台限制而非待辦。
 
 ## Android 應用程式：Waydroid
 

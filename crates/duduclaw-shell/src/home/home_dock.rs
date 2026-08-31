@@ -423,6 +423,7 @@ fn dock_app(app: &InstalledApp, palette: ShellPalette, running_windows: &Running
         // thing that ever consumed it.
         .child(crate::icons::app_icon_element(
             app.resolved_icon.as_ref().and_then(|icon| icon.for_container(icon_theme::TILE_DOCK_PX)),
+            app.source,
             icon_theme::TILE_DOCK_PX,
             DOCK_TILE_RADIUS_PX,
             text_color.into(),

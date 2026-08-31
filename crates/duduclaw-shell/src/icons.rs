@@ -248,6 +248,28 @@ pub(crate) const CURSOR_HAND_FILL: &str = "icons/cursor-hand-fill.svg";
 pub(crate) const CURSOR_PAW_OUTLINE: &str = "icons/cursor-paw-outline.svg";
 pub(crate) const CURSOR_PAW_FILL: &str = "icons/cursor-paw-fill.svg";
 
+// ── CP-2 wave-2 (2026-08-31): launcher compat-tile icons ─────────────────
+// Board: `commercial/design/duduclaw-launcher-compat-icons/Main.html`. Same
+// extraction discipline the rest of this module documents (path data
+// character-for-character, the two container attributes are the only
+// additions) — each asset file's own header comment names its board option
+// letter, cites the ratified pick (which was NOT always the board's own
+// "建議案" tag), and records the one geometry exception (`BOTTLES_PAIR`'s
+// stroke-width) up front rather than leaving a reader to spot it.
+
+/// `apps::catalog::INSTALL_CATALOG`'s "catalog-bottles" tile — see the asset
+/// file's own header comment for the board option (B · 雙瓶) and why it
+/// deviates from this family's usual stroke-width. Bound by `catalog_layers`
+/// below, the same lookup `GLOBE` already goes through.
+pub(crate) const BOTTLES_PAIR: &str = "icons/bottles-pair.svg";
+
+/// The one source-level icon for every `apps::installed::AppSource::
+/// WindowsVm` row — see the asset file's own header comment (board option
+/// B · 疊窗) and `fallback_icon_for_source` below for why a RemoteApp pin
+/// gets ONE shared glyph instead of the plain `APP_GENERIC` every other
+/// unresolvable icon falls back to.
+pub(crate) const WINDOW_BEHIND: &str = "icons/window-behind.svg";
+
 /// Every embedded asset, keyed by its `AssetSource` path.
 ///
 /// `include_bytes!` rather than a runtime file read: the appliance boots
@@ -313,6 +335,9 @@ const ICONS: &[(&str, &[u8])] = &[
     (CURSOR_HAND_FILL, include_bytes!("../assets/icons/cursor-hand-fill.svg")),
     (CURSOR_PAW_OUTLINE, include_bytes!("../assets/icons/cursor-paw-outline.svg")),
     (CURSOR_PAW_FILL, include_bytes!("../assets/icons/cursor-paw-fill.svg")),
+    // ── CP-2 wave-2 (2026-08-31) ──────────────────────────────────────────
+    (BOTTLES_PAIR, include_bytes!("../assets/icons/bottles-pair.svg")),
+    (WINDOW_BEHIND, include_bytes!("../assets/icons/window-behind.svg")),
 ];
 
 /// The embedded bytes for `path`, or `None` when nothing is registered
@@ -478,14 +503,21 @@ pub(crate) fn warn_once(key: &str, message: &str) {
 ///
 /// * `variant` is the already-resolved file for THIS container size
 ///   (`AppIcon::for_container`); `None` means the app has no drawable icon
-///   and the generic application icon is drawn instead.
+///   and this row's SOURCE-appropriate fallback icon is drawn instead (see
+///   `source` below and `fallback_icon_for_source`'s own doc comment).
+/// * `source` is `InstalledApp::source` — which enumeration this row came
+///   from. Presentation-only input (picks WHICH shell asset the fallback
+///   draws, nothing about resolution itself), threaded in rather than
+///   inferred so this fn stays a pure function of its arguments.
 /// * `container_px` / `radius_px` are the tile's own size and corner
 ///   radius, passed in from the call site so this never invents a second
 ///   set of geometry — the dock's 44px/10px and the Launcher row's
 ///   30px/8px are unchanged from before ICON-2.
-/// * `fallback_color` is the tint for the generic icon: each call site
+/// * `fallback_color` is the tint for the fallback icon: each call site
 ///   passes the exact color its text placeholder used, so a degraded tile
-///   is the same weight and hue it always was.
+///   is the same weight and hue it always was. Unchanged by CP-2 wave-2 —
+///   only WHICH asset key gets tinted changed for `AppSource::WindowsVm`,
+///   never how it is coloured.
 ///
 /// Three things this deliberately does NOT do: it never scales artwork up
 /// (`icon_theme::draw_px` already capped `draw_px` at the file's own pixel
@@ -495,12 +527,13 @@ pub(crate) fn warn_once(key: &str, message: &str) {
 /// hard to satisfy.
 pub(crate) fn app_icon_element(
     variant: Option<&crate::apps::icon_resolve::AppIconVariant>,
+    source: crate::apps::installed::AppSource,
     container_px: f32,
     radius_px: f32,
     fallback_color: Hsla,
 ) -> AnyElement {
     let Some(variant) = variant else {
-        return generic_app_icon(crate::apps::icon_theme::content_px(container_px), fallback_color);
+        return fallback_app_icon(source, crate::apps::icon_theme::content_px(container_px), fallback_color);
     };
 
     let path = variant.path.clone();
@@ -508,11 +541,12 @@ pub(crate) fn app_icon_element(
     // `img()`'s own fallback: the load happens asynchronously inside gpui
     // and can still fail after resolution succeeded (the file was deleted
     // between the scan and this frame, a PNG is corrupt, a decoder rejects
-    // it). Degrading to the same generic icon — rather than to nothing —
-    // is what keeps "the tile is always drawn" true on every path.
+    // it). Degrading to the same source-appropriate fallback icon — rather
+    // than to nothing — is what keeps "the tile is always drawn" true on
+    // every path.
     let image = gpui::img(path).with_fallback(move || {
-        warn_once(&miss_key, &format!("[app-icon] {miss_key} — the resolved icon file failed to load; drawing the generic application icon"));
-        generic_app_icon(crate::apps::icon_theme::content_px(container_px), fallback_color)
+        warn_once(&miss_key, &format!("[app-icon] {miss_key} — the resolved icon file failed to load; drawing the fallback application icon"));
+        fallback_app_icon(source, crate::apps::icon_theme::content_px(container_px), fallback_color)
     });
 
     if variant.full_bleed {
@@ -538,16 +572,52 @@ pub(crate) fn app_icon_element(
     image.w(px(variant.draw_px)).h(px(variant.draw_px)).flex_none().into_any_element()
 }
 
-/// This shell's own generic application icon, on the `svg()` path (it is a
-/// shell asset, not third-party artwork). Falls back to nothing drawable
-/// only if the embedded asset itself went missing, which
-/// `every_registered_key_resolves_to_non_empty_bytes` makes impossible.
-pub(crate) fn generic_app_icon(size: f32, color: Hsla) -> AnyElement {
-    if bytes(APP_GENERIC).is_none() {
-        warn_missing(APP_GENERIC);
+/// Which shell asset an installed-app tile falls back to when it has no
+/// resolved artwork of its own — the `AppSource -> key` half of
+/// `fallback_app_icon`, split out as its own pure fn so the mapping is
+/// directly testable without going through a render call. Kept in this
+/// module rather than as a method on `AppSource` itself for the same reason
+/// this file's "Slot → icon mapping" section gives for `catalog_layers` /
+/// `quick_tile_layers` / etc.: "which vector icon draws this row" is a
+/// presentation concern, and `apps::installed::AppSource` has no business
+/// knowing about it.
+///
+/// Every source resolves to the plain `APP_GENERIC` glyph — unchanged from
+/// before CP-2 wave-2 — except `AppSource::WindowsVm`: see `WINDOW_BEHIND`'s
+/// own doc comment and the design board's ruling ③
+/// (`commercial/design/duduclaw-launcher-compat-icons/Main.html`) for why a
+/// RemoteApp pin gets ONE shared source-level icon instead of the plain
+/// generic-app glyph. A windows-vm row's `resolved_icon` is unconditionally
+/// `None` (`InstalledApp` — there is no local `.desktop`/`Icon=` for a
+/// program that lives inside a VM), so EVERY row from this source hits this
+/// mapping, always; reusing `APP_GENERIC` for all of them would read as "icon
+/// lookup failed" rather than the honest "this runs through a pinned Windows
+/// window" signal the ruling asked for.
+pub(crate) fn fallback_icon_for_source(source: crate::apps::installed::AppSource) -> &'static str {
+    use crate::apps::installed::AppSource;
+    match source {
+        AppSource::WindowsVm => WINDOW_BEHIND,
+        AppSource::Flatpak | AppSource::Desktop => APP_GENERIC,
+    }
+}
+
+/// Draws the source-appropriate fallback icon (`fallback_icon_for_source`),
+/// on the `svg()` path (it is always a shell asset, never third-party
+/// artwork). Falls back to nothing drawable only if the embedded asset
+/// itself went missing, which `every_registered_key_resolves_to_non_empty_
+/// bytes` makes impossible.
+///
+/// Replaces the old, source-blind `generic_app_icon` — for every source
+/// other than `AppSource::WindowsVm` this resolves to the exact same key
+/// (`APP_GENERIC`) with the exact same tinting the old fn always used, so
+/// behavior there is byte-identical.
+fn fallback_app_icon(source: crate::apps::installed::AppSource, size: f32, color: Hsla) -> AnyElement {
+    let key = fallback_icon_for_source(source);
+    if bytes(key).is_none() {
+        warn_missing(key);
         return div().into_any_element();
     }
-    tinted_svg(APP_GENERIC, color, size).into_any_element()
+    tinted_svg(key, color, size).into_any_element()
 }
 
 // ── Slot → icon mapping ──────────────────────────────────────────────────
@@ -580,6 +650,24 @@ pub(crate) fn generic_app_icon(size: f32, color: Hsla) -> AnyElement {
 pub(crate) fn catalog_layers(catalog_id: &str, palette: ShellPalette) -> Option<Vec<Layer>> {
     match catalog_id {
         "catalog-chromium" => Some(vec![(GLOBE, palette.icon_globe())]),
+        // CP-2 wave-2 (2026-08-31): unlike the globe, Bottles has no brand
+        // identity color to lift — `BOTTLES_PAIR`'s own header comment notes
+        // this is original line art, not the app's real (multi-color) logo,
+        // so there is no "the board's own icon-specific stroke" the way
+        // `icon_globe()` exists for Chromium. `icon_control()` is the
+        // closest-fitting EXISTING token (no new token added, per this
+        // module's own "read `palette.rs` before inventing a field" habit),
+        // picked on two independent signals rather than a guess: its LIGHT
+        // value (`#52525c`) is exactly the design board's own inert stroke
+        // color baked into this asset file, and its DARK value (`#b0b0b8`)
+        // is exactly the literal `home/home_dock.rs::dock_app` and
+        // `overlay/launcher.rs::app_tile_content_color` already tint the
+        // generic-app fallback icon with in dark mode. A Bottles tile and an
+        // unresolved-icon tile therefore read as the same "plain gray app
+        // glyph" weight, which is the right family for a catalog entry with
+        // no identity color of its own — not `icon_globe()`'s bespoke brand
+        // blue, and not a new field for a one-off value.
+        "catalog-bottles" => Some(vec![(BOTTLES_PAIR, palette.icon_control())]),
         _ => None,
     }
 }
@@ -825,36 +913,60 @@ mod tests {
         }
     }
 
-    /// Every catalog entry must render SOMETHING real — either a registered
-    /// icon or `CatalogApp::glyph`'s own documented fallback (that field's
-    /// doc comment in `apps/catalog.rs`: "this is what shows if that lookup
-    /// finds nothing" — the type was always designed to allow this, not an
-    /// oversight this test should treat as one).
+    /// Every catalog entry must render a REAL registered icon — the strict
+    /// guarantee this test originally pinned (true by coincidence back when
+    /// Chromium, with real board artwork from A2's own container PASS, was
+    /// the only entry). It was briefly relaxed to "icon OR non-empty glyph"
+    /// on 2026-08-30 when CP-2 wave-2 added Bottles with no board icon
+    /// behind it yet — logic/backend work landed first, a visual design
+    /// pass for its tile was a deliberate follow-up, and the glyph "轉" was
+    /// the honest interim state (see the git history of this fn for that
+    /// version).
     ///
-    /// This test used to require a REGISTERED ICON for every entry with no
-    /// exception — true by coincidence back when Chromium (which has real
-    /// board artwork, A2's own container PASS) was the only entry, and
-    /// worth holding onto as long as it stayed true for free. CP-2 wave-2
-    /// (2026-08-30) added Bottles with no board icon behind it — logic/
-    /// backend work landed first, a visual design pass for its tile is a
-    /// deliberate follow-up, not an oversight; the glyph "轉" is the honest
-    /// interim state — so the blanket claim is no longer true and this test
-    /// now checks what the type actually guarantees instead: no entry falls
-    /// all the way through to an EMPTY glyph, which would render an
-    /// invisible tile.
-    /// `apps/catalog.rs::every_catalog_entry_names_a_real_ref_a_real_remote_
-    /// and_a_rated_tier` already pins the glyph non-empty at the source; this
-    /// is the cross-module confirmation that the render path actually agrees.
+    /// CP-2 wave-2's visual design pass (2026-08-31,
+    /// `commercial/design/duduclaw-launcher-compat-icons/Main.html`) closed
+    /// that gap: `BOTTLES_PAIR` gives Bottles real board artwork too, so
+    /// every catalog entry now maps to a registered icon again and the
+    /// strict form is restored. `apps/catalog.rs::
+    /// every_catalog_entry_names_a_real_ref_a_real_remote_and_a_rated_tier`
+    /// still pins the glyph non-empty at the source (it is kept as a
+    /// documented fallback field, not deleted — see that field's own doc
+    /// comment) — this is the cross-module confirmation that, today, no
+    /// entry actually NEEDS to fall back to it. A future entry added without
+    /// a registered icon fails HERE, not silently.
     #[test]
-    fn every_catalog_entry_renders_a_real_icon_or_a_documented_glyph_fallback() {
+    fn every_catalog_entry_renders_a_registered_icon() {
         let palette = ShellPalette::light();
         for entry in crate::apps::catalog::INSTALL_CATALOG {
-            let has_icon = catalog_layers(entry.id, palette).is_some();
-            assert!(
-                has_icon || !entry.glyph.is_empty(),
-                "catalog entry {} has neither a registered icon nor a non-empty glyph fallback — its tile would render empty",
-                entry.id
-            );
+            assert!(catalog_layers(entry.id, palette).is_some(), "catalog entry {} has no registered icon — its tile would render only the glyph fallback", entry.id);
+        }
+    }
+
+    // ── CP-2 wave-2 (2026-08-31): windows-vm source-level fallback ────────
+
+    /// The load-bearing mapping test for `fallback_icon_for_source`: a
+    /// `WindowsVm` row must resolve to `WINDOW_BEHIND`, and every other
+    /// source must resolve to the exact same `APP_GENERIC` this fn always
+    /// returned before CP-2 wave-2 — pinned explicitly so a future edit to
+    /// the match arms cannot silently widen (or narrow) which sources get
+    /// the special glyph.
+    #[test]
+    fn fallback_icon_for_source_gives_windows_vm_its_own_glyph_and_leaves_every_other_source_generic() {
+        use crate::apps::installed::AppSource;
+        assert_eq!(fallback_icon_for_source(AppSource::WindowsVm), WINDOW_BEHIND);
+        assert_eq!(fallback_icon_for_source(AppSource::Flatpak), APP_GENERIC);
+        assert_eq!(fallback_icon_for_source(AppSource::Desktop), APP_GENERIC);
+    }
+
+    /// Every source's fallback key must actually be a registered asset —
+    /// same "the mapping is where a typo would land" guarantee this module
+    /// already enforces for the catalog/quick-tile/launcher-file mappings.
+    #[test]
+    fn every_source_fallback_icon_is_registered() {
+        use crate::apps::installed::AppSource;
+        for source in [AppSource::Flatpak, AppSource::Desktop, AppSource::WindowsVm] {
+            let key = fallback_icon_for_source(source);
+            assert!(bytes(key).is_some(), "{source:?} maps to unregistered key {key}");
         }
     }
 
