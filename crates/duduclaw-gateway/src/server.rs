@@ -154,6 +154,20 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     let home_dir = config.home_dir.clone();
 
+    // ── B5 (OS security line P0): boot event ──────────────────────────────
+    // One `os_boot` row per gateway process start, chained (B1) into
+    // `security_audit.jsonl` — the durable "when did this box last come up,
+    // running what" record neither `journald` drop-ins nor the OS timers
+    // (later waves) can substitute for from inside this process. Cheap,
+    // synchronous, best-effort (same fire-and-forget convention as every
+    // other `append_audit_event` call site in this codebase — an audit-write
+    // failure must never block boot). `running_image_version()` reads
+    // `/etc/os-release`'s `IMAGE_VERSION=` and is `None` off-appliance.
+    duduclaw_security::audit::log_os_boot(
+        &home_dir,
+        crate::os_update::running_image_version().as_deref(),
+    );
+
     // ── WP-G1: apply a pending device-migration restore, if any ──────────
     // Must run before anything else in this function touches `home_dir`'s
     // files (config.toml, identity.key, org.toml, MCP key, …) — those are
@@ -939,6 +953,18 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // Store background task handles for graceful shutdown (BE-L4)
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // ── OS security line P0 (C1 producer 乙): SecurityPosture poll loop ──
+    // Independent of the autopilot engine's own enable/disable gate below —
+    // posture monitoring + failsafe degradation is a core safety mechanism,
+    // not an opt-in automation. Reuses the SAME `reply_ctx.failsafe` every
+    // channel reply's L1 gate already reads, so a Red-driven `L2Restricted`
+    // on the `__global__` scope takes effect immediately, everywhere. See
+    // `posture_watch.rs` module docs for the full design + known limits.
+    bg_handles.push(crate::posture_watch::spawn(
+        home_dir.clone(),
+        reply_ctx.failsafe.clone(),
+    ));
+
     // ── Skill synthesis auto-run scheduler (W19-P1) ───────────────────────────
     // Makes conversation→skill extraction autonomous: runs the Rollout-to-Skill
     // pipeline on an interval instead of waiting for a manual `skill_synthesis_run`
@@ -1148,6 +1174,17 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 let arc = Arc::new(ap);
                 handler.set_autopilot_store(arc.clone()).await;
                 info!("Autopilot store initialized");
+                // OS security line P0 (C4): seed the default (disabled)
+                // security autopilot rule pack once. Never blocks boot —
+                // see `security_rules_seed.rs` for the full seed contract.
+                let seed_report =
+                    crate::security_rules_seed::run(&home_dir, arc.as_ref()).await;
+                if !seed_report.seeded.is_empty() {
+                    info!(
+                        seeded = ?seed_report.seeded,
+                        "G19 security rules seed: default security autopilot rules created (disabled)"
+                    );
+                }
                 Some(arc)
             }
             Err(e) => {
@@ -1258,6 +1295,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         let (ap_tx, ap_rx) =
             tokio::sync::broadcast::channel::<crate::autopilot_engine::AutopilotEvent>(8192);
         handler.set_autopilot_event_tx(ap_tx.clone()).await;
+        // OS security line P0 (C1 producer 甲): give every gateway call site
+        // (many have no `&self` on `MethodHandler`/`ReplyContext` to thread a
+        // sender through) a process-global way to mirror a security audit
+        // event onto this SAME bus. See `security_autopilot.rs` module docs.
+        crate::security_autopilot::set_security_event_tx(ap_tx.clone());
 
         // ── OS-native per-edition quota (P4-3) ──────────────────────────────
         // Resolve, ONCE, which os_native agents may run OS-native features
@@ -1274,7 +1316,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         )
         .await;
         for skipped in &os_allowed.skipped {
-            duduclaw_security::audit::append_audit_event(
+            crate::security_autopilot::audit_and_emit(
                 &home_dir,
                 &duduclaw_security::audit::AuditEvent::new(
                     "os_native_quota_skipped",
@@ -1669,7 +1711,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                             );
 
                             // Audit log
-                            duduclaw_security::audit::append_audit_event(
+                            crate::security_autopilot::audit_and_emit(
                                 &home_for_update,
                                 &duduclaw_security::audit::AuditEvent::new(
                                     "auto_update_start",
@@ -1711,7 +1753,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                         let _ = etx.send(json);
                                     }
 
-                                    duduclaw_security::audit::append_audit_event(
+                                    crate::security_autopilot::audit_and_emit(
                                         &home_for_update,
                                         &duduclaw_security::audit::AuditEvent::new(
                                             "auto_update_success",
@@ -1749,7 +1791,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                                 Err(e) => {
                                     warn!(error = %e, "Auto-update failed — will retry next cycle");
 
-                                    duduclaw_security::audit::append_audit_event(
+                                    crate::security_autopilot::audit_and_emit(
                                         &home_for_update,
                                         &duduclaw_security::audit::AuditEvent::new(
                                             "auto_update_failed",
@@ -3282,7 +3324,7 @@ async fn handle_first_run_network_connect(
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.code.code())),
     };
-    duduclaw_security::audit::append_audit_event(
+    crate::security_autopilot::audit_and_emit(
         &state.home_dir,
         &duduclaw_security::audit::AuditEvent::new(
             "wifi_connect",

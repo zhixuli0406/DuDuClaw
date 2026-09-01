@@ -570,7 +570,7 @@ pub fn audit_operator_decision(
         "signals": result.signals,
         "text_excerpt": duduclaw_core::truncate_chars(text, 200),
     });
-    duduclaw_security::audit::append_audit_event(
+    crate::security_autopilot::audit_and_emit(
         home_dir,
         &duduclaw_security::audit::AuditEvent::new(
             "system_operator_intent",

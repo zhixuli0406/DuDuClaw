@@ -253,7 +253,7 @@ async fn refresh_handler(
     let _ = store.touch_refresh(&rec.id);
 
     // Audit — private key never appears.
-    duduclaw_security::audit::append_audit_event(
+    crate::security_autopilot::audit_and_emit(
         &state.home_dir,
         &duduclaw_security::audit::AuditEvent::new(
             "license_refresh_served",
@@ -474,7 +474,7 @@ async fn branding_sign_handler(
         Err(_) => return internal_error(),
     };
 
-    duduclaw_security::audit::append_audit_event(
+    crate::security_autopilot::audit_and_emit(
         &state.home_dir,
         &duduclaw_security::audit::AuditEvent::new(
             "branding_bundle_signed",

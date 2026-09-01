@@ -1,5 +1,6 @@
 pub mod action_claim_verifier;
 pub mod audit;
+pub mod audit_chain;
 pub mod circuit_breaker;
 pub mod credential_proxy;
 pub mod crypto;

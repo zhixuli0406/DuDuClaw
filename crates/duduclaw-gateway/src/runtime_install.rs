@@ -683,7 +683,7 @@ fn audit(
     if let Some(obj) = details.as_object_mut() {
         obj.insert("actor_email".into(), json!(actor.email));
     }
-    duduclaw_security::audit::append_audit_event(
+    crate::security_autopilot::audit_and_emit(
         home_dir,
         &duduclaw_security::audit::AuditEvent::new(
             event_type,

@@ -67,7 +67,7 @@ use duduclaw_core::delegation_policy::delegation_rules_from_table;
 use duduclaw_core::{
     DelegationDenied, OrgNode, OrgView, can_delegate_rules_ext, is_valid_agent_id, truncate_chars,
 };
-use duduclaw_security::audit::{AuditEvent, Severity, append_audit_event};
+use duduclaw_security::audit::{AuditEvent, Severity};
 
 /// Senders that are internal to the gateway itself rather than agents.
 ///
@@ -383,7 +383,7 @@ fn audit_denial(home_dir: &Path, denied: &DelegationDenied, task_id: &str, path_
             "message": denied.message_zh(),
         }),
     );
-    append_audit_event(home_dir, &event);
+    crate::security_autopilot::audit_and_emit(home_dir, &event);
 }
 
 /// zh-TW text written back to the task / forwarded to the requester when a

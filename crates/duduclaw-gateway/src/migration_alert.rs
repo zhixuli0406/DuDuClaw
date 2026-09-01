@@ -47,7 +47,7 @@
 use std::path::{Path, PathBuf};
 
 use duduclaw_core::data_migrations::{self, MigrationFailure};
-use duduclaw_security::audit::{AuditEvent, Severity, append_audit_event};
+use duduclaw_security::audit::{AuditEvent, Severity};
 use tracing::warn;
 
 use crate::task_store::{ActivityRow, TaskStore};
@@ -96,7 +96,7 @@ pub async fn check_and_notify(home: &Path) {
         return;
     }
 
-    append_audit_event(
+    crate::security_autopilot::audit_and_emit(
         home,
         &AuditEvent::new(
             "data_migration_failed",

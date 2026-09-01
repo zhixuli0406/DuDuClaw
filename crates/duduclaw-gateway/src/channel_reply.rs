@@ -907,6 +907,8 @@ async fn enforce_contract(
                     agent_id,
                     &[format!("guardrail: {reason}")],
                 );
+                // C1 producer 甲 companion — see `security_autopilot.rs`.
+                crate::security_autopilot::emit_contract_violation(agent_id);
                 return crate::guardrail::blocked_reply();
             }
         }
@@ -925,6 +927,8 @@ async fn enforce_contract(
     let rules: Vec<String> = result.violations.iter().map(|v| v.rule.clone()).collect();
     warn!(agent = %agent_id, ?rules, "CONTRACT must_not violation — blocking outgoing reply");
     duduclaw_security::audit::log_contract_violation(home_dir, agent_id, &rules);
+    // C1 producer 甲 companion — see `security_autopilot.rs`.
+    crate::security_autopilot::emit_contract_violation(agent_id);
     CONTRACT_BLOCK_MESSAGE.to_string()
 }
 
@@ -1848,6 +1852,8 @@ async fn build_reply_with_session_inner(
                                 user_id,
                                 "stop",
                             );
+                            // C1 producer 甲 companion — see `security_autopilot.rs`.
+                            crate::security_autopilot::emit_safety_word_triggered(&agent_id);
                             return duduclaw_security::safety_word::format_response(
                                 &safety_action,
                                 session_id,
@@ -1873,6 +1879,8 @@ async fn build_reply_with_session_inner(
                                 user_id,
                                 "stop_all_downgraded",
                             );
+                            // C1 producer 甲 companion — see `security_autopilot.rs`.
+                            crate::security_autopilot::emit_safety_word_triggered(&agent_id);
                             return "🛑 Agent stopped (scope). Global stop requires admin — use chat command.".to_string();
                         }
                     }
@@ -1892,6 +1900,8 @@ async fn build_reply_with_session_inner(
                         user_id,
                         "resume",
                     );
+                    // C1 producer 甲 companion — see `security_autopilot.rs`.
+                    crate::security_autopilot::emit_safety_word_triggered(&agent_id);
                     return duduclaw_security::safety_word::format_response(
                         &safety_action,
                         session_id,
@@ -1980,6 +1990,8 @@ async fn build_reply_with_session_inner(
                     session_id,
                     &reason.to_string(),
                 );
+                // C1 producer 甲 companion — see `security_autopilot.rs`.
+                crate::security_autopilot::emit_circuit_breaker_trip(&agent_id);
                 record_silent_reply(
                     &ctx.home_dir,
                     session_id,
@@ -3261,6 +3273,8 @@ async fn build_reply_with_session_inner(
                             &claim.matched_text,
                             claim.claim_type.expected_tool(),
                         );
+                        // C1 producer 甲 companion — see `security_autopilot.rs`.
+                        crate::security_autopilot::emit_tool_hallucination(&agent_id);
                     }
                 }
             }
@@ -7986,6 +8000,8 @@ async fn spawn_claude_cli_with_env(
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
         duduclaw_security::audit::log_git_credentials_granted(home_dir, agent_id, &git_env_granted);
+        // C1 producer 甲 companion — see `security_autopilot.rs`.
+        crate::security_autopilot::emit_git_credentials_granted(agent_id);
     }
 
     // Resume an existing Claude CLI session for multi-turn continuity.
@@ -9323,6 +9339,8 @@ async fn spawn_claude_cli_pty_with_env(
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
         duduclaw_security::audit::log_git_credentials_granted(home_dir, agent_id, &git_env_granted);
+        // C1 producer 甲 companion — see `security_autopilot.rs`.
+        crate::security_autopilot::emit_git_credentials_granted(agent_id);
     }
 
     // Caller-provided env wins. Empty value means "force-remove" — for

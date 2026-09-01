@@ -3248,6 +3248,8 @@ fn prepare_claude_cmd(
             .map(std::path::PathBuf::from)
             .unwrap_or_else(duduclaw_core::platform::duduclaw_home);
         duduclaw_security::audit::log_git_credentials_granted(&home_dir, agent_id, &git_env_granted);
+        // C1 producer 甲 companion — see `security_autopilot.rs`.
+        crate::security_autopilot::emit_git_credentials_granted(agent_id);
     }
 
     // Set working directory so Claude CLI auto-discovers the agent's

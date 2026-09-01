@@ -510,7 +510,7 @@ pub fn log_judge_seam_event(
             "detail": duduclaw_core::truncate_bytes(detail, 1000),
         }),
     );
-    duduclaw_security::audit::append_audit_event(home_dir, &event);
+    crate::security_autopilot::audit_and_emit(home_dir, &event);
 }
 
 #[cfg(test)]

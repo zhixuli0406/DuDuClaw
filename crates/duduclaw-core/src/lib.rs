@@ -26,6 +26,7 @@ pub mod platform;
 pub mod preset;
 pub mod provider_env;
 pub mod relay_protocol;
+pub mod secaudit_config;
 pub mod sensitivity;
 pub mod spawn_admission;
 pub mod spawn_env;
@@ -95,6 +96,7 @@ pub use platform::{duduclaw_home, duduclaw_instance, expand_tilde, home_dir, mcp
 pub use provider_env::{
     provider_env_key_names, resolve_env_key as resolve_provider_env_key, KNOWN_PROVIDER_IDS,
 };
+pub use secaudit_config::SecauditConfig;
 pub use sensitivity::{is_private_session, perception_source_sensitivity, Sensitivity};
 pub use spawn_admission::{
     clamp_min_one as spawn_admission_clamp_min_one, dequeue_next as spawn_admission_dequeue_next,
@@ -806,6 +808,15 @@ pub fn which_cli_in_home(home: &std::path::Path, bin: &str) -> Option<String> {
         format!("{home_str}/.volta/bin/{bin}"),
         format!("{home_str}/.npm-global/bin/{bin}"),
         format!("{home_str}/.asdf/shims/{bin}"),
+        // S2 (OS security line P0, secaudit-adjacent): Yocto packages a CLI
+        // like `duduclaw-cli` itself into the image's standard system
+        // locations, not a per-user dir — none of the candidates above are
+        // reachable on an appliance boot (no Homebrew, no per-user npm/bun/
+        // asdf install). Listed last so a desktop install's user-local /
+        // package-manager copy still wins when both exist.
+        format!("/usr/bin/{bin}"),
+        format!("/usr/sbin/{bin}"),
+        format!("/bin/{bin}"),
     ];
 
     #[cfg(windows)]
@@ -938,6 +949,31 @@ mod which_cli_tests {
         let found = which_cli_in_home(&tmp, "definitely-not-a-cli-xyz");
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(found, None);
+    }
+
+    /// S2 (OS security line P0): Yocto installs `duduclaw-cli` into the
+    /// image's standard system locations, not a per-user dir — this
+    /// candidate must be reachable even though it does not depend on `home`
+    /// at all. Skipped when the machine running the test genuinely has
+    /// nothing there (CI containers / macOS dev boxes usually don't ship a
+    /// `/bin/sh`-adjacent binary named after this test's probe), which is
+    /// why the assertion is conditional on a REAL match rather than
+    /// asserting a specific path exists.
+    #[cfg(not(windows))]
+    #[test]
+    fn finds_a_real_system_binary_via_usr_bin_or_bin_fallback() {
+        let tmp = std::env::temp_dir().join("duduclaw-which-cli-system-fallback");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // `sh` is POSIX-guaranteed to exist somewhere on the system PATH;
+        // on every mainstream Unix it lives at exactly one of the three new
+        // candidates (usually /bin/sh).
+        let found = which_cli_in_home(&tmp, "sh");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let found = found.expect("`sh` must resolve via the new /usr/bin, /usr/sbin, or /bin fallback");
+        assert!(
+            found == "/usr/bin/sh" || found == "/usr/sbin/sh" || found == "/bin/sh",
+            "unexpected resolution path: {found}"
+        );
     }
 }
 

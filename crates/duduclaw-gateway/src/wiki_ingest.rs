@@ -792,7 +792,7 @@ async fn run_knowledge_branch(
             // `page_blocked` because nothing was written, so there is nothing
             // for a human to release — this is a rate signal, not a queue item
             // (an approval with no ids would be a button that does nothing).
-            duduclaw_security::audit::append_audit_event(
+            crate::security_autopilot::audit_and_emit(
                 home_dir,
                 &duduclaw_security::audit::AuditEvent::new(
                     "knowledge_quarantined",
@@ -845,6 +845,8 @@ async fn run_knowledge_branch(
                     duduclaw_security::audit::log_injection_detected(
                         home_dir, agent_id, 0, rules, true,
                     );
+                    // C1 producer 甲 companion — see `security_autopilot.rs`.
+                    crate::security_autopilot::emit_injection_detected(agent_id, true);
                 }
                 AutoPageError::ScopeDenied(r) => {
                     debug!(agent = agent_id, "knowledge route: scope denied: {r}");
@@ -1516,6 +1518,12 @@ async fn store_facts_protected(
             duduclaw_security::audit::log_injection_detected(
                 home_dir, agent_id, score, &rules, true,
             );
+            // C1 producer 甲 companion — see `security_autopilot.rs`. One
+            // emission per flagged fact (bounded by `MAX_FACTS_PER_INGEST`
+            // per call); the per-rule circuit breaker in
+            // `AutopilotEngine::fire_matched_rule` still protects against
+            // any single rule firing away on a burst.
+            crate::security_autopilot::emit_injection_detected(agent_id, true);
             let subject = fact
                 .triple()
                 .map(|(s, _, _)| s.to_string())
@@ -1635,7 +1643,7 @@ async fn store_facts_protected(
     for (subject, ids) in quarantined_ids {
         let reason = quarantined_reason.get(&subject).cloned().unwrap_or_default();
         let snippet = quarantined_snippet.get(&subject).cloned().unwrap_or_default();
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "knowledge_quarantined",

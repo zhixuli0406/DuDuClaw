@@ -554,6 +554,8 @@ async fn execute_cron_task(
                             &claim.matched_text,
                             claim.claim_type.expected_tool(),
                         );
+                        // C1 producer 甲 companion — see `security_autopilot.rs`.
+                        crate::security_autopilot::emit_tool_hallucination(&task.agent_id);
                     }
                 }
             }

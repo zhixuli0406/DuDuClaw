@@ -165,7 +165,62 @@ pub async fn cmd_secaudit(home_dir: &Path, opts: SecauditOptions) -> i32 {
         }
     }
 
+    // S6 / secaudit→C1 bridge: a High+ finding is worth feeding the
+    // autopilot security-event loop (`AutopilotEvent::SecurityEvent`, a
+    // later wave — this is only the producer side). Gated on "a report was
+    // actually persisted" (`--report` and/or `--save`, both of which would
+    // already have returned exit 2 above on failure — reaching here means
+    // whichever was requested succeeded): a console-only summary has no
+    // durable artifact backing it, so this event only fires when there is
+    // something on disk an operator/agent can follow up on. Never fires for
+    // a bare `duduclaw secaudit` with neither flag.
+    if opts.report.is_some() || opts.save {
+        if let Some(event_severity) = secaudit_findings_event_severity(&audit_report.summary) {
+            let high_plus = audit_report.summary.by_severity.count_at_or_above(Severity::High);
+            duduclaw_security::audit::append_audit_event(
+                home_dir,
+                &duduclaw_security::audit::AuditEvent::new(
+                    "secaudit_findings",
+                    opts.agent.as_deref().unwrap_or("secaudit"),
+                    event_severity,
+                    serde_json::json!({
+                        "repo": audit_report.repo,
+                        "profile": opts.profile,
+                        "high_plus_count": high_plus,
+                        "critical_count": audit_report.summary.by_severity.critical,
+                        "high_count": audit_report.summary.by_severity.high,
+                        "report_path": opts.report.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        "saved": opts.save,
+                    }),
+                ),
+            );
+        }
+    }
+
     report::exit_code(&audit_report, fail_on)
+}
+
+/// Pure: decide whether the `secaudit_findings` audit event should fire, and
+/// at what severity. Extracted so the severity-mapping logic is unit
+/// testable without a live scan (`scanners::run_all` depends on external
+/// tool availability, so driving `cmd_secaudit` end-to-end can't
+/// deterministically produce a High/Critical finding in a unit test).
+///
+/// `None` when there is no High-or-above ACTIONABLE finding — `by_severity`
+/// already excludes `Refuted`/`Suppressed` findings (see
+/// `schema::Summary::from_findings`), so a refuted ai_audit candidate at
+/// Critical severity correctly does not trigger this event either, same
+/// fail-closed-toward-refuted discipline the `--fail-on` CI gate uses.
+fn secaudit_findings_event_severity(summary: &Summary) -> Option<duduclaw_security::audit::Severity> {
+    let high_plus = summary.by_severity.count_at_or_above(Severity::High);
+    if high_plus == 0 {
+        return None;
+    }
+    Some(if summary.by_severity.critical > 0 {
+        duduclaw_security::audit::Severity::Critical
+    } else {
+        duduclaw_security::audit::Severity::Warning
+    })
 }
 
 /// Steps 3b-3d: AI deep audit → adversarial review → (opt-in) PoC. Extracted
@@ -407,5 +462,126 @@ mod tests {
         o.agent = Some("does-not-exist".to_string());
         let code = cmd_secaudit(home.path(), o).await;
         assert_eq!(code, 0);
+    }
+
+    // ── S6 / secaudit→C1 bridge: secaudit_findings audit event ─────────
+
+    #[test]
+    fn findings_event_severity_none_below_high() {
+        let f = schema::Finding::candidate(
+            "semgrep",
+            schema::FindingKind::StaticAnalysis,
+            Severity::Medium,
+            "t",
+            "f",
+            None,
+            "s",
+            "r",
+            vec![],
+        );
+        let summary = Summary::from_findings(&[f], 1, 0);
+        assert!(secaudit_findings_event_severity(&summary).is_none());
+    }
+
+    #[test]
+    fn findings_event_severity_warning_for_high_without_critical() {
+        let f = schema::Finding::candidate(
+            "semgrep",
+            schema::FindingKind::StaticAnalysis,
+            Severity::High,
+            "t",
+            "f",
+            None,
+            "s",
+            "r",
+            vec![],
+        );
+        let summary = Summary::from_findings(&[f], 1, 0);
+        let sev = secaudit_findings_event_severity(&summary).expect("High must trigger");
+        assert!(matches!(sev, duduclaw_security::audit::Severity::Warning));
+    }
+
+    #[test]
+    fn findings_event_severity_critical_when_any_critical_present() {
+        let high = schema::Finding::candidate(
+            "semgrep",
+            schema::FindingKind::StaticAnalysis,
+            Severity::High,
+            "t",
+            "f",
+            None,
+            "s",
+            "r",
+            vec![],
+        );
+        let critical = schema::Finding::candidate(
+            "gitleaks",
+            schema::FindingKind::Secret,
+            Severity::Critical,
+            "t",
+            "f",
+            None,
+            "s",
+            "r",
+            vec![],
+        );
+        let summary = Summary::from_findings(&[high, critical], 2, 0);
+        let sev = secaudit_findings_event_severity(&summary).expect("Critical must trigger");
+        assert!(matches!(sev, duduclaw_security::audit::Severity::Critical));
+    }
+
+    #[test]
+    fn findings_event_severity_ignores_refuted_and_suppressed() {
+        // by_severity already excludes Refuted/Suppressed (see
+        // `Summary::from_findings`) — this inherits that discipline for
+        // free rather than re-deriving it.
+        let mut refuted = schema::Finding::candidate(
+            "ai_audit",
+            schema::FindingKind::Other,
+            Severity::Critical,
+            "t",
+            "f",
+            None,
+            "s",
+            "r",
+            vec![],
+        );
+        refuted.status = schema::FindingStatus::Refuted;
+        let summary = Summary::from_findings(&[refuted], 1, 0);
+        assert!(secaudit_findings_event_severity(&summary).is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_findings_never_writes_a_secaudit_findings_event_even_with_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("report.json");
+        let mut o = opts(dir.path().to_path_buf());
+        o.report = Some(report_path);
+        let code = cmd_secaudit(home.path(), o).await;
+        assert_eq!(code, 0);
+
+        let audit_path = home.path().join("security_audit.jsonl");
+        // Empty repo ⇒ zero findings ⇒ no event at all, so the file may not
+        // even have been created.
+        if let Ok(body) = std::fs::read_to_string(&audit_path) {
+            assert!(!body.contains("secaudit_findings"));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_report_and_no_save_never_writes_a_secaudit_findings_event() {
+        // Bare invocation (neither --report nor --save): even if findings
+        // existed, the gate itself must not fire — verified here on the
+        // always-true "no findings" empty-repo case, which exercises the
+        // same code path without needing a live scanner finding.
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let o = opts(dir.path().to_path_buf());
+        assert!(o.report.is_none() && !o.save);
+        let code = cmd_secaudit(home.path(), o).await;
+        assert_eq!(code, 0);
+        let audit_path = home.path().join("security_audit.jsonl");
+        assert!(!audit_path.exists(), "no persistence requested ⇒ no audit event ⇒ file never created");
     }
 }

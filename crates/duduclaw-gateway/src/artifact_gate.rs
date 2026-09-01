@@ -318,7 +318,7 @@ async fn record_gate_event(
     } else {
         duduclaw_security::audit::Severity::Info
     };
-    duduclaw_security::audit::append_audit_event(
+    crate::security_autopilot::audit_and_emit(
         home_dir,
         &duduclaw_security::audit::AuditEvent::new(
             event_type,

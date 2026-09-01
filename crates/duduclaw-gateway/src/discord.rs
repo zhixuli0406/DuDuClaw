@@ -1060,7 +1060,7 @@ async fn gateway_loop(
                                 let home = ctx.home_dir.clone();
                                 let label_for_audit = label.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    duduclaw_security::audit::append_audit_event(
+                                    crate::security_autopilot::audit_and_emit(
                                         &home,
                                         &duduclaw_security::audit::AuditEvent::new(
                                             "discord_invalid_session_storm",

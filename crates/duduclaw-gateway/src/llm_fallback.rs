@@ -172,7 +172,7 @@ pub async fn emit_llm_fallback_audit(
                 "trigger_error": error,
             }),
         );
-        duduclaw_security::audit::append_audit_event(&home, &event);
+        crate::security_autopilot::audit_and_emit(&home, &event);
     })
     .await
     {

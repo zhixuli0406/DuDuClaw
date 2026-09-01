@@ -112,6 +112,11 @@ pub const KNOWN_EVENT_NAMES: &[&str] = &[
     // confirmation tick within 60s" is exactly the temporal shape this
     // matcher exists for, and it stays 100% deterministic.
     "tick",
+    // OS security line P0 (C1): security-relevant signals (audit-log
+    // mirrors + SecurityPosture transitions). Legal on both sides — e.g.
+    // "prompt_injection, then no operator ack within 5m" is a legitimate
+    // temporal pattern for a `sequence` rule.
+    "security_event",
 ];
 
 /// Bounds on `within_secs` — floor rejects a degenerate always-false-window

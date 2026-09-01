@@ -52,7 +52,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use duduclaw_security::audit::{append_audit_event, AuditEvent, Severity};
+use duduclaw_security::audit::{AuditEvent, Severity};
 use duduclaw_security::rate_limiter::RateLimiter;
 
 use crate::device_ops::{DeviceOps, OpResult};
@@ -334,7 +334,7 @@ const AUDIT_RAW_ACTION_MAX_CHARS: usize = 32;
 /// the process that would otherwise write the row afterwards, so "log then
 /// act" is the only ordering that leaves evidence.
 pub fn audit_accepted(home_dir: &Path, action: PowerAction, conn: &RpcConnInfo) {
-    append_audit_event(
+    crate::security_autopilot::audit_and_emit(
         home_dir,
         &AuditEvent::new(
             AUDIT_EVENT_ACCEPTED,
@@ -360,7 +360,7 @@ pub fn audit_denied(
     if !denial.is_auditable() {
         return;
     }
-    append_audit_event(
+    crate::security_autopilot::audit_and_emit(
         home_dir,
         &AuditEvent::new(
             AUDIT_EVENT_DENIED,

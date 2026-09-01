@@ -6218,7 +6218,7 @@ impl MethodHandler {
             }
             "system.update_config" => {
                 require_admin!();
-                self.handle_system_update_config(params).await
+                self.handle_system_update_config(params, ctx).await
             }
             // ── WP21 §2.8: delegation permissions (owner/admin only) ─────
             // Who may hand work to whom, org-wide. Admin-gated like every
@@ -11104,7 +11104,7 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Failed to soft-delete agent: {e}"));
         }
 
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "agent_soft_delete",
@@ -11169,7 +11169,7 @@ impl MethodHandler {
         if let Err(e) = self.offboard_agent_toml(&agent_id, "archived").await {
             return WsFrame::error_response("", &format!("Failed to archive agent: {e}"));
         }
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "agent_archive",
@@ -11211,7 +11211,7 @@ impl MethodHandler {
         if let Err(e) = res {
             return WsFrame::error_response("", &format!("Failed to unarchive agent: {e}"));
         }
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "agent_unarchive",
@@ -11389,7 +11389,7 @@ impl MethodHandler {
             ));
         }
 
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "agent_handoff",
@@ -12849,7 +12849,7 @@ impl MethodHandler {
             Err(frame) => return frame,
         };
 
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "channel_config_set",
@@ -12938,7 +12938,7 @@ impl MethodHandler {
         } else {
             duduclaw_security::audit::Severity::Info
         };
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "channel_access_set",
@@ -13040,7 +13040,7 @@ impl MethodHandler {
         );
         ctrl.revoke_user(&subject).await;
 
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "channel_pairing_revoke",
@@ -18110,7 +18110,7 @@ impl MethodHandler {
     /// `security_audit.jsonl` via the shared, flock-protected writer. The
     /// private signing key is NEVER part of `details`.
     fn audit_distributor_event(&self, event_type: &str, details: Value) {
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 event_type,
@@ -20001,7 +20001,7 @@ impl MethodHandler {
         }
 
         // [M5] Audit log
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "system_update",
@@ -20074,7 +20074,7 @@ impl MethodHandler {
                     });
                 }
 
-                duduclaw_security::audit::append_audit_event(
+                crate::security_autopilot::audit_and_emit(
                     &self.home_dir,
                     &duduclaw_security::audit::AuditEvent::new(
                         "system_update_success",
@@ -20099,7 +20099,7 @@ impl MethodHandler {
 
                 // [R2:NM3] Sanitize error for audit log (strip ANSI/newlines)
                 let sanitized = e.replace('\n', " ").replace('\r', "").replace('\x1b', "");
-                duduclaw_security::audit::append_audit_event(
+                crate::security_autopilot::audit_and_emit(
                     &self.home_dir,
                     &duduclaw_security::audit::AuditEvent::new(
                         "system_update_failed",
@@ -20932,7 +20932,7 @@ impl MethodHandler {
             Err(e) => return WsFrame::error_response("", &format!("清理作業失敗:{e}")),
         }
 
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "credential_hygiene_cleanup",
@@ -21027,7 +21027,7 @@ impl MethodHandler {
         .await;
         match result {
             Ok(Ok(finding)) => {
-                duduclaw_security::audit::append_audit_event(
+                crate::security_autopilot::audit_and_emit(
                     &self.home_dir,
                     &duduclaw_security::audit::AuditEvent::new(
                         "secaudit_finding_status_changed",
@@ -22740,7 +22740,7 @@ impl MethodHandler {
     ///
     /// Only allows safe, non-sensitive fields: `log_level`, `rotation_strategy`.
     /// Uses atomic write (temp + rename) and never touches token/key fields.
-    async fn handle_system_update_config(&self, params: Value) -> WsFrame {
+    async fn handle_system_update_config(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
         let mut table = self.read_config_table(&config_path).await;
         let mut changes: Vec<String> = Vec::new();
@@ -23498,6 +23498,14 @@ impl MethodHandler {
             // "no valid fields".
             if config_toml_changes == 0 && !changes.is_empty() {
                 info!(?changes, "system.update_config completed");
+                duduclaw_security::audit::log_config_changed(
+                    &self.home_dir,
+                    &ctx.email,
+                    &format!("{:?}", ctx.role).to_lowercase(),
+                    &changes,
+                );
+                // C1 producer 甲 companion — see `security_autopilot.rs`.
+                crate::security_autopilot::emit_config_changed();
                 return WsFrame::ok_response("", json!({ "success": true, "changes": changes }));
             }
         }
@@ -23554,6 +23562,20 @@ impl MethodHandler {
         }
 
         info!(?changes, ?hot_reloaded, "system.update_config completed");
+        // B5 (OS security line P0): every accepted `config.toml` write is now
+        // auditable — same shape/spirit as `delegation.set`'s pre-existing
+        // `delegation_config_changed` event below. Fired only here (and at
+        // the voice-only early-return above), i.e. only once the write is
+        // durably committed — a rejected/failed update never reaches this
+        // point.
+        duduclaw_security::audit::log_config_changed(
+            &self.home_dir,
+            &ctx.email,
+            &format!("{:?}", ctx.role).to_lowercase(),
+            &changes,
+        );
+        // C1 producer 甲 companion — see `security_autopilot.rs`.
+        crate::security_autopilot::emit_config_changed();
         WsFrame::ok_response(
             "",
             json!({
@@ -23985,7 +24007,7 @@ impl MethodHandler {
         let pairs_json = |pairs: &Vec<(String, String)>| -> Value {
             Value::Array(pairs.iter().map(|(a, b)| json!([a, b])).collect())
         };
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "delegation_config_changed",
@@ -24118,7 +24140,7 @@ impl MethodHandler {
         );
 
         // Audit: who changed the global evolution switches, from what to what.
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "task_forward_model_config_changed",
@@ -33881,6 +33903,12 @@ pub(crate) fn validate_autopilot_trigger_event(ev: &str) -> Result<(), String> {
         // Without this entry a dashboard-authored rule could never subscribe
         // to a configured `[[tick.sources]]` feed at all.
         "tick",
+        // OS security line P0 (C1) — `autopilot_engine::AutopilotEvent::SecurityEvent`.
+        // Same gap class as `run_at_risk`/`os_file` above: without this entry
+        // a dashboard-authored rule (or `rule_induction`'s
+        // `enable_induced_rule`) could never subscribe to a security event
+        // even though the engine has fired them since this change.
+        "security_event",
     ];
     if KNOWN.iter().any(|k| *k == ev) {
         Ok(())
@@ -38275,6 +38303,22 @@ mod d6_curation_tests {
     //! memory.invalidate_origin rollback, and the D3 retrieval-weights wiring.
     use super::*;
 
+    /// B5 (OS security line P0): `handle_system_update_config` now takes a
+    /// `&UserContext` so `config_changed` audit events can attribute who
+    /// made the change. This module's direct-call tests bypass the
+    /// `require_admin!()` dispatch gate entirely (they call the handler, not
+    /// `.handle(method, params, ctx)`), so the role here is not enforced —
+    /// it only needs to be a plausible fixture value.
+    fn admin_ctx() -> UserContext {
+        UserContext {
+            user_id: "admin-test".to_string(),
+            email: "admin@test.local".to_string(),
+            role: UserRole::Admin,
+            agent_access: std::collections::HashMap::new(),
+            must_change_password: false,
+        }
+    }
+
     fn frame_ok(frame: &WsFrame) -> bool {
         matches!(frame, WsFrame::Response { ok: true, .. })
     }
@@ -38390,7 +38434,7 @@ mod d6_curation_tests {
                 "dispatch": { "policy": "round_robin" },
                 "memory": { "graph_embed_seed": true },
                 "topology_evolution": { "enabled": false },
-            }))
+            }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame), "valid knobs must persist: {frame:?}");
         let data = frame_data(&frame);
@@ -38453,7 +38497,7 @@ mod d6_curation_tests {
         let _ = frame;
 
         let frame = handler
-            .handle_system_update_config(json!({ "gap_digest_enabled": true }))
+            .handle_system_update_config(json!({ "gap_digest_enabled": true }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame), "gap_digest_enabled=true must persist: {frame:?}");
 
@@ -38474,7 +38518,7 @@ mod d6_curation_tests {
 
         // Turning it back off round-trips too.
         let frame = handler
-            .handle_system_update_config(json!({ "gap_digest_enabled": false }))
+            .handle_system_update_config(json!({ "gap_digest_enabled": false }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame));
         let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
@@ -38492,7 +38536,7 @@ mod d6_curation_tests {
 
         // Turn it off.
         let frame = handler
-            .handle_system_update_config(json!({ "novelty_gate_enabled": false }))
+            .handle_system_update_config(json!({ "novelty_gate_enabled": false }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame), "novelty_gate_enabled=false must persist: {frame:?}");
 
@@ -38511,7 +38555,7 @@ mod d6_curation_tests {
 
         // Turning it back on round-trips too.
         let frame = handler
-            .handle_system_update_config(json!({ "novelty_gate_enabled": true }))
+            .handle_system_update_config(json!({ "novelty_gate_enabled": true }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame));
         let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
@@ -38556,7 +38600,7 @@ mod d6_curation_tests {
         assert_eq!(data.get("daily_digest_at").and_then(|v| v.as_str()), Some("09:00"));
 
         let frame = handler
-            .handle_system_update_config(json!({ "daily_digest": true, "daily_digest_at": "07:30" }))
+            .handle_system_update_config(json!({ "daily_digest": true, "daily_digest_at": "07:30" }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame), "{frame:?}");
 
@@ -38578,7 +38622,7 @@ mod d6_curation_tests {
 
         // Turning it back off round-trips too.
         let frame = handler
-            .handle_system_update_config(json!({ "daily_digest": false }))
+            .handle_system_update_config(json!({ "daily_digest": false }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame));
         let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
@@ -38597,7 +38641,7 @@ mod d6_curation_tests {
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
         let frame = handler
-            .handle_system_update_config(json!({ "daily_digest_at": "早上九點" }))
+            .handle_system_update_config(json!({ "daily_digest_at": "早上九點" }), &admin_ctx())
             .await;
         assert!(!frame_ok(&frame), "malformed daily_digest_at must be rejected");
 
@@ -38613,7 +38657,7 @@ mod d6_curation_tests {
 
         // Unknown dispatch.policy enum value → rejected.
         let bad_policy = handler
-            .handle_system_update_config(json!({ "dispatch": { "policy": "chaos_monkey" } }))
+            .handle_system_update_config(json!({ "dispatch": { "policy": "chaos_monkey" } }), &admin_ctx())
             .await;
         assert!(
             !frame_ok(&bad_policy),
@@ -38622,7 +38666,7 @@ mod d6_curation_tests {
 
         // iteration_cap_simple out of the 1..=20 range → rejected.
         let bad_cap = handler
-            .handle_system_update_config(json!({ "goal_loop": { "iteration_cap_simple": 99 } }))
+            .handle_system_update_config(json!({ "goal_loop": { "iteration_cap_simple": 99 } }), &admin_ctx())
             .await;
         assert!(
             !frame_ok(&bad_cap),
@@ -38631,7 +38675,7 @@ mod d6_curation_tests {
 
         // knowledge_guard.window_secs = 0 → rejected.
         let bad_win = handler
-            .handle_system_update_config(json!({ "knowledge_guard": { "window_secs": 0 } }))
+            .handle_system_update_config(json!({ "knowledge_guard": { "window_secs": 0 } }), &admin_ctx())
             .await;
         assert!(!frame_ok(&bad_win), "window_secs=0 must be rejected");
 
@@ -38658,7 +38702,7 @@ mod d6_curation_tests {
 
         for mode in ["mav", "evaluator_only", "external", "human_only"] {
             let f = handler
-                .handle_system_update_config(json!({ "dispatch": { "judge": mode } }))
+                .handle_system_update_config(json!({ "dispatch": { "judge": mode } }), &admin_ctx())
                 .await;
             assert!(frame_ok(&f), "{mode} must be accepted");
             assert_eq!(
@@ -38670,7 +38714,7 @@ mod d6_curation_tests {
 
         // Unknown value → rejected, and the last good value survives.
         let bad = handler
-            .handle_system_update_config(json!({ "dispatch": { "judge": "eval_backed" } }))
+            .handle_system_update_config(json!({ "dispatch": { "judge": "eval_backed" } }), &admin_ctx())
             .await;
         assert!(!frame_ok(&bad), "unknown judge mode must be rejected");
         assert_eq!(
@@ -38684,7 +38728,7 @@ mod d6_curation_tests {
         let _ = handler
             .handle_system_update_config(json!({
                 "dispatch": { "judge_command": ["/bin/sh", "-c", "echo pwned"] }
-            }))
+            }), &admin_ctx())
             .await;
         let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
         assert!(
@@ -38709,7 +38753,7 @@ mod d6_curation_tests {
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
         let frame = handler
-            .handle_system_update_config(json!({ "goal_loop": { "resume_on_restart": "pause" } }))
+            .handle_system_update_config(json!({ "goal_loop": { "resume_on_restart": "pause" } }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame), "\"pause\" must be accepted: {frame:?}");
         let data = frame_data(&frame);
@@ -38737,7 +38781,7 @@ mod d6_curation_tests {
 
         // Round-trips back to "auto" too.
         let frame = handler
-            .handle_system_update_config(json!({ "goal_loop": { "resume_on_restart": "auto" } }))
+            .handle_system_update_config(json!({ "goal_loop": { "resume_on_restart": "auto" } }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame), "\"auto\" must be accepted: {frame:?}");
         assert_eq!(
@@ -38757,7 +38801,7 @@ mod d6_curation_tests {
 
         for bad in ["Auto", "PAUSE", "pausing", "", "auto ", " pause", "yes", "true"] {
             let frame = handler
-                .handle_system_update_config(json!({ "goal_loop": { "resume_on_restart": bad } }))
+                .handle_system_update_config(json!({ "goal_loop": { "resume_on_restart": bad } }), &admin_ctx())
                 .await;
             assert!(
                 !frame_ok(&frame),
@@ -38788,7 +38832,7 @@ mod d6_curation_tests {
                         "complaint_count": "daily_complaints",
                     },
                 },
-            }))
+            }), &admin_ctx())
             .await;
         assert!(frame_ok(&frame), "valid belief knobs must persist: {frame:?}");
         let data = frame_data(&frame);
@@ -38818,7 +38862,7 @@ mod d6_curation_tests {
 
         // flat_band_pct out of the 0.01-10.0 range.
         let bad_band = handler
-            .handle_system_update_config(json!({ "belief": { "flat_band_pct": 15.0 } }))
+            .handle_system_update_config(json!({ "belief": { "flat_band_pct": 15.0 } }), &admin_ctx())
             .await;
         assert!(!frame_ok(&bad_band), "out-of-range flat_band_pct must be rejected");
 
@@ -38827,7 +38871,7 @@ mod d6_curation_tests {
         let bad_key = handler
             .handle_system_update_config(json!({
                 "belief": { "tick_subject_map": { long_key: "subject" } },
-            }))
+            }), &admin_ctx())
             .await;
         assert!(!frame_ok(&bad_key), "over-long tick_subject_map key must be rejected");
 
@@ -38839,7 +38883,7 @@ mod d6_curation_tests {
         let bad_size = handler
             .handle_system_update_config(json!({
                 "belief": { "tick_subject_map": too_many },
-            }))
+            }), &admin_ctx())
             .await;
         assert!(!frame_ok(&bad_size), "more than 32 tick_subject_map entries must be rejected");
 
@@ -44399,7 +44443,7 @@ impl MethodHandler {
             Ok(()) => (true, None),
             Err(e) => (false, Some(e.code.code())),
         };
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 event_type,
@@ -44946,7 +44990,7 @@ impl MethodHandler {
     /// (timezone/ntp are not password-shaped), so unlike `audit_wifi_event`
     /// the actual values ARE included in the audit payload.
     fn audit_timedate_event(&self, timezone: Option<&str>, ntp: Option<bool>, ok: bool, code: Option<&str>) {
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "timedate_set",
@@ -45078,7 +45122,7 @@ impl MethodHandler {
         ok: bool,
         code: Option<&str>,
     ) {
-        duduclaw_security::audit::append_audit_event(
+        crate::security_autopilot::audit_and_emit(
             &self.home_dir,
             &duduclaw_security::audit::AuditEvent::new(
                 "network_wired_config",
@@ -45417,6 +45461,20 @@ pub async fn stage_and_apply_device_update(home_dir: &Path) -> DeviceUpdateApply
             ));
         }
         crate::os_update::cleanup_staged(&staged);
+        // B5 (OS security line P0): a device-target apply previously left NO
+        // trace in `security_audit.jsonl` at all — this is the fix. `"device"`
+        // is a fixed actor sentinel: this shared pipeline function (dashboard
+        // RPC + the `os_apply_update` MCP tool both call it, see the doc
+        // comment above) intentionally has no agent-identity parameter, so
+        // there is no caller identity to attribute this to more precisely.
+        // Fired only here — i.e. sysupdate succeeded AND the installed slot
+        // was confirmed to match what was staged — NOT the same moment as
+        // "the new slot booted successfully" (that is `log_os_update_blessed`/
+        // `log_os_rollback_detected`, recorded on a LATER boot by
+        // `update_report_reconcile.rs`).
+        duduclaw_security::audit::log_os_update_applied(home_dir, "device", "device", &staged.version);
+        // C1 producer 甲 companion — see `security_autopilot.rs`.
+        crate::security_autopilot::emit_os_update_applied("device");
     }
     DeviceUpdateApplyOutcome::Applied(applied)
 }

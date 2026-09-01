@@ -361,6 +361,12 @@ async fn reconcile_device(
     let assessment = crate::device_ops::select_device_ops().boot_assessment_status().await;
     match classify_boot_assessment(&assessment) {
         BootVerdict::Good => {
+            // B5 (OS security line P0): the update just survived its boot
+            // assessment — record the blessing before the notify/clear step
+            // below (whose own failure-to-deliver must not also swallow this
+            // audit trail — see `finalize_report`'s own retry-on-non-delivery
+            // behavior, which this event is independent of).
+            duduclaw_security::audit::log_os_update_blessed(home_dir, agent_id);
             finalize_report(
                 home_dir,
                 agent_id,
@@ -373,6 +379,9 @@ async fn reconcile_device(
             .await;
         }
         BootVerdict::Bad => {
+            // B5: the bootloader auto-rolled-back — Critical, see
+            // `log_os_rollback_detected`'s own doc comment for why.
+            duduclaw_security::audit::log_os_rollback_detected(home_dir, agent_id);
             finalize_report(
                 home_dir,
                 agent_id,

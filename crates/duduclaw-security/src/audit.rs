@@ -102,35 +102,28 @@ impl AuditEvent {
 /// The log is stored at `<home_dir>/security_audit.jsonl`.
 /// This function is synchronous (blocking I/O) and suitable for
 /// calling from both sync and async contexts via `spawn_blocking`.
+///
+/// B1 (OS security line P0): every line gains a `_prev_hash` SHA-256 chain
+/// field via [`crate::audit_chain::append_chained_line`] — tampering with
+/// any historical line is detectable via [`crate::audit_chain::verify_chain`].
+/// File creation mode is unchanged from before B1 (`None` — process umask,
+/// no explicit tightening), preserving this file's pre-existing permission
+/// behavior exactly.
 pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
     let path = home_dir.join("security_audit.jsonl");
-    let json = match serde_json::to_string(event) {
-        Ok(j) => j,
+    let map = match serde_json::to_value(event) {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(_) => {
+            warn!("audit event did not serialize to a JSON object; dropped");
+            return;
+        }
         Err(e) => {
             warn!("Failed to serialize audit event: {e}");
             return;
         }
     };
-
-    use std::io::Write;
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(mut f) => {
-            // Use advisory file lock to prevent multi-process write corruption (MW-H2)
-            if let Err(e) = duduclaw_core::platform::flock_exclusive(&f) {
-                warn!("flock failed on audit log: {e}");
-            }
-            if let Err(e) = writeln!(f, "{json}") {
-                warn!("Failed to write audit event: {e}");
-            }
-            // Lock automatically released when file is dropped
-        }
-        Err(e) => {
-            warn!("Failed to open audit log {}: {e}", path.display());
-        }
+    if let Err(e) = crate::audit_chain::append_chained_line(&path, map, None) {
+        warn!("Failed to write audit event to {}: {e}", path.display());
     }
 }
 
@@ -314,6 +307,11 @@ pub fn append_tool_call(
 /// Extras are attached as top-level JSON fields. They MUST NOT collide with
 /// the canonical fields (`timestamp`, `agent_id`, `tool_name`, `params_summary`,
 /// `success`); when collision occurs the canonical field wins.
+///
+/// B1 (OS security line P0): every line gains a `_prev_hash` SHA-256 chain
+/// field via [`crate::audit_chain::append_chained_line`] — see that module's
+/// doc comment for the concurrency and rotation-boundary contract. File
+/// creation mode (0600, tightened on drift) is unchanged from before B1.
 pub fn append_tool_call_with_extras(
     home_dir: &Path,
     agent_id: &str,
@@ -346,55 +344,13 @@ pub fn append_tool_call_with_extras(
         }
         map.insert((*key).to_string(), value.clone());
     }
-    let record = serde_json::Value::Object(map);
-    let json = match serde_json::to_string(&record) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!("Failed to serialize tool call record: {e}");
-            return;
-        }
-    };
 
-    use std::io::Write;
     // 0600 on create: since result_text landed, rows can carry business
     // data (e.g. Odoo reads), so the file must not be world/group-readable.
-    // mode() only applies at creation — pre-existing files keep their bits,
-    // hence the explicit tighten below for upgraded installs.
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    match opts.open(&path) {
-        Ok(mut f) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = f.metadata() {
-                    if meta.permissions().mode() & 0o077 != 0 {
-                        let mut perms = meta.permissions();
-                        perms.set_mode(0o600);
-                        if let Err(e) = f.set_permissions(perms) {
-                            warn!("failed to tighten tool_calls.jsonl to 0600: {e}");
-                        }
-                    }
-                }
-            }
-            // Warn (not silently swallow) like the security_audit.jsonl
-            // sibling path — a failed lock means concurrent writers may
-            // interleave lines (2026-07 MED).
-            if let Err(e) = duduclaw_core::platform::flock_exclusive(&f) {
-                warn!("flock failed on tool_calls.jsonl: {e}");
-            }
-            if let Err(e) = writeln!(f, "{json}") {
-                warn!("Failed to write tool call record: {e}");
-            }
-        }
-        Err(e) => {
-            warn!("Failed to open tool_calls.jsonl: {e}");
-        }
+    // `append_chained_line` tightens an existing file's permissions if they
+    // drifted wider (upgraded installs), same discipline as before B1.
+    if let Err(e) = crate::audit_chain::append_chained_line(&path, map, Some(0o600)) {
+        warn!("Failed to write tool call record to {}: {e}", path.display());
     }
 }
 
@@ -841,6 +797,14 @@ pub const TOOL_CALLS_ROTATION_MAX_BYTES: u64 = 16 * 1024 * 1024; // 16 MB
 /// Concurrent callers may both attempt `rename` — the loser gets ENOENT
 /// which is silently ignored since a fresh file will be created on the
 /// next `append` (review R3-L4).
+///
+/// B1: the hash chain deliberately does NOT continue in-band across this
+/// rotation (see `crate::audit_chain`'s module doc, "Rotation boundary
+/// semantics") — the next append to `path` starts a fresh chain at genesis.
+/// The rotation boundary itself is instead recorded as an ordinary,
+/// chained `audit_chain_rotated` event carrying the rotated-away file's
+/// final-line hash, so the two files stay forensically linkable without an
+/// in-band assertion that a second rotation would silently invalidate.
 fn maybe_rotate_tool_calls(path: &std::path::Path) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -853,13 +817,49 @@ fn maybe_rotate_tool_calls(path: &std::path::Path) {
     if let Ok(meta) = std::fs::metadata(path)
         && meta.len() > TOOL_CALLS_ROTATION_MAX_BYTES {
             let backup = path.with_extension("jsonl.old");
+            // Capture the tail hash BEFORE renaming — best-effort: if the
+            // process dies between this read and the rename, the file is
+            // simply not rotated this call and a later call retries. If it
+            // dies between the rename and the rotation-event write below,
+            // the rotation itself still happened correctly (the new file
+            // still starts at genesis on its own) — only the forensic
+            // cross-link event is lost, not any audit data.
+            let old_tail_hash = crate::audit_chain::last_line_hash(path).ok();
             // Ignore ENOENT: a concurrent caller may have already rotated.
             match std::fs::rename(path, &backup) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some(home_dir) = path.parent() {
+                        log_audit_chain_rotated(
+                            home_dir,
+                            "tool_calls.jsonl",
+                            old_tail_hash.as_deref(),
+                        );
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => warn!("Failed to rotate tool_calls.jsonl: {e}"),
             }
         }
+}
+
+/// Log the rotation boundary of a hash-chained JSONL audit file (B1). Fired
+/// by [`maybe_rotate_tool_calls`] whenever `tool_calls.jsonl` is rotated to
+/// `.jsonl.old` — see `crate::audit_chain`'s module doc for why the new
+/// file's chain restarts at genesis instead of continuing in-band, and why
+/// THIS event is what anchors the two files together instead. `agent_id` is
+/// the fixed sentinel `"system"` (rotation is a mechanical housekeeping
+/// action, not attributable to any one agent's turn).
+fn log_audit_chain_rotated(home_dir: &Path, file_name: &str, old_tail_hash: Option<&str>) {
+    let event = AuditEvent::new(
+        "audit_chain_rotated",
+        "system",
+        Severity::Info,
+        serde_json::json!({
+            "file": file_name,
+            "old_tail_hash": old_tail_hash,
+        }),
+    );
+    append_audit_event(home_dir, &event);
 }
 
 /// Log a tool hallucination detection event.
@@ -977,6 +977,102 @@ pub fn log_failsafe_change(
             "to": to_level,
             "reason": reason,
         }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+// ── B5: OS-level events (OS security line P0 §2 支柱二) ────────────────
+//
+// Four new generators, following the existing `log_*` convenience-
+// constructor pattern (`log_soul_drift`, `log_failsafe_change`, …). Every
+// call routes through `append_audit_event`, so every OS event automatically
+// gets the B1 hash chain for free — no separate wiring needed here.
+
+/// Log a successful OS update APPLY (device target — the appliance A/B
+/// image update pipeline `duduclaw_gateway::handlers::stage_and_apply_device_update`
+/// drives). Fired once `sysupdate` reports success AND the installed slot
+/// has been confirmed to match what was staged — NOT the same moment as
+/// "the new slot booted successfully", which is [`log_os_update_blessed`]/
+/// [`log_os_rollback_detected`], recorded on a LATER boot.
+///
+/// `actor` is the caller identity where one exists (an agent id for the
+/// `os_apply_update` MCP tool path) or the fixed sentinel `"device"` for the
+/// dashboard-triggered path, which has no agent context at this call site.
+pub fn log_os_update_applied(home_dir: &Path, actor: &str, target: &str, version: &str) {
+    let event = AuditEvent::new(
+        "os_update_applied",
+        actor,
+        Severity::Warning,
+        serde_json::json!({
+            "target": target,
+            "version": version,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log that a previously-applied OS update survived its post-reboot boot
+/// assessment (`systemd-bless-boot status` reporting `good`/`clean`) — the
+/// update is now blessed and the bootloader will not auto-roll-back to the
+/// previous slot. Fired from `update_report_reconcile.rs::reconcile_device`'s
+/// `BootVerdict::Good` branch.
+pub fn log_os_update_blessed(home_dir: &Path, agent_id: &str) {
+    let event = AuditEvent::new("os_update_blessed", agent_id, Severity::Info, serde_json::json!({}));
+    append_audit_event(home_dir, &event);
+}
+
+/// Log that the bootloader auto-rolled-back a failed OS update
+/// (`systemd-bless-boot status` reporting `bad`). Always Critical: this is
+/// exactly the "silent regression" scenario tamper-evident/auditable OS
+/// state exists to surface — the device is now running an OLDER version
+/// than whatever was most recently applied, without any explicit rollback
+/// action having been taken by an operator or agent. Fired from
+/// `update_report_reconcile.rs::reconcile_device`'s `BootVerdict::Bad`
+/// branch.
+pub fn log_os_rollback_detected(home_dir: &Path, agent_id: &str) {
+    let event = AuditEvent::new(
+        "os_rollback_detected",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({}),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log an accepted `config.toml` write via the dashboard's
+/// `system.update_config` RPC — same shape/spirit as the pre-existing
+/// `delegation_config_changed` event for the sibling `delegation.set` RPC.
+/// `changes` is the human-readable change list the handler already builds
+/// for its own success response (e.g. `"gateway.bind = \"0.0.0.0\" (restart
+/// required)"`) — reused verbatim rather than re-deriving a second
+/// before/after diff.
+pub fn log_config_changed(home_dir: &Path, actor_email: &str, actor_role: &str, changes: &[String]) {
+    let event = AuditEvent::new(
+        "config_changed",
+        "dashboard",
+        Severity::Warning,
+        serde_json::json!({
+            "actor_email": actor_email,
+            "actor_role": actor_role,
+            "changes": changes,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log a gateway boot (B5). Fired exactly once per `start_gateway` call,
+/// early, from `duduclaw-gateway::server`. `image_version` is the
+/// `IMAGE_VERSION=` field out of `/etc/os-release`
+/// (`duduclaw_gateway::os_update::running_image_version`) when running on an
+/// appliance image, `None` off-appliance — `duduclaw-security` cannot read
+/// that itself (`duduclaw-gateway` depends on `duduclaw-security`, not the
+/// other way around), so the caller resolves it and passes the value in.
+pub fn log_os_boot(home_dir: &Path, image_version: Option<&str>) {
+    let event = AuditEvent::new(
+        "os_boot",
+        "system",
+        Severity::Info,
+        serde_json::json!({ "image_version": image_version }),
     );
     append_audit_event(home_dir, &event);
 }
@@ -1489,6 +1585,158 @@ mod tests {
         let raw = serde_json::to_string(e).unwrap();
         assert!(!raw.contains("/tmp"), "no path/value should leak into the audit record");
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── B1: hash chain integration on the two production writers ─────
+
+    #[test]
+    fn security_audit_jsonl_rows_are_chained_and_verify_intact() {
+        let home = fresh_home();
+        log_soul_drift(&home, "agnes", "hash-a", "hash-b");
+        log_skill_quarantined(&home, "agnes", "some-skill", "policy violation");
+        log_tool_hallucination(&home, "agnes", "claimed X", "expected_tool");
+
+        let path = home.join("security_audit.jsonl");
+        let result = crate::audit_chain::verify_chain(&path).unwrap();
+        assert_eq!(
+            result,
+            crate::audit_chain::ChainVerifyResult::Intact { lines_checked: 3 }
+        );
+
+        // Existing typed reader still parses every row — the new `_prev_hash`
+        // field is additive and `AuditEvent` has no `deny_unknown_fields`.
+        let events = read_recent_events(&home, 10);
+        assert_eq!(events.len(), 3);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn tool_calls_jsonl_rows_are_chained_and_verify_intact() {
+        let home = fresh_home();
+        append_tool_call(&home, "agnes", "tasks_list", "ok", true);
+        append_tool_call_with_input(
+            &home,
+            "agnes",
+            "tasks_create",
+            "ok",
+            true,
+            Some(&serde_json::json!({ "title": "x" })),
+            None,
+        );
+        append_tool_call_denied(&home, "agnes", "runtime_install", "denied_tools", "blocked", None);
+
+        let path = home.join("tool_calls.jsonl");
+        let result = crate::audit_chain::verify_chain(&path).unwrap();
+        assert_eq!(
+            result,
+            crate::audit_chain::ChainVerifyResult::Intact { lines_checked: 3 }
+        );
+
+        // Existing generic-JSON readers still see every row untouched.
+        let since = "2000-01-01T00:00:00Z";
+        let rows = read_tool_calls_since(&home, "agnes", since);
+        assert_eq!(rows.len(), 3);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn tampering_a_security_audit_row_is_detected() {
+        let home = fresh_home();
+        log_soul_drift(&home, "agnes", "hash-a", "hash-b");
+        log_skill_quarantined(&home, "agnes", "some-skill", "reason");
+
+        let path = home.join("security_audit.jsonl");
+        let body = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = body.lines().map(String::from).collect();
+        assert!(lines[0].contains("hash-a"));
+        lines[0] = lines[0].replace("hash-a", "hash-TAMPERED");
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let result = crate::audit_chain::verify_chain(&path).unwrap();
+        assert_eq!(result, crate::audit_chain::ChainVerifyResult::Broken { line_number: 2 });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── B5: OS-level event generators ─────────────────────────────
+
+    #[test]
+    fn os_update_applied_carries_target_and_version() {
+        let home = fresh_home();
+        log_os_update_applied(&home, "device", "device", "2026.09.01");
+        let events = read_recent_events(&home, 10);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "os_update_applied");
+        assert_eq!(events[0].agent_id, "device");
+        assert!(matches!(events[0].severity, Severity::Warning));
+        assert_eq!(events[0].details["target"], "device");
+        assert_eq!(events[0].details["version"], "2026.09.01");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn os_update_blessed_is_info_severity() {
+        let home = fresh_home();
+        log_os_update_blessed(&home, "agnes");
+        let events = read_recent_events(&home, 10);
+        assert_eq!(events[0].event_type, "os_update_blessed");
+        assert!(matches!(events[0].severity, Severity::Info));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn os_rollback_detected_is_always_critical() {
+        let home = fresh_home();
+        log_os_rollback_detected(&home, "agnes");
+        let events = read_recent_events(&home, 10);
+        assert_eq!(events[0].event_type, "os_rollback_detected");
+        assert!(
+            matches!(events[0].severity, Severity::Critical),
+            "a silent auto-rollback must always be Critical"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn config_changed_records_actor_and_change_list() {
+        let home = fresh_home();
+        let changes = vec![
+            "logging.level = \"debug\"".to_string(),
+            "gateway.bind = \"0.0.0.0\" (restart required)".to_string(),
+        ];
+        log_config_changed(&home, "owner@example.com", "owner", &changes);
+        let events = read_recent_events(&home, 10);
+        assert_eq!(events[0].event_type, "config_changed");
+        assert_eq!(events[0].agent_id, "dashboard");
+        assert!(matches!(events[0].severity, Severity::Warning));
+        assert_eq!(events[0].details["actor_email"], "owner@example.com");
+        assert_eq!(events[0].details["actor_role"], "owner");
+        assert_eq!(events[0].details["changes"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn os_boot_records_image_version_when_present_and_null_when_absent() {
+        let home = fresh_home();
+        log_os_boot(&home, Some("2026.09.01"));
+        log_os_boot(&home, None);
+        let events = read_recent_events(&home, 10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "os_boot");
+        assert_eq!(events[0].details["image_version"], "2026.09.01");
+        assert!(events[1].details["image_version"].is_null());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn audit_chain_rotated_carries_file_and_old_tail_hash() {
+        let home = fresh_home();
+        log_audit_chain_rotated(&home, "tool_calls.jsonl", Some("deadbeef"));
+        let events = read_recent_events(&home, 10);
+        assert_eq!(events[0].event_type, "audit_chain_rotated");
+        assert_eq!(events[0].agent_id, "system");
+        assert_eq!(events[0].details["file"], "tool_calls.jsonl");
+        assert_eq!(events[0].details["old_tail_hash"], "deadbeef");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
