@@ -94,3 +94,12 @@ meta-duduclaw/.build/
 # root the same way, see meta-duduclaw/kas/duduclaw-os.yml's own A5 header
 # comment for the pin.
 /meta-virtualization/
+
+# UEFI Secure Boot signing keys (trust-chain P1, wave SB-1): repo-root
+# working copy of the db.key/db.crt pair the kas overlay
+# (meta-duduclaw/kas/sb-signing.yml) mounts into the builder container at
+# /workspace/sb-keys/ to sign UKIs. Produced by meta-duduclaw/scripts/
+# sb-keygen.sh into ~/.duduclaw-sb/ and copied here on demand -- never
+# committed, *.key is already covered above but the whole directory is
+# excluded for defense in depth (it may also hold .crt/.esl/.auth copies).
+/sb-keys/
