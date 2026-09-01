@@ -52,6 +52,22 @@
 //! bounds-checks every field and returns `Err` rather than panicking on a
 //! malformed image — a slice panic inside the gateway is a denial of service
 //! on the one process that can install the fix.
+//!
+//! ## T4 status update (2026-09-02) — rewrite is now the fallback, not the norm
+//!
+//! `commercial/docs/DESIGN-os-trust-chain-2026-09.md`'s 2026-09-02 修正案
+//! entry: once Secure Boot signs the whole UKI as one Authenticode PE, the
+//! [`rewrite_root_partuuid`] byte-patch described above corrupts that
+//! signature — a SB-enforcing firmware refuses to load the patched image.
+//! The fix ships one pre-signed UKI *per slot* instead (root-B's own
+//! PARTUUID had to become a build-time constant for that to be possible —
+//! see `duduclaw-ab-partflags.bbclass`'s `DUDUCLAW_AB_ROOTB_PARTUUID`), and
+//! [`crate::os_update`] now prefers *selecting* the already-correct variant
+//! ([`verify_root_partuuid`]) over patching one. `rewrite_root_partuuid`
+//! itself is unchanged and stays reachable: a release that still ships only
+//! one UKI template (pre-T4, or a line that never adopts per-slot UKIs)
+//! falls back to it, with a logged warning that SB enforcement will reject
+//! the result.
 
 /// PE section name holding the kernel command line of a UKI.
 const CMDLINE_SECTION: &str = ".cmdline";
@@ -241,17 +257,50 @@ pub fn rewrite_root_partuuid(data: &mut [u8], new_partuuid: &str) -> Result<Stri
     Ok(old)
 }
 
+/// Verify — without mutating anything — that a UKI's baked
+/// `root=PARTUUID=` already equals `want`.
+///
+/// This is the T4 selection primitive (see the module doc's "T4 status
+/// update"): `crate::os_update` calls it once per candidate UKI variant in a
+/// per-slot release to find the one that is already bound to the
+/// destination slot, instead of rewriting bytes and breaking a Secure Boot
+/// signature that covers the whole PE image. Fails closed the same way
+/// [`rewrite_root_partuuid`] does: a parse error, a missing token, or a
+/// mismatch are all `Err`, never a silent false — a caller must not be able
+/// to mistake "could not tell" for "does not match" or vice versa without
+/// looking at the error text either way, but a caller that only checks
+/// `is_ok()` still gets the fail-closed answer for all three.
+///
+/// Returns the baked PARTUUID on success (case-insensitively equal to
+/// `want`) so the caller can log it as provenance, mirroring
+/// `rewrite_root_partuuid`'s return value.
+pub fn verify_root_partuuid(data: &[u8], want: &str) -> Result<String, String> {
+    if !is_uuid_text(want) {
+        return Err(format!(
+            "refusing to verify against {want:?}: not a canonical UUID"
+        ));
+    }
+    let span = cmdline_span(data)?;
+    let got = root_partuuid(&span.text)?;
+    if !got.eq_ignore_ascii_case(want) {
+        return Err(format!(
+            "UKI is bound to {got}, expected {want}"
+        ));
+    }
+    Ok(got)
+}
+
+/// Shared test fixtures — `#[cfg(test)] pub(crate)` rather than private to
+/// this module's own `tests` submodule so `crate::os_update`'s tests can
+/// build the same structurally-real synthetic UKIs when exercising the T4
+/// selection path (`bind_uki_to_slot`), instead of maintaining a second,
+/// possibly-drifted copy of this PE-header arithmetic.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SLOT_A: &str = "5c058150-7f3d-4167-9241-3f83579b431f";
-    const SLOT_B: &str = "650a421b-6979-44d9-b580-917f384a8325";
-
+pub(crate) mod test_support {
     /// Build a minimal but structurally real PE image with one `.cmdline`
     /// section, so the parser is exercised against actual header arithmetic
     /// rather than a mock.
-    fn synth_uki(cmdline: &str) -> Vec<u8> {
+    pub(crate) fn synth_uki(cmdline: &str) -> Vec<u8> {
         let pe_off = 0x80usize;
         let opt_size = 0xF0usize;
         let table = pe_off + 24 + opt_size;
@@ -279,6 +328,15 @@ mod tests {
         data[cmd_at..cmd_at + cmdline.len()].copy_from_slice(cmdline.as_bytes());
         data
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::synth_uki;
+    use super::*;
+
+    const SLOT_A: &str = "5c058150-7f3d-4167-9241-3f83579b431f";
+    const SLOT_B: &str = "650a421b-6979-44d9-b580-917f384a8325";
 
     fn sample_cmdline(uuid: &str) -> String {
         format!("systemd.show_status=auto rw root=PARTUUID={uuid} console=tty0")
@@ -384,5 +442,54 @@ mod tests {
         assert!(!is_uuid_text(&format!("{SLOT_A}0")));
         assert!(!is_uuid_text("gggggggg-7f3d-4167-9241-3f83579b431f"));
         assert!(!is_uuid_text("5c058150_7f3d_4167_9241_3f83579b431f0"));
+    }
+
+    // --- verify_root_partuuid (T4) ----------------------------------------
+
+    #[test]
+    fn verify_accepts_a_uki_already_bound_to_the_target() {
+        let uki = synth_uki(&sample_cmdline(SLOT_B));
+        assert_eq!(verify_root_partuuid(&uki, SLOT_B).unwrap(), SLOT_B);
+        // Case-insensitive, matching rewrite_root_partuuid's own contract.
+        assert_eq!(
+            verify_root_partuuid(&uki, &SLOT_B.to_uppercase()).unwrap(),
+            SLOT_B
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_uki_bound_to_a_different_slot() {
+        let uki = synth_uki(&sample_cmdline(SLOT_A));
+        let err = verify_root_partuuid(&uki, SLOT_B).unwrap_err();
+        assert!(err.contains(SLOT_A), "error should name the actual value: {err}");
+    }
+
+    #[test]
+    fn verify_never_mutates_the_image() {
+        let uki = synth_uki(&sample_cmdline(SLOT_A));
+        let before = uki.clone();
+        let _ = verify_root_partuuid(&uki, SLOT_B);
+        let _ = verify_root_partuuid(&uki, SLOT_A);
+        assert_eq!(uki, before, "verification must be read-only");
+    }
+
+    #[test]
+    fn verify_refuses_a_non_uuid_target() {
+        let uki = synth_uki(&sample_cmdline(SLOT_A));
+        for bad in ["", "not-a-uuid", "/dev/sda2 root=/dev/sda3 init=/bin/sh  "] {
+            assert!(verify_root_partuuid(&uki, bad).is_err(), "must refuse {bad:?}");
+        }
+    }
+
+    #[test]
+    fn verify_fails_closed_on_a_malformed_image() {
+        assert!(verify_root_partuuid(&[], SLOT_A).is_err());
+        assert!(verify_root_partuuid(b"not a pe image", SLOT_A).is_err());
+    }
+
+    #[test]
+    fn verify_fails_closed_when_the_uki_has_no_root_partuuid() {
+        let uki = synth_uki("systemd.show_status=auto rw root=/dev/vda2");
+        assert!(verify_root_partuuid(&uki, SLOT_A).is_err());
     }
 }

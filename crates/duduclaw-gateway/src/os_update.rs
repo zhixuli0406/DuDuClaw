@@ -39,12 +39,35 @@
 //!  stores far fewer blocks than a payload's apparent size)
 //! download each file, hashing as it lands -> digest mismatch deletes and aborts
 //! resolve the destination slot from the live GPT
-//! rewrite the UKI's root=PARTUUID= to that slot   (see crate::uki_patch)
+//! bind the UKI to that slot                        (see bind_uki_to_slot)
 //! atomically move both files into the staging dir
 //! ```
 //!
 //! Only then does the caller invoke `systemd-sysupdate update`, which finds
 //! a staging directory containing exactly one verified version.
+//!
+//! ## T4 (2026-09-02): selection, not rewrite, whenever a release allows it
+//!
+//! `commercial/docs/DESIGN-os-trust-chain-2026-09.md`'s 2026-09-02 修正案
+//! entry: Secure Boot's Authenticode signature covers the whole UKI PE
+//! image, so patching `.cmdline` bytes on the device — the original binding
+//! step this module used — corrupts that signature, and a SB-enforcing
+//! firmware refuses to load the patched result. Once root-B's own PARTUUID
+//! is also a build-time constant (`duduclaw-ab-partflags.bbclass`'s
+//! `DUDUCLAW_AB_ROOTB_PARTUUID`), a release can ship one pre-signed UKI
+//! *per slot* instead, and step 6 becomes a *selection*
+//! ([`bind_uki_to_slot`]): download both candidate variants, and stage
+//! whichever one's baked `root=PARTUUID=` already equals the destination
+//! slot's (verified, never trusted from the filename, via
+//! [`uki_patch::verify_root_partuuid`]). A release that still ships only one
+//! UKI template — pre-T4, or a line that never adopts per-slot UKIs — is not
+//! broken by this: [`bind_uki_to_slot`] falls back to the original
+//! [`uki_patch::rewrite_root_partuuid`] byte-patch, with a logged warning
+//! that SB enforcement will reject the result. Either way, the file that
+//! lands in the staging directory is always named `release.uki.name` (the
+//! canonical `duduclaw-os_<version>.efi`) — sysupdate's
+//! `[Source] MatchPattern=` invariant (§3.3 of the design doc) never
+//! changes, regardless of which variant was actually selected.
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -219,6 +242,11 @@ pub struct StageReport {
     pub root_payload: PathBuf,
     pub uki_payload: PathBuf,
     pub destination_partuuid: String,
+    /// The UKI's baked `root=PARTUUID=` after binding. On the T4 selection
+    /// path this always equals `destination_partuuid` (selection only ever
+    /// stages a variant that already verified against it); on the legacy
+    /// rewrite fallback it is the payload's pre-rewrite, build-host value —
+    /// kept for the same provenance-logging reason it always was.
     pub template_partuuid: String,
     pub bytes_downloaded: u64,
 }
@@ -288,27 +316,47 @@ fn is_safe_basename(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
 }
 
-/// The two payload files a release must contain, already matched to this
+/// Suffix of the slot-B pre-signed UKI variant (T4, 2026-09-02 — see the
+/// module doc). Checked BEFORE the generic `.efi` suffix below, since a
+/// slot-B filename is itself a (more specific) `.efi` filename and would
+/// otherwise be misparsed as a canonical UKI with `.slot-b` glued onto its
+/// version string.
+const UKI_SLOT_B_SUFFIX: &str = ".slot-b.efi";
+
+/// The payload files a release must contain, already matched to this
 /// machine's architecture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseFiles {
     pub version: String,
     pub arch: String,
     pub root: ManifestEntry,
+    /// The canonical UKI — `duduclaw-os_<version>.efi`. Always present:
+    /// this is what a legacy (pre-T4) release ships alone, and what every
+    /// release stages under (`clear_stale_payloads`, sysupdate's own
+    /// `MatchPattern=`), whether or not it was the variant actually
+    /// selected for this device's destination slot.
     pub uki: ManifestEntry,
+    /// The slot-B pre-signed UKI variant (T4) — `duduclaw-os_<version>.slot-b.efi`.
+    /// `None` for a release that ships only the canonical UKI (pre-T4, or a
+    /// release line that never adopts per-slot UKIs); [`bind_uki_to_slot`]
+    /// reads this to decide between selection and the legacy device-side
+    /// rewrite.
+    pub uki_slot_b: Option<ManifestEntry>,
 }
 
-/// Pick this machine's payload pair out of a manifest.
+/// Pick this machine's payload set out of a manifest.
 ///
-/// Names must be exactly `duduclaw-os_<version>.root-<arch>.raw` and
-/// `duduclaw-os_<version>.efi` — the same shapes
-/// `mkosi.extra/etc/sysupdate.d/*.transfer` match on, so a name this
-/// function accepts is a name sysupdate will find. Anything else in the
-/// manifest (a checksum of the manifest itself, a second architecture, a
-/// release note) is ignored rather than treated as an error; anything
-/// *ambiguous* (two roots for this arch, two UKIs, mismatched versions) is
-/// refused, because guessing which one was meant is exactly how a machine
-/// ends up with a kernel from one build and a root from another.
+/// Names must be exactly `duduclaw-os_<version>.root-<arch>.raw`,
+/// `duduclaw-os_<version>.efi`, and (optionally, T4)
+/// `duduclaw-os_<version>.slot-b.efi` — the same shapes
+/// `mkosi.extra/etc/sysupdate.d/*.transfer` / `recipes-duduclaw/`
+/// `duduclaw-ab-update/files/*.transfer` match on, so a name this function
+/// accepts is a name sysupdate will find. Anything else in the manifest (a
+/// checksum of the manifest itself, a second architecture, a release note)
+/// is ignored rather than treated as an error; anything *ambiguous* (two
+/// roots for this arch, two canonical UKIs, two slot-B UKIs, mismatched
+/// versions) is refused, because guessing which one was meant is exactly how
+/// a machine ends up with a kernel from one build and a root from another.
 pub fn select_release_files(
     entries: &[ManifestEntry],
     arch: &str,
@@ -316,6 +364,7 @@ pub fn select_release_files(
     let root_suffix = format!(".root-{arch}.raw");
     let mut roots: Vec<(&ManifestEntry, String)> = Vec::new();
     let mut ukis: Vec<(&ManifestEntry, String)> = Vec::new();
+    let mut uki_slot_bs: Vec<(&ManifestEntry, String)> = Vec::new();
 
     for e in entries {
         let Some(rest) = e.name.strip_prefix(SLOT_LABEL_PREFIX) else {
@@ -324,6 +373,10 @@ pub fn select_release_files(
         if let Some(v) = rest.strip_suffix(&root_suffix) {
             if is_version_text(v) {
                 roots.push((e, v.to_string()));
+            }
+        } else if let Some(v) = rest.strip_suffix(UKI_SLOT_B_SUFFIX) {
+            if is_version_text(v) {
+                uki_slot_bs.push((e, v.to_string()));
             }
         } else if let Some(v) = rest.strip_suffix(".efi") {
             if is_version_text(v) {
@@ -351,11 +404,26 @@ pub fn select_release_files(
             "the release is inconsistent: root payload is {root_ver} but the kernel image is {uki_ver}"
         ));
     }
+    let uki_slot_b = match uki_slot_bs.len() {
+        0 => None,
+        1 => {
+            let (entry, v) = uki_slot_bs.remove(0);
+            if v != root_ver {
+                return Err(format!(
+                    "the release is inconsistent: root payload is {root_ver} but the slot-B \
+                     kernel image is {v}"
+                ));
+            }
+            Some(entry.clone())
+        }
+        n => return Err(format!("the release contains {n} slot-B kernel images")),
+    };
     Ok(ReleaseFiles {
         version: root_ver,
         arch: arch.to_string(),
         root: root.clone(),
         uki: uki.clone(),
+        uki_slot_b,
     })
 }
 
@@ -977,6 +1045,74 @@ pub async fn check_update_with(cfg: &OsUpdateConfig) -> Result<UpdateCheckReport
     })
 }
 
+// ---------------------------------------------------------------------------
+// UKI binding (T4, 2026-09-02)
+// ---------------------------------------------------------------------------
+
+/// Bind (or select) the UKI that will be staged under the canonical
+/// `release.uki.name`, for `dest_partuuid`.
+///
+/// See the module doc's "T4" section for the full rationale. Two release
+/// shapes, two behaviours:
+///
+/// - **`slot_b_bytes` is `Some`** (a per-slot release): both candidates have
+///   already been downloaded and checksum-verified against the manifest: this
+///   picks whichever one's baked `root=PARTUUID=` already equals
+///   `dest_partuuid` ([`uki_patch::verify_root_partuuid`]) rather than
+///   patching bytes, which would break the artifact's Secure Boot
+///   Authenticode signature. Neither candidate matching, or *both* matching
+///   (which should never happen — the two variants are built with distinct
+///   PARTUUIDs — but is exactly the kind of impossible-by-construction
+///   assumption this module never lets stand undetected), is refused rather
+///   than guessed: staging a UKI that would boot into the wrong slot's root
+///   is precisely the fault this function exists to prevent.
+/// - **`slot_b_bytes` is `None`** (a legacy single-UKI release): falls back
+///   to the original device-side byte rewrite
+///   ([`uki_patch::rewrite_root_partuuid`]), logging a warning that a
+///   Secure-Boot-enforcing firmware will reject the result — this keeps
+///   pre-T4 release servers, and any appliance without SB enforcement,
+///   working exactly as they did before this wave.
+///
+/// Returns the bytes to publish under `release.uki.name`, plus the PARTUUID
+/// they carry (always `dest_partuuid` on the selection path; the payload's
+/// pre-rewrite, build-host value on the legacy rewrite path — see
+/// [`StageReport::template_partuuid`]'s doc comment).
+fn bind_uki_to_slot(
+    canonical_bytes: Vec<u8>,
+    slot_b_bytes: Option<Vec<u8>>,
+    dest_partuuid: &str,
+) -> Result<(Vec<u8>, String), StageError> {
+    match slot_b_bytes {
+        None => {
+            warn!(
+                "[os_update] this release ships a single legacy UKI template (no slot-B \
+                 variant) — rewriting its root=PARTUUID= on-device. A Secure-Boot-enforcing \
+                 firmware will refuse the result; ship a per-slot release (T4) to fix that."
+            );
+            let mut bytes = canonical_bytes;
+            let template = uki_patch::rewrite_root_partuuid(&mut bytes, dest_partuuid)
+                .map_err(StageError::Rejected)?;
+            Ok((bytes, template))
+        }
+        Some(slot_b_bytes) => {
+            let a = uki_patch::verify_root_partuuid(&canonical_bytes, dest_partuuid);
+            let b = uki_patch::verify_root_partuuid(&slot_b_bytes, dest_partuuid);
+            match (a, b) {
+                (Ok(got), Err(_)) => Ok((canonical_bytes, got)),
+                (Err(_), Ok(got)) => Ok((slot_b_bytes, got)),
+                (Ok(_), Ok(_)) => Err(StageError::Rejected(format!(
+                    "both UKI variants in this release claim to be bound to the destination \
+                     slot ({dest_partuuid}) — refusing an ambiguous release"
+                ))),
+                (Err(e_a), Err(e_b)) => Err(StageError::Rejected(format!(
+                    "neither UKI variant in this release is bound to the destination slot \
+                     {dest_partuuid} (canonical: {e_a}; slot-b: {e_b})"
+                ))),
+            }
+        }
+    }
+}
+
 /// Download, verify and bind a release, leaving the staging directory
 /// holding exactly one version that `systemd-sysupdate update` can install.
 ///
@@ -1057,18 +1193,49 @@ pub async fn stage_update_with(
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&root_tmp);
         })?;
-    info!("[os_update] both payload files verified against the signed manifest");
+    // T4: a per-slot release also ships a slot-B pre-signed variant. Both
+    // candidates are downloaded (and checksum-verified against the signed
+    // manifest) up front — selection needs the actual bytes, since which
+    // variant matches this device's destination slot is not something the
+    // filename alone can prove (see bind_uki_to_slot's doc comment).
+    let uki_slot_b_tmp = release
+        .uki_slot_b
+        .as_ref()
+        .map(|entry| incoming.join(&entry.name));
+    if let (Some(entry), Some(tmp)) = (&release.uki_slot_b, &uki_slot_b_tmp) {
+        bytes_downloaded += fetch_payload(&source, entry, tmp, MAX_UKI_BYTES)
+            .await
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&root_tmp);
+                let _ = std::fs::remove_file(&uki_tmp);
+            })?;
+    }
+    info!("[os_update] all payload files verified against the signed manifest");
 
-    // ---- 6. bind the UKI to the destination slot
-    let mut uki_bytes = std::fs::read(&uki_tmp)
+    // ---- 6. bind the UKI to the destination slot (T4: select when a
+    // per-slot release allows it, else fall back to the legacy rewrite —
+    // see bind_uki_to_slot's own doc comment and the module doc's "T4"
+    // section).
+    let canonical_bytes = std::fs::read(&uki_tmp)
         .map_err(|e| StageError::Io(format!("cannot re-read the staged kernel image: {e}")))?;
-    let template_partuuid = uki_patch::rewrite_root_partuuid(&mut uki_bytes, &dest_partuuid)
-        .map_err(StageError::Rejected)?;
-    std::fs::write(&uki_tmp, &uki_bytes)
+    let slot_b_bytes = match &uki_slot_b_tmp {
+        Some(tmp) => Some(std::fs::read(tmp).map_err(|e| {
+            StageError::Io(format!("cannot re-read the staged slot-B kernel image: {e}"))
+        })?),
+        None => None,
+    };
+    let (bound_bytes, template_partuuid) =
+        bind_uki_to_slot(canonical_bytes, slot_b_bytes, &dest_partuuid)?;
+    std::fs::write(&uki_tmp, &bound_bytes)
         .map_err(|e| StageError::Io(format!("cannot write the bound kernel image: {e}")))?;
-    info!(
-        "[os_update] kernel image bound to {dest_partuuid} (payload was built against {template_partuuid})"
-    );
+    if let Some(tmp) = &uki_slot_b_tmp {
+        // The losing candidate is never published — only release.uki.name
+        // (the canonical filename) ever lands in the staging directory, so
+        // sysupdate's `MatchPattern=` invariant holds regardless of which
+        // variant was actually selected.
+        let _ = std::fs::remove_file(tmp);
+    }
+    info!("[os_update] kernel image bound to {dest_partuuid} (baked value: {template_partuuid})");
 
     // ---- 7. publish: clear stale versions, then move into place
     clear_stale_payloads(&staging, &release);
@@ -1078,6 +1245,9 @@ pub async fn stage_update_with(
         .map_err(|e| StageError::Io(format!("cannot publish the root payload: {e}")))?;
     std::fs::rename(&uki_tmp, &uki_final)
         .map_err(|e| StageError::Io(format!("cannot publish the kernel image: {e}")))?;
+    // Only reachable when uki_slot_b_tmp's file was already removed above
+    // (or never existed), so this is exactly the same empty-directory
+    // removal the pre-T4 code already did — not a new invariant.
     let _ = std::fs::remove_dir(&incoming);
 
     Ok(StageReport {
@@ -1192,6 +1362,7 @@ fn clear_stale_payloads(staging: &Path, keep: &ReleaseFiles) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uki_patch::test_support::synth_uki;
 
     fn entry(sha: &str, name: &str) -> ManifestEntry {
         ManifestEntry {
@@ -1270,6 +1441,140 @@ mod tests {
             entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
         ];
         assert!(select_release_files(&wrong_arch, "arm64").is_err());
+    }
+
+    // --- select_release_files: slot-B variant (T4) ------------------------
+
+    #[test]
+    fn release_selection_recognizes_the_slot_b_uki_variant() {
+        let entries = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+            entry(&"d".repeat(64), "duduclaw-os_0.2.0.slot-b.efi"),
+        ];
+        let got = select_release_files(&entries, "arm64").unwrap();
+        assert_eq!(got.uki.name, "duduclaw-os_0.2.0.efi");
+        assert_eq!(
+            got.uki_slot_b.as_ref().map(|e| e.name.as_str()),
+            Some("duduclaw-os_0.2.0.slot-b.efi")
+        );
+    }
+
+    #[test]
+    fn release_selection_leaves_slot_b_none_for_a_legacy_release() {
+        let entries = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+        ];
+        let got = select_release_files(&entries, "arm64").unwrap();
+        assert_eq!(got.uki_slot_b, None);
+    }
+
+    #[test]
+    fn release_selection_refuses_slot_b_ambiguity_and_version_mismatch() {
+        let two_slot_b = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+            entry(&"d".repeat(64), "duduclaw-os_0.2.0.slot-b.efi"),
+            entry(&"e".repeat(64), "duduclaw-os_0.2.0.slot-b.efi.bak"),
+        ];
+        // The `.bak` name does not match the `.slot-b.efi` suffix at all, so
+        // this is actually still unambiguous — assert the happy path holds
+        // before testing the real ambiguity case below.
+        assert!(select_release_files(&two_slot_b, "arm64").is_ok());
+
+        let real_ambiguity = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+            entry(&"d".repeat(64), "duduclaw-os_0.2.0.slot-b.efi"),
+            entry(&"e".repeat(64), "duduclaw-os_0.3.0.slot-b.efi"),
+        ];
+        assert!(
+            select_release_files(&real_ambiguity, "arm64").is_err(),
+            "two slot-B entries must be refused as ambiguous, not silently take the first"
+        );
+
+        let mismatched_version = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+            entry(&"d".repeat(64), "duduclaw-os_0.3.0.slot-b.efi"),
+        ];
+        assert!(
+            select_release_files(&mismatched_version, "arm64").is_err(),
+            "a slot-B UKI from a different version must be refused, not silently paired"
+        );
+    }
+
+    // --- bind_uki_to_slot (T4) ----------------------------------------
+
+    const BIND_SLOT_A: &str = "dedec1a0-0000-4000-8000-00000000000a";
+    const BIND_SLOT_B: &str = "dedec1a0-0000-4000-8000-00000000000b";
+    const BIND_UNRELATED: &str = "11111111-2222-3333-4444-555555555555";
+
+    fn uki_bound_to(uuid: &str) -> Vec<u8> {
+        synth_uki(&format!("rootwait root=PARTUUID={uuid} console=ttyS0"))
+    }
+
+    #[test]
+    fn bind_selects_the_slot_b_variant_when_it_matches_the_destination() {
+        let canonical = uki_bound_to(BIND_SLOT_A);
+        let slot_b = uki_bound_to(BIND_SLOT_B);
+        let (bytes, template) =
+            bind_uki_to_slot(canonical, Some(slot_b.clone()), BIND_SLOT_B).unwrap();
+        assert_eq!(bytes, slot_b, "must stage the slot-B candidate's own bytes");
+        assert_eq!(template, BIND_SLOT_B);
+    }
+
+    #[test]
+    fn bind_selects_the_canonical_variant_when_it_matches_the_destination() {
+        let canonical = uki_bound_to(BIND_SLOT_A);
+        let slot_b = uki_bound_to(BIND_SLOT_B);
+        let (bytes, template) =
+            bind_uki_to_slot(canonical.clone(), Some(slot_b), BIND_SLOT_A).unwrap();
+        assert_eq!(bytes, canonical, "must stage the canonical candidate's own bytes");
+        assert_eq!(template, BIND_SLOT_A);
+        // Selection never mutates either candidate's cmdline.
+        assert_eq!(
+            uki_patch::root_partuuid(&uki_patch::cmdline_span(&bytes).unwrap().text).unwrap(),
+            BIND_SLOT_A
+        );
+    }
+
+    #[test]
+    fn bind_rejects_when_neither_variant_matches_the_destination() {
+        let canonical = uki_bound_to(BIND_SLOT_A);
+        let slot_b = uki_bound_to(BIND_SLOT_B);
+        let err = bind_uki_to_slot(canonical, Some(slot_b), BIND_UNRELATED).unwrap_err();
+        assert!(
+            matches!(err, StageError::Rejected(_)),
+            "an unmatched pair must be a terminal Rejected, never retried: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bind_rejects_when_both_variants_claim_the_same_destination() {
+        // Should never happen by construction (the two variants are built
+        // with distinct PARTUUIDs) -- but a release that somehow ships two
+        // identically-bound candidates must still be refused, not resolved
+        // by picking whichever branch happens to run first.
+        let canonical = uki_bound_to(BIND_SLOT_A);
+        let slot_b = uki_bound_to(BIND_SLOT_A);
+        let err = bind_uki_to_slot(canonical, Some(slot_b), BIND_SLOT_A).unwrap_err();
+        assert!(matches!(err, StageError::Rejected(_)));
+    }
+
+    #[test]
+    fn bind_falls_back_to_legacy_rewrite_when_the_release_has_no_slot_b_variant() {
+        let canonical = uki_bound_to(BIND_SLOT_A);
+        let (bytes, template) = bind_uki_to_slot(canonical, None, BIND_SLOT_B).unwrap();
+        // The legacy path actually rewrites: the staged bytes now boot the
+        // destination slot, and the returned "template" is the payload's
+        // PRE-rewrite (build-host) value, not the destination.
+        assert_eq!(
+            uki_patch::root_partuuid(&uki_patch::cmdline_span(&bytes).unwrap().text).unwrap(),
+            BIND_SLOT_B
+        );
+        assert_eq!(template, BIND_SLOT_A);
     }
 
     #[test]
@@ -1541,6 +1846,7 @@ mod tests {
             arch: "arm64".into(),
             root: entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
             uki: entry(&"b".repeat(64), "duduclaw-os_0.2.0.efi"),
+            uki_slot_b: None,
         };
         clear_stale_payloads(dir.path(), &keep);
 
