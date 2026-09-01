@@ -194,26 +194,18 @@ async fn run_gitleaks(
         uuid::Uuid::new_v4()
     ));
     let report_path_str = report_path.to_string_lossy().to_string();
-    // `.as_str()` (not `&report_path_str`) — see the semgrep call above for
-    // why: keeps every array element a plain `&str`, no coercion involved.
-    let outcome = run_capped(
-        &bin,
-        &[
-            "detect",
-            "--source",
-            ".",
-            "--report-format",
-            "json",
-            "--report-path",
-            report_path_str.as_str(),
-            "--no-banner",
-            "--exit-code",
-            "0",
-        ],
-        repo_root,
-        &RunLimits::default(),
-    )
-    .await;
+    // Mode selection (live-fired against the real 8.30.1 binary, 2026-09-01):
+    // `detect` walks *git history* — on a plain directory it logs "0 commits
+    // scanned, ~0 bytes", writes an empty report, and exits 0, i.e. a
+    // permanent fake-clean that no exit-code check can catch. `dir` (v8.19+)
+    // walks the files actually on disk. The OS daily scan target
+    // (/data/duduclaw) is exactly the non-git shape, so anything without a
+    // .git entry MUST take the `dir` path; git repos keep `detect` so
+    // existing history-scan behavior is unchanged.
+    let git_mode = repo_root.join(".git").exists();
+    let args = gitleaks_args(git_mode, report_path_str.as_str());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let outcome = run_capped(&bin, &arg_refs, repo_root, &RunLimits::default()).await;
 
     if let Some(err) = outcome.spawn_error {
         let _ = std::fs::remove_file(&report_path);
@@ -238,9 +230,31 @@ async fn run_gitleaks(
         return;
     }
 
+    // Fail closed on engine failure (coding convention 4): a non-zero exit
+    // with NO report file means the scan never ran — e.g. a pre-8.19 binary
+    // that lacks the `dir` subcommand ("unknown command"), or a config
+    // error. With `--exit-code 0` a *findings* exit is 0, so non-zero here
+    // is never "leaks found". Reporting it as clean would be a silent
+    // fail-open in a security scanner.
+    if outcome.exit_code != Some(0) && !report_path.exists() {
+        engines_run.push(EngineRun {
+            engine: gitleaks::ENGINE_NAME.to_string(),
+            findings_count: 0,
+            duration_ms: outcome.duration.as_millis(),
+            parse_error: Some(format!(
+                "gitleaks exited with {:?} and wrote no report (stderr_tail={:?})",
+                outcome.exit_code,
+                duduclaw_core::truncate_bytes(outcome.stderr_tail.trim(), 300)
+            )),
+            timed_out: false,
+        });
+        return;
+    }
+
     // Some gitleaks versions may not create the report file at all when
-    // there are zero leaks — treat a clean process exit with no file as
-    // "zero findings", not a failure (documented uncertainty, see above).
+    // there are zero leaks — treat a clean (exit 0) process exit with no
+    // file as "zero findings", not a failure (documented uncertainty, see
+    // above).
     // Report-file size is capped the same as stdout for the other scanners
     // (task spec: "輸出上限 16MB") — `run_capped` only bounds the piped
     // stdout/stderr it reads itself, not a file gitleaks writes on its own,
@@ -284,6 +298,32 @@ async fn run_gitleaks(
             });
         }
     }
+}
+
+/// Pure arg builder for the gitleaks invocation so the git-vs-dir mode split
+/// is unit-testable without a gitleaks binary. `git_mode` ⇒ `detect` (git
+/// history, matches pre-2026-09 behavior on repos); otherwise `dir` (files on
+/// disk — the only mode that scans anything in a non-git directory).
+fn gitleaks_args(git_mode: bool, report_path: &str) -> Vec<String> {
+    let mut args: Vec<String> = if git_mode {
+        vec!["detect".into(), "--source".into(), ".".into()]
+    } else {
+        vec!["dir".into(), ".".into()]
+    };
+    args.extend(
+        [
+            "--report-format",
+            "json",
+            "--report-path",
+            report_path,
+            "--no-banner",
+            "--exit-code",
+            "0",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    args
 }
 
 /// osv-scanner is never actually invoked this wave (§3.3 zero-network
@@ -366,6 +406,28 @@ mod tests {
             timed_out: false,
             spawn_error: None,
         }
+    }
+
+    #[test]
+    fn gitleaks_args_git_mode_uses_detect_with_source() {
+        let args = gitleaks_args(true, "/tmp/r.json");
+        assert_eq!(args[0], "detect");
+        assert_eq!(&args[1..3], ["--source", "."]);
+        assert!(args.contains(&"--report-path".to_string()));
+        assert!(args.contains(&"/tmp/r.json".to_string()));
+        // `--exit-code 0` must survive both modes: findings never become a
+        // non-zero exit that the fail-closed guard would misread as failure.
+        assert_eq!(&args[args.len() - 2..], ["--exit-code", "0"]);
+    }
+
+    #[test]
+    fn gitleaks_args_non_git_uses_dir_subcommand() {
+        let args = gitleaks_args(false, "/tmp/r.json");
+        // `detect` on a non-git dir scans 0 bytes and exits 0 (live-fired
+        // fake-clean) — the dir subcommand is load-bearing, not stylistic.
+        assert_eq!(&args[0..2], ["dir", "."]);
+        assert!(!args.contains(&"--source".to_string()));
+        assert_eq!(&args[args.len() - 2..], ["--exit-code", "0"]);
     }
 
     #[test]
