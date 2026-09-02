@@ -103,3 +103,9 @@ meta-duduclaw/.build/
 # committed, *.key is already covered above but the whole directory is
 # excluded for defense in depth (it may also hold .crt/.esl/.auth copies).
 /sb-keys/
+
+# meta-security: kas-managed checkout (trust-chain P1 wave TPM pins its
+# meta-tpm sublayer for tpm2-tss/tpm2-tools -- see
+# meta-duduclaw/kas/tpm-luks.yml), never committed here -- same convention
+# as /meta-virtualization/ above.
+/meta-security/
