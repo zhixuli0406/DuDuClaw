@@ -184,22 +184,65 @@ pub fn is_uuid_text(s: &str) -> bool {
     parts.next().is_none()
 }
 
-/// Extract the `root=PARTUUID=<uuid>` value from a kernel command line.
-pub fn root_partuuid(cmdline: &str) -> Result<String, String> {
+/// Extract a fixed-width value immediately following `token` in a kernel
+/// command line, validated by `valid`.
+///
+/// [`root_partuuid`] (36-char PARTUUID) and [`cmdline_roothash`] (64-char
+/// dm-verity root hash, VER-V wave) are both instances of the same shape —
+/// `<token><fixed-width-hex-or-uuid>` — that systemd-boot and
+/// systemd-veritysetup-generator both expect on a kernel command line, so
+/// this is the one place that walks a token, slices a fixed run of
+/// characters after it, and hands the result to a shape validator.
+fn cmdline_field(
+    cmdline: &str,
+    token: &str,
+    len: usize,
+    valid: impl Fn(&str) -> bool,
+) -> Result<String, String> {
     let idx = cmdline
-        .find(ROOT_PARTUUID_TOKEN)
-        .ok_or("the UKI's kernel command line has no root=PARTUUID=")?;
-    let start = idx + ROOT_PARTUUID_TOKEN.len();
-    let value: String = cmdline[start..]
-        .chars()
-        .take(UUID_TEXT_LEN)
-        .collect::<String>();
-    if !is_uuid_text(&value) {
-        return Err(format!(
-            "root=PARTUUID= value {value:?} is not a canonical UUID"
-        ));
+        .find(token)
+        .ok_or_else(|| format!("the UKI's kernel command line has no {token}"))?;
+    let start = idx + token.len();
+    let value: String = cmdline[start..].chars().take(len).collect();
+    if !valid(&value) {
+        return Err(format!("{token} value {value:?} is not valid"));
     }
     Ok(value)
+}
+
+/// Extract the `root=PARTUUID=<uuid>` value from a kernel command line.
+pub fn root_partuuid(cmdline: &str) -> Result<String, String> {
+    cmdline_field(cmdline, ROOT_PARTUUID_TOKEN, UUID_TEXT_LEN, is_uuid_text)
+}
+
+/// The dm-verity root-hash token on a kernel command line (VER-V wave —
+/// `commercial/docs/DESIGN-os-trust-chain-2026-09.md` §3.2 P1's cmdline
+/// shape, once a build line bakes it in per the 2026-09-02 依賴鏈補記
+/// entry). Per `systemd-veritysetup-generator(8)`, this is the SHA-256 root
+/// hash of the dm-verity hash tree: 64 lowercase hex characters, fixed
+/// width exactly like [`ROOT_PARTUUID_TOKEN`]'s 36-character UUID.
+pub const ROOTHASH_TOKEN: &str = "roothash=";
+
+/// Length of a SHA-256 hex digest — dm-verity's default (and this project's
+/// only supported) root-hash algorithm.
+pub const ROOTHASH_TEXT_LEN: usize = 64;
+
+/// True when `s` is 64 ASCII hex characters (any case) — the shape of a
+/// dm-verity SHA-256 root hash.
+pub fn is_roothash_text(s: &str) -> bool {
+    s.len() == ROOTHASH_TEXT_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Extract the `roothash=<hex>` value from a kernel command line, if
+/// present.
+///
+/// `crate::os_update`'s VER-V consistency check treats `Err` here as "this
+/// UKI's cmdline shape has not adopted `roothash=` yet" — a legitimate,
+/// non-terminal state (not every build line has landed §3.2 P1's cmdline
+/// shape), never a security failure by itself. Only a value that IS
+/// present but disagrees with the release's signed hash tree is.
+pub fn cmdline_roothash(cmdline: &str) -> Result<String, String> {
+    cmdline_field(cmdline, ROOTHASH_TOKEN, ROOTHASH_TEXT_LEN, is_roothash_text)
 }
 
 /// Rewrite the UKI's `root=PARTUUID=` in place so it boots `new_partuuid`.
@@ -491,5 +534,57 @@ mod tests {
     fn verify_fails_closed_when_the_uki_has_no_root_partuuid() {
         let uki = synth_uki("systemd.show_status=auto rw root=/dev/vda2");
         assert!(verify_root_partuuid(&uki, SLOT_A).is_err());
+    }
+
+    // --- cmdline_roothash (VER-V wave) --------------------------------------
+
+    const ROOTHASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ROOTHASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn roothash_field_extracts_a_valid_value() {
+        let cmdline = format!("rw root=PARTUUID={SLOT_A} roothash={ROOTHASH_A} console=tty0");
+        assert_eq!(cmdline_roothash(&cmdline).unwrap(), ROOTHASH_A);
+        // Case-insensitive shape, same convention as root_partuuid/is_uuid_text.
+        let upper = format!(
+            "rw roothash={} root=PARTUUID={SLOT_A}",
+            ROOTHASH_A.to_uppercase()
+        );
+        assert_eq!(cmdline_roothash(&upper).unwrap(), ROOTHASH_A.to_uppercase());
+    }
+
+    #[test]
+    fn roothash_field_is_absent_on_a_pre_verity_cmdline() {
+        // Today's shipping cmdline shape (no roothash= token at all) must be
+        // a plain Err — the caller's job is to treat that as "not adopted
+        // yet", not this function's.
+        assert!(cmdline_roothash(&sample_cmdline(SLOT_A)).is_err());
+    }
+
+    #[test]
+    fn roothash_field_rejects_a_present_but_malformed_value() {
+        for bad_cmdline in [
+            format!("roothash={}", &ROOTHASH_A[..63]), // too short
+            format!("roothash={}", "z".repeat(64)),    // not hex
+            "roothash=".to_string(),                   // nothing follows
+        ] {
+            assert!(
+                cmdline_roothash(&bad_cmdline).is_err(),
+                "must reject {bad_cmdline:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_roothash_text_shape() {
+        assert!(is_roothash_text(ROOTHASH_A));
+        assert!(is_roothash_text(&ROOTHASH_A.to_uppercase()));
+        assert!(!is_roothash_text(&ROOTHASH_A[..63]));
+        assert!(!is_roothash_text(&format!("{ROOTHASH_A}0")));
+        assert!(!is_roothash_text(&"z".repeat(64)));
+        assert_ne!(
+            ROOTHASH_A, ROOTHASH_B,
+            "sanity: the two fixtures must differ"
+        );
     }
 }

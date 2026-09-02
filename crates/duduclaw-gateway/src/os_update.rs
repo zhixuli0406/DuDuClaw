@@ -68,6 +68,53 @@
 //! canonical `duduclaw-os_<version>.efi`) — sysupdate's
 //! `[Source] MatchPattern=` invariant (§3.3 of the design doc) never
 //! changes, regardless of which variant was actually selected.
+//!
+//! ## VER-V (2026-09-02): dm-verity hash tree
+//!
+//! `commercial/docs/DESIGN-os-trust-chain-2026-09.md` §3.3 + the
+//! 2026-09-02 拍板紀錄 entries. Unlike the UKI, the hash tree needs no
+//! per-slot variant: `veritysetup format`'s root hash is a pure function of
+//! the root payload's *content*, not of which slot it eventually lands in
+//! — so a release ships exactly **one** verity artifact,
+//! `duduclaw-os_<version>.verity-<arch>.raw`, and whichever destination
+//! slot's own verity partition is written (A's or B's — resolved the same
+//! way the root payload's destination is) gets the identical bytes.
+//!
+//! **Legacy compatibility**: a release with no verity artifact at all
+//! ([`ReleaseFiles::verity`] is `None`) is a legitimate pre-verity release,
+//! not an error — this module never requires one, only validates the one
+//! it is given.
+//!
+//! **Where the trusted root hash comes from — and why not `manifest.json`**:
+//! this module's own doc (above) draws a hard line that `manifest.json` is
+//! convenience provenance, never a security decision's input — only
+//! `SHA256SUMS` + `SHA256SUMS.minisig` are the trust boundary. A root-hash
+//! consistency gate that rested on `manifest.json` would quietly cross that
+//! line. So the root hash instead ships as its own tiny **signed** file,
+//! `duduclaw-os_<version>.verity-<arch>.roothash` — 64 hex characters,
+//! covered by a normal `SHA256SUMS` row like every other payload, fetched
+//! in memory the same way `fetch_small` already fetches `SHA256SUMS`
+//! itself (see [`stage_update_with`]'s step 5b). `manifest.json` still
+//! carries the same value for human/dashboard convenience
+//! (`appliance/tools/make-payload.py`'s `--verity-roothash`), but this
+//! module never reads it.
+//!
+//! **The consistency check is conditional, not universal**: §3.2 P1's
+//! cmdline shape (`roothash=` baked into the UKI alongside `root=PARTUUID=`)
+//! has not landed on every build line yet — the 2026-09-02 依賴鏈補記 entry
+//! records that the verity `initrd` module is still pending. So
+//! [`verify_verity_roothash_consistency`] treats "the selected UKI's
+//! cmdline has no `roothash=` token" as a no-op, not a rejection — it only
+//! fails closed when a `roothash=` token IS present and disagrees with the
+//! release's signed hash tree, which is precisely the verity-era shape of
+//! the same "root payload paired with the wrong sibling artifact" mistake
+//! [`bind_uki_to_slot`] already guards against for `root=PARTUUID=`.
+//!
+//! **Disk budget**: [`MAX_VERITY_BYTES`] is a ceiling separate from
+//! [`MAX_ROOT_BYTES`] — the design doc's own risk table estimates a hash
+//! tree at roughly 8-10% of the root payload's size, so it is never sized
+//! anywhere near the root budget and must not share (and thereby loosen)
+//! it.
 
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -98,6 +145,16 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 const MAX_UKI_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ROOT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// VER-V: a separate ceiling for the dm-verity hash-tree artifact — never
+/// shared with [`MAX_ROOT_BYTES`] (see the module doc's "Disk budget"
+/// note). The design doc's own risk-table estimate puts a hash tree at
+/// roughly 8-10% of the root payload it protects, so 1 GiB is generous
+/// headroom against the 8 GiB root ceiling without approaching it.
+const MAX_VERITY_BYTES: u64 = 1024 * 1024 * 1024;
+/// The verity roothash companion is nothing but 64 hex characters (see
+/// [`uki_patch::is_roothash_text`]), optionally newline-terminated by
+/// whatever wrote it — a few dozen bytes is already implausibly generous.
+const MAX_ROOTHASH_BYTES: u64 = 256;
 
 /// Streaming chunk size, and the granularity at which an all-zero run is
 /// turned into a filesystem hole (see [`write_sparse_chunk`]).
@@ -241,6 +298,10 @@ pub struct StageReport {
     pub arch: String,
     pub root_payload: PathBuf,
     pub uki_payload: PathBuf,
+    /// The staged dm-verity hash tree (VER-V), if this release shipped one
+    /// — `None` for a pre-verity release, exactly mirroring
+    /// [`ReleaseFiles::verity`].
+    pub verity_payload: Option<PathBuf>,
     pub destination_partuuid: String,
     /// The UKI's baked `root=PARTUUID=` after binding. On the T4 selection
     /// path this always equals `destination_partuuid` (selection only ever
@@ -342,6 +403,17 @@ pub struct ReleaseFiles {
     /// reads this to decide between selection and the legacy device-side
     /// rewrite.
     pub uki_slot_b: Option<ManifestEntry>,
+    /// The dm-verity hash-tree artifact (VER-V wave) —
+    /// `duduclaw-os_<version>.verity-<arch>.raw`. One per release,
+    /// slot-independent (see the module doc's "VER-V" section). `None` for
+    /// a release built before dm-verity landed — a legitimate, non-error
+    /// state.
+    pub verity: Option<ManifestEntry>,
+    /// The signed companion carrying [`Self::verity`]'s root hash as 64 hex
+    /// characters — `duduclaw-os_<version>.verity-<arch>.roothash`. Always
+    /// present exactly when `verity` is; [`select_release_files`] refuses a
+    /// release that ships one without the other.
+    pub verity_roothash: Option<ManifestEntry>,
 }
 
 /// Pick this machine's payload set out of a manifest.
@@ -362,15 +434,31 @@ pub fn select_release_files(
     arch: &str,
 ) -> Result<ReleaseFiles, String> {
     let root_suffix = format!(".root-{arch}.raw");
+    // VER-V: checked BEFORE `root_suffix` below for the same reason
+    // `UKI_SLOT_B_SUFFIX` is checked before the generic `.efi` match —
+    // `.verity-<arch>.raw` is itself a (more specific) `.raw` filename and
+    // would otherwise be misparsed as a root payload.
+    let verity_suffix = format!(".verity-{arch}.raw");
+    let verity_roothash_suffix = format!(".verity-{arch}.roothash");
     let mut roots: Vec<(&ManifestEntry, String)> = Vec::new();
     let mut ukis: Vec<(&ManifestEntry, String)> = Vec::new();
     let mut uki_slot_bs: Vec<(&ManifestEntry, String)> = Vec::new();
+    let mut veritys: Vec<(&ManifestEntry, String)> = Vec::new();
+    let mut verity_roothashes: Vec<(&ManifestEntry, String)> = Vec::new();
 
     for e in entries {
         let Some(rest) = e.name.strip_prefix(SLOT_LABEL_PREFIX) else {
             continue;
         };
-        if let Some(v) = rest.strip_suffix(&root_suffix) {
+        if let Some(v) = rest.strip_suffix(&verity_suffix) {
+            if is_version_text(v) {
+                veritys.push((e, v.to_string()));
+            }
+        } else if let Some(v) = rest.strip_suffix(&verity_roothash_suffix) {
+            if is_version_text(v) {
+                verity_roothashes.push((e, v.to_string()));
+            }
+        } else if let Some(v) = rest.strip_suffix(&root_suffix) {
             if is_version_text(v) {
                 roots.push((e, v.to_string()));
             }
@@ -418,12 +506,60 @@ pub fn select_release_files(
         }
         n => return Err(format!("the release contains {n} slot-B kernel images")),
     };
+    let verity = match veritys.len() {
+        0 => None,
+        1 => {
+            let (entry, v) = veritys.remove(0);
+            if v != root_ver {
+                return Err(format!(
+                    "the release is inconsistent: root payload is {root_ver} but the verity \
+                     hash tree is {v}"
+                ));
+            }
+            Some(entry.clone())
+        }
+        n => {
+            return Err(format!(
+                "the release contains {n} verity hash trees for {arch}"
+            ))
+        }
+    };
+    let verity_roothash = match verity_roothashes.len() {
+        0 => None,
+        1 => {
+            let (entry, v) = verity_roothashes.remove(0);
+            if v != root_ver {
+                return Err(format!(
+                    "the release is inconsistent: root payload is {root_ver} but the verity \
+                     roothash companion is {v}"
+                ));
+            }
+            Some(entry.clone())
+        }
+        n => {
+            return Err(format!(
+                "the release contains {n} verity roothash companions for {arch}"
+            ))
+        }
+    };
+    // VER-V: a hash tree without its signed roothash companion (or vice
+    // versa) is a half-shipped release — refused rather than guessed, the
+    // same discipline every other ambiguous/incomplete pairing above gets.
+    if verity.is_some() != verity_roothash.is_some() {
+        return Err(
+            "the release ships a verity hash tree without its roothash companion, or vice \
+             versa — both or neither must be present"
+                .to_string(),
+        );
+    }
     Ok(ReleaseFiles {
         version: root_ver,
         arch: arch.to_string(),
         root: root.clone(),
         uki: uki.clone(),
         uki_slot_b,
+        verity,
+        verity_roothash,
     })
 }
 
@@ -1113,6 +1249,63 @@ fn bind_uki_to_slot(
     }
 }
 
+// ---------------------------------------------------------------------------
+// VER-V: dm-verity hash tree
+// ---------------------------------------------------------------------------
+
+/// Verify a small in-memory fetch (VER-V's roothash companion; unlike
+/// [`fetch_payload`] it never touches the staging directory) against its
+/// `SHA256SUMS` entry. A mismatch is exactly as terminal as a mismatched
+/// root/UKI payload checksum — [`StageError::Rejected`], never retried.
+fn verify_small_fetch_checksum(entry: &ManifestEntry, bytes: &[u8]) -> Result<(), StageError> {
+    use sha2::{Digest, Sha256};
+    let got = format!("{:x}", Sha256::digest(bytes));
+    if got != entry.sha256 {
+        return Err(StageError::Rejected(format!(
+            "{} failed its checksum (expected {}, got {got})",
+            entry.name, entry.sha256
+        )));
+    }
+    Ok(())
+}
+
+/// Cross-check the *already selected* UKI's baked `roothash=` (if it has
+/// adopted one yet — see the module doc's "VER-V" section) against the
+/// release's signed verity root hash.
+///
+/// `want = None` (a pre-verity release, or one whose verity roothash
+/// companion could not be fetched — which would already have returned an
+/// error before this is called) is always `Ok`: there is nothing to check
+/// against. When `want` is `Some`, a UKI whose cmdline has no `roothash=`
+/// token at all is *also* `Ok` — that is "this build line has not baked
+/// `roothash=` into the cmdline yet", a known, non-terminal state (see the
+/// module doc), not a mismatch. Only a `roothash=` value that IS present
+/// and disagrees is [`StageError::Rejected`] — the verity-era shape of the
+/// same "root payload paired with the wrong sibling artifact" mistake
+/// [`bind_uki_to_slot`] already guards against for `root=PARTUUID=`.
+fn verify_verity_roothash_consistency(
+    bound_uki_bytes: &[u8],
+    want: Option<&str>,
+) -> Result<(), StageError> {
+    let Some(want) = want else {
+        return Ok(());
+    };
+    let Ok(span) = uki_patch::cmdline_span(bound_uki_bytes) else {
+        // Unreachable in practice: bind_uki_to_slot already parsed this
+        // same cmdline successfully to get here. Not this function's gate
+        // to enforce twice — treat it the same as "no roothash= token yet".
+        return Ok(());
+    };
+    match uki_patch::cmdline_roothash(&span.text) {
+        Ok(got) if got.eq_ignore_ascii_case(want) => Ok(()),
+        Ok(got) => Err(StageError::Rejected(format!(
+            "the selected kernel image bakes dm-verity roothash {got} but the release's \
+             signed hash tree is {want} — refusing a mismatched root/hash-tree pair"
+        ))),
+        Err(_) => Ok(()),
+    }
+}
+
 /// Download, verify and bind a release, leaving the staging directory
 /// holding exactly one version that `systemd-sysupdate update` can install.
 ///
@@ -1210,6 +1403,57 @@ pub async fn stage_update_with(
                 let _ = std::fs::remove_file(&uki_tmp);
             })?;
     }
+    // ---- 5b. VER-V: the dm-verity hash tree (streamed to disk like the
+    // root payload, since sysupdate's 15-duduclaw-root-verity.transfer
+    // needs to find it there) plus its signed roothash companion (small
+    // enough to verify entirely in memory, the same way SHA256SUMS /
+    // SHA256SUMS.minisig already are via fetch_small — see the module
+    // doc's "VER-V" section for why this never touches the staging
+    // directory). Both, or neither, are present — select_release_files
+    // already enforced that.
+    let verity_tmp = release
+        .verity
+        .as_ref()
+        .map(|entry| incoming.join(&entry.name));
+    if let (Some(entry), Some(tmp)) = (&release.verity, &verity_tmp) {
+        bytes_downloaded += fetch_payload(&source, entry, tmp, MAX_VERITY_BYTES)
+            .await
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&root_tmp);
+                let _ = std::fs::remove_file(&uki_tmp);
+                if let Some(sb) = &uki_slot_b_tmp {
+                    let _ = std::fs::remove_file(sb);
+                }
+            })?;
+    }
+    let verity_roothash_text: Option<String> = match &release.verity_roothash {
+        Some(entry) => {
+            let fetched = fetch_small(&source, &entry.name, MAX_ROOTHASH_BYTES)
+                .await
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(&root_tmp);
+                    let _ = std::fs::remove_file(&uki_tmp);
+                    if let Some(sb) = &uki_slot_b_tmp {
+                        let _ = std::fs::remove_file(sb);
+                    }
+                    if let Some(vt) = &verity_tmp {
+                        let _ = std::fs::remove_file(vt);
+                    }
+                })?;
+            verify_small_fetch_checksum(entry, &fetched.bytes)?;
+            let text = String::from_utf8_lossy(&fetched.bytes)
+                .trim()
+                .to_ascii_lowercase();
+            if !uki_patch::is_roothash_text(&text) {
+                return Err(StageError::Rejected(format!(
+                    "{} does not contain a valid dm-verity root hash",
+                    entry.name
+                )));
+            }
+            Some(text)
+        }
+        None => None,
+    };
     info!("[os_update] all payload files verified against the signed manifest");
 
     // ---- 6. bind the UKI to the destination slot (T4: select when a
@@ -1237,6 +1481,16 @@ pub async fn stage_update_with(
     }
     info!("[os_update] kernel image bound to {dest_partuuid} (baked value: {template_partuuid})");
 
+    // ---- 6b. VER-V: the selected UKI's baked roothash= (if it has one
+    // yet — see the module doc's "VER-V" section) must agree with the
+    // release's signed hash tree. A pre-verity release (verity_roothash_text
+    // is None) is always fine; so is a UKI whose cmdline has not adopted
+    // roothash= yet — only a present-but-mismatched value is fatal.
+    verify_verity_roothash_consistency(&bound_bytes, verity_roothash_text.as_deref())?;
+    if let Some(got) = &verity_roothash_text {
+        info!("[os_update] verity hash tree roothash {got} accepted for this release");
+    }
+
     // ---- 7. publish: clear stale versions, then move into place
     clear_stale_payloads(&staging, &release);
     let root_final = staging.join(&release.root.name);
@@ -1245,6 +1499,15 @@ pub async fn stage_update_with(
         .map_err(|e| StageError::Io(format!("cannot publish the root payload: {e}")))?;
     std::fs::rename(&uki_tmp, &uki_final)
         .map_err(|e| StageError::Io(format!("cannot publish the kernel image: {e}")))?;
+    let verity_final = match (&release.verity, &verity_tmp) {
+        (Some(entry), Some(tmp)) => {
+            let dest = staging.join(&entry.name);
+            std::fs::rename(tmp, &dest)
+                .map_err(|e| StageError::Io(format!("cannot publish the verity hash tree: {e}")))?;
+            Some(dest)
+        }
+        _ => None,
+    };
     // Only reachable when uki_slot_b_tmp's file was already removed above
     // (or never existed), so this is exactly the same empty-directory
     // removal the pre-T4 code already did — not a new invariant.
@@ -1255,6 +1518,7 @@ pub async fn stage_update_with(
         arch: release.arch,
         root_payload: root_final,
         uki_payload: uki_final,
+        verity_payload: verity_final,
         destination_partuuid: dest_partuuid,
         template_partuuid,
         bytes_downloaded,
@@ -1326,7 +1590,11 @@ pub async fn confirm_installed_slot(report: &StageReport) -> Result<(), String> 
 /// also make sysupdate keep offering a version that is already in a slot.
 /// Best-effort: a failure here is logged, never turned into a failed update.
 pub fn cleanup_staged(report: &StageReport) {
-    for path in [&report.root_payload, &report.uki_payload] {
+    let mut paths: Vec<&Path> = vec![&report.root_payload, &report.uki_payload];
+    if let Some(v) = &report.verity_payload {
+        paths.push(v);
+    }
+    for path in paths {
         if let Err(e) = std::fs::remove_file(path) {
             warn!("[os_update] could not remove staged {}: {e}", path.display());
         }
@@ -1346,6 +1614,12 @@ fn clear_stale_payloads(staging: &Path, keep: &ReleaseFiles) {
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == keep.root.name || name == keep.uki.name {
+            continue;
+        }
+        // VER-V: the roothash companion is never staged here (see the
+        // module doc's "VER-V" section — it is fetched in memory only), so
+        // only `verity` itself can ever legitimately be present to keep.
+        if keep.verity.as_ref().is_some_and(|v| v.name == name) {
             continue;
         }
         let is_ours = name
@@ -1502,6 +1776,176 @@ mod tests {
         assert!(
             select_release_files(&mismatched_version, "arm64").is_err(),
             "a slot-B UKI from a different version must be refused, not silently paired"
+        );
+    }
+
+    // --- select_release_files: verity artifact (VER-V) ---------------------
+
+    #[test]
+    fn release_selection_recognizes_the_verity_artifact_and_its_roothash_companion() {
+        let entries = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+            entry(&"d".repeat(64), "duduclaw-os_0.2.0.verity-arm64.raw"),
+            entry(&"e".repeat(64), "duduclaw-os_0.2.0.verity-arm64.roothash"),
+        ];
+        let got = select_release_files(&entries, "arm64").unwrap();
+        assert_eq!(
+            got.verity.as_ref().map(|e| e.name.as_str()),
+            Some("duduclaw-os_0.2.0.verity-arm64.raw")
+        );
+        assert_eq!(
+            got.verity_roothash.as_ref().map(|e| e.name.as_str()),
+            Some("duduclaw-os_0.2.0.verity-arm64.roothash")
+        );
+        // A verity filename must never be misparsed as a root payload —
+        // this is exactly the ambiguity UKI_SLOT_B_SUFFIX's own ordering
+        // note warns about, on the `.raw` side instead of `.efi`.
+        assert_eq!(got.root.name, "duduclaw-os_0.2.0.root-arm64.raw");
+    }
+
+    #[test]
+    fn release_selection_leaves_verity_none_for_a_pre_verity_release() {
+        let entries = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+        ];
+        let got = select_release_files(&entries, "arm64").unwrap();
+        assert_eq!(got.verity, None);
+        assert_eq!(got.verity_roothash, None);
+    }
+
+    #[test]
+    fn release_selection_refuses_a_verity_artifact_without_its_roothash_companion() {
+        let raw_only = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+            entry(&"d".repeat(64), "duduclaw-os_0.2.0.verity-arm64.raw"),
+        ];
+        assert!(
+            select_release_files(&raw_only, "arm64").is_err(),
+            "a hash tree without its signed roothash companion must be refused"
+        );
+
+        let roothash_only = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+            entry(&"e".repeat(64), "duduclaw-os_0.2.0.verity-arm64.roothash"),
+        ];
+        assert!(
+            select_release_files(&roothash_only, "arm64").is_err(),
+            "a roothash companion without its hash tree must be refused too"
+        );
+    }
+
+    #[test]
+    fn release_selection_refuses_verity_ambiguity_and_version_mismatch() {
+        let two_verity = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+            entry(&"d".repeat(64), "duduclaw-os_0.2.0.verity-arm64.raw"),
+            entry(&"e".repeat(64), "duduclaw-os_0.2.0.verity-arm64.roothash"),
+            entry(&"f".repeat(64), "duduclaw-os_0.3.0.verity-arm64.raw"),
+        ];
+        assert!(
+            select_release_files(&two_verity, "arm64").is_err(),
+            "two verity hash trees must be refused as ambiguous"
+        );
+
+        let mismatched_version = vec![
+            entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
+            entry(&"c".repeat(64), "duduclaw-os_0.2.0.efi"),
+            entry(&"d".repeat(64), "duduclaw-os_0.3.0.verity-arm64.raw"),
+            entry(&"e".repeat(64), "duduclaw-os_0.3.0.verity-arm64.roothash"),
+        ];
+        assert!(
+            select_release_files(&mismatched_version, "arm64").is_err(),
+            "a verity hash tree from a different version must be refused, not silently paired"
+        );
+    }
+
+    #[test]
+    fn release_selection_parses_a_real_make_payload_sha256sums_with_verity() {
+        // Captured verbatim (filenames + shape, digests replaced with
+        // placeholders) from a live `make-payload.py --uki-slot-b --verity
+        // --verity-roothash` run against a synthetic fixture (VER-V
+        // live-fire check) — locks the producer/consumer contract between
+        // appliance/tools/make-payload.py and this function.
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let d = "d".repeat(64);
+        let e = "e".repeat(64);
+        let sums = format!(
+            "{a}  duduclaw-os_9.9.9.root-x86-64.raw\n\
+             {b}  duduclaw-os_9.9.9.efi\n\
+             {c}  duduclaw-os_9.9.9.slot-b.efi\n\
+             {d}  duduclaw-os_9.9.9.verity-x86-64.raw\n\
+             {e}  duduclaw-os_9.9.9.verity-x86-64.roothash\n"
+        );
+        let entries = parse_manifest(&sums).unwrap();
+        let got = select_release_files(&entries, "x86-64").unwrap();
+        assert_eq!(got.version, "9.9.9");
+        assert_eq!(got.root.name, "duduclaw-os_9.9.9.root-x86-64.raw");
+        assert_eq!(got.uki.name, "duduclaw-os_9.9.9.efi");
+        assert_eq!(
+            got.uki_slot_b.as_ref().map(|e| e.name.as_str()),
+            Some("duduclaw-os_9.9.9.slot-b.efi")
+        );
+        assert_eq!(
+            got.verity.as_ref().map(|e| e.name.as_str()),
+            Some("duduclaw-os_9.9.9.verity-x86-64.raw")
+        );
+        assert_eq!(
+            got.verity_roothash.as_ref().map(|e| e.name.as_str()),
+            Some("duduclaw-os_9.9.9.verity-x86-64.roothash")
+        );
+    }
+
+    // --- verify_verity_roothash_consistency (VER-V) -------------------------
+
+    fn uki_with_roothash(root_partuuid: &str, roothash: &str) -> Vec<u8> {
+        synth_uki(&format!(
+            "rootwait root=PARTUUID={root_partuuid} roothash={roothash} console=ttyS0"
+        ))
+    }
+
+    #[test]
+    fn verity_consistency_is_a_noop_for_a_pre_verity_release() {
+        // No verity roothash at all (want = None): whatever the UKI's
+        // cmdline looks like, there is nothing to check it against.
+        let uki = uki_bound_to(BIND_SLOT_A);
+        assert!(verify_verity_roothash_consistency(&uki, None).is_ok());
+    }
+
+    #[test]
+    fn verity_consistency_accepts_a_uki_whose_cmdline_has_not_adopted_roothash_yet() {
+        // The release DOES ship a verity hash tree, but this build line's
+        // UKI cmdline still has only root=PARTUUID= — §3.2 P1's cmdline
+        // shape has not landed everywhere yet. Not a mismatch.
+        let uki = uki_bound_to(BIND_SLOT_A);
+        let roothash = "a".repeat(64);
+        assert!(verify_verity_roothash_consistency(&uki, Some(&roothash)).is_ok());
+    }
+
+    #[test]
+    fn verity_consistency_accepts_a_matching_roothash() {
+        let roothash = "a".repeat(64);
+        let uki = uki_with_roothash(BIND_SLOT_A, &roothash);
+        assert!(verify_verity_roothash_consistency(&uki, Some(&roothash)).is_ok());
+        // Case-insensitive, same convention as root_partuuid/PARTUUID.
+        assert!(verify_verity_roothash_consistency(&uki, Some(&roothash.to_uppercase())).is_ok());
+    }
+
+    #[test]
+    fn verity_consistency_rejects_a_mismatched_roothash() {
+        let baked = "a".repeat(64);
+        let shipped = "b".repeat(64);
+        let uki = uki_with_roothash(BIND_SLOT_A, &baked);
+        let err = verify_verity_roothash_consistency(&uki, Some(&shipped)).unwrap_err();
+        assert!(
+            matches!(err, StageError::Rejected(_)),
+            "a mismatched roothash must be a terminal Rejected, never retried: {err:?}"
         );
     }
 
@@ -1829,14 +2273,74 @@ mod tests {
         );
     }
 
+    // --- VER-V: verity artifact + roothash companion checksum gates -------
+
+    #[tokio::test]
+    async fn verity_payload_end_to_end_verifies_and_rejects_tampering() {
+        // Same gate fetch_payload already applies to root/UKI payloads,
+        // exercised explicitly against a verity-shaped filename and its own
+        // MAX_VERITY_BYTES ceiling, per the VER-V test matrix (a bad sha256
+        // on the hash tree itself must be rejected, never staged).
+        use sha2::{Digest, Sha256};
+        let release = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+
+        let hash_tree = vec![3u8; 2048];
+        let name = "duduclaw-os_9.9.9.verity-x86-64.raw";
+        std::fs::write(release.path().join(name), &hash_tree).unwrap();
+        let good = ManifestEntry {
+            sha256: format!("{:x}", Sha256::digest(&hash_tree)),
+            name: name.to_string(),
+        };
+        let src = Source::Dir(release.path().to_path_buf());
+        let dest = staging.path().join(name);
+
+        let n = fetch_payload(&src, &good, &dest, MAX_VERITY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(n, 2048);
+
+        let corrupted = ManifestEntry {
+            sha256: "e".repeat(64),
+            name: name.to_string(),
+        };
+        let err = fetch_payload(&src, &corrupted, &dest, MAX_VERITY_BYTES)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StageError::Rejected(_)));
+        assert!(
+            !dest.exists(),
+            "a verity hash tree with a bad sha256 must not be staged"
+        );
+    }
+
+    #[test]
+    fn verity_roothash_companion_checksum_is_enforced() {
+        let good = "a".repeat(64);
+        let entry = ManifestEntry {
+            sha256: {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(good.as_bytes()))
+            },
+            name: "duduclaw-os_9.9.9.verity-x86-64.roothash".to_string(),
+        };
+        assert!(verify_small_fetch_checksum(&entry, good.as_bytes()).is_ok());
+
+        let tampered = "b".repeat(64);
+        let err = verify_small_fetch_checksum(&entry, tampered.as_bytes()).unwrap_err();
+        assert!(matches!(err, StageError::Rejected(_)));
+    }
+
     #[test]
     fn stale_payloads_of_other_versions_are_cleared_but_foreign_files_are_not() {
         let dir = tempfile::tempdir().unwrap();
         for name in [
             "duduclaw-os_0.1.0.root-arm64.raw",
             "duduclaw-os_0.1.0.efi",
+            "duduclaw-os_0.1.0.verity-arm64.raw",
             "duduclaw-os_0.2.0.root-arm64.raw",
             "duduclaw-os_0.2.0.efi",
+            "duduclaw-os_0.2.0.verity-arm64.raw",
             "operator-notes.txt",
         ] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
@@ -1847,13 +2351,25 @@ mod tests {
             root: entry(&"a".repeat(64), "duduclaw-os_0.2.0.root-arm64.raw"),
             uki: entry(&"b".repeat(64), "duduclaw-os_0.2.0.efi"),
             uki_slot_b: None,
+            verity: Some(entry(&"c".repeat(64), "duduclaw-os_0.2.0.verity-arm64.raw")),
+            verity_roothash: None,
         };
         clear_stale_payloads(dir.path(), &keep);
 
         assert!(dir.path().join("duduclaw-os_0.2.0.root-arm64.raw").exists());
         assert!(dir.path().join("duduclaw-os_0.2.0.efi").exists());
+        assert!(dir
+            .path()
+            .join("duduclaw-os_0.2.0.verity-arm64.raw")
+            .exists());
         assert!(!dir.path().join("duduclaw-os_0.1.0.root-arm64.raw").exists());
         assert!(!dir.path().join("duduclaw-os_0.1.0.efi").exists());
+        assert!(
+            !dir.path()
+                .join("duduclaw-os_0.1.0.verity-arm64.raw")
+                .exists(),
+            "a stale verity hash tree of another version must be cleared too"
+        );
         assert!(
             dir.path().join("operator-notes.txt").exists(),
             "only our own naming shape may be removed"
