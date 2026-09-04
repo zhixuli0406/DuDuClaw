@@ -110,12 +110,12 @@ OS 的 `refresh-src.sh`（`meta-duduclaw/recipes-duduclaw/duduclaw-cli/`）原�
 - ~~`scripts/release.sh` 若引用 `release-os.sh` 或 yocto 產物路徑，更新為「見 DuDuClaw-OS repo」。~~
   **✅ 已完成（見 §7）**——`release.sh` 的 `yocto_inc`/`yocto_bb` 版號同步 kind 全數移除，
   平台版號流不再碰任何 OS metadata。
-- `CHANGELOG.md` / `docs/` 的 OS 段落：doc rot 防治原則下逐一複查，非阻塞。
+- ~~`CHANGELOG.md` / `docs/` 的 OS 段落：doc rot 防治原則下逐一複查，非阻塞。~~
+  **✅ 已完成（2026-09-04）**——`docs/guides/appliance-build.md` 改為指向 OS repo 的入口頁、`features/50` 安裝步驟與現況改寫、`hardware-requirements.md` 燒錄段區分 `.wic`／安裝器 `.iso`、`TODO-H1-ISO` 加追記並補進 `docs/README.md` 索引、`CHANGELOG.md [Unreleased]` 補 Changed。
 
 ## 6. 收尾
 
-- 兩 repo 各自 README 首句更新：主 repo=「Multi-Runtime AI Agent 平台」，
-  DuDuClaw-OS=「以 DuDuClaw 為原生 agent 的 Yocto OS（值班機 image）」。
+- ~~兩 repo 各自 README 首句更新~~ **✅**（主 repo 首句本就是平台；DuDuClaw-OS README 已於 2026-09-04 改繁中並對齊平台 repo 結構，見該 repo `7e52a53`）。
 - `commercial/`（L3，nested git）不受影響——設計文件仍在主 repo 旁的 gitignored tree，
   若 OS 設計文件要跟去 OS repo，另議（commercial 是獨立私有 repo）。
 - 驗證兩邊都能建：主 repo `cargo build`（workspace 完整）；DuDuClaw-OS

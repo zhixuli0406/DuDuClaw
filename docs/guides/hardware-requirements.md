@@ -208,17 +208,20 @@ DuDuClaw OS 是 x86-64。在 Apple Silicon Mac 上用 UTM/QEMU 模擬 x86-64 是
 
 ## 燒錄開機媒體的正確做法
 
-把出貨的 `.wic`（或 hybrid `.iso`）用 **balenaEtcher 選檔燒到 USB**，或指令：
+每個 release 每種 machine 有兩式產物，燒法不同（產物清單、驗簽公鑰與指令見 [DuDuClaw-OS repo](https://github.com/zhixuli0406/DuDuClaw-OS) 的 README「快速開始」；燒之前先驗 `.minisig` 與 `.sha256`）：
+
+- **安裝器 `.iso`（建議）**：用 balenaEtcher 或 `dd` 燒到 USB，或燒成光碟；UEFI 開機進圖形安裝精靈，選目標 SSD 安裝後重開。這是唯一支援「光碟／Boot from ISO」開機的產物。
+- **整碟 `.wic.zst`**：`zstd -d` 解壓後直接寫進目標磁碟（或寫到 USB 當硬碟開機）：
 
 ```bash
 sudo dd if=duduclaw-os-*.wic of=/dev/rdiskN bs=4m status=progress
-# rdiskN 換成你 USB 的實際編號，先用 diskutil list（macOS）或 lsblk（Linux）確認、注意別選錯碟
+# rdiskN 換成目標裝置的實際編號，先用 diskutil list（macOS）或 lsblk（Linux）確認、注意別選錯碟
 ```
 
-⚠️ **務必燒成 USB（當硬碟開機），不要燒成光碟 / 用「Boot from ISO」/ QEMU cdrom**——DuDuClaw 的開機鏈在光碟（`/dev/sr0`）路徑上因 kernel `sr` 驅動限制（`GENHD_FL_NO_PART`，光碟不建 GPT 分割節點）無法開機。USB（block device，等同硬碟）才是唯一且足夠的開機媒體，現代 UEFI 機從 USB 開機也是主流。
+⚠️ **`.wic` 不能燒成光碟、也不能用「Boot from ISO」/ QEMU cdrom 開機**：GPT 磁碟映像走光碟（`/dev/sr0`）路徑時，kernel `sr` 驅動的 `GENHD_FL_NO_PART` 限制讓光碟不建 GPT 分割節點，開機鏈找不到分割。要從光碟或 ISO 開機，請用安裝器 `.iso`：它是 ISO9660 live 環境，不依賴開機媒體上的分割表。
 
 ## 相關文件
 
-- [appliance-build.md](appliance-build.md) — OS image 建置
+- [appliance-build.md](appliance-build.md) — DuDuClaw OS image 取得與建置（OS 線已移至 DuDuClaw-OS repo）
 - [deployment-guide.md](deployment-guide.md) — 部署（服務端）
 - [features/41-resident-sensing.md](../features/41-resident-sensing.md) — resident sensing 完整功能說明（`http_poll` / `command` / `file_tail` / `websocket` 四種來源、SSRF 防護、rate cap、delta 推導）

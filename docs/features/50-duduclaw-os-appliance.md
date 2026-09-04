@@ -20,13 +20,15 @@ account credentials.
 
 ## From Power-On to Ready
 
-1. **Install.** The image doubles as its own installer. Flash it to a USB
-   stick, boot the target machine from that stick, and — after a
-   double-confirmation prompt so an empty stick can never wipe the wrong
-   disk — it writes a copy of itself onto the machine's internal drive and
-   powers off. Remove the USB stick, power the machine back on, and it
-   boots for real. A channel-installed unit can skip this step entirely if
-   its drive was pre-flashed before it shipped.
+1. **Install.** Each release ships two forms per machine. The live
+   installer ISO is the usual route: flash it to a USB stick (or burn it to
+   a disc), boot the target machine from it in UEFI mode with Secure Boot
+   in setup mode or temporarily off, pick the internal SSD in the graphical
+   installer, and reboot into the installed system — the first boot enrolls
+   the DuDuClaw Secure Boot keys. The whole-disk image (`.wic.zst`) skips
+   the installer: decompress it and write it straight to the target disk.
+   A channel-installed unit can skip this step entirely if its drive was
+   pre-flashed before it shipped.
 2. **First boot.** The box syncs its clock over NTP and sets its default
    timezone before touching the network (a clock that's wrong breaks OAuth
    and TLS silently, so this happens first), picks up an address over wired
@@ -127,34 +129,35 @@ screen happens to be sitting there anyway.
 ## Building It Yourself
 
 The image isn't shipped as a mystery binary — it's built from a public
-recipe you can audit and reproduce on your own machine. See
-[the appliance build guide](../guides/appliance-build.md) for the full
-walkthrough (prerequisites, the `build.sh` entry point, a QEMU boot smoke
-test, and the self-install USB flow).
+Yocto layer you can audit and reproduce on your own machine, and every
+release artifact is published with a SHA-256 and a minisign signature.
+Since 2026-09 the layer and its release pipeline live in the standalone
+[DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo; see
+[the build guide](../guides/appliance-build.md) for where to download a
+signed release or build one from source.
 
 ## Current Status
 
 This is a young part of the platform, and it's worth being direct about
-where it stands rather than rounding up:
+where it stands rather than rounding up. As of DuDuClaw OS v0.1.0
+(2026-09-04, the first tagged release from the DuDuClaw-OS repo):
 
-- The shipping build target is x86-64, and producing an actual, complete
-  x86-64 image still needs to be done in a proper Linux/amd64 build
-  environment — it hasn't been produced yet. A separate, faster local build
-  path exists for Apple Silicon developers to iterate on the recipe itself,
-  but that path targets arm64 purely for development speed and is
-  explicitly **not** the shipping target.
-- Full real-hardware validation — burn an image, boot it, walk through
-  setup, exchange a message on a chat channel, apply an OS update, force a
-  rollback, and run a factory reset, all on the actual certified hardware —
-  hasn't happened yet either. What's been exercised so far is a boot-reachability
-  smoke test under QEMU emulation.
-- A handful of individual mechanisms (how the read-only root partition's
-  identity survives a reboot, exactly how boot-counting interacts with the
-  update tool, a few UEFI firmware path assumptions) are documented as open
-  questions rather than confirmed behavior — see "Known open points" in
-  [the build guide](../guides/appliance-build.md) for the complete, current
-  list.
+- x86-64 images exist and are published for both machines, in both forms
+  (whole-disk image and live installer ISO), all signed. The QEMU machine
+  is boot-verified for both forms; the real-hardware machine
+  (`duduclaw-genericx86-64`) has been config-audited only.
+- Full real-hardware validation — burn the media, boot it, install, walk
+  through setup, exchange a message on a chat channel, apply an OS update,
+  force a rollback, and run a factory reset, all on the actual certified
+  hardware — hasn't happened yet. It is the most important open item.
+- The trust chain is largely in place (self-signed Secure Boot with a
+  dual-signed UKI per slot, read-only root with dm-verity); TPM2 + LUKS
+  key sealing is wired, but its automatic enrollment is still an open
+  defect that needs a real-hardware TPM to close.
+- The OS is versioned independently of the platform (`0.x` = bring-up;
+  `1.0.0` will mark the first GA). Release-by-release status lives in the
+  DuDuClaw-OS repo's `CHANGELOG.md`.
 
-None of this blocks building and experimenting with the recipe today; it's
+None of this blocks flashing and experimenting with a release today; it's
 what's left before the appliance is something you'd hand to someone who
 isn't comfortable debugging a boot failure themselves.

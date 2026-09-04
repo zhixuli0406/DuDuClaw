@@ -110,6 +110,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [todo/TODO-client-ws-protocol-mismatch.md](todo/TODO-client-ws-protocol-mismatch.md) | 🟠 VS Code / Chrome / Stream Deck send JSON-RPC 2.0 frames the gateway's `WsFrame` protocol rejects — every dashboard RPC dies as a misleading "connection closed" |
 | [todo/TODO-agent-toml-silent-skip.md](todo/TODO-agent-toml-silent-skip.md) | 🟠 One missing `agent.toml` field drops the whole agent with a single WARN — `agents.list` goes empty and `FirstRunGate` shows a working install as brand-new |
 | [todo/TODO-agent-honesty.md](todo/TODO-agent-honesty.md) | Agent honesty / anti-hallucination tasks |
+| [todo/TODO-H1-ISO-x86-installer.md](todo/TODO-H1-ISO-x86-installer.md) | H1-ISO：mkosi 線第一次真烤 x86-64 安裝媒介＋QEMU 安裝鏈驗證（歷史紀錄；該線已凍結並移至 DuDuClaw-OS） |
 | [todo/TODO-agent-cross-invocation-continuity.md](todo/TODO-agent-cross-invocation-continuity.md) | Agent 跨 invocation 行動連續性（否認/遺忘自己排程時的行動）修復 |
 | [todo/TODO-dispatch-run-visibility.md](todo/TODO-dispatch-run-visibility.md) | 排程／派工執行紀錄可觀測性——cron 路徑不落 run 紀錄，RunsPage 只看得到頻道對話 |
 | [todo/TODO-skill-extraction-cron-path.md](todo/TODO-skill-extraction-cron-path.md) | 技能萃取的排程路徑——cron 場景無使用者回饋，成功訊號分級（判官 accept/成功 run）替代方案已定向 |
@@ -157,7 +158,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/white-label.md](guides/white-label.md) | White-label branding (reseller logo/name) + distributor key console (`/manage/distributors`, `[distributor] issuer_key_path`) | Current |
 | [guides/recording-to-skill.md](guides/recording-to-skill.md) | 錄製 → 技能：瀏覽器/桌面示範錄製、HAR 脫敏、蒸餾成 SKILL.md 草稿＋審批安裝（`[capabilities] recording`） | Current |
 | [guides/feedback-page.md](guides/feedback-page.md) | 問題回報與建議網頁（GitHub Pages 表單 → issue 預填 → Actions + Haiku 自動分類/格式化/上標籤） | Current |
-| [guides/appliance-build.md](guides/appliance-build.md) | Community build guide for the DuDuClaw OS appliance image — `build.sh` usage, Docker/QEMU prerequisites, self-install USB flow, known limitations | Current |
+| [guides/appliance-build.md](guides/appliance-build.md) | Getting / building the DuDuClaw OS image — entry point to the standalone DuDuClaw-OS repo (signed releases, `kas` build pipeline); the Debian/mkosi line is frozen there | Current |
 
 ## API Reference
 

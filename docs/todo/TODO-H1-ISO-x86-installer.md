@@ -5,6 +5,11 @@
 > 燒錄一份可開機媒介、安裝 DuDuClaw OS，並完整驗證「開機→安裝→重開進系統」全鏈，
 > 在 QEMU x86_64 全模擬下先行驗證，真機驗證留待硬體到位。
 
+> **2026-09-04 追記**：本 TODO 描述的 `appliance/` Debian/mkosi 線已凍結，並隨 OS 拆分移至
+> [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo 的 `appliance/`（僅供參考）；
+> 出貨產物改由該 repo 的 Yocto 層產出（v0.1.0 起含安裝器 ISO）。本文件保留為歷史紀錄，
+> 文中 `appliance/...` 路徑指該 repo。
+
 ## 一句話
 
 `appliance/build.sh` 從未真的烤過 x86-64（雖然那才是設計上的「出貨預設」），這輪把它烤出來、
