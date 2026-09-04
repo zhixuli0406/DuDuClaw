@@ -107,7 +107,9 @@ OS 的 `refresh-src.sh`（`meta-duduclaw/recipes-duduclaw/duduclaw-cli/`）原�
 主 repo 仍有多處 `meta-duduclaw/`/`appliance/` 的**註解/字串**引用（`git grep -l`
 在 crates/docs/CHANGELOG 等），多為說明 OS 關係、不影響 build。剝除後：
 - `.gitignore` 裡 `/meta-duduclaw/.build/`、flatpak tarball、`/sb-keys/` 等 OS 條目可留可清。
-- `scripts/release.sh` 若引用 `release-os.sh` 或 yocto 產物路徑，更新為「見 DuDuClaw-OS repo」。
+- ~~`scripts/release.sh` 若引用 `release-os.sh` 或 yocto 產物路徑，更新為「見 DuDuClaw-OS repo」。~~
+  **✅ 已完成（見 §7）**——`release.sh` 的 `yocto_inc`/`yocto_bb` 版號同步 kind 全數移除，
+  平台版號流不再碰任何 OS metadata。
 - `CHANGELOG.md` / `docs/` 的 OS 段落：doc rot 防治原則下逐一複查，非阻塞。
 
 ## 6. 收尾
@@ -118,3 +120,36 @@ OS 的 `refresh-src.sh`（`meta-duduclaw/recipes-duduclaw/duduclaw-cli/`）原�
   若 OS 設計文件要跟去 OS repo，另議（commercial 是獨立私有 repo）。
 - 驗證兩邊都能建：主 repo `cargo build`（workspace 完整）；DuDuClaw-OS
   `kas build`（vendored 快照 + §4 修好的 refresh 路徑）。
+
+## 7. 發布產物路由（2026-09-04，拍板落地）
+
+拍板：**平台產物（gateway/desktop）留 DuDuClaw repo；OS 產物（.wic/.iso）進
+DuDuClaw-OS repo**；OS 走 **GitHub Releases 公開上傳**、採 **獨立版號**（與平台版號脫鉤）。
+
+### DuDuClaw-OS 側（`scripts/release-os.sh` + 新增 `VERSION`）
+- **OS 獨立版號 SoT** = repo 根 `VERSION` 檔（首個非註解行的 bare semver，起始 `0.1.0`——
+  0.x 標 bring-up，內部 DISTRO_VERSION 仍帶 `-y1-bringup`，跨 1.0.0 = 宣告 GA）。
+  取代原本讀 `Cargo.toml`（拆分後 OS repo 根已無 top-level Cargo.toml，那條讀取是壞的）。
+  所有子命令 `v<version>` 參數改**可選**，預設讀 `VERSION`。
+- **`publish` 新子命令**：把 `package` 產的四檔（`.wic.zst` + `.sha256` + `.minisig` +
+  `manifest.json`）上傳到 `zhixuli0406/DuDuClaw-OS` 的 GitHub Release（tag `v<version>`）。
+  上傳前 fail-closed：重驗 minisig 對釘死的 `OS_RELEASE_PUBKEY` + `shasum -c` sidecar；
+  idempotent（`--clobber`）；偵測 repo 私有時 warn（不擋）提醒「私有 repo 的 release 資產
+  不對外可下載，需 `gh repo edit --visibility public`」。`DUDUCLAW_OS_GH_REPO` 可覆寫目標。
+- **內部 Yocto DISTRO_VERSION 刻意不動**（仍 `${DUDUCLAW_PLATFORM_VERSION}-y1-bringup`）：
+  它餵 A/B GPT 分割名/UKI 檔名/更新台帳 ProtectVersion，改它要烤像重驗 A/B 鏈——
+  故本輪只有 **release 產物名 + GH tag** 帶獨立 OS 版號，DISTRO_VERSION 對齊列為需烤像的後續。
+  `manifest.json` schema bump 到 2：`version`=OS 版、新增 `platform_version`=內嵌平台版、
+  `distro_version_full`=內部建構版，三者分開記全 provenance。
+- 完整流程：`build → smoke → package → publish`（皆手動、皆非自動觸發）。
+
+### DuDuClaw 側（`scripts/release.sh`）
+- 移除 `yocto_inc`/`yocto_bb` 兩個版號同步 kind（platform_manifests / extract_version /
+  bump / assert 全清）——平台版號流**不再碰任何 OS metadata**。revert 邏輯保留
+  `git reset --hard HEAD`（原以 yocto_bb rename 為由，改為通用「一步清 staged+unstaged」註解）。
+  收尾 next-steps 第 5 點改指向 `cd ../DuDuClaw-OS && release-os.sh ...`。
+
+### 待使用者處理
+- OS repo 目前為 `--private`（§1 建立時）。若要 release 真正公開可下載，需
+  `gh repo edit zhixuli0406/DuDuClaw-OS --visibility public`（visibility flip = 使用者關卡）。
+- OS 簽章金鑰 `~/.minisign/duduclaw-os-release.key` 首次 `publish` 前需在該機備妥。
