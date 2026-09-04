@@ -46,6 +46,7 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
 | Tools shared across LLMs | Rewrite per vendor | Write 200+ MCP tools once, use on all 5 backends |
 | Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
+| A whole box to hand to a customer | Install Linux yourself, manage updates and tamper resistance yourself | DuDuClaw OS image: A/B update with rollback + Secure Boot + read-only root, plug in and go |
 
 <a id="architecture"></a>
 
@@ -70,6 +71,8 @@ DuDuClaw (plumbing)
 ```
 
 The Rust workspace is 20 crates: the `duduclaw-core` foundation, the `duduclaw-gateway` service layer, the `duduclaw-llm` unified API layer, `duduclaw-inference` for local models, `duduclaw-memory` for cognitive memory, `duduclaw-security`, and more. Full design in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+The same gateway + dashboard also ships as a whole machine: [DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) is a Yocto-built appliance image. Its Yocto layer and release pipeline live in their own repo and vendor this repo's Rust workspace as a trimmed snapshot; see the Install section below.
 
 <a id="prerequisites"></a>
 
@@ -108,6 +111,12 @@ npm install -g duduclaw
 This installs a prebuilt binary for your platform (macOS ARM64/x64, Linux x64/ARM64, Windows x64). No compiler, no Rust.
 
 > ⚠️ If the install asks you for Rust / MSVC Build Tools and a 1.5-hour compile, you took a wrong turn. That path is "build from source" for contributors; regular users should use the npm command above.
+
+### DuDuClaw OS (appliance image, pre-GA)
+
+If you would rather not dedicate a computer, get a box that runs the moment you plug it in: [DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) is a Yocto-built Linux image that turns an x86-64 mini PC into a headless appliance. Flash it, connect power and ethernet, and the dashboard appears on your LAN; everything after that is configured in the browser. It ships with A/B atomic updates and rollback, a read-only root verified by dm-verity, self-signed Secure Boot, and preloaded Chromium / LibreOffice / Steam plus a Chinese IME.
+
+Download the installer `.iso` (flash to USB, boot, install) or the whole-disk `.wic.zst` from [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases); every file comes with a `.sha256` and a minisign signature, and the verification commands are in that repo's README. This is a bring-up line (0.x): QEMU-verified, **not yet booted on real hardware**. Hardware requirements and compatible machines: [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md); product overview: [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md).
 
 ### Build from source
 
@@ -172,6 +181,7 @@ duduclaw service install   # start on boot (launchd / systemd)
 | Auto-update | One click from the dashboard or unattended (`auto_update = true`); SHA-256 + Ed25519 verification, in-place restart, open tabs reload themselves | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web dashboard | React 19 + TypeScript SPA, 32 pages, embedded in the binary; zh-TW / en / ja | [docs/features](docs/features/README.md) |
 | ERP | Odoo bridge with 17 MCP tools (CRM / sales / inventory / accounting), CE/EE auto-detection, per-agent credential isolation | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| DuDuClaw OS | Yocto appliance image: A/B atomic update with rollback, read-only root + dm-verity, self-signed Secure Boot, TPM2 key sealing (partial), first-boot provisioning + LAN dashboard, own compositor / shell with keyboard shortcuts, app compatibility layer (Flatpak / Bottles / Waydroid); separate repo and version line, pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) |
 
 Full feature list in [docs/features/feature-inventory.md](docs/features/feature-inventory.md); version history in [CHANGELOG.md](CHANGELOG.md).
 
@@ -252,6 +262,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 - [docs/guides/development-guide.md](docs/guides/development-guide.md): dev environment and agent development
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md): writing custom MCP tools
 - [docs/spec](docs/spec/soul-md-spec.md): SOUL.md and CONTRACT.toml format specs
+- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md): the DuDuClaw OS appliance; hardware requirements in [hardware-requirements.md](docs/guides/hardware-requirements.md), app compatibility in [app-compat.md](docs/guides/app-compat.md); image build and releases in the [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo
 - [CHANGELOG.md](CHANGELOG.md): version history
 
 <a id="license"></a>

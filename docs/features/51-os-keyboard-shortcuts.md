@@ -1,64 +1,74 @@
-# DuDuClaw OS 快捷鍵總表
+# DuDuClaw OS keyboard shortcuts
 
-> DuDuClaw OS（可開機的值班機映像檔，詳見
-> [50-duduclaw-os-appliance.md](50-duduclaw-os-appliance.md)）桌面環境的
-> 完整快捷鍵速查表。若您是以一般伺服器方式安裝 DuDuClaw、透過網頁儀表板操作，
-> 本頁與您無關——這裡談的是值班機本體的桌面。
+> The complete keyboard shortcut reference for the DuDuClaw OS (a bootable
+> appliance image — see
+> [50-duduclaw-os-appliance.md](50-duduclaw-os-appliance.md)) desktop
+> environment. If you installed DuDuClaw the regular server way and drive it
+> through the web dashboard, this page doesn't apply to you — it covers the
+> appliance's own desktop.
 
-## 這是什麼
+## What it is
 
-DuDuClaw OS 開機後直接進入一套精簡的桌面環境——主畫面、視窗切換器、鎖定畫面，
-以及首次啟用時的設定精靈，全都可以不靠滑鼠操作。本頁按「在哪裡有效」把每一個
-快捷鍵分組列出，省去在選單裡（其實也沒什麼選單）翻找或用猜的。
+DuDuClaw OS boots straight into a lean desktop environment — a home screen,
+a window switcher, a lock screen, and a setup wizard on first boot — all of
+it operable without a mouse. This page groups every shortcut by where it's
+active, so you don't have to hunt through menus (there aren't many) or
+guess.
 
-本頁有兩個快捷鍵是這一輪新增的：**Tab** 鍵可以在首次設定過程中的輸入欄位間移動；
-**⌘K** 現在無論目前在用哪一個 app，都能叫出全域交辦欄。
+Two shortcuts on this page are new this round: **Tab** moves between input
+fields during first-time setup, and **Cmd+K** now summons the global
+delegation bar no matter which app currently has focus.
 
-## 全域——在裝置上任何 app 之上都有效
+## Global — active over any app on the device
 
-這一組由系統本身處理，蓋在所有 app 之上——即使目前是第三方 app 佔用鍵盤焦點，
-這些按鍵一樣有效；而且 AI 代理人在操作機器時，結構上完全無法觸發或攔截這幾個
-按鍵，它們只保留給坐在實體鍵盤前的真人。
+This group is handled by the system itself, layered above every app — even
+when a third-party app currently holds keyboard focus, these keys still
+work. And structurally, an AI agent operating the machine can never trigger
+or intercept any of them; they're reserved for the human sitting at the
+physical keyboard.
 
-| 按鍵 | 作用 |
+| Key | What it does |
 |---|---|
-| **⌘Esc** | 緊急停止。立即中止 AI 代理人正在畫面上進行的任何操作，把控制權交還給您。不管畫面上是什麼狀態都一定有效。 |
-| **⌘↵**（Return） | 在 AI 代理人操作完畫面後，把控制權交還給真人——是上面「緊急停止」比較溫和、有意識的版本。 |
-| **⌘K** | 從目前正在使用的任何 app 之上，叫出交辦欄——DuDuClaw 快速把任務交給 AI 員工的入口。**本輪新增。** |
-| **Alt+Tab**（或 **⌘Tab**） | 依「最近使用」順序切換視窗。按住修飾鍵不放、連續按 Tab 依序瀏覽，放開後就切換到當時反白的視窗；同時按住 **Shift** 則反方向瀏覽。 |
-| **Esc**（切換視窗過程中） | 取消本次視窗切換，留在原本的視窗上。 |
-| **⌘Q** | 關閉目前最前面的視窗。 |
+| **Cmd+Esc** | Emergency stop. Immediately halts whatever the AI agent is currently doing on screen and hands control back to you. Works no matter what state the screen is in. |
+| **Cmd+Return** | Hands control back to a human after the AI agent finishes acting on screen — the calmer, deliberate counterpart to the emergency stop above. |
+| **Cmd+K** | Summons the delegation bar over whatever app you're currently using — DuDuClaw's quick entry point for handing a task to an AI employee. **New this round.** |
+| **Alt+Tab** (or **Cmd+Tab**) | Cycles windows in most-recently-used order. Hold the modifier and press Tab repeatedly to step through them; release to switch to whichever window is highlighted. Hold **Shift** at the same time to step in reverse. |
+| **Esc** (while cycling) | Cancels the window switch and stays on the current window. |
+| **Cmd+Q** | Closes the frontmost window. |
 
-## 殼介面——主畫面、交辦欄、控制中心
+## Shell interface — home screen, delegation bar, control center
 
-這一組只在 DuDuClaw 自己的畫面擁有鍵盤焦點時有效（若焦點在第三方 app 上，請用
-上方全域的 **⌘K**）。
+This group only works while DuDuClaw's own screen holds keyboard focus (if
+focus is on a third-party app, use the global **Cmd+K** above instead).
 
-| 按鍵 | 作用 | 在哪裡有效 |
+| Key | What it does | Where it works |
 |---|---|---|
-| **⌘K** | 開啟或關閉交辦欄。 | 主畫面 |
-| **Esc** | 關閉目前開啟中的面板——交辦欄、通知中心或控制中心（同一時刻只會開一個）。 | 主畫面 |
-| **⌘L** | 立即鎖定螢幕，效果等同從電源選單選「鎖定」。 | 主畫面 |
+| **Cmd+K** | Opens or closes the delegation bar. | Home screen |
+| **Esc** | Closes whichever panel is currently open — delegation bar, notification center, or control center (only one is ever open at a time). | Home screen |
+| **Cmd+L** | Locks the screen immediately, the same as picking "Lock" from the power menu. | Home screen |
 
-## 初次設定
+## First-time setup
 
-DuDuClaw OS 第一次開機會走一段簡短的設定流程——語言、網路、建立管理者帳號，
-以及幾個偏好設定畫面。不用滑鼠、光靠以下三個按鍵就能走完全程。
+DuDuClaw OS walks through a short setup flow on first boot — language,
+network, creating an administrator account, and a few preference screens.
+You can get through the whole thing with just these three keys, no mouse
+needed.
 
-| 按鍵 | 作用 | 在哪裡有效 |
+| Key | What it does | Where it works |
 |---|---|---|
-| **↵**（Enter） | 繼續到下一步。在「需要先連上伺服器才能繼續」的兩個步驟——建立管理者帳號、加入 Wi-Fi 網路——按 Enter 會先觸發該步驟自己的動作按鈕（例如「建立帳號」「連線」，如果還沒按過的話），成功之後才會前進，行為就跟一般登入表單打完密碼按 Enter 一樣直覺。 | 初次設定 |
-| **Esc** | 返回上一步。在第一步按沒有作用——前面已經沒有步驟了。 | 初次設定 |
-| **Tab** / **Shift+Tab** | 把游標移到目前步驟的下一個（按 Shift 則是上一個）文字輸入欄位——例如建立帳號步驟的姓名、密碼欄位之間，或跳進 Wi-Fi 密碼欄位。到最後一個欄位再按 Tab 會繞回第一個。**本輪新增。** | 初次設定 |
+| **Enter** | Continues to the next step. On the two steps that need a server round trip before they can continue — creating the administrator account, joining a Wi-Fi network — Enter first triggers that step's own action button (e.g. "Create account", "Connect", if you haven't pressed it yet), then advances only once it succeeds. It behaves the same way pressing Enter after typing a password does on an ordinary login form. | First-time setup |
+| **Esc** | Goes back one step. Does nothing on the first step — there's nothing before it. | First-time setup |
+| **Tab** / **Shift+Tab** | Moves the cursor to the next (or, with Shift, the previous) text field in the current step — for example between the name and password fields on the account-creation step, or into the Wi-Fi password field. Pressing Tab on the last field wraps back to the first. **New this round.** | First-time setup |
 
-## 鎖定畫面
+## Lock screen
 
-| 按鍵 | 作用 |
+| Key | What it does |
 |---|---|
-| 任意按鍵或點擊 | 顯示密碼輸入框（如果還沒顯示的話）。 |
-| **↵**（Enter） | 若密碼輸入框還沒顯示，先顯示出來；若已經顯示且已經打了字，就送出解鎖嘗試。 |
+| Any key or click | Shows the password field (if it isn't already showing). |
+| **Enter** | Shows the password field if it isn't showing yet; if it's already showing and you've typed something, submits the unlock attempt. |
 
-## 延伸閱讀
+## Further reading
 
-- [50-duduclaw-os-appliance.md](50-duduclaw-os-appliance.md) ——
-  這套桌面所在的值班機本身，以及初次設定在整個上手流程中的位置。
+- [50-duduclaw-os-appliance.md](50-duduclaw-os-appliance.md) — the appliance
+  this desktop runs on, and where first-time setup fits in the overall
+  onboarding flow.

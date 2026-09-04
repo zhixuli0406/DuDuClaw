@@ -46,6 +46,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | 對話記憶與知識庫 | 單次 session | SQLite 時態記憶 + 分層 wiki + 自動注入 |
 | 工具跨 LLM 共用 | 每家重寫 | 200+ MCP 工具寫一次,五種後端共用 |
 | 安全邊界 / 稽核 / 密鑰管理 | 自己造 | 政策核心 + OS 沙箱 + AES-256-GCM 內建 |
+| 交給客戶的整台值班機 | 自己裝 Linux,更新與防竄改自己管 | DuDuClaw OS 映像:A/B 更新回滾 + Secure Boot + 唯讀 root,插電即用 |
 
 <a id="architecture"></a>
 
@@ -70,6 +71,8 @@ DuDuClaw (plumbing)
 ```
 
 Rust workspace 由 20 個 crate 組成:核心地基 `duduclaw-core`、服務層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、本地推論 `duduclaw-inference`、認知記憶 `duduclaw-memory`、安全層 `duduclaw-security` 等。完整設計見 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+同一套 gateway + dashboard 還有一種出貨形態:整台機器。[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的值班機映像,Yocto 層與映像產線放在獨立 repo,把本 repo 的 Rust workspace 以剪枝快照 vendor 進去;見下方安裝一節。
 
 <a id="prerequisites"></a>
 
@@ -108,6 +111,12 @@ npm install -g duduclaw
 會自動安裝對應平台的預編譯 binary(macOS ARM64/x64、Linux x64/ARM64、Windows x64),免編譯器、免 Rust。
 
 > ⚠️ 如果安裝過程要求你裝 Rust / MSVC Build Tools 並編譯 1.5 小時,代表走錯路徑了。那是給貢獻者的「從原始碼建構」;一般使用請用上面的 npm 指令。
+
+### DuDuClaw OS(值班機映像,pre-GA)
+
+不想佔用一台電腦,想要一台插電就跑的 AI 員工值班機:[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的 Linux 映像,把一台 x86-64 迷你主機變成無頭值班機。燒進去、接上電源與網路線,管理後台就出現在區網,之後全部在瀏覽器裡設定。內建 A/B 原子更新與回滾、唯讀 root + dm-verity、自簽 Secure Boot,並預載 Chromium / LibreOffice / Steam 與注音輸入法。
+
+到 [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) 下載安裝器 `.iso`(燒 USB 開機安裝)或整碟 `.wic.zst`,每個檔案都附 `.sha256` 與 minisign 簽章,驗簽指令在該 repo 的 README。目前是 bring-up 版(0.x):QEMU 驗證通過,**尚未在真實硬體開機驗證**。硬體條件與相容機型見 [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md),產品說明見 [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md)。
 
 ### 從原始碼建構
 
@@ -172,6 +181,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 自動更新 | Dashboard 一鍵更新或背景自動更新(`auto_update = true`),SHA-256 + Ed25519 雙重驗證後原地重啟,前台分頁自動重載 | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web Dashboard | React 19 + TypeScript SPA 32 頁,嵌入 binary 零額外部署;zh-TW / en / ja 三語 | [docs/features](docs/features/README.md) |
 | ERP 整合 | Odoo 中間層 17 個 MCP 工具(CRM / 銷售 / 庫存 / 會計),CE/EE 自動偵測、per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| DuDuClaw OS | Yocto 值班機映像:A/B 原子更新與回滾、唯讀 root + dm-verity、自簽 Secure Boot、TPM2 金鑰密封(部分)、首次開機自動 provision + 區網後台、自家 compositor / 殼與快捷鍵、app 相容層(Flatpak / Bottles / Waydroid);獨立 repo 與版號,pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) |
 
 完整功能清單見 [docs/features/feature-inventory.md](docs/features/feature-inventory.md),版本演進見 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -252,6 +262,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開發環境與 agent 開發
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):自訂 MCP 工具教學
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md 與 CONTRACT.toml 格式規範
+- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS 值班機(產品說明);硬體需求見 [hardware-requirements.md](docs/guides/hardware-requirements.md)、app 相容層見 [app-compat.md](docs/guides/app-compat.md);映像建置與發布在 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo
 - [CHANGELOG.md](CHANGELOG.md):版本變更紀錄
 
 <a id="license"></a>

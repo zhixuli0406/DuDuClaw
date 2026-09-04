@@ -1,4 +1,4 @@
-# Custom MCP tool development guide
+# 自訂 MCP 工具開發指南
 
 > 如何為 DuDuClaw 的 MCP Server 新增工具
 > 適用版本：v0.12.0+
@@ -65,7 +65,7 @@ ToolDef {
         .and_then(|v| v.as_str())
         .unwrap_or("default");
 
-    // Your logic here
+    // 這裡放你的邏輯
     let result = do_something(input, options).await?;
 
     Ok(json!({
@@ -80,7 +80,7 @@ ToolDef {
 錯誤要回傳結構化 JSON，不要 panic：
 
 ```rust
-// Good: structured error
+// 好：結構化錯誤
 if input.is_empty() {
     return Ok(json!({
         "status": "error",
@@ -88,8 +88,8 @@ if input.is_empty() {
     }));
 }
 
-// Bad: panic
-assert!(!input.is_empty());  // Never do this in a tool handler
+// 不好：panic
+assert!(!input.is_empty());  // tool handler 裡絕對不要這樣做
 ```
 
 ### Async operations
@@ -140,10 +140,10 @@ mod tests {
 ### Manual test with Claude Code
 
 ```bash
-# Start the MCP server
+# 啟動 MCP server
 duduclaw mcp-server
 
-# In another terminal, verify the tool appears in the tool list
+# 在另一個 terminal 驗證工具有出現在工具清單裡
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | duduclaw mcp-server
 ```
 
@@ -223,7 +223,7 @@ static LIMITER: OnceLock<RateLimiter> = OnceLock::new();
             "error": "rate limit exceeded, try again in 60s"
         }));
     }
-    // ... call external API
+    // ... 呼叫外部 API
 }
 ```
 

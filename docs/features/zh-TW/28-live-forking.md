@@ -280,3 +280,5 @@ gateway 的 `/metrics` 端點在 scrape 時讀取跨行程的 `ForkStore`，並�
 ## 總結
 
 當你迷失在迷宮裡、又負擔得起複製自己時，你不會挑一條隧道然後祈禱。你會送一個分身走每一條，讓入口處的評審只保留那個找到出口的分身。Live Run Forking 賦予 DuDuClaw agent 這項能力：平行競爭分支、隔離工作區、獨立帳號、有界預算、AI 評審，以及一個跨行程的 `ForkStore`，讓 gateway 與 dashboard 都能看著它發生。預設關閉、fail-closed、無靜默上限，以廣度探索，只合併贏家。
+
+另見：[Live Forking：同一個任務，並行跑幾條路，擇優收斂](./live-forking.md)（使用情境：什麼時候該分叉、什麼時候不該，以及它與 `duduclaw eval` 有何不同）。

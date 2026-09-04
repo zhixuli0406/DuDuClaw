@@ -7,6 +7,7 @@
 
 ### Changed
 - **DuDuClaw OS 線拆分為獨立 repo（2026-09-04）**：`meta-duduclaw/`（Yocto 層）、`appliance/`（已凍結的 Debian/mkosi 線）與 `scripts/release-os.sh` 連同歷史移至 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS)，本 repo 只保留 Rust workspace（OS 以剪枝快照 vendor）。`scripts/release.sh` 移除 `yocto_inc`／`yocto_bb` 兩種版號同步 kind，平台版號流不再碰任何 OS metadata；OS 改採獨立版號（該 repo 的 `VERSION` 檔，起始 0.1.0 bring-up）並走該 repo 的 GitHub Releases。文件端同步：`docs/guides/appliance-build.md` 改為指向 OS repo 的入口頁；`docs/features/50` 的安裝步驟與現況改寫為 v0.1.0 事實（兩式產物、真機仍未驗證）；`docs/guides/hardware-requirements.md` 燒錄段落區分 `.wic`（僅 USB／磁碟）與安裝器 `.iso`（可光碟開機）；`docs/todo/TODO-H1-ISO-x86-installer.md` 加追記並補進索引。
+- **docs/features 與 docs/guides 三語對齊**：2026-08-16「三語規範化」之後累積的落差一次補平——features 48／49／50 與 guides `appliance-build.md` 補齊 zh-TW／ja-JP 譯本；features 51 與 guides `app-compat.md`、`hardware-requirements.md` 原本是繁中直接放在英文 root，改為 root 英文版＋繁中移入 `zh-TW/`＋新增 ja-JP；features 28 的 See also 與 31 的 Provenance（I-2b）段落補進兩語譯本；`guides/zh-TW/custom-mcp-tool.md` 半英文舊稿重譯；三語 features README 索引補 48–51 並更新版本／日期。三語 README 新增 DuDuClaw OS：為什麼表格加一列、架構一覽補出貨形態、安裝一節新增「DuDuClaw OS(值班機映像,pre-GA)」小節、功能總覽加一列、文件清單加入口。
 
 ### Fixed
 - **sysd 拒絕未授權連線時，拒絕回應可能被 Linux RST 摧毀**：server 對 uid 不符的 peer 寫完 `unauthorized` 回應後直接關閉，socket 收件佇列裡未讀的 request 使 close 變成 RST——client 收到 `ECONNRESET` 而非結構化錯誤（macOS 語義不同從未在本機重現，只在 Linux CI 以 `mismatched_uid_is_rejected` 閃失敗現形）。現在回應寫出後做尺寸與時間雙重上限（500ms）的 bounded drain 再關閉，未授權 peer 也無法藉此拖住連線。

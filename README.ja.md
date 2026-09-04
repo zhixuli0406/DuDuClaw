@@ -46,6 +46,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | 会話メモリと知識ベース | 単発セッション | SQLite 時系列メモリ + 階層 wiki を自動注入 |
 | ツールの LLM 間共有 | ベンダーごとに書き直し | 200+ MCP ツールを一度書けば 5 バックエンドで共用 |
 | ガードレール / 監査 / 秘密情報管理 | 自作 | ポリシーカーネル + OS サンドボックス + AES-256-GCM 内蔵 |
+| 顧客に渡す一台まるごとの専用機 | Linux を自分で入れ、更新と改ざん対策も自前 | DuDuClaw OS イメージ:A/B アップデートとロールバック + Secure Boot + 読み取り専用ルート、電源を入れるだけ |
 
 <a id="architecture"></a>
 
@@ -70,6 +71,8 @@ DuDuClaw (plumbing)
 ```
 
 Rust ワークスペースは 20 crate 構成:基盤の `duduclaw-core`、サービス層 `duduclaw-gateway`、統一 API 層 `duduclaw-llm`、ローカル推論 `duduclaw-inference`、認知メモリ `duduclaw-memory`、セキュリティ層 `duduclaw-security` など。全体設計は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
+
+同じ gateway + dashboard は、マシン一台まるごとという形でも提供しています。[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) は Yocto でビルドしたアプライアンスイメージで、Yocto レイヤーとリリースパイプラインは独立したリポジトリに置き、本リポジトリの Rust ワークスペースを剪定済みスナップショットとして取り込んでいます。詳しくは下記のインストール節を参照してください。
 
 <a id="prerequisites"></a>
 
@@ -108,6 +111,12 @@ npm install -g duduclaw
 プラットフォームに対応するビルド済みバイナリ(macOS ARM64/x64、Linux x64/ARM64、Windows x64)が自動で入ります。コンパイラも Rust も不要です。
 
 > ⚠️ インストール中に Rust / MSVC Build Tools の導入と 1.5 時間のコンパイルを求められたら、それは間違ったルートです。「ソースからビルド」はコントリビュータ向け。通常利用は上の npm コマンドを使ってください。
+
+### DuDuClaw OS(アプライアンスイメージ、pre-GA)
+
+PC を一台専有したくないなら、電源を入れるだけで動く AI スタッフ専用機という選択肢があります。[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) は Yocto でビルドした Linux イメージで、x86-64 ミニ PC をヘッドレスのアプライアンスに変えます。書き込んで電源と LAN ケーブルをつなげばダッシュボードが LAN 上に現れ、以降の設定はすべてブラウザで完結します。A/B アトミックアップデートとロールバック、dm-verity で検証される読み取り専用ルート、自己署名の Secure Boot を備え、Chromium / LibreOffice / Steam と中国語 IME をプリロード済みです。
+
+[DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) からインストーラー `.iso`(USB に書き込んで起動・インストール)またはディスク全体イメージ `.wic.zst` をダウンロードしてください。各ファイルには `.sha256` と minisign 署名が付属し、検証コマンドは同リポジトリの README にあります。現在は bring-up 段階(0.x)で、QEMU での検証は済んでいますが、**実機での起動検証はまだ行っていません**。ハードウェア要件と対応機種は [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md)、製品概要は [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md) を参照してください。
 
 ### ソースからビルド
 
@@ -172,6 +181,7 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | 自動アップデート | ダッシュボードからワンクリック、または無人更新(`auto_update = true`)。SHA-256 + Ed25519 の二重検証後にその場で再起動、開いているタブは自動リロード | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web ダッシュボード | React 19 + TypeScript SPA 32 ページ、バイナリに内蔵で追加デプロイ不要。zh-TW / en / ja 対応 | [docs/features](docs/features/README.md) |
 | ERP 連携 | Odoo ブリッジ 17 MCP ツール(CRM / 販売 / 在庫 / 会計)、CE/EE 自動検出、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
+| DuDuClaw OS | Yocto アプライアンスイメージ:A/B アトミックアップデートとロールバック、読み取り専用ルート + dm-verity、自己署名 Secure Boot、TPM2 鍵封印(部分実装)、初回起動時の自動プロビジョニング + LAN ダッシュボード、自前コンポジタ / シェルとショートカット、アプリ互換レイヤー(Flatpak / Bottles / Waydroid);独立リポジトリ・独立バージョン、pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) |
 
 全機能リストは [docs/features/feature-inventory.md](docs/features/feature-inventory.md)、バージョン履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
@@ -252,6 +262,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開発環境とエージェント開発
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):カスタム MCP ツールの作り方
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md / CONTRACT.toml フォーマット仕様
+- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS アプライアンス(製品概要);ハードウェア要件は [hardware-requirements.md](docs/guides/hardware-requirements.md)、アプリ互換は [app-compat.md](docs/guides/app-compat.md);イメージのビルドとリリースは [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) リポジトリ
 - [CHANGELOG.md](CHANGELOG.md):バージョン履歴
 
 <a id="license"></a>

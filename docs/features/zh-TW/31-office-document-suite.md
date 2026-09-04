@@ -60,6 +60,27 @@ Files 頁透過 `GET /api/files/preview` 在瀏覽器裡預覽辦公文件:
 - 缺 LibreOffice → 明確的 503 JSON 訊息,絕不吐出壞掉的位元組串流。
 - 與下載端點相同的 JWT 驗證與路徑圍欄。
 
+## Provenance (I-2b)
+
+每個進到 `attachments/` 的檔案,以前只是扁平目錄清單裡一筆匿名項目;客戶的入站上傳,和 agent 為某個 goal task 產出的報表,兩者難以分辨。一份 provenance ledger(`artifacts.jsonl`,與 `tool_calls.jsonl`、`task_changes.jsonl` 放在一起)現在會記錄每個檔案從哪裡來,**在寫入當下**就記下,絕不事後用猜的:
+
+| 來源 | 意義 |
+|---|---|
+| `declared` | agent 透過 `📎DELIVER:` 親手交付。 |
+| `swept` | `sweep_undeclared_deliverables` 撿回來的;檔案存在,只是 marker 被忘了。 |
+| `uploaded` | 人類透過某個通道送進來的(入站附件)。 |
+| `produced` | 在讀取時從任務自己的 change ledger 推導出來,從未真正寫進 artifacts 檔案本身。 |
+| `unknown` | 證據不足以判斷。誠實留白,不亂猜。 |
+
+任務歸屬分兩層,標法相同:當該筆記錄(或任務自己的 change ledger)直接點名任務時記為 `exact`;只靠 claim→review 時間窗慣例(與 `tasks.changes` 用的同一個窗口)推定出來時記為 `inferred`,dashboard 絕不會把推論當成事實呈現。合併用的 key 是檔案真正的 basename,不是 CJK-sanitized 過的顯示名稱,因此兩個來源不同、卻剛好 sanitize 成同一字串的檔案,永遠不會被併成一筆。開機時的 backfill 會替 ledger 出現之前的檔案補齊歷史,但只補到既有證據(declared/swept 紀錄、`task_changes.jsonl`)所能到達的範圍;放不進去的一律留 `unknown`,不猜方向。
+
+有兩個介面會讀這份 ledger:
+
+- **任務詳情 → 產物分頁**:列出每個與該任務綁定的檔案,含來源、輪次,以及(對有歸檔副本的 `uploaded`/`declared`/`swept` 列)一個下載連結。agent 寫過但從未歸檔的檔案,會顯示它被寫入的路徑,而不是一個失效的下載連結。
+- **Files 頁**:一欄來源加上任務篩選器,「找上週的交付物」變成一次篩選,不必再滾頁面找。
+
+**已知限制**:goal-loop 的 dispatch 路徑,目前還不會替它產出的檔案歸檔一份可下載的副本;這些列可能會以 `produced` 的樣子出現,背後卻沒有附件。補上這個缺口已排進未來的 wave。
+
 ## 限制
 
 | 項目 | 限制 |

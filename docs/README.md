@@ -61,7 +61,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/48-goal-intent-router.md](features/48-goal-intent-router.md) | Goal intent router — chat channels notice task delegation and offer to create a goal; never auto-created |
 | [features/49-code-security-audit.md](features/49-code-security-audit.md) | Code security audit — `duduclaw secaudit`: static scanners + AI deep audit + adversarial review + sandboxed PoC |
 | [features/50-duduclaw-os-appliance.md](features/50-duduclaw-os-appliance.md) | DuDuClaw OS appliance — bootable image, LAN dashboard onboarding, device page, sysd privilege separation, webhook relay |
-| [features/51-os-keyboard-shortcuts.md](features/51-os-keyboard-shortcuts.md) | DuDuClaw OS keyboard shortcuts — global compositor bindings, shell UI, first-run setup, lock screen (zh-TW) |
+| [features/51-os-keyboard-shortcuts.md](features/51-os-keyboard-shortcuts.md) | DuDuClaw OS keyboard shortcuts — global compositor bindings, shell UI, first-run setup, lock screen |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 

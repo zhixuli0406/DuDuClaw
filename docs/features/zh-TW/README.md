@@ -1,6 +1,6 @@
 # DuDuClaw 特色功能介紹
 
-> DuDuClaw v1.61.0 | 最後更新：2026-08-16
+> DuDuClaw v1.62.0 | 最後更新：2026-09-04
 
 本目錄收錄 DuDuClaw 各項特色功能的詳細介紹。每篇文章以設計理念、系統行為與運作流程為主軸：面向想深入了解「系統如何運作」的開發者，無需閱讀原始碼。
 
@@ -57,6 +57,10 @@
 | 45 | [本地模型市集](45-local-model-marketplace.md) | 依用途選擇、硬體適配綠黃紅燈、一鍵安裝與 MoE 雙軌 |
 | 46 | [信念迴圈](46-belief-loop.md) | 對外部世界的結構化預測，與實際對比計分 |
 | 47 | [信箱](47-agent-mail.md) | 每個 AI 員工獨立的郵件收件夾，待寄件夾中的回覆需人工確認才送出 |
+| 48 | [目標意圖路由器](48-goal-intent-router.md) | 聊天通道察覺交辦意圖後提議建立目標，絕不自動建立 |
+| 49 | [程式碼安全稽核](49-code-security-audit.md) | `duduclaw secaudit`：靜態掃描器＋AI 深度稽核＋對抗式覆核＋沙盒 PoC |
+| 50 | [DuDuClaw OS 值班機](50-duduclaw-os-appliance.md) | 可開機的值班機映像：區網儀表板引導、裝置頁、sysd 權限分離、webhook relay |
+| 51 | [DuDuClaw OS 快捷鍵總表](51-os-keyboard-shortcuts.md) | DuDuClaw OS 全部快捷鍵：compositor 全域綁定、殼 UI、首次設定、鎖定畫面 |
 
 ---
 
