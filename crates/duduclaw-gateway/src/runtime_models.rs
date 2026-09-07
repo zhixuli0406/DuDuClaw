@@ -105,61 +105,35 @@ fn m(id: &str, label: &str, provider: &str) -> RuntimeModel {
 
 /// Claude static fallback — the three ids the old hard-coded list carried.
 /// Deliberately conservative; only used when every live source fails.
+///
+/// WP-B: this and every other provider's fallback list now come from
+/// [`duduclaw_core::runtime_catalog`]'s `fallback_models`, so the ids a
+/// runtime advertises live next to the flags that drive it. Kept as a named
+/// function because `discover_claude` has its own (API-first) discovery path
+/// and several tests reference it by name.
 pub fn claude_fallback() -> Vec<RuntimeModel> {
-    vec![
-        m("claude-opus-4-6", "Claude Opus 4.6", "claude"),
-        m("claude-sonnet-4-6", "Claude Sonnet 4.6", "claude"),
-        m("claude-haiku-4-5", "Claude Haiku 4.5", "claude"),
-    ]
+    fallback_for("claude")
 }
 
-/// Codex has NO model-listing command (openai/codex#8871 closed "not planned"),
-/// so this fallback IS the codex list in practice. Ids per the official model
-/// docs (developers.openai.com/codex/models, checked 2026-07-11).
-fn codex_fallback() -> Vec<RuntimeModel> {
-    vec![
-        m("gpt-5.6-sol", "GPT-5.6 Sol", "codex"),
-        m("gpt-5.6-terra", "GPT-5.6 Terra", "codex"),
-        m("gpt-5.6-luna", "GPT-5.6 Luna", "codex"),
-        m("gpt-5.5", "GPT-5.5", "codex"),
-        m("gpt-5.4", "GPT-5.4", "codex"),
-        m("gpt-5.4-mini", "GPT-5.4 mini", "codex"),
-        m("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", "codex"),
-    ]
+/// Static `(id, label)` list for a runtime, tagged with the provider label the
+/// UI groups under.
+///
+/// `provider_label` differs from the catalog id for exactly one entry: `agy`
+/// runs Gemini models and has always been grouped under "gemini" in the UI, so
+/// the label is passed separately rather than assumed equal to the id.
+fn fallback_labelled(id: &str, provider_label: &str) -> Vec<RuntimeModel> {
+    duduclaw_core::runtime_catalog::spec_for(id)
+        .map(|spec| {
+            spec.fallback_models
+                .iter()
+                .map(|(mid, label)| m(mid, label, provider_label))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// Gemini CLI only lists models via the interactive `/model` dialog — no
-/// non-interactive listing exists — so this fallback IS the gemini list in
-/// practice. Ids per the official `-m/--model` docs
-/// (google-gemini/gemini-cli docs/cli/model.md, checked 2026-07-11).
-fn gemini_fallback() -> Vec<RuntimeModel> {
-    vec![
-        m("gemini-3-pro-preview", "Gemini 3 Pro", "gemini"),
-        m("gemini-3-flash-preview", "Gemini 3 Flash", "gemini"),
-        m("gemini-2.5-pro", "Gemini 2.5 Pro", "gemini"),
-        m("gemini-2.5-flash", "Gemini 2.5 Flash", "gemini"),
-    ]
-}
-
-/// agy fallback — only used if the `agy models` probe fails. NOTE: agy's
-/// `--model` takes the *display name* verbatim (official codelab:
-/// `agy --model "Gemini 3.5 Flash (Low)"`), so ids here are display names.
-fn agy_fallback() -> Vec<RuntimeModel> {
-    vec![
-        m("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)", "gemini"),
-        m("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)", "gemini"),
-    ]
-}
-
-/// Grok (xAI "Grok Build") fallback — used when the live probe fails or the CLI
-/// has no non-interactive listing. R4 / UNVERIFIED (2026-07-12): the coding agent
-/// drives `grok-build-0.1`; `grok-4` is listed as a likely general model. Confirm
-/// ids against the real CLI when available.
-fn grok_fallback() -> Vec<RuntimeModel> {
-    vec![
-        m("grok-build-0.1", "Grok Build 0.1", "grok"),
-        m("grok-4", "Grok 4", "grok"),
-    ]
+fn fallback_for(id: &str) -> Vec<RuntimeModel> {
+    fallback_labelled(id, id)
 }
 
 fn now_rfc3339() -> String {
@@ -173,45 +147,42 @@ fn now_rfc3339() -> String {
 pub async fn discover_all(home_dir: &Path) -> RuntimeModelsCache {
     let mut providers = BTreeMap::new();
 
+    // Claude keeps its own path: it is the only provider with a live models
+    // API (`api.anthropic.com/v1/models`), so discovery is API-first with a
+    // `--help` / PTY-menu ladder behind it.
     providers.insert("claude".to_string(), discover_claude(home_dir).await);
 
+    // WP-B: every other installed runtime is probed through one catalog loop
+    // instead of a hand-written `if let Some(bin) = which_<cli>()` block per
+    // vendor — the shape that made a new runtime's models invisible until
+    // someone remembered to edit this function too.
+    //
     // NOTE: `home_dir` here is the DuDuClaw home (~/.duduclaw), NOT the user
-    // home — `which_*_in_home(home_dir)` alone would probe
-    // `~/.duduclaw/.local/bin/<cli>` and never find anything. PATH/real-HOME
-    // resolution (`which_*()`) comes first, mirroring the claude fix.
-    if let Some(bin) =
-        duduclaw_core::which_codex().or_else(|| duduclaw_core::which_codex_in_home(home_dir))
-    {
+    // home — a HOME-rooted probe against it alone would look in
+    // `~/.duduclaw/.local/bin/<cli>` and never find anything.
+    // `detect_runtime` does PATH/real-HOME first, then this dir.
+    for spec in duduclaw_core::runtime_catalog::cli_specs() {
+        if spec.id == "claude" {
+            continue;
+        }
+        let Some(bin) = duduclaw_core::detect_runtime(spec.id, home_dir) else {
+            continue;
+        };
+        if spec.id == "antigravity" {
+            // `agy` runs Gemini models — group it under the "gemini" provider
+            // label (matching the UI) but keep a distinct cache key. It also
+            // has its own parser: `agy models` prints display names ("Gemini
+            // 3.5 Flash (Low)") and `--model` accepts exactly those strings, so
+            // lines pass verbatim.
+            providers.insert("agy".to_string(), discover_agy(&bin).await);
+            continue;
+        }
+        // Everything else: best-effort `--help`-gated `models` probe, falling
+        // back to the catalog's static list (marked `Fallback` in the cache, so
+        // the UI can say the list is stale rather than pretending it is live).
         providers.insert(
-            "codex".to_string(),
-            discover_generic("codex", &bin, codex_fallback()).await,
-        );
-    }
-    if let Some(bin) =
-        duduclaw_core::which_gemini().or_else(|| duduclaw_core::which_gemini_in_home(home_dir))
-    {
-        providers.insert(
-            "gemini".to_string(),
-            discover_generic("gemini", &bin, gemini_fallback()).await,
-        );
-    }
-    if let Some(bin) =
-        duduclaw_core::which_agy().or_else(|| duduclaw_core::which_agy_in_home(home_dir))
-    {
-        // `agy` runs Gemini models — group it under the "gemini" provider label
-        // (matching the old UI) but keep a distinct cache key. agy has its own
-        // parser: `agy models` prints display names ("Gemini 3.5 Flash (Low)")
-        // and `--model` accepts exactly those strings, so lines pass verbatim.
-        providers.insert("agy".to_string(), discover_agy(&bin).await);
-    }
-    // R4: Grok CLI (official `grok`, fallback third-party `grok-cli`). No verified
-    // non-interactive listing, so `discover_generic` falls back to the static list.
-    if let Some(bin) =
-        duduclaw_core::which_grok().or_else(|| duduclaw_core::which_grok_in_home(home_dir))
-    {
-        providers.insert(
-            "grok".to_string(),
-            discover_generic("grok", &bin, grok_fallback()).await,
+            spec.id.to_string(),
+            discover_generic(spec.id, &bin, fallback_for(spec.id)).await,
         );
     }
 
@@ -364,7 +335,11 @@ async fn discover_agy(bin: &str) -> ProviderModels {
             return ProviderModels { models, source: DiscoverySource::CliProbe, fetched_at };
         }
     }
-    ProviderModels { models: agy_fallback(), source: DiscoverySource::Fallback, fetched_at }
+    ProviderModels {
+        models: fallback_labelled("antigravity", "gemini"),
+        source: DiscoverySource::Fallback,
+        fetched_at,
+    }
 }
 
 // ── Probes ───────────────────────────────────────────────────────────────

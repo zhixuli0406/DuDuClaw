@@ -61,6 +61,121 @@ pub enum AccountClaimState {
 /// three different ways — the operator's retry action is identical either
 /// way (click "建立帳號" again).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeClaimFailureKind {
+    /// Nothing typed.
+    Empty,
+    /// Too short to be any provider's key — caught before any round trip.
+    LooksWrong,
+    /// The gateway refused the call or could not be reached.
+    Unreachable,
+}
+
+/// Lifecycle of the `RuntimeAuth` step's "儲存金鑰" click — same shape as
+/// `AccountClaimState` below (the render fn reads it to label the button
+/// and show the one status line; the click handler guards on `InFlight`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeClaimState {
+    #[default]
+    Idle,
+    InFlight,
+    /// `accounts.add` accepted the key. Stored, not yet proven: the first
+    /// real dispatch is what validates it against the provider.
+    Saved,
+    Failed(RuntimeClaimFailureKind),
+}
+
+/// Why a CLI login on the `RuntimeAuth` step did not end in an authorized
+/// provider — WP-C (2026-09-05). Four kinds because the operator's next
+/// action genuinely differs: install/no-such-login is a dead end on this
+/// machine, a transport failure is worth retrying, a refusal means wrong
+/// credentials, and an abandoned session means "you closed the browser".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeLoginFailureKind {
+    /// The gateway refused to start: the CLI is not installed on this
+    /// machine, or that runtime has no interactive login at all.
+    Unavailable,
+    /// Could not reach the local service, or the session never settled
+    /// inside its budget.
+    Unreachable,
+    /// The CLI itself reported an authentication failure.
+    Refused,
+    /// The CLI exited without succeeding — cancelled, or abandoned in the
+    /// browser.
+    Abandoned,
+}
+
+/// The `RuntimeAuth` step's 「登入帳號」 flow — WP-C (2026-09-05).
+///
+/// One state for the WHOLE step, not one per row: a PTY login owns a real
+/// process on the appliance, and letting an operator start ten at once would
+/// be a way to wedge the machine, not a feature. Whichever provider is
+/// mid-flow is named inside the variant, so the row that started it is the
+/// only one that renders the panel.
+///
+/// `&'static str` for the provider because it always comes from
+/// `oobe::runtime_providers::PROVIDERS` — a row that does not exist cannot
+/// be put into this state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RuntimeLoginState {
+    #[default]
+    Idle,
+    /// The §1-1 risk disclosure is on screen and the operator has not (or
+    /// has, once `acknowledged`) taken it on. NOTHING is sent to the gateway
+    /// in this state — see `RuntimeLoginState::start_enabled`.
+    Disclosure { provider: &'static str, acknowledged: bool },
+    /// `auth.cli_login.start` is in flight.
+    Starting { provider: &'static str },
+    /// The gateway spawned the CLI. `session_id` is `None` for the instant
+    /// between "we sent start" and "the response came back" — the cancel
+    /// button has nothing to cancel until it fills in.
+    Running { provider: &'static str, session_id: Option<String>, url: Option<String>, code: Option<String> },
+    Succeeded { provider: &'static str },
+    Failed { provider: &'static str, kind: RuntimeLoginFailureKind },
+}
+
+impl RuntimeLoginState {
+    /// Which provider's row owns the panel right now, if any.
+    pub fn provider(&self) -> Option<&'static str> {
+        match self {
+            RuntimeLoginState::Idle => None,
+            RuntimeLoginState::Disclosure { provider, .. }
+            | RuntimeLoginState::Starting { provider }
+            | RuntimeLoginState::Running { provider, .. }
+            | RuntimeLoginState::Succeeded { provider }
+            | RuntimeLoginState::Failed { provider, .. } => Some(*provider),
+        }
+    }
+
+    /// The gate the TODO's decision 1B asks for: a subscription login may
+    /// only START once the operator has ticked 「我了解風險，由我自行承擔」.
+    /// Pure, and the whole reason this is a method rather than an inline
+    /// check inside a click handler — see `disclosure_gates_the_login_start`
+    /// in this file's own tests.
+    ///
+    /// Every state other than an ACKNOWLEDGED disclosure is `false`,
+    /// including the in-flight ones: a second click while a session is
+    /// already running must not spawn a second PTY.
+    pub fn start_enabled(&self) -> bool {
+        matches!(self, RuntimeLoginState::Disclosure { acknowledged: true, .. })
+    }
+
+    /// The live session id, for the cancel button and for tearing a session
+    /// down when the operator leaves the step.
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            RuntimeLoginState::Running { session_id, .. } => session_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Is a login occupying the machine right now? Used to keep a second
+    /// row's 「登入帳號」 from starting one on top of it.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, RuntimeLoginState::Starting { .. } | RuntimeLoginState::Running { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountClaimFailureKind {
     /// The gateway rejected the password as too short, OR the client-side
     /// pre-check (`steps::account`, mirroring the gateway's own `< 8 chars`
@@ -109,6 +224,16 @@ pub struct OobeUiState {
     /// idempotent-FROM-THE-CLIENT'S-VIEW: a retry after a real success just
     /// reports `AlreadyClaimed`, never a silent double-charge of anything).
     pub account_claim: AccountClaimState,
+    /// See `RuntimeClaimState`.
+    pub runtime_claim: RuntimeClaimState,
+    /// WP-C (2026-09-05): which provider row has its masked API-key field
+    /// expanded, if any. At most one at a time — the step owns exactly ONE
+    /// `OobeTextField` entity (`RuntimeAuthFields`, created at window-open),
+    /// so two rows cannot both host it, and expanding a second row collapses
+    /// the first. `None` = every row collapsed.
+    pub runtime_key_provider: Option<&'static str>,
+    /// WP-C: the 「登入帳號」 flow — see `RuntimeLoginState`.
+    pub runtime_login: RuntimeLoginState,
     /// `Network` step's scan progress — see `NetScanState`'s own doc
     /// comment.
     pub net_scan: NetScanState,
@@ -141,6 +266,10 @@ pub struct OobeUiState {
     /// being unplugged between renders must be re-observed on the next
     /// scan, never remembered from an earlier point in this process's life.
     pub net_status: Option<network::NetworkStatus>,
+    /// The gateway said first-run setup already completed on this machine
+    /// (`NetError::FirstRunCompleted`) — OOBE is being re-run. Counts as
+    /// online in `wired_online()` so the Network step is passable.
+    pub net_first_run_done: bool,
     /// D4a-7 (2026-08-31, QEMU wired-only OOBE deadlock): set when the
     /// operator clicks Continue on the `Network` step while `OobeFlow::
     /// can_advance_with_wired` is still false — see `render.rs`'s
@@ -165,6 +294,93 @@ impl OobeUiState {
 
     pub fn set_account_validation_error(&mut self, on: bool) {
         self.account_validation_error = on;
+    }
+
+    pub fn set_runtime_claim(&mut self, state: RuntimeClaimState) {
+        self.runtime_claim = state;
+    }
+
+    // ── WP-C (2026-09-05): the provider list's two actions ──────────────
+
+    /// Expands `provider`'s API-key field, or collapses it if it was already
+    /// the expanded one. Always resets `runtime_claim` back to `Idle`: a
+    /// "金鑰已儲存"/"這不像 API 金鑰" line left over from ANOTHER provider's
+    /// attempt would read as this row's own status.
+    pub fn toggle_runtime_key_field(&mut self, provider: &'static str) {
+        self.runtime_key_provider = if self.runtime_key_provider == Some(provider) { None } else { Some(provider) };
+        self.runtime_claim = RuntimeClaimState::Idle;
+    }
+
+    pub fn close_runtime_key_field(&mut self) {
+        self.runtime_key_provider = None;
+        self.runtime_claim = RuntimeClaimState::Idle;
+    }
+
+    /// Opens the §1-1 risk disclosure for `provider`, un-acknowledged. Also
+    /// collapses any expanded key field — the two panels are alternatives,
+    /// and showing both at once would make the card taller than the step.
+    pub fn open_runtime_login_disclosure(&mut self, provider: &'static str) {
+        self.runtime_key_provider = None;
+        self.runtime_claim = RuntimeClaimState::Idle;
+        self.runtime_login = RuntimeLoginState::Disclosure { provider, acknowledged: false };
+    }
+
+    /// The 「我了解風險，由我自行承擔」 checkbox. A no-op in every other
+    /// state, so a stray click cannot acknowledge a disclosure that is not
+    /// on screen.
+    pub fn toggle_runtime_login_acknowledged(&mut self) {
+        if let RuntimeLoginState::Disclosure { provider, acknowledged } = self.runtime_login {
+            self.runtime_login = RuntimeLoginState::Disclosure { provider, acknowledged: !acknowledged };
+        }
+    }
+
+    /// Moves an ACKNOWLEDGED disclosure into the in-flight state. Refuses
+    /// (returns `None`, changing nothing) from any other state — this is the
+    /// single gate the click handler consults, so the "no login before the
+    /// operator takes the risk" rule cannot be bypassed by a second call
+    /// site forgetting to check.
+    pub fn start_runtime_login(&mut self) -> Option<&'static str> {
+        if !self.runtime_login.start_enabled() {
+            return None;
+        }
+        let provider = self.runtime_login.provider()?;
+        self.runtime_login = RuntimeLoginState::Starting { provider };
+        Some(provider)
+    }
+
+    /// The gateway accepted the start and named a session.
+    pub fn set_runtime_login_session(&mut self, session_id: String) {
+        if let Some(provider) = self.runtime_login.provider() {
+            if self.runtime_login.is_busy() {
+                self.runtime_login = RuntimeLoginState::Running { provider, session_id: Some(session_id), url: None, code: None };
+            }
+        }
+    }
+
+    /// A parsed URL / device code from the CLI's transcript.
+    pub fn set_runtime_login_prompt(&mut self, url: Option<String>, code: Option<String>) {
+        if let RuntimeLoginState::Running { url: slot_url, code: slot_code, .. } = &mut self.runtime_login {
+            *slot_url = url;
+            *slot_code = code;
+        }
+    }
+
+    pub fn set_runtime_login_succeeded(&mut self) {
+        if let Some(provider) = self.runtime_login.provider() {
+            self.runtime_login = RuntimeLoginState::Succeeded { provider };
+        }
+    }
+
+    pub fn set_runtime_login_failed(&mut self, kind: RuntimeLoginFailureKind) {
+        if let Some(provider) = self.runtime_login.provider() {
+            self.runtime_login = RuntimeLoginState::Failed { provider, kind };
+        }
+    }
+
+    /// Dismisses the login panel entirely. The caller is responsible for
+    /// having cancelled any live session FIRST — this only forgets it.
+    pub fn close_runtime_login(&mut self) {
+        self.runtime_login = RuntimeLoginState::Idle;
     }
 
     pub fn set_account_claim_in_flight(&mut self) {
@@ -268,7 +484,7 @@ impl OobeUiState {
     /// not a user selection, and must not survive a restart with the cable
     /// unplugged.
     pub fn wired_online(&self) -> bool {
-        self.net_status.as_ref().is_some_and(|s| s.internet.counts_as_connected() && s.has_ip)
+        self.net_first_run_done || self.net_status.as_ref().is_some_and(|s| s.internet.counts_as_connected() && s.has_ip)
     }
 
     /// D4a-7 (2026-08-31): the ONE mutator for `net_continue_blocked` — see
@@ -385,6 +601,177 @@ mod tests {
         ui.set_account_validation_error(true);
         assert_eq!(ui.account_claim, AccountClaimState::Failed(AccountClaimFailureKind::PasswordTooShort));
         assert!(ui.account_validation_error);
+    }
+
+    // ── WP-C (2026-09-05): provider key field + login disclosure gate ────
+
+    #[test]
+    fn the_key_field_starts_collapsed_and_toggles_per_provider() {
+        let mut ui = OobeUiState::default();
+        assert_eq!(ui.runtime_key_provider, None);
+
+        ui.toggle_runtime_key_field("anthropic");
+        assert_eq!(ui.runtime_key_provider, Some("anthropic"));
+
+        // A second row takes the one shared field away from the first —
+        // there is only one `OobeTextField` entity on this step.
+        ui.toggle_runtime_key_field("openai");
+        assert_eq!(ui.runtime_key_provider, Some("openai"));
+
+        // Clicking the SAME row again collapses it.
+        ui.toggle_runtime_key_field("openai");
+        assert_eq!(ui.runtime_key_provider, None);
+    }
+
+    #[test]
+    fn moving_the_key_field_clears_a_stale_status_line() {
+        // A "這不像 API 金鑰" left over from one provider's attempt must not
+        // read as the next provider's own status.
+        let mut ui = OobeUiState::default();
+        ui.toggle_runtime_key_field("anthropic");
+        ui.set_runtime_claim(RuntimeClaimState::Failed(RuntimeClaimFailureKind::LooksWrong));
+        ui.toggle_runtime_key_field("groq");
+        assert_eq!(ui.runtime_claim, RuntimeClaimState::Idle);
+
+        ui.set_runtime_claim(RuntimeClaimState::Saved);
+        ui.close_runtime_key_field();
+        assert_eq!(ui.runtime_claim, RuntimeClaimState::Idle);
+        assert_eq!(ui.runtime_key_provider, None);
+    }
+
+    /// The load-bearing one for TODO decision 1B: no acknowledgement, no
+    /// login. `start_runtime_login` is the single gate both the button's
+    /// disabled state and the click handler consult.
+    #[test]
+    fn disclosure_gates_the_login_start() {
+        let mut ui = OobeUiState::default();
+        // Nothing on screen: there is nothing to start.
+        assert!(!ui.runtime_login.start_enabled());
+        assert_eq!(ui.start_runtime_login(), None);
+
+        ui.open_runtime_login_disclosure("anthropic");
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Disclosure { provider: "anthropic", acknowledged: false });
+        assert!(!ui.runtime_login.start_enabled(), "an unacknowledged disclosure must not be startable");
+        assert_eq!(ui.start_runtime_login(), None, "a click while unacknowledged must change nothing at all");
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Disclosure { provider: "anthropic", acknowledged: false });
+
+        ui.toggle_runtime_login_acknowledged();
+        assert!(ui.runtime_login.start_enabled());
+        assert_eq!(ui.start_runtime_login(), Some("anthropic"));
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Starting { provider: "anthropic" });
+    }
+
+    #[test]
+    fn un_ticking_the_acknowledgement_closes_the_gate_again() {
+        let mut ui = OobeUiState::default();
+        ui.open_runtime_login_disclosure("xai");
+        ui.toggle_runtime_login_acknowledged();
+        assert!(ui.runtime_login.start_enabled());
+        ui.toggle_runtime_login_acknowledged();
+        assert!(!ui.runtime_login.start_enabled(), "the gate is re-derived every time, never a one-way latch");
+        assert_eq!(ui.start_runtime_login(), None);
+    }
+
+    #[test]
+    fn a_second_start_while_one_is_already_running_is_refused() {
+        // One PTY login owns the machine at a time — a double click, or a
+        // second row's button, must not spawn another.
+        let mut ui = OobeUiState::default();
+        ui.open_runtime_login_disclosure("gemini");
+        ui.toggle_runtime_login_acknowledged();
+        assert_eq!(ui.start_runtime_login(), Some("gemini"));
+        assert_eq!(ui.start_runtime_login(), None);
+        ui.set_runtime_login_session("sess-1".to_string());
+        assert_eq!(ui.start_runtime_login(), None);
+        assert!(ui.runtime_login.is_busy());
+    }
+
+    #[test]
+    fn the_acknowledgement_toggle_is_inert_outside_a_disclosure() {
+        let mut ui = OobeUiState::default();
+        ui.toggle_runtime_login_acknowledged();
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Idle);
+
+        ui.open_runtime_login_disclosure("openai");
+        ui.toggle_runtime_login_acknowledged();
+        ui.start_runtime_login();
+        ui.toggle_runtime_login_acknowledged();
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Starting { provider: "openai" }, "ticking the box mid-flight must not rewind the flow");
+    }
+
+    #[test]
+    fn opening_a_disclosure_collapses_an_expanded_key_field() {
+        // The two panels are alternatives; showing both would make the card
+        // taller than the step.
+        let mut ui = OobeUiState::default();
+        ui.toggle_runtime_key_field("anthropic");
+        ui.open_runtime_login_disclosure("anthropic");
+        assert_eq!(ui.runtime_key_provider, None);
+    }
+
+    #[test]
+    fn the_session_id_and_prompt_only_land_on_a_live_login() {
+        let mut ui = OobeUiState::default();
+        // No login in flight — a late update from an abandoned worker must
+        // not resurrect a panel the operator has closed.
+        ui.set_runtime_login_session("sess-late".to_string());
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Idle);
+        ui.set_runtime_login_prompt(Some("https://example.com/auth".to_string()), None);
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Idle);
+        ui.set_runtime_login_succeeded();
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Idle);
+        ui.set_runtime_login_failed(RuntimeLoginFailureKind::Unreachable);
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Idle);
+
+        ui.open_runtime_login_disclosure("kimi");
+        ui.toggle_runtime_login_acknowledged();
+        ui.start_runtime_login();
+        ui.set_runtime_login_session("sess-1".to_string());
+        assert_eq!(ui.runtime_login.session_id(), Some("sess-1"));
+        ui.set_runtime_login_prompt(Some("https://x.ai/device?user_code=ABCD-1234".to_string()), Some("ABCD-1234".to_string()));
+        assert_eq!(
+            ui.runtime_login,
+            RuntimeLoginState::Running {
+                provider: "kimi",
+                session_id: Some("sess-1".to_string()),
+                url: Some("https://x.ai/device?user_code=ABCD-1234".to_string()),
+                code: Some("ABCD-1234".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_settled_login_stops_being_busy_and_keeps_naming_its_provider() {
+        let mut ui = OobeUiState::default();
+        ui.open_runtime_login_disclosure("gemini");
+        ui.toggle_runtime_login_acknowledged();
+        ui.start_runtime_login();
+        ui.set_runtime_login_session("s".to_string());
+        ui.set_runtime_login_succeeded();
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Succeeded { provider: "gemini" });
+        assert!(!ui.runtime_login.is_busy());
+        assert_eq!(ui.runtime_login.session_id(), None, "a settled login has no session left to cancel");
+        assert_eq!(ui.runtime_login.provider(), Some("gemini"));
+
+        ui.close_runtime_login();
+        assert_eq!(ui.runtime_login, RuntimeLoginState::Idle);
+        assert_eq!(ui.runtime_login.provider(), None);
+    }
+
+    #[test]
+    fn every_failure_kind_is_reachable_and_names_its_provider() {
+        for kind in [
+            RuntimeLoginFailureKind::Unavailable,
+            RuntimeLoginFailureKind::Unreachable,
+            RuntimeLoginFailureKind::Refused,
+            RuntimeLoginFailureKind::Abandoned,
+        ] {
+            let mut ui = OobeUiState::default();
+            ui.open_runtime_login_disclosure("cursor");
+            ui.set_runtime_login_failed(kind);
+            assert_eq!(ui.runtime_login, RuntimeLoginState::Failed { provider: "cursor", kind });
+            assert!(!ui.runtime_login.is_busy());
+        }
     }
 
     // ── Shell-S3: NetScanState / NetConnectState / OobeUiState transitions ──

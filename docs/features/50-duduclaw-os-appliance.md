@@ -21,14 +21,14 @@ account credentials.
 ## From Power-On to Ready
 
 1. **Install.** Each release ships two forms per machine. The live
-   installer ISO is the usual route: flash it to a USB stick (or burn it to
-   a disc), boot the target machine from it in UEFI mode with Secure Boot
-   in setup mode or temporarily off, pick the internal SSD in the graphical
-   installer, and reboot into the installed system — the first boot enrolls
-   the DuDuClaw Secure Boot keys. The whole-disk image (`.wic.zst`) skips
-   the installer: decompress it and write it straight to the target disk.
-   A channel-installed unit can skip this step entirely if its drive was
-   pre-flashed before it shipped.
+   installer ISO: flash it to a USB stick (or burn it to a disc), boot the
+   target machine from it in UEFI mode with Secure Boot **off** (the
+   published images are not Secure-Boot signed — see Editions and Trust
+   Chain below), pick the internal SSD in the graphical installer, and
+   reboot into the installed system. The whole-disk image (`.wic.zst`)
+   skips the installer: decompress it and write it straight to the target
+   disk. A channel-installed unit can skip this step entirely if its drive
+   was pre-flashed before it shipped.
 2. **First boot.** The box syncs its clock over NTP and sets its default
    timezone before touching the network (a clock that's wrong breaks OAuth
    and TLS silently, so this happens first), picks up an address over wired
@@ -91,15 +91,29 @@ something misleading.
   confirm, not just clicking a button), restart, and shutdown, each behind
   its own confirmation.
 
-## Optional Kiosk Display
+## Editions and the Desktop
 
-A headless box with nothing plugged into its video output behaves exactly
-as described above — that's the default and the common case. If a monitor
-*is* connected at boot, the box notices and shows the dashboard full-screen
-automatically instead of sitting idle behind a blank screen. This is purely
-additive: it costs nothing on a box no one ever plugs a monitor into, and
-it's meant for situations like an equipment rack or a shop counter where a
-screen happens to be sitting there anyway.
+Every DuDuClaw OS image boots into DuDuClaw's own desktop — a compositor and
+shell of its own, with a lock screen, a first-run wizard, and a Cmd+K bar
+that hands work to an AI employee from any app. A person and the AI share
+the machine, and the compositor guarantees the person always wins the
+input: touch the keyboard or mouse and whatever the AI was driving on your
+screen freezes. How that works, and what the AI is and is not allowed to do
+on your desktop, is its own article: [52-desktop-edition.md](52-desktop-edition.md).
+
+Two images ship per release, and they differ in what sits on top of that
+desktop:
+
+| Image | What it is | Ships as |
+|---|---|---|
+| **Desktop edition** (`duduclaw-image-appliance`) | The full machine: the desktop plus Chromium / LibreOffice / Steam preloaded offline, the app compatibility layer (Bottles, Windows VM, Waydroid), read-only root, the firewall, first-boot provisioning, and login hardening. | The whole-disk `.wic.zst`, and its own live installer ISO (`installer-desktop`, added to v0.1.0 on 2026-09-04). |
+| **Base image** (`duduclaw-image-ab`) | The same A/B layout, desktop shell and gateway, without the app layer, read-only root or firewall. A bring-up artifact rather than a product. | The payload of the v0.1.0 live installer ISO. |
+
+What the desktop does when no monitor is attached — whether it falls back
+to a headless dashboard-only box — has not been defined on real hardware
+yet; it is an open bring-up item. The dashboard-on-the-LAN flow described
+above works the same with or without a screen because it is served by the
+gateway, not by the desktop.
 
 ## Security Design
 
@@ -150,10 +164,14 @@ where it stands rather than rounding up. As of DuDuClaw OS v0.1.0
   through setup, exchange a message on a chat channel, apply an OS update,
   force a rollback, and run a factory reset, all on the actual certified
   hardware — hasn't happened yet. It is the most important open item.
-- The trust chain is largely in place (self-signed Secure Boot with a
-  dual-signed UKI per slot, read-only root with dm-verity); TPM2 + LUKS
-  key sealing is wired, but its automatic enrollment is still an open
-  defect that needs a real-hardware TPM to close.
+- The trust chain is wired in the build layer but only partly switched on
+  in the published images. Shipped in v0.1.0: A/B atomic update with
+  rollback, and a read-only root in the desktop edition. Build-time options
+  **not** enabled for the v0.1.0 artifacts: Secure Boot signing of the UKIs
+  and dm-verity root verification (both come from the `sb-signing` build
+  overlay — the published images boot with Secure Boot off), and TPM2 + LUKS
+  key sealing (the `tpm-luks` overlay; its automatic enrollment is still an
+  open defect that needs a real-hardware TPM to close).
 - The OS is versioned independently of the platform (`0.x` = bring-up;
   `1.0.0` will mark the first GA). Release-by-release status lives in the
   DuDuClaw-OS repo's `CHANGELOG.md`.

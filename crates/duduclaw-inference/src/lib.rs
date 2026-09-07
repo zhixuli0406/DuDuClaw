@@ -17,6 +17,7 @@
 //!   Meta-Token (lossless) / LLMLingua-2 (lossy) / StreamingLLM (KV-cache)
 
 pub mod adapter;
+pub mod appliance;
 pub mod backend;
 pub mod config;
 pub mod engine;

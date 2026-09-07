@@ -37,10 +37,16 @@ Two routes:
 ## 2. What you are building
 
 The shipping image is `duduclaw-image-appliance` from the `meta-duduclaw/`
-Yocto layer (Yocto 6.0 "wrynose", kernel 6.18): an A/B dual-slot layout with
-atomic update and rollback, a read-only root verified by dm-verity,
-self-signed Secure Boot with a dual-signed UKI per slot, and the DuDuClaw
-gateway + dashboard payload. Two machines are defined:
+Yocto layer (Yocto 6.0 "wrynose", kernel 6.18) — the desktop edition: an A/B
+dual-slot layout with atomic update and rollback, a read-only root, DuDuClaw's
+own desktop (compositor + shell) with the gateway + dashboard, preloaded
+apps, and the app compatibility layer. Secure Boot signing, dm-verity root
+verification and TPM2 key sealing exist in the layer as build-time overlays
+(`kas/sb-signing.yml`, `kas/tpm-luks.yml`) but are **not** enabled in the
+v0.1.0 artifacts, which boot with Secure Boot off. The v0.1.0 installer ISO
+writes the base image `duduclaw-image-ab` (same layout and desktop shell,
+without the app layer); a desktop-edition installer ISO (`duduclaw-os-installer-desktop-…`) was
+added to v0.1.0 on 2026-09-04. Two machines are defined:
 `duduclaw-qemux86-64` (QEMU bring-up target, boot-verified) and
 `duduclaw-genericx86-64` (real x86-64 hardware, config-audited; a real
 hardware boot is still the open validation item). The per-image roles and

@@ -113,6 +113,11 @@ pub struct OpenAiCompatProvider {
 }
 
 impl OpenAiCompatProvider {
+    /// The base URL requests go to (e.g. `http://127.0.0.1:8080/v1`).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Construct against an explicit base URL (local servers, proxies).
     /// `auth.base_url` (if set) takes precedence over `default_base_url`.
     pub fn new(id: impl Into<String>, auth: ApiAuth, default_base_url: impl Into<String>) -> Self {

@@ -89,22 +89,61 @@ impl RuntimeSettings {
     }
 }
 
+/// The ONE sanctioned "unknown runtime ⇒ default" call site family: reading a
+/// *stored config field* where refusing would leave the caller with no runtime
+/// at all and brick an otherwise working agent.
+///
+/// It is deliberately loud (`error!`, naming the bad value and the accepted
+/// list) and deliberately NOT available to request-scoped code:
+/// `duduclaw_core::types::RuntimeType::parse` returns `Option` precisely so an
+/// RPC that acts on a caller-supplied runtime name must refuse instead of
+/// silently driving the default one. If you are handling a request, do not
+/// reach for this function.
+fn parse_provider_or_default(agent_dir: &Path, field: &str, value: &str) -> RuntimeType {
+    match RuntimeType::parse(value) {
+        Some(rt) => rt,
+        None => {
+            tracing::error!(
+                agent_dir = %agent_dir.display(),
+                field,
+                value = %value,
+                valid = %RuntimeType::valid_values(),
+                default = %RuntimeType::default().as_str(),
+                "unknown runtime in config — falling back to the default runtime; \
+                 fix the config, this agent is NOT running the backend it names"
+            );
+            RuntimeType::default()
+        }
+    }
+}
+
 /// Load `[runtime] provider` / `[runtime] fallback` / `[model] utility` from the
 /// agent's `agent.toml` in a single read. Missing/malformed file ⇒ defaults
 /// (Claude / no fallback / [`DEFAULT_UTILITY_MODEL`]).
 pub fn load_runtime_settings(agent_dir: &Path) -> RuntimeSettings {
     let s = read_sections(agent_dir);
 
-    // `RuntimeType::parse` (not serde) stays the string→enum step on purpose:
-    // it maps an unrecognised provider to Claude with a warning instead of
-    // erroring, so a typo remains a warning rather than losing the agent.
     let provider = s
         .runtime
         .provider
         .as_deref()
-        .map(RuntimeType::parse)
+        .map(|v| parse_provider_or_default(agent_dir, "[runtime] provider", v))
         .unwrap_or_default();
-    let fallback = s.runtime.fallback.as_deref().map(RuntimeType::parse);
+    // A malformed FALLBACK is dropped, not defaulted: "no fallback" is a valid
+    // state, so there is nothing to lose by refusing it — unlike `provider`,
+    // where refusing would leave the agent with no brain at all.
+    let fallback = s.runtime.fallback.as_deref().and_then(|v| {
+        let parsed = RuntimeType::parse(v);
+        if parsed.is_none() {
+            tracing::error!(
+                agent_dir = %agent_dir.display(),
+                value = %v,
+                valid = %RuntimeType::valid_values(),
+                "[runtime] fallback names an unknown runtime — ignoring it (no fallback)"
+            );
+        }
+        parsed
+    });
     let utility_model = s
         .model
         .utility
@@ -160,25 +199,34 @@ pub fn read_runtime_json(agent_dir: &Path) -> serde_json::Value {
 }
 
 /// Conservative provider↔model compatibility check by model-id naming family.
-/// Only flags *confident* mismatches; unknown families and `openai_compat`
-/// (which proxies arbitrary models) always pass.
+/// Only flags *confident* mismatches; unknown families always pass, and so do
+/// runtimes that declare **no** family of their own (`openai_compat`, and the
+/// multi-vendor shells Copilot / Cursor / OpenCode) because those legitimately
+/// proxy arbitrary models.
+///
+/// WP-B: the families come from
+/// `duduclaw_core::runtime_catalog`'s `model_prefixes` instead of a hand-written
+/// `is_claude` / `is_openai` / `is_gemini` / `is_grok` ladder that had to grow a
+/// term — in two places — for every new backend.
 pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
-    let m = model.trim().to_ascii_lowercase();
-    // Accept the qualified "provider/model" form — take the model part.
-    let m = m.rsplit('/').next().unwrap_or(&m);
-    let is_claude = m.starts_with("claude");
-    let is_openai = m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("codex");
-    let is_gemini = m.starts_with("gemini");
-    let is_grok = m.starts_with("grok");
-    match provider {
-        RuntimeType::Claude => !(is_openai || is_gemini || is_grok),
-        RuntimeType::Codex => !(is_claude || is_gemini || is_grok),
-        RuntimeType::Gemini | RuntimeType::Antigravity => !(is_claude || is_openai || is_grok),
-        // Grok serves `grok-*` (e.g. grok-build-0.1, grok-4.x); reject other
-        // known families, accept grok + unknowns.
-        RuntimeType::Grok => !(is_claude || is_openai || is_gemini),
-        RuntimeType::OpenAiCompat => true,
+    // Which runtime does this model id CONFIDENTLY belong to? `None` ⇒ unknown
+    // family ⇒ never a mismatch.
+    let Some(owner) = duduclaw_core::runtime_catalog::runtime_for_model(model) else {
+        return true;
+    };
+    let spec = provider.spec();
+    // A runtime with no declared family serves anything.
+    if spec.model_prefixes.is_empty() {
+        return true;
     }
+    // Same runtime, obviously fine. Otherwise the two must share a family —
+    // which is how `antigravity` accepts `gemini-*` (both declare the `gemini`
+    // prefix) without needing a special case.
+    spec.id == owner.id
+        || spec
+            .model_prefixes
+            .iter()
+            .any(|p| owner.model_prefixes.contains(p))
 }
 
 /// Best-effort model-family → runtime mapping for the dashboard save-time
@@ -187,26 +235,18 @@ pub fn model_matches_provider(model: &str, provider: RuntimeType) -> bool {
 /// (API mode serves any model) so the aligned config is actually runnable.
 /// Claude always maps to Claude (its API path is the Anthropic-native client,
 /// not chat/completions). Unknown families return `None` — never guess.
+///
+/// WP-B: driven by the catalog's `model_prefixes` + the catalog-driven binary
+/// probe, so a new runtime's models auto-align the moment its entry lands.
 pub fn infer_provider_for_model(model: &str) -> Option<RuntimeType> {
-    let lower = model.trim().to_ascii_lowercase();
-    let m = lower.rsplit('/').next().unwrap_or(&lower);
-    if m.starts_with("claude") {
+    let spec = duduclaw_core::runtime_catalog::runtime_for_model(model)?;
+    let family = RuntimeType::from_id(spec.id)?;
+    if family == RuntimeType::Claude {
         return Some(RuntimeType::Claude);
     }
-    let (family, cli_present) = if m.starts_with("grok") {
-        (RuntimeType::Grok, duduclaw_core::which_grok().is_some())
-    } else if m.starts_with("gemini") {
-        (RuntimeType::Gemini, duduclaw_core::which_gemini().is_some())
-    } else if m.starts_with("gpt-")
-        || m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("codex")
-    {
-        (RuntimeType::Codex, duduclaw_core::which_codex().is_some())
-    } else {
-        return None;
-    };
-    Some(if cli_present {
+    // The family's own CLI when it is installed; otherwise the API-mode
+    // backend, which serves any model, so the aligned config is runnable.
+    Some(if duduclaw_core::which_runtime(spec.id).is_some() {
         family
     } else {
         RuntimeType::OpenAiCompat
@@ -399,7 +439,7 @@ pub fn global_utility_provider(home_dir: &Path) -> RuntimeType {
         .and_then(|v| v.get("runtime"))
         .and_then(|r| r.get("utility_provider"))
         .and_then(|s| s.as_str())
-        .map(RuntimeType::parse)
+        .map(|v| parse_provider_or_default(home_dir, "[runtime] utility_provider", v))
         .unwrap_or_default()
 }
 
@@ -424,7 +464,7 @@ fn global_utility_spec(home_dir: &Path) -> UtilitySpec {
     let provider = runtime
         .and_then(|r| r.get("utility_provider"))
         .and_then(|s| s.as_str())
-        .map(RuntimeType::parse)
+        .map(|v| parse_provider_or_default(home_dir, "[runtime] utility_provider", v))
         .unwrap_or_default();
     let model = runtime
         .and_then(|r| r.get("utility_model"))
@@ -798,9 +838,69 @@ mod tests {
                 "{model} inferred {got:?}"
             );
         }
-        // Unknown families: never guess.
-        assert_eq!(infer_provider_for_model("qwen3-8b"), None);
+        // WP-B: families that used to be unknown now have a runtime. `qwen*`
+        // reaches Qwen Code (or the API fallback when its CLI isn't
+        // installed) instead of returning None and skipping the auto-align.
+        for (model, family) in [
+            ("qwen3-coder-plus", Qwen),
+            ("kimi-for-coding", Kimi),
+            ("devstral-small", Vibe),
+        ] {
+            let got = infer_provider_for_model(model).expect(model);
+            assert!(
+                got == family || got == OpenAiCompat,
+                "{model} inferred {got:?}"
+            );
+        }
+        // Multi-vendor shells claim no family, so a model they happen to serve
+        // still infers its OWN vendor's runtime — `gpt-5` must not be hijacked
+        // to Copilot/Cursor/OpenCode just because they can run it.
+        let gpt = infer_provider_for_model("gpt-5").unwrap();
+        assert!(gpt == Codex || gpt == OpenAiCompat, "{gpt:?}");
+        // Genuinely unknown families: still never guess.
+        assert_eq!(infer_provider_for_model("deepseek-v3.2"), None);
+        assert_eq!(infer_provider_for_model("llama-3.2-3b"), None);
         assert_eq!(infer_provider_for_model(""), None);
+    }
+
+    /// WP-B: the multi-vendor shells (Copilot / Cursor / OpenCode / Kiro)
+    /// declare no model family, so they must never be a confident mismatch —
+    /// otherwise every model a user picks for them would be "auto-aligned"
+    /// away to another runtime on save.
+    #[test]
+    fn multi_vendor_shells_never_mismatch() {
+        use RuntimeType::*;
+        for provider in [Copilot, Cursor, OpenCode, Kiro] {
+            for model in [
+                "claude-sonnet-4-6",
+                "gpt-5.4",
+                "gemini-3.5-flash",
+                "grok-4",
+                "something-unknown",
+            ] {
+                assert!(
+                    model_matches_provider(model, provider),
+                    "{provider:?} must accept {model}"
+                );
+            }
+        }
+    }
+
+    /// The new single-family runtimes behave like the old ones: they accept
+    /// their own family and reject other known families.
+    #[test]
+    fn new_single_family_runtimes_reject_foreign_families() {
+        use RuntimeType::*;
+        assert!(model_matches_provider("qwen3-coder-plus", Qwen));
+        assert!(!model_matches_provider("claude-sonnet-4-6", Qwen));
+        assert!(!model_matches_provider("gpt-5.4", Qwen));
+        assert!(model_matches_provider("kimi-for-coding", Kimi));
+        assert!(!model_matches_provider("gemini-3.5-flash", Kimi));
+        assert!(model_matches_provider("mistral-medium-3.5", Vibe));
+        assert!(!model_matches_provider("grok-4", Vibe));
+        // …and an unknown family still passes everywhere (never a confident
+        // mismatch).
+        assert!(model_matches_provider("deepseek-v3.2", Qwen));
     }
 
     #[test]

@@ -116,6 +116,9 @@ pub enum Key {
     /// re-scanning from `Failed`/`Loaded`/empty-list states — see
     /// `steps::network`'s `kick_off_scan`, shared by every caller.
     NetworkRescanButton,
+    /// Shown in the Network step when the gateway reports first-run setup already done.
+    NetworkFirstRunDoneStatus,
+    NetworkFirstRunDoneHint,
     NetworkScanningStatus,
     NetworkScanFailedStatus,
     NetworkScanEmptyStatus,
@@ -253,6 +256,52 @@ pub enum Key {
     RuntimeAuthAuthorized,
     RuntimeAuthAuthorizeNow,
     RuntimeAuthDeferLater,
+    /// Real credential entry (2026-09-05): hint, field label, button, statuses.
+    RuntimeAuthKeyHint,
+    RuntimeAuthSaveKey,
+    RuntimeAuthSaving,
+    RuntimeAuthKeyEmpty,
+    RuntimeAuthKeyLooksWrong,
+    RuntimeAuthUnreachable,
+    /// WP-C (2026-09-05, `docs/todo/TODO-ai-runtimes-2026-09.md` §3): the
+    /// step is a PROVIDER LIST now, not one Anthropic field. These cover the
+    /// list itself, the per-row status badge and the two row actions.
+    RuntimeAuthProvidersHint,
+    RuntimeAuthStatusUnset,
+    RuntimeAuthStatusKeySaved,
+    RuntimeAuthStatusLoggedIn,
+    RuntimeAuthEnterKeyAction,
+    RuntimeAuthLoginAction,
+    /// The row note under a provider's name — two variants, picked by
+    /// `oobe::runtime_providers::ProviderEntry::note_key` (see that method's
+    /// own doc comment for why the notes are derived, not per-provider).
+    RuntimeProviderNoteLoginOrKey,
+    RuntimeProviderNoteKeyOnly,
+    /// Shown on a row whose CLI login this build cannot start yet — the
+    /// gateway would resolve its runtime name to Claude and authenticate the
+    /// wrong vendor, so the button is inert and says so.
+    RuntimeAuthLoginUnavailableHere,
+    /// The expanded key panel: header (takes the provider name), collapse.
+    RuntimeAuthKeyFor,
+    RuntimeAuthKeyCollapse,
+    /// §1-1 subscription-login risk disclosure and its required tick-box.
+    RuntimeAuthRiskTitle,
+    RuntimeAuthRiskBody,
+    RuntimeAuthRiskAck,
+    /// The login panel itself.
+    RuntimeAuthLoginStart,
+    RuntimeAuthLoginStarting,
+    RuntimeAuthLoginWaiting,
+    RuntimeAuthLoginCodeLabel,
+    RuntimeAuthLoginUrlLabel,
+    RuntimeAuthLoginOpenBrowser,
+    RuntimeAuthLoginCancel,
+    RuntimeAuthLoginClose,
+    RuntimeAuthLoginSucceeded,
+    RuntimeAuthLoginErrUnavailable,
+    RuntimeAuthLoginErrUnreachable,
+    RuntimeAuthLoginErrRefused,
+    RuntimeAuthLoginErrAbandoned,
 
     PrivacyTitle,
     PrivacySubtitle,
@@ -273,6 +322,17 @@ pub enum Key {
     TemplatesExpressApplied,
     TemplatesCustomHint,
     TemplatesSkip,
+    /// Shown where the fake industry cards used to be — the real catalogue
+    /// is Pro-only and locked on a fresh install.
+    TemplatesPremiumLocked,
+    /// Display name / trigger of the assistant `oobe::seed` creates.
+    OobeDefaultAgentName,
+    OobeDefaultAgentTrigger,
+    OobeSeedAgentCreatedTitle,
+    /// `{}` = the created assistant's display name.
+    OobeSeedAgentCreatedBody,
+    OobeSeedAgentFailedTitle,
+    OobeSeedAgentFailedBody,
 
     ThemeTitle,
     ThemeSubtitle,
@@ -288,9 +348,16 @@ pub enum Key {
     FinishSummaryPrivacy,
     FinishSummaryTemplates,
     FinishRuntimeAuthorized,
+    /// WP-C (2026-09-05): the summary now counts providers — takes the
+    /// count, so it goes through `t1`, not `t`. `FinishRuntimeAuthorized`
+    /// above stays for a state file written before this round, which has the
+    /// `runtime_authorized` flag but no per-provider list to count.
+    FinishRuntimeAuthorizedCount,
     FinishRuntimeDeferred,
     FinishRuntimeNotSet,
     FinishNetworkNotConnected,
+    /// Finish-page network row when the link is up but has no SSID (wired).
+    FinishNetworkWired,
     FinishAccountCreated,
     FinishAccountNotCreated,
     FinishPrivacyAllOff,
@@ -516,6 +583,9 @@ pub enum Key {
     /// post_submit_failure_card`) — separate from the two sentences above
     /// so either can be reused as the card BODY under one shared heading.
     LauncherDelegateSubmitFailedTitle,
+    /// Posted the moment `tasks.goal_create` succeeds; `{}` `{}` = task title, agent.
+    LauncherDelegateSubmittedTitle,
+    LauncherDelegateSubmittedBody,
 
     /// A1 result-loopback (2026-08-24): `main.rs::post_task_result_card`'s
     /// three terminal-state card summaries (a single `{}` placeholder for
@@ -542,6 +612,80 @@ pub enum Key {
     /// forbids, hence this second card.
     TaskResultDecideFailedTitle,
     TaskResultDecideFailed,
+
+    /// WP-fix-QEMU-a (2026-09-05): the Home surface's greeting, replacing
+    /// the old hardcoded `fake_data::GREETING = "晚上好，Louis"` — a
+    /// placeholder person's name shown on every boot regardless of the
+    /// actual operator or the actual time of day (the defect this round
+    /// fixes). Genuinely NEW process chrome (a time-of-day salutation is
+    /// computed logic, not design-board content), so it routes through this
+    /// catalog like `Notif*`/`Lock*` above rather than staying a plain
+    /// literal — see `home.rs::greeting_text`'s own doc comment for the
+    /// hour-of-day selection and the real-name source. The `*Named` variant
+    /// is used whenever `oobe::boot_operator_name` resolved to `Some`; the
+    /// plain variant when it did not — greeting nobody by an invented name
+    /// is the honest fallback, never `Louis`.
+    HomeGreetingMorning,
+    HomeGreetingAfternoon,
+    HomeGreetingEvening,
+    HomeGreetingMorningNamed,
+    HomeGreetingAfternoonNamed,
+    HomeGreetingEveningNamed,
+    /// WP-fix-QEMU-a: the Home surface's goal-cards row, shown when the
+    /// real task source (`overlay::notifications_feed::NotificationsFeed`'s
+    /// pending approvals + `overlay::task_progress_feed::TaskProgressFeed`'s
+    /// in-progress tasks — see `home/home_dock.rs::goal_cards_row`'s own doc
+    /// comment) has nothing to show and the gateway IS reachable (an
+    /// unreachable gateway reuses `NotifOfflineBanner` instead, the same
+    /// honest banner the Notifications panel already shows for the same
+    /// underlying condition). Replaces the old three-entry
+    /// `fake_data::GOAL_CARDS` design-board mockup, which rendered on every
+    /// boot including a freshly installed system with nothing delegated
+    /// yet.
+    HomeTasksEmptyState,
+    /// Notification centre tab labels (counts appended by `counted_tab`).
+    NotifTabAll,
+    NotifTabApprovals,
+    NotifTabProgress,
+    NotifTabSystem,
+    /// Launcher install outcome cards. `{}` = app display name (or reason).
+    InstallDoneTitle,
+    InstallDoneBody,
+    InstallFailedTitle,
+    InstallFailedBodyUnknown,
+    /// Launcher 交辦 card (real agent). `{}` = agent display name.
+    LauncherDelegateTo,
+    LauncherDelegatePlanHint,
+    LauncherDelegateHint,
+    LauncherDelegateNoAgentTitle,
+    LauncherDelegateNoAgentBody,
+    /// Control Centre footer: `{}` agents on duty · `{}` waiting on you.
+    CcFooterStatus,
+
+    /// Y20-P6 (2026-09-05): the live installer's `DiskSelect`/`Progress`
+    /// steps (`live_install::steps::disk_select`/`progress`) — three strings
+    /// that were hardcoded bilingual "zh · en" literals until a review
+    /// finding on the same round's disk-picker bug fix asked for them to be
+    /// routed through this catalog like the sibling `LiveWifi*` step keys
+    /// instead (single-locale strings, real `t()`/`t1()` calls). Scoped to
+    /// ONLY these three — `disk_select.rs`'s/`progress.rs`'s OTHER,
+    /// pre-existing bilingual literals ("已選取 · Selected" et al.) predate
+    /// this round and are a separate, larger retrofit not in scope here.
+    /// `{}` in `LiveInstallDiskExcludedMedium` is the bare device basename
+    /// (e.g. `"vdb"`, NOT `"/dev/vdb"` — each locale's own string supplies
+    /// the `/dev/` prefix, same "the catalog string decides where the
+    /// placeholder sits" reasoning `t1`'s own doc comment gives for
+    /// `NetworkConnectedTo`).
+    LiveInstallDiskExcludedMedium,
+    /// The live-medium detection-FAILURE warning — see
+    /// `state::LiveMediumNote::DetectionFailed`'s own doc comment for when
+    /// this renders instead of `LiveInstallDiskExcludedMedium` above.
+    LiveInstallDiskMediumUnknown,
+    /// `steps::progress::running_label`'s `percent: None` branch — `{}` is
+    /// the live status line pumped from the installer's own stdout/stderr
+    /// (`install_runner::InstallEvent::Status`), unchanged from before this
+    /// round; only the leading "preparing" wording moved into this catalog.
+    LiveInstallProgressPreparing,
 }
 
 /// Look up `key` in `locale`'s catalog. Never falls through to a "missing
@@ -567,6 +711,11 @@ pub fn t(locale: Locale, key: Key) -> &'static str {
 /// reason this isn't just a `format!("{prefix}{value}")` call at each site.
 pub fn t1(locale: Locale, key: Key, value: &str) -> String {
     t(locale, key).replacen("{}", value, 1)
+}
+
+/// Two-placeholder variant of `t1`: the first `{}` becomes `a`, the second `b`.
+pub fn t2(locale: Locale, key: Key, a: &str, b: &str) -> String {
+    t(locale, key).replacen("{}", a, 1).replacen("{}", b, 1)
 }
 
 fn zh_tw(key: Key) -> &'static str {
@@ -607,6 +756,8 @@ fn zh_tw(key: Key) -> &'static str {
         Key::NetworkNeverScanned => "尚未掃描 Wi-Fi 網路",
         Key::NetworkScanButton => "掃描 Wi-Fi",
         Key::NetworkRescanButton => "重新整理",
+        Key::NetworkFirstRunDoneStatus => "網路已在首次設定時完成",
+        Key::NetworkFirstRunDoneHint => "這台機器已經設定過網路，本機服務也連得到；直接按「繼續」即可",
         Key::NetworkScanningStatus => "正在掃描 Wi-Fi…",
         Key::NetworkScanFailedStatus => "掃描失敗，請重試",
         Key::NetworkScanEmptyStatus => "找不到任何 Wi-Fi 網路",
@@ -659,10 +810,43 @@ fn zh_tw(key: Key) -> &'static str {
         Key::LiveWifiErrPskLength => "Wi-Fi 密碼長度須為 8–63 字元",
 
         Key::RuntimeAuthTitle => "AI Runtime 授權",
-        Key::RuntimeAuthSubtitle => "這台機器的 AI runtime 需要授權才能開始工作",
-        Key::RuntimeAuthAuthorized => "已授權，可以繼續",
+        Key::RuntimeAuthSubtitle => "這台機器要有 AI 服務的授權，交辦的事才會真的被執行",
+        Key::RuntimeAuthAuthorized => "已完成授權（第一次交辦時實際驗證），可以繼續",
         Key::RuntimeAuthAuthorizeNow => "立即設定",
         Key::RuntimeAuthDeferLater => "稍後再說",
+        Key::RuntimeAuthKeyHint => "交辦要真的執行，這台機器需要至少一家 AI 服務的授權。沒有的話可以先略過，之後在管理面加入",
+        Key::RuntimeAuthSaveKey => "儲存金鑰",
+        Key::RuntimeAuthSaving => "儲存中…",
+        Key::RuntimeAuthKeyEmpty => "請先貼上金鑰",
+        Key::RuntimeAuthKeyLooksWrong => "這不像 API 金鑰，請確認後再試",
+        Key::RuntimeAuthUnreachable => "連不上本機服務，稍後在管理面再加",
+        Key::RuntimeAuthProvidersHint => "可以設定多家，也可以一家都不設定先略過",
+        Key::RuntimeAuthStatusUnset => "未設定",
+        Key::RuntimeAuthStatusKeySaved => "已存金鑰",
+        Key::RuntimeAuthStatusLoggedIn => "已登入",
+        Key::RuntimeAuthEnterKeyAction => "輸入 API 金鑰",
+        Key::RuntimeAuthLoginAction => "登入帳號",
+        Key::RuntimeProviderNoteLoginOrKey => "可以登入既有帳號，或改貼 API 金鑰",
+        Key::RuntimeProviderNoteKeyOnly => "以 API 金鑰授權",
+        Key::RuntimeAuthLoginUnavailableHere => "這台機器還不能用登入的方式設定，請改貼 API 金鑰",
+        Key::RuntimeAuthKeyFor => "{} 的 API 金鑰",
+        Key::RuntimeAuthKeyCollapse => "收起",
+        Key::RuntimeAuthRiskTitle => "登入前請先看這段",
+        Key::RuntimeAuthRiskBody => "Anthropic 與 Google 自 2026 年 3 月起，在伺服器端擋掉第三方產品使用消費者訂閱的登入憑證，已經有帳號因此被停權；OpenAI 目前沒有明確說法。要穩定使用，建議改用各家後台申請的 API 金鑰。",
+        Key::RuntimeAuthRiskAck => "我了解風險，由我自行承擔",
+        Key::RuntimeAuthLoginStart => "開始登入",
+        Key::RuntimeAuthLoginStarting => "正在啟動登入…",
+        Key::RuntimeAuthLoginWaiting => "等你在瀏覽器完成登入，這裡會自動更新",
+        Key::RuntimeAuthLoginCodeLabel => "裝置代碼",
+        Key::RuntimeAuthLoginUrlLabel => "登入網址",
+        Key::RuntimeAuthLoginOpenBrowser => "用瀏覽器開啟",
+        Key::RuntimeAuthLoginCancel => "取消登入",
+        Key::RuntimeAuthLoginClose => "關閉",
+        Key::RuntimeAuthLoginSucceeded => "登入完成",
+        Key::RuntimeAuthLoginErrUnavailable => "這台機器上找不到這個 CLI，或它沒有登入流程",
+        Key::RuntimeAuthLoginErrUnreachable => "連不上本機服務，請稍後再試",
+        Key::RuntimeAuthLoginErrRefused => "登入被拒絕，請確認帳號後再試",
+        Key::RuntimeAuthLoginErrAbandoned => "登入沒有完成就結束了",
 
         Key::PrivacyTitle => "隱私與遙測",
         Key::PrivacySubtitle => "以下選項預設全部關閉，可以隨時在設定中調整",
@@ -678,11 +862,18 @@ fn zh_tw(key: Key) -> &'static str {
         Key::TemplatesTitle => "挑選產業板模",
         Key::TemplatesSubtitle => "可以先跳過，之後隨時在管理面加入",
         Key::TemplatesExpressTitle => "快速開始",
-        Key::TemplatesExpressDesc => "一鍵套用預設 AI 團隊組合",
+        Key::TemplatesExpressDesc => "建立一位總管助理作為你的預設 AI 員工，之後隨時在管理面加入更多成員",
         Key::TemplatesExpressApply => "套用 Express",
         Key::TemplatesExpressApplied => "已選擇 Express",
         Key::TemplatesCustomHint => "或自行挑選產業板模",
         Key::TemplatesSkip => "略過，稍後再設定",
+        Key::TemplatesPremiumLocked => "產業板模（零售門市、診所助理、物流倉儲…）需 Pro 授權，之後可在管理面解鎖",
+        Key::OobeDefaultAgentName => "總管助理",
+        Key::OobeDefaultAgentTrigger => "日常交辦、整理資料、安排與提醒",
+        Key::OobeSeedAgentCreatedTitle => "你的第一位 AI 員工已就位",
+        Key::OobeSeedAgentCreatedBody => "{} 已建立，現在可以在主畫面交代事情給它",
+        Key::OobeSeedAgentFailedTitle => "還沒能建立 AI 員工",
+        Key::OobeSeedAgentFailedBody => "剛才連不上本機服務。稍後在管理面新增成員，或重新開機再試一次",
 
         Key::ThemeTitle => "選擇外觀",
         Key::ThemeSubtitle => "亮色或暗色，之後可以在設定中變更",
@@ -698,9 +889,11 @@ fn zh_tw(key: Key) -> &'static str {
         Key::FinishSummaryPrivacy => "隱私",
         Key::FinishSummaryTemplates => "板模",
         Key::FinishRuntimeAuthorized => "已授權",
+        Key::FinishRuntimeAuthorizedCount => "已授權 {} 家",
         Key::FinishRuntimeDeferred => "已延後",
         Key::FinishRuntimeNotSet => "未設定",
         Key::FinishNetworkNotConnected => "未連線",
+        Key::FinishNetworkWired => "有線網路已連線",
         Key::FinishAccountCreated => "已建立",
         Key::FinishAccountNotCreated => "未建立",
         Key::FinishPrivacyAllOff => "全部關閉",
@@ -798,6 +991,8 @@ fn zh_tw(key: Key) -> &'static str {
         Key::LauncherDelegateNoAgent => "找不到可交辦的 AI 員工，請先在儀表板建立一個。",
         Key::LauncherDelegateSubmitFailed => "交辦沒有送出，請稍後再試一次。",
         Key::LauncherDelegateSubmitFailedTitle => "交辦沒有送出",
+        Key::LauncherDelegateSubmittedTitle => "已交辦",
+        Key::LauncherDelegateSubmittedBody => "「{}」已交給 {}，進度會顯示在主畫面",
 
         Key::TaskResultDoneSummary => "「{}」已完成",
         Key::TaskResultFailedSummary => "「{}」失敗",
@@ -807,6 +1002,32 @@ fn zh_tw(key: Key) -> &'static str {
         Key::TaskResultAbortButton => "放棄",
         Key::TaskResultDecideFailedTitle => "決定沒有送出",
         Key::TaskResultDecideFailed => "沒有送出成功，請稍後再試一次。",
+
+        Key::HomeGreetingMorning => "早安",
+        Key::HomeGreetingAfternoon => "午安",
+        Key::HomeGreetingEvening => "晚上好",
+        Key::HomeGreetingMorningNamed => "早安，{}",
+        Key::HomeGreetingAfternoonNamed => "午安，{}",
+        Key::HomeGreetingEveningNamed => "晚上好，{}",
+        Key::HomeTasksEmptyState => "還沒有交辦的任務 · 交代一件事給你的 AI 團隊",
+        Key::NotifTabAll => "全部",
+        Key::NotifTabApprovals => "審批",
+        Key::NotifTabProgress => "進度",
+        Key::NotifTabSystem => "系統",
+        Key::InstallDoneTitle => "安裝完成",
+        Key::InstallDoneBody => "{} 已可以從 app 清單或 dock 開啟",
+        Key::InstallFailedTitle => "{} 安裝失敗",
+        Key::InstallFailedBodyUnknown => "flatpak 沒有說明原因；請檢查網路後再試一次",
+        Key::LauncherDelegateTo => "交辦給 {}",
+        Key::LauncherDelegatePlanHint => "描述你想交辦的事，按 Enter 送出；進度會顯示在主畫面",
+        Key::LauncherDelegateHint => "Enter 交辦",
+        Key::LauncherDelegateNoAgentTitle => "還沒有 AI 團隊成員",
+        Key::LauncherDelegateNoAgentBody => "到管理面新增一位，或重新執行首次設定",
+        Key::CcFooterStatus => "{} 位在值 · {} 件等你",
+
+        Key::LiveInstallDiskExcludedMedium => "已排除安裝媒介 /dev/{}",
+        Key::LiveInstallDiskMediumUnknown => "無法確認安裝媒介，請小心選擇",
+        Key::LiveInstallProgressPreparing => "準備中… — {}",
     }
 }
 
@@ -848,6 +1069,8 @@ fn en(key: Key) -> &'static str {
         Key::NetworkNeverScanned => "Wi-Fi networks haven't been scanned yet",
         Key::NetworkScanButton => "Scan for Wi-Fi",
         Key::NetworkRescanButton => "Refresh",
+        Key::NetworkFirstRunDoneStatus => "Network was set up during first-run",
+        Key::NetworkFirstRunDoneHint => "This machine already has its network configured and the local service is reachable — just press Continue",
         Key::NetworkScanningStatus => "Scanning for Wi-Fi networks…",
         Key::NetworkScanFailedStatus => "Scan failed, please try again",
         Key::NetworkScanEmptyStatus => "No Wi-Fi networks found",
@@ -900,10 +1123,43 @@ fn en(key: Key) -> &'static str {
         Key::LiveWifiErrPskLength => "The Wi-Fi password must be 8–63 characters",
 
         Key::RuntimeAuthTitle => "Authorize AI runtime",
-        Key::RuntimeAuthSubtitle => "This device's AI runtime needs authorization before it can start working",
-        Key::RuntimeAuthAuthorized => "Authorized. Ready to continue.",
+        Key::RuntimeAuthSubtitle => "Delegated work only runs once this machine is authorized with an AI provider",
+        Key::RuntimeAuthAuthorized => "Authorized (verified on first real use) — you can continue",
         Key::RuntimeAuthAuthorizeNow => "Set up now",
         Key::RuntimeAuthDeferLater => "Set up later",
+        Key::RuntimeAuthKeyHint => "For delegated work to actually run, this machine needs at least one authorized AI provider. Nothing to hand over yet? Skip and add one in the dashboard later",
+        Key::RuntimeAuthSaveKey => "Save key",
+        Key::RuntimeAuthSaving => "Saving…",
+        Key::RuntimeAuthKeyEmpty => "Paste a key first",
+        Key::RuntimeAuthKeyLooksWrong => "That does not look like an API key — check it and try again",
+        Key::RuntimeAuthUnreachable => "The local service was unreachable — add it in the dashboard later",
+        Key::RuntimeAuthProvidersHint => "Set up as many as you like, or none at all and skip",
+        Key::RuntimeAuthStatusUnset => "Not set",
+        Key::RuntimeAuthStatusKeySaved => "Key saved",
+        Key::RuntimeAuthStatusLoggedIn => "Signed in",
+        Key::RuntimeAuthEnterKeyAction => "Enter API key",
+        Key::RuntimeAuthLoginAction => "Sign in",
+        Key::RuntimeProviderNoteLoginOrKey => "Sign in with an existing account, or paste an API key",
+        Key::RuntimeProviderNoteKeyOnly => "Authorized with an API key",
+        Key::RuntimeAuthLoginUnavailableHere => "Signing in is not available on this machine yet — paste an API key instead",
+        Key::RuntimeAuthKeyFor => "API key for {}",
+        Key::RuntimeAuthKeyCollapse => "Collapse",
+        Key::RuntimeAuthRiskTitle => "Read this before signing in",
+        Key::RuntimeAuthRiskBody => "Since March 2026 Anthropic and Google block consumer-subscription sign-in tokens from third-party products server-side, and accounts have been suspended over it; OpenAI has said nothing definite. An API key from the provider's own console is the stable path.",
+        Key::RuntimeAuthRiskAck => "I understand the risk and accept it",
+        Key::RuntimeAuthLoginStart => "Start sign-in",
+        Key::RuntimeAuthLoginStarting => "Starting sign-in…",
+        Key::RuntimeAuthLoginWaiting => "Finish signing in from your browser — this updates by itself",
+        Key::RuntimeAuthLoginCodeLabel => "Device code",
+        Key::RuntimeAuthLoginUrlLabel => "Sign-in address",
+        Key::RuntimeAuthLoginOpenBrowser => "Open in browser",
+        Key::RuntimeAuthLoginCancel => "Cancel sign-in",
+        Key::RuntimeAuthLoginClose => "Close",
+        Key::RuntimeAuthLoginSucceeded => "Signed in",
+        Key::RuntimeAuthLoginErrUnavailable => "That CLI is not on this machine, or it has no sign-in flow",
+        Key::RuntimeAuthLoginErrUnreachable => "The local service was unreachable — try again shortly",
+        Key::RuntimeAuthLoginErrRefused => "Sign-in was refused — check the account and try again",
+        Key::RuntimeAuthLoginErrAbandoned => "Sign-in ended before it completed",
 
         Key::PrivacyTitle => "Privacy & diagnostics",
         Key::PrivacySubtitle => "These are all off by default. Change them anytime in Settings.",
@@ -919,11 +1175,18 @@ fn en(key: Key) -> &'static str {
         Key::TemplatesTitle => "Choose an industry template",
         Key::TemplatesSubtitle => "You can skip this and add one later from the console",
         Key::TemplatesExpressTitle => "Quick start",
-        Key::TemplatesExpressDesc => "Apply the default AI team lineup with one click",
+        Key::TemplatesExpressDesc => "Create a general assistant as your default AI employee; add more teammates in the dashboard any time",
         Key::TemplatesExpressApply => "Apply Express",
         Key::TemplatesExpressApplied => "Express applied",
         Key::TemplatesCustomHint => "Or pick an industry template yourself",
         Key::TemplatesSkip => "Skip for now",
+        Key::TemplatesPremiumLocked => "Industry templates (retail, clinic, logistics…) need a Pro licence and can be unlocked later in the dashboard",
+        Key::OobeDefaultAgentName => "Assistant",
+        Key::OobeDefaultAgentTrigger => "Everyday tasks, organising information, scheduling and reminders",
+        Key::OobeSeedAgentCreatedTitle => "Your first AI employee is ready",
+        Key::OobeSeedAgentCreatedBody => "{} was created — hand it something to do from the Home screen",
+        Key::OobeSeedAgentFailedTitle => "Could not create your AI employee yet",
+        Key::OobeSeedAgentFailedBody => "The local service was unreachable. Add a teammate in the dashboard later, or reboot and try again",
 
         Key::ThemeTitle => "Choose your appearance",
         Key::ThemeSubtitle => "Light or dark — change this anytime in Settings",
@@ -939,9 +1202,11 @@ fn en(key: Key) -> &'static str {
         Key::FinishSummaryPrivacy => "Privacy",
         Key::FinishSummaryTemplates => "Template",
         Key::FinishRuntimeAuthorized => "Authorized",
+        Key::FinishRuntimeAuthorizedCount => "{} provider(s) authorized",
         Key::FinishRuntimeDeferred => "Deferred",
         Key::FinishRuntimeNotSet => "Not set",
         Key::FinishNetworkNotConnected => "Not connected",
+        Key::FinishNetworkWired => "Wired, connected",
         Key::FinishAccountCreated => "Created",
         Key::FinishAccountNotCreated => "Not created",
         Key::FinishPrivacyAllOff => "All off",
@@ -1039,6 +1304,8 @@ fn en(key: Key) -> &'static str {
         Key::LauncherDelegateNoAgent => "No agent is reachable to delegate to — set one up on the dashboard first.",
         Key::LauncherDelegateSubmitFailed => "The delegation wasn't sent — please try again in a moment.",
         Key::LauncherDelegateSubmitFailedTitle => "Delegation not sent",
+        Key::LauncherDelegateSubmittedTitle => "Delegated",
+        Key::LauncherDelegateSubmittedBody => "\"{}\" was handed to {} — progress shows on the Home screen",
 
         Key::TaskResultDoneSummary => "\u{201c}{}\u{201d} is done",
         Key::TaskResultFailedSummary => "\u{201c}{}\u{201d} failed",
@@ -1048,6 +1315,32 @@ fn en(key: Key) -> &'static str {
         Key::TaskResultAbortButton => "Abort",
         Key::TaskResultDecideFailedTitle => "That decision wasn't sent",
         Key::TaskResultDecideFailed => "That didn't go through — please try again in a moment.",
+
+        Key::HomeGreetingMorning => "Good morning",
+        Key::HomeGreetingAfternoon => "Good afternoon",
+        Key::HomeGreetingEvening => "Good evening",
+        Key::HomeGreetingMorningNamed => "Good morning, {}",
+        Key::HomeGreetingAfternoonNamed => "Good afternoon, {}",
+        Key::HomeGreetingEveningNamed => "Good evening, {}",
+        Key::HomeTasksEmptyState => "No tasks yet — hand your AI team something to do",
+        Key::NotifTabAll => "All",
+        Key::NotifTabApprovals => "Approvals",
+        Key::NotifTabProgress => "Progress",
+        Key::NotifTabSystem => "System",
+        Key::InstallDoneTitle => "Installed",
+        Key::InstallDoneBody => "{} is ready in the app list and the dock",
+        Key::InstallFailedTitle => "{} did not install",
+        Key::InstallFailedBodyUnknown => "flatpak gave no reason; check the network and try again",
+        Key::LauncherDelegateTo => "Delegate to {}",
+        Key::LauncherDelegatePlanHint => "Describe what you want done and press Enter; progress shows on the Home screen",
+        Key::LauncherDelegateHint => "Enter to delegate",
+        Key::LauncherDelegateNoAgentTitle => "No AI teammates yet",
+        Key::LauncherDelegateNoAgentBody => "Add one in the dashboard, or run first-time setup again",
+        Key::CcFooterStatus => "{} on duty · {} waiting on you",
+
+        Key::LiveInstallDiskExcludedMedium => "Install medium excluded: /dev/{}",
+        Key::LiveInstallDiskMediumUnknown => "Could not identify the install medium — choose carefully",
+        Key::LiveInstallProgressPreparing => "Preparing… — {}",
     }
 }
 
@@ -1089,6 +1382,8 @@ fn ja_jp(key: Key) -> &'static str {
         Key::NetworkNeverScanned => "まだ Wi-Fi ネットワークをスキャンしていません",
         Key::NetworkScanButton => "Wi-Fi をスキャン",
         Key::NetworkRescanButton => "更新",
+        Key::NetworkFirstRunDoneStatus => "ネットワークは初期設定で設定済みです",
+        Key::NetworkFirstRunDoneHint => "この端末はすでにネットワーク設定が済んでおり、ローカルサービスにも接続できます。「続行」を押してください",
         Key::NetworkScanningStatus => "Wi-Fi ネットワークをスキャン中…",
         Key::NetworkScanFailedStatus => "スキャンに失敗しました。もう一度お試しください",
         Key::NetworkScanEmptyStatus => "Wi-Fi ネットワークが見つかりません",
@@ -1141,10 +1436,43 @@ fn ja_jp(key: Key) -> &'static str {
         Key::LiveWifiErrPskLength => "Wi-Fi パスワードは8〜63文字で入力してください",
 
         Key::RuntimeAuthTitle => "AI ランタイムの認証",
-        Key::RuntimeAuthSubtitle => "この端末の AI ランタイムを使い始めるには認証が必要です",
-        Key::RuntimeAuthAuthorized => "認証済み。続行できます。",
+        Key::RuntimeAuthSubtitle => "AI サービスの認証があって初めて、依頼した仕事が実際に実行されます",
+        Key::RuntimeAuthAuthorized => "認証が完了しました（初回の依頼時に検証）。続行できます",
         Key::RuntimeAuthAuthorizeNow => "今すぐ設定",
         Key::RuntimeAuthDeferLater => "あとで設定",
+        Key::RuntimeAuthKeyHint => "依頼した仕事を実際に実行するには、少なくとも 1 社の AI サービスの認証が必要です。まだ無い場合はスキップして、後で管理画面から追加できます",
+        Key::RuntimeAuthSaveKey => "キーを保存",
+        Key::RuntimeAuthSaving => "保存中…",
+        Key::RuntimeAuthKeyEmpty => "先にキーを貼り付けてください",
+        Key::RuntimeAuthKeyLooksWrong => "API キーの形式ではないようです。確認してもう一度お試しください",
+        Key::RuntimeAuthUnreachable => "ローカルサービスに接続できません。後で管理画面から追加してください",
+        Key::RuntimeAuthProvidersHint => "何社でも設定できます。設定せずにスキップしても構いません",
+        Key::RuntimeAuthStatusUnset => "未設定",
+        Key::RuntimeAuthStatusKeySaved => "キー保存済み",
+        Key::RuntimeAuthStatusLoggedIn => "ログイン済み",
+        Key::RuntimeAuthEnterKeyAction => "API キーを入力",
+        Key::RuntimeAuthLoginAction => "アカウントでログイン",
+        Key::RuntimeProviderNoteLoginOrKey => "既存アカウントでログイン、または API キーを貼り付け",
+        Key::RuntimeProviderNoteKeyOnly => "API キーで認証",
+        Key::RuntimeAuthLoginUnavailableHere => "このマシンではまだログインを使えません。API キーを貼り付けてください",
+        Key::RuntimeAuthKeyFor => "{} の API キー",
+        Key::RuntimeAuthKeyCollapse => "閉じる",
+        Key::RuntimeAuthRiskTitle => "ログインの前にお読みください",
+        Key::RuntimeAuthRiskBody => "Anthropic と Google は 2026 年 3 月以降、消費者向けサブスクリプションのログイン資格情報を第三者製品から使うことをサーバー側で遮断しており、アカウント停止の事例も出ています。OpenAI の方針は不明です。安定して使うには各社のコンソールで発行した API キーをおすすめします。",
+        Key::RuntimeAuthRiskAck => "リスクを理解し、自己責任で進めます",
+        Key::RuntimeAuthLoginStart => "ログインを開始",
+        Key::RuntimeAuthLoginStarting => "ログインを準備中…",
+        Key::RuntimeAuthLoginWaiting => "ブラウザでログインを完了してください。ここは自動で更新されます",
+        Key::RuntimeAuthLoginCodeLabel => "デバイスコード",
+        Key::RuntimeAuthLoginUrlLabel => "ログイン URL",
+        Key::RuntimeAuthLoginOpenBrowser => "ブラウザで開く",
+        Key::RuntimeAuthLoginCancel => "ログインを中止",
+        Key::RuntimeAuthLoginClose => "閉じる",
+        Key::RuntimeAuthLoginSucceeded => "ログインしました",
+        Key::RuntimeAuthLoginErrUnavailable => "このマシンに該当の CLI が無いか、ログイン方式がありません",
+        Key::RuntimeAuthLoginErrUnreachable => "ローカルサービスに接続できません。しばらくしてからお試しください",
+        Key::RuntimeAuthLoginErrRefused => "ログインが拒否されました。アカウントを確認してもう一度お試しください",
+        Key::RuntimeAuthLoginErrAbandoned => "ログインが完了しないまま終了しました",
 
         Key::PrivacyTitle => "プライバシーと診断",
         Key::PrivacySubtitle => "以下はすべて初期設定でオフです。設定からいつでも変更できます。",
@@ -1160,11 +1488,18 @@ fn ja_jp(key: Key) -> &'static str {
         Key::TemplatesTitle => "業種テンプレートを選択",
         Key::TemplatesSubtitle => "スキップして、あとから管理画面で追加することもできます",
         Key::TemplatesExpressTitle => "クイックスタート",
-        Key::TemplatesExpressDesc => "デフォルトの AI チーム構成をワンクリックで適用",
+        Key::TemplatesExpressDesc => "既定の AI 社員として総合アシスタントを 1 人作成します。メンバーは後から管理画面でいつでも追加できます",
         Key::TemplatesExpressApply => "Express を適用",
         Key::TemplatesExpressApplied => "Express を適用済み",
         Key::TemplatesCustomHint => "または、業種テンプレートを自分で選ぶ",
         Key::TemplatesSkip => "今はスキップ",
+        Key::TemplatesPremiumLocked => "業種テンプレート（小売、クリニック、物流…）は Pro ライセンスが必要です。後から管理画面で解除できます",
+        Key::OobeDefaultAgentName => "総合アシスタント",
+        Key::OobeDefaultAgentTrigger => "日常の依頼、情報整理、予定とリマインド",
+        Key::OobeSeedAgentCreatedTitle => "最初の AI 社員が着任しました",
+        Key::OobeSeedAgentCreatedBody => "{} を作成しました。ホーム画面から仕事を頼めます",
+        Key::OobeSeedAgentFailedTitle => "AI 社員をまだ作成できていません",
+        Key::OobeSeedAgentFailedBody => "ローカルサービスに接続できませんでした。後で管理画面から追加するか、再起動してもう一度お試しください",
 
         Key::ThemeTitle => "外観を選択",
         Key::ThemeSubtitle => "ライトまたはダーク。設定からいつでも変更できます",
@@ -1180,9 +1515,11 @@ fn ja_jp(key: Key) -> &'static str {
         Key::FinishSummaryPrivacy => "プライバシー",
         Key::FinishSummaryTemplates => "テンプレート",
         Key::FinishRuntimeAuthorized => "認証済み",
+        Key::FinishRuntimeAuthorizedCount => "{} 社を認証済み",
         Key::FinishRuntimeDeferred => "あとで設定",
         Key::FinishRuntimeNotSet => "未設定",
         Key::FinishNetworkNotConnected => "未接続",
+        Key::FinishNetworkWired => "有線で接続済み",
         Key::FinishAccountCreated => "作成済み",
         Key::FinishAccountNotCreated => "未作成",
         Key::FinishPrivacyAllOff => "すべてオフ",
@@ -1280,6 +1617,8 @@ fn ja_jp(key: Key) -> &'static str {
         Key::LauncherDelegateNoAgent => "委任できる AI スタッフが見つかりません。ダッシュボードで作成してください。",
         Key::LauncherDelegateSubmitFailed => "委任を送信できませんでした。しばらくしてからもう一度お試しください。",
         Key::LauncherDelegateSubmitFailedTitle => "委任を送信できませんでした",
+        Key::LauncherDelegateSubmittedTitle => "依頼しました",
+        Key::LauncherDelegateSubmittedBody => "「{}」を {} に渡しました。進捗はホーム画面に表示されます",
 
         Key::TaskResultDoneSummary => "「{}」が完了しました",
         Key::TaskResultFailedSummary => "「{}」が失敗しました",
@@ -1289,6 +1628,32 @@ fn ja_jp(key: Key) -> &'static str {
         Key::TaskResultAbortButton => "中止",
         Key::TaskResultDecideFailedTitle => "決定を送信できませんでした",
         Key::TaskResultDecideFailed => "送信できませんでした。しばらくしてからもう一度お試しください。",
+
+        Key::HomeGreetingMorning => "おはようございます",
+        Key::HomeGreetingAfternoon => "こんにちは",
+        Key::HomeGreetingEvening => "こんばんは",
+        Key::HomeGreetingMorningNamed => "おはようございます、{}",
+        Key::HomeGreetingAfternoonNamed => "こんにちは、{}",
+        Key::HomeGreetingEveningNamed => "こんばんは、{}",
+        Key::HomeTasksEmptyState => "まだ依頼したタスクがありません。AIチームに何か任せてみましょう",
+        Key::NotifTabAll => "すべて",
+        Key::NotifTabApprovals => "承認",
+        Key::NotifTabProgress => "進捗",
+        Key::NotifTabSystem => "システム",
+        Key::InstallDoneTitle => "インストール完了",
+        Key::InstallDoneBody => "{} をアプリ一覧と Dock から起動できます",
+        Key::InstallFailedTitle => "{} をインストールできませんでした",
+        Key::InstallFailedBodyUnknown => "flatpak は理由を返しませんでした。ネットワークを確認してもう一度お試しください",
+        Key::LauncherDelegateTo => "{} に依頼",
+        Key::LauncherDelegatePlanHint => "やってほしいことを書いて Enter を押してください。進捗はホーム画面に表示されます",
+        Key::LauncherDelegateHint => "Enter で依頼",
+        Key::LauncherDelegateNoAgentTitle => "AI チームのメンバーがまだいません",
+        Key::LauncherDelegateNoAgentBody => "管理画面で追加するか、初期設定をもう一度実行してください",
+        Key::CcFooterStatus => "{} 名が稼働中 · {} 件があなた待ち",
+
+        Key::LiveInstallDiskExcludedMedium => "インストールメディアを除外しました：/dev/{}",
+        Key::LiveInstallDiskMediumUnknown => "インストールメディアを確認できませんでした。慎重に選択してください",
+        Key::LiveInstallProgressPreparing => "準備中です… — {}",
     }
 }
 

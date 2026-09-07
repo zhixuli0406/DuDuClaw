@@ -43,7 +43,16 @@ pub fn supports_vision(provider: RuntimeType, model_id: &str) -> bool {
         // fail closed otherwise. Anchored (ends_with) rather than substring —
         // convention #2 bans unanchored `contains` for routing decisions.
         RuntimeType::Grok => m.ends_with("-vision") || m.ends_with("vision-preview"),
-        RuntimeType::OpenAiCompat => false,
+        // Fail closed for every other runtime.
+        //
+        // The 2026-09 additions (Qwen / Kimi / Copilot / Kiro / Cursor / Vibe /
+        // OpenCode) are print-mode CLIs whose per-model vision support is not
+        // verified — and several of them (Copilot, Cursor, OpenCode) multiplex
+        // OTHER vendors' models, so the model id alone cannot answer the
+        // question. `false` makes the UI warn instead of silently dropping an
+        // image on a model that cannot see it, which is this module's stated
+        // contract. Give a runtime its own arm above only with evidence.
+        _ => false,
     }
 }
 

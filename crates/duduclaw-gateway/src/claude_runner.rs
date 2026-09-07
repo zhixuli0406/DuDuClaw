@@ -558,17 +558,55 @@ pub async fn call_claude_for_agent_preloaded(
     .await
 }
 
+/// OTel `gen_ai.system` for a runtime.
+///
+/// For the vendor-native backends this is the vendor's semconv name (the
+/// values Anthropic/OpenAI/Google/xAI backends are conventionally reported
+/// under); for a multi-vendor CLI shell — Copilot, Cursor, OpenCode, Kiro,
+/// which serve whichever model the user selected — there IS no single vendor,
+/// so the runtime id is reported instead. That is the most specific true
+/// statement available, and it is better than picking one vendor at random.
+fn gen_ai_system_for(provider: duduclaw_core::types::RuntimeType) -> &'static str {
+    use duduclaw_core::types::RuntimeType as R;
+    match provider {
+        R::Claude => "anthropic",
+        R::Codex | R::OpenAiCompat => "openai",
+        R::Gemini | R::Antigravity => "gcp.gemini",
+        R::Grok => "xai",
+        R::Qwen => "alibaba",
+        R::Kimi => "moonshot",
+        R::Vibe => "mistral",
+        // Multi-vendor shells: report the shell, not a guessed vendor.
+        other => other.as_str(),
+    }
+}
+
+/// Record the resolved runtime on the current `invoke_agent` span.
+fn record_runtime_on_span(provider: duduclaw_core::types::RuntimeType) {
+    let span = tracing::Span::current();
+    span.record(crate::otel::attrs::SYSTEM, gen_ai_system_for(provider));
+    span.record(crate::otel::attrs::PROVIDER_NAME, provider.as_str());
+}
+
 // OTel GenAI semconv (Development): root `invoke_agent` span for one
 // dispatcher agent run (sub-agent delegation / cron / bus tasks). Attribute
 // names centralized in `crate::otel`; model + usage are resolved mid-flight
 // and recorded post-hoc (usage in `call_claude_streaming` / the chat spans).
+//
+// WP-B: `gen_ai.system` / `gen_ai.provider.name` start `Empty` and are recorded
+// once the agent's `[runtime] provider` is resolved a few lines into the body.
+// They used to be the literal `"anthropic"`, which meant every Qwen / Kimi /
+// Copilot / Grok run was attributed to Anthropic in the trace — cost and
+// latency dashboards split by provider were silently wrong for every non-Claude
+// agent. There is no correct value to hard-code here: this span covers ALL
+// runtimes.
 #[tracing::instrument(
     name = "invoke_agent",
     skip_all,
     fields(
         gen_ai.operation.name = "invoke_agent",
-        gen_ai.system = "anthropic",
-        gen_ai.provider.name = "anthropic",
+        gen_ai.system = tracing::field::Empty,
+        gen_ai.provider.name = tracing::field::Empty,
         gen_ai.agent.name = %agent_id,
         gen_ai.request.model = tracing::field::Empty,
         gen_ai.usage.input_tokens = tracing::field::Empty,
@@ -714,6 +752,18 @@ async fn call_claude_for_agent_impl(
     // responding agent's runtime — and is the foundation A2A (Phase 3) builds on.
     // Parse agent.toml once for the routing decision and the choke-point (L7 followup).
     let delegation_settings = crate::runtime_config::load_runtime_settings(&agent_dir);
+
+    // OTel (WP-B): stamp the ACTUAL runtime on the `invoke_agent` span, now
+    // that `[runtime] provider` is known. Recorded here rather than in the
+    // `#[instrument]` attribute because the provider is a per-agent config read
+    // that cannot happen before the span opens — and hard-coding "anthropic"
+    // there (what this used to do) mis-attributed every non-Claude agent's run.
+    //
+    // `gen_ai.system` is the semconv's well-known backend identifier; for the
+    // vendor-native backends that is the vendor, and for a CLI shell we report
+    // the runtime id, which is the most specific true thing we know. Both
+    // attributes get the same value, matching what the `chat` spans below do.
+    record_runtime_on_span(delegation_settings.provider);
 
     // O1: confidence-aware multi-scale routing for delegated sub-tasks
     // (arXiv:2601.04861). Opt-in, default OFF — `config.toml [delegation]
@@ -1097,7 +1147,18 @@ async fn call_claude_for_agent_impl(
     // In "cli" mode: CLI is the only cloud path.
     // In "direct" mode: skip CLI, go straight to Direct API.
     let wd = effective_work_dir(&agent_dir);
-    if api_mode != "direct" {
+    // 2026-09-05 (DuDuClaw OS QEMU walkthrough): an appliance ships no Claude
+    // Code CLI at all, so "cli"/"auto" (agent.toml's default) died right here
+    // with "Claude CLI not found" on every dispatch — the goal task sat in
+    // `todo` forever and nothing told the operator why. A missing binary is
+    // not a reason to refuse the Direct API (which only needs a key), so
+    // treat it exactly like `api_mode = "direct"`: skip ② and let ③ surface
+    // the real, actionable blocker (a missing API key) if there is one.
+    let cli_available = duduclaw_core::which_claude().is_some();
+    if !cli_available && api_mode != "direct" {
+        info!(agent = %agent_name, api_mode = %api_mode, "Claude CLI is not installed on this machine — using Direct API instead");
+    }
+    if api_mode != "direct" && cli_available {
         info!(agent = %agent_name, model = %claude_model, "Calling Claude CLI (SDK primary)");
         match call_with_rotation(
             home_dir,
@@ -1936,7 +1997,27 @@ async fn try_direct_api(
         .await;
     }
 
-    let api_key = get_api_key(home_dir).await;
+    let mut api_key = get_api_key(home_dir).await;
+    if api_key.is_empty() {
+        // 2026-09-05 (DuDuClaw OS): a key added through `accounts.add` (the
+        // dashboard, and now the OOBE "AI Runtime 授權" step) lands in
+        // `[[accounts]]`, which only the rotator reads — `get_api_key` looks
+        // at the env var and `[api]` alone, so an appliance with exactly one
+        // stored key still died here with "No API key available". Ask the
+        // rotator for an API-key account before giving up.
+        if let Some(rotator) = rotator {
+            if let Some(env) = rotator.select_for_provider("anthropic").await {
+                if env.auth_method == duduclaw_agent::account_rotator::AuthMethod::ApiKey {
+                    if let Some(key) = env.raw_key.clone().or_else(|| env.env_vars.get("ANTHROPIC_API_KEY").cloned()) {
+                        if !key.is_empty() {
+                            info!(account = %env.id, "Direct API: using the stored [[accounts]] API key");
+                            api_key = key;
+                        }
+                    }
+                }
+            }
+        }
+    }
     if api_key.is_empty() {
         return Err(
             "No API key available for Direct API (OAuth accounts require CLI path)".to_string(),
@@ -2286,19 +2367,57 @@ static INFERENCE_INIT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
 /// Process-lifetime negative cache — set to `true` once
-/// `InferenceEngine::init` fails in a way that won't recover this run
-/// (e.g. the binary was built without `--features metal`/`cuda`/`vulkan`,
-/// so llama.cpp has no backend; or the router is disabled and there's
-/// no remote endpoint configured). Every later `get_inference_engine`
-/// call short-circuits silently to `None` instead of retrying init and
-/// re-emitting the same WARN. Reset is by restarting the gateway —
-/// which is also when the operator would have rebuilt with features.
-///
-/// Before this cache, every channel/dispatch call hit the init path and
-/// logged the same "Backend unavailable: llama.cpp — Build with
-/// --features metal, cuda, or vulkan" WARN, flooding the gateway log.
-static INFERENCE_UNAVAILABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// `InferenceEngine::init` failed, or initialised with no available
+/// backend. Instead of retrying on every channel/dispatch call (and
+/// re-emitting the same "Backend unavailable" WARN, flooding the log) the
+/// next attempt is deferred until this epoch-seconds instant. Until
+/// 2026-09-06 this was a permanent `AtomicBool`: an appliance whose first
+/// goal task ran before any local model was served marked local inference
+/// dead for the rest of the process, and downloading + serving a model
+/// through `inference.local.serve` changed nothing until a gateway
+/// restart. Now the probe re-runs after [`INFERENCE_RETRY_SECS`], and
+/// [`reset_inference_engine`] clears it immediately when the local model
+/// service is (re)started or stopped from the dashboard.
+static INFERENCE_RETRY_AFTER_SECS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// How long a failed engine init suppresses further init attempts.
+const INFERENCE_RETRY_SECS: i64 = 60;
+
+fn inference_unavailable_now() -> bool {
+    inference_retry_window_open(
+        chrono::Utc::now().timestamp(),
+        INFERENCE_RETRY_AFTER_SECS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Pure: `true` while `now` is before the deferred retry instant.
+pub(crate) fn inference_retry_window_open(now_secs: i64, retry_after_secs: i64) -> bool {
+    now_secs < retry_after_secs
+}
+
+fn mark_inference_unavailable() {
+    INFERENCE_RETRY_AFTER_SECS.store(
+        chrono::Utc::now().timestamp() + INFERENCE_RETRY_SECS,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Forget the cached engine and any deferred-retry window, so the next
+/// `get_inference_engine` re-reads `inference.toml` and re-probes the
+/// backend. Called by `inference.local.serve` / `inference.local.stop`
+/// once the local model service has been (re)started or stopped — the
+/// moment "is a local backend reachable" can change without a gateway
+/// restart.
+pub(crate) async fn reset_inference_engine() {
+    INFERENCE_RETRY_AFTER_SECS.store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Some(cache) = INFERENCE_ENGINE.get() {
+        let mut guard = cache.write().await;
+        if guard.take().is_some() {
+            info!("inference engine cache cleared — will re-probe the local backend on next use");
+        }
+    }
+}
 
 /// Get or create the inference engine singleton.
 ///
@@ -2313,7 +2432,7 @@ pub(crate) async fn get_inference_engine(
 ) -> Option<std::sync::Arc<duduclaw_inference::InferenceEngine>> {
     // Negative-cache fast path: a previous init attempt already failed
     // in a way that won't recover without a gateway restart. Skip silently.
-    if INFERENCE_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+    if inference_unavailable_now() {
         return None;
     }
 
@@ -2333,7 +2452,7 @@ pub(crate) async fn get_inference_engine(
 
     // Double-check after acquiring lock (another task may have initialized
     // or marked the engine permanently unavailable).
-    if INFERENCE_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+    if inference_unavailable_now() {
         return None;
     }
     {
@@ -2350,16 +2469,17 @@ pub(crate) async fn get_inference_engine(
         // fall through to SDK for the rest of this process's lifetime.
         warn!(
             error = %e,
-            "Failed to initialize inference engine — disabling local offload for this process (build with --features metal/cuda/vulkan to enable llama.cpp, or configure [openai_compat] in inference.toml for a remote backend)"
+            "Failed to initialize inference engine — local offload paused, will re-probe (build with --features metal/cuda/vulkan to enable llama.cpp, or configure [openai_compat] in inference.toml for a remote backend)"
         );
-        INFERENCE_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        mark_inference_unavailable();
         return None;
     }
     if !engine.is_available().await {
         warn!(
-            "Inference engine initialized but reports no available backend — disabling local offload for this process"
+            retry_secs = INFERENCE_RETRY_SECS,
+            "Inference engine initialized but reports no available backend — local offload paused, will re-probe"
         );
-        INFERENCE_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        mark_inference_unavailable();
         return None;
     }
     let arc = std::sync::Arc::new(engine);
@@ -2406,6 +2526,30 @@ async fn call_local_inference(
     let engine = get_inference_engine(home_dir)
         .await
         .ok_or_else(|| "Local inference engine not available".to_string())?;
+
+    // ── WP-D: never fabricate a model ─────────────────────────────
+    // On the appliance the local endpoint is configured by default (the
+    // image ships llama.cpp's server), so `enabled = true` says nothing
+    // about whether anyone has actually downloaded weights yet. Without
+    // this check a fresh device answers every local call with a connection
+    // error against 127.0.0.1:8080 — technically true, useless to read, and
+    // indistinguishable from a crashed server. Refuse up front with the
+    // real reason instead, and only in the one case where the request is
+    // *guaranteed* to fail: appliance defaults in play AND no GGUF on disk.
+    // An operator-configured endpoint is never second-guessed.
+    // (The directory scan is inside the branch, so a non-appliance host
+    // never pays for it on the hot path.)
+    if duduclaw_inference::appliance::appliance_defaults_active() {
+        let has_gguf =
+            duduclaw_inference::appliance::models_dir_has_gguf(&engine.config().models_path())
+                .await;
+        if duduclaw_inference::appliance::no_local_model(true, has_gguf) {
+            return Err(format!(
+                "{}: no local model installed — download one from the dashboard's local models page first",
+                duduclaw_inference::appliance::NO_LOCAL_MODEL_MARKER
+            ));
+        }
+    }
 
     // ── MCP tool loop (G2-local) ──────────────────────────────────
     // When the active backend is an OpenAI-compatible HTTP endpoint and
@@ -3883,6 +4027,15 @@ mod direct_api_routing_tests {
 
 #[cfg(test)]
 mod chain_tests {
+    #[test]
+    fn inference_retry_window_is_time_limited_not_permanent() {
+        use super::inference_retry_window_open;
+        assert!(!inference_retry_window_open(100, 0), "never failed ⇒ open to try");
+        assert!(inference_retry_window_open(100, 160), "inside the 60 s window ⇒ suppressed");
+        assert!(!inference_retry_window_open(160, 160), "window elapsed ⇒ re-probe");
+        assert!(!inference_retry_window_open(1000, 160));
+    }
+
     use super::*;
     use std::sync::{Arc, Mutex};
 

@@ -46,7 +46,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | 對話記憶與知識庫 | 單次 session | SQLite 時態記憶 + 分層 wiki + 自動注入 |
 | 工具跨 LLM 共用 | 每家重寫 | 200+ MCP 工具寫一次,五種後端共用 |
 | 安全邊界 / 稽核 / 密鑰管理 | 自己造 | 政策核心 + OS 沙箱 + AES-256-GCM 內建 |
-| 交給客戶的整台值班機 | 自己裝 Linux,更新與防竄改自己管 | DuDuClaw OS 映像:A/B 更新回滾 + Secure Boot + 唯讀 root,插電即用 |
+| 交給客戶的整台值班機 | 自己裝 Linux,更新與防竄改自己管 | DuDuClaw OS 映像:A/B 更新回滾 + 唯讀 root,插電即用;人機共用桌面,不影響日常使用 |
 
 <a id="architecture"></a>
 
@@ -114,9 +114,9 @@ npm install -g duduclaw
 
 ### DuDuClaw OS(值班機映像,pre-GA)
 
-不想佔用一台電腦,想要一台插電就跑的 AI 員工值班機:[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的 Linux 映像,把一台 x86-64 迷你主機變成無頭值班機。燒進去、接上電源與網路線,管理後台就出現在區網,之後全部在瀏覽器裡設定。內建 A/B 原子更新與回滾、唯讀 root + dm-verity、自簽 Secure Boot,並預載 Chromium / LibreOffice / Steam 與注音輸入法。
+不想佔用一台電腦,想要一台插電就跑的 AI 員工值班機:[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的 Linux 作業系統,AI agent 是原生住民:開機就是自家桌面(compositor / 殼、鎖定畫面、Cmd+K 交辦列),人和 AI 共用同一台 x86-64 主機,而且不影響日常使用:agent 的 GUI 工作預設在影子工作區跑,你一動鍵盤滑鼠,正在你桌面上操作的 agent 立刻讓位。桌面版內建 A/B 原子更新與回滾、唯讀 root,並預載 Chromium / LibreOffice / Steam 與注音輸入法;Secure Boot 簽章、dm-verity、TPM2 為建置期 overlay 選項,v0.1.0 發布映像未啟用。
 
-到 [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) 下載安裝器 `.iso`(燒 USB 開機安裝)或整碟 `.wic.zst`,每個檔案都附 `.sha256` 與 minisign 簽章,驗簽指令在該 repo 的 README。目前是 bring-up 版(0.x):QEMU 驗證通過,**尚未在真實硬體開機驗證**。硬體條件與相容機型見 [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md),產品說明見 [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md)。
+到 [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) 下載整碟 `.wic.zst`(桌面版)或安裝器 `.iso`(v0.1.0 寫入的是基礎版:同樣的桌面殼與 gateway,沒有應用層;桌面版安裝器 `installer-desktop` `.iso` 已於 2026-09-04 補進 v0.1.0),每個檔案都附 `.sha256` 與 minisign 簽章,驗簽指令在該 repo 的 README。目前是 bring-up 版(0.x):QEMU 驗證通過,**尚未在真實硬體開機驗證**。硬體條件與相容機型見 [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md),產品說明見 [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md)。
 
 ### 從原始碼建構
 
@@ -177,11 +177,12 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 安全 | PolicyKernel reference monitor(零 LLM、fail-closed)、macOS Seatbelt / Linux Landlock 原生沙箱、Docker / Apple Container / WSL2 容器沙箱、secret redaction vault、CONTRACT.toml 行為契約 + 紅隊測試 | [SECURITY.md](SECURITY.md) |
 | 帳號與成本 | 多 OAuth + API Key 輪替(4 策略)、rate-limit / 帳單冷卻、成本遙測與快取效率分析、跨平台 PTY pool 驅動 OAuth 訂閱帳號 | [docs/features](docs/features/README.md) |
 | 本地推論 | llama.cpp(Metal/CUDA/Vulkan)/ mistral.rs / Exo P2P / llamafile / MLX,三層信心路由自動分流;內建 Whisper 語音辨識與向量嵌入 | [docs/features](docs/features/README.md) |
+| 微調與後訓練 | 從本機對話、任務結果與審批決定建構 SFT / DPO 資料集(ShareGPT / Alpaca),送到自有 GPU 主機(SSH + LLaMA-Factory)或 Together 雲端訓練,GGUF / LoRA 匯回本地模型目錄;本機不做訓練(內顯跑不動),資料離機需明確確認 | [docs/features/53](docs/features/54-finetune.md) |
 | Live Forking | RFC-26:把進行中的任務分叉成 N 個競爭分支,各自 copy-on-write 隔離、AI judge 選勝者合併(預設關閉) | [docs/rfc](docs/rfc) |
 | 自動更新 | Dashboard 一鍵更新或背景自動更新(`auto_update = true`),SHA-256 + Ed25519 雙重驗證後原地重啟,前台分頁自動重載 | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web Dashboard | React 19 + TypeScript SPA 32 頁,嵌入 binary 零額外部署;zh-TW / en / ja 三語 | [docs/features](docs/features/README.md) |
 | ERP 整合 | Odoo 中間層 17 個 MCP 工具(CRM / 銷售 / 庫存 / 會計),CE/EE 自動偵測、per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
-| DuDuClaw OS | Yocto 值班機映像:A/B 原子更新與回滾、唯讀 root + dm-verity、自簽 Secure Boot、TPM2 金鑰密封(部分)、首次開機自動 provision + 區網後台、自家 compositor / 殼與快捷鍵、app 相容層(Flatpak / Bottles / Waydroid);獨立 repo 與版號,pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) |
+| DuDuClaw OS | Yocto 值班機映像:自家 compositor / 殼與快捷鍵、人機共駕(agent 專屬 seat、影子工作區、人輸入即凍結、Super+Esc 急停,預設關閉)、A/B 原子更新與回滾、唯讀 root、首次開機自動 provision + 區網後台、app 相容層(Flatpak / Bottles / Waydroid);Secure Boot 簽章 / dm-verity / TPM2 為建置 overlay 選項(v0.1.0 未啟用);獨立 repo 與版號,pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
 完整功能清單見 [docs/features/feature-inventory.md](docs/features/feature-inventory.md),版本演進見 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -262,7 +263,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開發環境與 agent 開發
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):自訂 MCP 工具教學
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md 與 CONTRACT.toml 格式規範
-- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS 值班機(產品說明);硬體需求見 [hardware-requirements.md](docs/guides/hardware-requirements.md)、app 相容層見 [app-compat.md](docs/guides/app-compat.md);映像建置與發布在 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo
+- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS 值班機(產品說明);[52-desktop-edition.md](docs/features/52-desktop-edition.md):桌面版,人機共用一台機器;硬體需求見 [hardware-requirements.md](docs/guides/hardware-requirements.md)、app 相容層見 [app-compat.md](docs/guides/app-compat.md);映像建置與發布在 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo
 - [CHANGELOG.md](CHANGELOG.md):版本變更紀錄
 
 <a id="license"></a>

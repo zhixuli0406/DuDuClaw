@@ -360,6 +360,19 @@ pub mod preset_prompt;
 //    install-job registry over the resumable downloader ──
 pub mod local_models;
 
+// ── WP-D: appliance local-model control plane (`inference.local.*` RPCs) —
+//    the verified six-model catalog, one-click download, and the env-file +
+//    service (re)start that points the image's llama.cpp server at a
+//    downloaded GGUF. Narrow, appliance-shaped counterpart to the
+//    open-ended `localmodels.*` marketplace above; shares its job registry ──
+pub mod inference_local;
+// ── WP-E: fine-tuning / post-training (`finetune.*` RPCs). Curate here,
+//    train elsewhere, deploy here — the appliance's iGPU cannot train, so
+//    this module only builds datasets, ships them to a GPU the user
+//    supplies, and imports the resulting GGUF/LoRA back into
+//    `<DUDUCLAW_HOME>/models` (the same dir `local_models` scans) ──
+pub mod finetune;
+
 // ── G1: durable multi-agent dispatch engine (atomic claim / zombie reclaim /
 //        dependency unlock / goal-mode judge acceptance) ──
 pub mod dispatch_engine;

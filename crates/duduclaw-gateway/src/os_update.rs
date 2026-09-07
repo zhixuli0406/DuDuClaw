@@ -140,16 +140,27 @@ pub const SIGNATURE_NAME: &str = "SHA256SUMS.minisig";
 
 /// Byte ceilings. Each refuses an absurd response *before* it is written to a
 /// small appliance disk, and each is far above any legitimate value: a UKI is
-/// ~150 MiB, a root slot is 5 GiB, the manifest is a few hundred bytes.
+/// ~150 MiB, the manifest is a few hundred bytes.
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 const MAX_UKI_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_ROOT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Root-payload ceiling — **9 GiB**.
+///
+/// Sized against the OS image's A/B root slot, not against the payload we
+/// happen to ship today: `docs/todo/TODO-ai-runtimes-2026-09.md` §1-2 raised
+/// `DUDUCLAW_AB_SLOT_SIZE_MB` from 7168 MiB to **8192 MiB** so the image can
+/// carry the full bundled AI-runtime set (six npm CLIs + four vendor binaries
+/// + a `mistral-vibe` venv, `meta-duduclaw`'s `duduclaw-ai-runtimes` recipe).
+/// A raw slot image is exactly the slot size, so the ceiling must sit ABOVE
+/// 8192 MiB or a legitimate full-size root would be refused mid-download; one
+/// GiB of headroom keeps that margin without opening the door to an absurd
+/// response on a small appliance disk.
+const MAX_ROOT_BYTES: u64 = 9 * 1024 * 1024 * 1024;
 /// VER-V: a separate ceiling for the dm-verity hash-tree artifact — never
 /// shared with [`MAX_ROOT_BYTES`] (see the module doc's "Disk budget"
 /// note). The design doc's own risk-table estimate puts a hash tree at
 /// roughly 8-10% of the root payload it protects, so 1 GiB is generous
-/// headroom against the 8 GiB root ceiling without approaching it.
+/// headroom against the 9 GiB root ceiling without approaching it.
 const MAX_VERITY_BYTES: u64 = 1024 * 1024 * 1024;
 /// The verity roothash companion is nothing but 64 hex characters (see
 /// [`uki_patch::is_roothash_text`]), optionally newline-terminated by
@@ -1643,6 +1654,24 @@ mod tests {
             sha256: sha.to_string(),
             name: name.to_string(),
         }
+    }
+
+    /// The root ceiling must stay ABOVE the OS's A/B root slot size, or a
+    /// legitimate full-size root image is refused mid-download. The OS raised
+    /// `DUDUCLAW_AB_SLOT_SIZE_MB` to 8192 MiB (TODO-ai-runtimes-2026-09 §1-2);
+    /// this pins the paired gateway-side ceiling so the two can't drift apart
+    /// silently again.
+    #[test]
+    fn root_ceiling_clears_the_8192_mib_ab_slot() {
+        const AB_SLOT_BYTES: u64 = 8192 * 1024 * 1024;
+        assert_eq!(MAX_ROOT_BYTES, 9 * 1024 * 1024 * 1024, "9 GiB");
+        assert!(
+            MAX_ROOT_BYTES > AB_SLOT_BYTES,
+            "MAX_ROOT_BYTES ({MAX_ROOT_BYTES}) must exceed the 8192 MiB root slot \
+             ({AB_SLOT_BYTES}) — a full-size slot image is exactly the slot size"
+        );
+        // …and the verity ceiling must remain strictly separate and smaller.
+        assert!(MAX_VERITY_BYTES < MAX_ROOT_BYTES);
     }
 
     #[test]

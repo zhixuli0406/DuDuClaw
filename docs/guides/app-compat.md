@@ -239,6 +239,8 @@ that `app-add`/`app-list` read and write
 where `setup` hasn't run, so the Launcher doesn't show an error or an
 empty section for it — that whole category just doesn't appear.
 
+On DuDuClaw OS the registry lives at `/data/system/windows-vm/apps.toml` instead (the image sets `DUDUCLAW_WINDOWS_VM_APPS_DIR=/data/system/windows-vm` for the gateway and for root's shell): `/data/duduclaw` is the gateway's home for the bundled AI CLIs and holds their login tokens, so it is `0700` and the kiosk shell could not read a file inside it. Only the registry moves; `compose.yaml` and the VM storage stay under `/data/duduclaw/windows-vm`.
+
 Running `app-add` again for the same executable overwrites the existing
 display name instead of creating a duplicate entry.
 

@@ -35,6 +35,63 @@ pub struct AgentRef {
     #[serde(rename = "name")]
     pub id: String,
     pub role: String,
+    /// Human-facing name (the dashboard's "顯示名稱"); empty when the
+    /// gateway omits it, in which case callers fall back to `id`.
+    #[serde(default)]
+    pub display_name: String,
+}
+
+impl AgentRef {
+    /// What to show a human: `display_name`, or the id when it is blank.
+    pub fn label(&self) -> &str {
+        if self.display_name.trim().is_empty() {
+            &self.id
+        } else {
+            &self.display_name
+        }
+    }
+}
+
+/// `accounts.add` — the dashboard's own "add credential" RPC (admin only).
+/// Stores an API key (encrypted into `config.toml` `[[accounts]]`) so the
+/// dispatch engine has something to run agents with. Used by the OOBE
+/// `RuntimeAuth` step. The gateway does not validate the key here; the first
+/// dispatch does.
+///
+/// WP-C (2026-09-05) added `provider` — the id from
+/// `oobe::runtime_providers::PROVIDERS`, one of
+/// `duduclaw_core::provider_env::KNOWN_PROVIDER_IDS` for the twelve rows
+/// that mirror it. `handle_accounts_add` on `main` as of this date reads
+/// only `id`/`type`/`key`/`monthly_budget_cents`/`priority` and IGNORES any
+/// other param, so sending this today is inert rather than an error;
+/// WP-A of `docs/todo/TODO-ai-runtimes-2026-09.md` is what makes
+/// `build_account_entry` write the provider-specific key field. Until then
+/// every key lands in the Anthropic field regardless of which row was used —
+/// stated here rather than discovered later.
+pub fn add_api_key_account(jwt: &str, provider: &str, id: &str, key: &str) -> Result<(), RpcError> {
+    let payload = ws_rpc::call_once(jwt, "accounts.add", json!({ "id": id, "type": "api_key", "provider": provider, "key": key }))?;
+    match payload.get("success").and_then(|v| v.as_bool()) {
+        Some(false) => Err(RpcError::Malformed(format!("accounts.add refused: {payload}"))),
+        _ => Ok(()),
+    }
+}
+
+/// `agents.create` — the dashboard's own "new AI employee" RPC (admin only,
+/// which the local session is). Used by `oobe::seed` so a freshly installed
+/// machine has someone to delegate to at all; `role` is the org role slug
+/// (`"main"` = the operator's default assistant, exactly what
+/// `pick_default_agent` prefers).
+pub fn create_agent(jwt: &str, name: &str, display_name: &str, role: &str, trigger: &str) -> Result<(), RpcError> {
+    let payload = ws_rpc::call_once(
+        jwt,
+        "agents.create",
+        json!({ "name": name, "display_name": display_name, "role": role, "trigger": trigger }),
+    )?;
+    if payload.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(())
+    } else {
+        Err(RpcError::Malformed(format!("agents.create did not report success: {payload}")))
+    }
 }
 
 /// Lists every agent this session can see. Blocking.
@@ -133,7 +190,7 @@ mod tests {
     use super::*;
 
     fn agent(id: &str, role: &str) -> AgentRef {
-        AgentRef { id: id.to_string(), role: role.to_string() }
+        AgentRef { id: id.to_string(), role: role.to_string(), display_name: String::new() }
     }
 
     #[test]

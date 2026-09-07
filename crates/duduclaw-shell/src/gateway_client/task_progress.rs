@@ -35,15 +35,39 @@ pub struct TaskProgressItem {
     pub assigned_to: String,
 }
 
-/// Lists every task-board row currently `status == "in_progress"`, across
-/// every agent this session can see (the task board's own `todo |
-/// in_progress | done | blocked` vocabulary — see
-/// `duduclaw-gateway/src/task_store.rs::TaskRow`'s own field comment). No
-/// `agent_id` filter is sent — `admin@local`'s local session is admin, which
-/// `check_agent_filter!` on the gateway side lets through unscoped (verified
-/// against `handle_dispatch`'s own `"tasks.list"` arm).
-pub fn list_in_progress_tasks(jwt: &str) -> Result<Vec<TaskProgressItem>, RpcError> {
-    let payload = ws_rpc::call_once(jwt, "tasks.list", json!({ "status": "in_progress" }))?;
-    let items = payload.get("tasks").cloned().unwrap_or(serde_json::Value::Array(Vec::new()));
-    serde_json::from_value(items).map_err(|e| RpcError::Malformed(format!("tasks.list payload did not match the expected shape: {e}")))
+/// The statuses Home and the dock badge treat as "open": what the AI team is
+/// doing right now, what is queued behind it, and what is parked waiting on
+/// the operator. Order matters — it is the display order when several
+/// compete for the three Home card slots, and the fetch order below.
+///
+/// 2026-09-05 (QEMU feature walkthrough): before this the feed asked only
+/// for `in_progress`, so a freshly delegated goal task (`status: "todo"`,
+/// picked up by the goal loop on its next tick or never, if no API key is
+/// configured) was invisible on Home — the operator pressed Enter on 交辦
+/// and saw「還沒有交辦的任務」. `needs_human` (the dispatch engine's
+/// parking status for a structured blocker such as a missing API key) was
+/// equally invisible unless it happened to be an approval-broker row.
+pub const OPEN_STATUSES: [&str; 3] = ["needs_human", "in_progress", "todo"];
+
+/// Display rank of an open status — lower sorts first (`needs_human`
+/// outranks everything: it is the one the operator can unblock).
+pub fn open_status_rank(status: &str) -> usize {
+    OPEN_STATUSES.iter().position(|s| *s == status).unwrap_or(OPEN_STATUSES.len())
 }
+
+/// Every open task, across all agents (admin session), ordered by
+/// `OPEN_STATUSES` rank and stable within a status. One `tasks.list` per
+/// status — the gateway's filter takes a single status string.
+pub fn list_open_tasks(jwt: &str) -> Result<Vec<TaskProgressItem>, RpcError> {
+    let mut all = Vec::new();
+    for status in OPEN_STATUSES {
+        let payload = ws_rpc::call_once(jwt, "tasks.list", json!({ "status": status }))?;
+        let items = payload.get("tasks").cloned().unwrap_or(serde_json::Value::Array(Vec::new()));
+        let mut batch: Vec<TaskProgressItem> = serde_json::from_value(items)
+            .map_err(|e| RpcError::Malformed(format!("tasks.list payload did not match the expected shape: {e}")))?;
+        all.append(&mut batch);
+    }
+    all.sort_by_key(|t| open_status_rank(&t.status));
+    Ok(all)
+}
+

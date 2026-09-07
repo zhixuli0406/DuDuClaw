@@ -61,6 +61,9 @@
 | 49 | [程式碼安全稽核](49-code-security-audit.md) | `duduclaw secaudit`：靜態掃描器＋AI 深度稽核＋對抗式覆核＋沙盒 PoC |
 | 50 | [DuDuClaw OS 值班機](50-duduclaw-os-appliance.md) | 可開機的值班機映像：區網儀表板引導、裝置頁、sysd 權限分離、webhook relay |
 | 51 | [DuDuClaw OS 快捷鍵總表](51-os-keyboard-shortcuts.md) | DuDuClaw OS 全部快捷鍵：compositor 全域綁定、殼 UI、首次設定、鎖定畫面 |
+| 52 | [DuDuClaw OS 桌面版](52-desktop-edition.md) | 人與 AI 共用一台機器：影子工作區、人輸入永遠優先、明確交還、共駕預設關閉 |
+| 53 | [裝置上的本地模型](53-local-models.md) | 六個查證過的 GGUF，一鍵下載、一鍵啟用；預設 hybrid，速度誠實不灌水 |
+| 54 | [微調與後訓練](54-finetune.md) | 資料在這裡整理、訓練到別的 GPU 上跑、GGUF／LoRA 再收回來——這台機器不做訓練 |
 
 ---
 

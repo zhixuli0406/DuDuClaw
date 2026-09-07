@@ -512,10 +512,29 @@ impl McpDispatcher {
         // (§3.5) and the OS-native gate (§3.62) all read it, so we avoid
         // parsing agent.toml twice. External clients aren't agents (no
         // per-agent config), so they get the empty default without a fs read.
+        // The per-agent capability gate is keyed by the AGENT whose
+        // agent.toml applies. A per-agent MCP key's `client_id` IS that
+        // agent id, but every MCP child the gateway spawns (each agent's own
+        // `.mcp.json`) authenticates with the shared internal key, whose
+        // client_id is `gateway-internal` — not an agent, so the gate used
+        // to read `agents/gateway-internal/agent.toml`, find nothing, and
+        // fail closed for ALL of os_native / recording / system_operator /
+        // codrive on every production spawn (2026-09-05, DuDuClaw OS QEMU
+        // walkthrough: `codrive_status` refused for an agent whose
+        // agent.toml plainly said `codrive = true`). For the internal key the
+        // acting agent is `default_agent` (DUDUCLAW_AGENT_ID, token-verified
+        // at startup), so gate on that instead.
+        let gate_agent: &str = if principal.client_id == duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
+            && !self.default_agent.is_empty()
+        {
+            &self.default_agent
+        } else {
+            &principal.client_id
+        };
         let agent_gate = if principal.is_external {
             AgentGateConfig::default()
         } else {
-            load_agent_gate_config(&self.home_dir, &principal.client_id).await
+            load_agent_gate_config(&self.home_dir, gate_agent).await
         };
 
         // ── 3.45 denied_tools / allowed_tools capability gate (Gap (b), WP-H2 §1.3) ──

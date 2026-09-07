@@ -88,7 +88,7 @@ mod state;
 mod steps;
 
 pub(crate) use render::render;
-pub(crate) use state::{AccountError, DiskInfo, DiskScanState, InstallState, LiveInstallFlow, LiveInstallStep, NetworkError};
+pub(crate) use state::{AccountError, DiskInfo, DiskScanState, InstallState, LiveInstallFlow, LiveInstallStep, LiveMediumNote, NetworkError};
 
 #[cfg(test)]
 mod tests {

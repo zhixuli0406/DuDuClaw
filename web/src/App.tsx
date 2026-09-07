@@ -74,6 +74,7 @@ const ReliabilityPage = lazyPage(() => import('./pages/ReliabilityPage'), 'Relia
 const SettingsPage = lazyPage(() => import('./pages/SettingsPage'), 'SettingsPage');
 const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
 const LocalModelsPage = lazyPage(() => import('./pages/LocalModelsPage'), 'LocalModelsPage');
+const FineTunePage = lazyPage(() => import('./pages/FineTunePage'), 'FineTunePage');
 const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const DepartmentsPage = lazyPage(() => import('./pages/DepartmentsPage'), 'DepartmentsPage');
 const MigratePage = lazyPage(() => import('./pages/MigratePage'), 'MigratePage');
@@ -386,6 +387,10 @@ export function App() {
                   <Route path="integrations" element={<IntegrationsPage />} />
                   <Route path="inference" element={<InferencePage />} />
                   <Route path="local-models" element={<LocalModelsPage />} />
+                  {/* 微調與後訓練 (WP-E) — curate here, train elsewhere,
+                      deploy here. Admin-only: dataset building reads every
+                      stored conversation on the box. */}
+                  <Route path="finetune" element={<FineTunePage />} />
                   <Route path="reliability" element={<ReliabilityPage />} />
                   {/* 安全 / 設定 relocated to `/app/system/*` (N-3). */}
                   <Route path="security" element={<LegacyRouteRedirect to="/app/system/security" />} />
@@ -454,6 +459,7 @@ export function App() {
                 <Route path="settings" element={<LegacyRouteRedirect to="/app/system/settings" />} />
                 <Route path="inference" element={<InferencePage />} />
                 <Route path="local-models" element={<LocalModelsPage />} />
+                <Route path="finetune" element={<FineTunePage />} />
                 {/* D10-B: the aliases were the hole — every Enterprise-only page
                     had an ungated second path in here. Same guard as the
                     canonical routes above, so neither can be used to walk around

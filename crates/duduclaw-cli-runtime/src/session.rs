@@ -76,6 +76,23 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Which CLI we're driving. Determines flag conventions used to inject the
 /// sentinel-protocol instructions.
+///
+/// **These variants and their strings mirror
+/// `duduclaw_core::runtime_catalog::CATALOG` one-for-one** (every entry with a
+/// binary — `openai_compat` is an HTTP endpoint and therefore has no kind).
+/// This crate is deliberately dependency-free (it is a standalone PTY pool, not
+/// a DuDuClaw-internal library), so the coupling is enforced by a test rather
+/// than by a shared table: see
+/// `duduclaw-gateway/src/pty_runtime.rs::cli_kind_covers_every_catalog_cli`,
+/// which fails the build the moment a runtime is added to the catalog and not
+/// here. `duduclaw-gateway/src/pty_runtime.rs::cli_kind_for_runtime` is the one
+/// bridge function between the two types — do not write a second one.
+///
+/// Only [`CliKind::Claude`] has a validated interactive-REPL protocol. The rest
+/// exist so the pool/worker layer is unbound from Claude and so
+/// `parse`/`as_str` round-trip every runtime id; in practice they are routed to
+/// the oneshot print-mode path (`runtime/generic_cli.rs` or a bespoke module)
+/// upstream. See `inject_protocol_args`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CliKind {
     Claude,
@@ -85,26 +102,83 @@ pub enum CliKind {
     /// Gemini CLI. Driven via oneshot `agy -p` (no interactive-REPL protocol);
     /// see `inject_protocol_args`.
     Antigravity,
+    /// xAI Grok Build (`grok`).
+    Grok,
+    /// Alibaba Qwen Code (`qwen`).
+    Qwen,
+    /// Moonshot AI Kimi Code (`kimi`).
+    Kimi,
+    /// GitHub Copilot CLI (`copilot`).
+    Copilot,
+    /// AWS Kiro CLI (`kiro-cli`).
+    Kiro,
+    /// Cursor CLI (`cursor-agent`).
+    Cursor,
+    /// Mistral Vibe (`vibe`).
+    Vibe,
+    /// OpenCode (`opencode`).
+    OpenCode,
 }
 
 impl CliKind {
+    /// Every kind, in catalog order.
+    pub const ALL: &'static [CliKind] = &[
+        CliKind::Claude,
+        CliKind::Codex,
+        CliKind::Gemini,
+        CliKind::Antigravity,
+        CliKind::Grok,
+        CliKind::Qwen,
+        CliKind::Kimi,
+        CliKind::Copilot,
+        CliKind::Kiro,
+        CliKind::Cursor,
+        CliKind::Vibe,
+        CliKind::OpenCode,
+    ];
+
+    /// Stable identifier — byte-identical to the runtime's catalog id, so a
+    /// `RuntimeType` can be bridged to a `CliKind` by string without a second
+    /// mapping table.
     pub fn as_str(&self) -> &'static str {
         match self {
             CliKind::Claude => "claude",
             CliKind::Codex => "codex",
             CliKind::Gemini => "gemini",
             CliKind::Antigravity => "antigravity",
+            CliKind::Grok => "grok",
+            CliKind::Qwen => "qwen",
+            CliKind::Kimi => "kimi",
+            CliKind::Copilot => "copilot",
+            CliKind::Kiro => "kiro",
+            CliKind::Cursor => "cursor",
+            CliKind::Vibe => "vibe",
+            CliKind::OpenCode => "opencode",
         }
     }
 
+    /// Parse an id (or a documented alias). Unknown ⇒ error, never a default:
+    /// silently coercing an unrecognised kind to Claude would drive the wrong
+    /// binary.
     pub fn parse(s: &str) -> Result<Self, SessionError> {
-        match s.to_ascii_lowercase().as_str() {
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            "gemini" => Ok(Self::Gemini),
-            "antigravity" | "agy" => Ok(Self::Antigravity),
-            other => Err(SessionError::UnknownCliKind(other.to_string())),
-        }
+        let key = s.trim().to_ascii_lowercase();
+        // Aliases mirror `runtime_catalog`'s `aliases` for the same runtimes.
+        let canonical = match key.as_str() {
+            "agy" => "antigravity",
+            "grok-cli" => "grok",
+            "qwen-code" => "qwen",
+            "kimi-code" => "kimi",
+            "github-copilot" => "copilot",
+            "kiro-cli" | "amazon-q" => "kiro",
+            "cursor-agent" => "cursor",
+            "mistral-vibe" => "vibe",
+            other => other,
+        };
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|k| k.as_str() == canonical)
+            .ok_or_else(|| SessionError::UnknownCliKind(key))
     }
 }
 
@@ -1053,13 +1127,17 @@ pub(crate) fn inject_protocol_args(args: &mut Vec<String>, kind: CliKind) {
             // surfaces its own flag conventions; not yet validated against
             // live binaries.
         }
-        CliKind::Antigravity => {
-            // Antigravity (`agy`) exposes NO system-prompt flag (verified against
-            // `agy --help` v1.0.12), so the sentinel bootstrap that Claude gets
-            // via `--append-system-prompt` has no equivalent here. agy is driven
-            // through the oneshot `agy -p` path (no persistent interactive REPL),
-            // which does not need the sentinel protocol — so this is a no-op.
-        }
+        // Antigravity (`agy`) exposes NO system-prompt flag (verified against
+        // `agy --help` v1.0.12), so the sentinel bootstrap that Claude gets via
+        // `--append-system-prompt` has no equivalent here.
+        //
+        // The same is true of every kind below it: they are print-mode
+        // ("oneshot") CLIs driven through `runtime/generic_cli.rs` or a bespoke
+        // runtime module, never through a persistent interactive REPL, so the
+        // sentinel protocol has nothing to attach to. One arm rather than a
+        // dozen identical no-ops — a new runtime does not need an edit here,
+        // and if one ever DOES grow a REPL it gets its own arm above.
+        _ => {}
     }
 }
 
@@ -1402,20 +1480,39 @@ mod tests {
 
     #[test]
     fn cli_kind_round_trip() {
-        for k in [
-            CliKind::Claude,
-            CliKind::Codex,
-            CliKind::Gemini,
-            CliKind::Antigravity,
-        ] {
-            assert_eq!(CliKind::parse(k.as_str()).unwrap(), k);
+        for k in CliKind::ALL {
+            assert_eq!(CliKind::parse(k.as_str()).unwrap(), *k);
+            assert_eq!(
+                CliKind::parse(&k.as_str().to_ascii_uppercase()).unwrap(),
+                *k,
+                "parse is case-insensitive"
+            );
         }
-        // `agy` is an accepted alias for antigravity.
+        // Aliases, mirroring `runtime_catalog`'s alias lists.
         assert_eq!(CliKind::parse("agy").unwrap(), CliKind::Antigravity);
+        assert_eq!(CliKind::parse("grok-cli").unwrap(), CliKind::Grok);
+        assert_eq!(CliKind::parse("cursor-agent").unwrap(), CliKind::Cursor);
+        assert_eq!(CliKind::parse("kiro-cli").unwrap(), CliKind::Kiro);
+        assert_eq!(CliKind::parse(" QWEN-CODE ").unwrap(), CliKind::Qwen);
         assert!(matches!(
             CliKind::parse("nothing"),
             Err(SessionError::UnknownCliKind(_))
         ));
+        // `openai_compat` is an HTTP endpoint, not a CLI — it must NOT parse
+        // into a kind that would send the pool looking for a binary.
+        assert!(CliKind::parse("openai_compat").is_err());
+    }
+
+    #[test]
+    fn cli_kind_ids_are_unique_and_all_is_exhaustive() {
+        let mut seen = std::collections::HashSet::new();
+        for k in CliKind::ALL {
+            assert!(seen.insert(k.as_str()), "duplicate CliKind id {}", k.as_str());
+        }
+        // Cheap guard that a new variant was added to `ALL` too: `parse` walks
+        // `ALL`, so a variant missing from it would fail its own round-trip
+        // above — this pins the count so the omission is named explicitly.
+        assert_eq!(CliKind::ALL.len(), 12);
     }
 
     // Round 4 deferred-cleanup — spawn_cwd accessor.

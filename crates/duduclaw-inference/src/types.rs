@@ -8,7 +8,20 @@ use serde::{Deserialize, Serialize};
 pub enum BackendType {
     /// llama.cpp via llama-cpp-2 crate (Metal/CUDA/Vulkan/CPU)
     LlamaCpp,
-    /// OpenAI-compatible HTTP server (Exo, llamafile, vLLM, etc.)
+    /// OpenAI-compatible HTTP server (Exo, llamafile, vLLM, the DuDuClaw OS
+    /// llama-server, etc.).
+    ///
+    /// Wire name is `openai_compat` — the spelling every other surface
+    /// already uses (`[openai_compat]` config table, `inference.update`'s
+    /// backend validation, the dashboard, `appliance.rs`'s defaults). Until
+    /// 2026-09-06 `rename_all = "snake_case"` alone made this variant
+    /// `open_ai_compat`, so a file written by any of those surfaces failed
+    /// to deserialize ("unknown variant `openai_compat`") and the engine
+    /// silently reported "no available backend" — found live on the first
+    /// appliance bake with a downloaded model. `open_ai_compat` stays
+    /// accepted as an alias for files written by hand against the old
+    /// serde name.
+    #[serde(rename = "openai_compat", alias = "open_ai_compat")]
     OpenAiCompat,
     /// mistral.rs native Rust engine (future)
     MistralRs,
@@ -231,4 +244,29 @@ pub struct HardwareInfo {
     pub recommended_backend: BackendType,
     /// Recommended max model size in GB
     pub recommended_max_model_gb: f64,
+}
+
+#[cfg(test)]
+mod backend_type_wire_name_tests {
+    use super::BackendType;
+
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        backend: BackendType,
+    }
+
+    #[test]
+    fn openai_compat_is_the_wire_name_and_the_legacy_spelling_still_parses() {
+        // The spelling every writer uses (`[openai_compat]`, appliance.rs,
+        // inference.update, the dashboard).
+        let p: Probe = toml::from_str("backend = \"openai_compat\"\n").unwrap();
+        assert_eq!(p.backend, BackendType::OpenAiCompat);
+        // The pre-2026-09-06 serde-derived spelling, kept as an alias.
+        let p: Probe = toml::from_str("backend = \"open_ai_compat\"\n").unwrap();
+        assert_eq!(p.backend, BackendType::OpenAiCompat);
+        // Serialization emits the canonical spelling, so a config the engine
+        // writes back is one it can read again.
+        assert_eq!(serde_json::to_string(&BackendType::OpenAiCompat).unwrap(), "\"openai_compat\"");
+        assert_eq!(serde_json::to_string(&BackendType::LlamaCpp).unwrap(), "\"llama_cpp\"");
+    }
 }

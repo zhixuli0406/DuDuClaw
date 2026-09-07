@@ -259,15 +259,16 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
 /// panic, never a silently-assumed success.
 fn decode_envelope(resp: HttpResponse) -> Result<Value, NetError> {
     if resp.status == 403 {
-        // D4a §5.2: 403 = the gateway's own first-run gate refused this
-        // caller (not loopback, first run already completed, or not
-        // running on an appliance). In practice this path should never be
-        // reached (this module already refuses non-loopback URLs itself,
-        // and OOBE only runs before first-run completes) — if it IS
-        // reached, something upstream disagrees about state, and the
-        // honest answer is "the network service isn't available", not a
-        // guess at which of the three gate conditions tripped.
-        return Err(NetError::Unavailable("gateway refused this caller (HTTP 403 — not loopback, first run already completed, or not an appliance)".to_string()));
+        // The gate names its reason since 2026-09-05; an older gateway sends
+        // no `code` at all. This shell only ever calls over loopback on the
+        // appliance, so a code-less 403 can only mean setup already ran.
+        let code = serde_json::from_slice::<Value>(&resp.body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string));
+        return match code.as_deref() {
+            None | Some("first_run_completed") => Err(NetError::FirstRunCompleted),
+            Some(other) => Err(NetError::Unavailable(format!("gateway refused this caller (HTTP 403, {other})"))),
+        };
     }
     if resp.status != 200 {
         return Err(NetError::Unavailable(format!(
@@ -668,9 +669,29 @@ mod tests {
 
     // ── HTTP-layer failure modes ─────────────────────────────────────────
 
+    // 2026-09-05: a 403 from the first-run gate is read by its `code`. A
+    // code-less 403 (older gateway) can only mean "setup already ran" for
+    // this shell (always loopback, always on the appliance), so it maps to
+    // `FirstRunCompleted` too; any other named reason stays `Unavailable`.
     #[test]
-    fn http_403_maps_to_an_unavailable_error_not_a_classified_code() {
+    fn http_403_without_a_code_means_first_run_already_completed() {
         let base = start_mock_server(vec!["HTTP/1.1 403 Forbidden\r\n\r\n{}"]);
+        assert!(matches!(scan_at(&base), Err(NetError::FirstRunCompleted)));
+    }
+
+    #[test]
+    fn http_403_with_the_first_run_completed_code_maps_to_first_run_completed() {
+        let base = start_mock_server(vec![
+            "HTTP/1.1 403 Forbidden\r\n\r\n{\"error\":\"x\",\"code\":\"first_run_completed\"}",
+        ]);
+        assert!(matches!(scan_at(&base), Err(NetError::FirstRunCompleted)));
+    }
+
+    #[test]
+    fn http_403_with_another_code_stays_an_unavailable_error() {
+        let base = start_mock_server(vec![
+            "HTTP/1.1 403 Forbidden\r\n\r\n{\"error\":\"x\",\"code\":\"not_loopback\"}",
+        ]);
         assert!(matches!(scan_at(&base), Err(NetError::Unavailable(_))));
     }
 

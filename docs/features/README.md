@@ -61,6 +61,9 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 49 | [Code Security Audit](49-code-security-audit.md) | `duduclaw secaudit`: static scanners + AI deep audit + adversarial review + sandboxed PoC |
 | 50 | [DuDuClaw OS Appliance](50-duduclaw-os-appliance.md) | Bootable appliance image — LAN dashboard onboarding, device page, sysd privilege separation, webhook relay |
 | 51 | [OS Keyboard Shortcuts](51-os-keyboard-shortcuts.md) | Every DuDuClaw OS shortcut — global compositor bindings, shell UI, first-run setup, lock screen |
+| 52 | [DuDuClaw OS Desktop Edition](52-desktop-edition.md) | One machine shared by a person and the AI — shadow workspace, human input always wins, explicit hand-back, off-by-default co-driving |
+| 53 | [Local Models on the Device](53-local-models.md) | Six verified GGUFs, one click to download and one to switch on; hybrid by default, honest about speed |
+| 54 | [Fine-tuning and Post-training](54-finetune.md) | Curate the dataset here, train it on a GPU elsewhere, import the GGUF/LoRA back — this machine never trains |
 
 ---
 

@@ -248,6 +248,8 @@ duduclaw compat windows-vm app-remove winword.exe
 いマシンにはそもそも存在しないため、ランチャーはエラーや空欄を表示する
 のではなく、そのカテゴリ自体がまったく現れません。
 
+DuDuClaw OS ではこのレジストリは `/data/system/windows-vm/apps.toml` に置かれます（イメージが gateway と root のシェルに `DUDUCLAW_WINDOWS_VM_APPS_DIR=/data/system/windows-vm` を設定します）。`/data/duduclaw` は同梱 AI CLI を動かすときの gateway のホームで各社のログイントークンを含むため `0700` になっており、キオスクのシェルはその中のファイルを読めません。移動するのはレジストリだけで、`compose.yaml` と VM のストレージは `/data/duduclaw/windows-vm` のままです。
+
 同じ実行ファイルに対して再度 `app-add` を実行すると、既存の表示名が上
 書きされ、重複した項目は生成されません。
 

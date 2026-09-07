@@ -339,13 +339,31 @@ fn compose_path(home: &Path) -> PathBuf {
 //
 // An operator-maintained list of Windows executables inside the VM that
 // should appear as tiles in the shell's Launcher. `app-add`/`app-remove`/
-// `app-list` below read and write `<DUDUCLAW_HOME>/windows-vm/apps.toml`;
-// `duduclaw-shell`'s own `apps::windows_vm` module reads the SAME file from
-// a fixed, hardcoded path (never `$HOME`-relative — see that module's
-// header comment), because it runs as a different OS user (the
-// unprivileged `kiosk` account, home `/data/duduclaw-kiosk`) than this CLI
-// (whatever account owns `/data/duduclaw`, where `duduclaw_home()`
+// `app-list` below read and write `<DUDUCLAW_HOME>/windows-vm/apps.toml`
+// by default; `duduclaw-shell`'s own `apps::windows_vm` module reads the
+// SAME file from a fixed, hardcoded path (never `$HOME`-relative — see
+// that module's header comment), because it runs as a different OS user
+// (the unprivileged `kiosk` account, home `/data/duduclaw-kiosk`) than this
+// CLI (whatever account owns `/data/duduclaw`, where `duduclaw_home()`
 // resolves on the appliance).
+//
+// ── `DUDUCLAW_WINDOWS_VM_APPS_DIR` (2026-09-06): the registry moved OUT of
+// `<DUDUCLAW_HOME>` on DuDuClaw OS ──────────────────────────────────────
+// The OS image's gateway now runs the vendor AI CLIs with
+// `HOME=/data/duduclaw`, so that directory holds every vendor's OAuth
+// tokens and is `0700` (the firstboot provisioner tightens it). A `0700`
+// parent blocks traversal for the kiosk user regardless of `apps.toml`'s
+// own `0644`, which would make every pinned Windows app silently vanish
+// from the Launcher. So the appliance points BOTH sides at a root-owned,
+// world-readable directory outside the credential tree:
+// `/data/system/windows-vm` — this CLI through the
+// [`WINDOWS_VM_APPS_DIR_ENV`] environment variable (set on the gateway
+// unit by `duduclaw-firstboot`'s `20-home.conf` drop-in and in root's
+// interactive profile), the shell through its hardcoded default. Only the
+// registry moves: `compose.yaml` and the VM storage stay under
+// `<DUDUCLAW_HOME>/windows-vm`, which nobody but this CLI reads. Off the
+// appliance (a workstation install) the variable is unset and the registry
+// stays next to `compose.yaml` exactly as before.
 //
 // ── Why `0644`/`0755`, not `compose.yaml`'s `0600` ───────────────────────
 // `compose.yaml` is treated as sensitive-by-default (see
@@ -428,8 +446,22 @@ struct RemoteAppsFile {
     apps: Vec<RemoteAppEntry>,
 }
 
+/// Overrides the DIRECTORY the RemoteApp registry (`apps.toml`) lives in —
+/// see the "`DUDUCLAW_WINDOWS_VM_APPS_DIR`" paragraph in this section's
+/// header. Empty or unset ⇒ `<DUDUCLAW_HOME>/windows-vm`.
+pub const WINDOWS_VM_APPS_DIR_ENV: &str = "DUDUCLAW_WINDOWS_VM_APPS_DIR";
+
 fn apps_toml_path(home: &Path) -> PathBuf {
-    windows_vm_dir(home).join("apps.toml")
+    apps_toml_path_with(home, std::env::var_os(WINDOWS_VM_APPS_DIR_ENV).as_deref())
+}
+
+/// Pure half of [`apps_toml_path`] (no environment read) so the override
+/// can be unit-tested without racing other tests on a process-wide env var.
+fn apps_toml_path_with(home: &Path, override_dir: Option<&std::ffi::OsStr>) -> PathBuf {
+    match override_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("apps.toml"),
+        _ => windows_vm_dir(home).join("apps.toml"),
+    }
 }
 
 /// Rejects a CR/LF or over-length exe path before it ever reaches the
@@ -1232,7 +1264,24 @@ mod tests {
     #[test]
     fn apps_toml_lives_under_the_windows_vm_directory_next_to_compose_yaml() {
         let home = Path::new("/home/duduclaw/.duduclaw");
-        assert_eq!(apps_toml_path(home), home.join("windows-vm").join("apps.toml"));
+        assert_eq!(apps_toml_path_with(home, None), home.join("windows-vm").join("apps.toml"));
+        // An EMPTY override is "unset", not "the current directory".
+        assert_eq!(
+            apps_toml_path_with(home, Some(std::ffi::OsStr::new(""))),
+            home.join("windows-vm").join("apps.toml")
+        );
+    }
+
+    #[test]
+    fn apps_toml_dir_override_moves_only_the_registry_not_compose_yaml() {
+        // The appliance sets `DUDUCLAW_WINDOWS_VM_APPS_DIR=/data/system/windows-vm`
+        // so the kiosk shell can read the registry from outside the `0700`
+        // credential tree — see the section header. `compose.yaml` must NOT
+        // follow: it is `0600` and nobody but this CLI reads it.
+        let home = Path::new("/data/duduclaw");
+        let over = std::ffi::OsStr::new("/data/system/windows-vm");
+        assert_eq!(apps_toml_path_with(home, Some(over)), PathBuf::from("/data/system/windows-vm/apps.toml"));
+        assert_eq!(compose_path(home), PathBuf::from("/data/duduclaw/windows-vm/compose.yaml"));
     }
 
     #[tokio::test]

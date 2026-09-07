@@ -62,6 +62,9 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/49-code-security-audit.md](features/49-code-security-audit.md) | Code security audit — `duduclaw secaudit`: static scanners + AI deep audit + adversarial review + sandboxed PoC |
 | [features/50-duduclaw-os-appliance.md](features/50-duduclaw-os-appliance.md) | DuDuClaw OS appliance — bootable image, LAN dashboard onboarding, device page, sysd privilege separation, webhook relay |
 | [features/51-os-keyboard-shortcuts.md](features/51-os-keyboard-shortcuts.md) | DuDuClaw OS keyboard shortcuts — global compositor bindings, shell UI, first-run setup, lock screen |
+| [features/52-desktop-edition.md](features/52-desktop-edition.md) | DuDuClaw OS desktop edition — one machine shared by a person and the AI: shadow workspace, human input always wins, explicit hand-back, off-by-default co-driving |
+| [features/53-local-models.md](features/53-local-models.md) | Local models on the device — six verified GGUFs served by the image's llama.cpp `llama-server`, one click to download and one to switch on; hybrid by default |
+| [features/54-finetune.md](features/54-finetune.md) | Fine-tuning and post-training — curate the dataset from stored conversations/tasks/approvals here, train on a remote GPU host or Together, import the GGUF/LoRA back into the local models directory; never trains locally |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
@@ -120,6 +123,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [todo/TODO-telegram-reply-context.md](todo/TODO-telegram-reply-context.md) | Telegram 回覆/引用訊息內容遺失（reply_to_message 未解析）修復 |
 | [todo/TODO-channel-quote-context-remaining.md](todo/TODO-channel-quote-context-remaining.md) | 其餘通道引用/回覆上下文缺口（全通道掃描結果）追蹤 |
 | [todo/TODO-gateway-store-reopen-per-rpc.md](todo/TODO-gateway-store-reopen-per-rpc.md) | gateway 三個 SQLite store 每次 dashboard RPC 都重開（日誌噪音；已排除洩漏嫌疑） |
+| [todo/TODO-ai-runtimes-2026-09.md](todo/TODO-ai-runtimes-2026-09.md) | 全 runtime 開箱即用、本地模型、微調介面（2026-09）：決策紀錄與 WP-A～WP-F 工作單元規格／完成狀態 |
 
 ## User & Developer Guides
 
@@ -134,6 +138,7 @@ Open standards that define the DuDuClaw agent ecosystem.
 | [guides/shortcuts-and-wearables.md](guides/shortcuts-and-wearables.md) | 手腕與穿戴：Apple Watch 捷徑打 HTTP API、Bee=外部 MCP 純設定、Omi/Plaud webhook→`/ingest/transcript` 直灌記憶 | Current |
 | [guides/remote-mcp.md](guides/remote-mcp.md) | Remote MCP：claude.ai 自訂連接器直連自家 DuDuClaw（標準 `/mcp` 端點＋OAuth 2.1 流程、scope 收斂模型、tunnel 部署與撤銷） | Current |
 | [guides/hardware-requirements.md](guides/hardware-requirements.md) | DuDuClaw OS 硬體需求與相容性指南（硬性條件 x86-64+AVX2／UEFI／SSD、最低/建議/舒適配置表、自組 PC 相容性檢查清單、x86 筆電評估、推薦迷你主機 N100/N305/8845HS、驅動缺口 MT7927/RTL8125、樹莓派/Arduino/ESP32 為何跑不了 OS＋作為 resident sensing 感測端點的接入方式、兩層總矩陣、為何不能用 ARM/Mac 模擬、燒 USB 而非光碟） | Current |
+| [guides/remote-gpu-host.md](guides/remote-gpu-host.md) | 遠端 GPU 主機準備指南（Ubuntu + CUDA 驅動、venv 安裝 LLaMA-Factory、工作目錄、選用 llama.cpp 轉 GGUF、SSH 金鑰授權與 `BatchMode` 驗證、表單欄位對照、先跑乾跑、template 對照表、故障排除） | Current |
 | [guides/app-compat.md](guides/app-compat.md) | app 相容層：`compat.d` 宣告式 runner 登記（出貨層/資料層覆蓋序）、`duduclaw compat list` 用法、Bottles（Flathub 安裝＋Silver 級以上適用範圍，Office/LINE/AutoCAD 明文不承諾）、Waydroid（不含 GApps/ARM 轉譯，自裝入口＋風險揭露）、macOS 應用程式不做本機執行的話術鐵則 | Current |
 | [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
 | [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |

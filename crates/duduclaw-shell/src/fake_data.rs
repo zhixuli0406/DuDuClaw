@@ -14,6 +14,20 @@
 // `main.rs` stays data-free — same separation `duduclaw-native-gui`'s own
 // `screens::prototypes` module keeps between its static page data and
 // rendering.
+//
+// ── WP-fix-QEMU-a (2026-09-05): that S0 convention stops at chrome/decor
+// content, not at claims about THIS machine's own state or history ────────
+// A QEMU first-boot walkthrough found `GREETING`/`GOAL_CARDS`/
+// `ACTIVITY_SHELF`/`BATTERY_PCT`/`CLOCK` (a placeholder person's name, three
+// invented in-flight tasks, a fabricated "completed today" log, an
+// unconditional battery reading, and a frozen clock value) still rendering
+// on a freshly installed system that had none of that. See the note just
+// above `SUGGESTION_CHIPS` below for exactly what replaced each one and
+// where. The dock's Launcher/Notifications/ControlCenter chrome strings
+// further down are unaffected — that content is either genuinely generic
+// (menu labels, button labels) or already real (approval cards, since
+// Shell-S4/WP-S4-notif), never a claim like "已存到 工作/月報" about work
+// that never happened.
 
 // ── `DockApp` / `DOCK_APPS` were REMOVED in APP-1 (2026-08-22) ──────────
 // They used to be this crate's whole "app registry": six hand-authored
@@ -48,12 +62,6 @@
 /// status convention (the design board's actual sample data has one of
 /// each, not one of every state — kept verbatim rather than inventing a
 /// third example).
-pub struct DockAgent {
-    pub id: &'static str,
-    pub initial: &'static str,
-    pub bg_hex: u32,
-    pub status: AgentDockStatus,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentDockStatus {
@@ -63,7 +71,7 @@ pub enum AgentDockStatus {
 
 /// Shell-S1 (2026-08-20, Home/overlay dark theme): which SEMANTIC
 /// color family a status ring / badge belongs to. This file used to resolve
-/// `GoalCard`'s dot and each badge's text/bg pair below straight to a
+/// each badge's text/bg pair below straight to a
 /// literal hex, appropriate when there was only ONE design board to lift
 /// colors from. Now that Home/overlay has a light AND a dark board, the
 /// concrete hex for each kind differs per theme (see `crate::palette::
@@ -92,74 +100,75 @@ pub enum BadgeKind {
     Brand,
 }
 
-pub const DOCK_AGENTS: &[DockAgent] = &[
-    DockAgent { id: "duxiaodu", initial: "杜", bg_hex: 0x2171cc, status: AgentDockStatus::Running },
-    DockAgent { id: "finance", initial: "財", bg_hex: 0x0f766e, status: AgentDockStatus::NeedsHuman },
-];
 
-/// One "進行中 goal" card in the Home surface's mid-canvas row. `badge_kind`
-/// drives BOTH the badge pill (text/bg) AND `dot`'s own ring/fill color —
-/// see `BadgeKind`'s own doc comment for why a semantic kind replaces the
-/// raw hex pair this struct used to carry (light-only precedent).
-pub struct GoalCard {
-    pub id: &'static str,
-    pub dot: GoalDot,
-    pub title: &'static str,
-    pub badge_label: &'static str,
-    pub badge_kind: BadgeKind,
-    pub meta: &'static str,
-}
-
-/// The small status ring left of a goal card's title — an unfilled ring
-/// (still running / awaiting a decision) or a filled dot (done). Carries a
-/// `BadgeKind`, not a raw hex — see that type's own doc comment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GoalDot {
-    Outline(BadgeKind),
-    Filled(BadgeKind),
-}
-
-pub const GOAL_CARDS: &[GoalCard] = &[
-    GoalCard {
-        id: "goal-daily-revenue",
-        dot: GoalDot::Outline(BadgeKind::Warning),
-        title: "每日營收日報自動化",
-        badge_label: "等你決定",
-        badge_kind: BadgeKind::Warning,
-        meta: "第 3/5 輪 · 財務助理 · 判官指出兩處數字落差",
-    },
-    GoalCard {
-        id: "goal-site-copy",
-        dot: GoalDot::Outline(BadgeKind::Brand),
-        title: "官網改版文案",
-        badge_label: "進行中",
-        badge_kind: BadgeKind::Brand,
-        meta: "第 1/5 輪 · 小杜 · 正在讀現有頁面",
-    },
-    GoalCard {
-        id: "goal-support-report",
-        dot: GoalDot::Filled(BadgeKind::Success),
-        title: "客服月報",
-        badge_label: "已完成",
-        badge_kind: BadgeKind::Success,
-        meta: "10 分鐘前 · 小杜 · 已存到 工作/月報",
-    },
-];
+// ── `GoalCard`/`GOAL_CARDS`, `GREETING`, `ACTIVITY_SHELF`, `BATTERY_PCT`,
+// `CLOCK` were REMOVED in WP-fix-QEMU-a (2026-09-05, a QEMU walkthrough
+// defect fix) ─────────────────────────────────────────────────────────────
+// A first-boot QEMU walkthrough of a freshly installed, never-used system
+// showed 「晚上好，Louis」 as the greeting, three canned goal cards (每日營
+// 收日報自動化／官網改版文案／客服月報) and a "今日" activity strip claiming
+// specific completed work — all invented, on a machine that had done
+// nothing and belonged to nobody named Louis (the real operator, set during
+// OOBE/live-install account creation, is read from `oobe::boot_operator_name`
+// and shown correctly on the SAME boot's lock screen — this file's old
+// `GREETING` constant was the one surface that ignored it). Same shape as
+// APP-1's `DOCK_APPS` deletion (see this file's own note below): a design
+// board mockup shipped as literal running-system content that could not be
+// true for an appliance nobody had used yet.
+//
+// What replaced them, all in `home.rs`/`home/home_dock.rs`:
+//   * the greeting — `home.rs::greeting_text`, a real time-of-day
+//     salutation (`chrono::Local::now()`, the same clock source
+//     `lockscreen::render::now_local_strings` already established) plus the
+//     real operator display name threaded down from `ShellView.operator_name`
+//     (the SAME field the lock screen's own identity row reads) — greets
+//     without a name when none is on file, never a placeholder person.
+//   * the goal cards — `home/home_dock.rs::goal_cards_row`, built from the
+//     real `overlay::notifications_feed::NotificationsFeed` (pending
+//     approvals → "等你決定" cards) and `overlay::task_progress_feed::
+//     TaskProgressFeed` (in-progress tasks → "進行中" cards), the same two
+//     feeds A4 (2026-08-24) already wired into the dock's own badge. An
+//     honest empty-state line renders instead when neither feed has
+//     anything real to show, and a distinct offline line when the gateway
+//     is unreachable.
+//   * the "今日" activity strip — `home/home_dock.rs::activity_shelf`, built
+//     from `NotificationsFeed::decided()` (approvals the operator has
+//     actually decided this session) — real, if narrower in scope than the
+//     old fabricated agent-activity lines (no "小杜 完成 X" agent-work log
+//     exists yet on the client side to draw from honestly). Renders nothing
+//     at all when there is no real decided-today activity, same "an empty
+//     heading over an empty list is noise" rule `overlay::
+//     notifications_tasks::task_progress_section` already applies to its own
+//     section, rather than a second fabricated "nothing happened today"
+//     line duplicating the goal cards' own empty state.
+//   * the battery reading (`BATTERY_PCT`) — `crate::battery::
+//     battery_percent()`, a real read of this machine's own
+//     `/sys/class/power_supply` tree; hidden entirely (not "0%") on a
+//     desktop appliance with no battery hardware, which `apps::installed`'s
+//     own "Absent, not an error" convention already establishes for exactly
+//     this situation (a dev Mac / a battery-less appliance is the correct,
+//     quiet answer).
+//   * the menu-bar clock (`CLOCK`) — `home.rs`'s own `chrono::Local::now()`
+//     read, ticking on the same 20s cadence `lockscreen::render::
+//     schedule_clock_tick` already uses for the identical purpose, so the
+//     two clocks on one machine can no longer read different times (the
+//     other half of the QEMU defect: menu bar showed 22:58 while the lock
+//     screen's real local-time clock showed 17:16 on the same boot).
+//
+// `SUGGESTION_CHIPS` below stays: the task brief's own ruling is that
+// generic example prompts ("整理 Q3 報表" etc. — things ANY operator could
+// plausibly type, not a claim about what has already happened) are fine to
+// keep static, unlike a card or a greeting asserting a specific fact.
 
 // `APPROVAL_TICKER` (the old hardcoded menu-bar ticker text) was removed in
 // Shell-S4 (2026-08-22, WP-S4-notif) — `home.rs::ticker_text` now renders
 // the real `overlay::notifications_feed::NotificationsFeed`'s pending list
 // instead of one static example sentence.
-pub const GREETING: &str = "晚上好，Louis";
 pub const COMPOSER_PLACEHOLDER: &str = "交代一件事給你的 AI 團隊…";
-pub const BATTERY_PCT: &str = "86%";
-pub const CLOCK: &str = "22:58";
 pub const MENU_BRAND: &str = "DuDuClaw";
 
 pub const MENU_ITEMS: &[&str] = &["檔案", "編輯", "顯示", "AI 團隊", "視窗"];
 pub const SUGGESTION_CHIPS: &[&str] = &["整理 Q3 報表", "清理收件匣", "排明天的行程"];
-/// "今日" activity shelf entries, rendered joined by "·" separators.
-pub const ACTIVITY_SHELF: &[&str] = &["小杜 完成 客服月報", "財務助理 對照了 3 份表格", "已自動歸檔 12 封信"];
 
 // ── Launcher overlay fake data ────────────────────────────────────────────
 // Content lifted verbatim from `commercial/design/duduclaw-os-desktop/
@@ -186,11 +195,7 @@ pub const LAUNCHER_FILE_RESULTS: &[LauncherFileResult] = &[
 pub const LAUNCHER_SECTION_DELEGATE: &str = "交辦";
 pub const LAUNCHER_SECTION_APPS: &str = "應用程式";
 pub const LAUNCHER_SECTION_FILES: &str = "檔案";
-pub const LAUNCHER_DELEGATE_AGENT_INITIAL: &str = "財";
 pub const LAUNCHER_DELEGATE_AGENT_BG_HEX: u32 = 0x0f766e;
-pub const LAUNCHER_DELEGATE_TITLE: &str = "交辦給 財務助理";
-pub const LAUNCHER_DELEGATE_PLAN: &str = "將執行：收集今日請款單 → 對照部門預算 → 產出摘要與異常清單";
-pub const LAUNCHER_DELEGATE_HINT: &str = "Enter 交辦";
 pub const LAUNCHER_FOOTER_LEFT: &str = "↑↓ 選擇 · Enter 執行 · Tab 換分類";
 pub const LAUNCHER_FOOTER_RIGHT: &str = "Super 鍵隨時喚起";
 
@@ -222,45 +227,10 @@ pub enum RowAvatar {
     System,
 }
 
-pub struct ActivityRow {
-    pub id: &'static str,
-    pub avatar: RowAvatar,
-    pub line1: &'static str,
-    pub line2: &'static str,
-    /// `(label, kind)` — `None` for the system-update row, which has no
-    /// status pill in the design board. `kind` replaces the old raw
-    /// `(text_hex, bg_hex)` pair — see `BadgeKind`'s own doc comment.
-    pub badge: Option<(&'static str, BadgeKind)>,
-}
 
-pub const TODAY_ACTIVITY: &[ActivityRow] = &[
-    ActivityRow {
-        id: "activity-support-report",
-        avatar: RowAvatar::Agent { initial: "杜", bg_hex: 0x2171cc },
-        line1: "完成 客服月報-9月 草稿",
-        line2: "22:47 · 存到 工作/月報",
-        badge: Some(("完成", BadgeKind::Success)),
-    },
-    ActivityRow {
-        id: "activity-daily-revenue",
-        avatar: RowAvatar::Agent { initial: "財", bg_hex: 0x0f766e },
-        line1: "每日營收日報 · 第 3/5 輪暫停",
-        line2: "21:12 · 兩處數字落差，等你決定口徑",
-        badge: Some(("等你決定", BadgeKind::Warning)),
-    },
-    ActivityRow {
-        id: "activity-system-update",
-        avatar: RowAvatar::System,
-        line1: "系統更新 1.7.0 可用",
-        line2: "今晚 03:00 自動安裝，失敗自動回滾",
-        badge: None,
-    },
-];
 
 pub const NOTIF_HEADER_TITLE: &str = "通知";
 pub const NOTIF_MARK_ALL_READ: &str = "全部標為已讀";
-pub const NOTIF_TABS: &[&str] = &["全部", "審批 2", "進度", "系統"];
-pub const NOTIF_TODAY_LABEL: &str = "今天";
 pub const NOTIF_FOOTER: &str = "已在儀表板處理過的項目會自動消失";
 pub const NOTIF_NOTE_PLACEHOLDER: &str = "補一句備註…";
 pub const NOTIF_APPROVED_LABEL: &str = "已核准";
@@ -306,7 +276,6 @@ pub const CC_SWITCH_PROACTIVE_LABEL: &str = "主動行為";
 pub const CC_SWITCH_PROACTIVE_DESC: &str = "允許 AI 員工主動提出建議與提醒";
 pub const CC_SWITCH_PAUSE_ALL_LABEL: &str = "全部暫停";
 pub const CC_SWITCH_PAUSE_ALL_DESC: &str = "一鍵暫停所有 AI 行為，待辦保留";
-pub const CC_FOOTER_STATUS: &str = "2 位在值 · 1 件等你";
 pub const CC_FOOTER_LINK: &str = "打開管理面";
 /// Shell-S4-lock (2026-08-22): the manual-lock entry point in ControlCenter's
 /// footer — see `overlay/controlcenter.rs::lock_button`'s own doc comment.
@@ -320,72 +289,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dock_agents_has_two_entries_matching_the_design_board() {
-        assert_eq!(DOCK_AGENTS.len(), 2);
-    }
-
-    #[test]
-    fn goal_cards_has_three_entries_matching_the_design_board() {
-        assert_eq!(GOAL_CARDS.len(), 3);
-    }
-
-    #[test]
     fn suggestion_chips_has_three_entries() {
         assert_eq!(SUGGESTION_CHIPS.len(), 3);
     }
 
     #[test]
-    fn activity_shelf_has_three_entries() {
-        assert_eq!(ACTIVITY_SHELF.len(), 3);
-    }
-
-    #[test]
     fn menu_items_has_five_entries() {
         assert_eq!(MENU_ITEMS.len(), 5);
-    }
-
-    #[test]
-    fn no_field_is_empty() {
-        for agent in DOCK_AGENTS {
-            assert!(!agent.id.is_empty());
-            assert!(!agent.initial.is_empty());
-        }
-        for card in GOAL_CARDS {
-            assert!(!card.id.is_empty());
-            assert!(!card.title.is_empty());
-            assert!(!card.badge_label.is_empty());
-            assert!(!card.meta.is_empty());
-        }
-        for chip in SUGGESTION_CHIPS {
-            assert!(!chip.is_empty());
-        }
-        for line in ACTIVITY_SHELF {
-            assert!(!line.is_empty());
-        }
-        for item in MENU_ITEMS {
-            assert!(!item.is_empty());
-        }
-        assert!(!GREETING.is_empty());
-        assert!(!COMPOSER_PLACEHOLDER.is_empty());
-        assert!(!BATTERY_PCT.is_empty());
-        assert!(!CLOCK.is_empty());
-        assert!(!MENU_BRAND.is_empty());
-    }
-
-    #[test]
-    fn dock_agent_ids_are_unique() {
-        let mut ids: Vec<&str> = DOCK_AGENTS.iter().map(|a| a.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), DOCK_AGENTS.len());
-    }
-
-    #[test]
-    fn goal_card_ids_are_unique() {
-        let mut ids: Vec<&str> = GOAL_CARDS.iter().map(|c| c.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), GOAL_CARDS.len());
     }
 
     #[test]
@@ -417,71 +327,6 @@ mod tests {
     }
 
     #[test]
-    fn launcher_no_field_is_empty() {
-        for r in LAUNCHER_FILE_RESULTS {
-            assert!(!r.id.is_empty());
-            assert!(!r.glyph.is_empty());
-            assert!(!r.label.is_empty());
-            assert!(!r.meta.is_empty());
-        }
-        assert!(!LAUNCHER_SECTION_DELEGATE.is_empty());
-        assert!(!LAUNCHER_SECTION_APPS.is_empty());
-        assert!(!LAUNCHER_SECTION_FILES.is_empty());
-        assert!(!LAUNCHER_DELEGATE_AGENT_INITIAL.is_empty());
-        assert!(!LAUNCHER_DELEGATE_TITLE.is_empty());
-        assert!(!LAUNCHER_DELEGATE_PLAN.is_empty());
-        assert!(!LAUNCHER_DELEGATE_HINT.is_empty());
-        assert!(!LAUNCHER_FOOTER_LEFT.is_empty());
-        assert!(!LAUNCHER_FOOTER_RIGHT.is_empty());
-    }
-
-    // ── Notifications ────────────────────────────────────────────────────
-
-    #[test]
-    fn today_activity_has_three_entries_matching_the_design_board() {
-        assert_eq!(TODAY_ACTIVITY.len(), 3);
-    }
-
-    #[test]
-    fn activity_row_ids_are_unique() {
-        let mut ids: Vec<&str> = TODAY_ACTIVITY.iter().map(|r| r.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), TODAY_ACTIVITY.len());
-    }
-
-    #[test]
-    fn notif_tabs_has_four_entries_matching_the_design_board() {
-        assert_eq!(NOTIF_TABS.len(), 4);
-    }
-
-    #[test]
-    fn notifications_no_field_is_empty() {
-        assert!(!NOTIF_APPROVE_LABEL.is_empty());
-        assert!(!NOTIF_REJECT_LABEL.is_empty());
-        for r in TODAY_ACTIVITY {
-            assert!(!r.id.is_empty());
-            assert!(!r.line1.is_empty());
-            assert!(!r.line2.is_empty());
-            if let Some((label, ..)) = r.badge {
-                assert!(!label.is_empty());
-            }
-        }
-        for tab in NOTIF_TABS {
-            assert!(!tab.is_empty());
-        }
-        assert!(!NOTIF_HEADER_TITLE.is_empty());
-        assert!(!NOTIF_MARK_ALL_READ.is_empty());
-        assert!(!NOTIF_TODAY_LABEL.is_empty());
-        assert!(!NOTIF_FOOTER.is_empty());
-        assert!(!NOTIF_NOTE_PLACEHOLDER.is_empty());
-        assert!(!NOTIF_APPROVED_LABEL.is_empty());
-        assert!(!NOTIF_REJECTED_LABEL.is_empty());
-    }
-
-    // ── ControlCenter ────────────────────────────────────────────────────
-
-    #[test]
     fn quick_tiles_has_three_entries_matching_the_design_board() {
         assert_eq!(QUICK_TILES.len(), 3);
     }
@@ -504,28 +349,5 @@ mod tests {
         for row in SLIDER_ROWS {
             assert!((0.0..=1.0).contains(&row.pct), "pct {} out of range for {}", row.pct, row.glyph);
         }
-    }
-
-    #[test]
-    fn controlcenter_no_field_is_empty() {
-        for t in QUICK_TILES {
-            assert!(!t.id.is_empty());
-            assert!(!t.glyph.is_empty());
-            assert!(!t.title.is_empty());
-            assert!(!t.subtitle.is_empty());
-        }
-        for row in SLIDER_ROWS {
-            assert!(!row.glyph.is_empty());
-        }
-        assert!(!CC_SECTION_AI_TEAM.is_empty());
-        assert!(!CC_SWITCH_AUTOMATION_LABEL.is_empty());
-        assert!(!CC_SWITCH_AUTOMATION_DESC.is_empty());
-        assert!(!CC_SWITCH_PROACTIVE_LABEL.is_empty());
-        assert!(!CC_SWITCH_PROACTIVE_DESC.is_empty());
-        assert!(!CC_SWITCH_PAUSE_ALL_LABEL.is_empty());
-        assert!(!CC_SWITCH_PAUSE_ALL_DESC.is_empty());
-        assert!(!CC_FOOTER_STATUS.is_empty());
-        assert!(!CC_FOOTER_LINK.is_empty());
-        assert!(!CC_LOCK_BUTTON.is_empty());
     }
 }

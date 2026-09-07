@@ -22,6 +22,7 @@ import {
   CreditCard,
   Cpu,
   HardDriveDownload,
+  FlaskConical,
   Activity,
   Shield,
   Scale,
@@ -648,6 +649,12 @@ export const manageAdvancedNav: NavItem[] = [
   // 本地模型市集 — intent + hardware-fit HF picker with one-click install
   // (design: DESIGN-local-model-marketplace-2026-08-13).
   { to: '/manage/local-models', icon: HardDriveDownload, label: 'manage.localModels', desc: 'manage.localModels.desc', minRole: 'admin' },
+  // 微調與後訓練 (WP-E, TODO-ai-runtimes-2026-09 decision 4C) — sits right
+  // after 本地模型 because that is where its output lands: a finished LoRA or
+  // GGUF is imported into the same models directory the row above lists.
+  // Admin-only: building a dataset reads every stored conversation, task
+  // result and approval decision on this machine.
+  { to: '/manage/finetune', icon: FlaskConical, label: 'manage.finetune', desc: 'manage.finetune.desc', minRole: 'admin' },
   // 資料搬家 is a one-shot wizard — the least-often-opened row that still is
   // not the catch-all settings page.
   { to: '/manage/migrate', icon: Import, label: 'manage.migrate', desc: 'manage.migrate.desc', minRole: 'manager' },

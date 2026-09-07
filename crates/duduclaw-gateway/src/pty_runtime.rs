@@ -1479,7 +1479,21 @@ pub(crate) fn capability_extra_args(
                 args.push("--sandbox".to_string());
             }
         }
-        CliKind::Antigravity => {}
+        // Antigravity has no capability flags. The catalog-driven print-mode
+        // runtimes (WP-B: Grok, Qwen, Kimi, Copilot, Kiro, Cursor, Vibe,
+        // OpenCode) never enter the PtyPool at all — they are dispatched
+        // through `runtime::generic_cli` oneshot — so no interactive flag
+        // dialect exists for them either; the caller emits the same
+        // "enforcement unavailable" warn it does for Antigravity.
+        CliKind::Antigravity
+        | CliKind::Grok
+        | CliKind::Qwen
+        | CliKind::Kimi
+        | CliKind::Copilot
+        | CliKind::Kiro
+        | CliKind::Cursor
+        | CliKind::Vibe
+        | CliKind::OpenCode => {}
     }
     args
 }
@@ -1503,12 +1517,12 @@ fn resolve_program(home: &Path, kind: CliKind) -> Option<String> {
     // the PATH fallback the PTY/OAuth reply path fails with "binary not found"
     // even though `which claude` resolves fine (which is why one-click login,
     // which uses the PATH-aware resolver, worked but channel replies didn't).
-    match kind {
-        CliKind::Claude => duduclaw_core::which_claude_in_home(home).or_else(duduclaw_core::which_claude),
-        CliKind::Codex => duduclaw_core::which_codex_in_home(home).or_else(duduclaw_core::which_codex),
-        CliKind::Gemini => duduclaw_core::which_gemini_in_home(home).or_else(duduclaw_core::which_gemini),
-        CliKind::Antigravity => duduclaw_core::which_agy_in_home(home).or_else(duduclaw_core::which_agy),
-    }
+    //
+    // WP-B: one catalog-driven probe replaces the per-kind `which_*` match —
+    // `CliKind::as_str()` IS the catalog id, so a new runtime resolves here
+    // without an edit (and cannot be forgotten into a "binary not found").
+    duduclaw_core::which_runtime_in_home(home, kind.as_str())
+        .or_else(|| duduclaw_core::which_runtime(kind.as_str()))
 }
 
 /// Map an agent's `[runtime] provider` to the PtyPool [`CliKind`]. `None` for
@@ -1522,20 +1536,33 @@ fn resolve_program(home: &Path, kind: CliKind) -> Option<String> {
 /// gone, so when a non-Claude interactive REPL is implemented the call sites
 /// already pass the right kind.
 pub fn cli_kind_for_provider(provider: duduclaw_core::types::RuntimeType) -> Option<CliKind> {
-    use duduclaw_core::types::RuntimeType;
-    match provider {
-        RuntimeType::Claude => Some(CliKind::Claude),
-        RuntimeType::Codex => Some(CliKind::Codex),
-        RuntimeType::Gemini => Some(CliKind::Gemini),
-        RuntimeType::Antigravity => Some(CliKind::Antigravity),
-        // R4 phase 1: Grok has no interactive-REPL PtyPool kind yet — it is routed
-        // through the oneshot `runtime_dispatch` path (like every non-Claude
-        // provider today), so `None` here keeps it off the PtyPool. Adding a
-        // dedicated `CliKind::Grok` is a follow-up when an interactive REPL is
-        // implemented.
-        RuntimeType::Grok => None,
-        RuntimeType::OpenAiCompat => None,
-    }
+    let kind = cli_kind_for_runtime(provider)?;
+    // Allow-list, NOT "everything with a binary": a kind only belongs on the
+    // PtyPool once `inject_protocol_args` can frame its REPL turns. Every other
+    // runtime is routed through the oneshot print-mode path
+    // (`runtime_dispatch` → `runtime/generic_cli.rs` or a bespoke module)
+    // upstream, and returning `Some` here would send it into a pool that cannot
+    // parse its output. Grok/Qwen/Kimi/Copilot/Kiro/Cursor/Vibe/OpenCode are
+    // deliberately absent for exactly that reason.
+    const PTY_POOL_KINDS: &[CliKind] = &[
+        CliKind::Claude,
+        CliKind::Codex,
+        CliKind::Gemini,
+        CliKind::Antigravity,
+    ];
+    PTY_POOL_KINDS.contains(&kind).then_some(kind)
+}
+
+/// **The** bridge between [`duduclaw_core::types::RuntimeType`] (the catalog's
+/// closed key set) and [`CliKind`] (the PTY pool's). There is exactly one, and
+/// it is a string round-trip through the shared catalog id rather than a second
+/// hand-written mapping table that could disagree with the first.
+///
+/// `None` for a runtime that is not a local CLI at all (`openai_compat`).
+/// Unlike [`cli_kind_for_provider`] this does NOT filter by PTY capability —
+/// use it when you want "which CLI is this", not "can the pool drive it".
+pub fn cli_kind_for_runtime(provider: duduclaw_core::types::RuntimeType) -> Option<CliKind> {
+    CliKind::parse(provider.as_str()).ok()
 }
 
 #[cfg(test)]
@@ -1543,6 +1570,95 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    // ── WP-B: CliKind ↔ runtime_catalog coupling ─────────────────────────
+    //
+    // `duduclaw-cli-runtime` is deliberately dependency-free (a standalone PTY
+    // pool crate), so `CliKind` cannot literally read the catalog. These tests
+    // are the enforcement instead: they fail the build the moment the two sets
+    // diverge, which is exactly what `CliKind`'s doc comment promises.
+
+    #[test]
+    fn cli_kind_covers_every_catalog_cli() {
+        for spec in duduclaw_core::runtime_catalog::cli_specs() {
+            let kind = CliKind::parse(spec.id).unwrap_or_else(|_| {
+                panic!(
+                    "runtime `{}` is in the catalog but has no CliKind — add the \
+                     variant in duduclaw-cli-runtime/src/session.rs",
+                    spec.id
+                )
+            });
+            assert_eq!(
+                kind.as_str(),
+                spec.id,
+                "CliKind::as_str must equal the catalog id"
+            );
+        }
+    }
+
+    #[test]
+    fn every_cli_kind_maps_back_to_a_catalog_runtime() {
+        for kind in CliKind::ALL {
+            let spec = duduclaw_core::runtime_catalog::spec_for(kind.as_str())
+                .unwrap_or_else(|| panic!("CliKind::{kind:?} is not in the catalog"));
+            assert!(
+                !spec.binary.is_empty(),
+                "CliKind::{kind:?} maps to a runtime with no binary — the pool \
+                 would go looking for a program that does not exist"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_kind_for_runtime_is_the_only_bridge_and_rejects_non_clis() {
+        use duduclaw_core::types::RuntimeType;
+        for rt in RuntimeType::ALL {
+            let want_kind = !rt.spec().binary.is_empty();
+            assert_eq!(
+                cli_kind_for_runtime(*rt).is_some(),
+                want_kind,
+                "{rt:?}: a runtime with a binary must bridge to a CliKind, and \
+                 an HTTP-only one must not"
+            );
+        }
+        assert_eq!(cli_kind_for_runtime(RuntimeType::OpenAiCompat), None);
+        assert_eq!(
+            cli_kind_for_runtime(RuntimeType::Kimi),
+            Some(CliKind::Kimi)
+        );
+    }
+
+    #[test]
+    fn pty_pool_only_accepts_kinds_with_a_repl_protocol() {
+        use duduclaw_core::types::RuntimeType;
+        // Exactly the four with `inject_protocol_args` wiring.
+        for rt in [
+            RuntimeType::Claude,
+            RuntimeType::Codex,
+            RuntimeType::Gemini,
+            RuntimeType::Antigravity,
+        ] {
+            assert!(cli_kind_for_provider(rt).is_some(), "{rt:?}");
+        }
+        // Every print-mode runtime stays OFF the pool — it would be handed a
+        // session it cannot frame or parse.
+        for rt in [
+            RuntimeType::Grok,
+            RuntimeType::Qwen,
+            RuntimeType::Kimi,
+            RuntimeType::Copilot,
+            RuntimeType::Kiro,
+            RuntimeType::Cursor,
+            RuntimeType::Vibe,
+            RuntimeType::OpenCode,
+            RuntimeType::OpenAiCompat,
+        ] {
+            assert!(
+                cli_kind_for_provider(rt).is_none(),
+                "{rt:?} has no interactive REPL protocol and must not reach the PtyPool"
+            );
+        }
+    }
 
     // ── R5: `[runtime]` PTY directions, pinned ───────────────────────────
     //

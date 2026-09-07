@@ -25,7 +25,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::selections::{LanguageChoice, OobeSelections, OobeState, PrivacyToggle, TemplateChoice, ThemeChoice};
+use super::selections::{LanguageChoice, OobeSelections, OobeState, PrivacyToggle, RuntimeCredentialKind, RuntimeProviderOutcome, TemplateChoice, ThemeChoice};
 
 /// The ten OOBE steps, in fixed linear order — no branching, matching
 /// every device-type OS surveyed (§A: "誰選步驟｜系統定順序" is the
@@ -473,6 +473,40 @@ impl OobeFlow {
         self.state.selections.runtime_authorized = authorized;
     }
 
+    /// WP-C (2026-09-05): records ONE provider's settled outcome on the
+    /// `RuntimeAuth` step, and flips the step-level `runtime_authorized`
+    /// flag with it — every existing reader of that flag (the Finish
+    /// summary, the state-machine tests) keeps behaving exactly as before
+    /// while the per-provider list grows underneath it.
+    ///
+    /// Upserts by provider id: authorizing the same provider twice (a key
+    /// re-typed after a failure, a login after a key) REPLACES the earlier
+    /// outcome instead of appending a second row, so the count can never
+    /// exceed the number of distinct providers actually authorized. Also
+    /// clears `runtime_deferred`, which would otherwise leave a state that
+    /// says both "deferred" and "authorized" after an operator skips and
+    /// then comes back with Back.
+    pub fn record_runtime_provider(&mut self, provider: &str, kind: RuntimeCredentialKind) {
+        let outcome = RuntimeProviderOutcome { provider: provider.to_string(), kind };
+        match self.state.selections.runtime_providers.iter_mut().find(|o| o.provider == provider) {
+            Some(existing) => *existing = outcome,
+            None => self.state.selections.runtime_providers.push(outcome),
+        }
+        self.set_runtime_authorized(true);
+        self.state.selections.runtime_deferred = false;
+    }
+
+    /// What one provider's row shows as its status, or `None` for "未設定".
+    pub fn runtime_provider_kind(&self, provider: &str) -> Option<RuntimeCredentialKind> {
+        self.state.selections.runtime_providers.iter().find(|o| o.provider == provider).map(|o| o.kind)
+    }
+
+    /// How many providers this machine ended up with a credential for — the
+    /// number the Finish summary's 「已授權 N 家」 line reports.
+    pub fn authorized_provider_count(&self) -> usize {
+        self.state.selections.runtime_providers.len()
+    }
+
     pub fn privacy_toggle_on(&self, toggle: PrivacyToggle) -> bool {
         match toggle {
             PrivacyToggle::UsageStats => self.state.selections.privacy_usage_stats,
@@ -790,6 +824,87 @@ mod tests {
         flow.set_runtime_authorized(true);
         assert!(flow.selections().runtime_authorized);
         assert_eq!(flow.current(), OobeStep::RuntimeAuth, "click-to-record must not itself advance — same split as set_account_created/set_network");
+    }
+
+    // ── WP-C (2026-09-05): per-provider outcomes ─────────────────────────
+
+    #[test]
+    fn recording_a_provider_authorizes_the_step_and_counts_it() {
+        let mut flow = OobeFlow::new();
+        assert_eq!(flow.authorized_provider_count(), 0);
+        assert_eq!(flow.runtime_provider_kind("anthropic"), None);
+
+        flow.record_runtime_provider("anthropic", RuntimeCredentialKind::ApiKey);
+
+        assert_eq!(flow.authorized_provider_count(), 1);
+        assert_eq!(flow.runtime_provider_kind("anthropic"), Some(RuntimeCredentialKind::ApiKey));
+        assert!(flow.selections().runtime_authorized, "the step-level flag every pre-WP-C reader uses must follow along");
+    }
+
+    #[test]
+    fn several_providers_each_get_their_own_row() {
+        let mut flow = OobeFlow::new();
+        flow.record_runtime_provider("anthropic", RuntimeCredentialKind::ApiKey);
+        flow.record_runtime_provider("gemini", RuntimeCredentialKind::Login);
+        flow.record_runtime_provider("groq", RuntimeCredentialKind::ApiKey);
+        assert_eq!(flow.authorized_provider_count(), 3);
+        assert_eq!(flow.runtime_provider_kind("gemini"), Some(RuntimeCredentialKind::Login));
+        assert_eq!(flow.runtime_provider_kind("openai"), None);
+    }
+
+    #[test]
+    fn re_authorizing_one_provider_replaces_its_outcome_instead_of_appending() {
+        // Otherwise 「已授權 N 家」 would count retries, and a key re-typed
+        // after a failed attempt would read as two providers.
+        let mut flow = OobeFlow::new();
+        flow.record_runtime_provider("anthropic", RuntimeCredentialKind::ApiKey);
+        flow.record_runtime_provider("anthropic", RuntimeCredentialKind::Login);
+        assert_eq!(flow.authorized_provider_count(), 1);
+        assert_eq!(flow.runtime_provider_kind("anthropic"), Some(RuntimeCredentialKind::Login));
+    }
+
+    #[test]
+    fn authorizing_after_a_deferral_clears_the_deferred_flag() {
+        // Reachable with Back: 略過 records the deferral, the operator goes
+        // back and sets a key. Reporting both "deferred" and "authorized"
+        // would make the Finish summary contradict itself.
+        let mut flow = OobeFlow::new();
+        while flow.current() != OobeStep::RuntimeAuth {
+            assert!(flow.next() || flow.skip(), "walk to RuntimeAuth");
+            if flow.current() == OobeStep::Network {
+                flow.set_network("DuDu-Office", true);
+            }
+            if flow.current() == OobeStep::AccountCreate {
+                flow.set_account_created(true);
+            }
+        }
+        flow.skip();
+        assert!(flow.selections().runtime_deferred);
+        flow.back();
+        flow.record_runtime_provider("xai", RuntimeCredentialKind::ApiKey);
+        assert!(!flow.selections().runtime_deferred);
+        assert!(flow.selections().runtime_authorized);
+    }
+
+    #[test]
+    fn recording_a_provider_does_not_advance_the_step() {
+        // Same click-records / continue-advances split every other setter on
+        // this type follows.
+        let mut flow = OobeFlow::new();
+        let before = flow.current();
+        flow.record_runtime_provider("anthropic", RuntimeCredentialKind::ApiKey);
+        assert_eq!(flow.current(), before);
+    }
+
+    #[test]
+    fn an_outcome_for_a_provider_this_build_does_not_know_still_counts() {
+        // A state file written by a newer build can name a provider this one
+        // has no row for. Dropping it would under-report the machine's real
+        // credentials in the summary.
+        let mut flow = OobeFlow::new();
+        flow.record_runtime_provider("some-future-provider", RuntimeCredentialKind::Login);
+        assert_eq!(flow.authorized_provider_count(), 1);
+        assert_eq!(flow.runtime_provider_kind("some-future-provider"), Some(RuntimeCredentialKind::Login));
     }
 
     #[test]

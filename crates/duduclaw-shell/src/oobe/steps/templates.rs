@@ -13,19 +13,17 @@
 // transition, so there is no way for the in-card and bottom-nav skip
 // controls to disagree.
 
-use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
+use gpui::{div, prelude::*, px, Context, Div, FontWeight};
 
 use duduclaw_native_gui::theme;
 
-use crate::i18n::{t, Key, Locale};
-use crate::palette::ShellPalette;
+use crate::i18n::{t, Key};
 use crate::oobe::widgets::{self, StepButtonVariant};
-use crate::oobe::{fake_data, OobeFlow, TemplateChoice};
+use crate::oobe::{OobeFlow, TemplateChoice};
 use crate::ShellView;
 
 pub(super) fn render(flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
-    let choice = &flow.selections().template_choice;
-    let is_express = matches!(choice, Some(TemplateChoice::Express));
+    let is_express = matches!(flow.selections().template_choice, Some(TemplateChoice::Express));
     let locale = flow.locale();
     let palette = flow.palette();
 
@@ -57,17 +55,31 @@ pub(super) fn render(flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
             express_click,
         ));
 
-    let mut custom_rows = div().flex().flex_col().gap(px(8.));
-    for (index, tpl) in fake_data::FAKE_TEMPLATES.iter().enumerate() {
-        custom_rows = custom_rows.child(template_card(tpl, index, choice, locale, palette, cx));
-    }
+    // 2026-09-05: the three industry cards that used to render here were
+    // `fake_data::FAKE_TEMPLATES` — invented entries no click could apply.
+    // The gateway's real catalogue (`templates.industries`) is a Pro
+    // feature and comes back locked on a fresh Personal install, so say
+    // exactly that instead of showing pretend choices.
+    let locked_hint = div()
+        .px(px(14.))
+        .py(px(10.))
+        .rounded(px(theme::RADIUS_LG))
+        .bg(theme::alpha(palette.surface, 1.0))
+        .border_1()
+        .border_color(palette.surface_border)
+        .text_size(px(theme::TEXT_XS))
+        .text_color(theme::alpha(palette.muted_foreground, 1.0))
+        .child(t(locale, Key::TemplatesPremiumLocked));
 
     let skip_click = cx.listener(|view, _ev, _window, cx| {
         if let Some(flow) = view.oobe.as_mut() {
             flow.skip();
             crate::oobe::save_state(flow.state());
             if flow.completed() {
-                view.oobe = None;
+                // Same single completion path as every other site — see
+                // `ShellView::complete_oobe`'s own doc comment (this site
+                // used to drop the flow without adopting theme or name).
+                view.complete_oobe(cx);
             }
         }
         cx.notify();
@@ -79,7 +91,7 @@ pub(super) fn render(flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
         .gap(px(14.))
         .child(express_card)
         .child(div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(t(locale, Key::TemplatesCustomHint)))
-        .child(custom_rows)
+        .child(locked_hint)
         .child(widgets::step_button("oobe-template-skip", t(locale, Key::TemplatesSkip), StepButtonVariant::Ghost, false, palette, skip_click));
 
     div()
@@ -92,56 +104,3 @@ pub(super) fn render(flow: &OobeFlow, cx: &mut Context<ShellView>) -> Div {
         .child(widgets::card(body, palette))
 }
 
-fn template_card(
-    tpl: &fake_data::FakeTemplate,
-    index: usize,
-    choice: &Option<TemplateChoice>,
-    locale: Locale,
-    palette: ShellPalette,
-    cx: &mut Context<ShellView>,
-) -> Stateful<Div> {
-    let id = tpl.id;
-    let selected = matches!(choice, Some(TemplateChoice::Custom(c)) if c.as_str() == id);
-    let click = cx.listener(move |view, _ev, _window, cx| {
-        if let Some(flow) = view.oobe.as_mut() {
-            flow.set_template_choice(TemplateChoice::Custom(id.to_string()));
-            crate::oobe::save_state(flow.state());
-        }
-        cx.notify();
-    });
-
-    div()
-        .id(("oobe-template", index))
-        .cursor_pointer()
-        .flex()
-        .items_center()
-        .justify_between()
-        .px(px(14.))
-        .py(px(10.))
-        .rounded(px(theme::RADIUS_LG))
-        .bg(theme::alpha(if selected { palette.secondary } else { palette.surface }, 1.0))
-        .border_1()
-        .border_color(if selected { theme::alpha(palette.brand, 1.0) } else { palette.surface_border })
-        .hover(|style| style.bg(theme::alpha(palette.surface_hover, 1.0)))
-        .child(
-            // `tpl.title`/`tpl.desc` stay hardcoded zh-TW — see
-            // `oobe/fake_data.rs`'s header comment for why this one's a
-            // knowingly-left stub, not the same "literal identifier" case
-            // `net.ssid` (`steps::network`) is.
-            div()
-                .flex()
-                .flex_col()
-                .child(div().text_size(px(theme::TEXT_SM)).font_weight(FontWeight::MEDIUM).child(tpl.title))
-                .child(div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(tpl.desc)),
-        )
-        .when(selected, |el| {
-            el.child(
-                div()
-                    .text_size(px(theme::TEXT_XS))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::alpha(palette.brand, 1.0))
-                    .child(t(locale, Key::CommonSelected)),
-            )
-        })
-        .on_click(click)
-}

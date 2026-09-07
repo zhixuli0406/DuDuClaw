@@ -326,6 +326,16 @@ fn scanning_panel(locale: crate::i18n::Locale, palette: ShellPalette) -> Div {
 /// connection" hint on top of the generic "scan failed, retry" message —
 /// never a fabricated SSID list, never a silent claim of success.
 fn failed_panel(locale: crate::i18n::Locale, palette: ShellPalette, ui: &OobeUiState, cx: &mut Context<ShellView>) -> Div {
+    if ui.net_first_run_done {
+        return div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(12.))
+            .py(px(8.))
+            .child(div().text_size(px(theme::TEXT_SM)).font_weight(gpui::FontWeight::MEDIUM).child(t(locale, Key::NetworkFirstRunDoneStatus)))
+            .child(div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(t(locale, Key::NetworkFirstRunDoneHint)));
+    }
     let click = cx.listener(|view, _ev, _window, cx| kick_off_scan(view, cx));
     let mut column = div()
         .flex()
@@ -723,7 +733,19 @@ fn kick_off_scan(view: &mut ShellView, cx: &mut Context<ShellView>) {
                     // since the last successful scan must not keep showing
                     // as connected just because the LATEST refresh happened
                     // to fail.
-                    view.oobe_ui.net_status = net_status.ok();
+                    match net_status {
+                        Ok(status) => view.oobe_ui.net_status = Some(status),
+                        Err(network::NetError::FirstRunCompleted) => {
+                            // Setup already ran on this machine: the network
+                            // was configured then and the gateway just
+                            // answered over loopback. Count as online so the
+                            // step is passable (`wired_online`), and let the
+                            // panel say so instead of "scan failed".
+                            view.oobe_ui.net_status = None;
+                            view.oobe_ui.net_first_run_done = true;
+                        }
+                        Err(_) => view.oobe_ui.net_status = None,
+                    }
                     match scan_result {
                         Ok(aps) => {
                             view.oobe_ui.set_net_scan_loaded(aps, kind);

@@ -222,17 +222,19 @@ pub(crate) enum AccountError {
 /// exactly the shape that env var expects, so `install_runner::
 /// start_install` passes it straight through with no reformatting.
 ///
-/// KNOWN SIMPLIFICATION (disclosed, not silently dropped): the shell script
-/// additionally excludes whichever disk physically carries the running live
-/// medium (its own `SRC_DISK`, found via `findmnt`/`lsblk -no PKNAME`) —
-/// `steps::disk_select`'s own scan does not re-derive that exclusion. In
-/// every topology this round's own QEMU harness exercises, the live medium
-/// is the ISO9660 `sr0` optical device, already excluded by the `sr*`
-/// prefix rule, so the gap has no live consequence here. If a future
-/// topology (e.g. USB) ever DID let the operator pick the source disk, the
-/// shell script's own CANDIDATES check is the actual fail-closed backstop:
-/// `DUDUCLAW_INSTALL_TARGET=<src>` is rejected there with "不在可安裝清單內"
-/// rather than silently overwriting the medium being read from.
+/// Y20-P5 (2026-09-04) closed the gap this doc comment used to disclose:
+/// `steps::disk_select`'s own scan now re-derives the shell script's own
+/// `SRC_DISK` exclusion (find the live medium's mount, resolve it to a
+/// physical block device via `findmnt`/`lsblk -no PKNAME`, same as the
+/// script) via `steps::disk_select::find_live_medium_device`, and its own
+/// pure `filter_install_targets` excludes that device even when it looks
+/// like an ordinary disk (the USB-stick case: `TYPE=disk`, not `rom`,
+/// nothing about the row itself distinguishes it from the real target —
+/// see screens/05-installer-disks.png, `/dev/vdb 1.8G` offered as a pick).
+/// `duduclaw-os-install.sh`'s own CANDIDATES check remains the fail-closed
+/// backstop either way (`DUDUCLAW_INSTALL_TARGET=<src>` still rejected there
+/// with "不在可安裝清單內") — this UI-side filter is a usability fix on top
+/// of that guarantee, not a replacement for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiskInfo {
     pub(crate) name: String,
@@ -253,6 +255,49 @@ pub(crate) enum DiskScanState {
     Scanning,
     Loaded(Vec<DiskInfo>),
     Failed(String),
+}
+
+/// Y20-P6 (2026-09-05) bug fix — what `steps::disk_select`'s own live-medium
+/// detection concluded during the most recent `Loaded` scan, set alongside
+/// `disk_scan` by `set_disk_scan_loaded`. Three-way, not a nullable
+/// `String`, specifically because a review finding on the Y20-P5 round
+/// caught `steps::disk_select::find_live_medium_device` failing OPEN
+/// SILENTLY: if `/run/media` etc. wasn't mounted yet, the payload filename
+/// differed, or `findmnt`/`lsblk` failed to run, that fn returned `None`,
+/// the filter excluded nothing extra, and — because `None` was the ONLY
+/// value threaded through — NO note rendered either, so the original
+/// `/dev/vdb`-offered-as-target regression could come back with zero
+/// visible signal that detection had quietly given up. Splitting the
+/// "nothing to report" case from the "detection itself failed" case makes
+/// that failure VISIBLE (see `steps::disk_select::LiveMediumDetection`,
+/// the tri-state I/O result this is built from, for the full mapping).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) enum LiveMediumNote {
+    /// Nothing to report — either `find_live_medium_device` cleanly
+    /// determined there's no live medium under any scanned path
+    /// (`LiveMediumDetection::NotFound`), or it named a device that never
+    /// actually showed up among this scan's own rows (a race, or the
+    /// filter's OWN independent mount-based exclusion already caught it
+    /// under a different check). Neither warrants a visible warning: the
+    /// filter's filename-independent "any mounted disk is excluded" backstop
+    /// (see `steps::disk_select::filter_install_targets`'s own doc comment)
+    /// still protects a genuinely-mounted live medium regardless of whether
+    /// this note can name it.
+    #[default]
+    None,
+    /// `find_live_medium_device` positively identified the device
+    /// (`LiveMediumDetection::Found`) and it was excluded from the candidate
+    /// list. `steps::disk_select` renders "已排除安裝媒介 /dev/{0}" (via
+    /// `Key::LiveInstallDiskExcludedMedium`).
+    Excluded(String),
+    /// `find_live_medium_device` returned `LiveMediumDetection::Failed` —
+    /// the install image WAS located (proof a live medium is present), but
+    /// resolving it to a physical device did not succeed. This is the one
+    /// outcome this round's fix exists to surface: `steps::disk_select`
+    /// renders a warning telling the operator to choose carefully, since the
+    /// NAMED exclusion (though not the mount-based backstop, which is
+    /// independent of this detection path) may not have applied.
+    DetectionFailed,
 }
 
 /// The `Progress` step's own state — set by `install_runner::start_install`
@@ -318,6 +363,13 @@ struct LiveInstallState {
     /// default()`'s own doc comment establishes for OOBE's identical field.
     theme: ThemeChoice,
     disk_scan: DiskScanState,
+    /// Y20-P6: set alongside `disk_scan` by `set_disk_scan_loaded` — see
+    /// `LiveMediumNote`'s own doc comment for the full tri-state rationale.
+    /// `LiveMediumNote::None` on every OTHER transition
+    /// (`set_disk_scanning`/`set_disk_scan_failed`) — same "irrelevant while
+    /// not `Loaded`" discipline `selected_disk` doesn't bother clearing
+    /// either.
+    disk_medium_note: LiveMediumNote,
     selected_disk: Option<DiskInfo>,
     confirm_checked: bool,
     install: InstallState,
@@ -337,6 +389,7 @@ impl Default for LiveInstallState {
             account_error: None,
             theme: ThemeChoice::default(),
             disk_scan: DiskScanState::default(),
+            disk_medium_note: LiveMediumNote::default(),
             selected_disk: None,
             confirm_checked: false,
             install: InstallState::default(),
@@ -495,12 +548,20 @@ impl LiveInstallFlow {
         self.state.disk_scan = DiskScanState::Scanning;
     }
 
-    pub(crate) fn set_disk_scan_loaded(&mut self, disks: Vec<DiskInfo>) {
+    /// Y20-P6: `medium_note` is `steps::disk_select::scan_disks`'s own
+    /// second return value — see `LiveMediumNote`'s own doc comment for
+    /// exactly what each variant means.
+    pub(crate) fn set_disk_scan_loaded(&mut self, disks: Vec<DiskInfo>, medium_note: LiveMediumNote) {
         self.state.disk_scan = DiskScanState::Loaded(disks);
+        self.state.disk_medium_note = medium_note;
     }
 
     pub(crate) fn set_disk_scan_failed(&mut self, message: String) {
         self.state.disk_scan = DiskScanState::Failed(message);
+    }
+
+    pub(crate) fn disk_medium_note(&self) -> &LiveMediumNote {
+        &self.state.disk_medium_note
     }
 
     pub(crate) fn selected_disk(&self) -> Option<&DiskInfo> {
@@ -1081,10 +1142,36 @@ mod tests {
         flow.set_disk_scanning();
         assert_eq!(*flow.disk_scan(), DiskScanState::Scanning);
         let disks = vec![DiskInfo { name: "vda".to_string(), size: "20G".to_string(), model: "QEMU HARDDISK".to_string() }];
-        flow.set_disk_scan_loaded(disks.clone());
+        flow.set_disk_scan_loaded(disks.clone(), LiveMediumNote::None);
         assert_eq!(*flow.disk_scan(), DiskScanState::Loaded(disks));
+        assert_eq!(*flow.disk_medium_note(), LiveMediumNote::None);
         flow.set_disk_scan_failed("lsblk not found".to_string());
         assert_eq!(*flow.disk_scan(), DiskScanState::Failed("lsblk not found".to_string()));
+    }
+
+    /// Y20-P6: `set_disk_scan_loaded`'s second argument records whichever
+    /// `LiveMediumNote` `steps::disk_select::scan_disks` produced for the
+    /// same scan — this is the whole reason `Loaded` and this note are
+    /// separate fields rather than one combined variant (see
+    /// `LiveMediumNote`'s own doc comment).
+    #[test]
+    fn disk_scan_loaded_records_the_excluded_live_medium() {
+        let mut flow = LiveInstallFlow::new();
+        let disks = vec![DiskInfo { name: "vda".to_string(), size: "20G".to_string(), model: String::new() }];
+        flow.set_disk_scan_loaded(disks, LiveMediumNote::Excluded("vdb".to_string()));
+        assert_eq!(*flow.disk_medium_note(), LiveMediumNote::Excluded("vdb".to_string()));
+    }
+
+    /// Y20-P6 bug fix: a detection FAILURE must be recorded distinctly from
+    /// "nothing to report" — this is the state-layer half of the review
+    /// finding's fix (the rendering half is `steps::disk_select::
+    /// medium_note_text`'s own test).
+    #[test]
+    fn disk_scan_loaded_records_a_detection_failure_distinctly_from_none() {
+        let mut flow = LiveInstallFlow::new();
+        flow.set_disk_scan_loaded(vec![], LiveMediumNote::DetectionFailed);
+        assert_eq!(*flow.disk_medium_note(), LiveMediumNote::DetectionFailed);
+        assert_ne!(*flow.disk_medium_note(), LiveMediumNote::None);
     }
 
     #[test]

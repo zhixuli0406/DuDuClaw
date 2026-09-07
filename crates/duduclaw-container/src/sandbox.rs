@@ -157,16 +157,22 @@ pub async fn run_sandboxed_for_runtime(
     // to this one-shot container, but the file indirection is preferred where
     // the CLI supports it.
     let mut env = vec!["ANTHROPIC_API_KEY_FILE=/run/secrets/api_key".to_string()];
-    match runtime {
-        RuntimeType::Claude => {}
-        RuntimeType::Codex => env.push(format!("OPENAI_API_KEY={api_key}")),
-        RuntimeType::Gemini => env.push(format!("GEMINI_API_KEY={api_key}")),
-        RuntimeType::Antigravity => env.push(format!("ANTIGRAVITY_API_KEY={api_key}")),
-        // R4 / UNVERIFIED: xAI's standard env var for the api-key CLI.
-        RuntimeType::Grok => env.push(format!("XAI_API_KEY={api_key}")),
-        // No CLI binary for OpenAI-compat — treated as Claude-shaped fallback
-        // upstream; nothing extra to inject here.
-        RuntimeType::OpenAiCompat => {}
+    // WP-B: the per-runtime key variable comes from
+    // `duduclaw_core::runtime_catalog` rather than a hand-written match that
+    // had to be edited for every new backend (and that silently injected
+    // nothing when someone forgot). Two runtimes are deliberately skipped:
+    //   * Claude — reads the key through `ANTHROPIC_API_KEY_FILE` above, so it
+    //     never surfaces in `docker inspect`.
+    //   * `openai_compat` — no CLI binary at all (empty `binary`); it is
+    //     treated as a Claude-shaped fallback upstream, so there is nothing to
+    //     inject here. Keyed off `binary.is_empty()` so any future HTTP-only
+    //     backend is skipped for the same structural reason.
+    let runtime_spec = runtime.spec();
+    if runtime != RuntimeType::Claude
+        && !runtime_spec.binary.is_empty()
+        && let Some(key_env) = runtime_spec.auth.api_key_env
+    {
+        env.push(format!("{key_env}={api_key}"));
     }
     for (k, v) in extra_env {
         env.push(format!("{k}={v}"));
@@ -453,6 +459,33 @@ pub(crate) fn build_agent_cmd(
             }
             cmd.push("-p".to_string());
             cmd.push(flag_safe(&embed_system_prompt(safe_system_prompt, prompt)));
+            cmd
+        }
+        // WP-B: every runtime added from 2026-09 on is a print-mode CLI whose
+        // argv is fully described by `duduclaw_core::runtime_catalog`, so it
+        // is built from the spec instead of growing one hand-written arm per
+        // vendor (the pattern that made this match a five-place edit).
+        //
+        // Container semantics are unchanged: the CLIs' own auto-approve flags
+        // are already in the spec's template (they have to be, or a headless
+        // run never executes anything), and **the container is the
+        // enforcement boundary** — exactly as documented for Antigravity and
+        // Grok above. `disallowed_tools` cannot be translated per-vendor here;
+        // the caller has already emitted the best-effort warning for that.
+        other => {
+            let spec = other.spec();
+            let payload = flag_safe(&embed_system_prompt(safe_system_prompt, prompt));
+            let mut cmd = vec![spec.binary.to_string()];
+            for a in spec.headless.args_template {
+                cmd.push(
+                    if *a == duduclaw_core::runtime_catalog::PROMPT_PLACEHOLDER {
+                        payload.clone()
+                    } else {
+                        (*a).to_string()
+                    },
+                );
+            }
+            cmd.extend(spec.headless.model_args(model));
             cmd
         }
     }

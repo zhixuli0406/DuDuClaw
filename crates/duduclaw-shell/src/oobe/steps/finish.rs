@@ -55,13 +55,21 @@ use crate::oobe::{OobeFlow, PrivacyToggle, TemplateChoice};
 const CAT_HEIGHT: f32 = 72.;
 const CAT_WIDTH: f32 = 264. / 512. * CAT_HEIGHT;
 
-pub(super) fn render(flow: &OobeFlow) -> Div {
+pub(super) fn render(flow: &OobeFlow, wired_online: bool) -> Div {
     let s = flow.selections();
     let locale = flow.locale();
     let palette = flow.palette();
 
     let privacy_on_count = PrivacyToggle::ALL.into_iter().filter(|toggle| flow.privacy_toggle_on(*toggle)).count();
-    let runtime_summary = if s.runtime_authorized {
+    // WP-C (2026-09-05): the `RuntimeAuth` step authorizes PROVIDERS now, so
+    // the summary says how many rather than a bare 「已授權」. The bare form
+    // is still the honest answer for a state file written before that round
+    // — it carries `runtime_authorized` but has no per-provider list to
+    // count, and reporting 「已授權 0 家」 for it would be a lie.
+    let authorized_count = flow.authorized_provider_count();
+    let runtime_summary = if authorized_count > 0 {
+        t1(locale, Key::FinishRuntimeAuthorizedCount, &authorized_count.to_string())
+    } else if s.runtime_authorized {
         t(locale, Key::FinishRuntimeAuthorized).to_string()
     } else if s.runtime_deferred {
         t(locale, Key::FinishRuntimeDeferred).to_string()
@@ -82,7 +90,10 @@ pub(super) fn render(flow: &OobeFlow) -> Div {
 
     let summary_rows: [(&'static str, String); 6] = [
         (t(locale, Key::FinishSummaryLanguage), s.language.label().to_string()),
-        (t(locale, Key::FinishSummaryNetwork), s.network_ssid.clone().unwrap_or_else(|| t(locale, Key::FinishNetworkNotConnected).to_string())),
+        (
+            t(locale, Key::FinishSummaryNetwork),
+            network_summary(locale, s.network_ssid.as_deref(), s.network_connected, wired_online),
+        ),
         (
             t(locale, Key::FinishSummaryAccount),
             if s.account_created { t(locale, Key::FinishAccountCreated).to_string() } else { t(locale, Key::FinishAccountNotCreated).to_string() },
@@ -111,6 +122,24 @@ pub(super) fn render(flow: &OobeFlow) -> Div {
         .child(widgets::card(rows, palette))
 }
 
+/// The finish page's network row. A wired link carries no SSID and is never
+/// persisted into the Wi-Fi join fields (D4a §5.4-2), so it arrives here as
+/// the live `wired_online` signal — before 2026-09-06 this row said
+/// 「未連線」on every appliance that skipped Wi-Fi because Ethernet was
+/// already up (QEMU walkthroughs of 09-05 and 09-06).
+pub(crate) fn network_summary(
+    locale: crate::i18n::Locale,
+    ssid: Option<&str>,
+    wifi_connected: bool,
+    wired_online: bool,
+) -> String {
+    match ssid {
+        Some(ssid) if wifi_connected || !ssid.is_empty() => ssid.to_string(),
+        _ if wired_online => t(locale, Key::FinishNetworkWired).to_string(),
+        _ => t(locale, Key::FinishNetworkNotConnected).to_string(),
+    }
+}
+
 fn summary_row(label: &'static str, value: String, palette: ShellPalette) -> Div {
     div()
         .flex()
@@ -118,4 +147,28 @@ fn summary_row(label: &'static str, value: String, palette: ShellPalette) -> Div
         .justify_between()
         .child(div().text_size(px(theme::TEXT_XS)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(label))
         .child(div().text_size(px(theme::TEXT_SM)).font_weight(FontWeight::MEDIUM).text_color(theme::alpha(palette.foreground, 1.0)).child(value))
+}
+
+#[cfg(test)]
+mod network_summary_tests {
+    use super::network_summary;
+    use crate::i18n::Locale;
+
+    #[test]
+    fn wired_link_without_ssid_is_reported_as_connected() {
+        let zh = network_summary(Locale::ZhTw, None, false, true);
+        assert_eq!(zh, "有線網路已連線");
+        assert_eq!(network_summary(Locale::En, None, false, true), "Wired, connected");
+        assert_eq!(network_summary(Locale::JaJp, None, false, true), "有線で接続済み");
+    }
+
+    #[test]
+    fn no_link_at_all_still_says_not_connected() {
+        assert_eq!(network_summary(Locale::ZhTw, None, false, false), "未連線");
+    }
+
+    #[test]
+    fn a_joined_wifi_network_shows_its_ssid_even_when_wired_is_also_up() {
+        assert_eq!(network_summary(Locale::En, Some("DuDu-Office"), true, true), "DuDu-Office");
+    }
 }

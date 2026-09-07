@@ -28,8 +28,45 @@ function mockCall(handlers: Record<string, (params?: unknown) => unknown>) {
   });
 }
 
+/**
+ * WP-A (§1-1 risk disclosure): this wizard now opens on a gated disclosure
+ * step and only calls `setup_token_start` after the risk checkbox is ticked
+ * and "Continue" is clicked — every test below has to walk through that
+ * gate before it can assert on the flow that used to start automatically.
+ */
+async function acknowledgeRiskAndContinue(user: ReturnType<typeof userEvent.setup>) {
+  const checkbox = await screen.findByRole('checkbox', { name: /understand the risk/i });
+  await user.click(checkbox);
+  await user.click(screen.getByRole('button', { name: /^continue$/i }));
+}
+
 describe('SubscriptionSetupWizard', () => {
-  it('starts the flow on open and shows the authorize link + QR code', async () => {
+  it('shows the risk disclosure first and only starts the flow after acknowledgment', async () => {
+    const user = userEvent.setup();
+    mockCall({
+      'accounts.setup_token_start': () => ({
+        session_id: 'sess-0',
+        auth_url: 'https://claude.com/cai/oauth/authorize?code=true',
+        expires_in_seconds: 300,
+        program: '/usr/local/bin/claude',
+      }),
+    });
+
+    renderWithProviders(<SubscriptionSetupWizard open onClose={vi.fn()} />);
+
+    // The disclosure gate is up; nothing has been called yet, and Continue
+    // is disabled until the box is ticked.
+    expect(screen.getByText(/consumer-subscription/i)).toBeInTheDocument();
+    const continueBtn = screen.getByRole('button', { name: /^continue$/i });
+    expect(continueBtn).toBeDisabled();
+    expect(mockWsClient.call).not.toHaveBeenCalledWith('accounts.setup_token_start');
+
+    await acknowledgeRiskAndContinue(user);
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('accounts.setup_token_start'));
+  });
+
+  it('starts the flow after acknowledgment and shows the authorize link + QR code', async () => {
+    const user = userEvent.setup();
     mockCall({
       'accounts.setup_token_start': () => ({
         session_id: 'sess-1',
@@ -40,6 +77,7 @@ describe('SubscriptionSetupWizard', () => {
     });
 
     renderWithProviders(<SubscriptionSetupWizard open onClose={vi.fn()} />);
+    await acknowledgeRiskAndContinue(user);
 
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('accounts.setup_token_start'));
     const link = await screen.findByRole('link', { name: /open authorization page/i });
@@ -49,6 +87,7 @@ describe('SubscriptionSetupWizard', () => {
   });
 
   it('polls status until the URL appears when start returns none yet', async () => {
+    const user = userEvent.setup();
     let statusCalls = 0;
     mockCall({
       'accounts.setup_token_start': () => ({
@@ -69,6 +108,7 @@ describe('SubscriptionSetupWizard', () => {
     });
 
     renderWithProviders(<SubscriptionSetupWizard open onClose={vi.fn()} />);
+    await acknowledgeRiskAndContinue(user);
 
     expect(await screen.findByText(/waiting for the link/i)).toBeInTheDocument();
     expect(
@@ -93,6 +133,7 @@ describe('SubscriptionSetupWizard', () => {
     });
 
     renderWithProviders(<SubscriptionSetupWizard open onClose={vi.fn()} onSuccess={onSuccess} />);
+    await acknowledgeRiskAndContinue(user);
 
     const input = await screen.findByPlaceholderText(/paste the code you received/i);
     await user.type(input, 'ABC123');
@@ -117,6 +158,7 @@ describe('SubscriptionSetupWizard', () => {
     });
 
     renderWithProviders(<SubscriptionSetupWizard open onClose={vi.fn()} />);
+    await acknowledgeRiskAndContinue(user);
 
     const input = await screen.findByPlaceholderText(/paste the code you received/i);
     await user.type(input, 'WRONG');
@@ -145,6 +187,7 @@ describe('SubscriptionSetupWizard', () => {
 
     const user = userEvent.setup();
     renderWithProviders(<SubscriptionSetupWizard open onClose={onClose} />);
+    await acknowledgeRiskAndContinue(user);
     await screen.findByRole('link', { name: /open authorization page/i });
 
     // Two elements are named "Close" — the dialog's own icon-only [x] and

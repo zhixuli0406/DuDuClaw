@@ -150,6 +150,8 @@ duduclaw compat windows-vm app-remove winword.exe
 
 **還沒執行過 `setup` 的機器，啟動器完全不會出現任何 Windows 項目**——這是刻意的誠實靜默：`app-add`/`app-list` 讀寫的登記檔（`~/.duduclaw/windows-vm/apps.toml`）在 `setup` 都還沒跑過的機器上根本不存在，啟動器不會因此顯示錯誤或空白區塊，就是完全不出現這個分類。
 
+在 DuDuClaw OS 上，這份登記檔改放在 `/data/system/windows-vm/apps.toml`（映像為 gateway 與 root 的 shell 設定 `DUDUCLAW_WINDOWS_VM_APPS_DIR=/data/system/windows-vm`）：`/data/duduclaw` 是 gateway 跑內建 AI CLI 時的家目錄、放著各家登入 token，因此是 `0700`，kiosk 殼讀不到裡面的檔案。只有登記檔搬家；`compose.yaml` 與 VM 儲存仍在 `/data/duduclaw/windows-vm`。
+
 再次對同一個執行檔執行 `app-add` 會覆蓋原本的顯示名稱，不會產生重複項目。
 
 ### 硬體虛擬化（KVM）是硬性要求

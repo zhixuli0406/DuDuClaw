@@ -70,18 +70,23 @@
 // `home_dock.rs` (`pub(super)`, not `pub` — nothing outside this module
 // needs its internals) owns the goal-cards/activity-shelf/dock bottom half.
 
+/// WP-fix-QEMU-a (2026-09-05): the menu bar's real, ticking local clock —
+/// see that module's own header comment for what it replaces and why it's
+/// its own file.
+pub(crate) mod clock;
 mod home_dock;
 pub(crate) mod running_windows;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use chrono::Timelike;
 use gpui::{div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, BoxShadow, Context, Div, FontWeight, Image, ImageFormat, Stateful};
 
 use duduclaw_native_gui::theme;
 
 use crate::fake_data;
-use crate::i18n::{t, Key, Locale};
+use crate::i18n::{t, t1, Key, Locale};
 use crate::icons;
 use crate::overlay::notifications_feed::{FeedStatus, NotificationsFeed};
 use crate::overlay::task_progress_feed::TaskProgressFeed;
@@ -90,7 +95,11 @@ use crate::surface::Overlay;
 use crate::ShellView;
 use running_windows::RunningWindowsFeed;
 
-/// Branding PNGs, repo-relative to `appliance/branding/png/` (this crate's
+/// Branding PNGs, vendored into this crate at `assets/branding/` (2026-09-05:
+/// the `appliance/` tree moved to the DuDuClaw-OS repo, so the old repo-relative
+/// `appliance/branding/png/` path resolves neither here nor in the OS snapshot;
+/// the OS recipe's do_patch guard rejects a snapshot still using it). Originally
+/// repo-relative to `appliance/branding/png/` (this crate's
 /// task brief: "commercial/ 是 gitignored，資產一律用 appliance/branding 的
 /// 版本"). `include_bytes!` embeds them directly into the binary — no
 /// asset-loader / runtime file path involved, matching the task brief's
@@ -101,8 +110,8 @@ use running_windows::RunningWindowsFeed;
 /// board reuses the identical two assets) — widening visibility here avoids
 /// a second `include_bytes!` of the same PNGs bloating the binary with a
 /// duplicate copy.
-pub(crate) const MARK_32: &[u8] = include_bytes!("../../../appliance/branding/png/mark-32.png");
-pub(crate) const CAT_512: &[u8] = include_bytes!("../../../appliance/branding/png/cat-512.png");
+pub(crate) const MARK_32: &[u8] = include_bytes!("../assets/branding/mark-32.png");
+pub(crate) const CAT_512: &[u8] = include_bytes!("../assets/branding/cat-512.png");
 
 /// WP-A4-4 (2026-08-22): memoized per asset. This is called from RENDER
 /// bodies (Home's mascot + menu-bar mark, the lockscreen's watermark +
@@ -164,6 +173,12 @@ pub(crate) fn png(bytes: &'static [u8]) -> Arc<Image> {
 /// and `home_dock::dock` also dispatches the background scan that keeps it
 /// warm for the Launcher overlay too (see `crate::apps::feed::
 /// InstalledAppsFeed`'s own header comment).
+/// `operator_name` (WP-fix-QEMU-a, 2026-09-05) is `self.operator_name.
+/// as_deref()` from the same caller — the SAME field `lockscreen::render::
+/// render`'s own identity row already reads (see that field's own doc
+/// comment on `ShellView`), now also reaching the greeting this surface
+/// draws instead of the old hardcoded `fake_data::GREETING = "晚上好，
+/// Louis"`.
 pub fn render(
     palette: ShellPalette,
     notifications: &NotificationsFeed,
@@ -175,11 +190,13 @@ pub fn render(
     // count. See `overlay::task_progress_feed::TaskProgressFeed`'s own
     // header comment.
     task_progress: &TaskProgressFeed,
+    agents: &crate::overlay::agents_feed::AgentsFeed,
+    operator_name: Option<&str>,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
-    desktop_content(palette, cx)
+    desktop_content(palette, operator_name, notifications, task_progress, agents, cx)
         .child(menu_bar(palette, notifications, cx))
-        .child(home_dock::dock(palette, running_windows, installed_apps, notifications, task_progress, cx))
+        .child(home_dock::dock(palette, running_windows, installed_apps, notifications, task_progress, agents, cx))
 }
 
 /// WM-3 layer-shell migration (`crate::chrome`, 2026-08-23): everything
@@ -196,7 +213,28 @@ pub fn render(
 /// its own menu_bar/dock children, so the two entry points can never
 /// visually drift apart — see `ShellView::render_root`'s own doc comment
 /// (`main.rs`) for the matching split on that side.
-pub(crate) fn desktop_content(palette: ShellPalette, cx: &mut Context<ShellView>) -> Stateful<Div> {
+///
+/// `operator_name`/`notifications`/`task_progress` (WP-fix-QEMU-a,
+/// 2026-09-05): the greeting and the goal-cards/activity-shelf sections
+/// below used to be static `fake_data` content (a placeholder name, three
+/// canned tasks, a fabricated "today" log) that rendered unchanged on a
+/// freshly installed system — see `fake_data.rs`'s own header comment for
+/// the full defect. `render` above already receives all three from
+/// `ShellView` for the dock's benefit; this fn now takes the same three so
+/// the LayerSurfaces path (`chrome::windows`' `duduclaw-shell-home`
+/// surface, which calls this fn directly, never `render`) gets the
+/// identical real greeting and real task content, not a second code path
+/// that quietly kept the fake one.
+pub(crate) fn desktop_content(
+    palette: ShellPalette,
+    operator_name: Option<&str>,
+    notifications: &NotificationsFeed,
+    task_progress: &TaskProgressFeed,
+    // Threaded through for the dock (`chrome::windows` renders it via
+    // `dock_surface`); unused on this particular path.
+    _agents: &crate::overlay::agents_feed::AgentsFeed,
+    cx: &mut Context<ShellView>,
+) -> Stateful<Div> {
     div()
         .id("shell-home")
         .relative()
@@ -230,9 +268,9 @@ pub(crate) fn desktop_content(palette: ShellPalette, cx: &mut Context<ShellView>
             theme::alpha(0x788cc8, if palette.is_dark() { 0.08 } else { 0.12 }),
         ))
         .child(cat_hero())
-        .child(workspace(palette, cx))
-        .child(home_dock::goal_cards_row(palette))
-        .child(home_dock::activity_shelf(palette))
+        .child(workspace(palette, operator_name, cx))
+        .child(home_dock::goal_cards_row(palette, notifications, task_progress))
+        .child(home_dock::activity_shelf(palette, notifications))
 }
 
 /// WM-3: the menu bar, wrapped for its own dedicated `duduclaw-shell-
@@ -266,13 +304,14 @@ pub(crate) fn render_dock(
     // single-fullscreen path does.
     notifications: &NotificationsFeed,
     task_progress: &TaskProgressFeed,
+    agents: &crate::overlay::agents_feed::AgentsFeed,
     cx: &mut Context<ShellView>,
 ) -> Stateful<Div> {
     div()
         .id("shell-dock-surface")
         .relative()
         .size_full()
-        .child(home_dock::dock_surface(palette, running_windows, installed_apps, notifications, task_progress, cx))
+        .child(home_dock::dock_surface(palette, running_windows, installed_apps, notifications, task_progress, agents, cx))
 }
 
 fn blob_top_left(top: f32, left: f32, size: f32, color: gpui::Rgba) -> Div {
@@ -506,15 +545,26 @@ fn menu_bar_right(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
                 // renders nothing here rather than a wrong character —
                 // which is why `icons`' registry tests exist.
                 .children(icons::icon_or_none(&[(icons::WIFI, palette.foreground)], 14.))
-                .child(div().text_size(px(12.)).child(fake_data::BATTERY_PCT))
-                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(fake_data::CLOCK))
+                // WP-fix-QEMU-a (2026-09-05): a real read of this machine's
+                // own battery, hidden entirely (not "0%") when there isn't
+                // one — see `crate::battery`'s own header comment. The old
+                // `fake_data::BATTERY_PCT = "86%"` showed on every boot
+                // regardless of whether this appliance has battery hardware
+                // at all.
+                .children(crate::battery::battery_percent().map(|pct| div().text_size(px(12.)).child(format!("{pct}%"))))
+                // WP-fix-QEMU-a: `clock::menu_bar_clock_text()` — a real,
+                // ticking local-time clock (see that module's own header
+                // comment), replacing the frozen `fake_data::CLOCK = "22:58"`
+                // literal that disagreed with the lock screen's own real
+                // clock on the same boot.
+                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(clock::menu_bar_clock_text()))
                 .on_click(status_click),
         )
 }
 
 // ── AI workspace (greeting + composer + suggestion chips) ────────────────
 
-fn workspace(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+fn workspace(palette: ShellPalette, operator_name: Option<&str>, cx: &mut Context<ShellView>) -> Div {
     div()
         .absolute()
         .top(px(150.))
@@ -529,10 +579,41 @@ fn workspace(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
                 .text_size(px(theme::TEXT_XL))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::alpha(palette.foreground, 1.0))
-                .child(fake_data::GREETING),
+                .child(greeting_text(operator_name)),
         )
         .child(composer(palette, cx))
         .child(suggestion_chips(palette))
+}
+
+/// WP-fix-QEMU-a (2026-09-05): a time-of-day salutation plus the REAL
+/// operator display name, replacing the old hardcoded `fake_data::GREETING
+/// = "晚上好，Louis"` — a placeholder person's name shown on every boot
+/// regardless of who (if anyone) actually set this machine up. `hour()` is
+/// `chrono::Local::now()`'s, the same local-time source `clock::
+/// menu_bar_clock_text`/`lockscreen::render::now_local_strings` already use
+/// — one clock source for the whole shell, not a second one that could
+/// drift from the other two.
+///
+/// Boundaries (05:00–11:59 早安, 12:00–17:59 午安, otherwise 晚上好) are a
+/// plain, common three-way day split — no design-board or task-brief
+/// precedent pins the exact hours, so this is a reasonable default rather
+/// than a value lifted from a source.
+///
+/// `operator_name` empty/whitespace-only is treated the same as `None` —
+/// greets without a name rather than rendering a blank "早安，" — matching
+/// `oobe::boot_operator_name`'s own already-established emptiness filter
+/// (see that fn's own doc comment) applied here defensively too.
+fn greeting_text(operator_name: Option<&str>) -> String {
+    let name = operator_name.map(str::trim).filter(|n| !n.is_empty());
+    let hour = chrono::Local::now().hour();
+    match (hour, name) {
+        (5..=11, Some(name)) => t1(Locale::ZhTw, Key::HomeGreetingMorningNamed, name),
+        (12..=17, Some(name)) => t1(Locale::ZhTw, Key::HomeGreetingAfternoonNamed, name),
+        (_, Some(name)) => t1(Locale::ZhTw, Key::HomeGreetingEveningNamed, name),
+        (5..=11, None) => t(Locale::ZhTw, Key::HomeGreetingMorning).to_string(),
+        (12..=17, None) => t(Locale::ZhTw, Key::HomeGreetingAfternoon).to_string(),
+        (_, None) => t(Locale::ZhTw, Key::HomeGreetingEvening).to_string(),
+    }
 }
 
 /// Round 3: clicking the composer opens the Launcher — task brief's
@@ -690,5 +771,36 @@ mod tests {
         let mark = png(MARK_32);
         assert!(!Arc::ptr_eq(&cat, &mark));
         assert_ne!(cat.id(), mark.id(), "two different assets must not collapse onto one cache entry");
+    }
+
+    // ── WP-fix-QEMU-a: the real greeting, replacing `fake_data::GREETING`
+    // ────────────────────────────────────────────────────────────────────
+    // Deliberately does NOT assert which of 早安/午安/晚上好 comes back —
+    // that depends on the wall-clock hour the test happens to run at, and a
+    // test that only passes at certain times of day is exactly the kind of
+    // flake this crate's own testing discipline forbids. What's pinned
+    // instead: the real name shows up when given one, the placeholder name
+    // never does, and a missing/blank name degrades honestly rather than
+    // rendering a dangling separator.
+
+    #[test]
+    fn greeting_text_includes_the_real_operator_name_when_present() {
+        let text = greeting_text(Some("DuDu"));
+        assert!(text.contains("DuDu"), "expected the real operator name in the greeting, got {text:?}");
+        assert!(!text.contains("Louis"), "must never show the old placeholder name, got {text:?}");
+    }
+
+    #[test]
+    fn greeting_text_never_invents_a_name_when_none_is_on_file() {
+        let text = greeting_text(None);
+        assert!(!text.is_empty());
+        assert!(!text.contains("Louis"), "must never show the old placeholder name, got {text:?}");
+        assert!(!text.contains('，'), "a nameless greeting must not carry a dangling separator, got {text:?}");
+    }
+
+    #[test]
+    fn greeting_text_treats_a_blank_operator_name_the_same_as_none() {
+        assert_eq!(greeting_text(Some("   ")), greeting_text(None));
+        assert_eq!(greeting_text(Some("")), greeting_text(None));
     }
 }

@@ -105,30 +105,52 @@ fn candidates(url: &str) -> Vec<(&'static str, Vec<String>)> {
 /// same accepted trade-off `apps::launch` already makes for app launches on
 /// this single-purpose, long-lived session.
 pub(crate) fn open_portal(url: &str) {
+    open_checked(url, "oobe/network", "captive-portal sign-in page");
+}
+
+/// WP-C (2026-09-05): the `RuntimeAuth` step's 「用瀏覽器開啟」 button, for
+/// the verification URL a CLI login prints.
+///
+/// Shares this module's validator and candidate list rather than reaching
+/// for `crate::apps::launch`: that function launches an INSTALLED
+/// `.desktop` entry with its own recorded argv and has no way to append a
+/// URL, so it cannot open a specific page at all. The URL here is also not
+/// as hostile as a captive portal's — it comes from a CLI this appliance
+/// itself started — but it IS parsed out of terminal output, so it goes
+/// through exactly the same checks: a transcript fragment that happens to
+/// start with `-` or carry a control character must not reach a browser's
+/// argv either.
+pub(crate) fn open_login_page(url: &str) {
+    open_checked(url, "oobe/runtime-auth", "CLI sign-in page");
+}
+
+/// Shared body. `log_tag`/`what` only shape the diagnostics — the refusal
+/// rule and the candidate order are identical for both callers, on purpose.
+fn open_checked(url: &str, log_tag: &str, what: &str) {
     if !is_safe_portal_url(url) {
         // Deliberately does NOT echo the rejected URL: it is attacker-chosen
         // text and this line lands in the journal on an appliance.
-        eprintln!("[oobe/network] refusing to open the captive-portal URL — it is not a plain http(s) URL of a safe shape");
+        eprintln!("[{log_tag}] refusing to open the {what} — it is not a plain http(s) URL of a safe shape");
         return;
     }
     for (program, args) in candidates(url) {
         match Command::new(program).args(&args).spawn() {
             Ok(_child) => {
                 if crate::diag_enabled() {
-                    eprintln!("[oobe/network] opened the captive-portal sign-in page via {program}");
+                    eprintln!("[{log_tag}] opened the {what} via {program}");
                 }
                 return;
             }
             Err(e) => {
                 if crate::diag_enabled() {
-                    eprintln!("[oobe/network] {program} unavailable for the captive-portal page ({e}) — trying the next candidate");
+                    eprintln!("[{log_tag}] {program} unavailable for the {what} ({e}) — trying the next candidate");
                 }
             }
         }
     }
     // Always logged, not DIAG-gated: this happens once per click and is the
     // only trace the operator's click leaves when nothing could be launched.
-    eprintln!("[oobe/network] could not open the captive-portal sign-in page — no browser found (tried chromium, chromium-browser, xdg-open)");
+    eprintln!("[{log_tag}] could not open the {what} — no browser found (tried chromium, chromium-browser, xdg-open)");
 }
 
 #[cfg(test)]

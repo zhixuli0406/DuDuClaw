@@ -353,6 +353,44 @@ pub(crate) struct LockScreenState {
     /// reasoning, as `overlay::notifications_feed::NotificationsFeed::
     /// stale_timer_armed` — see that field's own doc comment.
     clock_timer_armed: bool,
+    /// D9-post-unlock-focus (2026-09-05): `true` from the moment a
+    /// successful `unlock()` runs until the very next render pass claims it
+    /// via `Self::take_pending_focus_reclaim` and calls real gpui
+    /// `Window::focus` to hand keyboard focus back to the shared root.
+    ///
+    /// Why this can't just happen INSIDE `unlock()`: every caller that ever
+    /// reaches `unlock()` (`lockscreen::render::unlock`, in turn only ever
+    /// reached from `apply_unlock_result`'s `cx.spawn` background-task
+    /// entity update, or from the `DUDUCLAW_SHELL_LOCK_NO_PASSWORD`
+    /// immediate path inside `dispatch_unlock_attempt`) runs with `&mut
+    /// Context<ShellView>` but NO live `&mut Window` in hand — the exact
+    /// same structural constraint `lock_and_refresh`'s own doc comment
+    /// already documents for the OPPOSITE edge ("Only the CLEAR half is
+    /// possible here — `lock_and_refresh` has no `&mut Window`"). So instead
+    /// of calling `Window::focus` directly, `unlock()` just raises this
+    /// flag, and `main.rs`'s `ShellView::render_root` — which DOES have a
+    /// live `&mut Window` on every render pass, on whichever window (Home,
+    /// in both `ChromeMode`s) is actually rendering it — claims it once and
+    /// performs the real focus move.
+    ///
+    /// Without this, `Window.focus` keeps pointing at the password field's
+    /// `FocusHandle` id — set by `render::reveal_and_focus`'s deferred
+    /// `window.focus(&handle, cx)` call — which is no longer present in ANY
+    /// rendered frame the instant Home replaces the lock screen. Actions and
+    /// the root's own raw key/mouse catch-alls still fire regardless (gpui's
+    /// `Window::focus_node_id_in_rendered_frame` falls back to the root node
+    /// when the stored focus id isn't found in the current frame), but no
+    /// text field can ever become the genuinely FOCUSED element again until
+    /// something calls `Window::focus` with a handle that DOES belong to the
+    /// current frame — which is exactly what left the operator unable to
+    /// reliably resume typing into Home-window-hosted fields after an
+    /// unlock, most visibly in `ChromeMode::LayerSurfaces` where the
+    /// composer's own click handler (`home.rs`'s `composer()` ->
+    /// `ShellView::settle_launcher_query`) deliberately leaves Home's own
+    /// window focus untouched on the open path (it defers to the Launcher
+    /// overlay's own separate window instead — see that method's own doc
+    /// comment) and so never repairs the staleness on its own.
+    focus_reclaim_pending: bool,
 }
 
 impl Default for LockScreenState {
@@ -364,6 +402,7 @@ impl Default for LockScreenState {
             unlock_prompt: UnlockPrompt::default(),
             power: PowerMenu::default(),
             clock_timer_armed: false,
+            focus_reclaim_pending: false,
         }
     }
 }
@@ -415,6 +454,15 @@ impl LockScreenState {
         // removes any need to trust that invariant.
         self.unlock_prompt = UnlockPrompt::default();
         self.power = PowerMenu::Closed;
+        // D9-post-unlock-focus: defensive reset, same "guaranteed-clean
+        // slate" reasoning the two resets just above already give — a fresh
+        // lock should never inherit a reclaim that was somehow still
+        // pending from a previous unlock's render race (in practice the very
+        // next render pass after `unlock()` always claims it well before a
+        // human could re-lock, but costing nothing to guard against it
+        // outright removes the possibility rather than relying on that
+        // timing).
+        self.focus_reclaim_pending = false;
     }
 
     /// See `last_input_at`'s own doc comment for why this also resets the
@@ -427,6 +475,23 @@ impl LockScreenState {
         self.last_input_at = Instant::now();
         self.unlock_prompt = UnlockPrompt::default();
         self.power = PowerMenu::Closed;
+        // D9-post-unlock-focus (2026-09-05): raise the flag `render_root`
+        // claims to actually move gpui keyboard focus back onto the shared
+        // root — see `focus_reclaim_pending`'s own doc comment for why this
+        // method cannot simply call `Window::focus` itself.
+        self.focus_reclaim_pending = true;
+    }
+
+    /// Claims the pending post-unlock focus reclaim — `true` exactly on the
+    /// edge (never again until the NEXT `unlock()` re-raises it), same
+    /// single-consumption shape `reveal_prompt`/`try_arm_clock_timer`
+    /// already establish elsewhere in this file. `main.rs`'s
+    /// `ShellView::render_root` is the one caller: it holds the live
+    /// `&mut Window` this state machine itself cannot carry (see
+    /// `focus_reclaim_pending`'s own doc comment), and calls real gpui
+    /// `Window::focus` exactly when this returns `true`.
+    pub(crate) fn take_pending_focus_reclaim(&mut self) -> bool {
+        std::mem::take(&mut self.focus_reclaim_pending)
     }
 
     pub(crate) fn note_input(&mut self) {
@@ -698,6 +763,92 @@ mod tests {
         assert!(!state.is_locked());
         assert_eq!(state.locked_at(), None);
         assert!(!state.is_idle_past(Duration::from_secs(60)), "unlocking must count as fresh input");
+    }
+
+    // ── D9-post-unlock-focus (2026-09-05): the pending focus reclaim ──────
+
+    #[test]
+    fn a_fresh_state_has_no_pending_focus_reclaim() {
+        let mut state = LockScreenState::default();
+        assert!(!state.take_pending_focus_reclaim(), "nothing has unlocked yet");
+    }
+
+    #[test]
+    fn locking_alone_never_raises_a_pending_focus_reclaim() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        assert!(!state.take_pending_focus_reclaim(), "a lock with no prior unlock must not queue a reclaim");
+    }
+
+    #[test]
+    fn unlock_raises_a_pending_focus_reclaim_consumed_exactly_once() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        state.unlock();
+        assert!(state.take_pending_focus_reclaim(), "the render pass right after an unlock must see the edge");
+        assert!(!state.take_pending_focus_reclaim(), "a second claim on the same edge must find nothing left to take");
+    }
+
+    #[test]
+    fn a_second_unlock_after_the_reclaim_was_already_taken_raises_it_again() {
+        // Regression guard for the one-shot shape itself: unlocking TWICE
+        // (e.g. two lock/unlock cycles in a row) must queue a fresh reclaim
+        // each time, not just once for the process lifetime.
+        let mut state = LockScreenState::default();
+        state.lock();
+        state.unlock();
+        assert!(state.take_pending_focus_reclaim());
+        state.lock();
+        state.unlock();
+        assert!(state.take_pending_focus_reclaim(), "the second unlock must raise its own fresh edge");
+    }
+
+    #[test]
+    fn relocking_before_the_reclaim_is_claimed_drops_it() {
+        // Belt-and-suspenders: `lock()`'s own defensive reset must clear a
+        // reclaim left pending by a same-tick unlock/lock race, so a lock
+        // screen that is up again never has a stale flag waiting to steal
+        // focus back once it eventually unlocks for real.
+        let mut state = LockScreenState::default();
+        state.lock();
+        state.unlock();
+        state.lock();
+        assert!(!state.take_pending_focus_reclaim(), "a fresh lock must drop an unclaimed reclaim from the previous session");
+    }
+
+    /// Review finding (2026-09-05): `main.rs`'s `render_root` guard now ALSO
+    /// requires `self.surface.overlay().is_none()` before it will claim this
+    /// flag — written as the last `&&` operand alongside
+    /// `take_pending_focus_reclaim()` so that while an overlay is open,
+    /// short-circuit evaluation never calls `take_pending_focus_reclaim()`
+    /// at all, leaving the flag untouched for the next Home render pass
+    /// after the overlay closes. `LockScreenState` has no notion of overlay
+    /// state (that lives on `SurfaceState`, a sibling field on `ShellView`
+    /// this module never sees), so the actual guard can't be exercised from
+    /// here — but the property it depends on IS this state machine's to
+    /// guarantee: nothing except an explicit `take_pending_focus_reclaim()`
+    /// call may ever clear the flag. This pins that contract directly: a
+    /// pile of unrelated reads/mutations between `unlock()` and the eventual
+    /// claim must never clear it early.
+    #[test]
+    fn the_pending_reclaim_survives_unrelated_reads_and_mutations_until_actually_claimed() {
+        let mut state = LockScreenState::default();
+        state.lock();
+        state.unlock();
+        // Stand in for "renders that ran while an open overlay kept the real
+        // call site from claiming it yet" — none of these may be the thing
+        // that clears `focus_reclaim_pending`.
+        assert!(!state.is_locked());
+        assert_eq!(state.locked_at(), None);
+        state.note_input();
+        let _ = state.prompt_visible();
+        let _ = state.unlock_phase();
+        let _ = state.power_menu();
+        let _ = state.is_idle_past(Duration::from_secs(0));
+        assert!(
+            state.take_pending_focus_reclaim(),
+            "the reclaim must still be pending after unrelated reads/mutations, not just after unlock() with nothing in between"
+        );
     }
 
     #[test]

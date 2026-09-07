@@ -13,7 +13,8 @@
 //! the narrowest thing that still works:
 //!
 //! 1. **Hard-coded whitelist.** The only input is a provider *name*, matched
-//!    for exact equality against [`SPECS`]. There is no package/version/URL/flag
+//!    for exact equality against `runtime_catalog::CATALOG`. There is no
+//!    package/version/URL/flag
 //!    parameter — the command that runs is a compile-time constant. An unknown
 //!    name (including any shell metacharacter payload) is rejected outright;
 //!    there is no default arm that could silently install "something".
@@ -30,22 +31,20 @@
 //!
 //! ## Where the install commands come from
 //!
-//! Every command below is the one this repo already uses in
-//! `container/Dockerfile.server` — i.e. the channel DuDuClaw itself ships and
-//! smoke-tests, not a guess:
+//! WP-B moved the table itself into
+//! [`duduclaw_core::runtime_catalog`] — one `const CATALOG` that detection,
+//! installation, model discovery and CLI login all read, so a runtime cannot
+//! be installable-but-undetectable (or vice versa) ever again. Each entry
+//! carries its vendor source in a comment next to the channel; the executable
+//! copy of those commands is
+//! [`tests::maps_every_supported_provider_to_its_documented_command`], which
+//! fails the build on a typo'd package name.
 //!
-//! | provider | command | source |
-//! |---|---|---|
-//! | `claude` | `npm install -g @anthropic-ai/claude-code` | `Dockerfile.server:53-56`, `docs/guides/docker.md:30`, `docs/guides/docker.md:231` |
-//! | `codex` | `npm install -g @openai/codex` | `Dockerfile.server:53-56`, `docs/guides/docker.md:30` |
-//! | `gemini` | `npm install -g @google/gemini-cli` | `Dockerfile.server:53-56`, `docs/guides/docker.md:30` |
-//! | `antigravity` | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | `Dockerfile.server:66`, `docs/todo/TODO-antigravity-cli-migration.md:25` |
-//! | `grok` | `curl -fsSL https://x.ai/cli/install.sh \| bash` | `Dockerfile.server:84`, `runtime/grok.rs:4-5` |
-//!
-//! Two of those are deliberately **manual-only** (`auto = false`) despite having
-//! a known command — see [`InstallChannel::Manual`] for the per-provider reason.
-//! Guessing an install channel for an unlisted provider is forbidden: add it
-//! here only with a verified source, otherwise it stays unknown and is rejected.
+//! Channels that are deliberately **not** auto-run (`Manual`, `Binary`,
+//! `PythonTool`) still return the exact command to paste — see
+//! [`decline_reason`] for the per-channel reason. Guessing an install channel
+//! for an unlisted provider is forbidden: add it to the catalog only with a
+//! verified source, otherwise it stays unknown and is rejected.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -59,164 +58,35 @@ use serde_json::{json, Value};
 /// `timeout` status plus the manual command.
 pub const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How a CLI gets installed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallChannel {
-    /// `npm install -g <package>`. Spawned argv-wise (no shell), works on
-    /// macOS / Linux / Windows, and lands the binary somewhere
-    /// [`duduclaw_core::which_cli_in_home`] already probes.
-    Npm { package: &'static str },
-    /// Vendor's official POSIX install script, run as `bash -c "<command>"`.
-    /// Unix only — the script is `sh`-flavoured, so Windows falls back to
-    /// manual. The install target must be a directory `which_cli_in_home`
-    /// probes, otherwise the post-install re-detect would report "still not
-    /// installed" and the flow would look broken.
-    PosixScript {
-        /// Full command line, a compile-time constant. Never assembled from
-        /// caller input.
-        command: &'static str,
-    },
-    /// Known command, but this gateway deliberately does not run it. `reason`
-    /// is a stable machine code the UI maps to an explanation; `command` is
-    /// shown for the user to paste into a terminal.
-    Manual {
-        command: &'static str,
-        reason: &'static str,
-    },
-}
+use duduclaw_core::runtime_catalog::{InstallChannel, RuntimeSpec};
 
 /// One provider's install recipe.
-#[derive(Clone, Copy)]
-pub struct InstallSpec {
-    /// Canonical provider id (the value `runtime.detect` keys on).
-    pub provider: &'static str,
-    /// Binary name, for logs and diagnostics.
-    pub binary: &'static str,
-    pub channel: InstallChannel,
-    /// Vendor documentation — the "我自己來" escape hatch in the UI.
-    pub docs_url: &'static str,
-    /// PATH-first probe — **the same `which_*` `runtime.detect` calls for this
-    /// CLI**. Stored as a function pointer rather than resolved from
-    /// `binary` via the generic `which_cli`, because the per-CLI probes are
-    /// materially richer: `which_claude` also walks NVM version dirs, Volta,
-    /// bun, asdf shims and `.claude/bin`, and `which_grok` falls back to the
-    /// third-party `grok-cli`. Using the generic probe here would report a
-    /// perfectly good NVM/Scoop install as "still missing" and turn a
-    /// successful install into a phantom failure.
-    probe: fn() -> Option<String>,
-    /// HOME-rooted probe, same family as [`Self::probe`].
-    probe_in_home: fn(&std::path::Path) -> Option<String>,
-}
-
-impl std::fmt::Debug for InstallSpec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InstallSpec")
-            .field("provider", &self.provider)
-            .field("binary", &self.binary)
-            .field("channel", &self.channel)
-            .finish()
-    }
-}
-
-/// The whitelist. Exhaustive: anything not here is unknown and is rejected.
-const SPECS: &[InstallSpec] = &[
-    InstallSpec {
-        provider: "claude",
-        binary: "claude",
-        // npm-global first, matching the README's recommended path and the
-        // Windows story (`@anthropic-ai/claude-code` ships a real `claude.exe`
-        // inside the npm package — see CHANGELOG v1.x "claude.exe" notes).
-        channel: InstallChannel::Npm { package: "@anthropic-ai/claude-code" },
-        docs_url: "https://docs.anthropic.com/en/docs/claude-code",
-        probe: duduclaw_core::which_claude,
-        probe_in_home: duduclaw_core::which_claude_in_home,
-    },
-    InstallSpec {
-        provider: "codex",
-        binary: "codex",
-        channel: InstallChannel::Npm { package: "@openai/codex" },
-        docs_url: "https://github.com/openai/codex",
-        probe: duduclaw_core::which_codex,
-        probe_in_home: duduclaw_core::which_codex_in_home,
-    },
-    InstallSpec {
-        provider: "gemini",
-        binary: "gemini",
-        channel: InstallChannel::Npm { package: "@google/gemini-cli" },
-        docs_url: "https://github.com/google-gemini/gemini-cli",
-        probe: duduclaw_core::which_gemini,
-        probe_in_home: duduclaw_core::which_gemini_in_home,
-    },
-    InstallSpec {
-        provider: "antigravity",
-        binary: "agy",
-        // Google's official installer drops `agy` in `$HOME/.local/bin`, which
-        // is the FIRST candidate `which_cli_in_home` probes — so the
-        // post-install re-detect turns green without any PATH surgery.
-        channel: InstallChannel::PosixScript {
-            command: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
-        },
-        docs_url: "https://antigravity.google/docs/cli",
-        probe: duduclaw_core::which_agy,
-        probe_in_home: duduclaw_core::which_agy_in_home,
-    },
-    InstallSpec {
-        provider: "grok",
-        binary: "grok",
-        // Manual on purpose. xAI's installer puts the binary at
-        // `$HOME/.grok/bin/grok` (see container/Dockerfile.server:76-83, which
-        // has to relocate it to /usr/local/bin). `which_cli_in_home` does NOT
-        // probe `~/.grok/bin`, so an auto-install would finish successfully and
-        // the wizard would still say "未安裝" — a worse experience than telling
-        // the user up front. Revisit if the core probe list gains `~/.grok/bin`.
-        channel: InstallChannel::Manual {
-            command: "curl -fsSL https://x.ai/cli/install.sh | bash",
-            reason: "install_target_not_on_probe_path",
-        },
-        docs_url: "https://docs.x.ai/build/cli",
-        probe: duduclaw_core::which_grok,
-        probe_in_home: duduclaw_core::which_grok_in_home,
-    },
-];
+///
+/// WP-B: this used to be a local `InstallSpec` table duplicating the runtime
+/// list. It is now an alias for the single
+/// [`duduclaw_core::runtime_catalog::RuntimeSpec`], so "which runtimes exist",
+/// "how each installs" and "which binary proves it worked" cannot drift apart.
+/// The security model is unchanged — see the module doc: `CATALOG` is still a
+/// compile-time `const`, [`spec_for`] still matches an exact, length-gated,
+/// ASCII-only identifier, and there is still no default arm.
+pub type InstallSpec = RuntimeSpec;
 
 /// Look up a provider's install recipe.
 ///
-/// Matching is exact (after trimming + ASCII-lowercasing) against the
-/// whitelist, plus the one documented alias `agy` → `antigravity` that the rest
-/// of the codebase already accepts. Anything else — an unknown CLI name, a
-/// shell payload, a path, an npm package name — returns `None`. Deliberately
-/// **not** built on `RuntimeType::parse`, whose unknown arm falls back to a
-/// default runtime; here an unrecognised name must never resolve to a command.
+/// Delegates to [`duduclaw_core::runtime_catalog::spec_for`] — same exact,
+/// length-gated, ASCII-only, alias-aware matching, same "unknown resolves to
+/// nothing" guarantee — then rejects the runtimes that have nothing to install:
+/// `openai_compat` is an HTTP endpoint with no binary at all.
 pub fn spec_for(provider: &str) -> Option<&'static InstallSpec> {
-    // Length gate FIRST, before any allocation: every legitimate provider name
-    // is under a dozen bytes, so a megabyte-long argument is a probe, not a
-    // typo, and must not cost us a megabyte-long lowercase copy per call.
-    let trimmed = provider.trim();
-    if trimmed.is_empty() || trimmed.len() > 32 {
-        return None;
-    }
-    let key = trimmed.to_ascii_lowercase();
-    // Reject anything that isn't a bare ASCII identifier before it can even be
-    // compared — cheap defence in depth so a payload can never reach the table.
-    // ASCII-only also rules out homoglyphs (Cyrillic `с`, fullwidth `ａ`),
-    // which `to_ascii_lowercase` leaves untouched and which would otherwise
-    // rely solely on the table comparison to fail.
-    if !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-        return None;
-    }
-    let canonical = if key == "agy" { "antigravity" } else { key.as_str() };
-    SPECS.iter().find(|s| s.provider == canonical)
+    let spec = duduclaw_core::runtime_catalog::spec_for(provider)?;
+    (!spec.binary.is_empty()).then_some(spec)
 }
 
 /// The command string shown to the user (and copied to the clipboard on
 /// fallback). Always the human-readable one-liner, even for the argv-spawned
 /// npm path.
 pub fn command_display(spec: &InstallSpec) -> String {
-    match spec.channel {
-        InstallChannel::Npm { package } => format!("npm install -g {package}"),
-        InstallChannel::PosixScript { command } => command.to_string(),
-        InstallChannel::Manual { command, .. } => command.to_string(),
-    }
+    spec.install.command_display()
 }
 
 /// Can this gateway actually run the install itself?
@@ -224,26 +94,30 @@ pub fn command_display(spec: &InstallSpec) -> String {
 /// `windows` is a parameter rather than a `cfg!` so the platform rule is unit
 /// testable on any host.
 pub fn auto_installable(spec: &InstallSpec, windows: bool) -> bool {
-    match spec.channel {
-        InstallChannel::Npm { .. } => true,
-        InstallChannel::PosixScript { .. } => !windows,
-        InstallChannel::Manual { .. } => false,
-    }
+    decline_reason(spec, windows).is_none()
 }
 
 /// Machine-readable reason an auto-install is declined, or `None` when it can
 /// run. Kept next to [`auto_installable`] so the two never drift.
 pub fn decline_reason(spec: &InstallSpec, windows: bool) -> Option<&'static str> {
-    match spec.channel {
+    match spec.install {
         InstallChannel::Npm { .. } => None,
-        InstallChannel::PosixScript { .. } => {
-            if windows {
-                Some("posix_script_on_windows")
-            } else {
-                None
-            }
-        }
+        InstallChannel::PosixScript { .. } => windows.then_some("posix_script_on_windows"),
         InstallChannel::Manual { reason, .. } => Some(reason),
+        // WP-B channels the gateway deliberately does NOT run itself:
+        //
+        // * `Binary` — a bare download has no vendor-signed integrity story
+        //   this process can verify, so auto-running it would mean fetching an
+        //   unauthenticated executable and putting it on PATH as root. The OS
+        //   image's `duduclaw-ai-runtimes` recipe expands these URLs under a
+        //   build that checksums what it fetched; the dashboard only reports.
+        // * `PythonTool` — needs a Python toolchain decision (uv vs pipx vs a
+        //   venv location) that belongs to the image, not to a web click.
+        //
+        // Both still return the exact command to paste, so the UI is a
+        // copyable fallback rather than a dead end.
+        InstallChannel::Binary { .. } => Some("binary_download_unverifiable"),
+        InstallChannel::PythonTool { .. } => Some("python_toolchain_required"),
     }
 }
 
@@ -256,9 +130,7 @@ pub fn decline_reason(spec: &InstallSpec, windows: bool) -> Option<&'static str>
 /// `handle_runtime_detect`.
 pub fn detect_binary(spec: &InstallSpec) -> bool {
     let user_home = PathBuf::from(duduclaw_core::platform::home_dir());
-    (spec.probe)()
-        .or_else(|| (spec.probe_in_home)(&user_home))
-        .is_some()
+    duduclaw_core::detect_runtime(spec.id, &user_home).is_some()
 }
 
 // ── concurrency guard ────────────────────────────────────────────────────────
@@ -329,19 +201,19 @@ impl StartOutcome {
         match self {
             Self::Started { session_id, command } => json!({
                 "started": true,
-                "provider": spec.provider,
+                "provider": spec.id,
                 "session_id": session_id,
                 "command": command,
-                "docs_url": spec.docs_url,
+                "docs_url": spec.vendor_url,
                 "timeout_secs": INSTALL_TIMEOUT.as_secs(),
             }),
             Self::Declined { reason, command, prerequisite } => json!({
                 "started": false,
-                "provider": spec.provider,
+                "provider": spec.id,
                 "reason": reason,
                 "command": command,
                 "prerequisite": prerequisite,
-                "docs_url": spec.docs_url,
+                "docs_url": spec.vendor_url,
             }),
         }
     }
@@ -443,7 +315,7 @@ pub async fn start_install(
 
     // Build the child. `program`/`args` are derived from the compile-time
     // channel only — no caller value reaches either.
-    let (program, args): (String, Vec<String>) = match spec.channel {
+    let (program, args): (String, Vec<String>) = match spec.install {
         InstallChannel::Npm { package } => {
             let Some(npm) = duduclaw_core::which_cli("npm") else {
                 return StartOutcome::Declined {
@@ -457,12 +329,14 @@ pub async fn start_install(
                 vec!["install".into(), "-g".into(), package.to_string()],
             )
         }
-        InstallChannel::PosixScript { command: script } => {
-            // `bash -c <constant>`. The constant is the whole pipeline; nothing
-            // is interpolated. Resolved to an absolute path rather than spawned
-            // by bare name so the shell we run is the one PATH resolution found
-            // now — and so a host without bash declines cleanly instead of
-            // surfacing as an opaque `spawn_failed`.
+        InstallChannel::PosixScript { url } => {
+            // `bash -c "curl -fsSL <url> | bash"`. `url` is a compile-time
+            // catalog constant, so the whole pipeline is constant too;
+            // nothing caller-supplied is interpolated. Resolved to an
+            // absolute path rather than spawned by bare name so the shell we
+            // run is the one PATH resolution found now — and so a host
+            // without bash declines cleanly instead of surfacing as an
+            // opaque `spawn_failed`.
             let Some(bash) = duduclaw_core::which_cli("bash") else {
                 return StartOutcome::Declined {
                     reason: "prerequisite_missing",
@@ -470,15 +344,20 @@ pub async fn start_install(
                     prerequisite: Some("bash"),
                 };
             };
-            (bash, vec!["-c".into(), script.to_string()])
+            (bash, vec!["-c".into(), format!("curl -fsSL {url} | bash")])
         }
-        // Unreachable: `decline_reason` returned `Some` for Manual above.
-        InstallChannel::Manual { reason, .. } => {
+        // Unreachable: `decline_reason` returned `Some` for Manual / Binary /
+        // PythonTool above. Kept explicit (no wildcard) so a new channel
+        // variant is a compile error here, not a silently-run installer.
+        InstallChannel::Manual { .. }
+        | InstallChannel::Binary { .. }
+        | InstallChannel::PythonTool { .. } => {
+            let reason = decline_reason(spec, cfg!(windows)).unwrap_or("unsupported_channel");
             return StartOutcome::Declined { reason, command, prerequisite: None };
         }
     };
 
-    if !try_claim(spec.provider) {
+    if !try_claim(spec.id) {
         return StartOutcome::Declined {
             reason: "already_running",
             command,
@@ -505,8 +384,8 @@ pub async fn start_install(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            release(spec.provider);
-            tracing::warn!(target: "runtime_install", provider = spec.provider, error = %e, "spawn failed");
+            release(spec.id);
+            tracing::warn!(target: "runtime_install", provider = spec.id, error = %e, "spawn failed");
             return StartOutcome::Declined {
                 reason: "spawn_failed",
                 command,
@@ -523,7 +402,7 @@ pub async fn start_install(
         &actor,
         duduclaw_security::audit::Severity::Warning,
         json!({
-            "provider": spec.provider,
+            "provider": spec.id,
             "session_id": session_id,
             "command": command,
         }),
@@ -570,7 +449,7 @@ pub async fn start_install(
                         Some(l) => emit(
                             &event_tx,
                             "runtime.install.output",
-                            json!({ "session_id": sid, "provider": spec.provider, "data": format!("{l}\n") }),
+                            json!({ "session_id": sid, "provider": spec.id, "data": format!("{l}\n") }),
                         ),
                         None => break,
                     },
@@ -580,7 +459,7 @@ pub async fn start_install(
                             emit(
                                 &event_tx,
                                 "runtime.install.output",
-                                json!({ "session_id": sid, "provider": spec.provider, "data": format!("{l}\n") }),
+                                json!({ "session_id": sid, "provider": spec.id, "data": format!("{l}\n") }),
                             );
                         }
                         return status.ok().and_then(|s| s.code());
@@ -611,7 +490,7 @@ pub async fn start_install(
         // to let another install of this provider start. Releasing before the
         // reap would let a second `npm install -g` run against the same global
         // prefix while the first was still dying.
-        release(spec.provider);
+        release(spec.id);
 
         // Authoritative answer for the UI: is the binary actually there now?
         // A zero exit that somehow didn't produce a usable binary must not turn
@@ -635,7 +514,7 @@ pub async fn start_install(
                 duduclaw_security::audit::Severity::Warning
             },
             json!({
-                "provider": spec.provider,
+                "provider": spec.id,
                 "session_id": sid,
                 "status": final_status,
                 "exit_code": exit_code,
@@ -645,7 +524,7 @@ pub async fn start_install(
 
         tracing::info!(
             target: "runtime_install",
-            provider = spec.provider,
+            provider = spec.id,
             status = final_status,
             detected,
             "install finished"
@@ -656,14 +535,14 @@ pub async fn start_install(
             "runtime.install.status",
             json!({
                 "session_id": sid,
-                "provider": spec.provider,
+                "provider": spec.id,
                 "status": final_status,
                 "exit_code": exit_code,
                 "detected": detected,
                 // Always hand back the manual command so a failure is a
                 // fallback, not a dead end.
                 "command": cmd_display,
-                "docs_url": spec.docs_url,
+                "docs_url": spec.vendor_url,
             }),
         );
     });
@@ -711,11 +590,19 @@ mod tests {
                 "curl -fsSL https://antigravity.google/cli/install.sh | bash",
             ),
             ("grok", "curl -fsSL https://x.ai/cli/install.sh | bash"),
+            // WP-B additions (2026-09), sources cited in each catalog entry.
+            ("qwen", "npm install -g @qwen-code/qwen-code"),
+            ("kimi", "npm install -g @moonshot-ai/kimi-code"),
+            ("copilot", "npm install -g @github/copilot"),
+            ("kiro", "curl -fsSL https://cli.kiro.dev/install | bash"),
+            ("cursor", "curl -fsSL https://cursor.com/install | bash"),
+            ("vibe", "uv tool install mistral-vibe"),
+            ("opencode", "curl -fsSL https://opencode.ai/install | bash"),
         ];
         for (provider, expected) in cases {
             let spec = spec_for(provider).unwrap_or_else(|| panic!("{provider} must be mapped"));
             assert_eq!(command_display(spec), expected, "{provider}");
-            assert!(spec.docs_url.starts_with("https://"), "{provider} docs url");
+            assert!(spec.vendor_url.starts_with("https://"), "{provider} docs url");
         }
     }
 
@@ -723,13 +610,67 @@ mod tests {
     fn agy_is_an_alias_for_antigravity() {
         let a = spec_for("agy").expect("agy alias");
         let b = spec_for("antigravity").expect("antigravity");
-        assert_eq!(a.provider, b.provider);
+        assert_eq!(a.id, b.id);
         assert_eq!(a.binary, "agy");
+    }
+
+    /// Every catalog runtime with a binary must be installable-or-explainable.
+    /// The failure this prevents: a new runtime that `runtime.detect` reports
+    /// as missing while `runtime.install` says "unsupported provider".
+    #[test]
+    fn every_catalog_cli_resolves_to_an_install_recipe() {
+        for spec in duduclaw_core::runtime_catalog::cli_specs() {
+            let got = spec_for(spec.id)
+                .unwrap_or_else(|| panic!("`{}` has no install recipe", spec.id));
+            assert_eq!(got.id, spec.id);
+            assert!(!command_display(got).is_empty(), "{} command", spec.id);
+            assert!(
+                got.vendor_url.starts_with("https://"),
+                "{} vendor_url",
+                spec.id
+            );
+            // Either it auto-installs, or it says exactly why not.
+            assert!(
+                auto_installable(got, false) || decline_reason(got, false).is_some(),
+                "{} must auto-install or explain the decline",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn non_cli_runtimes_have_nothing_to_install() {
+        // `openai_compat` is a real runtime but an HTTP endpoint — offering an
+        // install button for it would be a dead end.
+        assert!(duduclaw_core::runtime_catalog::spec_for("openai_compat").is_some());
+        assert!(spec_for("openai_compat").is_none());
+    }
+
+    #[test]
+    fn unverifiable_channels_decline_with_a_pasteable_command() {
+        // Binary / PythonTool are never auto-run (no integrity story / needs a
+        // Python toolchain decision) but must still hand the user the command.
+        let vibe = spec_for("vibe").unwrap();
+        assert!(!auto_installable(vibe, false));
+        assert_eq!(
+            decline_reason(vibe, false),
+            Some("python_toolchain_required")
+        );
+        assert!(command_display(vibe).contains("mistral-vibe"));
+
+        // Kiro is Manual for a POLICY reason, not a technical one — its vendor
+        // FAQ forbids third-party harnesses (see the catalog entry's tos_note).
+        let kiro = spec_for("kiro").unwrap();
+        assert_eq!(
+            decline_reason(kiro, false),
+            Some("vendor_tos_restricts_third_party_harness")
+        );
+        assert!(command_display(kiro).contains("cli.kiro.dev"));
     }
 
     #[test]
     fn provider_lookup_is_case_and_whitespace_tolerant() {
-        assert_eq!(spec_for("  CLAUDE ").map(|s| s.provider), Some("claude"));
+        assert_eq!(spec_for("  CLAUDE ").map(|s| s.id), Some("claude"));
     }
 
     #[test]
@@ -801,27 +742,40 @@ mod tests {
     }
 
     #[test]
-    fn every_spec_probes_with_its_own_which_family() {
+    fn every_spec_probes_the_same_way_runtime_detect_does() {
         // The post-install re-detect must use the SAME probe `runtime.detect`
-        // uses. A generic `which_cli(binary)` would miss NVM version dirs /
-        // Volta / bun / asdf / `.claude/bin` (claude) and the `grok-cli`
-        // fallback (grok), reporting a good install as a failure. Function
-        // pointers make that wiring structural: you cannot add a spec without
-        // choosing a probe pair.
-        let cases: [(&str, fn() -> Option<String>); 5] = [
-            ("claude", duduclaw_core::which_claude),
-            ("codex", duduclaw_core::which_codex),
-            ("gemini", duduclaw_core::which_gemini),
-            ("antigravity", duduclaw_core::which_agy),
-            ("grok", duduclaw_core::which_grok),
-        ];
-        for (provider, expected) in cases {
-            let spec = spec_for(provider).unwrap();
-            assert!(
-                std::ptr::fn_addr_eq(spec.probe, expected),
-                "{provider} must probe with its own which_* function"
+        // uses, or a good install is reported as a failure. Both now call
+        // `duduclaw_core::detect_runtime(id, home)`, which keeps the two
+        // special cases that used to need per-spec function pointers:
+        //   * `claude` delegates to `which_claude` (NVM version dirs, Volta,
+        //     bun, asdf shims, `.claude/bin`, Windows .exe > .cmd);
+        //   * `grok` falls back to the third-party `grok-cli` binary name.
+        // This pins both so a refactor of `which_runtime` cannot quietly drop
+        // them.
+        let home = std::path::Path::new("/nonexistent-home-for-this-test");
+        for spec in duduclaw_core::runtime_catalog::cli_specs() {
+            // Same function, same answer — the point is that there is exactly
+            // one probe, not that it finds anything on this machine.
+            assert_eq!(
+                duduclaw_core::detect_runtime(spec.id, home).is_some(),
+                duduclaw_core::which_runtime(spec.id)
+                    .or_else(|| duduclaw_core::which_runtime_in_home(home, spec.id))
+                    .is_some(),
+                "{} detect path must be the single catalog probe",
+                spec.id
             );
         }
+        // The two special cases, asserted structurally.
+        assert_eq!(
+            duduclaw_core::which_runtime("claude"),
+            duduclaw_core::which_claude(),
+            "claude must keep its richer bespoke probe"
+        );
+        assert_eq!(
+            spec_for("grok").unwrap().binary_aliases,
+            &["grok-cli"],
+            "grok must keep its third-party binary fallback"
+        );
     }
 
     #[test]
@@ -898,13 +852,17 @@ mod tests {
 
     #[test]
     fn every_spec_binary_is_a_bare_name() {
-        for spec in SPECS {
+        for spec in duduclaw_core::runtime_catalog::cli_specs() {
             assert!(
                 !spec.binary.contains('/') && !spec.binary.contains('\\'),
                 "{} binary must be a bare name",
-                spec.provider
+                spec.id
             );
-            assert!(spec.provider.chars().all(|c| c.is_ascii_lowercase()));
+            assert!(
+                spec.id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            );
         }
     }
 }

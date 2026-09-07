@@ -3210,11 +3210,23 @@ fn first_run_network_gate(state: &AppState, addr: SocketAddr) -> Option<axum::re
     if allowed {
         return None;
     }
+    // 2026-09-05: say WHICH gate refused. The desktop shell re-running OOBE
+    // after the admin account exists hits this from loopback on an
+    // appliance, and needs to tell "setup already done" (network was
+    // configured once; carry on) apart from a genuinely wrong caller.
+    let code = if !duduclaw_core::is_appliance() {
+        "not_appliance"
+    } else if !addr.ip().is_loopback() {
+        "not_loopback"
+    } else {
+        "first_run_completed"
+    };
     Some(
         (
             axum::http::StatusCode::FORBIDDEN,
             Json(serde_json::json!({
-                "error": "first-run network setup is only available from localhost on an appliance before setup"
+                "error": "first-run network setup is only available from localhost on an appliance before setup",
+                "code": code,
             })),
         )
             .into_response(),

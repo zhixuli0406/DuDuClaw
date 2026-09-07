@@ -61,6 +61,9 @@
 | 49 | [コードセキュリティ監査](49-code-security-audit.md) | `duduclaw secaudit`：静的スキャナ＋AI 深層監査＋敵対的レビュー＋サンドボックス PoC |
 | 50 | [DuDuClaw OSアプライアンス](50-duduclaw-os-appliance.md) | 起動可能なアプライアンスイメージ：LAN ダッシュボードでの初期設定、デバイスページ、sysd 権限分離、webhook リレー |
 | 51 | [DuDuClaw OS キーボードショートカット一覧](51-os-keyboard-shortcuts.md) | DuDuClaw OS の全ショートカット：コンポジタのグローバルバインド、シェル UI、初回セットアップ、ロック画面 |
+| 52 | [DuDuClaw OS デスクトップ版](52-desktop-edition.md) | 人と AI で一台のマシンを共有：シャドウワークスペース、人の入力が常に優先、明示的なハンドバック、共同運転は既定オフ |
+| 53 | [デバイス上のローカルモデル](53-local-models.md) | 検証済み GGUF 6 種、ワンクリックでダウンロードと有効化。既定は hybrid、速度は誇張しない |
+| 54 | [ファインチューニングと事後学習](54-finetune.md) | データの整理はここで、学習は別の GPU で、GGUF／LoRA を持ち帰る——この機械は学習しない |
 
 ---
 

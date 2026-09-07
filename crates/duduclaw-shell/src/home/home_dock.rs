@@ -43,10 +43,13 @@ use crate::apps::feed::InstalledAppsFeed;
 use crate::apps::icon_theme;
 use crate::apps::installed::InstalledApp;
 use crate::comp_client;
-use crate::fake_data::{self, AgentDockStatus, GoalDot};
+use crate::fake_data::{AgentDockStatus, BadgeKind};
+use crate::overlay::agents_feed::AgentsFeed;
+use crate::gateway_client::TaskProgressItem;
 use crate::home::running_windows::RunningWindowsFeed;
-use crate::overlay::notifications_feed::NotificationsFeed;
-use crate::overlay::task_progress_feed::TaskProgressFeed;
+use crate::i18n::{t, Key, Locale};
+use crate::overlay::notifications_feed::{ApprovalRow, FeedStatus as ApprovalFeedStatus, NotificationsFeed, RowDecision};
+use crate::overlay::task_progress_feed::{FeedStatus as TaskFeedStatus, TaskProgressFeed};
 use crate::palette::ShellPalette;
 use crate::surface::Overlay;
 use crate::ShellView;
@@ -69,26 +72,108 @@ const DOCK_MAX_APPS: usize = 8;
 const DOCK_TILE_RADIUS_PX: f32 = 10.;
 
 // ── Goal cards row ─────────────────────────────────────────────────────
+//
+// WP-fix-QEMU-a (2026-09-05): real cards, replacing `fake_data::GOAL_CARDS`
+// — three design-board example tasks that used to render unconditionally,
+// including on a freshly installed system with nothing delegated yet (see
+// `fake_data.rs`'s own header comment for the full defect). Built from the
+// SAME two feeds A4 (2026-08-24) already wired into `dock_task_badge`'s
+// count just below: pending approvals (`NotificationsFeed`, real
+// "等你決定" cards) and in-progress tasks (`TaskProgressFeed`, real "進行中"
+// cards) — both already threaded into `desktop_content`/`goal_cards_row`
+// for exactly this purpose, no new gateway call added.
 
-pub(super) fn goal_cards_row(palette: ShellPalette) -> Div {
-    div()
-        .absolute()
-        .top(px(360.))
-        .left(px(0.))
-        .right(px(0.))
-        .flex()
-        .justify_center()
-        .gap(px(14.))
-        .children(fake_data::GOAL_CARDS.iter().map(move |card| goal_card(card, palette)))
+/// How many goal cards this row ever shows at once — the row is a fixed,
+/// non-wrapping flex, and three 300px cards plus two 14px gaps (928px) is
+/// what the old design board's own row was built to hold in a 1440px
+/// window. Pending approvals fill slots first (something a human is
+/// explicitly waiting on outranks "still working"), in-progress tasks fill
+/// whatever's left.
+const MAX_GOAL_CARDS: usize = 3;
+
+pub(super) fn goal_cards_row(palette: ShellPalette, notifications: &NotificationsFeed, task_progress: &TaskProgressFeed) -> Div {
+    let container = div().absolute().top(px(360.)).left(px(0.)).right(px(0.)).flex().justify_center().gap(px(14.));
+
+    let mut cards: Vec<Stateful<Div>> = notifications.rows().iter().take(MAX_GOAL_CARDS).map(|row| goal_card_from_approval(row, palette)).collect();
+    if cards.len() < MAX_GOAL_CARDS {
+        cards.extend(task_progress.rows().iter().take(MAX_GOAL_CARDS - cards.len()).map(|item| goal_card_from_task(item, palette)));
+    }
+
+    if !cards.is_empty() {
+        return cards.into_iter().fold(container, |row, card| row.child(card));
+    }
+
+    // Nothing real to delegate right now — an honest empty state, never the
+    // old three canned examples. "Couldn't check" and "genuinely nothing
+    // there" are different facts, so offline gets its own line — the SAME
+    // banner the Notifications panel already shows for the identical
+    // underlying condition (`crate::i18n::Key::NotifOfflineBanner`), not a
+    // second, subtly different sentence for the same outage.
+    let offline = notifications.status == ApprovalFeedStatus::Offline || task_progress.status() == TaskFeedStatus::Offline;
+    let text = if offline { t(Locale::ZhTw, Key::NotifOfflineBanner) } else { t(Locale::ZhTw, Key::HomeTasksEmptyState) };
+    container.child(goal_cards_empty_state(text, palette))
 }
 
-fn goal_card(card: &fake_data::GoalCard, palette: ShellPalette) -> Stateful<Div> {
-    let dot = match card.dot {
-        GoalDot::Outline(kind) => {
-            div().w(px(10.)).h(px(10.)).rounded(px(10.)).border(px(2.5)).border_color(theme::alpha(palette.badge_accent(kind), 1.0))
-        }
-        GoalDot::Filled(kind) => div().w(px(10.)).h(px(10.)).rounded(px(10.)).bg(theme::alpha(palette.badge_accent(kind), 1.0)),
-    };
+/// The honest "nothing to show" state — same surface/border/shadow recipe
+/// `goal_card_view` below uses for a real card (so the empty state doesn't
+/// look like a different, lesser kind of thing), just wide enough for one
+/// line of prose instead of `MAX_GOAL_CARDS` narrow tiles.
+fn goal_cards_empty_state(text: &str, palette: ShellPalette) -> Div {
+    let border_color: gpui::Hsla = if palette.is_dark() { theme::alpha(0xffffff, 0.10).into() } else { palette.border() };
+    div()
+        .w(px(460.))
+        .bg(theme::alpha(palette.surface_raised, 1.0))
+        .border_1()
+        .border_color(border_color)
+        .rounded(px(theme::RADIUS_XL))
+        .px(px(16.))
+        .py(px(14.))
+        .shadow(palette.surface_shadow())
+        .text_size(px(13.))
+        .text_color(theme::alpha(palette.muted_foreground, 1.0))
+        .child(text.to_string())
+}
+
+/// A pending approval as a "等你決定" goal card — `row.summary`/`row.detail`
+/// are real gateway content (server-generated prose, same "stays a plain
+/// literal" treatment `overlay/notifications.rs::approval_card` already
+/// gives these exact two fields), not design-board copy.
+fn goal_card_from_approval(row: &ApprovalRow, palette: ShellPalette) -> Stateful<Div> {
+    goal_card_view(format!("goal-approval-{}", row.id), BadgeKind::Warning, row.summary.clone(), "等你決定", row.detail.clone(), palette)
+}
+
+/// An in-progress task as a "進行中" goal card. `assigned_to` can be empty
+/// (`TaskProgressItem`'s own `#[serde(default)]`) — falls back to a generic
+/// meta line rather than rendering "指派給 " with nothing after it.
+fn goal_card_from_task(item: &TaskProgressItem, palette: ShellPalette) -> Stateful<Div> {
+    let (kind, badge) = task_badge(&item.status);
+    let meta = if item.assigned_to.is_empty() { badge.to_string() } else { format!("指派給 {}", item.assigned_to) };
+    goal_card_view(format!("goal-task-{}", item.id), kind, item.title.clone(), badge, meta, palette)
+}
+
+/// Badge colour + label per open task status (`gateway_client::
+/// OPEN_STATUSES`). `needs_human` is the one the operator can act on, so it
+/// gets the same warning accent as a pending approval; `todo` is queued
+/// work the goal loop has not picked up yet — shown, not hidden, so a
+/// freshly delegated task is visible the moment Enter is pressed.
+pub(crate) fn task_badge(status: &str) -> (BadgeKind, &'static str) {
+    match status {
+        "needs_human" => (BadgeKind::Warning, "需要你"),
+        "todo" => (BadgeKind::Brand, "排隊中"),
+        _ => (BadgeKind::Brand, "進行中"),
+    }
+}
+
+/// The shared card shell both real sources above render through — same
+/// visual recipe the old `fake_data::GoalCard`-driven card used (`kind`
+/// drives both the status ring AND the badge pill, per that struct's own
+/// former doc comment), just fed real strings instead of static ones. Every
+/// real goal card renders an OUTLINE ring, never a filled one: neither
+/// pending-approval nor in-progress data represents a "done" state (the old
+/// mockup's third, filled-dot "已完成" card had no real client-side source
+/// to honestly replace it with this round).
+fn goal_card_view(id: String, kind: BadgeKind, title: String, badge_label: &'static str, meta: String, palette: ShellPalette) -> Stateful<Div> {
+    let dot = div().w(px(10.)).h(px(10.)).rounded(px(10.)).border(px(2.5)).border_color(theme::alpha(palette.badge_accent(kind), 1.0));
 
     // Main.dc.html: bg `#ffffff` light / `#1e1e21` dark — `surface_raised`
     // (see `home.rs`'s `menu_bar_ticker` comment for why, not `surface`).
@@ -110,7 +195,7 @@ fn goal_card(card: &fake_data::GoalCard, palette: ShellPalette) -> Stateful<Div>
     // hand-tuning a bespoke shadow for this one card too.
 
     div()
-        .id(card.id)
+        .id(id)
         .w(px(300.))
         .bg(theme::alpha(palette.surface_raised, 1.0))
         .border_1()
@@ -134,31 +219,50 @@ fn goal_card(card: &fake_data::GoalCard, palette: ShellPalette) -> Stateful<Div>
                         .text_size(px(14.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::alpha(palette.foreground, 1.0))
-                        .child(card.title),
+                        .child(title),
                 )
                 .child(
                     div()
                         .text_size(px(11.))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(palette.badge_text(card.badge_kind))
-                        .bg(palette.badge_bg(card.badge_kind))
+                        .text_color(palette.badge_text(kind))
+                        .bg(palette.badge_bg(kind))
                         .rounded(px(999.))
                         .px(px(8.))
                         .py(px(2.))
-                        .child(card.badge_label),
+                        .child(badge_label),
                 ),
         )
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme::alpha(palette.muted_foreground, 1.0))
-                .child(card.meta),
-        )
+        .child(div().text_size(px(12.)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(meta))
 }
 
 // ── Activity shelf ──────────────────────────────────────────────────────
+//
+// WP-fix-QEMU-a (2026-09-05): real "今日" activity, replacing
+// `fake_data::ACTIVITY_SHELF`'s three fabricated agent-work lines (see
+// `fake_data.rs`'s own header comment). Built from `NotificationsFeed::
+// decided()` — approvals the operator has actually decided this session,
+// most-recent first; no client-side agent-activity log exists yet to draw a
+// "小杜 完成 X" style line from honestly, so this strip's scope is
+// deliberately narrower than the old mockup's rather than fabricating one.
 
-pub(super) fn activity_shelf(palette: ShellPalette) -> Div {
+/// How many decided-today lines the strip shows — the pill has no wrap
+/// either, same reasoning `MAX_GOAL_CARDS` documents for the cards row.
+const MAX_ACTIVITY_LINES: usize = 3;
+
+pub(super) fn activity_shelf(palette: ShellPalette, notifications: &NotificationsFeed) -> Div {
+    let decided = notifications.decided();
+    if decided.is_empty() {
+        // Nothing decided yet this session. `goal_cards_row` above already
+        // carries the honest "nothing here yet" / offline messaging for
+        // this same underlying state — a second empty pill under it would
+        // just repeat that fact. Same "an empty heading over an empty list
+        // is noise" rule `overlay::notifications_tasks::
+        // task_progress_section` already applies to its own section: this
+        // whole strip simply does not render.
+        return div();
+    }
+
     // Main.dc.html: bg `rgba(255,255,255,0.7)` light / `rgba(24,24,27,0.70)`
     // dark — plain `surface` (NOT `surface_raised` — this glass pill, unlike
     // the dock/composer/ticker, deliberately sits on the DARKER menu-bar-
@@ -207,14 +311,31 @@ pub(super) fn activity_shelf(palette: ShellPalette) -> Div {
     // `home.rs`'s header comment) — `duduclaw-native-gui/src/main.rs`'s own
     // gotcha about `&mut Context<V>` not being `Copy` in a repeated closure
     // doesn't apply here.
-    for (i, line) in fake_data::ACTIVITY_SHELF.iter().enumerate() {
+    for (i, decided_row) in decided.iter().take(MAX_ACTIVITY_LINES).enumerate() {
         if i > 0 {
             row = row.child(div().text_color(theme::alpha(separator_hex, 1.0)).child("·"));
         }
-        row = row.child(div().child(*line));
+        row = row.child(div().child(decided_line(decided_row)));
     }
 
     div().absolute().bottom(px(120.)).left(px(0.)).right(px(0.)).flex().justify_center().child(row)
+}
+
+/// One decided-today line — "已核准：{summary}" / "已駁回：{summary}", real
+/// gateway content (`row.summary`), same "server-generated prose stays a
+/// plain literal" treatment `lockscreen::render::summary_lines` already
+/// gives this exact field.
+fn decided_line(row: &ApprovalRow) -> String {
+    match row.decision {
+        RowDecision::Settled { approved: true } => format!("已核准：{}", row.summary),
+        RowDecision::Settled { approved: false } => format!("已駁回：{}", row.summary),
+        // `decided()` only ever holds rows moved there by `apply_decide_ok`,
+        // which always assigns `Settled` — see that fn's own doc comment on
+        // `NotificationsFeed`. Any other variant here would mean that
+        // invariant broke; the bare summary is the honest fallback for a
+        // display string, not a panic.
+        _ => row.summary.clone(),
+    }
 }
 
 // ── Dock ─────────────────────────────────────────────────────────────────
@@ -229,9 +350,10 @@ pub(super) fn dock(
     installed: &InstalledAppsFeed,
     notifications: &NotificationsFeed,
     task_progress: &TaskProgressFeed,
+    agents: &AgentsFeed,
     cx: &mut Context<ShellView>,
 ) -> Div {
-    dock_container(palette, running_windows, installed, notifications, task_progress, cx)
+    dock_container(palette, running_windows, installed, notifications, task_progress, agents, cx)
 }
 
 /// D9-bug (2026-08-24): the dock as `ChromeMode::LayerSurfaces` composes it —
@@ -264,9 +386,10 @@ pub(super) fn dock_surface(
     installed: &InstalledAppsFeed,
     notifications: &NotificationsFeed,
     task_progress: &TaskProgressFeed,
+    agents: &AgentsFeed,
     cx: &mut Context<ShellView>,
 ) -> Div {
-    dock_container(palette, running_windows, installed, notifications, task_progress, cx).on_children_prepainted(|children, window, _cx| {
+    dock_container(palette, running_windows, installed, notifications, task_progress, agents, cx).on_children_prepainted(|children, window, _cx| {
         let wanted = crate::chrome::input_region::shown_region_for(&children);
         crate::chrome::input_region::apply(window, crate::chrome::input_region::RegionSlot::Dock, wanted);
     })
@@ -278,6 +401,7 @@ fn dock_container(
     installed: &InstalledAppsFeed,
     notifications: &NotificationsFeed,
     task_progress: &TaskProgressFeed,
+    agents: &AgentsFeed,
     cx: &mut Context<ShellView>,
 ) -> Div {
     // WP-comp-shell-ipc: keeps `running_windows` warm for as long as Home
@@ -335,8 +459,13 @@ fn dock_container(
         row = row.child(dock_app(app, palette, running_windows, cx));
     }
     row = row.child(dock_divider(palette));
-    for agent in fake_data::DOCK_AGENTS {
-        row = row.child(dock_agent(agent, palette));
+    // 2026-09-05: real roster (`AgentsFeed`), replacing the two invented
+    // `fake_data::DOCK_AGENTS` tiles. Status dot comes from that agent's
+    // open tasks: 需要你 (needs_human) outranks 進行中/排隊中; no open
+    // task, no dot. An empty roster draws no tiles.
+    for agent in agents.rows().iter().take(DOCK_MAX_AGENTS) {
+        let status = agent_dock_status(&agent.id, task_progress);
+        row = row.child(dock_agent(&agent.id, agent.label(), status, palette));
     }
     row = row.child(dock_divider(palette));
     // A4 (2026-08-24): real gap fill — before this round the dock had no
@@ -687,23 +816,49 @@ fn trigger_installed_apps_refresh_if_stale(view: &mut ShellView, cx: &mut Contex
     .detach();
 }
 
-fn dock_agent(agent: &fake_data::DockAgent, palette: ShellPalette) -> Stateful<Div> {
+/// Most tiles the dock shows before it gets crowded; the rest live in the
+/// dashboard's org chart.
+const DOCK_MAX_AGENTS: usize = 4;
+
+/// Avatar background per agent — a small fixed palette picked by a stable
+/// hash of the id, so an agent keeps its colour across boots.
+const AGENT_TILE_COLORS: [u32; 5] = [0x2171cc, 0x0f766e, 0x7c3aed, 0xb45309, 0xbe185d];
+
+fn agent_tile_color(agent_id: &str) -> u32 {
+    let h = agent_id.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    AGENT_TILE_COLORS[(h as usize) % AGENT_TILE_COLORS.len()]
+}
+
+/// Status dot for one agent from the open-task feed (`OPEN_STATUSES`).
+pub(crate) fn agent_dock_status(agent_id: &str, task_progress: &TaskProgressFeed) -> Option<AgentDockStatus> {
+    let mut running = false;
+    for t in task_progress.rows().iter().filter(|t| t.assigned_to == agent_id) {
+        if t.status == "needs_human" {
+            return Some(AgentDockStatus::NeedsHuman);
+        }
+        running = true;
+    }
+    running.then_some(AgentDockStatus::Running)
+}
+
+fn dock_agent(agent_id: &str, label: &str, status: Option<AgentDockStatus>, palette: ShellPalette) -> Stateful<Div> {
     // Status dot: `Running` uses the brand hue (matches its own avatar),
-    // `NeedsHuman` uses `warning_dot` — NOT `badge_accent(Warning)`, see
-    // `AgentDockStatus::badge_kind`'s own doc comment for why this small
-    // circular dot is a different field from the badge/ring token in dark.
-    let dot_hex = match agent.status {
+    // `NeedsHuman` uses `warning_dot` — see `AgentDockStatus::badge_kind`'s
+    // own doc comment for why this small circular dot is a different field
+    // from the badge/ring token in dark. No open task → no dot at all.
+    let initial = label.chars().next().map(|c| c.to_string()).unwrap_or_default();
+    let dot_hex = status.map(|s| match s {
         AgentDockStatus::Running => palette.brand,
         AgentDockStatus::NeedsHuman => palette.warning_dot,
-    };
+    });
 
     div()
-        .id(agent.id)
+        .id(format!("dock-agent-{agent_id}"))
         .relative()
         .w(px(44.))
         .h(px(44.))
         .rounded(px(22.))
-        .bg(theme::alpha(agent.bg_hex, 1.0))
+        .bg(theme::alpha(agent_tile_color(agent_id), 1.0))
         .flex()
         .items_center()
         .justify_center()
@@ -712,24 +867,26 @@ fn dock_agent(agent: &fake_data::DockAgent, palette: ShellPalette) -> Stateful<D
                 .text_size(px(15.))
                 .font_weight(FontWeight::BOLD)
                 .text_color(theme::alpha(palette.brand_foreground, 1.0))
-                .child(agent.initial),
+                .child(initial),
         )
-        .child(
-            div()
-                .absolute()
-                .bottom(px(1.))
-                .right(px(1.))
-                .w(px(11.))
-                .h(px(11.))
-                .rounded(px(11.))
-                .bg(theme::alpha(dot_hex, 1.0))
-                .border_2()
-                // Main.dc.html: `#ffffff` light / `#1e1e21` dark —
-                // `surface_raised` (the dot's border matches the DOCK
-                // surface it visually sits against, not the bare `surface`
-                // token).
-                .border_color(theme::alpha(palette.surface_raised, 1.0)),
-        )
+        .when_some(dot_hex, |tile, dot_hex| {
+            tile.child(
+                div()
+                    .absolute()
+                    .bottom(px(1.))
+                    .right(px(1.))
+                    .w(px(11.))
+                    .h(px(11.))
+                    .rounded(px(11.))
+                    .bg(theme::alpha(dot_hex, 1.0))
+                    .border_2()
+                    // Main.dc.html: `#ffffff` light / `#1e1e21` dark —
+                    // `surface_raised` (the dot's border matches the DOCK
+                    // surface it visually sits against, not the bare
+                    // `surface` token).
+                    .border_color(theme::alpha(palette.surface_raised, 1.0)),
+            )
+        })
 }
 
 /// A4 (2026-08-24) — real gap fill: "dock badge：待審批數/進行中任務數的即時

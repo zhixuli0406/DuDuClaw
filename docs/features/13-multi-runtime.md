@@ -1,6 +1,6 @@
 # Multi-Runtime Agent Execution
 
-> One platform, four AI backends — Claude, Codex, Gemini, and any OpenAI-compatible endpoint.
+> One platform, twelve AI backends — Claude, Codex, Gemini, Antigravity, Grok, Qwen Code, Kimi Code, GitHub Copilot CLI, Kiro, Cursor, Mistral Vibe, OpenCode, and any OpenAI-compatible endpoint.
 
 ---
 
@@ -29,7 +29,70 @@ AgentRuntime trait:
 
 Every backend — Claude, Codex, Gemini, or any OpenAI-compatible endpoint — implements this same interface. The rest of the system doesn't know or care which backend is handling a particular request.
 
-### The Four Backends
+### The Runtime Catalog
+
+Every backend is described once, in a single compile-time table
+(`crates/duduclaw-core/src/runtime_catalog.rs`). Detection, one-click install,
+model discovery, CLI login and model↔provider inference all read that table —
+so a runtime cannot be installable but undetectable, or configurable but
+unloggable-into.
+
+| Runtime | Binary | Install channel | Headless invocation | Output | Login | Credential store |
+|---|---|---|---|---|---|---|
+| Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token` (paste-back) | `~/.claude/.credentials.json` |
+| OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login` (localhost callback) | `~/.codex/auth.json` |
+| Gemini CLI | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login` (localhost callback) | `~/.gemini/oauth_creds.json` |
+| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | text | `agy login` (localhost callback) | — |
+| Grok Build | `grok` | `x.ai/cli/install.sh` (manual) | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
+| Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | none (API key only) | `~/.qwen/.env` |
+| Kimi Code | `kimi` | npm `@moonshot-ai/kimi-code` | `-p <prompt> --output-format stream-json` | jsonl | `kimi login` (device code) | `~/.kimi-code/credentials/` |
+| GitHub Copilot CLI | `copilot` | npm `@github/copilot` | `-p <prompt> -s --no-ask-user --allow-all-tools` | text | `copilot login --device-code` | `~/.copilot/config.json` |
+| Kiro CLI | `kiro-cli` | `cli.kiro.dev/install` (manual) | `chat --no-interactive --trust-all-tools <prompt>` | text | `kiro-cli login --use-device-flow` | `~/.kiro/settings/cli.json` |
+| Cursor CLI | `cursor-agent` | `cursor.com/install` | `-p <prompt> --force --output-format json` | json | `cursor-agent login` (browser) | `~/.cursor/cli-config.json` |
+| Mistral Vibe | `vibe` | PyPI `mistral-vibe` | `-p <prompt> --yolo --trust --output json` | json | none (API key only) | `~/.vibe/.env` |
+| OpenCode | `opencode` | `opencode.ai/install` | `run <prompt> --auto --format json` | jsonl | `opencode auth login` | `~/.local/share/opencode/auth.json` |
+| OpenAI-compatible | *(HTTP)* | — | — | json | none (API key only) | — |
+
+Model selection differs per vendor and the catalog records which form each one
+takes: a separate flag (`--model <id>`), the joined form Copilot documents
+(`--model=<id>`), an environment variable for CLIs with no flag at all (Mistral
+Vibe's `VIBE_ACTIVE_MODEL`), or nothing (Kiro selects its model through
+`kiro-cli settings`, not per call).
+
+**Vendor terms worth reading before you switch a runtime on:**
+
+- **Kiro** — AWS's FAQ states that use through third-party automation harnesses
+  that route requests outside Kiro's native interfaces is *not permitted*.
+  Driving Kiro from DuDuClaw is exactly that. Calling `kiro-cli` directly from
+  your own CI is allowed. This is why Kiro's install channel is manual: the
+  decision is yours to make deliberately.
+- **Anthropic / Google** — since 2026-03, consumer subscription tokens used by
+  third-party products are blocked server-side, and accounts have been
+  suspended. Use an API key.
+- **Qwen** — the free OAuth tier was discontinued 2026-04-15. API key
+  (ModelStudio / DashScope) only.
+- **OpenCode** — MIT with no restriction of its own, but it removed its
+  Anthropic subscription plugin in 1.3.0 for the reason above. Use provider API
+  keys.
+- **OpenAI** — policy on third-party products driving a ChatGPT subscription
+  login is unclear. API key is the supported path.
+
+The dashboard shows the relevant note and requires an explicit "I understand
+the risk" acknowledgement before starting a subscription login.
+
+### How Backends Are Driven
+
+Five backends have bespoke runtime modules, because each has real per-vendor
+wiring that is not shareable — account rotation (Claude), MCP config injection
+in the CLI's own format, capability→sandbox-flag translation, PTY recovery for
+empty-output failures. Everything else is driven by **one** generic print-mode
+runtime (`runtime/generic_cli.rs`) built straight from the catalog entry: spawn
+the binary with the templated argv, deliver the prompt as an argument or on
+stdin, parse text / JSON / JSONL back to the final assistant text, and map a
+non-zero exit or an auth-required marker to a typed failure the failover chain
+understands.
+
+### The Original Four Backends
 
 **Claude Runtime** — Calls the Claude Code CLI (`claude`) with JSONL streaming output. This is the most feature-rich backend, with native MCP tool support, bash execution, web search, and file operations built in.
 
@@ -97,17 +160,24 @@ Extract response
 When DuDuClaw starts, the **RuntimeRegistry** scans the system for available CLI tools:
 
 ```
-Startup scan:
+Startup scan (one loop over the runtime catalog):
      |
      v
-  Is `claude` in PATH? → Register Claude runtime
-  Is `codex` in PATH?  → Register Codex runtime
-  Is `gemini` in PATH? → Register Gemini runtime
-  Any configured HTTP endpoints? → Register OpenAI-compat runtimes
+  For each catalog entry with a binary:
+     PATH → ~/.local/bin, Homebrew, bun/volta/npm-global/asdf shims,
+     /opt/duduclaw/runtimes/bin, /usr/bin, /bin
+       found? → register (bespoke module if it has one, else generic print-mode)
+     |
+     v
+  Always: OpenAI-compat (an HTTP endpoint, gated on an API key, not a binary)
      |
      v
 Registry knows which backends are available
 ```
+
+`/opt/duduclaw/runtimes/bin` is where the DuDuClaw OS appliance image lands its
+bundled CLIs, so a runtime shipped in the image is discovered even when the
+gateway inherited no interactive `PATH`.
 
 Agents can specify their preferred runtime in `agent.toml`:
 
@@ -188,6 +258,28 @@ Different providers have different pricing. The `LeastCost` rotation strategy ca
 - **CostTelemetry**: Tracks cost per provider, enabling informed routing decisions.
 - **MCP Server**: Tools are exposed to all backends that support them (Claude via native MCP, others via tool injection).
 - **Agent Config**: Each agent's `agent.toml` specifies its runtime preference and fallback chain.
+
+---
+
+## Provider-Aware Accounts (WP-A, 2026-09)
+
+`accounts.add` — the gateway RPC behind both the dashboard's Accounts page and the OOBE "AI Runtime Authorization" step — accepts a `provider` id alongside the existing `type` (`api_key` | `oauth`). Accepted ids are the platform's canonical provider table (`duduclaw_core::provider_env::KNOWN_PROVIDER_IDS`): `anthropic`, `openai`, `gemini`/`google`, `deepseek`, `minimax`, `groq`, `together`, `mistral`, `openrouter`, `xai`, `qwen`. Omitting `provider` defaults to `"anthropic"`, so every caller written before this feature keeps working byte-for-byte; an unrecognized id is rejected instead of silently accepted.
+
+The credential still lands in `config.toml`'s `[[accounts]]` array, now tagged with its provider:
+
+```toml
+[[accounts]]
+id = "openai-prod"
+type = "api_key"
+provider = "openai"
+api_key_enc = "..."          # anthropic keeps the legacy anthropic_api_key_enc field
+```
+
+`AccountRotator::select_for_provider` — the same selection logic both the Claude CLI path and the Direct-API `duduclaw-llm` provider path already used for cross-provider Direct-API rotation — filters strictly by this field, so an OpenAI/Gemini/xAI/DeepSeek/… key added this way is picked up by the exact same rotation, budget-tracking, and cooldown machinery Anthropic accounts get. No per-provider code path was needed on the read side. `accounts.list` and `accounts.budget_summary` both return `provider` on every account so the dashboard's Accounts page can show which vendor each credential belongs to; `AddAccountDialog` offers a provider picker with a per-provider key-format hint and a "get an API key" link to the vendor's own console.
+
+## Subscription-Login Risk Disclosure
+
+Every one-click "sign in with your subscription" flow — the CLI login modal, the guided QR-code setup wizard, and the OOBE runtime-setup card that opens one of the two — shows a risk notice before it starts: Anthropic and Google have blocked third-party products from using consumer-subscription tokens on the server side since March 2026 and have suspended accounts over it; OpenAI's policy on this is unspecified. An explicit "I understand the risk and accept it" checkbox must be ticked before the flow's own login step (CLI subprocess, browser callback, or device-code polling) begins. The API-key path is unaffected by this gate and remains the recommended default.
 
 ---
 

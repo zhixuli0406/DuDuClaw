@@ -46,7 +46,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 | 会話メモリと知識ベース | 単発セッション | SQLite 時系列メモリ + 階層 wiki を自動注入 |
 | ツールの LLM 間共有 | ベンダーごとに書き直し | 200+ MCP ツールを一度書けば 5 バックエンドで共用 |
 | ガードレール / 監査 / 秘密情報管理 | 自作 | ポリシーカーネル + OS サンドボックス + AES-256-GCM 内蔵 |
-| 顧客に渡す一台まるごとの専用機 | Linux を自分で入れ、更新と改ざん対策も自前 | DuDuClaw OS イメージ:A/B アップデートとロールバック + Secure Boot + 読み取り専用ルート、電源を入れるだけ |
+| 顧客に渡す一台まるごとの専用機 | Linux を自分で入れ、更新と改ざん対策も自前 | DuDuClaw OS イメージ:A/B アップデートとロールバック + 読み取り専用ルート、電源を入れるだけ;人と AI がデスクトップを共用しても日常利用の邪魔をしない |
 
 <a id="architecture"></a>
 
@@ -114,9 +114,9 @@ npm install -g duduclaw
 
 ### DuDuClaw OS(アプライアンスイメージ、pre-GA)
 
-PC を一台専有したくないなら、電源を入れるだけで動く AI スタッフ専用機という選択肢があります。[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) は Yocto でビルドした Linux イメージで、x86-64 ミニ PC をヘッドレスのアプライアンスに変えます。書き込んで電源と LAN ケーブルをつなげばダッシュボードが LAN 上に現れ、以降の設定はすべてブラウザで完結します。A/B アトミックアップデートとロールバック、dm-verity で検証される読み取り専用ルート、自己署名の Secure Boot を備え、Chromium / LibreOffice / Steam と中国語 IME をプリロード済みです。
+PC を一台専有したくないなら、電源を入れるだけで動く AI スタッフ専用機という選択肢があります。[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) は Yocto でビルドした Linux OS で、AI エージェントがネイティブに住み着いています。起動するとそのまま自前のデスクトップ(コンポジタ / シェル、ロック画面、Cmd+K の委任バー)に入り、人と AI が一台の x86-64 マシンを共用しつつ、日常利用の邪魔はしません。エージェントの GUI 作業は既定でシャドウワークスペースで実行され、あなたがキーボードやマウスに触れた瞬間、デスクトップ上で操作中のエージェントは手を止めます。デスクトップ版は A/B アトミックアップデートとロールバック、読み取り専用ルートを備え、Chromium / LibreOffice / Steam と中国語 IME をプリロード済みです。Secure Boot 署名、dm-verity、TPM2 はビルド時のオーバーレイオプションで、v0.1.0 のリリースイメージでは有効化されていません。
 
-[DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) からインストーラー `.iso`(USB に書き込んで起動・インストール)またはディスク全体イメージ `.wic.zst` をダウンロードしてください。各ファイルには `.sha256` と minisign 署名が付属し、検証コマンドは同リポジトリの README にあります。現在は bring-up 段階(0.x)で、QEMU での検証は済んでいますが、**実機での起動検証はまだ行っていません**。ハードウェア要件と対応機種は [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md)、製品概要は [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md) を参照してください。
+[DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) からディスク全体イメージ `.wic.zst`(デスクトップ版)またはインストーラー `.iso`(v0.1.0 ではベースイメージ、つまり同じデスクトップシェルと gateway でアプリ層なしを書き込みます。デスクトップ版インストーラー `installer-desktop` `.iso` は 2026-09-04 に v0.1.0 へ追加済み)をダウンロードしてください。各ファイルには `.sha256` と minisign 署名が付属し、検証コマンドは同リポジトリの README にあります。現在は bring-up 段階(0.x)で、QEMU での検証は済んでいますが、**実機での起動検証はまだ行っていません**。ハードウェア要件と対応機種は [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md)、製品概要は [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md) を参照してください。
 
 ### ソースからビルド
 
@@ -177,11 +177,12 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | セキュリティ | PolicyKernel reference monitor(LLM 不使用、fail-closed)、macOS Seatbelt / Linux Landlock ネイティブサンドボックス、Docker / Apple Container / WSL2 コンテナサンドボックス、secret redaction vault、CONTRACT.toml 行動契約 + レッドチーム CLI | [SECURITY.md](SECURITY.md) |
 | アカウントとコスト | OAuth + API キーのローテーション(4 戦略)、レート制限 / 課金クールダウン、キャッシュ効率分析つきコストテレメトリ、OAuth サブスクリプションアカウントを駆動するクロスプラットフォーム PTY プール | [docs/features](docs/features/README.md) |
 | ローカル推論 | llama.cpp(Metal/CUDA/Vulkan)/ mistral.rs / Exo P2P / llamafile / MLX、3 段階の信頼度ルーティング。Whisper 音声認識とベクトル埋め込みも内蔵 | [docs/features](docs/features/README.md) |
+| ファインチューニング | この機械の会話・仕事の成果・承認判断から SFT / DPO データセット(ShareGPT / Alpaca)を構築し、自前の GPU 機(SSH + LLaMA-Factory)または Together のクラウドで学習、GGUF / LoRA をローカルモデルディレクトリへ取り込み。ローカル学習は行わず(内蔵グラフィックスでは不可)、データが機械を出るときは明示的な同意が必要 | [docs/features/53](docs/features/54-finetune.md) |
 | Live Forking | RFC-26:進行中のタスクを N 個の競合ブランチに分岐し、それぞれ copy-on-write 隔離、AI ジャッジが勝者を選んでマージ(デフォルト無効) | [docs/rfc](docs/rfc) |
 | 自動アップデート | ダッシュボードからワンクリック、または無人更新(`auto_update = true`)。SHA-256 + Ed25519 の二重検証後にその場で再起動、開いているタブは自動リロード | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web ダッシュボード | React 19 + TypeScript SPA 32 ページ、バイナリに内蔵で追加デプロイ不要。zh-TW / en / ja 対応 | [docs/features](docs/features/README.md) |
 | ERP 連携 | Odoo ブリッジ 17 MCP ツール(CRM / 販売 / 在庫 / 会計)、CE/EE 自動検出、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
-| DuDuClaw OS | Yocto アプライアンスイメージ:A/B アトミックアップデートとロールバック、読み取り専用ルート + dm-verity、自己署名 Secure Boot、TPM2 鍵封印(部分実装)、初回起動時の自動プロビジョニング + LAN ダッシュボード、自前コンポジタ / シェルとショートカット、アプリ互換レイヤー(Flatpak / Bottles / Waydroid);独立リポジトリ・独立バージョン、pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) |
+| DuDuClaw OS | Yocto アプライアンスイメージ:自前コンポジタ / シェルとショートカット、人と AI の共同運転(エージェント専用シート、シャドウワークスペース、人の入力でエージェントを凍結、Super+Esc 緊急停止;既定オフ)、A/B アトミックアップデートとロールバック、読み取り専用ルート、初回起動時の自動プロビジョニング + LAN ダッシュボード、アプリ互換レイヤー(Flatpak / Bottles / Waydroid);Secure Boot 署名 / dm-verity / TPM2 はビルドオーバーレイオプション(v0.1.0 では未有効化);独立リポジトリ・独立バージョン、pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
 全機能リストは [docs/features/feature-inventory.md](docs/features/feature-inventory.md)、バージョン履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
@@ -262,7 +263,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 - [docs/guides/development-guide.md](docs/guides/development-guide.md):開発環境とエージェント開発
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md):カスタム MCP ツールの作り方
 - [docs/spec](docs/spec/soul-md-spec.md):SOUL.md / CONTRACT.toml フォーマット仕様
-- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS アプライアンス(製品概要);ハードウェア要件は [hardware-requirements.md](docs/guides/hardware-requirements.md)、アプリ互換は [app-compat.md](docs/guides/app-compat.md);イメージのビルドとリリースは [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) リポジトリ
+- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md):DuDuClaw OS アプライアンス(製品概要);[52-desktop-edition.md](docs/features/52-desktop-edition.md):デスクトップ版、人と AI で一台を共有;ハードウェア要件は [hardware-requirements.md](docs/guides/hardware-requirements.md)、アプリ互換は [app-compat.md](docs/guides/app-compat.md);イメージのビルドとリリースは [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) リポジトリ
 - [CHANGELOG.md](CHANGELOG.md):バージョン履歴
 
 <a id="license"></a>

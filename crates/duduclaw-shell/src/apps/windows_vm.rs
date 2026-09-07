@@ -13,13 +13,24 @@
 // This shell runs as the unprivileged `kiosk` OS user (home
 // `/data/duduclaw-kiosk`, see `crates/duduclaw-sysd/src/dispatch.rs`'s own
 // `KIOSK_HOME_DIR` constant) — a DIFFERENT account from whatever owns
-// `/data/duduclaw`, which is where the CLI's own `duduclaw_home()` resolves
-// and writes `windows-vm/apps.toml` (see that module's own header comment
-// on why the file is deliberately `0644`/`0755`, not the compose file's
-// `0600` — this is exactly the cross-user read this crate exists for). So
-// [`apps_toml_path`] returns a HARDCODED absolute path, never
-// `$HOME`-joined: inside the kiosk session `$HOME` resolves to the kiosk
-// user's own home, a directory that will never contain this file.
+// `/data/duduclaw`, where the CLI's own `duduclaw_home()` resolves (see
+// that module's own header comment on why the file is deliberately
+// `0644`/`0755`, not the compose file's `0600` — this is exactly the
+// cross-user read this crate exists for). So [`apps_toml_path`] returns a
+// HARDCODED absolute path, never `$HOME`-joined: inside the kiosk session
+// `$HOME` resolves to the kiosk user's own home, a directory that will
+// never contain this file.
+//
+// The path is `/data/system/windows-vm/apps.toml`, NOT
+// `/data/duduclaw/windows-vm/apps.toml` (2026-09-06): `/data/duduclaw` is
+// the gateway's `$HOME` for the bundled vendor AI CLIs and therefore holds
+// their OAuth tokens, so the OS provisioner makes it `0700` — a parent this
+// user cannot traverse, whatever the file's own mode says. The CLI writes
+// the registry to the same `/data/system/windows-vm` through its
+// `DUDUCLAW_WINDOWS_VM_APPS_DIR` environment variable, set on the gateway
+// unit and in root's profile by the OS image; `/data/system` is the same
+// root-owned, kiosk-traversable tree the flatpak verify dir already lives
+// in.
 // [`WINDOWS_VM_APPS_ENV`] overrides it for tests ONLY — same "env override
 // so tests don't touch the real filesystem" convention
 // `installed::xdg_env_from_process`/`icon_resolve::THEME_ENV` already
@@ -71,7 +82,7 @@ pub(crate) const WINDOWS_VM_APPS_ENV: &str = "DUDUCLAW_SHELL_WINDOWS_VM_APPS";
 
 /// The real, fixed, cross-user path. Never joined with `$HOME` — see this
 /// file's header comment on why.
-const DEFAULT_APPS_TOML_PATH: &str = "/data/duduclaw/windows-vm/apps.toml";
+const DEFAULT_APPS_TOML_PATH: &str = "/data/system/windows-vm/apps.toml";
 
 /// Directory-walk-style safety rail, same spirit as
 /// `apps/installed.rs::MAX_FILE_BYTES` scaled down: this is a flat list of

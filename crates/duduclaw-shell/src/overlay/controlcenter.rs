@@ -197,7 +197,7 @@ pub(super) fn render(ui: &OverlayUiState, audio_ui: &audio::AudioUiState, palett
         .child(ai_team_card(ui, palette, cx))
         .child(system_settings_card(palette, cx))
         .child(accessibility_card(palette, cx))
-        .child(footer_row(palette, cx))
+        .child(footer_row(palette, ui.agents.count(), ui.notifications.pending_count(), cx))
 }
 
 /// D4b (2026-08-23): the entry point for 系統設定 (`crate::settings`).
@@ -803,7 +803,7 @@ fn toggle_pill(on: bool, palette: ShellPalette) -> Div {
 /// a new tile/card, following this file's own "no board precedent,
 /// approximate with the nearest existing element" convention (see e.g.
 /// `approval_card`'s rejected-badge color in `overlay/notifications.rs`).
-fn footer_row(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
+fn footer_row(palette: ShellPalette, agents_on_duty: usize, waiting: usize, cx: &mut Context<ShellView>) -> Div {
     // ControlCenter.dc.html: status text is `muted_foreground` in both
     // themes (`#71717b` light / `#9f9fa9` dark); the link text is `brand`
     // light / `brand_bright` dark.
@@ -821,7 +821,7 @@ fn footer_row(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
                 .gap(px(8.))
                 .child(small_avatar("杜", palette.brand, palette))
                 .child(small_avatar("財", 0x0f766e, palette))
-                .child(div().text_size(px(12.)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(fake_data::CC_FOOTER_STATUS)),
+                .child(div().text_size(px(12.)).text_color(theme::alpha(palette.muted_foreground, 1.0)).child(crate::i18n::t2(crate::i18n::Locale::ZhTw, crate::i18n::Key::CcFooterStatus, &agents_on_duty.to_string(), &waiting.to_string()))),
         )
         .child(
             div()

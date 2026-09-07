@@ -311,6 +311,7 @@ fn render_surface_content(kind: ChromeSurface, shell: &mut ShellView, window: &m
                         &shell.installed_apps,
                         &shell.overlay_ui.notifications,
                         &shell.overlay_ui.task_progress,
+                        &shell.overlay_ui.agents,
                         cx,
                     ))
                     .into_any_element()

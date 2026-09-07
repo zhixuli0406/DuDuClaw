@@ -202,6 +202,9 @@ export interface AccountInfo {
   id: string;
   auth_method: 'apikey' | 'oauth';
   account_type?: string; // legacy alias
+  /** LLM provider this account authenticates against ("anthropic", "openai",
+   * "gemini", "deepseek", ...). Absent on accounts added before WP-A. */
+  provider?: string;
   priority: number;
   is_healthy: boolean;
   is_available: boolean;
@@ -1216,6 +1219,136 @@ export interface MarketInstallJob {
   total_bytes: number;
   error?: string;
   dest?: string;
+}
+
+/** One curated GGUF from `inference.local.catalog`. `fit` and `installed`
+ *  are computed per request for THIS machine, not stored in the table. */
+export interface LocalCatalogModel {
+  id: string;
+  display_name: string;
+  hf_repo: string;
+  file: string;
+  size_bytes: number;
+  params_b: number;
+  quant: string;
+  min_ram_gb: number;
+  recommended_for: string[];
+  /** Repo, filename, byte size and ungated downloadability were checked
+   *  against the live Hugging Face API on `verified_at`. */
+  verified: boolean;
+  verified_at: string;
+  fit: MarketFit;
+  installed: boolean;
+}
+
+/** `inference.local.status` — every state the banner needs, each read from
+ *  a live probe or scan rather than asserted from configuration. */
+export interface LocalInferenceStatus {
+  /** Running on a DuDuClaw OS device that shipped the local model engine. */
+  appliance: boolean;
+  llama_server_present: boolean;
+  endpoint: string;
+  /** The local model service answered its liveness endpoint just now. */
+  reachable: boolean;
+  /** Model name the service reports serving; null when unreachable. */
+  loaded_model: string | null;
+  /** Model file the saved settings point at; null when never configured. */
+  configured_model: string | null;
+  models_dir: string;
+  has_model: boolean;
+  installed: Array<{ filename: string; size_bytes: number }>;
+  downloads: MarketInstallJob[];
+}
+
+// ── Fine-tuning / post-training (`finetune.*`, WP-E) ─────────────────────
+// Training never runs on this machine — the appliance has integrated
+// graphics only. These types describe curating a dataset here, training it
+// on a GPU elsewhere, and importing the result back.
+
+export type FineTuneFormat = 'sharegpt' | 'alpaca';
+export type FineTuneMethod = 'sft' | 'dpo';
+export type FineTuneBackendId = 'dry_run' | 'remote_gpu_ssh' | 'together';
+
+export interface FineTuneSources {
+  agent_ids: string[];
+  since: string | null;
+  include_approvals: boolean;
+  include_task_results: boolean;
+}
+
+export interface FineTuneDatasetCounts {
+  conversations: number;
+  task_results: number;
+  approvals: number;
+  sft_rows: number;
+  preference_rows: number;
+  bytes: number;
+}
+
+export interface FineTuneDatasetFile {
+  name: string;
+  rows: number;
+  size_bytes: number;
+}
+
+export interface FineTuneDataset {
+  id: string;
+  name: string;
+  format: FineTuneFormat;
+  created_at: string;
+  built_at?: string | null;
+  sources: FineTuneSources;
+  preference_pairs: boolean;
+  counts: FineTuneDatasetCounts;
+  files: FineTuneDatasetFile[];
+}
+
+export interface FineTuneRemoteGpu {
+  host: string;
+  user: string;
+  key_path: string;
+  workdir: string;
+  python: string;
+  llama_cpp_dir?: string | null;
+}
+
+export interface FineTuneJobConfig {
+  dataset_id: string;
+  backend: FineTuneBackendId;
+  base_model: string;
+  method: FineTuneMethod;
+  template: string;
+  lora_rank: number;
+  lora_alpha: number;
+  epochs: number;
+  learning_rate: number;
+  cutoff_len: number;
+  per_device_batch_size: number;
+  gradient_accumulation_steps: number;
+  remote?: FineTuneRemoteGpu | null;
+  together?: { model: string; suffix?: string | null } | null;
+}
+
+export interface FineTuneArtifact {
+  name: string;
+  path: string;
+  size_bytes: number;
+}
+
+export interface FineTuneJob {
+  id: string;
+  config: FineTuneJobConfig & { id: string };
+  /** No percentage exists on purpose — the gateway never invents progress. */
+  state: 'planned' | 'preparing' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  detail?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  remote_ref?: string | null;
+  error?: string | null;
+  artifacts: FineTuneArtifact[];
+  /** Verbatim tail of the real training log. */
+  log_tail: string[];
 }
 
 /** Per-agent forward-model aggregate (`forward.summary`). */
@@ -4748,8 +4881,15 @@ export const api = {
         account_id: accountId,
         monthly_budget_cents: monthlyBudgetCents,
       }) as Promise<{ success: boolean }>,
-    add: (params: { id: string; type: string; key: string; monthly_budget_cents: number; priority: number }) =>
-      client.call('accounts.add', params) as Promise<{ success: boolean }>,
+    add: (params: {
+      id: string;
+      type: string;
+      /** One of `KNOWN_PROVIDER_IDS` (WP-A); server defaults to "anthropic" when omitted. */
+      provider?: string;
+      key: string;
+      monthly_budget_cents: number;
+      priority: number;
+    }) => client.call('accounts.add', params) as Promise<{ success: boolean; provider: string }>,
     /** G.5 — general per-account edit (no secret). Send only changed fields. */
     update: (params: {
       account_id: string;
@@ -4980,6 +5120,80 @@ export const api = {
       client.call('localmodels.cancel', { job_id: jobId }) as Promise<{ cancelled: boolean }>,
     remove: (filename: string) =>
       client.call('localmodels.remove', { filename }) as Promise<{ removed: boolean }>,
+  },
+  /**
+   * 微調與後訓練 (`finetune.*`, WP-E). Curate here, train elsewhere, deploy
+   * here — nothing in this family trains on the local machine.
+   *
+   * `export` and `create` against a remote backend refuse without
+   * `acknowledged_data_leaves_device: true`; the refusal arrives as a
+   * structured error with `code === 'data_leaves_device_not_acknowledged'`,
+   * which the page turns into a consent step rather than an error toast.
+   */
+  finetune: {
+    datasets: {
+      list: () => client.call('finetune.datasets.list') as Promise<{ datasets: FineTuneDataset[] }>,
+      create: (name: string, format: FineTuneFormat) =>
+        client.call('finetune.datasets.create', { name, format }) as Promise<{
+          dataset: FineTuneDataset;
+        }>,
+      remove: (datasetId: string) =>
+        client.call('finetune.datasets.delete', { dataset_id: datasetId }) as Promise<{
+          deleted: boolean;
+        }>,
+      build: (
+        datasetId: string,
+        sources: Partial<FineTuneSources>,
+        format: FineTuneFormat,
+        preferencePairs: boolean,
+      ) =>
+        client.call('finetune.datasets.build', {
+          dataset_id: datasetId,
+          sources,
+          format,
+          preference_pairs: preferencePairs,
+        }) as Promise<{ dataset: FineTuneDataset }>,
+      preview: (datasetId: string, n = 5) =>
+        client.call('finetune.datasets.preview', { dataset_id: datasetId, n }) as Promise<{
+          dataset: FineTuneDataset;
+          train: unknown[];
+          preference: unknown[];
+        }>,
+      /** Privacy-gated: pass `acknowledged` only after the user consented. */
+      export: (datasetId: string, acknowledged: boolean) =>
+        client.call('finetune.datasets.export', {
+          dataset_id: datasetId,
+          acknowledged_data_leaves_device: acknowledged,
+        }) as Promise<{
+          dataset_id: string;
+          dir: string;
+          path: string;
+          size_bytes: number;
+          files: Array<{ name: string; path: string; rows: number; size_bytes: number }>;
+        }>,
+    },
+    jobs: {
+      list: () => client.call('finetune.jobs.list') as Promise<{ jobs: FineTuneJob[] }>,
+      /** Privacy-gated for every backend except `dry_run`. */
+      create: (config: FineTuneJobConfig, acknowledged: boolean) =>
+        client.call('finetune.jobs.create', {
+          ...config,
+          acknowledged_data_leaves_device: acknowledged,
+        }) as Promise<{ job: FineTuneJob }>,
+      status: (jobId: string) =>
+        client.call('finetune.jobs.status', { job_id: jobId }) as Promise<{ job: FineTuneJob }>,
+      cancel: (jobId: string) =>
+        client.call('finetune.jobs.cancel', { job_id: jobId }) as Promise<{ job: FineTuneJob }>,
+    },
+    /** GGUF / LoRA → `<DUDUCLAW_HOME>/models`, i.e. the local-models list. */
+    import: (pathOrUrl: string) =>
+      client.call('finetune.import', { path_or_url: pathOrUrl }) as Promise<{
+        filename: string;
+        path: string;
+        size_bytes: number;
+        models_dir: string;
+        note: string;
+      }>,
   },
   /** v1.53/54 task forward-model + calibration views — generic, per-agent
    *  (the LWM trading experiment is just one producer of this store). */
@@ -6023,6 +6237,45 @@ export const api = {
         success: boolean;
         changes: string[];
       }>,
+    /** WP-D: the appliance's built-in local model engine. Admin-gated — the
+     *  responses expose the machine's memory profile and state-root layout. */
+    local: {
+      /** Curated, HF-verified GGUF list with a fit light for this machine. */
+      catalog: () =>
+        client.call('inference.local.catalog') as Promise<{
+          models: LocalCatalogModel[];
+          hardware: MarketHardware;
+          appliance: boolean;
+          endpoint: string;
+          models_dir: string;
+        }>,
+      /** Start a background download; poll `status()` for progress. */
+      download: (id: string) =>
+        client.call('inference.local.download', { id }) as Promise<{
+          job_id: number;
+          id: string;
+          filename: string;
+          size_bytes: number;
+        }>,
+      /** Point the local model engine at one downloaded file and start it.
+       *  `restarted: false` means the engine was not started (this host is
+       *  not a DuDuClaw OS device, or the start failed) — `detail` says why. */
+      serve: (modelFile: string, ctx?: number) =>
+        client.call('inference.local.serve', {
+          model_file: modelFile,
+          ...(ctx != null ? { ctx } : {}),
+        }) as Promise<{
+          model_file: string;
+          model_path: string;
+          ctx: number;
+          env_path: string;
+          restarted: boolean;
+          detail: string;
+        }>,
+      stop: () =>
+        client.call('inference.local.stop') as Promise<{ stopped: boolean; detail: string }>,
+      status: () => client.call('inference.local.status') as Promise<LocalInferenceStatus>,
+    },
   },
   migrate: {
     /** Dry-run preview — reads the source platform and reports what WOULD be

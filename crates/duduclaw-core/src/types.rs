@@ -228,68 +228,123 @@ fn default_utility_model() -> String {
 /// Matches the `agents.create` scaffold default so display and execution agree.
 pub const DEFAULT_PREFERRED_MODEL: &str = "claude-sonnet-4-6";
 
-/// Which agent runtime backend executes a prompt (RFC-25 multi-runtime).
+/// Declare [`RuntimeType`]'s variants and their catalog ids in ONE place.
 ///
-/// Used as the `RuntimeRegistry` key and parsed from `agent.toml [runtime] provider`.
-/// Defaults to [`RuntimeType::Claude`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeType {
+/// The macro exists so a variant, its serde wire value, its `as_str()`
+/// identifier and its [`crate::runtime_catalog`] key are physically impossible
+/// to write inconsistently — the four used to be four separate hand-written
+/// matches. `runtime_catalog` owns everything *about* a runtime (binary,
+/// install channel, headless flags, auth); this enum is only the closed set of
+/// keys the `RuntimeRegistry` and `agent.toml` use, and the paired
+/// `every_runtime_type_has_a_catalog_spec` test proves the two never drift.
+macro_rules! runtime_types {
+    ($( $(#[$meta:meta])* $variant:ident => $id:literal ),+ $(,)?) => {
+        /// Which agent runtime backend executes a prompt (RFC-25 multi-runtime).
+        ///
+        /// Used as the `RuntimeRegistry` key and parsed from `agent.toml
+        /// [runtime] provider`. Defaults to [`RuntimeType::Claude`].
+        /// Per-runtime facts live in [`crate::runtime_catalog::CATALOG`];
+        /// reach them with [`RuntimeType::spec`].
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+        pub enum RuntimeType {
+            $(
+                $(#[$meta])*
+                #[serde(rename = $id)]
+                $variant,
+            )+
+        }
+
+        impl RuntimeType {
+            /// Every variant, in catalog order. `ALL[0]` is the default.
+            pub const ALL: &'static [RuntimeType] = &[ $( RuntimeType::$variant, )+ ];
+
+            /// Stable lowercase identifier (matches `agent.toml` values, the
+            /// serde wire value, and the catalog id).
+            pub fn as_str(&self) -> &'static str {
+                match self { $( Self::$variant => $id, )+ }
+            }
+
+            /// Strict id → variant. `None` for anything not a canonical id —
+            /// use [`Self::parse`] when aliases should be accepted, and never
+            /// use either one where an unknown value must not resolve to a
+            /// command (that is `runtime_catalog::spec_for`'s job).
+            pub fn from_id(id: &str) -> Option<Self> {
+                match id { $( $id => Some(Self::$variant), )+ _ => None }
+            }
+        }
+    };
+}
+
+runtime_types! {
     #[default]
-    Claude,
-    Codex,
-    Gemini,
+    Claude => "claude",
+    Codex => "codex",
+    Gemini => "gemini",
     /// Google Antigravity CLI (`agy`) — the 2026-06-18 successor to the
     /// personal-tier Gemini CLI. Same model lineage, distinct binary/flags.
-    Antigravity,
+    Antigravity => "antigravity",
     /// xAI Grok CLI ("Grok Build", beta 2026-05) — terminal coding agent driving
     /// `grok-build-0.1` behind a SuperGrok / X Premium+ subscription. MCP-native,
     /// `-p` headless mode. R4 phase 1 wired CLI detection + headless spawn;
     /// phase 2 (v1.41) added the dashboard one-click SuperGrok device-code
     /// login (`grok login --device-code`, see `cli_auth.rs`).
-    Grok,
-    #[serde(rename = "openai_compat")]
-    OpenAiCompat,
+    Grok => "grok",
+    /// Alibaba **Qwen Code** (`qwen`, npm `@qwen-code/qwen-code`). Driven
+    /// through the generic print-mode runtime. The free OAuth tier was
+    /// discontinued 2026-04-15 — API key / ModelStudio only.
+    Qwen => "qwen",
+    /// Moonshot AI **Kimi Code** (`kimi`, npm `@moonshot-ai/kimi-code`).
+    /// Device-code login; shell API-key env vars are ignored by design.
+    Kimi => "kimi",
+    /// **GitHub Copilot CLI** (`copilot`, npm `@github/copilot`). GitHub OAuth
+    /// device flow; plain-text headless output only (no JSON mode exists).
+    Copilot => "copilot",
+    /// AWS **Kiro CLI** (`kiro-cli`) — the 2026 successor to the Amazon Q
+    /// Developer CLI.
+    Kiro => "kiro",
+    /// **Cursor CLI** (`cursor-agent`, installed by `cursor.com/install`).
+    Cursor => "cursor",
+    /// **Mistral Vibe** (`vibe`, PyPI `mistral-vibe`).
+    Vibe => "vibe",
+    /// **OpenCode** (`opencode`, sst/opencode) — a multi-provider shell driven
+    /// headlessly with `opencode run`.
+    OpenCode => "opencode",
+    OpenAiCompat => "openai_compat",
 }
 
 impl RuntimeType {
-    /// Stable lowercase identifier (matches `agent.toml` values).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Gemini => "gemini",
-            Self::Antigravity => "antigravity",
-            Self::Grok => "grok",
-            Self::OpenAiCompat => "openai_compat",
-        }
+    /// This runtime's catalog entry. Infallible: the
+    /// `every_runtime_type_has_a_catalog_spec` test proves every variant has
+    /// one, so a missing spec is a compile-time-adjacent bug, not a runtime
+    /// condition callers should have to handle.
+    pub fn spec(&self) -> &'static crate::runtime_catalog::RuntimeSpec {
+        crate::runtime_catalog::spec_for(self.as_str())
+            .expect("every RuntimeType has a runtime_catalog entry (enforced by test)")
     }
 
-    /// Parse from a config string; unknown values fall back to
-    /// [`RuntimeType::Claude`].
+    /// Parse a runtime identifier. Canonical ids and the catalog's documented
+    /// aliases (`agy`, `grok-cli`, `cursor-agent`, `openai`, …) both resolve —
+    /// the alias list lives in [`crate::runtime_catalog`], so adding one no
+    /// longer means editing this function.
     ///
-    /// L18 fix: an unknown provider (typically a typo such as `"claudee"` or
-    /// `"openai_compatible"`) used to be silently coerced to `Claude`, masking
-    /// the misconfiguration. We now emit a `tracing::warn!` before defaulting so
-    /// operators can spot the bad value. The signature is unchanged to keep the
-    /// existing `.map(RuntimeType::parse)` callers working.
-    pub fn parse(s: &str) -> Self {
-        let normalized = s.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "claude" => Self::Claude,
-            "codex" => Self::Codex,
-            "gemini" => Self::Gemini,
-            "antigravity" | "agy" => Self::Antigravity,
-            "grok" | "grok-cli" => Self::Grok,
-            "openai_compat" | "openai" | "openai-compat" => Self::OpenAiCompat,
-            other => {
-                tracing::warn!(
-                    provider = %other,
-                    "unknown runtime provider in config; defaulting to Claude"
-                );
-                Self::Claude
-            }
-        }
+    /// **`None` for anything else. There is no fallback.**
+    ///
+    /// This used to return `Self`, mapping an unknown string to `Claude` with a
+    /// warning. With one runtime that was a typo-tolerance nicety; with twelve
+    /// it is a correctness hole — a `auth.cli_login.start {runtime: "kimi"}`
+    /// against a build that did not know `kimi` would silently run
+    /// `claude setup-token` and hand the user someone else's login screen. Any
+    /// caller that genuinely needs a default must now say so at the call site
+    /// (see `runtime_config::parse_provider_or_default`, which logs the bad
+    /// value first); a caller acting on a *request* must refuse.
+    pub fn parse(s: &str) -> Option<Self> {
+        crate::runtime_catalog::spec_for(s).and_then(|spec| Self::from_id(spec.id))
+    }
+
+    /// `claude|codex|gemini|…` — the accepted-values list for an error
+    /// message, built from the catalog so it can never go stale.
+    pub fn valid_values() -> String {
+        crate::runtime_catalog::id_list_pipe()
     }
 }
 
@@ -3249,21 +3304,15 @@ mod tests {
     #[test]
     fn runtime_type_grok_parse_and_display_roundtrip() {
         // Config-string parse (case/alias-insensitive).
-        assert_eq!(RuntimeType::parse("grok"), RuntimeType::Grok);
-        assert_eq!(RuntimeType::parse("GROK"), RuntimeType::Grok);
-        assert_eq!(RuntimeType::parse("grok-cli"), RuntimeType::Grok);
+        assert_eq!(RuntimeType::parse("grok"), Some(RuntimeType::Grok));
+        assert_eq!(RuntimeType::parse("GROK"), Some(RuntimeType::Grok));
+        assert_eq!(RuntimeType::parse("grok-cli"), Some(RuntimeType::Grok));
         // Stable identifier.
         assert_eq!(RuntimeType::Grok.as_str(), "grok");
-        // as_str ↔ parse round-trip for every variant.
-        for rt in [
-            RuntimeType::Claude,
-            RuntimeType::Codex,
-            RuntimeType::Gemini,
-            RuntimeType::Antigravity,
-            RuntimeType::Grok,
-            RuntimeType::OpenAiCompat,
-        ] {
-            assert_eq!(RuntimeType::parse(rt.as_str()), rt, "round-trip {rt:?}");
+        // as_str ↔ parse round-trip for EVERY variant — driven by `ALL`, so a
+        // new runtime is covered the moment it is declared.
+        for rt in RuntimeType::ALL {
+            assert_eq!(RuntimeType::parse(rt.as_str()), Some(*rt), "round-trip {rt:?}");
         }
     }
 
@@ -3273,6 +3322,121 @@ mod tests {
         assert_eq!(json, r#""grok""#);
         let back: RuntimeType = serde_json::from_str(&json).unwrap();
         assert_eq!(back, RuntimeType::Grok);
+    }
+
+    // ── WP-B: RuntimeType ↔ runtime_catalog coupling ───────────────
+
+    /// The whole point of the catalog: a variant with no spec would be
+    /// configurable but undetectable, uninstallable and unloggable-into —
+    /// exactly the class of bug the six hand-written lists used to produce.
+    #[test]
+    fn every_runtime_type_has_a_catalog_spec() {
+        for rt in RuntimeType::ALL {
+            let spec = crate::runtime_catalog::spec_for(rt.as_str())
+                .unwrap_or_else(|| panic!("RuntimeType::{rt:?} has no runtime_catalog entry"));
+            assert_eq!(spec.id, rt.as_str());
+            // …and `spec()` must not panic for any variant.
+            assert_eq!(rt.spec().id, spec.id);
+        }
+    }
+
+    /// …and the reverse: a catalog entry with no variant could never be
+    /// selected as an agent's `[runtime] provider`.
+    #[test]
+    fn every_catalog_spec_has_a_runtime_type() {
+        for spec in crate::runtime_catalog::CATALOG {
+            assert!(
+                RuntimeType::from_id(spec.id).is_some(),
+                "catalog entry `{}` has no RuntimeType variant — it can be \
+                 detected but never selected",
+                spec.id
+            );
+        }
+        assert_eq!(
+            RuntimeType::ALL.len(),
+            crate::runtime_catalog::CATALOG.len(),
+            "the enum and the catalog must be the same set"
+        );
+    }
+
+    /// Serde's wire value, `as_str()` and the catalog id are one string.
+    /// A drift here silently rewrites every persisted `agent.toml`.
+    #[test]
+    fn serde_wire_value_equals_the_catalog_id() {
+        for rt in RuntimeType::ALL {
+            let json = serde_json::to_string(rt).unwrap();
+            assert_eq!(json, format!("\"{}\"", rt.as_str()), "{rt:?}");
+            let back: RuntimeType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, *rt);
+        }
+        // The pre-WP-B wire values must be byte-identical (persisted configs).
+        assert_eq!(RuntimeType::OpenAiCompat.as_str(), "openai_compat");
+        assert_eq!(RuntimeType::Antigravity.as_str(), "antigravity");
+    }
+
+    #[test]
+    fn runtime_type_parse_accepts_catalog_aliases() {
+        assert_eq!(RuntimeType::parse("agy"), Some(RuntimeType::Antigravity));
+        assert_eq!(RuntimeType::parse("openai"), Some(RuntimeType::OpenAiCompat));
+        assert_eq!(
+            RuntimeType::parse("openai-compat"),
+            Some(RuntimeType::OpenAiCompat)
+        );
+        assert_eq!(RuntimeType::parse("qwen-code"), Some(RuntimeType::Qwen));
+        assert_eq!(RuntimeType::parse("cursor-agent"), Some(RuntimeType::Cursor));
+        assert_eq!(RuntimeType::parse("  KIMI  "), Some(RuntimeType::Kimi));
+        // `from_id` is strict about ALIASES too (canonical ids only).
+        assert!(RuntimeType::from_id("agy").is_none());
+    }
+
+    /// The hole this closes: `parse` used to map ANY unknown string to
+    /// `Claude`. A request to log into a runtime this build does not know
+    /// would then have run `claude setup-token` and shown the user the wrong
+    /// vendor's login screen. Unknown MUST be `None` so the caller refuses.
+    #[test]
+    fn runtime_type_parse_rejects_unknown_ids_instead_of_defaulting() {
+        for bad in [
+            "",
+            "   ",
+            "claudee",              // typo
+            "openai_compatible",    // near-miss
+            "kimi2",               // a runtime this build does not have
+            "not-a-runtime",
+            "claude; rm -rf /",     // payload
+            "../../etc/passwd",
+            "сlaude",              // Cyrillic homoglyph
+        ] {
+            assert_eq!(
+                RuntimeType::parse(bad),
+                None,
+                "`{bad}` must NOT resolve to a runtime"
+            );
+        }
+        assert!(RuntimeType::parse(&"a".repeat(4096)).is_none());
+        // …and the accepted-values list used in error messages stays in sync.
+        let valid = RuntimeType::valid_values();
+        for rt in RuntimeType::ALL {
+            assert!(valid.contains(rt.as_str()), "{rt:?} missing from valid_values()");
+        }
+    }
+
+    #[test]
+    fn every_new_runtime_is_reachable() {
+        // Pins the WP-B additions by name so a rename/removal is a test
+        // failure rather than a silently missing backend.
+        for (id, rt) in [
+            ("qwen", RuntimeType::Qwen),
+            ("kimi", RuntimeType::Kimi),
+            ("copilot", RuntimeType::Copilot),
+            ("kiro", RuntimeType::Kiro),
+            ("cursor", RuntimeType::Cursor),
+            ("vibe", RuntimeType::Vibe),
+            ("opencode", RuntimeType::OpenCode),
+        ] {
+            assert_eq!(RuntimeType::from_id(id), Some(rt));
+            assert_eq!(rt.as_str(), id);
+            assert!(!rt.spec().binary.is_empty(), "{id} must name a binary");
+        }
     }
 
     // ── WP1 evolution master kill-switch ───────────────────────────

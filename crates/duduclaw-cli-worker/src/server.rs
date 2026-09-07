@@ -315,17 +315,14 @@ async fn spawn_session_default(
 ) -> Result<Arc<PtySession>, duduclaw_cli_runtime::SessionError> {
     // Resolve the binary per CLI kind so the worker has a call point for every
     // runtime (not just Claude). NOTE: only Claude has a validated interactive
-    // REPL — Codex / Gemini / Antigravity resolve their binary here for
-    // completeness, but non-Claude providers are routed to the oneshot
-    // `runtime_dispatch` path upstream, so they do not normally reach the
-    // worker's interactive spawn.
-    let program = match key.cli_kind {
-        CliKind::Claude => duduclaw_core::which_claude(),
-        CliKind::Codex => duduclaw_core::which_codex(),
-        CliKind::Gemini => duduclaw_core::which_gemini(),
-        CliKind::Antigravity => duduclaw_core::which_agy(),
-    }
-    .ok_or_else(|| {
+    // REPL — the others resolve their binary here for completeness, but
+    // non-Claude providers are routed to the oneshot `runtime_dispatch` path
+    // upstream, so they do not normally reach the worker's interactive spawn.
+    //
+    // WP-B: one catalog-driven probe (`CliKind::as_str()` IS the runtime
+    // catalog id) replaces the per-kind `which_*` match, so a runtime added to
+    // the catalog cannot be forgotten into a "binary not found" here.
+    let program = duduclaw_core::which_runtime(key.cli_kind.as_str()).ok_or_else(|| {
         duduclaw_cli_runtime::SessionError::UnknownCliKind(format!(
             "{} binary not found on PATH",
             key.cli_kind.as_str()

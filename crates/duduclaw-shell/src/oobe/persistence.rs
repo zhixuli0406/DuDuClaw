@@ -169,7 +169,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::oobe::selections::{LanguageChoice, OobeSelections, TemplateChoice};
+    use crate::oobe::selections::{LanguageChoice, OobeSelections, RuntimeCredentialKind, TemplateChoice};
 
     // `std::env::set_var`/`remove_var` are `unsafe` (stdlib requires it
     // regardless of edition on this toolchain) and process-global — these
@@ -353,6 +353,83 @@ mod tests {
         assert!(!loaded.completed);
         assert!(loaded.selections.runtime_authorized);
         assert_eq!(loaded.selections.theme, ThemeChoice::Light, "a missing `theme` key must default in, not error the whole file out");
+    }
+
+    #[test]
+    fn load_state_tolerates_an_older_schema_missing_the_runtime_providers_field() {
+        // WP-C (2026-09-05): same forward-compat contract as the `theme` and
+        // `operator_name` tests either side of this one, pinned for the
+        // per-provider list the `RuntimeAuth` step's rewrite added. Every
+        // machine that has already run OOBE has a state file with
+        // `runtime_authorized` and NO `runtime_providers` key; that absence
+        // must default to an empty list, not error the whole file out and
+        // throw a resumed flow back to step 0.
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("duduclaw-shell-oobe-test-preproviders-{}", std::process::id()));
+        let prev = std::env::var("DUDUCLAW_HOME").ok();
+        unsafe { std::env::set_var("DUDUCLAW_HOME", &tmp) };
+
+        let old_schema = r#"{
+            "completed": false,
+            "current_step": "privacy",
+            "selections": {
+                "language": "zh-tw",
+                "network_connected": true,
+                "account_created": true,
+                "runtime_deferred": false,
+                "runtime_authorized": true,
+                "theme": "dark"
+            }
+        }"#;
+        let dir = tmp.join("shell");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("oobe_state.json"), old_schema).unwrap();
+
+        let loaded = load_state();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DUDUCLAW_HOME", v),
+                None => std::env::remove_var("DUDUCLAW_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(loaded.current_step, OobeStep::Privacy, "must NOT fall back to step 0 just because `runtime_providers` is missing");
+        assert!(loaded.selections.runtime_authorized, "the pre-WP-C flag must survive");
+        assert!(loaded.selections.runtime_providers.is_empty(), "a missing key defaults to an empty list");
+        assert_eq!(loaded.selections.theme, ThemeChoice::Dark);
+    }
+
+    #[test]
+    fn a_runtime_provider_list_survives_a_save_load_round_trip() {
+        // The other half of the contract above: what THIS build writes has
+        // to come back as the same rows, so a machine that authorizes two
+        // providers and reboots mid-OOBE still shows both as set.
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("duduclaw-shell-oobe-test-providers-rt-{}", std::process::id()));
+        let prev = std::env::var("DUDUCLAW_HOME").ok();
+        unsafe { std::env::set_var("DUDUCLAW_HOME", &tmp) };
+
+        let mut flow = OobeFlow::new();
+        flow.record_runtime_provider("anthropic", RuntimeCredentialKind::ApiKey);
+        flow.record_runtime_provider("gemini", RuntimeCredentialKind::Login);
+        save_state(flow.state());
+        let loaded = load_state();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DUDUCLAW_HOME", v),
+                None => std::env::remove_var("DUDUCLAW_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(loaded.selections.runtime_providers.len(), 2);
+        assert_eq!(loaded.selections.runtime_providers[0].provider, "anthropic");
+        assert_eq!(loaded.selections.runtime_providers[0].kind, RuntimeCredentialKind::ApiKey);
+        assert_eq!(loaded.selections.runtime_providers[1].kind, RuntimeCredentialKind::Login);
+        assert!(loaded.selections.runtime_authorized);
     }
 
     #[test]

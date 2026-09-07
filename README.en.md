@@ -46,7 +46,7 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
 | Tools shared across LLMs | Rewrite per vendor | Write 200+ MCP tools once, use on all 5 backends |
 | Guardrails / audit / secret management | Build it yourself | Policy kernel + OS sandbox + AES-256-GCM built in |
-| A whole box to hand to a customer | Install Linux yourself, manage updates and tamper resistance yourself | DuDuClaw OS image: A/B update with rollback + Secure Boot + read-only root, plug in and go |
+| A whole box to hand to a customer | Install Linux yourself, manage updates and tamper resistance yourself | DuDuClaw OS image: A/B update with rollback + read-only root, plug in and go; a desktop shared by a person and the AI without getting in each other's way |
 
 <a id="architecture"></a>
 
@@ -114,9 +114,9 @@ This installs a prebuilt binary for your platform (macOS ARM64/x64, Linux x64/AR
 
 ### DuDuClaw OS (appliance image, pre-GA)
 
-If you would rather not dedicate a computer, get a box that runs the moment you plug it in: [DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) is a Yocto-built Linux image that turns an x86-64 mini PC into a headless appliance. Flash it, connect power and ethernet, and the dashboard appears on your LAN; everything after that is configured in the browser. It ships with A/B atomic updates and rollback, a read-only root verified by dm-verity, self-signed Secure Boot, and preloaded Chromium / LibreOffice / Steam plus a Chinese IME.
+If you would rather not dedicate a computer, get a box that runs the moment you plug it in: [DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) is a Yocto-built Linux operating system in which the AI agent is a native resident: it boots into its own desktop (compositor / shell, lock screen, Cmd+K delegation bar), so a person and the AI share one x86-64 box without getting in each other's way — the agent's GUI work runs in a shadow workspace by default, and the moment you touch the keyboard or mouse, whatever it was driving on your desktop yields. The desktop edition ships with A/B atomic updates and rollback, a read-only root, and preloaded Chromium / LibreOffice / Steam plus a Chinese IME; Secure Boot signing, dm-verity and TPM2 are build-time overlay options that the v0.1.0 images do not enable.
 
-Download the installer `.iso` (flash to USB, boot, install) or the whole-disk `.wic.zst` from [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases); every file comes with a `.sha256` and a minisign signature, and the verification commands are in that repo's README. This is a bring-up line (0.x): QEMU-verified, **not yet booted on real hardware**. Hardware requirements and compatible machines: [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md); product overview: [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md).
+Download the whole-disk `.wic.zst` (desktop edition) or the installer `.iso` (in v0.1.0 it writes the base image: the same desktop shell and gateway without the app layer; a desktop-edition `installer-desktop` `.iso` was added to v0.1.0 on 2026-09-04) from [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases); every file comes with a `.sha256` and a minisign signature, and the verification commands are in that repo's README. This is a bring-up line (0.x): QEMU-verified, **not yet booted on real hardware**. Hardware requirements and compatible machines: [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md); product overview: [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md).
 
 ### Build from source
 
@@ -177,11 +177,12 @@ duduclaw service install   # start on boot (launchd / systemd)
 | Security | PolicyKernel reference monitor (zero-LLM, fail-closed), macOS Seatbelt / Linux Landlock native sandbox, Docker / Apple Container / WSL2 container sandbox, secret redaction vault, CONTRACT.toml behavioral contracts + red-team CLI | [SECURITY.md](SECURITY.md) |
 | Accounts and cost | OAuth + API key rotation (4 strategies), rate-limit and billing cooldowns, cost telemetry with cache-efficiency analytics, cross-platform PTY pool driving OAuth subscription accounts | [docs/features](docs/features/README.md) |
 | Local inference | llama.cpp (Metal/CUDA/Vulkan), mistral.rs, Exo P2P, llamafile, MLX, with three-tier confidence routing; built-in Whisper speech recognition and vector embeddings | [docs/features](docs/features/README.md) |
+| Fine-tuning | Build SFT / DPO datasets (ShareGPT / Alpaca) from this machine's conversations, task results and approval decisions, train them on your own GPU host (SSH + LLaMA-Factory) or Together's cloud, then import the GGUF / LoRA back into the local models directory. No local training — integrated graphics cannot train — and data leaving the machine requires an explicit acknowledgement | [docs/features/53](docs/features/54-finetune.md) |
 | Live forking | RFC-26: fork an in-progress task into N competing branches, each in a copy-on-write isolate, with an AI judge picking the winner to merge (off by default) | [docs/rfc](docs/rfc) |
 | Auto-update | One click from the dashboard or unattended (`auto_update = true`); SHA-256 + Ed25519 verification, in-place restart, open tabs reload themselves | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web dashboard | React 19 + TypeScript SPA, 32 pages, embedded in the binary; zh-TW / en / ja | [docs/features](docs/features/README.md) |
 | ERP | Odoo bridge with 17 MCP tools (CRM / sales / inventory / accounting), CE/EE auto-detection, per-agent credential isolation | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
-| DuDuClaw OS | Yocto appliance image: A/B atomic update with rollback, read-only root + dm-verity, self-signed Secure Boot, TPM2 key sealing (partial), first-boot provisioning + LAN dashboard, own compositor / shell with keyboard shortcuts, app compatibility layer (Flatpak / Bottles / Waydroid); separate repo and version line, pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) |
+| DuDuClaw OS | Yocto appliance image: own compositor / shell with keyboard shortcuts, human–AI co-driving (dedicated agent seat, shadow workspace, human input freezes the agent, Super+Esc emergency stop; off by default), A/B atomic update with rollback, read-only root, first-boot provisioning + LAN dashboard, app compatibility layer (Flatpak / Bottles / Waydroid); Secure Boot signing / dm-verity / TPM2 are build overlay options (not enabled in v0.1.0); separate repo and version line, pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
 Full feature list in [docs/features/feature-inventory.md](docs/features/feature-inventory.md); version history in [CHANGELOG.md](CHANGELOG.md).
 
@@ -262,7 +263,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 - [docs/guides/development-guide.md](docs/guides/development-guide.md): dev environment and agent development
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md): writing custom MCP tools
 - [docs/spec](docs/spec/soul-md-spec.md): SOUL.md and CONTRACT.toml format specs
-- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md): the DuDuClaw OS appliance; hardware requirements in [hardware-requirements.md](docs/guides/hardware-requirements.md), app compatibility in [app-compat.md](docs/guides/app-compat.md); image build and releases in the [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo
+- [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md): the DuDuClaw OS appliance; [52-desktop-edition.md](docs/features/52-desktop-edition.md): the desktop edition, one machine shared by a person and the AI; hardware requirements in [hardware-requirements.md](docs/guides/hardware-requirements.md), app compatibility in [app-compat.md](docs/guides/app-compat.md); image build and releases in the [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo
 - [CHANGELOG.md](CHANGELOG.md): version history
 
 <a id="license"></a>

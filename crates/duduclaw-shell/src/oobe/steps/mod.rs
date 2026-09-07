@@ -31,7 +31,7 @@ pub(crate) use language::A11yCategory;
 use gpui::{Context, Div};
 
 use super::state::EnterOutcome;
-use super::widgets::{AccountFields, NetworkFields};
+use super::widgets::{AccountFields, NetworkFields, RuntimeAuthFields};
 use super::{OobeFlow, OobeStep, OobeUiState};
 use crate::ShellView;
 
@@ -41,6 +41,7 @@ pub(super) fn render(
     ui: &OobeUiState,
     account_fields: &AccountFields,
     network_fields: &NetworkFields,
+    runtime_fields: &RuntimeAuthFields,
     cx: &mut Context<ShellView>,
 ) -> Div {
     match step {
@@ -55,11 +56,14 @@ pub(super) fn render(
         OobeStep::Network => network::render(flow, ui, network_fields, cx),
         OobeStep::Update => update::render(flow),
         OobeStep::AccountCreate => account::render(flow, ui, account_fields, cx),
-        OobeStep::RuntimeAuth => runtime_auth::render(flow, cx),
+        OobeStep::RuntimeAuth => runtime_auth::render(flow, ui, runtime_fields, cx),
         OobeStep::Privacy => privacy::render(flow, cx),
         OobeStep::Templates => templates::render(flow, cx),
         OobeStep::Theme => theme::render(flow, cx),
-        OobeStep::Finish => finish::render(flow),
+        // The finish summary reads the LIVE wired signal from `ui`, never a
+        // persisted flag (D4a §5.4-2: wired connectivity is an environmental
+        // fact, not a Wi-Fi join) — see `finish::network_summary`.
+        OobeStep::Finish => finish::render(flow, ui.wired_online()),
     }
 }
 

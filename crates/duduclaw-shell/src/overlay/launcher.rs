@@ -187,7 +187,7 @@ pub(super) fn render(
     // still being the visually FIRST thing a fresh Launcher open shows, not
     // by forcing it to survive every possible typed query.
     if query.trim().is_empty() {
-        panel = panel.child(delegate_section(palette)).child(apps_section(query, installed, palette, cx));
+        panel = panel.child(delegate_section(palette, ui.agents.default_agent())).child(apps_section(query, installed, palette, cx));
         if let Some(section) = maybe_catalog_section(query, installed, palette, cx) {
             panel = panel.child(section);
         }
@@ -241,7 +241,25 @@ fn section_label(label: &'static str, palette: ShellPalette) -> Div {
         .child(label)
 }
 
-fn delegate_section(palette: ShellPalette) -> Div {
+fn delegate_section(palette: ShellPalette, agent: Option<&crate::gateway_client::AgentRef>) -> Div {
+    // 2026-09-05: this card was the fixed demo preview ("交辦給 財務助理" +
+    // an invented plan) on every machine. It now names the agent
+    // `try_submit_delegate` will actually target, or says plainly that
+    // there is nobody yet.
+    let (initial, title, plan, show_hint) = match agent {
+        Some(a) => (
+            a.label().chars().next().map(|c| c.to_string()).unwrap_or_default(),
+            crate::i18n::t1(Locale::ZhTw, Key::LauncherDelegateTo, a.label()),
+            t(Locale::ZhTw, Key::LauncherDelegatePlanHint).to_string(),
+            true,
+        ),
+        None => (
+            "?".to_string(),
+            t(Locale::ZhTw, Key::LauncherDelegateNoAgentTitle).to_string(),
+            t(Locale::ZhTw, Key::LauncherDelegateNoAgentBody).to_string(),
+            false,
+        ),
+    };
     // Launcher.dc.html: highlight card bg `#e8f1fb` / border `#cfe0f5`
     // light — brand-tinted `rgba(67,144,238,0.12)` bg / `rgba(67,144,238,
     // 0.35)` border dark. Hint pill: bg `#ffffff` / border `#cfe0f5` / text
@@ -279,7 +297,7 @@ fn delegate_section(palette: ShellPalette) -> Div {
                             .text_size(px(14.))
                             .font_weight(FontWeight::BOLD)
                             .text_color(theme::alpha(palette.brand_foreground, 1.0))
-                            .child(fake_data::LAUNCHER_DELEGATE_AGENT_INITIAL),
+                            .child(initial),
                     ),
             )
             .child(
@@ -287,10 +305,10 @@ fn delegate_section(palette: ShellPalette) -> Div {
                     .flex_1()
                     .flex()
                     .flex_col()
-                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(fake_data::LAUNCHER_DELEGATE_TITLE))
-                    .child(div().mt(px(3.)).text_size(px(12.)).text_color(plan_text).child(fake_data::LAUNCHER_DELEGATE_PLAN)),
+                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(div().mt(px(3.)).text_size(px(12.)).text_color(plan_text).child(plan)),
             )
-            .child(
+            .when(show_hint, |card| card.child(
                 div()
                     .bg(hint_bg)
                     .border_1()
@@ -301,8 +319,8 @@ fn delegate_section(palette: ShellPalette) -> Div {
                     .text_size(px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(hint_text)
-                    .child(fake_data::LAUNCHER_DELEGATE_HINT),
-            ),
+                    .child(t(Locale::ZhTw, Key::LauncherDelegateHint)),
+            )),
     )
 }
 
@@ -770,13 +788,48 @@ fn decision_row(palette: ShellPalette, cx: &mut Context<ShellView>) -> Div {
 /// every other blocking call in this crate uses.
 fn dispatch_install(remote: &'static str, app_id: &'static str, cx: &mut Context<ShellView>) {
     let (tx, rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel::<InstallOutcome>();
     std::thread::spawn(move || {
-        let result = crate::apps::install(remote, app_id);
-        if let Err(e) = &result {
-            eprintln!("[apps] install {remote} {app_id} could not start: {e}");
+        match crate::apps::install(remote, app_id) {
+            Ok(child) => {
+                let _ = tx.send(Ok(()));
+                // 2026-09-05: the spawn used to be fire-and-forget, so a
+                // failed install (on the shipped image: EVERY install, the
+                // `data` installation did not exist) left no trace at all.
+                // Wait for flatpak and report the real outcome as a card.
+                let outcome = match child.wait_with_output() {
+                    Ok(out) if out.status.success() => InstallOutcome::Installed,
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let last = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+                        eprintln!("[apps] install {app_id} failed: {last}");
+                        InstallOutcome::Failed(last)
+                    }
+                    Err(e) => InstallOutcome::Failed(e.to_string()),
+                };
+                let _ = done_tx.send(outcome);
+            }
+            Err(e) => {
+                eprintln!("[apps] install {remote} {app_id} could not start: {e}");
+                let _ = tx.send(Err(e));
+            }
         }
-        let _ = tx.send(result);
     });
+    cx.spawn(async move |weak, cx| loop {
+        match done_rx.try_recv() {
+            Ok(outcome) => {
+                let _ = weak.update(cx, |view, cx| {
+                    post_install_outcome_card(view, app_id, outcome);
+                    cx.notify();
+                });
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+        cx.background_executor().timer(SUBMIT_BRIDGE_POLL_INTERVAL * 10).await;
+    })
+    .detach();
     cx.spawn(async move |weak, cx| loop {
         match rx.try_recv() {
             Ok(result) => {
@@ -1049,7 +1102,19 @@ fn apply_submit_outcome(view: &mut ShellView, outcome: (Option<String>, SubmitOu
             if crate::diag_enabled() {
                 eprintln!("[launcher] delegate submitted: agent={agent_id} task={task_id} title={title:?}");
             }
-            view.task_results.apply_submit_ok(agent_id, task_id, title);
+            view.task_results.apply_submit_ok(agent_id.clone(), task_id, title.clone());
+            // 2026-09-05: the panel closed with no trace and Home only showed
+            // in_progress work, so a successful 交辦 looked like nothing
+            // happened. Say so right away; the terminal-state card from
+            // `task_result` still follows when the task finishes.
+            view.notify_center.post_system(
+                crate::task_result::NOTIFY_APP_NAME,
+                t(Locale::ZhTw, Key::LauncherDelegateSubmittedTitle),
+                &crate::i18n::t2(Locale::ZhTw, Key::LauncherDelegateSubmittedBody, &title, &agent_id),
+                crate::notifyd::Urgency::Low,
+                Vec::new(),
+                None,
+            );
         }
         SubmitOutcome::NoAgent => {
             view.task_results.apply_submit_err();
@@ -1071,6 +1136,40 @@ fn apply_submit_outcome(view: &mut ShellView, outcome: (Option<String>, SubmitOu
 /// to tell them Enter did not actually work. No `system_task` id: there is
 /// no task to retry FROM (it was never created), so no action button is
 /// offered — dismissing it is the whole interaction.
+/// What became of a Launcher-started `flatpak install`, once flatpak exited.
+enum InstallOutcome {
+    Installed,
+    /// Last non-empty stderr line, or the OS error.
+    Failed(String),
+}
+
+fn post_install_outcome_card(view: &mut ShellView, app_id: &str, outcome: InstallOutcome) {
+    let name = crate::apps::catalog::INSTALL_CATALOG.iter().find(|e| e.flatpak_id == app_id).map(|e| e.label).unwrap_or(app_id);
+    match outcome {
+        InstallOutcome::Installed => {
+            view.notify_center.post_system(
+                crate::task_result::NOTIFY_APP_NAME,
+                t(Locale::ZhTw, Key::InstallDoneTitle),
+                &crate::i18n::t1(Locale::ZhTw, Key::InstallDoneBody, name),
+                crate::notifyd::Urgency::Low,
+                Vec::new(),
+                None,
+            );
+        }
+        InstallOutcome::Failed(reason) => {
+            let body = if reason.is_empty() { t(Locale::ZhTw, Key::InstallFailedBodyUnknown).to_string() } else { reason };
+            view.notify_center.post_system(
+                crate::task_result::NOTIFY_APP_NAME,
+                &crate::i18n::t1(Locale::ZhTw, Key::InstallFailedTitle, name),
+                &body,
+                crate::notifyd::Urgency::Normal,
+                Vec::new(),
+                None,
+            );
+        }
+    }
+}
+
 fn post_submit_failure_card(view: &mut ShellView, message: &str) {
     view.notify_center.post_system(
         crate::task_result::NOTIFY_APP_NAME,

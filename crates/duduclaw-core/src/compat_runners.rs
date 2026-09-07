@@ -79,7 +79,8 @@ pub const COMPAT_DIRS_ENV: &str = "DUDUCLAW_COMPAT_DIRS";
 /// these origin ecosystems into `to_os = "duduclaw-os"`.
 ///
 /// Serialized/deserialized as kebab-case in the TOML declaration file
-/// (`windows-game` / `windows-app` / `android` / `macos-remote`).
+/// (`windows-game` / `windows-app` / `android` / `macos-remote` /
+/// `linux-container`).
 ///
 /// **This enum, not a free string, is the enforcement mechanism** behind
 /// "an unknown `from_os` value must reject the whole file, not silently
@@ -106,6 +107,16 @@ pub enum FromOs {
     /// executing macOS code locally, but sharing the same install/
     /// grading/entry-point surface as the other three (design §2.5).
     MacosRemote,
+    /// A Linux workload that ships as an OCI container and is driven
+    /// through docker/podman — e.g. the LLaMA-Factory LlamaBoard
+    /// fine-tuning console (`docs/todo/TODO-ai-runtimes-2026-09.md` §1
+    /// 決策 4C(b)). Not an app "translation" at all: the origin OS is
+    /// Linux too, and what the runner bridges is the container runtime
+    /// plus, typically, a discrete GPU the reference appliances do not
+    /// have. Declared here (2026-09-06) because the first such declaration
+    /// (`compat.d/llamafactory.toml`) shipped with `from_os = "linux-gpu"`
+    /// and was rejected as malformed — exactly what this enum is for.
+    LinuxContainer,
 }
 
 impl FromOs {
@@ -116,6 +127,7 @@ impl FromOs {
             Self::WindowsApp => "windows-app",
             Self::Android => "android",
             Self::MacosRemote => "macos-remote",
+            Self::LinuxContainer => "linux-container",
         }
     }
 }
@@ -437,6 +449,28 @@ require_tool = ["flatpak"]
                 assert!(!error.is_empty());
             }
             other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linux_container_from_os_is_a_recognized_origin() {
+        // The LLaMA-Factory LlamaBoard runner DuDuClaw OS ships declares
+        // `from_os = "linux-container"`; before the variant existed the
+        // whole file was (correctly) rejected as malformed.
+        let dir = tempfile::tempdir().unwrap();
+        write_decl(
+            dir.path(),
+            "llamafactory.toml",
+            "id = \"llamafactory\"\ndisplay_name = \"LlamaBoard\"\nfrom_os = \"linux-container\"\nentrypoint = \"docker compose up\"\n",
+        );
+        let statuses = discover_runners_from(&[dir.path().to_path_buf()]);
+        assert_eq!(statuses.len(), 1);
+        match &statuses[0] {
+            RunnerStatus::Ok { decl, .. } => {
+                assert_eq!(decl.from_os, FromOs::LinuxContainer);
+                assert_eq!(decl.from_os.as_str(), "linux-container");
+            }
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 

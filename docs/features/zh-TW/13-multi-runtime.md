@@ -1,6 +1,6 @@
 # Multi-Runtime Agent 執行
 
-> 一個平台，四種 AI 後端：Claude、Codex、Gemini，以及任何 OpenAI 相容端點。
+> 一個平台，十二種 AI 後端：Claude、Codex、Gemini、Antigravity、Grok、Qwen Code、Kimi Code、GitHub Copilot CLI、Kiro、Cursor、Mistral Vibe、OpenCode，以及任何 OpenAI 相容端點。
 
 ---
 
@@ -29,7 +29,43 @@ AgentRuntime trait:
 
 每個後端（Claude、Codex、Gemini 或任何 OpenAI 相容端點）都實作相同的介面。系統的其餘部分不需要知道、也不在乎是哪個後端在處理特定請求。
 
-### 四種後端
+### Runtime 目錄（Runtime Catalog）
+
+每個後端只描述一次，寫在單一份編譯期表格（`crates/duduclaw-core/src/runtime_catalog.rs`）。偵測、一鍵安裝、模型探索、CLI 登入、模型↔供應商推斷全都讀這張表——所以不會再出現「裝得起來卻偵測不到」或「設定得了卻登入不了」的 runtime。
+
+| Runtime | 執行檔 | 安裝管道 | Headless 呼叫 | 輸出 | 登入方式 | 憑證位置 |
+|---|---|---|---|---|---|---|
+| Claude Code | `claude` | npm `@anthropic-ai/claude-code` | `-p <prompt> --output-format stream-json` | jsonl | `claude setup-token`（貼回驗證碼） | `~/.claude/.credentials.json` |
+| OpenAI Codex | `codex` | npm `@openai/codex` | `exec --json <prompt>` | jsonl | `codex login`（localhost 回呼） | `~/.codex/auth.json` |
+| Gemini CLI | `gemini` | npm `@google/gemini-cli` | `-p --output-format stream-json <prompt>` | jsonl | `gemini auth login`（localhost 回呼） | `~/.gemini/oauth_creds.json` |
+| Google Antigravity | `agy` | `antigravity.google/cli/install.sh` | `-p <prompt>` | text | `agy login`（localhost 回呼） | — |
+| Grok Build | `grok` | `x.ai/cli/install.sh`（手動） | `-p <prompt>` | text | `grok login --device-code` | `~/.grok/auth.json` |
+| Qwen Code | `qwen` | npm `@qwen-code/qwen-code` | `-p <prompt> --yolo --output-format json` | json | 無（僅 API key） | `~/.qwen/.env` |
+| Kimi Code | `kimi` | npm `@moonshot-ai/kimi-code` | `-p <prompt> --output-format stream-json` | jsonl | `kimi login`（裝置碼） | `~/.kimi-code/credentials/` |
+| GitHub Copilot CLI | `copilot` | npm `@github/copilot` | `-p <prompt> -s --no-ask-user --allow-all-tools` | text | `copilot login --device-code` | `~/.copilot/config.json` |
+| Kiro CLI | `kiro-cli` | `cli.kiro.dev/install`（手動） | `chat --no-interactive --trust-all-tools <prompt>` | text | `kiro-cli login --use-device-flow` | `~/.kiro/settings/cli.json` |
+| Cursor CLI | `cursor-agent` | `cursor.com/install` | `-p <prompt> --force --output-format json` | json | `cursor-agent login`（瀏覽器） | `~/.cursor/cli-config.json` |
+| Mistral Vibe | `vibe` | PyPI `mistral-vibe` | `-p <prompt> --yolo --trust --output json` | json | 無（僅 API key） | `~/.vibe/.env` |
+| OpenCode | `opencode` | `opencode.ai/install` | `run <prompt> --auto --format json` | jsonl | `opencode auth login` | `~/.local/share/opencode/auth.json` |
+| OpenAI 相容端點 | *(HTTP)* | — | — | json | 無（僅 API key） | — |
+
+模型選擇每家寫法不同，目錄一併記下是哪一種：獨立旗標（`--model <id>`）、Copilot 文件寫的等號式（`--model=<id>`）、完全沒有旗標時改用環境變數（Mistral Vibe 的 `VIBE_ACTIVE_MODEL`），或是沒有（Kiro 的模型走 `kiro-cli settings`，不是每次呼叫指定）。
+
+**啟用 runtime 前該讀的廠商條款：**
+
+- **Kiro**——AWS FAQ 明文寫著：不允許透過第三方自動化 harness、將請求繞過 Kiro 原生介面。用 DuDuClaw 驅動 Kiro 正屬此類；自行在 CI 直接呼叫 `kiro-cli` 則被允許。所以 Kiro 的安裝管道是手動的：這個決定要由你自己明確做出。
+- **Anthropic／Google**——2026-03 起，第三方產品使用消費者訂閱 token 會在伺服器端被封鎖，已有帳號被停權。請走 API key。
+- **Qwen**——免費 OAuth 方案已於 2026-04-15 停用，只剩 API key（ModelStudio／DashScope）。
+- **OpenCode**——MIT 授權、本身無限制，但它在 1.3.0 移除 Anthropic 訂閱 plugin，理由同上。請用各供應商的 API key。
+- **OpenAI**——對「第三方產品驅動 ChatGPT 訂閱登入」的政策不明，API key 才是受支援的路徑。
+
+Dashboard 會顯示對應的條款提示，並要求勾選「我了解風險」才開始訂閱登入。
+
+### 後端怎麼被驅動
+
+五個後端有各自的 runtime 模組，因為它們各有無法共用的廠商專屬接線——帳號輪替（Claude）、以該 CLI 自己的格式注入 MCP 設定、能力→sandbox 旗標的轉譯、空輸出時的 PTY 補救。其餘全部由**同一支**通用 print-mode runtime（`runtime/generic_cli.rs`）直接依目錄項目驅動：用模板 argv 啟動執行檔，把 prompt 以參數或 stdin 送進去，把 text／JSON／JSONL 解析回最終回覆文字，並把非零離開碼或「需要登入」的訊號對應成 failover 鏈看得懂的具名錯誤。
+
+### 原本的四種後端
 
 **Claude Runtime** — 呼叫 Claude Code CLI（`claude`），採用 JSONL 串流輸出。這是功能最完整的後端，內建 MCP 工具支援、bash 執行、web search 和檔案操作。
 
@@ -97,17 +133,22 @@ HTTP POST /v1/chat/completions
 DuDuClaw 啟動時，**RuntimeRegistry** 會掃描系統中可用的 CLI 工具：
 
 ```
-啟動掃描：
+啟動掃描（對 runtime 目錄跑一次迴圈）：
      |
      v
-  PATH 中有 `claude`？ → 註冊 Claude runtime
-  PATH 中有 `codex`？  → 註冊 Codex runtime
-  PATH 中有 `gemini`？ → 註冊 Gemini runtime
-  有設定的 HTTP 端點？  → 註冊 OpenAI-compat runtimes
+  目錄中每個有執行檔的項目：
+     PATH → ~/.local/bin、Homebrew、bun/volta/npm-global/asdf shim、
+     /opt/duduclaw/runtimes/bin、/usr/bin、/bin
+       找到？ → 註冊（有專屬模組就用專屬的，否則用通用 print-mode）
+     |
+     v
+  一律註冊：OpenAI 相容端點（HTTP 端點，看的是 API key 不是執行檔）
      |
      v
 Registry 知道哪些後端可用
 ```
+
+`/opt/duduclaw/runtimes/bin` 是 DuDuClaw OS 值班機映像放內建 CLI 的位置——即使 gateway 沒有繼承到互動式 `PATH`，映像內建的 runtime 一樣找得到。
 
 Agent 可以在 `agent.toml` 中指定偏好的 runtime：
 
@@ -188,6 +229,28 @@ DuDuClaw 不押注在單一 AI 供應商。如果 Claude 漲價，可以將 Agen
 - **CostTelemetry**：追蹤每個供應商的成本，支援明智的路由決策。
 - **MCP Server**：工具暴露給所有支援的後端（Claude 透過原生 MCP，其他透過工具注入）。
 - **Agent Config**：每個 Agent 的 `agent.toml` 指定其 runtime 偏好和備案鏈。
+
+---
+
+## Provider 感知的帳號（WP-A，2026-09）
+
+`accounts.add`——dashboard 帳號頁與 OOBE「AI Runtime 授權」步驟背後共用的 gateway RPC——現在除了既有的 `type`（`api_key` | `oauth`）之外，還接受 `provider` id。可接受的值來自平台的統一 provider 對照表（`duduclaw_core::provider_env::KNOWN_PROVIDER_IDS`）：`anthropic`、`openai`、`gemini`/`google`、`deepseek`、`minimax`、`groq`、`together`、`mistral`、`openrouter`、`xai`、`qwen`。不帶 `provider` 時預設為 `"anthropic"`，因此這個功能上線前寫的每一個呼叫端都會維持原本行為不變；未知的 id 會被拒絕，不會被靜默接受。
+
+金鑰仍然寫進 `config.toml` 的 `[[accounts]]` 陣列，只是現在會標上它的 provider：
+
+```toml
+[[accounts]]
+id = "openai-prod"
+type = "api_key"
+provider = "openai"
+api_key_enc = "..."          # anthropic 維持舊有的 anthropic_api_key_enc 欄位
+```
+
+`AccountRotator::select_for_provider`——Claude CLI 路徑與跨供應商 Direct-API 的 `duduclaw-llm` provider 路徑早就在用的同一套挑選邏輯——嚴格依這個欄位篩選，所以用這種方式新增的 OpenAI／Gemini／xAI／DeepSeek…金鑰，會被套進和 Anthropic 帳號完全相同的輪替、預算追蹤與冷卻機制，讀取端不需要為每個 provider 另開一條程式碼路徑。`accounts.list` 與 `accounts.budget_summary` 現在都會在每筆帳號回傳 `provider`，讓 dashboard 帳號頁能顯示每把金鑰屬於哪家服務商；`AddAccountDialog` 新增服務商選單，附上各家的金鑰格式提示與前往該服務商主控台取得金鑰的連結。
+
+## 訂閱登入風險告知
+
+每一個「用你的訂閱帳號一鍵登入」的流程——CLI 登入彈窗、引導式 QR code 設定精靈，以及只會開啟這兩者之一的 OOBE runtime 設定卡片——在開始前都會先顯示風險告知：Anthropic 與 Google 自 2026 年 3 月起已在伺服器端封鎖第三方產品使用消費者訂閱帳號登入，且已有帳號因此被停權；OpenAI 目前政策不明。使用者必須勾選「我了解風險並自行承擔」，流程本身的登入步驟（CLI 子行程、瀏覽器回呼，或裝置碼輪詢）才會開始。API 金鑰路徑不受此關卡影響，仍是預設建議。
 
 ---
 

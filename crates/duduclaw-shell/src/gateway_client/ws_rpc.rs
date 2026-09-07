@@ -220,6 +220,168 @@ async fn call_once_async(url: &str, jwt: &str, method: &str, params: Value) -> R
     outcome
 }
 
+// ── One request, then the server-pushed events it produces — WP-C ───────
+// (2026-09-05, `docs/todo/TODO-ai-runtimes-2026-09.md` §3 WP-C)
+//
+// `auth.cli_login.start` is the first RPC in this crate whose ANSWER is not
+// the interesting part: it returns a `session_id` immediately and then the
+// gateway drives the CLI's login in a PTY, streaming the transcript as
+// `auth.cli_login.output` EVENTS (`handlers.rs::handle_cli_login_start`
+// spawns that forwarder). The device code and the verification URL the
+// operator has to see exist only inside that transcript.
+//
+// Those events go onto `AppState::event_tx`, a broadcast every authenticated
+// socket receives unconditionally (`server.rs`'s "Outbound event broadcast
+// (always active for authenticated clients)" select arm — checked, not
+// assumed), so ONE connection that sends the start request and then keeps
+// reading sees both the response and every event it produced. Sending the
+// request on a throwaway `call_once` connection and subscribing on a second
+// one would race: the PTY starts on the gateway the moment `start` returns,
+// and the first lines — the ones carrying the URL — can be broadcast before
+// a second connection finishes its handshake.
+//
+// This is still not `ws_status.rs`'s persistent-connection manager: no
+// reconnect, no backoff, no pending-call registry. One dial, one request, a
+// bounded read loop, close. The caller runs it from a `std::thread::spawn`
+// like every other function in this module tree.
+
+/// What a stream callback wants next. Returning `Stop` closes the connection
+/// (the caller has what it came for); `Continue` keeps reading until the
+/// budget runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamStep {
+    Continue,
+    Stop,
+}
+
+/// Sends one request and then streams the events that follow it.
+///
+/// `on_response` sees the request's own `res` payload exactly once;
+/// `on_event` sees every subsequent `event` frame as `(event name,
+/// payload)`. Either can end the call by returning [`StreamStep::Stop`].
+/// `budget` bounds the WHOLE call — a login the operator walks away from
+/// must not pin a thread and a socket forever.
+///
+/// A rejected request (`ok: false`) is an error, same as `call_once`. A
+/// connection that dies AFTER a successful response is not: the events are
+/// best-effort by nature, and the caller's own fallback (polling
+/// `auth.cli_login.status`) is what settles the outcome.
+pub(crate) fn call_then_stream_events(
+    jwt: &str,
+    method: &str,
+    params: Value,
+    budget: Duration,
+    on_response: impl FnMut(&Value) -> StreamStep,
+    on_event: impl FnMut(&str, &Value) -> StreamStep,
+) -> Result<(), RpcError> {
+    call_then_stream_events_at(&ws_url(), jwt, method, params, budget, on_response, on_event)
+}
+
+pub(crate) fn call_then_stream_events_at(
+    url: &str,
+    jwt: &str,
+    method: &str,
+    params: Value,
+    budget: Duration,
+    on_response: impl FnMut(&Value) -> StreamStep,
+    on_event: impl FnMut(&str, &Value) -> StreamStep,
+) -> Result<(), RpcError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| RpcError::Unreachable(format!("failed to start local async runtime: {e}")))?;
+    rt.block_on(stream_async(url, jwt, method, params, budget, on_response, on_event))
+}
+
+/// How long one `read.next()` may sit idle before the loop re-checks the
+/// overall budget. Short enough that a `Stop` decision or a blown budget is
+/// acted on promptly, long enough not to spin.
+const STREAM_IDLE_TICK: Duration = Duration::from_secs(1);
+
+async fn stream_async(
+    url: &str,
+    jwt: &str,
+    method: &str,
+    params: Value,
+    budget: Duration,
+    mut on_response: impl FnMut(&Value) -> StreamStep,
+    mut on_event: impl FnMut(&str, &Value) -> StreamStep,
+) -> Result<(), RpcError> {
+    let connect_fut = tokio_tungstenite::connect_async(url);
+    let (ws_stream, _response) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_fut).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(classify_connect_error(&e)),
+        Err(_) => return Err(RpcError::Timeout),
+    };
+    let (mut write, mut read) = ws_stream.split();
+
+    let connect_req = serde_json::json!({
+        "type": "req", "id": "connect", "method": "connect", "params": { "jwt": jwt },
+    });
+    write.send(Message::Text(connect_req.to_string())).await.map_err(|e| RpcError::Unreachable(e.to_string()))?;
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, read.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => {
+            let v: Value = serde_json::from_str(&text).map_err(|e| RpcError::Malformed(format!("handshake response was not valid JSON: {e}")))?;
+            if v.get("ok").and_then(Value::as_bool) != Some(true) {
+                return Err(RpcError::AuthRejected);
+            }
+        }
+        Ok(Some(Ok(_))) => return Err(RpcError::Malformed("handshake response was not a text frame".to_string())),
+        Ok(Some(Err(e))) => return Err(RpcError::Unreachable(e.to_string())),
+        Ok(None) => return Err(RpcError::Unreachable("connection closed during handshake".to_string())),
+        Err(_) => return Err(RpcError::Timeout),
+    }
+
+    let req = serde_json::json!({ "type": "req", "id": "call", "method": method, "params": params });
+    write.send(Message::Text(req.to_string())).await.map_err(|e| RpcError::Unreachable(e.to_string()))?;
+
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut answered = false;
+    let outcome = 'frames: loop {
+        if tokio::time::Instant::now() >= deadline {
+            // Not an error once the request itself was answered — the caller
+            // asked for a bounded window, and it just closed.
+            break 'frames if answered { Ok(()) } else { Err(RpcError::Timeout) };
+        }
+        match tokio::time::timeout(STREAM_IDLE_TICK, read.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    // A single unparseable frame is not worth killing a live
+                    // login over; keep reading within the budget.
+                    continue;
+                };
+                match v.get("type").and_then(Value::as_str) {
+                    Some("res") if v.get("id").and_then(Value::as_str) == Some("call") => {
+                        if v.get("ok").and_then(Value::as_bool) != Some(true) {
+                            break 'frames Err(RpcError::Rejected(v.get("error").map(ToString::to_string).unwrap_or_default()));
+                        }
+                        answered = true;
+                        let payload = v.get("payload").cloned().unwrap_or(Value::Null);
+                        if on_response(&payload) == StreamStep::Stop {
+                            break 'frames Ok(());
+                        }
+                    }
+                    Some("event") => {
+                        let name = v.get("event").and_then(Value::as_str).unwrap_or("");
+                        let payload = v.get("payload").cloned().unwrap_or(Value::Null);
+                        if on_event(name, &payload) == StreamStep::Stop {
+                            break 'frames Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Some(Ok(_))) => {}   // ping/pong/binary — tungstenite answers pings itself.
+            Ok(Some(Err(e))) => break 'frames if answered { Ok(()) } else { Err(RpcError::Unreachable(e.to_string())) },
+            Ok(None) => break 'frames if answered { Ok(()) } else { Err(RpcError::Unreachable("connection closed before the response arrived".to_string())) },
+            Err(_) => {} // idle tick — loop back and re-check the budget.
+        }
+    };
+
+    let _ = write.close().await;
+    outcome
+}
+
 // ── Pre-auth (lock-screen) round trip — ICON-3 (2026-08-23) ─────────────
 // The lock screen has no credential to present, and must not depend on one:
 // `bootstrap_local_session` only issues a JWT where the Personal edition's
@@ -454,6 +616,180 @@ mod tests {
 
         let result = call_once_at(&url, "jwt-abc", "approvals.decide", serde_json::json!({"id":"a1","approve":true}));
         assert_eq!(result, Ok(serde_json::json!({"ok": true})));
+    }
+
+    // ── WP-C (2026-09-05): one request, then its events ──────────────────
+
+    #[test]
+    fn a_streamed_call_sees_its_response_and_then_the_events_that_follow() {
+        let url = start_mock_ws_server(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":true}"#.into())).await;
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"call","ok":true,"payload":{"session_id":"s1"}}"#.into())).await;
+            let _ = ws
+                .send(Message::Text(r#"{"type":"event","event":"auth.cli_login.output","payload":{"session_id":"s1","data":"open https://x/"}}"#.into()))
+                .await;
+            let _ = ws
+                .send(Message::Text(r#"{"type":"event","event":"auth.cli_login.status","payload":{"session_id":"s1","status":"succeeded"}}"#.into()))
+                .await;
+        });
+
+        let response = std::cell::RefCell::new(Value::Null);
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+        let result = call_then_stream_events_at(
+            &url,
+            "jwt-abc",
+            "auth.cli_login.start",
+            serde_json::json!({"runtime": "claude"}),
+            Duration::from_secs(5),
+            |payload| {
+                *response.borrow_mut() = payload.clone();
+                StreamStep::Continue
+            },
+            |event, payload| {
+                events.borrow_mut().push(format!("{event}:{payload}"));
+                // Stop on the terminal status, exactly as the login worker does.
+                if event == "auth.cli_login.status" {
+                    StreamStep::Stop
+                } else {
+                    StreamStep::Continue
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(response.into_inner()["session_id"], "s1");
+        let events = events.into_inner();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events[0].starts_with("auth.cli_login.output:"), "{events:?}");
+        assert!(events[1].starts_with("auth.cli_login.status:"), "{events:?}");
+    }
+
+    #[test]
+    fn a_rejected_request_is_an_error_even_though_the_call_streams() {
+        // "CLI not installed on this host" arrives as an `ok: false` res —
+        // it must reach the caller as `Rejected`, not as an empty stream
+        // that eventually times out.
+        let url = start_mock_ws_server(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":true}"#.into())).await;
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"call","ok":false,"error":"kimi CLI not installed on this host"}"#.into())).await;
+        });
+
+        let result = call_then_stream_events_at(
+            &url,
+            "jwt-abc",
+            "auth.cli_login.start",
+            serde_json::json!({"runtime": "kimi"}),
+            Duration::from_secs(5),
+            |_| StreamStep::Continue,
+            |_, _| StreamStep::Continue,
+        );
+        match result {
+            Err(RpcError::Rejected(text)) => assert!(text.contains("not installed"), "{text}"),
+            other => panic!("expected a Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_connection_that_dies_after_the_response_is_not_an_error() {
+        // The gateway's own 60s no-pong reaper, or any dropped socket: the
+        // request WAS answered, so the caller falls back to polling
+        // `auth.cli_login.status` rather than reporting a failure.
+        let url = start_mock_ws_server(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":true}"#.into())).await;
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"call","ok":true,"payload":{"session_id":"s1"}}"#.into())).await;
+            drop(ws);
+        });
+
+        let seen = std::cell::Cell::new(false);
+        let result = call_then_stream_events_at(
+            &url,
+            "jwt-abc",
+            "auth.cli_login.start",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+            |_| {
+                seen.set(true);
+                StreamStep::Continue
+            },
+            |_, _| StreamStep::Continue,
+        );
+        assert_eq!(result, Ok(()));
+        assert!(seen.get(), "the response must still have been delivered");
+    }
+
+    #[test]
+    fn a_stream_that_never_answers_times_out_inside_its_budget() {
+        let url = start_mock_ws_server(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":true}"#.into())).await;
+            // …and then never answers the real request.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let result = call_then_stream_events_at(
+            &url,
+            "jwt-abc",
+            "auth.cli_login.start",
+            serde_json::json!({}),
+            Duration::from_millis(200),
+            |_| StreamStep::Continue,
+            |_, _| StreamStep::Continue,
+        );
+        assert_eq!(result, Err(RpcError::Timeout));
+        // Bounded: one idle tick past the budget at worst, nowhere near the
+        // server's own 5s sleep.
+        assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_stopping_response_callback_never_waits_for_events() {
+        let url = start_mock_ws_server(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":true}"#.into())).await;
+            let _ = ws.next().await;
+            // A response with NO session id — the worker's own "unusable,
+            // stop now" case.
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"call","ok":true,"payload":{}}"#.into())).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let result = call_then_stream_events_at(
+            &url,
+            "jwt-abc",
+            "auth.cli_login.start",
+            serde_json::json!({}),
+            Duration::from_secs(30),
+            |_| StreamStep::Stop,
+            |_, _| StreamStep::Continue,
+        );
+        assert_eq!(result, Ok(()));
+        assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_streamed_call_still_refuses_a_rejected_handshake() {
+        let url = start_mock_ws_server(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.send(Message::Text(r#"{"type":"res","id":"connect","ok":false,"error":"bad jwt"}"#.into())).await;
+        });
+        let result = call_then_stream_events_at(
+            &url,
+            "stale-jwt",
+            "auth.cli_login.start",
+            serde_json::json!({}),
+            Duration::from_secs(5),
+            |_| StreamStep::Continue,
+            |_, _| StreamStep::Continue,
+        );
+        assert_eq!(result, Err(RpcError::AuthRejected));
     }
 
     // ── ICON-3 (2026-08-23): the pre-auth path ───────────────────────────

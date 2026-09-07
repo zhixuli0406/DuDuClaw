@@ -5,6 +5,7 @@ import { api } from '@/lib/api';
 import { isImeComposing } from '@/lib/keyboard';
 import { QrCode } from '@/components/shared/QrCode';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, Button, Input } from '@/components/mds';
+import { SubscriptionRiskDisclosure } from '@/components/SubscriptionRiskDisclosure';
 
 interface Props {
   open: boolean;
@@ -12,7 +13,7 @@ interface Props {
   onSuccess?: () => void;
 }
 
-type Step = 'starting' | 'awaiting_code' | 'submitting' | 'succeeded' | 'error';
+type Step = 'disclosure' | 'starting' | 'awaiting_code' | 'submitting' | 'succeeded' | 'error';
 
 /** The closed set of machine-readable codes `handlers.rs::setup_token_error_frame`
  *  can return — kept in sync manually (small, stable surface; see
@@ -57,11 +58,15 @@ function messageOf(err: unknown): string | undefined {
  */
 export function SubscriptionSetupWizard({ open, onClose, onSuccess }: Props) {
   const intl = useIntl();
-  const [step, setStep] = useState<Step>('starting');
+  const [step, setStep] = useState<Step>('disclosure');
   const [authUrl, setAuthUrl] = useState<string | null>(null);
   const [code, setCode] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [accountId, setAccountId] = useState<string | null>(null);
+  // §1-1 risk disclosure (WP-A) — this wizard connects a Claude subscription
+  // (Pro/Max) via `setup-token`, so it is gated the same way `CliLoginModal`
+  // is: acknowledgment required before `startFlow` ever runs.
+  const [riskAck, setRiskAck] = useState(false);
   const sidRef = useRef<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -120,12 +125,16 @@ export function SubscriptionSetupWizard({ open, onClose, onSuccess }: Props) {
       });
   }, [describeError, stopPolling]);
 
+  // Every open starts at the disclosure step, never mid-flow — this component
+  // stays mounted across opens (`AccountsPage` toggles `open`, it doesn't
+  // remount), so state from a previous session must not leak into a new one.
   useEffect(() => {
     if (!open) return;
-    startFlow();
+    setStep('disclosure');
+    setRiskAck(false);
+    setErrorMsg(null);
     return () => stopPolling();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- startFlow only on open, not on every identity change
-  }, [open]);
+  }, [open, stopPolling]);
 
   const handleSubmit = useCallback(async () => {
     const sid = sidRef.current;
@@ -167,6 +176,20 @@ export function SubscriptionSetupWizard({ open, onClose, onSuccess }: Props) {
           <DialogTitle>{intl.formatMessage({ id: 'subscriptionSetup.title' })}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4">
+          {step === 'disclosure' && (
+            <>
+              <SubscriptionRiskDisclosure checked={riskAck} onCheckedChange={setRiskAck} />
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <Button variant="outline" onClick={() => void handleClose()}>
+                  {intl.formatMessage({ id: 'common.cancel' })}
+                </Button>
+                <Button variant="brand" disabled={!riskAck} onClick={startFlow}>
+                  {intl.formatMessage({ id: 'subscriptionRisk.continue' })}
+                </Button>
+              </div>
+            </>
+          )}
+
           {step === 'starting' && (
             <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -271,11 +294,13 @@ export function SubscriptionSetupWizard({ open, onClose, onSuccess }: Props) {
             </div>
           )}
 
-          <div className="flex items-center justify-end gap-2 pt-1">
-            <Button variant="outline" onClick={() => void handleClose()}>
-              {intl.formatMessage({ id: step === 'succeeded' ? 'common.done' : 'common.close' })}
-            </Button>
-          </div>
+          {step !== 'disclosure' && (
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <Button variant="outline" onClick={() => void handleClose()}>
+                {intl.formatMessage({ id: step === 'succeeded' ? 'common.done' : 'common.close' })}
+              </Button>
+            </div>
+          )}
         </div>
       </DialogContent>
     </Dialog>

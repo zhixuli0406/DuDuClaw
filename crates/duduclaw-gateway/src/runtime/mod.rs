@@ -7,6 +7,7 @@ pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod generic_cli;
 pub mod grok;
 pub mod openai_compat;
 
@@ -303,6 +304,16 @@ pub use duduclaw_core::types::RuntimeType;
 
 // ── Registry ────────────────────────────────────────────────────
 
+/// Catalog ids that have a hand-written runtime module in this directory.
+///
+/// Everything else in `runtime_catalog` is driven by [`generic_cli`]. Kept at
+/// module scope so `bespoke_ids_match_the_modules_that_exist` can prove the two
+/// stay in step: a new bespoke module that is not listed here would never be
+/// reached (the generic driver would shadow it), and a listed id with no module
+/// would silently drop that runtime from the registry entirely.
+pub(crate) const BESPOKE_RUNTIME_IDS: &[&str] =
+    &["claude", "codex", "gemini", "antigravity", "grok"];
+
 /// Registry of available runtimes, auto-detected at startup.
 pub struct RuntimeRegistry {
     runtimes: HashMap<RuntimeType, Box<dyn AgentRuntime>>,
@@ -345,6 +356,43 @@ impl RuntimeRegistry {
         if grok.is_available().await {
             info!("Grok CLI detected — registering GrokRuntime");
             runtimes.insert(RuntimeType::Grok, Box::new(grok));
+        }
+
+        // WP-B: every remaining catalog runtime is a print-mode CLI driven by
+        // the ONE generic implementation (`generic_cli.rs`) from its
+        // `runtime_catalog` entry — Qwen Code, Kimi Code, GitHub Copilot CLI,
+        // Kiro CLI, Cursor, Mistral Vibe, OpenCode today, and anything added to
+        // the catalog tomorrow without touching this function.
+        //
+        // The five above keep bespoke modules because each has real per-vendor
+        // wiring the generic driver has no place for (account rotation, MCP
+        // config injection, capability→sandbox-flag translation, PTY recovery).
+        // They are excluded by NAME rather than by `runtimes.contains_key`: a
+        // bespoke runtime whose own availability probe said "no" must stay
+        // absent so failover fires, not be quietly replaced by a generic driver
+        // that would hide the broken install.
+        //
+        // Registration is gated on the binary actually being present, exactly
+        // like the bespoke ones: a runtime that is configured but not installed
+        // must fail over, not spawn a missing program.
+        let user_home = std::path::PathBuf::from(duduclaw_core::platform::home_dir());
+        for spec in duduclaw_core::runtime_catalog::cli_specs() {
+            if BESPOKE_RUNTIME_IDS.contains(&spec.id) {
+                continue;
+            }
+            let Some(rt) = RuntimeType::from_id(spec.id) else {
+                continue;
+            };
+            if let Some(runtime) = generic_cli::GenericCliRuntime::detect(spec, &user_home) {
+                info!(
+                    runtime = spec.id,
+                    output = spec.headless.output.as_str(),
+                    verified = spec.verified,
+                    "{} detected — registering generic print-mode runtime",
+                    spec.display_name
+                );
+                runtimes.insert(rt, Box::new(runtime));
+            }
         }
 
         // OpenAI-compatible: always available if API key is configured
@@ -860,6 +908,56 @@ mod tests {
     #[test]
     fn test_runtime_type_default() {
         assert_eq!(RuntimeType::default(), RuntimeType::Claude);
+    }
+
+    // ── WP-B: catalog ↔ registry coverage ───────────────────────────────
+
+    /// Every catalog CLI must be *reachable*: either a bespoke module claims
+    /// it, or the generic print-mode driver can build a command line for it.
+    /// A runtime that is in neither set would be configurable and detectable
+    /// but never executable.
+    #[test]
+    fn every_catalog_cli_is_either_bespoke_or_generic_drivable() {
+        for spec in duduclaw_core::runtime_catalog::cli_specs() {
+            if BESPOKE_RUNTIME_IDS.contains(&spec.id) {
+                continue;
+            }
+            let args = generic_cli::build_args(spec, "PROMPT", "some-model");
+            assert!(
+                !args.is_empty(),
+                "`{}` is not bespoke and has no generic argv",
+                spec.id
+            );
+            assert!(
+                spec.headless.prompt_via_stdin()
+                    || args.iter().any(|a| a == "PROMPT"),
+                "`{}` neither takes the prompt as an argument nor on stdin",
+                spec.id
+            );
+            assert!(
+                RuntimeType::from_id(spec.id).is_some(),
+                "`{}` has no RuntimeType, so the registry could never key it",
+                spec.id
+            );
+        }
+    }
+
+    /// The bespoke list must name only runtimes that actually have a module
+    /// here — a stale entry would silently remove that runtime from the
+    /// registry (the generic loop skips it, and no bespoke module registers it).
+    #[test]
+    fn bespoke_ids_match_the_modules_that_exist() {
+        let mut expected: Vec<&str> = vec!["claude", "codex", "gemini", "antigravity", "grok"];
+        expected.sort_unstable();
+        let mut got: Vec<&str> = BESPOKE_RUNTIME_IDS.to_vec();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+        for id in BESPOKE_RUNTIME_IDS {
+            assert!(
+                duduclaw_core::runtime_catalog::spec_for(id).is_some(),
+                "bespoke id `{id}` is not in the catalog"
+            );
+        }
     }
 
     #[test]

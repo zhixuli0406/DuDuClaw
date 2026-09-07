@@ -84,6 +84,16 @@
 
 mod apps;
 mod audio;
+/// WP-fix-QEMU-a (2026-09-05) — a real, TTL-cached read of this machine's
+/// own battery (if it has one) for the menu bar's status group. Called
+/// directly from the render body (no background thread/poll feed the way
+/// `apps::feed::InstalledAppsFeed` needs for its own, much heavier scan),
+/// but the underlying sysfs walk itself only actually runs at most once
+/// every 30s regardless of how often the menu bar repaints in between —
+/// see its own header comment for the cache and the cost-model fix behind
+/// it (2026-09-05 review: the menu bar re-renders far more often than
+/// once per clock tick).
+mod battery;
 // WM-3 layer-shell migration (2026-08-23) — see this module's own header
 // comment for the whole design; `chrome::windows` (Linux-only) is what
 // `main()` calls into below instead of opening a single window directly.
@@ -514,6 +524,9 @@ pub struct ShellView {
     /// plain data with no gpui types) and why they're created once,
     /// unconditionally, at window-open time rather than lazily.
     pub(crate) oobe_account_fields: oobe::AccountFields,
+    /// The `RuntimeAuth` step's API-key field — same once-per-window shape
+    /// as `oobe_account_fields` just above.
+    pub(crate) oobe_runtime_fields: oobe::RuntimeAuthFields,
     /// The live-install wizard's OWN `Account` step's two real text-input
     /// entities — installer-settings-integration WP1 (2026-08-29,
     /// `commercial/docs/DESIGN-installer-settings-integration-2026-08.md`
@@ -595,6 +608,31 @@ impl Focusable for ShellView {
 }
 
 impl ShellView {
+    /// The ONE place every OOBE completion path lands — `handle_enter_key`'s
+    /// `Advance` arm, `oobe::render`'s 完成 / 略過 clicks and the Templates
+    /// step's own 略過. 2026-09-05 (QEMU walkthrough finding): the operator
+    /// name was adopted on only one of those four sites, so completing OOBE
+    /// with the mouse (what everyone actually does) left Home's greeting and
+    /// the lock screen nameless until the next shell start — the same drift
+    /// D2-b (2026-08-24) had already fixed once for `theme` by hand-copying
+    /// two lines around. One method makes the drift impossible to repeat.
+    /// Callers `save_state` FIRST; this reads the in-memory flow's live
+    /// selections at the moment it completes — the same source that was just
+    /// written to disk, so the two never disagree.
+    pub(crate) fn complete_oobe(&mut self, cx: &mut Context<Self>) {
+        let Some(flow) = self.oobe.take() else {
+            return;
+        };
+        self.theme = flow.state().selections.theme;
+        notify_comp_theme(self.theme);
+        if let Some(name) = oobe::boot_operator_name(flow.state()) {
+            self.operator_name = Some(name);
+        }
+        // 2026-09-05: a fresh install had no agents at all, so 交辦 had no
+        // one to hand a task to — see `oobe::seed`'s own module comment.
+        oobe::seed::spawn_seed_default_agent(self, flow.locale(), cx);
+    }
+
     /// Re-settles everything that has to follow a Launcher open/close
     /// transition, in ONE place so the four call sites (cmd-k toggle, Escape
     /// close, backdrop click, Home's composer/dock click) cannot drift apart.
@@ -816,27 +854,9 @@ impl ShellView {
                 flow.next_with_wired(wired_online);
                 oobe::save_state(flow.state());
                 if flow.completed() {
-                    // Carry the Theme step's pick (if any was made) onto
-                    // Home in this SAME process — see `ShellView.theme`'s
-                    // own doc comment. Reading `flow.state().selections.
-                    // theme` here (not `oobe::boot_theme` again) is
-                    // deliberate: `boot_theme` is specifically about the
-                    // PERSISTED file at boot, whereas this is reading the
-                    // in-memory flow's live selection at the exact moment
-                    // it transitions to completed — same source `save_
-                    // state` just wrote to disk two lines up, so the two
-                    // never disagree.
-                    self.theme = flow.state().selections.theme;
-                    // D2 (2026-08-23): the compositor draws the SERVER-SIDE
-                    // decorations around application windows (title bars,
-                    // borders, shadows, the Alt-Tab switcher). It has no way
-                    // to learn the operator's theme pick on its own, so the
-                    // shell — which is the half that persists it — tells it.
-                    // Fire-and-forget: comp not running (macOS dev loop, or
-                    // a shell started before the compositor) must never
-                    // block or fail OOBE completion.
-                    notify_comp_theme(self.theme);
-                    self.oobe = None;
+                    // Theme / operator name / comp notify / drop the flow —
+                    // see `ShellView::complete_oobe`'s own doc comment.
+                    self.complete_oobe(cx);
                 }
             }
             // `AccountCreate`/`Network`: trigger that step's own submit
@@ -1398,6 +1418,53 @@ impl ShellView {
         // entirely). OOBE still overwrites this with the flow's own palette
         // on the branch below, so its behavior is unchanged.
         cx.set_global(home_palette);
+        // D9-post-unlock-focus (2026-09-05): claim the pending post-unlock
+        // focus reclaim here, once, on whichever window is actually
+        // rendering Home right now — this fn's own `window` argument is the
+        // real, live `&mut Window` `LockScreenState::unlock()` itself never
+        // has (see `LockScreenState::focus_reclaim_pending`'s own doc
+        // comment for the full write-up). Without this, `Window.focus` keeps
+        // pointing at the lock screen's password field — a `FocusHandle` id
+        // no longer present in ANY rendered frame the instant Home replaces
+        // it below — so no field on THIS window (the composer's own
+        // click-to-open-Launcher path included, in `ChromeMode::
+        // LayerSurfaces` where that path deliberately leaves Home's own
+        // window focus untouched — see `settle_launcher_query`'s own doc
+        // comment) can ever become the genuinely focused element again until
+        // something calls `Window::focus` with a handle this frame's tree
+        // actually contains.
+        //
+        // Gated on "neither OOBE nor live-install owns the screen and the
+        // lock screen isn't up" even though the flag can only ever be raised
+        // by a real `unlock()` (mutually exclusive with both by construction
+        // — locking/unlocking never happens mid-OOBE or mid-live-install):
+        // cheap insurance against ever yanking focus away from either flow's
+        // own field onto the shared root instead.
+        //
+        // ALSO gated on `self.surface.overlay().is_none()` — review finding
+        // (2026-09-05): without this, correctness rested on the UNDOCUMENTED
+        // invariant that `lock_and_refresh` always closes any open overlay
+        // before a lock can even start, so no overlay could possibly be open
+        // the instant `unlock()` raises the flag. That invariant holds today,
+        // but nothing here enforced it, and a future change that unlocked
+        // without going through `lock_and_refresh` first — or a lock/unlock
+        // race — could let this reclaim silently yank focus away from a
+        // reopened Launcher/Notifications/ControlCenter window and back onto
+        // the shell root. Written as the LAST `&&` operand alongside
+        // `take_pending_focus_reclaim()` deliberately: `&&` short-circuits
+        // left-to-right, so when an overlay IS open, `take_pending_focus_
+        // reclaim()` is never even called and the flag stays pending — the
+        // very next Home render pass after the overlay closes (this same
+        // guard, re-evaluated) claims it and performs the focus move then,
+        // rather than the reclaim being lost outright.
+        if self.live_install.is_none()
+            && self.oobe.is_none()
+            && !self.lockscreen.is_locked()
+            && self.surface.overlay().is_none()
+            && self.lockscreen.take_pending_focus_reclaim()
+        {
+            window.focus(&self.focus_handle, cx);
+        }
         root = if let Some(flow) = &self.live_install {
             // Y20-P2 (2026-08-29): checked FIRST, ahead of `oobe` — a
             // live-image boot never reaches normal OOBE, the lockscreen, or
@@ -1409,7 +1476,7 @@ impl ShellView {
             // addition.
             root.child(live_install::render(flow, &self.live_install_account_fields, &self.live_install_wifi_fields, cx))
         } else if let Some(flow) = &self.oobe {
-            root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, &self.oobe_network_fields, cx))
+            root.child(oobe::render(flow, &self.oobe_ui, &self.oobe_account_fields, &self.oobe_network_fields, &self.oobe_runtime_fields, cx))
         } else if self.lockscreen.is_locked() {
             // Shell-S4-lock: same "takes over the root's ENTIRE child, no
             // app chrome underneath" shape OOBE establishes above — Home
@@ -1435,6 +1502,8 @@ impl ShellView {
                 &self.running_windows,
                 &self.installed_apps,
                 &self.overlay_ui.task_progress,
+                &self.overlay_ui.agents,
+                self.operator_name.as_deref(),
                 cx,
             ))
         } else {
@@ -1447,7 +1516,14 @@ impl ShellView {
             // the one this note points at); the call site said
             // `render_desktop`, which never existed. Corrected 2026-08-23
             // while wiring D4b — the crate did not compile until it was.
-            root.child(home::desktop_content(home_palette, cx))
+            root.child(home::desktop_content(
+                home_palette,
+                self.operator_name.as_deref(),
+                &self.overlay_ui.notifications,
+                &self.overlay_ui.task_progress,
+                &self.overlay_ui.agents,
+                cx,
+            ))
         };
         if self.diag {
             root = root
@@ -1767,6 +1843,7 @@ fn main() {
         // one's own signature in `oobe/widgets.rs`), so moving them to here,
         // before any window exists, changes nothing about what they do.
         let oobe_account_fields = oobe::AccountFields::new(cx);
+        let oobe_runtime_fields = oobe::RuntimeAuthFields::new(cx);
         // Installer-settings-integration WP1 (2026-08-29): the live-install
         // wizard's OWN `Account` step needs its own `AccountFields` instance
         // — see that field's own doc comment on `ShellView` for why this
@@ -1814,6 +1891,7 @@ fn main() {
             live_install: initial_live_install,
             oobe_ui: oobe::OobeUiState::default(),
             oobe_account_fields,
+            oobe_runtime_fields,
             live_install_account_fields,
             live_install_wifi_fields,
             oobe_network_fields,
@@ -1934,6 +2012,13 @@ fn main() {
         // none of that matters here).
         shared_state.update(cx, |_view, cx| {
             lockscreen::render::spawn_idle_watchdog(cx);
+            // WP-fix-QEMU-a (2026-09-05): same "started exactly once here,
+            // runs continuously from boot" shape as `spawn_idle_watchdog`
+            // just above — see `home::clock::spawn_menu_bar_clock_tick`'s
+            // own doc comment for why the menu bar's real clock has no
+            // cheaper "only tick while X" condition to self-re-arm on the
+            // way the lock screen's own clock does.
+            home::clock::spawn_menu_bar_clock_tick(cx);
         });
 
         // Debug-only boot override for headless smoke runs — this crate has

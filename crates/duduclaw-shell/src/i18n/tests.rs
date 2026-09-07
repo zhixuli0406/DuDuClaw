@@ -108,6 +108,43 @@ const ALL_KEYS: &[Key] = &[
     Key::RuntimeAuthAuthorized,
     Key::RuntimeAuthAuthorizeNow,
     Key::RuntimeAuthDeferLater,
+    // 2026-09-05: the seven real-credential-entry keys were added to `Key`
+    // (and to all three catalogs) without being listed here, so
+    // `every_key_has_a_non_empty_translation_in_all_three_locales` never
+    // covered them. Listed now, alongside WP-C's own additions below.
+    Key::RuntimeAuthKeyHint,
+    Key::RuntimeAuthSaveKey,
+    Key::RuntimeAuthSaving,
+    Key::RuntimeAuthKeyEmpty,
+    Key::RuntimeAuthKeyLooksWrong,
+    Key::RuntimeAuthUnreachable,
+    Key::RuntimeAuthProvidersHint,
+    Key::RuntimeAuthStatusUnset,
+    Key::RuntimeAuthStatusKeySaved,
+    Key::RuntimeAuthStatusLoggedIn,
+    Key::RuntimeAuthEnterKeyAction,
+    Key::RuntimeAuthLoginAction,
+    Key::RuntimeProviderNoteLoginOrKey,
+    Key::RuntimeProviderNoteKeyOnly,
+    Key::RuntimeAuthLoginUnavailableHere,
+    Key::RuntimeAuthKeyFor,
+    Key::RuntimeAuthKeyCollapse,
+    Key::RuntimeAuthRiskTitle,
+    Key::RuntimeAuthRiskBody,
+    Key::RuntimeAuthRiskAck,
+    Key::RuntimeAuthLoginStart,
+    Key::RuntimeAuthLoginStarting,
+    Key::RuntimeAuthLoginWaiting,
+    Key::RuntimeAuthLoginCodeLabel,
+    Key::RuntimeAuthLoginUrlLabel,
+    Key::RuntimeAuthLoginOpenBrowser,
+    Key::RuntimeAuthLoginCancel,
+    Key::RuntimeAuthLoginClose,
+    Key::RuntimeAuthLoginSucceeded,
+    Key::RuntimeAuthLoginErrUnavailable,
+    Key::RuntimeAuthLoginErrUnreachable,
+    Key::RuntimeAuthLoginErrRefused,
+    Key::RuntimeAuthLoginErrAbandoned,
     Key::PrivacyTitle,
     Key::PrivacySubtitle,
     Key::PrivacyUsageStatsLabel,
@@ -139,6 +176,7 @@ const ALL_KEYS: &[Key] = &[
     Key::FinishSummaryPrivacy,
     Key::FinishSummaryTemplates,
     Key::FinishRuntimeAuthorized,
+    Key::FinishRuntimeAuthorizedCount,
     Key::FinishRuntimeDeferred,
     Key::FinishRuntimeNotSet,
     Key::FinishNetworkNotConnected,
@@ -228,6 +266,16 @@ const ALL_KEYS: &[Key] = &[
     Key::VerifiedTierPartial,
     Key::VerifiedTierUnsupported,
     Key::VerifiedTierUnrated,
+    Key::HomeGreetingMorning,
+    Key::HomeGreetingAfternoon,
+    Key::HomeGreetingEvening,
+    Key::HomeGreetingMorningNamed,
+    Key::HomeGreetingAfternoonNamed,
+    Key::HomeGreetingEveningNamed,
+    Key::HomeTasksEmptyState,
+    Key::LiveInstallDiskExcludedMedium,
+    Key::LiveInstallDiskMediumUnknown,
+    Key::LiveInstallProgressPreparing,
 ];
 
 const ALL_LOCALES: [Locale; 3] = [Locale::ZhTw, Locale::En, Locale::JaJp];
@@ -239,7 +287,25 @@ fn all_keys_has_the_expected_count_and_no_duplicates() {
     // `ALL_KEYS` silently drifting out of sync with a newly added `Key`
     // variant (the compiler won't catch THAT half; only the per-locale
     // match arms are compiler-enforced).
-    // 204 as of D4a-7 (2026-08-31), which added `NetworkContinueBlockedNotice`
+    // 248 as of WP-C (2026-09-05, `docs/todo/TODO-ai-runtimes-2026-09.md`
+    // §3): 28 new keys for the `RuntimeAuth` step's provider list, its §1-1
+    // subscription-login risk disclosure and the login panel, plus the seven
+    // real-credential-entry keys that had been added to `Key` earlier the
+    // same day without ever being listed here (one of those seven,
+    // `RuntimeAuthKeyLabel`, stopped being rendered by the rewrite and was
+    // removed rather than left as a dead catalog entry).
+    // 214 as of Y20-P6 (2026-09-05), which added the three `LiveInstallDisk*`
+    // /`LiveInstallProgressPreparing` keys — a review finding on the live
+    // installer's disk-picker bug fix asked for its exclusion note,
+    // detection-failed warning, and progress "preparing" label to route
+    // through this catalog (previously hardcoded bilingual "zh · en"
+    // literals) like the sibling `LiveWifi*` step keys already do.
+    // 211 as of WP-fix-QEMU-a (2026-09-05), which added the six `HomeGreeting*`
+    // keys (the Home surface's time-of-day + real-name greeting, replacing
+    // the hardcoded `fake_data::GREETING = "晚上好，Louis"` QEMU-walkthrough
+    // defect) plus `HomeTasksEmptyState` (the goal-cards row's honest empty
+    // state, replacing the canned `fake_data::GOAL_CARDS`); 204 as of D4a-7
+    // (2026-08-31), which added `NetworkContinueBlockedNotice`
     // /`NetworkStatusCheckingNotice` for the wired-only-machine Continue
     // deadlock fix; 202 as of installer-settings-integration WP3
     // (2026-08-29), which added the eight `LiveWifi*` keys for the live
@@ -247,7 +313,7 @@ fn all_keys_has_the_expected_count_and_no_duplicates() {
     // the eleven `org.freedesktop.Notifications` panel keys
     // (`NotifAppSectionLabel` … `NotifAgeDays`); 183 before that, from D4a
     // §6's `NetworkPortalOpenButton`.
-    assert_eq!(ALL_KEYS.len(), 204);
+    assert_eq!(ALL_KEYS.len(), 248);
     let mut seen = std::collections::HashSet::new();
     for key in ALL_KEYS {
         assert!(seen.insert(key), "duplicate key in ALL_KEYS: {key:?}");

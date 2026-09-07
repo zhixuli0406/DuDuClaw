@@ -166,10 +166,21 @@ pub(crate) fn launch(app: &InstalledApp) {
 
 fn spawn_and_log(command: &mut std::process::Command, rendered: &str, app_id: &str) {
     match command.spawn() {
-        Ok(_child) => {
+        Ok(mut child) => {
             if crate::diag_enabled() {
                 eprintln!("[apps] launched '{app_id}' via {rendered}");
             }
+            // 2026-09-05: dropping the `Child` left every launched (or
+            // instantly-failed) process as a zombie under the shell — three
+            // `[flatpak] <defunct>` rows after three clicks in the QEMU
+            // walkthrough. Reap on a detached thread; a non-zero exit is the
+            // one trace a silently failing launch leaves, so log it always.
+            let app_id = app_id.to_string();
+            std::thread::spawn(move || match child.wait() {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!("[apps] '{app_id}' exited with {status}"),
+                Err(e) => eprintln!("[apps] waiting on '{app_id}' failed: {e}"),
+            });
         }
         Err(e) => {
             // Always logged, not DIAG-gated: unlike a poll that fails
@@ -332,18 +343,60 @@ pub(crate) fn probe_download_size(remote: &str, app_id: &str) -> Option<String> 
 /// reached through the confirmation gate: the human prompt flatpak would
 /// otherwise print has already been asked, on screen, with the app name,
 /// remote, size and destination shown (`overlay::install_gate`).
-pub(crate) fn install(remote: &str, app_id: &str) -> Result<(), String> {
+pub(crate) fn install(remote: &'static str, app_id: &str) -> Result<std::process::Child, String> {
+    let remote = pick_install_remote(remote, app_id);
     let Some(argv) = install_argv(remote, app_id) else {
         return Err(format!("refusing to run flatpak with remote={remote:?} app_id={app_id:?}"));
     };
-    match std::process::Command::new("flatpak").args(&argv).spawn() {
-        Ok(_child) => {
+    // stderr is captured so a failed install can tell the operator WHY
+    // (`overlay::launcher::dispatch_install` waits on the child and posts
+    // the last line as a card) instead of vanishing into the journal.
+    match std::process::Command::new("flatpak")
+        .args(&argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => {
             if crate::diag_enabled() {
                 eprintln!("[apps] install started: flatpak {}", argv.join(" "));
             }
-            Ok(())
+            Ok(child)
         }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The remote the shipped offline repo is registered under on DuDuClaw OS
+/// (`duduclaw-flatpak-setup.sh` in the OS layer): a `file://` mirror of a
+/// handful of Flathub apps baked into the image, so those install in
+/// seconds with zero network.
+pub(crate) const OFFLINE_REMOTE: &str = "flathub-offline";
+
+/// 2026-09-05 (QEMU walkthrough): the catalogue names `flathub` for every
+/// app, so the Launcher's 安裝 went to the network even for the apps whose
+/// bytes were already on disk. Prefer the offline mirror whenever it has
+/// the ref (`remote-info` succeeds); fall back to the catalogue's remote
+/// otherwise. Same `--installation` scoping as everything else here.
+pub(crate) fn pick_install_remote(preferred: &'static str, app_id: &str) -> &'static str {
+    if preferred == OFFLINE_REMOTE || !is_safe_cli_arg(app_id) {
+        return preferred;
+    }
+    let probe = std::process::Command::new("flatpak")
+        .args(["remote-info", &format!("--installation={FLATPAK_INSTALLATION}"), OFFLINE_REMOTE, app_id])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match probe {
+        Ok(status) if status.success() => {
+            if crate::diag_enabled() {
+                eprintln!("[apps] {app_id} is in the offline repo — installing from {OFFLINE_REMOTE}");
+            }
+            OFFLINE_REMOTE
+        }
+        _ => preferred,
     }
 }
 
@@ -542,7 +595,7 @@ mod tests {
         // install of a real app, so the args deliberately name a remote that
         // cannot exist rather than `flathub`.
         let result = install("duduclaw-nonexistent-remote-for-tests", "org.example.DoesNotExist");
-        if let Ok(()) = result {
+        if let Ok(_child) = result {
             // flatpak was present and forked; it will fail on its own and
             // this test has still proven the no-panic contract.
         }

@@ -46,7 +46,7 @@ use duduclaw_inference::InferenceEngine;
 use duduclaw_llm::providers::OpenAiCompatProvider;
 use duduclaw_llm::{
     ApiAuth, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ContentPart, LlmError,
-    NormalizedUsage, Role, StopReason, StreamEvent, SystemBlock,
+    NormalizedUsage, Role, StopReason, StreamEvent, SystemBlock, ToolDef,
 };
 
 /// Provider id reported by the adapter (telemetry / logs).
@@ -102,6 +102,15 @@ impl LocalChatProvider {
     /// Whether this provider can be driven by the tool loop.
     pub fn supports_tools(&self) -> bool {
         self.tools_capable
+    }
+
+    /// Base URL of the OpenAI-compatible endpoint this provider talks to
+    /// (`None` for the in-process engine path).
+    pub fn compat_base_url(&self) -> Option<&str> {
+        match &self.inner {
+            Inner::Compat(p) => Some(p.base_url()),
+            Inner::Engine(_) => None,
+        }
     }
 
     /// Model the local endpoint expects (request fallback).
@@ -227,6 +236,113 @@ impl ChatProvider for LocalChatProvider {
     }
 }
 
+/// Tokens kept free for the model's own output and tool-call round trips
+/// when fitting a request into a known context window.
+const LOCAL_CTX_RESERVE_TOKENS: u64 = 1024;
+/// Share of the remaining budget the tool definitions may take; the rest
+/// goes to the system prompt.
+const LOCAL_CTX_TOOL_SHARE: f64 = 0.45;
+/// Tools the goal loop's work message asks the agent to call by name; kept
+/// even when everything else has to go.
+const LOCAL_CTX_ALWAYS_KEEP_PREFIX: &str = "tasks_";
+const LOCAL_CTX_TRIM_MARKER: &str = "\n\n[…系統提示已依本地模型的 context 長度截短…]";
+
+/// Result of [`fit_request_to_context`].
+#[derive(Debug)]
+struct FittedRequest {
+    system_prompt: String,
+    tools: Vec<ToolDef>,
+    trimmed_tools: usize,
+    trimmed_system_chars: usize,
+}
+
+fn tool_tokens(t: &ToolDef) -> u64 {
+    crate::prompt_compression::estimate_tokens(&t.name)
+        + crate::prompt_compression::estimate_tokens(&t.description)
+        + crate::prompt_compression::estimate_tokens(&t.input_schema.to_string())
+        + 8
+}
+
+/// Pure: trim `tools` and `system_prompt` so that system + tools + `prompt`
+/// + [`LOCAL_CTX_RESERVE_TOKENS`] fit in `n_ctx` (estimated tokens, CJK-aware).
+/// Tools are kept in registry order; `tasks_*` tools are always kept
+/// (the goal-loop work message names them). The system prompt is cut at
+/// a char boundary with a visible marker rather than silently.
+fn fit_request_to_context(
+    system_prompt: &str,
+    prompt: &str,
+    tools: Vec<ToolDef>,
+    n_ctx: u64,
+) -> FittedRequest {
+    let est = crate::prompt_compression::estimate_tokens;
+    let budget = n_ctx.saturating_sub(LOCAL_CTX_RESERVE_TOKENS).saturating_sub(est(prompt));
+    let system_tokens = est(system_prompt);
+    let tools_total: u64 = tools.iter().map(tool_tokens).sum();
+    if system_tokens + tools_total <= budget {
+        return FittedRequest {
+            system_prompt: system_prompt.to_string(),
+            tools,
+            trimmed_tools: 0,
+            trimmed_system_chars: 0,
+        };
+    }
+
+    let tool_budget = (budget as f64 * LOCAL_CTX_TOOL_SHARE) as u64;
+    let original_tools = tools.len();
+    let mut kept: Vec<ToolDef> = Vec::new();
+    let mut used: u64 = 0;
+    for t in tools {
+        let cost = tool_tokens(&t);
+        let must_keep = t.name.starts_with(LOCAL_CTX_ALWAYS_KEEP_PREFIX);
+        if must_keep || used + cost <= tool_budget {
+            used += cost;
+            kept.push(t);
+        }
+    }
+    let trimmed_tools = original_tools - kept.len();
+
+    let system_budget = budget.saturating_sub(used);
+    let (system_prompt_out, trimmed_system_chars) = if system_tokens <= system_budget {
+        (system_prompt.to_string(), 0)
+    } else if system_budget <= est(LOCAL_CTX_TRIM_MARKER) {
+        (String::new(), system_prompt.chars().count())
+    } else {
+        // Keep the head: the identity / rules sections come first in every
+        // DuDuClaw system prompt, the long tail is memory and skill text.
+        let ratio = (system_budget - est(LOCAL_CTX_TRIM_MARKER)) as f64 / system_tokens as f64;
+        let total_chars = system_prompt.chars().count();
+        let keep_chars = ((total_chars as f64) * ratio).floor() as usize;
+        let head: String = system_prompt.chars().take(keep_chars).collect();
+        (format!("{}{}", head.trim_end(), LOCAL_CTX_TRIM_MARKER), total_chars - keep_chars)
+    };
+    FittedRequest {
+        system_prompt: system_prompt_out,
+        tools: kept,
+        trimmed_tools,
+        trimmed_system_chars,
+    }
+}
+
+/// Ask a llama.cpp-style server for its context window (`GET /props` →
+/// `default_generation_settings.n_ctx`). `None` for engines/servers that do
+/// not expose one — the request is then sent untrimmed, as before.
+async fn probe_context_window(provider: &LocalChatProvider) -> Option<u64> {
+    let base = provider.compat_base_url()?;
+    let root = base.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let v: serde_json::Value = client.get(format!("{root}/props")).send().await.ok()?.json().await.ok()?;
+    let n_ctx = v
+        .get("default_generation_settings")
+        .and_then(|d| d.get("n_ctx"))
+        .and_then(|n| n.as_u64())
+        .filter(|n| *n >= 512)?;
+    Some(n_ctx)
+}
+
+
 /// Run the MCP tool loop against the local OpenAI-compat endpoint.
 ///
 /// Returns `Some(text)` only on a successful, non-empty tool-loop answer.
@@ -257,6 +373,34 @@ pub(crate) async fn try_local_tool_loop(
         info!(agent = %agent_id, "local tool loop skipped — capability filter left no tools");
         return None;
     }
+
+    // ── Fit the request to the served model's context window ──
+    // A local model is small in every dimension the cloud path never has
+    // to think about: the DuDuClaw OS appliance serves 8192 tokens by
+    // default and a full agent system prompt plus the whole MCP tool
+    // registry came to ~33 k tokens on the first live run (llama-server
+    // answered `HTTP 400 … exceeds the available context size`). llama.cpp
+    // publishes the window on `/props`; when it is known, trim tools and
+    // system prompt to fit instead of failing every round.
+    let context_window = probe_context_window(&provider).await;
+    let (system_prompt, tools) = match context_window {
+        Some(n_ctx) => {
+            let fit = fit_request_to_context(system_prompt, prompt, tools, n_ctx);
+            if fit.trimmed_tools > 0 || fit.trimmed_system_chars > 0 {
+                warn!(
+                    agent = %agent_id,
+                    n_ctx,
+                    kept_tools = fit.tools.len(),
+                    dropped_tools = fit.trimmed_tools,
+                    dropped_system_chars = fit.trimmed_system_chars,
+                    "local tool loop: request trimmed to the served model's context window"
+                );
+            }
+            (fit.system_prompt, fit.tools)
+        }
+        None => (system_prompt.to_string(), tools),
+    };
+    let system_prompt = system_prompt.as_str();
 
     let model = model_id
         .filter(|m| !m.trim().is_empty())
@@ -335,6 +479,63 @@ pub(crate) async fn try_local_tool_loop(
 
 #[cfg(test)]
 mod tests {
+    use super::{fit_request_to_context, LOCAL_CTX_RESERVE_TOKENS, LOCAL_CTX_TRIM_MARKER};
+    use duduclaw_llm::ToolDef;
+
+    fn tool(name: &str, desc_len: usize) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            description: "x".repeat(desc_len),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[test]
+    fn fit_is_a_no_op_when_everything_already_fits() {
+        let tools = vec![tool("tasks_claim", 40), tool("read_file", 40)];
+        let fit = fit_request_to_context("be helpful", "hi", tools, 8192);
+        assert_eq!(fit.tools.len(), 2);
+        assert_eq!(fit.trimmed_tools, 0);
+        assert_eq!(fit.trimmed_system_chars, 0);
+        assert_eq!(fit.system_prompt, "be helpful");
+    }
+
+    #[test]
+    fn fit_drops_tools_in_order_but_always_keeps_tasks_tools() {
+        // ~1000 tokens per tool × 20 tools ≫ an 8192 window.
+        let mut tools: Vec<ToolDef> = (0..18).map(|i| tool(&format!("tool_{i:02}"), 4000)).collect();
+        tools.push(tool("tasks_claim", 4000));
+        tools.push(tool("tasks_complete", 4000));
+        let fit = fit_request_to_context("sys", "prompt", tools, 8192);
+        assert!(fit.trimmed_tools > 0);
+        let names: Vec<&str> = fit.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"tasks_claim"), "{names:?}");
+        assert!(names.contains(&"tasks_complete"), "{names:?}");
+        // Earlier tools are preferred over later ones.
+        let first_dropped = (0..18).find(|i| !names.contains(&format!("tool_{i:02}").as_str())).unwrap();
+        assert!((first_dropped..18).all(|i| !names.contains(&format!("tool_{i:02}").as_str())), "{names:?}");
+    }
+
+    #[test]
+    fn fit_truncates_the_system_prompt_with_a_visible_marker() {
+        // 40 000 ASCII chars ≈ 10 000 tokens against a 4096 window.
+        let system = "a".repeat(40_000);
+        let fit = fit_request_to_context(&system, "prompt", vec![tool("tasks_claim", 40)], 4096);
+        assert!(fit.trimmed_system_chars > 0);
+        assert!(fit.system_prompt.ends_with(LOCAL_CTX_TRIM_MARKER));
+        let kept = super::super::prompt_compression::estimate_tokens(&fit.system_prompt);
+        assert!(kept + LOCAL_CTX_RESERVE_TOKENS < 4096, "kept {kept} tokens");
+    }
+
+    #[test]
+    fn fit_never_leaves_the_prompt_itself_without_room() {
+        // The user prompt alone eats most of the window: tools and system go.
+        let prompt = "p".repeat(20_000); // ≈ 5000 tokens
+        let fit = fit_request_to_context("system text here", &prompt, vec![tool("read_file", 400)], 6000);
+        assert_eq!(fit.tools.len(), 0);
+        assert!(fit.system_prompt.is_empty() || fit.system_prompt.ends_with(LOCAL_CTX_TRIM_MARKER));
+    }
+
     use super::*;
 
     // ── tools_capability decision (pure, table-driven) ─────────────────

@@ -10,6 +10,7 @@ import {
   type MarketModel,
   type MarketQuant,
 } from '@/lib/api';
+import { BuiltInLocalModel } from '@/components/localmodels/BuiltInLocalModel';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
@@ -187,6 +188,12 @@ export function LocalModelsPage() {
         </div>
       </div>
 
+      {/* WP-D: the device's own local model engine — verified list, one-click
+          download, one click to make a downloaded model the live one. Renders
+          nothing on a host without that engine, leaving the open-ended
+          Hugging Face marketplace below as the only path. */}
+      <BuiltInLocalModel />
+
       {/* Hardware banner — the fit lights below are computed against this. */}
       {hardware && (
         <Card data-size="sm">
@@ -209,6 +216,10 @@ export function LocalModelsPage() {
           </CardContent>
         </Card>
       )}
+
+      <h2 className="text-sm font-medium text-foreground">
+        {intl.formatMessage({ id: 'localmodels.marketplace.title' })}
+      </h2>
 
       <div className="overflow-x-auto">
         <Segmented

@@ -250,117 +250,116 @@ fn redact_for_log(s: &str) -> String {
 }
 
 /// Login spec for a runtime, or `None` for runtimes with no interactive login
-/// (OpenAI-compat is API-key only).
+/// (OpenAI-compat is API-key only; Qwen Code and Mistral Vibe are API-key only
+/// too — their sign-in lives inside an interactive TUI dialog that cannot be
+/// driven headlessly, so this returns `None` rather than inventing a
+/// subcommand).
+///
+/// WP-B: the *structural* half of this spec — which argv starts the login,
+/// whether the flow is remote-safe, which credential file proves success, and
+/// the zh-TW/en/ja hint — now comes from
+/// [`duduclaw_core::runtime_catalog`]. Only the success/failure MARKERS stay
+/// here: they are scraped-TUI heuristics tuned against live binaries, not
+/// facts about the runtime, and they belong next to the scraper that uses them.
 pub fn spec_for(runtime: RuntimeType) -> Option<CliAuthSpec> {
+    let spec = runtime.spec();
+    let login_args = spec.auth.login.args();
+    if login_args.is_empty() {
+        // `LoginMethod::None` — nothing to drive.
+        return None;
+    }
+    let (success_markers, failure_markers) = auth_markers(runtime);
+    Some(CliAuthSpec {
+        runtime,
+        login_args: v(login_args),
+        success_markers,
+        failure_markers,
+        remote_safe: spec.auth.login.remote_safe(),
+        hint: spec
+            .auth
+            .login_hint
+            .map(|h| h.zh_tw)
+            .unwrap_or("依畫面提示完成登入。"),
+        // Most authoritative credential path; `None` ⇒ marker-only detection.
+        success_file: spec.auth.credential_paths.first().copied(),
+    })
+}
+
+/// Success / failure substrings for one CLI's login TUI.
+///
+/// Best-effort and version-sensitive by nature (see the module doc) — the
+/// deterministic signal is the `success_file` watcher, and these only shorten
+/// the wait. Every list is lowercased and whitespace-stripped before matching
+/// (see `normalize_for_markers`), so multi-word markers survive a TUI that
+/// positions words with cursor escapes.
+fn auth_markers(runtime: RuntimeType) -> (Vec<String>, Vec<String>) {
     match runtime {
-        RuntimeType::Claude => Some(CliAuthSpec {
-            runtime,
-            login_args: v(&["setup-token"]),
-            // Broad, case-insensitive (tail is lowercased): `claude setup-token`
-            // confirms with phrasings like "Success!", "Token has been saved",
-            // "credentials saved", "you can now use" — narrow markers like
-            // "successfully" / "token saved" miss those and leave the dashboard
-            // spinning forever after a valid paste-back.
-            success_markers: v(&["success", "authenticated", "logged in", "saved", "you can now"]),
-            failure_markers: v(&["authentication failed", "login failed", "invalid code", "access denied", "token expired"]),
-            // `claude setup-token` is the headless long-lived-token flow (paste-back).
-            remote_safe: true,
-            hint: "在開啟的網址完成授權後，把驗證碼貼回下方並按 Enter。",
-            // Claude Code writes the OAuth token here on success (Linux headless).
-            // Watching it is the reliable success signal — the TUI's success text
-            // is escape-laden and version-dependent, and may not print at all.
-            success_file: Some(".claude/.credentials.json"),
-        }),
-        RuntimeType::Codex => Some(CliAuthSpec {
-            runtime,
-            login_args: v(&["login"]),
-            success_markers: v(&["successfully", "logged in", "authenticated"]),
-            failure_markers: v(&["login failed", "authentication failed", "invalid", "access denied"]),
-            // codex login uses a localhost callback.
-            remote_safe: false,
-            hint: "於同機瀏覽器完成 OpenAI 登入（localhost 回呼）。遠端請改用 API key。",
-            success_file: Some(".codex/auth.json"),
-        }),
-        RuntimeType::Gemini => Some(CliAuthSpec {
-            runtime,
-            login_args: v(&["auth", "login"]),
-            success_markers: v(&["successfully", "logged in", "authenticated", "credentials saved"]),
-            failure_markers: v(&["login failed", "authentication failed", "invalid"]),
-            remote_safe: false,
-            hint: "於同機瀏覽器完成 Google 登入（localhost 回呼）。",
-            success_file: Some(".gemini/oauth_creds.json"),
-        }),
-        RuntimeType::Antigravity => Some(CliAuthSpec {
-            runtime,
-            login_args: v(&["login"]),
-            success_markers: v(&["successfully", "authenticated", "auth-success", "signed in"]),
-            failure_markers: v(&["login failed", "authentication failed", "invalid"]),
-            // agy uses an oauth-callback (antigravity.google/oauth-callback).
-            remote_safe: false,
-            hint: "於同機瀏覽器完成 Antigravity 登入。遠端請改用 ANTIGRAVITY_API_KEY。",
-            success_file: None,
-        }),
-        // R4 phase 2 (v1.41): SuperGrok device-code login, verified live against
-        // grok 0.2.111 (`grok login --device-code`; `--device-auth` is the same
-        // flag, `--device-code` is documented as its alias in `grok login --help`).
-        //
-        // Confirmed by a sandboxed-HOME live run (never against the real
-        // account — this machine already has a real `~/.grok/auth.json` and was
-        // never touched): stderr prints
-        //   "To sign in, open this URL in your browser:\n\n  <url>\n\n
-        //    Confirm this code in your browser:\n\n  <code>\n\n
-        //    ...\nWaiting for authorization..."
-        // then polls `/oauth2/token` in the background — no paste-back needed,
-        // unlike `claude setup-token`.
-        RuntimeType::Grok => Some(CliAuthSpec {
-            runtime,
-            login_args: v(&["login", "--device-code"]),
-            // The completed-run success wording could not be captured live
-            // (doing so would require completing a real device-code approval
-            // against this machine's live SuperGrok account — not attempted).
-            // Extracted instead via `strings` on the grok 0.2.111 binary:
-            // `xai_grok_shell::auth::flow` shares one "Signed in as <email>"
-            // confirmation across every login method (browser / device-code /
-            // OIDC); the device-code path is internally tagged
-            // `GROK_LOGIN_DEVICE_FLOW`. Best-effort per the module doc — the
-            // deterministic `success_file` watcher below is the primary signal.
-            success_markers: v(&["signed in as"]),
-            // From `xai_grok_shell::auth::device_code` (same `strings` pass):
-            // the ways a device-code flow terminates without success —
-            // "Device code expired. Run `grok login --device-auth` again.",
-            // "device auth authorization denied" / "Authorization denied. The
-            // user rejected the request.", "device auth token exchange failed".
-            failure_markers: v(&[
+        // Broad, case-insensitive: `claude setup-token` confirms with phrasings
+        // like "Success!", "Token has been saved", "credentials saved", "you can
+        // now use" — narrow markers like "successfully" / "token saved" miss
+        // those and leave the dashboard spinning forever after a valid
+        // paste-back.
+        RuntimeType::Claude => (
+            v(&["success", "authenticated", "logged in", "saved", "you can now"]),
+            v(&[
+                "authentication failed",
+                "login failed",
+                "invalid code",
+                "access denied",
+                "token expired",
+            ]),
+        ),
+        // R4 phase 2 (v1.41): verified live against grok 0.2.111. The completed-run
+        // success wording could not be captured live (that would require
+        // completing a real device-code approval against this machine's live
+        // SuperGrok account — not attempted). Extracted instead via `strings` on
+        // the binary: `xai_grok_shell::auth::flow` shares one "Signed in as
+        // <email>" confirmation across every login method; the failure phrases
+        // come from `xai_grok_shell::auth::device_code` in the same pass.
+        RuntimeType::Grok => (
+            v(&["signed in as"]),
+            v(&[
                 "device code expired",
                 "authorization denied",
                 "the user rejected the request",
                 "token exchange failed",
             ]),
-            // Device-code / paste-back-free flow: the user approves in their
-            // own browser using the printed URL + code; the CLI polls in the
-            // background. Same remote-safe class as `claude setup-token`.
-            remote_safe: true,
-            hint: "開啟下方網址，在瀏覽器輸入驗證碼完成授權即可——CLI 會自動偵測完成，不需要在這裡貼回代碼。",
-            // `grok login` persists to `~/.grok/auth.json` on success (verified:
-            // this file exists — mode 0600 — on this already-logged-in
-            // machine). Same deterministic watcher pattern as Codex/Gemini,
-            // independent of the marker strings above.
-            success_file: Some(".grok/auth.json"),
-        }),
-        RuntimeType::OpenAiCompat => None,
+        ),
+        // Everything else: the conventional CLI login vocabulary. Deliberately
+        // shared rather than copy-pasted per vendor — for the 2026-09 additions
+        // (Kimi / Copilot / Kiro / Cursor / OpenCode) no live transcript has been
+        // captured, so a per-vendor list would be invented precision. The
+        // `success_file` watcher from the catalog is the real signal for all of
+        // them; these markers only make the UI stop spinning sooner.
+        _ => (
+            v(&[
+                "success",
+                "successfully",
+                "authenticated",
+                "logged in",
+                "signed in",
+                "credentials saved",
+            ]),
+            v(&[
+                "login failed",
+                "authentication failed",
+                "authorization denied",
+                "access denied",
+                "invalid",
+                "expired",
+                "timed out",
+            ]),
+        ),
     }
 }
 
 /// Resolve the login program path for a runtime (`None` ⇒ CLI not installed).
+///
+/// WP-B: one catalog-driven probe (`which_runtime`) instead of a per-runtime
+/// `which_*` match. `openai_compat` has no binary, so it resolves to `None`
+/// structurally rather than by a special case.
 pub fn resolve_program(runtime: RuntimeType) -> Option<String> {
-    match runtime {
-        RuntimeType::Claude => duduclaw_core::which_claude(),
-        RuntimeType::Codex => duduclaw_core::which_codex(),
-        RuntimeType::Gemini => duduclaw_core::which_gemini(),
-        RuntimeType::Antigravity => duduclaw_core::which_agy(),
-        RuntimeType::Grok => duduclaw_core::which_grok(),
-        RuntimeType::OpenAiCompat => None,
-    }
+    duduclaw_core::which_runtime(runtime.as_str())
 }
 
 /// Snapshot of one CLI's OWN credential store, for the dashboard accounts
@@ -386,8 +385,16 @@ pub struct CliCredentialStatus {
 /// purpose: its login already surfaces as a rotator account (keychain /
 /// setup-token). Runtimes without a `success_file` (antigravity) are skipped.
 pub fn cli_credential_statuses() -> Vec<CliCredentialStatus> {
-    [RuntimeType::Codex, RuntimeType::Gemini, RuntimeType::Grok]
-        .into_iter()
+    // WP-B: derived from the catalog rather than a hand-written trio, so a new
+    // runtime's login shows up on the 帳號 page the moment its entry lands —
+    // the exact failure mode this list had before ("grok cli oAuth 不會出現在
+    // 帳號輪替卡片" was a missing row here). Claude stays excluded on purpose;
+    // runtimes without a credential path (antigravity) are skipped by the
+    // `?` below.
+    RuntimeType::ALL
+        .iter()
+        .copied()
+        .filter(|rt| *rt != RuntimeType::Claude)
         .filter_map(|rt| {
             let rel = spec_for(rt)?.success_file?;
             let path = home_join(rel);
@@ -558,6 +565,11 @@ impl AuthSession {
         // user can't see (esp. headless / remote). `BROWSER=echo` is honoured by
         // most CLIs' "open in browser" helpers.
         cmd.env("BROWSER", "echo");
+        // Cursor's CLI documents its own opt-out (`NO_OPEN_BROWSER=1` makes
+        // `cursor-agent login` print the URL instead of launching a browser).
+        // Harmless everywhere else — an unrecognised env var is ignored — so it
+        // is set unconditionally rather than per-runtime.
+        cmd.env("NO_OPEN_BROWSER", "1");
 
         let child = pair
             .slave
@@ -933,15 +945,90 @@ mod tests {
     fn cli_credential_statuses_cover_store_persisting_runtimes() {
         let statuses = cli_credential_statuses();
         let runtimes: Vec<RuntimeType> = statuses.iter().map(|s| s.runtime).collect();
+        // WP-B: derived from the catalog — every non-Claude runtime that HAS a
+        // login flow and a credential file shows up, in catalog order. Pinned
+        // by name so a runtime silently losing its credential card (the
+        // original "grok oAuth 不會出現在帳號卡片" bug) fails the build.
         assert_eq!(
             runtimes,
-            vec![RuntimeType::Codex, RuntimeType::Gemini, RuntimeType::Grok]
+            vec![
+                RuntimeType::Codex,
+                RuntimeType::Gemini,
+                RuntimeType::Grok,
+                RuntimeType::Kimi,
+                RuntimeType::Copilot,
+                RuntimeType::Kiro,
+                RuntimeType::Cursor,
+                RuntimeType::OpenCode,
+            ]
         );
+        // Excluded, each for a structural reason:
+        //   claude       — already surfaces as a rotator account
+        //   antigravity  — no documented single credential file
+        //   qwen / vibe  — API-key only, no login flow to report on
+        //   openai_compat— not a CLI
+        for excluded in [
+            RuntimeType::Claude,
+            RuntimeType::Antigravity,
+            RuntimeType::Qwen,
+            RuntimeType::Vibe,
+            RuntimeType::OpenAiCompat,
+        ] {
+            assert!(!runtimes.contains(&excluded), "{excluded:?} must be excluded");
+        }
         for s in &statuses {
             assert!(s.store.starts_with("~/."), "display path: {}", s.store);
             if !s.present {
                 assert!(s.modified_epoch.is_none(), "mtime without file: {:?}", s);
             }
+        }
+    }
+
+    /// Every runtime the OOBE shell / dashboard can start a login for must
+    /// resolve to a spec — `auth.cli_login.start` refuses otherwise, and a
+    /// runtime that advertises a login method but has no spec would be an
+    /// un-loginable dead end in the UI.
+    #[test]
+    fn every_runtime_with_a_login_method_has_an_auth_spec() {
+        for rt in RuntimeType::ALL {
+            let has_login = !rt.spec().auth.login.args().is_empty();
+            assert_eq!(
+                spec_for(*rt).is_some(),
+                has_login,
+                "{rt:?}: catalog login method and cli_auth spec must agree"
+            );
+            if let Some(spec) = spec_for(*rt) {
+                assert!(!spec.login_args.is_empty(), "{rt:?} login args");
+                assert!(!spec.success_markers.is_empty(), "{rt:?} success markers");
+                assert!(!spec.failure_markers.is_empty(), "{rt:?} failure markers");
+                assert!(!spec.hint.is_empty(), "{rt:?} hint");
+                // Device-code and paste-back flows are remote-safe;
+                // localhost-callback ones are not. The dashboard warns on the
+                // latter before starting, so this must reflect the real flow.
+                let is_browser = matches!(
+                    rt.spec().auth.login,
+                    duduclaw_core::runtime_catalog::LoginMethod::BrowserOauth { .. }
+                );
+                assert_eq!(spec.remote_safe, !is_browser, "{rt:?} remote_safe");
+            }
+        }
+        // The runtimes the WP-C shell offers a login button for.
+        for rt in [
+            RuntimeType::Kimi,
+            RuntimeType::Copilot,
+            RuntimeType::Kiro,
+            RuntimeType::Cursor,
+            RuntimeType::OpenCode,
+        ] {
+            assert!(spec_for(rt).is_some(), "{rt:?} must be loginable");
+        }
+        // API-key-only runtimes must NOT pretend to have a login.
+        for rt in [RuntimeType::Qwen, RuntimeType::Vibe, RuntimeType::OpenAiCompat] {
+            assert!(spec_for(rt).is_none(), "{rt:?} is API-key only");
+            assert!(
+                rt.spec().auth.api_key_env.is_some() || rt == RuntimeType::OpenAiCompat,
+                "{rt:?} must at least name its API key variable"
+            );
         }
     }
 

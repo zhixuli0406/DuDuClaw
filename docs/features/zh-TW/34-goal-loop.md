@@ -54,6 +54,7 @@ driver enqueue ─▶ dispatcher ─▶ agent works ─▶ goal task → review
 | 停滯偵測 | 連續兩輪駁回回饋的 **gap 指紋**相同(從回饋抽取 `path:line` 引用與反引號關鍵詞正規化而成,不是逐字比對,換句話說的同一個 gap 也算;抽不到任何引用/關鍵詞才退回逐字比對) | 提前 `needs_human` |
 | 提前收工偵測 | 九條 zh+en 正則比對 agent 最後一段非空文字(如自簽 `VERDICT:`、「請稍後再來查看」、「請你審核一下」) | 記遙測與 activity 事件,提示帶進下一輪判官/評估器輸入,但不會自己駁回或卡住任務 |
 | In-flight 去重 | 已派工但未認領的任務在停滯逾時(600 s)前不重新排入 | 重新派工 |
+| 派工失敗（工作訊息根本沒送到 runtime：CLI 缺、本地引擎未就緒、憑證被拒） | 下一個 tick 立即釋放名額與 edition lease；退避 60 → 120 → 240 秒；連續 3 次 | `needs_human`（`infra`），錯誤文字寫進任務時間軸 |
 | 跨程序斷路器(`dispatch_guard`) | 60 s 滑動視窗內 20 次派工 | 冷卻拒絕 |
 | 委派 hop 深度 | 5 | 拒絕派工 |
 | gateway 重啟時的復活行為(`resume_on_restart`) | `pause`(**預設**):開機把所有 in-flight `goal_mode` 任務轉 `needs_human`(原因 `gateway_restart`) | `auto` 時重啟後 in-flight 任務照常接續(這項設定出現前的唯一行為);可在 `config.toml` 或儀表板「設定→自動化」切換(`system.update_config` 只收 `"auto"`/`"pause"`) |

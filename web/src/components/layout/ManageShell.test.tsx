@@ -195,6 +195,12 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
       // 本地模型市集 rides directly after 推理設定 — same mental bucket
       // (local model runtime), install surface next to its settings.
       en['manage.localModels'],
+      // 微調與後訓練 (WP-E) follows 本地模型 for the same reason 本地模型
+      // follows 推理設定: it is the surface that PRODUCES what the row above
+      // lists — a finished LoRA/GGUF is imported into that same models
+      // directory. Curation happens here; training happens on a GPU host
+      // elsewhere (the appliance's iGPU cannot train).
+      en['manage.finetune'],
       en['manage.migrate'],
       // catch-all last.
       en['manage.system'],

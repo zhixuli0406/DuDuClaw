@@ -69,7 +69,8 @@ impl LanguageChoice {
 /// only reached `Skipped` (the step was a placeholder); round 2 adds the
 /// two real outcomes the task brief asks for: `Express` (the "快速開始"
 /// one-click card) and `Custom` (one of the fake板模 cards,
-/// `fake_data::FAKE_TEMPLATES`).
+/// the removed `fake_data::FAKE_TEMPLATES` table; the OOBE step now shows
+    /// the honest Pro-locked hint instead of pretend cards).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TemplateChoice {
@@ -162,6 +163,33 @@ impl PrivacyToggle {
     }
 }
 
+/// How one provider on the `RuntimeAuth` step ended up authorized — WP-C
+/// (2026-09-05). Two outcomes, deliberately distinguished on the persisted
+/// side rather than collapsed to a bool: the summary and the row badge say
+/// different things ("已存金鑰" vs "已登入"), and a later round that has to
+/// re-validate credentials needs to know which kind it is looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeCredentialKind {
+    /// An API key typed into the step and stored through `accounts.add`.
+    ApiKey,
+    /// A CLI login the gateway drove to a `succeeded` terminal status.
+    Login,
+}
+
+/// One row's settled outcome on the `RuntimeAuth` step.
+///
+/// `provider` is a `String`, not the `&'static str` the in-memory catalog
+/// (`oobe::runtime_providers::PROVIDERS`) uses, because this value is
+/// SERIALIZED: a state file written by a build that knew a provider this
+/// build does not must still load (the id simply won't resolve to a row, and
+/// the count below still reports it honestly rather than dropping it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeProviderOutcome {
+    pub provider: String,
+    pub kind: RuntimeCredentialKind,
+}
+
 /// Everything the operator has chosen so far — the part of `OobeState` the
 /// task brief means by "已完成步驟的選擇（語言/是否跳過等）".
 ///
@@ -204,6 +232,22 @@ pub struct OobeSelections {
     /// was never reached yet (or was reached but neither button was
     /// clicked before the operator backed out) honestly reports neither.
     pub runtime_authorized: bool,
+    /// WP-C (2026-09-05): which providers the `RuntimeAuth` step actually
+    /// authorized, and how. `runtime_authorized` above stays the flow-level
+    /// "at least one credential reached the gateway" flag (every existing
+    /// reader — the Finish summary's own three-way status, the state-machine
+    /// tests — keeps working unchanged); this is the per-provider detail the
+    /// summary's 「已授權 N 家」 line and each row's badge are derived from.
+    ///
+    /// `#[serde(default)]` is spelled out here even though this struct
+    /// already carries it at the STRUCT level (see the struct's own doc
+    /// comment): an on-disk state file written by ANY build before this
+    /// round has no `runtime_providers` key at all, and that absence must
+    /// default to an empty list rather than fail the whole deserialize and
+    /// throw the operator back to step 0. Belt and braces, matching the
+    /// forward-compat contract the rest of this struct documents.
+    #[serde(default)]
+    pub runtime_providers: Vec<RuntimeProviderOutcome>,
     /// The `Privacy` step's four independent opt-IN toggles — §A consensus
     /// #4 ("隱私/遙測獨立屏、預設全關", the strongest consensus in the whole
     /// survey, "5/8，無反例") is why every one of these defaults `false`

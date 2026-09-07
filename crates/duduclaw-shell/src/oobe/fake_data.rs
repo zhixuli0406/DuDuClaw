@@ -12,7 +12,7 @@
 // oversight — this is DATA standing in for real-world entity names (a Wi-Fi
 // network's own SSID, an example account name), not screen chrome, the same
 // category the task brief's own item 4 carves out for Home/overlay. Only
-// `FAKE_TEMPLATES.{title,desc}` is a genuinely arguable case (an invented
+// (Historical) `FAKE_TEMPLATES.{title,desc}` was a genuinely arguable case (an invented
 // industry template's display name IS UI copy, not a proper noun) — left
 // untranslated this round to avoid turning `title`/`desc` into effectively
 // dead fields (an id-keyed i18n lookup would stop reading them at all), not
@@ -62,17 +62,7 @@ pub(super) const FAKE_ACCOUNT_PASSWORD_MASK: &str = "••••••••";
 /// 可單選）". `id` is the STABLE key persisted into `TemplateChoice::Custom`
 /// (see that variant's own doc comment in `oobe/mod.rs`) — `title`/`desc`
 /// are display-only and free to reword without touching persisted state.
-pub(super) struct FakeTemplate {
-    pub(super) id: &'static str,
-    pub(super) title: &'static str,
-    pub(super) desc: &'static str,
-}
 
-pub(super) const FAKE_TEMPLATES: &[FakeTemplate] = &[
-    FakeTemplate { id: "retail", title: "零售門市", desc: "客服應答、庫存提醒、促銷排程" },
-    FakeTemplate { id: "clinic", title: "診所助理", desc: "預約提醒、初診問卷、回診追蹤" },
-    FakeTemplate { id: "logistics", title: "物流倉儲", desc: "到貨通知、異常回報、司機調度" },
-];
 
 #[cfg(test)]
 mod tests {
@@ -99,27 +89,5 @@ mod tests {
         ssids.sort_unstable();
         ssids.dedup();
         assert_eq!(ssids.len(), FAKE_WIFI_NETWORKS.len());
-    }
-
-    #[test]
-    fn fake_templates_has_three_to_four_entries() {
-        assert!((3..=4).contains(&FAKE_TEMPLATES.len()), "task brief: \"3-4 個假板模卡\"");
-    }
-
-    #[test]
-    fn fake_template_fields_are_not_empty() {
-        for tpl in FAKE_TEMPLATES {
-            assert!(!tpl.id.is_empty());
-            assert!(!tpl.title.is_empty());
-            assert!(!tpl.desc.is_empty());
-        }
-    }
-
-    #[test]
-    fn fake_template_ids_are_unique() {
-        let mut ids: Vec<&str> = FAKE_TEMPLATES.iter().map(|t| t.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), FAKE_TEMPLATES.len());
     }
 }

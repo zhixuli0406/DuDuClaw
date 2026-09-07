@@ -223,6 +223,13 @@ pub(crate) enum NetError {
     /// for the full mapping). Portable as of this round: `gateway.rs`
     /// constructs this on every target, not just Linux.
     Unavailable(String),
+    /// The gateway's first-run network API refused us because first-run
+    /// setup has already completed on this machine (HTTP 403 with
+    /// `code = "first_run_completed"`, or a code-less 403 from an appliance
+    /// over loopback — the only other gate conditions cannot apply to this
+    /// shell). Not a failure: the network was configured once already and
+    /// the gateway itself just answered over loopback.
+    FirstRunCompleted,
     /// `forget()`/`connect()` was asked about an SSID this backend has no
     /// record of (legacy backends only — the gateway backend's equivalent
     /// case is `Classified(WifiFailureCode::NotFound)` below, since the

@@ -26,6 +26,7 @@ pub mod platform;
 pub mod preset;
 pub mod provider_env;
 pub mod relay_protocol;
+pub mod runtime_catalog;
 pub mod secaudit_config;
 pub mod sensitivity;
 pub mod spawn_admission;
@@ -43,7 +44,8 @@ pub use agent_rename::{rename_in_markdown, synced_trigger};
 pub use appliance::{appliance_default_bind, appliance_flag, is_appliance, pick_default_bind, APPLIANCE_ENV};
 pub use concurrency_gate::{
     active_count as concurrency_active_count, effective_limit as concurrency_effective_limit,
-    release as concurrency_release, renew as concurrency_renew, try_acquire as concurrency_try_acquire,
+    release as concurrency_release, release_class as concurrency_release_class,
+    renew as concurrency_renew, try_acquire as concurrency_try_acquire,
     AcquireOutcome as ConcurrencyAcquireOutcome, ConcurrencyGateConfig, Lease as ConcurrencyLease,
 };
 pub use config::{
@@ -814,6 +816,14 @@ pub fn which_cli_in_home(home: &std::path::Path, bin: &str) -> Option<String> {
         // reachable on an appliance boot (no Homebrew, no per-user npm/bun/
         // asdf install). Listed last so a desktop install's user-local /
         // package-manager copy still wins when both exist.
+        //
+        // WP-B: `/opt/duduclaw/runtimes/bin` is where the OS image's
+        // `duduclaw-ai-runtimes` recipe (TODO-ai-runtimes-2026-09 §3 WP-F)
+        // lands the bundled AI CLIs — npm shims, vendor binaries and the
+        // `mistral-vibe` venv all get a wrapper there. Without this candidate
+        // every bundled runtime is invisible on an appliance whose PATH the
+        // gateway did not inherit.
+        format!("/opt/duduclaw/runtimes/bin/{bin}"),
         format!("/usr/bin/{bin}"),
         format!("/usr/sbin/{bin}"),
         format!("/bin/{bin}"),
@@ -843,6 +853,64 @@ pub fn which_cli_in_home(home: &std::path::Path, bin: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── Catalog-driven CLI discovery ──────────────────────────────────────
+//
+// WP-B: the one probe every call site should use. `handle_runtime_detect`,
+// `runtime_install`, `runtime_models::discover_all`, `cli_auth::resolve_program`
+// and `infer_provider_for_model` used to each keep their own `which_*` list,
+// so a new runtime had to be remembered in five places. These two read
+// `runtime_catalog` instead, and the per-CLI `which_*` wrappers below are now
+// thin aliases kept only for existing external callers.
+
+/// Resolve a runtime's CLI binary by catalog id (or alias): PATH first, then
+/// the HOME-rooted candidate scan, then each of the runtime's
+/// `binary_aliases` in order.
+///
+/// Returns `None` for an unknown id, and for a runtime with no binary at all
+/// (`openai_compat` is an HTTP endpoint, never a process) — the caller then
+/// treats it as "not a CLI", which is exactly right.
+///
+/// `claude` keeps its bespoke [`which_claude`] probe: that one also walks NVM
+/// version dirs, Volta, bun, asdf shims, `.claude/bin` and the Windows
+/// `.exe` > `.cmd` BatBadBut precedence, none of which the generic scan
+/// covers. Reporting a perfectly good NVM install as "missing" would turn a
+/// successful install into a phantom failure.
+pub fn which_runtime(id: &str) -> Option<String> {
+    let spec = runtime_catalog::spec_for(id)?;
+    if spec.id == "claude" {
+        return which_claude();
+    }
+    if spec.binary.is_empty() {
+        return None;
+    }
+    std::iter::once(spec.binary)
+        .chain(spec.binary_aliases.iter().copied())
+        .find_map(which_cli)
+}
+
+/// [`which_runtime`] rooted at an explicit HOME, for deterministic tests and
+/// for the "PATH first, then the user home" pairing every call site uses.
+pub fn which_runtime_in_home(home: &std::path::Path, id: &str) -> Option<String> {
+    let spec = runtime_catalog::spec_for(id)?;
+    if spec.id == "claude" {
+        return which_claude_in_home(home);
+    }
+    if spec.binary.is_empty() {
+        return None;
+    }
+    std::iter::once(spec.binary)
+        .chain(spec.binary_aliases.iter().copied())
+        .find_map(|bin| which_cli_in_home(home, bin))
+}
+
+/// The probe every detect/install/model-discovery call site should use:
+/// PATH + real HOME first (what the user sees in their own terminal), then
+/// the supplied `user_home` candidate scan (what a launchd/systemd-launched
+/// gateway can still reach).
+pub fn detect_runtime(id: &str, user_home: &std::path::Path) -> Option<String> {
+    which_runtime(id).or_else(|| which_runtime_in_home(user_home, id))
 }
 
 /// Resolve the `codex` CLI binary. See [`which_cli`].

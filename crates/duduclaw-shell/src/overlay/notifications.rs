@@ -310,7 +310,7 @@ pub(super) fn render(
     }
     panel
         .child(header(palette, ui.notifications.is_busy()))
-        .child(tabs(palette))
+        .child(tabs(palette, ui.notifications.pending_count(), ui.task_progress.count()))
         .child(content(&ui.notifications, &ui.task_progress, notify_center, palette, cx))
         .child(footer(palette))
 }
@@ -394,6 +394,7 @@ pub(crate) fn schedule_stale_check(cx: &mut Context<ShellView>) {
                 // exactly the WP-A4-4 regression this file's own header
                 // comment documents.
                 super::notifications_tasks::trigger_task_refresh_if_stale(view, cx);
+                super::notifications_agents::trigger_agents_refresh_if_stale(view, cx);
                 true
             });
             match keep_polling {
@@ -434,7 +435,7 @@ fn header(palette: ShellPalette, is_busy: bool) -> Div {
         .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(theme::alpha(link_text, 1.0)).child(fake_data::NOTIF_MARK_ALL_READ))
 }
 
-fn tabs(palette: ShellPalette) -> Div {
+fn tabs(palette: ShellPalette, pending_approvals: usize, open_tasks: usize) -> Div {
     // Notifications.dc.html: the ACTIVE tab is an INVERTED chip in both
     // themes (`bg=#09090b/text=#fafafa` light, `bg=#fafafa/text=#18181b`
     // dark) — `active_bg` is `palette.foreground` in both cases; `active_
@@ -448,7 +449,16 @@ fn tabs(palette: ShellPalette) -> Div {
     let active_text = if palette.is_dark() { palette.surface } else { 0xfafafa };
 
     let mut row = div().flex().gap(px(6.)).px(px(18.)).pb(px(12.));
-    for (i, tab) in fake_data::NOTIF_TABS.iter().enumerate() {
+    // 2026-09-05: the tab labels used to be `fake_data::NOTIF_TABS`
+    // (`"審批 2"` on every machine). Same four tabs, counts from the two real
+    // feeds; a zero count shows the bare label.
+    let tabs: [String; 4] = [
+        t(Locale::ZhTw, Key::NotifTabAll).to_string(),
+        counted_tab(t(Locale::ZhTw, Key::NotifTabApprovals), pending_approvals),
+        counted_tab(t(Locale::ZhTw, Key::NotifTabProgress), open_tasks),
+        t(Locale::ZhTw, Key::NotifTabSystem).to_string(),
+    ];
+    for (i, tab) in tabs.iter().enumerate() {
         let active = i == 0; // Notifications.dc.html: "全部" is the selected tab
         let (bg_hex, text_hex) = if active { (active_bg, active_text) } else { (palette.surface_hover, palette.text_secondary) };
         row = row.child(
@@ -460,7 +470,7 @@ fn tabs(palette: ShellPalette) -> Div {
                 .font_weight(if active { FontWeight::MEDIUM } else { FontWeight::NORMAL })
                 .bg(theme::alpha(bg_hex, 1.0))
                 .text_color(theme::alpha(text_hex, 1.0))
-                .child(*tab),
+                .child(tab.clone()),
         );
     }
     row
@@ -510,17 +520,20 @@ fn content(
     }
 
     body = super::notifications_apps::app_notifications_section(body, notify_center, palette, cx);
-    body = super::notifications_tasks::task_progress_section(body, task_progress, palette);
+    // 2026-09-05: the "今天" block that followed here was
+    // `fake_data::TODAY_ACTIVITY` — three invented rows on every machine.
+    // There is no real activity feed yet, so the section is gone rather
+    // than pretending; the task section above is the real "what happened".
+    super::notifications_tasks::task_progress_section(body, task_progress, palette)
+}
 
-    body.child(
-        div()
-            .text_size(px(11.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme::alpha(palette.text_faint, 1.0))
-            .px(px(4.))
-            .child(fake_data::NOTIF_TODAY_LABEL),
-    )
-    .children(fake_data::TODAY_ACTIVITY.iter().map(move |row| activity_row(row, palette)))
+/// "審批" → "審批 2" when there is something to count, bare label at zero.
+fn counted_tab(label: &str, count: usize) -> String {
+    if count == 0 {
+        label.to_string()
+    } else {
+        format!("{label} {count}")
+    }
 }
 
 /// One connectivity/state line — the offline banner uses `destructive` text
@@ -884,34 +897,6 @@ fn system_icon(palette: ShellPalette) -> Div {
         )
 }
 
-fn activity_row(row: &fake_data::ActivityRow, palette: ShellPalette) -> Stateful<Div> {
-    let avatar_el = match row.avatar {
-        fake_data::RowAvatar::Agent { initial, bg_hex } => avatar(initial.to_string(), bg_hex, palette),
-        fake_data::RowAvatar::System => system_icon(palette),
-    };
-
-    let mut el = div()
-        .id(row.id)
-        .flex()
-        .items_center()
-        .gap(px(10.))
-        .px(px(6.))
-        .py(px(8.))
-        .rounded(px(10.))
-        .child(avatar_el)
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .child(div().text_size(px(12.5)).child(row.line1))
-                .child(div().text_size(px(11.)).text_color(theme::alpha(palette.text_faint, 1.0)).child(row.line2)),
-        );
-    if let Some((label, kind)) = row.badge {
-        el = el.child(decision_badge(label, palette.badge_text(kind), palette.badge_bg(kind)));
-    }
-    el
-}
 
 fn footer(palette: ShellPalette) -> Div {
     // Notifications.dc.html: border-top `#f0f0f2` light / `rgba(255,255,

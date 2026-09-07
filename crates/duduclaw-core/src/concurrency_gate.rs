@@ -313,6 +313,33 @@ pub fn release(home_dir: &Path, lease: &Lease) {
     });
 }
 
+/// Drop every lease of `class`, expired or not, and return how many were
+/// dropped. For crash / restart recovery by the ONE process that owns a
+/// class (the goal-loop driver owns `"goal"`): after a gateway restart the
+/// driver's in-memory in-flight map is empty, so any lease still in the
+/// file belongs to a round that can no longer report back — left alone it
+/// would count against the Personal-edition cap for the remaining TTL
+/// (30 min by default) and every new goal task would be deferred with
+/// "edition concurrency cap reached" although nothing is running
+/// (observed 2026-09-06 on the appliance). Never call this from a process
+/// that shares the class with another live holder.
+pub fn release_class(home_dir: &Path, class: &str) -> usize {
+    let path = home_dir.join(STATE_FILE);
+    let now_ms = now_epoch_ms();
+    crate::with_file_lock(&path, || {
+        let mut state = load_state(&path);
+        prune_expired(&mut state, now_ms);
+        let before = state.len();
+        state.retain(|_, rec| rec.class != class);
+        let dropped = before - state.len();
+        if dropped > 0 {
+            let _ = save_state(&path, &state);
+        }
+        Ok::<usize, std::io::Error>(dropped)
+    })
+    .unwrap_or(0)
+}
+
 /// Extend a still-in-flight lease's TTL to `now + ttl_secs`. No-op on an
 /// unguarded lease. If the lease has already been pruned (e.g. TTL lapsed under
 /// heavy stall), it is re-inserted so the live task keeps counting toward its
@@ -358,6 +385,22 @@ pub fn active_count(home_dir: &Path, class: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_class_drops_only_that_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let ttl = 1800;
+        assert!(matches!(try_acquire(dir.path(), "goal", Some(2), ttl), AcquireOutcome::Admitted(_)));
+        assert!(matches!(try_acquire(dir.path(), "goal", Some(2), ttl), AcquireOutcome::Admitted(_)));
+        assert!(matches!(try_acquire(dir.path(), "other", Some(2), ttl), AcquireOutcome::Admitted(_)));
+        assert_eq!(active_count(dir.path(), "goal"), 2);
+        assert_eq!(release_class(dir.path(), "goal"), 2);
+        assert_eq!(active_count(dir.path(), "goal"), 0);
+        assert_eq!(active_count(dir.path(), "other"), 1);
+        assert_eq!(release_class(dir.path(), "goal"), 0);
+        // the cap is free again
+        assert!(matches!(try_acquire(dir.path(), "goal", Some(2), ttl), AcquireOutcome::Admitted(_)));
+    }
 
     #[test]
     fn effective_limit_personal_vs_enterprise() {

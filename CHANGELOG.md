@@ -3,18 +3,123 @@
 ## [Unreleased]
 
 ### Added
+- **WP-A：provider-aware `[[accounts]]`（`docs/todo/TODO-ai-runtimes-2026-09.md` §3）**：
+  `accounts.add` 新增 `provider` 參數（`duduclaw_core::provider_env::KNOWN_PROVIDER_IDS` 之一，
+  未帶時預設 `"anthropic"`，未知值 fail-closed 拒絕）；`build_account_entry` 依 provider 決定金鑰欄位
+  名——`anthropic` 維持 `anthropic_api_key(_enc)` 相容既有設定，其餘 provider 一律寫可攜的
+  `api_key(_enc)`（`duduclaw-agent::account_rotator::resolve_api_key` 早就讀得到這個備援欄位名，
+  此前只是從未有寫入者真的用過）；`account.toml` 每筆帳號同步寫入 `provider = "<id>"`。`accounts.list`
+  與 `accounts.budget_summary`（改用共用的 `account_status_to_json`）皆回傳 `provider`，dashboard
+  帳號卡片同步顯示服務商。`AddAccountDialog` 新增服務商選單（`web/src/lib/provider-catalog.ts`，11
+  家、各自的金鑰格式提示與取得金鑰連結；`"google"` 因是 `"gemini"` 的環境變數別名、實際路由永遠不會
+  選到它而刻意不列出，避免使用者選到一個永遠死掉的選項）。新增 gateway／account-rotator 單元測試與
+  `provider-catalog.test.ts`。
+- **§1-1 訂閱登入風險告知（同 TODO §1 決策 1B）**：`CliLoginModal`／`SubscriptionSetupWizard`（以及只會
+  開啟這兩者之一的 OOBE `RuntimeSetupCard`）新增共用元件 `SubscriptionRiskDisclosure`——登入流程開始前
+  一律先顯示告知（Anthropic 與 Google 自 2026-03 起已在伺服器端封鎖第三方產品使用消費者訂閱帳號登入、
+  且已有帳號因此被停權；OpenAI 政策不明）並要求勾選「我了解風險並自行承擔」才會啟用「繼續」按鈕；
+  API 金鑰路徑不受影響、仍是預設建議。三語 i18n（`subscriptionRisk.*`）。
+- **多 runtime 註冊表與七款新 AI CLI 後端（WP-B，`docs/todo/TODO-ai-runtimes-2026-09.md` §3）**：新增單一編譯期資料表 `crates/duduclaw-core/src/runtime_catalog.rs`——每個 runtime 的 id／顯示名／執行檔／別名／安裝管道／headless 呼叫模板／輸出格式（text｜json｜jsonl）／模型旗標／登入方式／憑證路徑／MCP 支援／模型家族前綴／ToS 註記／三語文案，全部寫在同一處。偵測（`runtime.detect`）、一鍵安裝（`runtime_install`）、模型探索（`runtime_models::discover_all`）、CLI 登入（`cli_auth::spec_for`）、`infer_provider_for_model`／`model_matches_provider`、`RuntimeType`、`CliKind`、容器 sandbox 的 argv 與金鑰環境變數，改為全部讀這張表；`VALID_RUNTIME_PROVIDERS` 與錯誤訊息裡的廠商清單也由表格生成，不會再過期。安裝白名單仍是**編譯期常數**、仍是精確比對、仍無 default arm——安全模型不變。
+- **通用 print-mode runtime `runtime/generic_cli.rs`**：依 `RuntimeSpec` 驅動任何「一次問答、答案印在 stdout」的 CLI——模板 argv、prompt 走參數或 stdin、模型旗標（分離式 `--model X`／等號式 `--model=X`／環境變數）、工作目錄、逾時、text/JSON/JSONL 解析、非零離開碼與「需要登入」訊號對應到具名錯誤（`GenericCliError`，Display 保留 `classify_cli_failure` 依賴的關鍵字，failover 照舊運作）。
+- **七款新 runtime**：Qwen Code（`qwen`，npm `@qwen-code/qwen-code`）、Kimi Code（`kimi`，npm `@moonshot-ai/kimi-code`，裝置碼登入）、GitHub Copilot CLI（`copilot`，npm `@github/copilot`，GitHub OAuth 裝置流程）、Kiro CLI（`kiro-cli`，curl 安裝腳本）、Cursor CLI（`cursor-agent`，`cursor.com/install`）、Mistral Vibe（`vibe`，PyPI `mistral-vibe`）、OpenCode（`opencode`，`opencode.ai/install`）。每一項的 headless 旗標都對照廠商官方文件查證並在 catalog 條目註明出處；查不到的一律標記而非臆造（見下方 Security 節的 Kiro 條款事項）。
+- **`which_runtime(id)`／`which_runtime_in_home`／`detect_runtime`**（`duduclaw-core`）：依 catalog id 解析執行檔的單一探測函式，取代散落各處的 `which_codex`／`which_gemini`／`which_agy`／`which_grok` 呼叫；`claude` 保留原本更完整的 `which_claude`（NVM／Volta／bun／asdf／`.claude/bin`／Windows `.exe` 優先），`grok` 保留第三方 `grok-cli` 後備名稱。候選路徑新增 `/opt/duduclaw/runtimes/bin`（OS 映像內建 CLI 的位置）。
+- **`runtime.detect` 回傳 `runtimes` 陣列**：每個 runtime 一列，含顯示名、執行檔、是否安裝、安裝管道與指令、登入方式與是否遠端可用、API 金鑰環境變數、憑證是否存在、MCP 支援、headless 旗標是否已驗證、廠商連結與三語 ToS 註記——dashboard／OOBE 不必再自己維護一份表。既有的 `claude_cli`／`claude_oauth`／`claude_subscription` 與各 runtime 的布林旗標維持原樣。
+- **[WP-D] 裝置內建本地模型（gateway＋dashboard，TODO-ai-runtimes-2026-09 §3 WP-D／§1 決策 3A）**：DuDuClaw OS 映像帶 llama.cpp 的 `llama-server` 但不帶權重，這一包把「開箱沒有權重」到「本地模型正在回答」的路補起來。
+  ① **appliance 預設值**（`duduclaw-inference/src/appliance.rs`）：偵測到 appliance 旗標**且** `/usr/bin/llama-server` 真的存在時（兩者缺一不套用），`inference.toml` 缺哪個 key 就補哪個——`enabled = true`、`backend = "openai_compat"`、`[openai_compat] base_url = http://127.0.0.1:8080/v1`、`models_dir = $DUDUCLAW_HOME/models`；**operator 寫過的值一律不覆蓋**（含 `enabled = false`），`[general] inference_mode` 完全不碰，維持 `hybrid`，設定好的雲端 runtime 照樣優先。
+  ② **新 RPC `inference.local.*`（admin gated，`inference_local.rs`）**：`catalog`（六個精選 GGUF，每列附本機相容燈與是否已下載）、`download {id}`（背景下載，沿用市集的 job registry／續傳／100 GB 上限）、`serve {model_file, ctx?}`（原子寫入 `<home>/llama-server.env` 後重啟本地模型服務；非 appliance 主機照樣寫檔但誠實回 `restarted: false` 與原因）、`stop`、`status`（即時探測端點、回報實際載入的權重、下載進度、已安裝清單）。
+  ③ **精選清單全數對 Hugging Face API 實查**（2026-09-05，repo `gated` 欄位＋`tree/main` 的 `lfs.size`＋匿名 HEAD 200）：Qwen3 1.7B／4B／8B、Gemma 3 4B、Llama 3.2 3B、Qwen2.5-Coder 7B，皆 Q4_K_M、皆未設門禁，repo commit SHA 記在原始碼註解裡。查證改變了兩列——Qwen 官方 `Qwen3-1.7B-GGUF` 根本沒有 Q4_K_M（只有 Q8_0）故改用 `unsloth`；Google 的 Gemma 3 GGUF repo 是 `gated: "manual"`、匿名下載回 401，故改用 `ggml-org` 版。
+  ④ **dashboard「本地模型」頁新增內建面板**（`components/localmodels/BuiltInLocalModel.tsx`）：狀態橫幅（來自即時探測，不看設定檔）、相容燈、下載進度、「設為本地模型並啟動」、關閉；沒有內建引擎的主機整塊不顯示，Hugging Face 市集維持原樣。文案誠實標明本地推理由裝置自身處理器與內顯運算，且**不給任何沒實測過的 tokens/秒數字**。i18n 三語。
+  ⑤ **文件**：新特稿 `docs/features/53-local-models.md`（三語）＋三語索引。
+- **微調與後訓練（WP-E，`docs/todo/TODO-ai-runtimes-2026-09.md` 裁決 4C）**：dashboard 新增「微調與後訓練」頁（`/manage/finetune`，admin only，三語）與 gateway `finetune.*` RPC 家族。產品框架是**在這裡整理、到別處訓練、再收回這裡**——目標機種（N305／8845HS 內顯）訓練不了任何模型，2026 年的 LLaMA-Factory／Unsloth／Axolotl 全部需要 CUDA／ROCm，所以本功能明文不做本機訓練，UI 每一頁都寫明 GPU 在哪裡。
+  - **資料集**（`finetune.datasets.list/create/delete/build/preview/export`）：從 `sessions.db` 的對話、`tasks.db` 的 `result_summary`、`approvals.db` 的審批決定，以及 `task_iterations` 的覆核裁決，建構 ShareGPT／Alpaca SFT JSONL 與 DPO 偏好對，附 LLaMA-Factory `dataset_info.json` 讓遠端免轉檔。無回答的對話、無結果的任務、未決的審批一律不產生資料列——回報的筆數就是真的寫進檔案的量，新機器誠實建出零筆。
+  - **訓練工作**（`finetune.jobs.list/create/status/cancel`）：`FinetuneBackend` trait 三個實作——`dry_run`（只驗證設定並寫出 `train.yaml`＋`plan.json`，狀態永遠停在 `planned`，不會漂移成完成）、`remote_gpu_ssh`（SSH＋rsync 到使用者自己的 GPU 主機跑 `llamafactory-cli train`，取回 adapter，遠端有 llama.cpp `convert_lora_to_gguf.py` 時再取回 GGUF）、`together`（wire format 於 2026-09-05 對 `docs.together.ai` 線上 OpenAPI 實地查證：`training_type`／`training_method` 是物件而非平鋪欄位、9 種狀態列舉、DPO 用 `preferred_output`／`non_preferred_output` 的自有 JSONL 格式）。**不編造進度**：沒有任何百分比欄位，SSH 後端的狀態來自遠端 PID 與 adapter 檔案是否存在、日誌是 `train.log` 原文結尾，Together 用對方的 `status` 一對一對應；主機一時連不上時保留原狀態，斷線不等於訓練失敗。
+  - **匯入**（`finetune.import`）：GGUF／LoRA（`.gguf`／`.safetensors`／`.bin`，本機路徑或 https URL）複製進 `<DUDUCLAW_HOME>/models`——與 `local_models.rs` 掃描、`duduclaw-inference` `InferenceConfig::models_dir` 指向的同一個目錄，所以成果直接出現在「本地模型」頁，不需要第二套登記表。
+  - **資料離機閘門**：`datasets.export` 與對遠端後端的 `jobs.create` 未帶 `acknowledged_data_leaves_device: true` 時一律拒絕，回傳 `code = "data_leaves_device_not_acknowledged"` 的結構化錯誤，dashboard 據此顯示勾選確認而非紅色錯誤。失敗時關閉：欄位缺席＝拒絕，不認識的後端一律視為遠端。SSH 後端所有會進入遠端 shell 的欄位（host／user／workdir／python／job id／模型名）先過嚴格字元白名單，`BatchMode=yes` 避免密碼提示卡住 gateway。
+  - 文件：`docs/features/54-finetune.md`（三語）、`docs/guides/remote-gpu-host.md`（三語，Ubuntu＋CUDA＋venv 裝 LLaMA-Factory＋llama.cpp 轉檔＋SSH 金鑰授權），features／guides 索引三語同步，三語 README 功能總覽各補一列。
+
 - **[OS] DuDuClaw OS Yocto 基底 bring-up（Y 線，`meta-duduclaw/`，MAP-agent-native-os-2026-08.md 裁決⑥）**：去 Debian 化的新基底重建線開工——layer 骨架＋kas 設定＋UKI/systemd-boot 接通，QEMU 開機驗證到 login prompt（Y1-1）；`duduclaw-cli`／`duduclaw-sysd` 兩顆 Rust binary 的 cargo class recipe 完成並實際建置出 RPM（Y2-1／Y2-3，`duduclaw-comp` recipe 已寫但未 build-verified）；真機 genericx86-64 kernel provider 接通＋建置成功（Y2-2／Y2-3）；QEMU 雙驗證（sysd socket＋gateway `/healthz`）全綠。**同版同發工程形態**（Y3-3）：OS 版本單一源機制上線——`meta-duduclaw/conf/distro/include/duduclaw-platform-version.inc` 為唯一數字源（由 `scripts/release.sh` 通用 bump 迴圈同步，新增 `yocto_inc`／`yocto_bb` 兩種 manifest kind），`DISTRO_VERSION` 改為 `${DUDUCLAW_PLATFORM_VERSION}-y1-bringup`（里程碑後綴維持人工維護），`duduclaw-cli`/`duduclaw-sysd`/`duduclaw-comp` 三顆 recipe 的檔名版號（Yocto `<pn>_<pv>.bb` 慣例）由 release 腳本 `git mv` 同步；順帶修正 `duduclaw-comp` 版號孤兒漂移（Cargo.toml/Cargo.lock 停留在 spike 期 `0.1.0`，已正規化到平台版號 `1.62.0`，並補上 release.sh 對所有 workspace-excluded crate 自身 Cargo.lock 版號條目的通用同步，堵住這類漂移的機制性缺口）；OS image 的實際建置／簽章／發佈是獨立、不隨每次平台 release 自動觸發的人工步驟（`scripts/release-os.sh audit/plan/package`，見 `commercial/docs/DESIGN-unified-release-2026-08.md`）。**尚未出貨**：本節記錄的是 Y 線目前的 bring-up 狀態，不代表有可安裝的 OS image 存在。（2026-09-04 追記：本線已拆至 DuDuClaw-OS repo，v0.1.0 已於該 repo 發布；後續 OS 變更記於該 repo 的 CHANGELOG。）
 
-### Changed
-- **DuDuClaw OS 線拆分為獨立 repo（2026-09-04）**：`meta-duduclaw/`（Yocto 層）、`appliance/`（已凍結的 Debian/mkosi 線）與 `scripts/release-os.sh` 連同歷史移至 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS)，本 repo 只保留 Rust workspace（OS 以剪枝快照 vendor）。`scripts/release.sh` 移除 `yocto_inc`／`yocto_bb` 兩種版號同步 kind，平台版號流不再碰任何 OS metadata；OS 改採獨立版號（該 repo 的 `VERSION` 檔，起始 0.1.0 bring-up）並走該 repo 的 GitHub Releases。文件端同步：`docs/guides/appliance-build.md` 改為指向 OS repo 的入口頁；`docs/features/50` 的安裝步驟與現況改寫為 v0.1.0 事實（兩式產物、真機仍未驗證）；`docs/guides/hardware-requirements.md` 燒錄段落區分 `.wic`（僅 USB／磁碟）與安裝器 `.iso`（可光碟開機）；`docs/todo/TODO-H1-ISO-x86-installer.md` 加追記並補進索引。
-- **docs/features 與 docs/guides 三語對齊**：2026-08-16「三語規範化」之後累積的落差一次補平——features 48／49／50 與 guides `appliance-build.md` 補齊 zh-TW／ja-JP 譯本；features 51 與 guides `app-compat.md`、`hardware-requirements.md` 原本是繁中直接放在英文 root，改為 root 英文版＋繁中移入 `zh-TW/`＋新增 ja-JP；features 28 的 See also 與 31 的 Provenance（I-2b）段落補進兩語譯本；`guides/zh-TW/custom-mcp-tool.md` 半英文舊稿重譯；三語 features README 索引補 48–51 並更新版本／日期。三語 README 新增 DuDuClaw OS：為什麼表格加一列、架構一覽補出貨形態、安裝一節新增「DuDuClaw OS(值班機映像,pre-GA)」小節、功能總覽加一列、文件清單加入口。
+- **features/52 桌面版（三語）**：新特稿 `docs/features/52-desktop-edition.md`——人與 AI 共用一台機器且不影響日常使用：agent 專屬 seat、影子工作區（headless 第二輸出＋子母畫面）、人輸入即凍結（QEMU 實測 3–4 ms）、Super+Enter 明確交還／Super+Esc 急停、watch mode、共駕預設關閉、後果性動作先審批、憑證一律交人、畫面文字視為 DATA；並誠實列出已驗證（容器＋QEMU 真輸入）與未驗證（真機 DRM、雙螢幕、AT-SPI2 真機點擊）項目。索引三語同步。
 
-### Fixed
-- **sysd 拒絕未授權連線時，拒絕回應可能被 Linux RST 摧毀**：server 對 uid 不符的 peer 寫完 `unauthorized` 回應後直接關閉，socket 收件佇列裡未讀的 request 使 close 變成 RST——client 收到 `ECONNRESET` 而非結構化錯誤（macOS 語義不同從未在本機重現，只在 Linux CI 以 `mismatched_uid_is_rejected` 閃失敗現形）。現在回應寫出後做尺寸與時間雙重上限（500ms）的 bounded drain 再關閉，未授權 peer 也無法藉此拖住連線。
-- **`resolve_duduclaw_bin_from_exe` 測試在 Windows 矩陣必失敗**：解析器在 Windows 探測的是 `duduclaw.exe`（與實際出貨檔名一致，生產行為正確），但測試 fixture 用無副檔名檔名。fixture 改依平台命名。
+- **DuDuClaw OS 桌面殼：OOBE「AI Runtime 授權」改為 provider 清單**（`crates/duduclaw-shell`，2026-09-05，`docs/todo/TODO-ai-runtimes-2026-09.md` WP-C）：原本只收一把 Anthropic 金鑰的單欄位，改為可捲動的 17 家清單（Claude Code／Codex／Gemini CLI／Grok／Qwen／Kimi／Copilot／Kiro／Cursor／Mistral Vibe／OpenCode，加上 DeepSeek／MiniMax／Z.ai GLM／Groq／Together／OpenRouter），每列標明未設定／已存金鑰／已登入，並有兩個動作：「輸入 API 金鑰」（`accounts.add` 帶 `provider`，帳號 id `oobe-<provider>`）與「登入帳號」（走 gateway 既有的 `auth.cli_login.*`，畫面顯示解析自 CLI 輸出的裝置代碼與登入網址，可用機器上的瀏覽器開啟）。訂閱登入前先顯示 §1-1 風險告知（Anthropic／Google 自 2026-03 伺服器端封鎖第三方產品使用訂閱憑證、已有帳號被停權；OpenAI 政策不明），勾選「我了解風險，由我自行承擔」才會開始；未勾選時按鈕完全不掛 click handler。**失效即拒**：gateway 的 `RuntimeType::parse` 對未知 runtime 名會預設回 Claude，所以 Kimi／Copilot／Kiro／Cursor／Vibe／OpenCode 這六列在 WP-B 教會 gateway 之前一律不可啟動（會用錯廠商的身分登入），畫面誠實說明。每家的結果持久化到 `OobeSelections::runtime_providers`（`#[serde(default)]`，舊 state 檔照載），完成頁摘要改顯示「已授權 N 家」。三語文案齊備；`auth.cli_login.*` 一路標記 `UNVERIFIED: needs live gateway`（依 TODO §4，活體驗證等 WP-A／WP-B 合併）。
+
+### Changed
+- **`compat.d` 的 `from_os` 新增 `linux-container`**（`duduclaw_core::compat_runners::FromOs::LinuxContainer`）：以 OCI 容器（docker／podman）交付的 Linux 工作負載，例如 DuDuClaw OS 的 LLaMA-Factory LlamaBoard 微調工作台 runner。首版宣告檔寫成 `linux-gpu` 被列舉拒絕為 malformed（這正是該列舉存在的目的），故正式加入變體而非放寬解析。
+- **Windows RemoteApp 登錄檔可改放到 `$DUDUCLAW_WINDOWS_VM_APPS_DIR`**：`duduclaw compat windows-vm app-add/app-remove/app-list` 讀寫的 `apps.toml` 位置新增環境變數覆寫（未設定時仍是 `<DUDUCLAW_HOME>/windows-vm/apps.toml`；`compose.yaml` 與 VM 儲存不受影響）。DuDuClaw OS 因 gateway 家目錄改為各家 AI CLI 的 `$HOME` 並收緊為 `0700`，kiosk 殼讀不到裡面的檔案，映像遂把兩端都指向 `/data/system/windows-vm`——`duduclaw-shell` 的 `apps::windows_vm` 讀取路徑同步改為 `/data/system/windows-vm/apps.toml`（原本硬編碼 `/data/duduclaw/...`）。`docs/guides/app-compat.md`（三語）補述。
+- **⚠️ 行為變更：`RuntimeType::parse` 改回傳 `Option<RuntimeType>`，未知字串不再默默變成 Claude**。單一 runtime 時代這是容錯，十二個 runtime 之後這是正確性漏洞——`auth.cli_login.start {runtime: "kimi"}` 打到不認得 `kimi` 的版本，過去會安靜地跑 `claude setup-token`，把別家的登入畫面交給使用者。現在請求型呼叫端一律拒絕並回報可接受的清單（清單由 catalog 生成）；只有讀「已存下的設定欄位」時才允許退回預設值，且集中在 `runtime_config::parse_provider_or_default` 一處、以 `error!` 記錄壞值與正確清單。`[runtime] fallback` 讀到不認得的值改為忽略（「沒有 fallback」本來就是合法狀態），不再退回預設。
+- **`invoke_agent` OTel span 的 `gen_ai.system`／`gen_ai.provider.name` 改依實際 runtime**：原本寫死 `"anthropic"`，等於每一次 Qwen／Kimi／Copilot／Grok 的執行在 trace 裡都被記成 Anthropic，依供應商切分的成本與延遲儀表板對所有非 Claude agent 都是錯的。現在在 `[runtime] provider` 解析出來後即時 record；多供應商殼層（Copilot／Cursor／OpenCode／Kiro）沒有單一 vendor，回報 runtime id 而不是隨便挑一家。
+- **`os_update.rs::MAX_ROOT_BYTES` 由 8 GiB 提高到 9 GiB**：OS 的 A/B root 槽由 7168 MiB 升到 8192 MiB（TODO-ai-runtimes-2026-09 §1-2，為了容納內建 AI runtime 套組），而 raw 槽映像的大小就等於槽大小——上限若不高於 8192 MiB，一個合法的滿槽 root 會在下載途中被拒。新增測試釘住「上限必須大於 A/B 槽」這個關係，避免兩邊再次各走各的。
+- **`infer_provider_for_model` 現在認得新 runtime 的模型家族**：`qwen*`／`kimi*`／`mistral*`／`codestral*`／`devstral*`／`magistral*` 會對應到對應 runtime（CLI 已安裝）或 `openai_compat`（未安裝，API 模式服務任何模型）。先前這些模型一律回 `None`、不做自動對齊。多供應商殼層（Copilot／Cursor／OpenCode／Kiro）刻意不宣告任何模型家族，以免把 `gpt-5` 之類的 id 從 codex 手上搶走。
+- **`CliKind` 補齊 12 個變體並與 catalog id 對齊**；`duduclaw-cli-runtime` 維持零 DuDuClaw 相依（它是獨立的 PTY pool crate），兩邊的一致性由 gateway 的測試把關。`RuntimeType` ↔ `CliKind` 只有一條橋接函式 `pty_runtime::cli_kind_for_runtime`。PTY pool 仍只接受有互動式 REPL 協定的四種（Claude／Codex／Gemini／Antigravity），其餘一律走 oneshot print-mode 路徑。
+- **DuDuClaw OS 線拆分為獨立 repo（2026-09-04）**：`meta-duduclaw/`（Yocto 層）、`appliance/`（已凍結的 Debian/mkosi 線）與 `scripts/release-os.sh` 連同歷史移至 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS)，本 repo 只保留 Rust workspace（OS 以剪枝快照 vendor）。`scripts/release.sh` 移除 `yocto_inc`／`yocto_bb` 兩種版號同步 kind，平台版號流不再碰任何 OS metadata；OS 改採獨立版號（該 repo 的 `VERSION` 檔，起始 0.1.0 bring-up）並走該 repo 的 GitHub Releases。文件端同步：`docs/guides/appliance-build.md` 改為指向 OS repo 的入口頁；`docs/features/50` 的安裝步驟與現況改寫為 v0.1.0 事實（兩式產物、真機仍未驗證）；`docs/guides/hardware-requirements.md` 燒錄段落區分 `.wic`（僅 USB／磁碟）與安裝器 `.iso`（可光碟開機）；`docs/todo/TODO-H1-ISO-x86-installer.md` 加追記並補進索引。
+- **DuDuClaw OS 文件事實修正（拆開 v0.1.0 發布 wic 查證）**：兩槽 UKI 與 systemd-boot 皆無簽章、GPT 無 verity 分割、無 TPM 套件——這三項是 OS repo 的建置 overlay 選項，v0.1.0 未啟用；安裝器 ISO 寫入的 `duduclaw-image-ab` 也不是無頭，它有同一個桌面殼與 gateway，只是沒有應用層。`docs/features/50` 安裝步驟改「Secure Boot 關閉」、「Optional Kiosk Display」（Debian 線敘述）改為「Editions and the Desktop」、現況段改寫；README 三語 OS 小節同步改為「人機共用且不影響日常使用」框架。
+- **docs/features 與 docs/guides 三語對齊**：2026-08-16「三語規範化」之後累積的落差一次補平——features 48／49／50 與 guides `appliance-build.md` 補齊 zh-TW／ja-JP 譯本；features 51 與 guides `app-compat.md`、`hardware-requirements.md` 原本是繁中直接放在英文 root，改為 root 英文版＋繁中移入 `zh-TW/`＋新增 ja-JP；features 28 的 See also 與 31 的 Provenance（I-2b）段落補進兩語譯本；`guides/zh-TW/custom-mcp-tool.md` 半英文舊稿重譯；三語 features README 索引補 48–51 並更新版本／日期。三語 README 新增 DuDuClaw OS：為什麼表格加一列、架構一覽補出貨形態、安裝一節新增「DuDuClaw OS(值班機映像,pre-GA)」小節、功能總覽加一列、文件清單加入口；OS 小節首句改為「AI 原生住民的作業系統：整碟映像＝自家桌面、安裝器 ISO＝無頭版」，不再把整個 OS 寫成無頭值班機。
 
 ### Security
+- **Kiro CLI 的廠商條款明文禁止第三方 harness**：AWS 的 Kiro FAQ 寫著「不允許透過第三方自動化 harness、將請求繞過 Kiro 原生介面」，而用 DuDuClaw 驅動 Kiro 正屬此類（自行在 CI 直接呼叫 `kiro-cli` 則被允許）。Kiro 的 catalog 條目因此把安裝管道設為 `Manual`、decline reason 為 `vendor_tos_restricts_third_party_harness`，並在三語 `tos_note` 中原文載明——gateway 不會替使用者自動安裝，啟用與否是使用者明確的決定。
+- **catalog 的 `verified` 欄位**：headless 旗標若無法對照廠商文件或實機驗證，條目必須標 `verified: false` 並在註解寫明是哪一項——嚴禁臆造旗標。此欄位會經 `runtime.detect` 上浮到 dashboard，讓 UI 誠實顯示「尚未實機驗證」。目前全部 12 條皆為 `verified: true`（旗標來源已在各條目註明），未實機跑過的部分在 `docs/features/13-multi-runtime.md` 與本節如實說明。
+- **通用 print-mode runtime 的能力執行邊界**：這些 CLI 在 headless 模式下必須帶自動核准旗標才會真的執行工具，因此該旗標寫在 catalog 的 argv 模板中。硬性、fail-closed 的約束是選用的原生 OS sandbox（`[capabilities] native_sandbox`，與 `runtime/grok.rs` 相同）；當 agent 宣告了本 runtime 無法轉譯的工具限制時，每次 spawn 都會發出結構化 `warn!`（與 Antigravity 既有的處理一致），不會靜默丟棄。
 - **h2 0.4.13 → 0.4.18 修補 RUSTSEC-2026-0258**（unbounded empty DATA frames，2026-08-17 公告）——透過 reqwest/hyper 間接依賴，`cargo update -p h2` 鎖檔升版。
+
+### Fixed
+- **本地引擎第一次探測失敗就整個程序永久停用**（`claude_runner::get_inference_engine`）：appliance 上第一件交辦若發生在模型尚未下載／服務前，`INFERENCE_UNAVAILABLE` 旗標會讓之後 `inference.local.serve` 起好的模型完全不被使用，直到 gateway 重啟（2026-09-06 fix12 走查發現）。改為 60 秒重探視窗，且 `inference.local.serve`／`stop` 完成後立即清掉引擎快取重探。
+- **OOBE 完成頁在有線網路下顯示「網路 未連線」**（`crates/duduclaw-shell`）：只有 Wi-Fi 連線會設 `network_connected`，以有線上線通過網路步驟時旗標仍是 false。現在離開網路步驟時若有線在線即記錄已連線，完成頁顯示「有線網路已連線」（三語）。
+- **goal loop：派工同步失敗仍占用並行配額**（`goal_loop.rs`）：work message 被 dispatcher 標為 `failed`（runtime 未安裝、本地引擎未就緒、憑證被拒…）時，任務仍留在 in-flight 並持有 RFC-27 edition lease，Personal 版 cap=2 之下所有後續交辦都被「edition concurrency cap reached」擱置到 30 分鐘 TTL 到期；gateway 重啟也不會解除（2026-09-06 appliance 走查重現兩次）。現在 in-flight 記錄帶 `message_id`，每個 tick 檢查該訊息是否 `failed`：是則立刻釋放 slot 與 lease、寫 activity、進入退避（60→120→240 秒），連續三次轉 `needs_human`（原因 `infra`）並附錯誤文字；driver 啟動時清掉前一個程序殘留的 `goal` lease（`duduclaw_core::concurrency_release_class`）。四個回歸測試。
+- **`system.update_config {log_level}` 寫到沒人讀的鍵**：handler 寫 `[logging] level`，CLI 啟動只讀 `[general] log_level`，dashboard 回報成功但等級從未改變。改寫 `[general] log_level`。
+- **本地工具迴圈把整包系統提示＋全部 MCP 工具（約 33k token）送給 8192 ctx 的 llama-server**，每輪都被 `HTTP 400 exceeds the available context size` 打回再退到 bare completion。`local_llm` 現在先向 `/props` 問 `n_ctx`（llama.cpp），依視窗預留 1024 token 給生成後，工具依註冊順序裝到 45% 預算（`tasks_*` 永遠保留），系統提示超出就從尾端截短並附可見標記；不支援 `/props` 的伺服器維持原樣。四個純函式測試。
+- **OOBE「AI Runtime 授權」金鑰欄位對每家 provider 都顯示 `sk-ant-…` 佔位字**（`crates/duduclaw-shell` `RuntimeAuthFields`）：同一個欄位服務十七家，改為中性的 `API key…`。2026-09-06 QEMU 走查在 Codex 列發現。
+- **本地推理設定檔 `backend = "openai_compat"` 反序列化失敗**（`duduclaw-inference::types::BackendType`）：列舉靠 `rename_all = "snake_case"` 產生的線上名稱是 `open_ai_compat`，但 `[openai_compat]` 表、`inference.update` 的後端驗證、dashboard 與 appliance 預設值寫的都是 `openai_compat`，導致引擎回報「no available backend」、本地交辦派工失敗（2026-09-06 QEMU 活體、模型已下載且 llama-server 已就緒的情況下發現）。變體改為 `rename = "openai_compat"` 並保留 `open_ai_compat` 別名；新增線上名稱測試。
+- **[WP-D] `[openai_compat]` 端點活著卻回「No model loaded」**（`duduclaw-inference/src/openai_compat.rs`）：HTTP backend 的「載入模型」只是記下名字，權重在伺服器那邊。但 `loaded_model` 只有在 `load_model()` 被呼叫時才寫入，而 `InferenceEngine::generate` 只在 request 帶 `model_id` 或設了 `default_model` 時才會呼叫它——所以一份只寫了 `[openai_compat]`、沒寫 `default_model` 的設定（appliance 的預設形態，也是不少人手寫的形態），對著一台跑得好好的伺服器每次都回 `NoModelLoaded`。改為在 backend 建構時就以設定中的 model 名字登記；`model` 為空字串維持 `None`（沒指名模型就不替它捏一個）。
+- **[WP-D] `models_dir` 的 `~` 與 `DUDUCLAW_HOME` 各說各話**：`InferenceConfig` 預設 `"~/.duduclaw/models"`，gateway 的下載與 `models.list` 用的是 `<home>/models`。兩者只有在 `DUDUCLAW_HOME` 沒設時才一致——而 appliance 正是設了（`/data/duduclaw`），於是引擎去 `$HOME/.duduclaw/models` 找模型、下載卻落在 `$DUDUCLAW_HOME/models`。`InferenceConfig::load` 改為在缺 key 時補上 `<home_dir>/models`（appliance 與否都套用），檔案裡寫死的值照舊優先。
+- **[WP-D] 沒有權重的裝置回報連線錯誤而非「沒有本地模型」**：appliance 預設把端點指向 127.0.0.1:8080，但沒人下載過權重時本地模型服務不會啟動，每次本地推理都以一則無從處理的連線錯誤收場。`call_local_inference` 改為在送出請求前先判斷（僅限「appliance 預設生效**且** models 目錄沒有任何 .gguf」這一種情況）並回報 `NO_LOCAL_MODEL`；operator 自己設定的端點永遠不做這個判斷。
+- **DuDuClaw OS 三功能走查（交辦／共駕／相容層）抓到的缺陷**（2026-09-05，QEMU 實機操作＋root 序列埠診斷）：
+  ① **新機器沒有任何 AI 員工，交辦必定失敗**：OOBE「套用 Express」只寫本機旗標、從不呼叫 gateway；
+  三張產業板模卡是 `fake_data`。現在 OOBE 完成（四條路徑）時若 `agents.list` 為空就以 `agents.create`
+  建立 `role: "main"` 的「總管助理」（依 OOBE 語言命名），結果以通知卡回報；板模頁改為誠實的
+  「產業板模需 Pro 授權」提示（`oobe::seed`）。
+  ② **「AI Runtime 授權」的「立即設定」什麼都沒做**：現在是一個遮罩的 API 金鑰欄位，經 `accounts.add`
+  存進 gateway（`oobe_runtime_fields`／`steps::runtime_auth::try_submit`），文案明說「存入、第一次交辦時驗證」。
+  ③ **交辦送出後毫無回饋**：主畫面只列 `in_progress`，剛建立的 `todo` 任務看不到。任務 feed 改為
+  `needs_human`／`in_progress`／`todo` 三種開放狀態（`gateway_client::OPEN_STATUSES`，卡片標 需要你／進行中／排隊中），
+  交辦成功當下就發「已交辦」通知卡。
+  ④ **launcher 的「交辦給 財務助理」、dock 的兩位 agent、控制中心「2 位在值 · 1 件等你」、通知中心「審批 2」分頁與
+  「今天」活動列全是假資料**：新增 `overlay::agents_feed`（`agents.list`，30 秒同步），交辦卡顯示真實預設 agent
+  或「還沒有 AI 團隊成員」、dock 依真實名單畫頭像並由該 agent 的開放任務推導狀態點、控制中心與分頁用真實計數、
+  假活動列移除。
+  ⑤ **app 安裝按了沒下文**：`flatpak install` 原本 fire-and-forget；現在等它結束並以通知卡回報成功／失敗
+  （stderr 末行），且若映像內建離線倉庫 `flathub-offline` 有該 app 就從離線倉庫安裝、不走網路。
+  ⑥ **gateway：機器上沒有 Claude CLI 時每次派工都死在「Claude CLI not found」**（appliance 不裝 CLI）：
+  `claude_runner` 偵測到沒有 CLI 就視同 `api_mode = "direct"` 走 Direct API，讓真正的阻礙（缺 API 金鑰）浮上來。
+  ⑦ **MCP 能力閘門用錯身分**：內部金鑰（`gateway-internal`）啟動的 MCP 子行程一律拿 client_id 當 agent id 讀
+  `agents/gateway-internal/agent.toml`，os_native／recording／system_operator／codrive 在正式路徑上永遠 false；
+  改為內部金鑰時以實際 agent（`DUDUCLAW_AGENT_ID`）為準（`mcp_dispatch.rs`）。
+  ⑧ **OOBE 重跑時網路頁卡死**：gateway 的首次設定網路 API 在 admin 帳號建立後一律回 403，殼顯示「找不到網路服務」且無法繼續。
+  gateway 的 403 現在帶 `code`（`first_run_completed`／`not_loopback`／`not_appliance`），殼把「首次設定已完成」
+  （含舊 gateway 的無 code 403）視為網路已就緒（`NetError::FirstRunCompleted`），網路頁顯示說明、可直接繼續。
+  ⑨ **Direct API 不讀 `accounts.add` 存的金鑰**：`try_direct_api` 只看 `ANTHROPIC_API_KEY` 與 `[api]`，
+  機器上明明有一把 `[[accounts]]` 金鑰仍報「No API key available」；現在先問 rotator 的 API-key 帳號。
+  ⑩ **launcher 開 app 留殭屍行程**：`apps::launch` spawn 後丟掉 `Child`，每點一次留一個 `[flatpak] <defunct>`；
+  改為背景 reap，非零退出一律記 log（失敗的啟動終於有跡可循）。
+  ⑪ OS 側修正（Flatpak `data` 安裝區與 remote 設定、polkit 放行桌面帳號、verify 目錄權限、gateway `[codrive]` socket 路徑）記在 DuDuClaw-OS repo CHANGELOG。
+- **DuDuClaw OS 桌面殼：QEMU 全流程走查抓到的七個缺陷**（`crates/duduclaw-shell`，2026-09-05）：
+  ① 安裝精靈的選碟清單把安裝媒介本身列為目標——改用 `lsblk -J` 含子裝置與掛載點的完整樹，
+  排除 rom／loop／唯讀裝置、任何自身或分割區有掛載點的磁碟，以及以 findmnt＋PKNAME 解析出的
+  安裝媒介所在磁碟；偵測失敗不再靜默 fail-open，畫面顯示「無法確認安裝媒介，請小心選擇」。
+  ② 進度步驟的「進度未知（無 pv）」誤導文案改為「準備中…」（三語）。
+  ③ 主畫面的占位內容（「晚上好，Louis」、三張假任務卡、假的「今日」摘要、假電池 86%、
+  假時鐘 22:58）全部移除：問候語＝時段＋真實操作者名稱（與鎖定畫面同源；OOBE 的四個完成路徑
+  ——Enter／完成／略過／範本頁略過——收斂為單一 `ShellView::complete_oobe`，主題與名稱在完成當下即帶入，
+  先前只有 Enter 路徑帶主題、名稱則四處都沒帶，滑鼠點「開始使用」後主畫面與鎖定畫面都沒名字）、
+  任務卡＝真實待核准與進行中任務（空狀態「還沒有交辦的任務」）、選單列時鐘＝真實本地時間每 20 秒更新、
+  電池由 sysfs 讀取並以 30 秒快取，無電池即隱藏。
+  ④ Cmd+L 鎖定後解鎖，鍵盤焦點從未交回 Home，交辦列點了打字沒反應——解鎖時立起一次性
+  focus reclaim 旗標，由 Home 視窗下一次 render 認領（overlay 開啟時延後）。
+  ⑤ 兩張品牌 PNG 從已拆到 OS repo 的 `appliance/branding/` 改為 vendor 進 crate 的 `assets/branding/`，
+  主 repo 的 shell crate 拆分後首次恢復可編譯。
+  ⑥ Boxed 單行文字欄（含鎖定畫面密碼欄）加上 overflow 裁切：按鍵自動重複時遮罩圓點會畫出欄位外直到螢幕邊緣。
+  ⑦ 走查時發現的其餘問題（輸入法附著時序、硬殺後重開慢）記在 OS repo `wiki/eval/desktop-iso-qemu-walkthrough-2026-09-05.md`。
+- **sysd 拒絕未授權連線時，拒絕回應可能被 Linux RST 摧毀**：server 對 uid 不符的 peer 寫完 `unauthorized` 回應後直接關閉，socket 收件佇列裡未讀的 request 使 close 變成 RST——client 收到 `ECONNRESET` 而非結構化錯誤（macOS 語義不同從未在本機重現，只在 Linux CI 以 `mismatched_uid_is_rejected` 閃失敗現形）。現在回應寫出後做尺寸與時間雙重上限（500ms）的 bounded drain 再關閉，未授權 peer 也無法藉此拖住連線。
+- **`resolve_duduclaw_bin_from_exe` 測試在 Windows 矩陣必失敗**：解析器在 Windows 探測的是 `duduclaw.exe`（與實際出貨檔名一致，生產行為正確），但測試 fixture 用無副檔名檔名。fixture 改依平台命名。
 
 ## [1.62.0] - 2026-08-21 — goal 意圖路由×代碼安全審計×記憶與停滯修復
 

@@ -84,6 +84,12 @@ mod persistence;
 // whole module rather than one `Command::new` call.
 mod portal_browser;
 mod render;
+/// WP-C (2026-09-05, `docs/todo/TODO-ai-runtimes-2026-09.md` §3): the
+/// `RuntimeAuth` step's provider catalog — see its own header comment for
+/// why the table is mirrored shell-side and for the fail-closed rule on CLI
+/// logins the gateway cannot yet name.
+pub(crate) mod runtime_providers;
+pub(crate) mod seed;
 mod selections;
 mod state;
 mod steps;
@@ -106,6 +112,7 @@ pub(crate) mod widgets;
 /// `widgets` itself stays a private module, only specific items are opened
 /// up.
 pub(crate) use widgets::AccountFields;
+pub(crate) use widgets::RuntimeAuthFields;
 /// `main.rs` needs `NetworkFields` for the same reason it needs
 /// `AccountFields` (see that type's doc comment just above) — the
 /// `Network` step's PSK entry (Shell-S3) is the second, and so far only
@@ -182,7 +189,7 @@ pub(crate) use focus_order::{focus_next, focus_order, focus_prev, OobeFocusTarge
 /// own artifact, not a new reachability decision — the path stays exactly
 /// as public as it always was.
 #[allow(unused_imports)]
-pub use selections::{LanguageChoice, OobeSelections, OobeState, PrivacyToggle, TemplateChoice, ThemeChoice};
+pub use selections::{LanguageChoice, OobeSelections, OobeState, PrivacyToggle, RuntimeCredentialKind, RuntimeProviderOutcome, TemplateChoice, ThemeChoice};
 /// Disk I/O + boot-entry resolution — see `persistence.rs`'s own header
 /// comment. `state_path()` has no direct call site outside `oobe`'s own
 /// files either (same `#[allow]` reasoning as `OobeSelections`/`OobeState`

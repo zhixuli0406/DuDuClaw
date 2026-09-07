@@ -48,6 +48,28 @@ fn default_duduclaw_home() -> std::path::PathBuf {
     duduclaw_core::duduclaw_home()
 }
 
+/// The `ModelInfo` an HTTP backend reports for its configured model.
+///
+/// Deliberately honest about what is unknown: an OpenAI-compatible server
+/// exposes a name, not an architecture, a parameter count, a quantization
+/// or a file size, so those stay `"unknown"` / `0` rather than being
+/// guessed. `context_length` is the conservative 4096 floor every server in
+/// this class supports; callers that need the real window ask the server.
+fn remote_model_info(config: &OpenAiCompatConfig) -> ModelInfo {
+    ModelInfo {
+        id: config.model.clone(),
+        path: config.base_url.clone(),
+        architecture: "remote".to_string(),
+        parameter_count: "unknown".to_string(),
+        quantization: "unknown".to_string(),
+        file_size_bytes: 0,
+        estimated_memory_mb: 0,
+        kv_cache_mb: 0, // remote — managed by server
+        is_loaded: true,
+        context_length: 4096,
+    }
+}
+
 impl OpenAiCompatBackend {
     /// Construct using the standard `~/.duduclaw` home dir for key resolution.
     pub async fn new(config: OpenAiCompatConfig) -> Self {
@@ -73,10 +95,27 @@ impl OpenAiCompatBackend {
 
         let resolved_api_key = config.resolved_api_key(home_dir).await;
 
+        // WP-D: an HTTP backend has nothing to load — the server already
+        // holds the weights, and `load_model` below is a pure bookkeeping
+        // no-op that records the configured name. Seeding it here is what
+        // makes a bare `[openai_compat]` section usable on its own.
+        //
+        // Before this, `InferenceEngine::generate` refused with
+        // `NoModelLoaded` whenever the request carried no `model_id` AND
+        // `default_model` was unset — a live, reachable server answering
+        // "No model loaded". That is exactly the appliance's shape (the
+        // image's llama.cpp server is configured by default; nobody writes
+        // a `default_model`), and it also hit every hand-written
+        // `[openai_compat]` config that omitted `default_model`.
+        //
+        // An empty `model` stays `None`: that config names no model, so
+        // claiming one would be the fabrication this change exists to stop.
+        let loaded_model = (!config.model.trim().is_empty()).then(|| remote_model_info(&config));
+
         Self {
             config,
             client,
-            loaded_model: RwLock::new(None),
+            loaded_model: RwLock::new(loaded_model),
             chat_url,
             models_url,
             resolved_api_key,
@@ -182,19 +221,8 @@ impl InferenceBackend for OpenAiCompatBackend {
     }
 
     async fn load_model(&self, _model_path: &str, _params: &GenerationParams) -> Result<ModelInfo> {
-        // HTTP backends manage their own models — just verify connectivity
-        let info = ModelInfo {
-            id: self.config.model.clone(),
-            path: self.config.base_url.clone(),
-            architecture: "remote".to_string(),
-            parameter_count: "unknown".to_string(),
-            quantization: "unknown".to_string(),
-            file_size_bytes: 0,
-            estimated_memory_mb: 0,
-            kv_cache_mb: 0, // remote — managed by server
-            is_loaded: true,
-            context_length: 4096,
-        };
+        // HTTP backends manage their own models — this only records the name.
+        let info = remote_model_info(&self.config);
         *self.loaded_model.write().await = Some(info.clone());
         Ok(info)
     }
@@ -389,5 +417,55 @@ mod logprob_tests {
         let body = ChatRequest { logit_bias: Some(bias), ..body };
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("\"logit_bias\":{\"42\":1.5}"), "got: {json}");
+    }
+}
+
+#[cfg(test)]
+mod loaded_model_tests {
+    use super::*;
+    use crate::backend::InferenceBackend;
+
+    fn cfg(model: &str) -> OpenAiCompatConfig {
+        OpenAiCompatConfig {
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            api_key: None,
+            api_key_enc: None,
+            model: model.into(),
+        }
+    }
+
+    /// WP-D regression: a configured HTTP endpoint is usable on its own.
+    ///
+    /// `InferenceEngine::generate` refuses with `NoModelLoaded` unless the
+    /// backend reports a loaded model, and for an HTTP backend "loading" is
+    /// pure bookkeeping. Before the constructor seeded it, a bare
+    /// `[openai_compat]` section with no `default_model` — the appliance's
+    /// exact shape — made a live, reachable server answer "No model loaded".
+    #[tokio::test]
+    async fn constructor_reports_the_configured_model_as_loaded() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = OpenAiCompatBackend::new_with_home(cfg("local"), home.path()).await;
+        let loaded = backend.loaded_model().await.expect("model reported as loaded");
+        assert_eq!(loaded.id, "local");
+        assert_eq!(loaded.path, "http://127.0.0.1:8080/v1");
+        // Nothing is guessed about weights we cannot see.
+        assert_eq!(loaded.parameter_count, "unknown");
+        assert_eq!(loaded.file_size_bytes, 0);
+    }
+
+    /// A config naming no model must not have one invented for it.
+    #[tokio::test]
+    async fn an_empty_model_name_stays_unloaded() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = OpenAiCompatBackend::new_with_home(cfg("   "), home.path()).await;
+        assert!(backend.loaded_model().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unload_still_clears_it() {
+        let home = tempfile::tempdir().unwrap();
+        let backend = OpenAiCompatBackend::new_with_home(cfg("local"), home.path()).await;
+        backend.unload_model().await.unwrap();
+        assert!(backend.loaded_model().await.is_none());
     }
 }

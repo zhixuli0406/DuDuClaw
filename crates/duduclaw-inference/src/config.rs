@@ -445,26 +445,59 @@ impl Default for RouterConfig {
 }
 
 impl InferenceConfig {
-    /// Load config from `~/.duduclaw/inference.toml`, falling back to defaults.
+    /// Load config from `<home_dir>/inference.toml`, falling back to defaults.
+    ///
+    /// Two defaults layers are overlaid onto the parsed TOML **table**
+    /// before deserialization, so an explicit value in the file always wins
+    /// and an absent key gets a home-aware default rather than a literal:
+    ///
+    /// 1. `models_dir` → `<home_dir>/models` (every host). Previously the
+    ///    struct default `"~/.duduclaw/models"` diverged from where the
+    ///    gateway actually downloads models (`<home>/models`) whenever
+    ///    `DUDUCLAW_HOME` was set — the appliance case.
+    /// 2. On an appliance that actually shipped `llama-server`, the image's
+    ///    local-endpoint layout (see [`crate::appliance`]).
+    ///
+    /// A corrupt file is warned about and treated as absent so the appliance
+    /// still comes up with a working local path.
     pub async fn load(home_dir: &Path) -> Self {
-        let config_path = home_dir.join("inference.toml");
-        match tokio::fs::read_to_string(&config_path).await {
-            Ok(content) => match toml::from_str::<Self>(&content) {
-                Ok(mut config) => {
-                    // Auto-validate voice config on load
-                    if let Some(ref mut voice) = config.voice {
-                        voice.validate();
-                    }
-                    config
-                }
+        let table = match tokio::fs::read_to_string(&home_dir.join("inference.toml")).await {
+            Ok(content) => match content.parse::<toml::Table>() {
+                Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("Failed to parse inference.toml: {e}, using defaults");
-                    Self::default()
+                    toml::Table::new()
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
             Err(e) => {
                 tracing::warn!("Failed to read inference.toml: {e}, using defaults");
+                toml::Table::new()
+            }
+        };
+        Self::from_table_for_home(table, home_dir)
+    }
+
+    /// Deserialize a parsed `inference.toml` table with the home-aware
+    /// defaults layers applied. Split out from [`Self::load`] so the
+    /// defaults are testable without touching the filesystem.
+    pub fn from_table_for_home(mut table: toml::Table, home_dir: &Path) -> Self {
+        let models_dir = home_dir.join("models").to_string_lossy().to_string();
+        if crate::appliance::appliance_defaults_active() {
+            crate::appliance::overlay_appliance_defaults(&mut table, &models_dir);
+        } else {
+            crate::appliance::overlay_models_dir_default(&mut table, &models_dir);
+        }
+        match toml::Value::Table(table).try_into::<Self>() {
+            Ok(mut config) => {
+                // Auto-validate voice config on load
+                if let Some(ref mut voice) = config.voice {
+                    voice.validate();
+                }
+                config
+            }
+            Err(e) => {
+                tracing::warn!("Failed to deserialize inference.toml: {e}, using defaults");
                 Self::default()
             }
         }
@@ -609,5 +642,62 @@ mod openai_compat_key_tests {
         assert!(!dbg.contains("sk-plain"));
         assert!(!dbg.contains("enc-blob"));
         assert!(dbg.contains("[REDACTED]"));
+    }
+}
+
+#[cfg(test)]
+mod home_aware_defaults_tests {
+    use super::InferenceConfig;
+    use std::path::Path;
+
+    /// WP-D: an absent `models_dir` resolves against the home the config was
+    /// loaded from, not against a literal `~/.duduclaw`. Those two agree
+    /// only while `DUDUCLAW_HOME` is unset; with it set, the engine used to
+    /// look in `$HOME/.duduclaw/models` while every download landed in
+    /// `$DUDUCLAW_HOME/models`.
+    ///
+    /// (These tests run without `DUDUCLAW_APPLIANCE`, so only the
+    /// `models_dir` layer applies — the appliance layer is table-tested in
+    /// `crate::appliance`, where it needs no process-global env state.)
+    #[test]
+    fn absent_models_dir_resolves_against_the_loading_home() {
+        let cfg = InferenceConfig::from_table_for_home(
+            "enabled = true".parse().unwrap(),
+            Path::new("/data/duduclaw"),
+        );
+        assert_eq!(cfg.models_dir, "/data/duduclaw/models");
+        assert_eq!(cfg.models_path(), Path::new("/data/duduclaw/models"));
+    }
+
+    #[test]
+    fn an_explicit_models_dir_still_wins() {
+        let cfg = InferenceConfig::from_table_for_home(
+            "models_dir = \"/mnt/big/models\"".parse().unwrap(),
+            Path::new("/data/duduclaw"),
+        );
+        assert_eq!(cfg.models_dir, "/mnt/big/models");
+    }
+
+    /// Off-appliance nothing else is filled in: local inference stays off
+    /// unless the operator turned it on.
+    #[test]
+    fn no_appliance_keys_are_invented_on_an_ordinary_host() {
+        let cfg =
+            InferenceConfig::from_table_for_home(toml::Table::new(), Path::new("/home/kai/.duduclaw"));
+        assert!(!cfg.enabled);
+        assert!(cfg.backend.is_none());
+        assert!(cfg.openai_compat.is_none());
+        assert_eq!(cfg.models_dir, "/home/kai/.duduclaw/models");
+    }
+
+    /// A file that does not deserialize (right TOML, wrong types) falls back
+    /// to defaults with a warning rather than panicking the gateway.
+    #[test]
+    fn a_type_mismatch_falls_back_to_defaults() {
+        let cfg = InferenceConfig::from_table_for_home(
+            "enabled = \"yes-please\"".parse().unwrap(),
+            Path::new("/data/duduclaw"),
+        );
+        assert!(!cfg.enabled);
     }
 }

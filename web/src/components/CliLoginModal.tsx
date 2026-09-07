@@ -14,6 +14,7 @@ import { extractAuthUrl } from '@/lib/cli-auth-url';
 import { isImeComposing } from '@/lib/keyboard';
 import { client } from '@/lib/ws-client';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, Button, Input } from '@/components/mds';
+import { SubscriptionRiskDisclosure } from '@/components/SubscriptionRiskDisclosure';
 
 /* eslint-disable no-control-regex */
 /**
@@ -75,6 +76,11 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
   const [input, setInput] = useState('');
   const [errMsg, setErrMsg] = useState<string | null>(null);
   const [registerMsg, setRegisterMsg] = useState<string | null>(null);
+  // §1-1 risk disclosure (WP-A) — the CLI's native login is a consumer-
+  // subscription token, gated behind an explicit acknowledgment before the
+  // login subprocess/browser flow is even started.
+  const [riskAck, setRiskAck] = useState(false);
+  const [started, setStarted] = useState(false);
   const outRef = useRef<HTMLPreElement>(null);
   const sidRef = useRef<string | null>(null);
 
@@ -82,9 +88,10 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
   const clean = useMemo(() => stripAnsi(output), [output]);
   const authUrl = useMemo(() => extractAuthUrl(clean), [clean]);
 
-  // Start the login session when the modal opens.
+  // Start the login session once the modal is open AND the risk disclosure
+  // has been acknowledged (`started`) — never on open alone.
   useEffect(() => {
-    if (!open) return;
+    if (!open || !started) return;
     let cancelled = false;
     setOutput('');
     setStatus('running');
@@ -109,7 +116,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [open, runtime]);
+  }, [open, runtime, started]);
 
   // Stream output + terminal status from the gateway event bus.
   useEffect(() => {
@@ -234,6 +241,31 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             )}
           </DialogTitle>
         </DialogHeader>
+        {/* Docker deployment caveat — grok's device-code login writes into
+            whichever ~/.grok the gateway process sees, which is the
+            container's volume when the gateway runs in Docker. Shown
+            regardless of the risk-disclosure gate below: it's relevant
+            context for the decision, not part of the login flow itself. */}
+        {runtime === 'grok' && (
+          <div className="flex items-start gap-2 rounded-lg border border-surface-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            <Info className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{intl.formatMessage({ id: 'cliLogin.grok.dockerHint' })}</span>
+          </div>
+        )}
+
+        {!started ? (
+          <div className="space-y-3">
+            <SubscriptionRiskDisclosure checked={riskAck} onCheckedChange={setRiskAck} />
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <Button variant="outline" onClick={() => void handleClose()}>
+                {intl.formatMessage({ id: 'common.cancel' })}
+              </Button>
+              <Button variant="brand" disabled={!riskAck} onClick={() => setStarted(true)}>
+                {intl.formatMessage({ id: 'subscriptionRisk.continue' })}
+              </Button>
+            </div>
+          </div>
+        ) : (
         <div className="space-y-3">
           {!remoteSafe && (
             <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
@@ -242,16 +274,6 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             </div>
           )}
           {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
-
-          {/* Docker deployment caveat — grok's device-code login writes into
-              whichever ~/.grok the gateway process sees, which is the
-              container's volume when the gateway runs in Docker. */}
-          {runtime === 'grok' && (
-            <div className="flex items-start gap-2 rounded-lg border border-surface-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              <Info className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>{intl.formatMessage({ id: 'cliLogin.grok.dockerHint' })}</span>
-            </div>
-          )}
 
           {/* One-click auth link — surfaces the URL buried in the CLI output. */}
           {authUrl && status === 'running' && (
@@ -325,6 +347,7 @@ export function CliLoginModal({ open, runtime, onClose, onSuccess }: Props) {
             </div>
           </div>
         </div>
+        )}
       </DialogContent>
     </Dialog>
   );

@@ -95,7 +95,7 @@ fn fetch_once(existing_jwt: Option<String>) -> Result<Vec<TaskProgressItem>, gat
         Some(jwt) => jwt,
         None => gateway_client::bootstrap_local_session()?,
     };
-    Ok(gateway_client::list_in_progress_tasks(&jwt)?)
+    Ok(gateway_client::list_open_tasks(&jwt)?)
 }
 
 /// Applies one settled fetch. Returns whether the dock badge / panel section

@@ -86,6 +86,8 @@ pub(crate) mod notifications;
 /// rather than more lines in `notifications.rs` — that file was already at
 /// this crate's 800-line ceiling; see `notifications_apps`'s own header.
 mod notifications_apps;
+pub mod agents_feed;
+mod notifications_agents;
 /// WP-A4-4 (2026-08-22): retry spacing + log denoise for the feed's gateway
 /// poll. Its own module rather than more methods on `notifications_feed`
 /// because it is a self-contained, clock-injected policy with a test suite
@@ -138,6 +140,8 @@ pub struct OverlayUiState {
     /// (`notifications_tasks::task_progress_section`) both read it. See
     /// `task_progress_feed::TaskProgressFeed`'s own header comment.
     pub task_progress: task_progress_feed::TaskProgressFeed,
+    /// The real AI-team roster — see `agents_feed`.
+    pub agents: agents_feed::AgentsFeed,
     /// A2 (2026-08-23): the 共駕 row's compositor-backed state.
     ///
     /// It lives HERE rather than as a sibling field on `ShellView` (the shape
@@ -172,6 +176,7 @@ impl Default for OverlayUiState {
             // A4: nothing has been fetched yet — the same honest "no data
             // yet" starting point `notifications` above uses.
             task_progress: task_progress_feed::TaskProgressFeed::default(),
+            agents: agents_feed::AgentsFeed::default(),
             // A2: nothing has been asked of the compositor yet — the row's
             // own `NotLoaded` default, which is what arms its first read.
             codrive: codrive_row::CodriveUiState::default(),

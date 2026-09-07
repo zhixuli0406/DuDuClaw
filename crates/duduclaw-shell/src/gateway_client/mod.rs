@@ -24,6 +24,13 @@
 //                  `TaskSnapshot` + `list_agents`/`pick_default_agent`/
 //                  `create_goal`/`list_tasks`/`decide_goal_task` — the
 //                  Launcher's 交辦 card and its own agent-scoped poll loop.
+//   `cli_login`  — WP-C (2026-09-05): the `auth.cli_login.*` family the
+//                  OOBE `RuntimeAuth` step's 「登入帳號」 action drives, plus
+//                  the transcript parsing that pulls a device code and a
+//                  verification URL out of a CLI's PTY output. The one
+//                  module here that is NOT a plain request/response — see
+//                  its own header comment, and `ws_rpc::
+//                  call_then_stream_events`.
 //   `task_progress` — A4 (2026-08-24): typed `TaskProgressItem` +
 //                  `list_in_progress_tasks`, over the SAME `ws_rpc::
 //                  call_once` — the dock badge / Notifications panel's
@@ -41,6 +48,12 @@
 // so it's usable — and tested — without a live window.
 
 pub mod approvals;
+/// WP-C (2026-09-05): the `auth.cli_login.*` family — the same "Dashboard
+/// 一鍵登入" flow `web/src/components/CliLoginModal.tsx` drives, reached
+/// from the OOBE `RuntimeAuth` step's 「登入帳號」 action. See that module's
+/// own header comment for the wire contract, and for its
+/// `UNVERIFIED: needs live gateway` scope note.
+pub mod cli_login;
 mod login;
 /// ICON-3 (2026-08-23): `device.power_local`, the lockscreen's restart/
 /// shut-down control — see that module's own header comment for the wire
@@ -66,8 +79,8 @@ pub use approvals::{decide_approval, list_approvals, ApprovalItem};
 // allowance `duduclaw-native-gui/src/rpc.rs::CallError::Rejected`'s own doc
 // comment gives for the identical situation, not dead code to delete.
 #[allow(unused_imports)]
-pub use tasks::{create_goal, decide_goal_task, list_agents, list_tasks, pick_default_agent, AgentRef, CreatedGoal, TaskSnapshot};
-pub use task_progress::{list_in_progress_tasks, TaskProgressItem};
+pub use tasks::{add_api_key_account, create_agent, create_goal, decide_goal_task, list_agents, list_tasks, pick_default_agent, AgentRef, CreatedGoal, TaskSnapshot};
+pub use task_progress::{list_open_tasks, TaskProgressItem};
 pub(crate) use login::{verify_password, LoginError};
 pub(crate) use power::{power_local, PowerAction, PowerError};
 pub use session::{bootstrap_local_session, SessionError};

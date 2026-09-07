@@ -662,11 +662,30 @@ struct InFlight {
     /// the gate is unwired in tests) — carried forward across re-dispatch,
     /// renewed each tick, released when the task reaches a terminal state.
     lease: Option<duduclaw_core::ConcurrencyLease>,
+    /// Queue id of the work message this round dispatched. Lets the tick
+    /// notice a SYNCHRONOUS dispatch failure (the dispatcher marked the
+    /// message `failed` — runtime not installed, local engine down, auth
+    /// refused …) and free the slot at once instead of holding it until
+    /// `stalled_secs` / the no-progress escalation.
+    message_id: Option<String>,
     /// H22: the round (`iter`) for which the no-progress notice has already
     /// been emitted, so a long-running task reports at most once per round
     /// instead of once per tick. Reset to `None` implicitly on every
     /// re-dispatch, since dispatch rebuilds the whole [`InFlight`] entry.
     progress_reported_round: Option<u32>,
+}
+
+/// Consecutive synchronous dispatch failures after which a goal task is
+/// parked `needs_human` instead of being retried again.
+const DISPATCH_FAILURE_LIMIT: u32 = 3;
+
+/// Back-off before a task whose dispatch failed becomes a candidate again:
+/// 60 s, 120 s, 240 s … (doubling per consecutive failure). Short enough that
+/// a transient outage (llama-server still loading a model) self-heals within
+/// a few minutes, long enough that a hard failure does not burn a round every
+/// tick.
+fn dispatch_backoff_secs(failures: u32) -> i64 {
+    60i64.saturating_mul(1i64 << failures.saturating_sub(1).min(6))
 }
 
 /// H22: pure predicate — how many whole minutes a task has gone without an
@@ -711,6 +730,11 @@ pub struct GoalLoopDriver {
     /// Per-task in-flight bookkeeping. Held behind a mutex so `tick_once` can
     /// take `&self`; there is only ever one tick in flight, so contention is nil.
     inflight: Mutex<HashMap<String, InFlight>>,
+    /// Per-task synchronous dispatch failures: (consecutive count, not-before).
+    /// A task listed here is skipped by the candidate loop until `not-before`
+    /// and is escalated once the count reaches [`DISPATCH_FAILURE_LIMIT`].
+    /// Cleared the moment a round is picked up (`in_progress`) or escalated.
+    dispatch_failures: Mutex<HashMap<String, (u32, DateTime<Utc>)>>,
     /// Task ids whose kickoff approval is outstanding (task_id → approval id).
     kickoff: Mutex<HashMap<String, ApprovalId>>,
     /// needs_human goal tasks already pushed to a channel this process life, so
@@ -792,6 +816,7 @@ impl GoalLoopDriver {
             broker: None,
             policy: None,
             inflight: Mutex::new(HashMap::new()),
+            dispatch_failures: Mutex::new(HashMap::new()),
             kickoff: Mutex::new(HashMap::new()),
             notified_needs_human: Mutex::new(HashSet::new()),
             operator_skipped: Mutex::new(HashSet::new()),
@@ -883,6 +908,7 @@ impl GoalLoopDriver {
             tick_secs = self.config.tick_secs,
             "Goal loop driver started (autonomous goal_mode dispatch)"
         );
+        self.release_stale_goal_leases();
         while self.running.load(Ordering::SeqCst) {
             time::sleep(Duration::from_secs(self.config.tick_secs.max(1))).await;
             if let Err(e) = self.tick_once().await {
@@ -952,8 +978,24 @@ impl GoalLoopDriver {
         // ── Reconcile: prune finished/escalated entries, and mark picked-up
         //    tasks (moved to in_progress/review) as no longer awaiting pickup so
         //    they still count against concurrency but are not re-dispatched. ──
+        // Tasks escalated by the dispatch-failure path in THIS tick: the
+        // candidate list above was read while they were still `todo`, so
+        // without this set the loop below would re-dispatch a task that was
+        // just parked `needs_human`.
+        let mut escalated_this_tick: HashSet<String> = HashSet::new();
         let tracked: Vec<String> = inflight.keys().cloned().collect();
         for id in tracked {
+            // ── Synchronous dispatch failure: the dispatcher could not even
+            //    hand the round to the runtime (`message dispatch failed`).
+            //    Free the slot NOW — before the candidate check below, because
+            //    such a task is still `todo` and therefore a candidate — so the
+            //    Personal-edition cap is not held by a round that never ran. ──
+            if let Some(failed_error) = self.dispatch_failure_for(&inflight, &id).await {
+                if self.on_dispatch_failed(&mut inflight, &id, &failed_error).await? {
+                    escalated_this_tick.insert(id.clone());
+                }
+                continue;
+            }
             if candidate_ids.contains(&id) {
                 continue; // still a candidate — handled below
             }
@@ -969,6 +1011,9 @@ impl GoalLoopDriver {
                     if let Some(e) = inflight.get_mut(&id) {
                         e.awaiting_pickup = false;
                     }
+                    // The round reached the runtime — an earlier synchronous
+                    // failure streak is over.
+                    self.dispatch_failures.lock().await.remove(&id);
                     // H22: the task IS claimed and running — the stall guard
                     // (`stalled_secs`) no longer applies here, so a silent
                     // long-runner had no visible signal at all until it
@@ -1275,8 +1320,15 @@ impl GoalLoopDriver {
                 continue;
             }
 
+            if escalated_this_tick.contains(&task.id) {
+                continue;
+            }
             let entry = inflight.get(&task.id).cloned();
             let is_new = entry.is_none();
+
+            if is_new && self.in_dispatch_backoff(&task.id, now).await {
+                continue;
+            }
 
             // Collaborator/Consultant: gate the FIRST dispatch behind a human
             // kickoff approval. Waiting/Aborted ⇒ do not dispatch this tick.
@@ -1621,7 +1673,7 @@ impl GoalLoopDriver {
             }
             state_text.push_str("\n\n");
             state_text.push_str(&risk_boundary_section);
-            self.enqueue_work(task, next_iter, &state_text).await?;
+            let dispatched_message_id = self.enqueue_work(task, next_iter, &state_text).await?;
             // A2: commit this round's state as the latest dispatched state
             // for the unchanged-streak comparison the NEXT rejection
             // re-dispatch will make (see the peek/commit split in the guard
@@ -1671,6 +1723,7 @@ impl GoalLoopDriver {
                     lease,
                     // H22: a fresh round starts its own silence window.
                     progress_reported_round: None,
+                    message_id: Some(dispatched_message_id),
                 },
             );
 
@@ -1733,6 +1786,117 @@ impl GoalLoopDriver {
     fn release_lease(&self, entry: &InFlight) {
         if let Some(lease) = &entry.lease {
             duduclaw_core::concurrency_release(&self.home_dir, lease);
+        }
+    }
+
+    /// If the tracked round for `task_id` is still awaiting pickup and its
+    /// work message is marked `failed` in the queue, return the error text.
+    async fn dispatch_failure_for(
+        &self,
+        inflight: &HashMap<String, InFlight>,
+        task_id: &str,
+    ) -> Option<String> {
+        let entry = inflight.get(task_id)?;
+        if !entry.awaiting_pickup {
+            return None;
+        }
+        let message_id = entry.message_id.as_deref()?;
+        let msg = self.queue.get_by_id(message_id).await.ok().flatten()?;
+        if msg.status != MessageStatus::Failed {
+            return None;
+        }
+        Some(msg.error.unwrap_or_else(|| "dispatch failed".to_string()))
+    }
+
+    /// A round's work message failed before any agent ran it. Free the slot
+    /// and the edition lease immediately, record a back-off so the task is
+    /// not re-dispatched every tick, and after [`DISPATCH_FAILURE_LIMIT`]
+    /// consecutive failures park the task `needs_human` with the error —
+    /// the person can then fix the runtime / local model / credentials and
+    /// resume, instead of the loop silently retrying into the same wall.
+    async fn on_dispatch_failed(
+        &self,
+        inflight: &mut HashMap<String, InFlight>,
+        task_id: &str,
+        error: &str,
+    ) -> Result<bool, String> {
+        if let Some(removed) = inflight.remove(task_id) {
+            self.release_lease(&removed);
+        }
+        let now = Utc::now();
+        let failures = {
+            let mut map = self.dispatch_failures.lock().await;
+            let entry = map.entry(task_id.to_string()).or_insert((0, now));
+            entry.0 += 1;
+            entry.1 = now + chrono::Duration::seconds(dispatch_backoff_secs(entry.0));
+            entry.0
+        };
+        let short_error: String = error.chars().take(200).collect();
+        warn!(
+            task = %task_id,
+            failures,
+            limit = DISPATCH_FAILURE_LIMIT,
+            error = %short_error,
+            "goal loop: work message failed to dispatch — slot released"
+        );
+        let Some(task) = self.store.get_task(task_id).await? else {
+            return Ok(false);
+        };
+        if failures >= DISPATCH_FAILURE_LIMIT {
+            self.post_activity(
+                "goal_loop.dispatch_failed",
+                &task.assigned_to,
+                Some(task_id),
+                &format!(
+                    "goal-loop 連續 {failures} 次派工失敗，轉人工 — {}：{short_error}",
+                    task.title
+                ),
+            )
+            .await;
+            self.dispatch_failures.lock().await.remove(task_id);
+            self.escalate(
+                inflight,
+                &task,
+                &format!("goal-loop dispatch failed {failures}x: {short_error}"),
+                crate::pause_reason::PauseReason::Infra,
+            )
+            .await?;
+            return Ok(true);
+        } else {
+            self.post_activity(
+                "goal_loop.dispatch_failed",
+                &task.assigned_to,
+                Some(task_id),
+                &format!(
+                    "goal-loop 派工失敗（第 {failures}/{DISPATCH_FAILURE_LIMIT} 次，{} 秒後重試）— {}：{short_error}",
+                    dispatch_backoff_secs(failures),
+                    task.title
+                ),
+            )
+            .await;
+        }
+        Ok(false)
+    }
+
+    /// `true` while `task_id` is inside its dispatch-failure back-off window.
+    async fn in_dispatch_backoff(&self, task_id: &str, now: DateTime<Utc>) -> bool {
+        let map = self.dispatch_failures.lock().await;
+        map.get(task_id).is_some_and(|(_, not_before)| now < *not_before)
+    }
+
+    /// Restart recovery for the edition concurrency gate: this driver is the
+    /// only holder of the `goal` lease class and its in-memory in-flight map
+    /// is empty at start, so every lease still in the file is an orphan of a
+    /// previous process. Dropping them is what keeps a restart from deferring
+    /// every new goal task for the lease TTL.
+    fn release_stale_goal_leases(&self) {
+        if self.concurrency_limit.is_none() {
+            return;
+        }
+        let dropped =
+            duduclaw_core::concurrency_release_class(&self.home_dir, CONCURRENCY_CLASS_GOAL);
+        if dropped > 0 {
+            info!(dropped, "goal loop: released orphaned edition concurrency leases from a previous process");
         }
     }
 
@@ -2184,7 +2348,9 @@ impl GoalLoopDriver {
     /// to the agent unchanged. Carries `judge_feedback` (if any) so a rejected
     /// task is retried *with* the reviewer's feedback, and (I-1c) an approved
     /// plan-first plan so the very first round after approval executes it.
-    async fn enqueue_work(&self, task: &TaskRow, iter: u32, state_text: &str) -> Result<(), String> {
+    /// Returns the queue id of the work message so the in-flight record can
+    /// watch it for a synchronous dispatch failure.
+    async fn enqueue_work(&self, task: &TaskRow, iter: u32, state_text: &str) -> Result<String, String> {
         let marker = format!("[goal-loop task_id={} iter={iter}]", task.id);
         // I-3a: a task continued from `done`/`failed`/`cancelled` via the
         // dashboard's "接著做" action stamps `judge_feedback` with
@@ -2289,7 +2455,7 @@ impl GoalLoopDriver {
             turn_id: None,
             session_id: None,
         };
-        let result = self.queue.enqueue(&msg).await;
+        let result = self.queue.enqueue(&msg).await.map(|()| msg.id.clone());
         // I-1c: the plan has now been injected into this round's payload —
         // consume it so it is not re-injected on every later round. Cleared
         // only after a successful enqueue (an enqueue failure leaves it in
@@ -3282,6 +3448,118 @@ mod tests {
     /// plan-first creation path (parking directly in `needs_human`) actually
     /// keeps the task out of the loop — not a new guard, the existing
     /// candidate-status filter already provides it.
+    // ── Synchronous dispatch failure → slot freed, back-off, escalation ──
+    //
+    // 2026-09-06 appliance walkthrough: two goal tasks whose work messages
+    // failed synchronously (local engine misconfigured) kept their in-flight
+    // slots AND their edition leases, so with the Personal cap of 2 every
+    // later goal task was deferred with "edition concurrency cap reached"
+    // until the 30-minute lease TTL — a restart did not help either.
+
+    async fn fail_all_pending(queue: &MessageQueue, error: &str) -> usize {
+        let pending = queue.pending_messages(50).await.unwrap();
+        for m in &pending {
+            queue.fail(&m.id, error).await.unwrap();
+        }
+        pending.len()
+    }
+
+    #[tokio::test]
+    async fn failed_dispatch_frees_the_slot_and_the_lease_on_the_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+        store.insert_task(&goal_task("g2", "alice")).await.unwrap();
+
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf())
+            .with_concurrency_limit(Some(1), 1800);
+
+        d.tick_once().await.unwrap();
+        assert_eq!(d.inflight.lock().await.len(), 1, "cap 1 ⇒ one round in flight");
+        assert_eq!(duduclaw_core::concurrency_active_count(dir.path(), CONCURRENCY_CLASS_GOAL), 1);
+        assert_eq!(fail_all_pending(&queue, "Local inference engine not available").await, 1);
+
+        d.tick_once().await.unwrap();
+        assert_eq!(
+            duduclaw_core::concurrency_active_count(dir.path(), CONCURRENCY_CLASS_GOAL),
+            1,
+            "the failed round's lease was released and the OTHER task admitted"
+        );
+        let inflight = d.inflight.lock().await;
+        assert_eq!(inflight.len(), 1);
+        assert!(
+            !inflight.contains_key("g1") || !inflight.contains_key("g2"),
+            "exactly one task in flight"
+        );
+        drop(inflight);
+        // The failed task is in back-off, the other one got the slot.
+        assert!(d.in_dispatch_backoff("g1", Utc::now()).await || d.in_dispatch_backoff("g2", Utc::now()).await);
+        assert_eq!(store.get_task("g1").await.unwrap().unwrap().status, "todo", "one failure does not escalate");
+    }
+
+    #[tokio::test]
+    async fn three_consecutive_dispatch_failures_park_the_task_needs_human() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), GoalLoopConfig { iteration_cap: 10, ..small_cfg() })
+            .with_home_dir(dir.path().to_path_buf());
+
+        for round in 1..=DISPATCH_FAILURE_LIMIT {
+            d.tick_once().await.unwrap();
+            assert_eq!(fail_all_pending(&queue, "runtime not installed").await, 1, "round {round} dispatched");
+            d.tick_once().await.unwrap(); // notices the failure
+            // Skip the back-off window so the next tick re-dispatches.
+            if let Some(entry) = d.dispatch_failures.lock().await.get_mut("g1") {
+                entry.1 = Utc::now() - chrono::Duration::seconds(1);
+            }
+        }
+        let task = store.get_task("g1").await.unwrap().unwrap();
+        assert_eq!(task.status, "needs_human", "third failure escalates");
+        assert!(d.inflight.lock().await.is_empty());
+        assert!(!d.dispatch_failures.lock().await.contains_key("g1"), "escalation clears the streak");
+    }
+
+    #[tokio::test]
+    async fn dispatch_backoff_skips_the_task_until_its_window_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+        let d = driver(store.clone(), queue.clone(), small_cfg());
+
+        d.tick_once().await.unwrap();
+        fail_all_pending(&queue, "boom").await;
+        d.tick_once().await.unwrap(); // failure noticed → back-off 60 s
+        d.tick_once().await.unwrap(); // inside the window: no new dispatch
+        assert!(queue.pending_messages(10).await.unwrap().is_empty(), "no re-dispatch inside the back-off window");
+        assert_eq!(dispatch_backoff_secs(1), 60);
+        assert_eq!(dispatch_backoff_secs(2), 120);
+        assert_eq!(dispatch_backoff_secs(3), 240);
+        assert_eq!(dispatch_backoff_secs(20), 60 * 64, "capped");
+    }
+
+    #[tokio::test]
+    async fn stale_goal_leases_are_released_when_the_driver_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two orphaned leases from a previous process life.
+        for _ in 0..2 {
+            assert!(matches!(
+                duduclaw_core::concurrency_try_acquire(dir.path(), CONCURRENCY_CLASS_GOAL, Some(2), 1800),
+                duduclaw_core::ConcurrencyAcquireOutcome::Admitted(_)
+            ));
+        }
+        let (store, queue) = open_stores(dir.path()).await;
+        store.insert_task(&goal_task("g1", "alice")).await.unwrap();
+        let d = GoalLoopDriver::new(store.clone(), queue.clone(), small_cfg())
+            .with_home_dir(dir.path().to_path_buf())
+            .with_concurrency_limit(Some(2), 1800);
+        d.release_stale_goal_leases();
+        assert_eq!(duduclaw_core::concurrency_active_count(dir.path(), CONCURRENCY_CLASS_GOAL), 0);
+        d.tick_once().await.unwrap();
+        assert_eq!(d.inflight.lock().await.len(), 1, "a fresh task is admitted after the orphans are gone");
+    }
+
     #[tokio::test]
     async fn plan_pending_task_is_not_dispatched_before_approval() {
         let dir = tempfile::tempdir().unwrap();
@@ -4697,6 +4975,7 @@ mod tests {
             awaiting_pickup: false,
             lease: None,
             progress_reported_round: None,
+            message_id: None,
         }
     }
 

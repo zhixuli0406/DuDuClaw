@@ -283,8 +283,12 @@ describe('RuntimeSetupCard — login + re-detect', () => {
       <RuntimeSetupCard provider="codex" installed loggedIn={false} onDetect={vi.fn()} />,
     );
     await user.click(screen.getByRole('button', { name: /sign in now/i }));
-    await waitFor(() => expect(api.auth.cliLoginStart).toHaveBeenCalledWith('codex'));
+    // WP-A (§1-1): the modal opens on the risk disclosure gate — the actual
+    // login subprocess only starts once that is acknowledged.
     expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    await user.click(await screen.findByRole('checkbox', { name: /understand the risk/i }));
+    await user.click(screen.getByRole('button', { name: /^continue$/i }));
+    await waitFor(() => expect(api.auth.cliLoginStart).toHaveBeenCalledWith('codex'));
   });
 
   // WP-D: headless boxes can't complete `claude login`'s localhost-callback
@@ -303,8 +307,11 @@ describe('RuntimeSetupCard — login + re-detect', () => {
       <RuntimeSetupCard provider="claude" installed loggedIn={false} onDetect={vi.fn()} />,
     );
     await user.click(screen.getByRole('button', { name: /sign in now/i }));
-    await waitFor(() => expect(api.accounts.setupTokenStart).toHaveBeenCalled());
+    // WP-A (§1-1): same risk-disclosure gate as the generic CLI login modal.
     expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    await user.click(await screen.findByRole('checkbox', { name: /understand the risk/i }));
+    await user.click(screen.getByRole('button', { name: /^continue$/i }));
+    await waitFor(() => expect(api.accounts.setupTokenStart).toHaveBeenCalled());
   });
 
   it('reports ready once installed and signed in', () => {

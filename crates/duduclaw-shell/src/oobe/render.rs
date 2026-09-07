@@ -23,12 +23,19 @@ use gpui::{div, prelude::*, px, Context, Stateful, Div};
 
 use duduclaw_native_gui::theme;
 
-use super::widgets::{self, AccountFields, NetworkFields, StepButtonVariant};
+use super::widgets::{self, AccountFields, NetworkFields, RuntimeAuthFields, StepButtonVariant};
 use super::{steps, OobeFlow, OobeStep, OobeUiState};
 use crate::i18n::{t, Key};
 use crate::ShellView;
 
-pub fn render(flow: &OobeFlow, ui: &OobeUiState, account_fields: &AccountFields, network_fields: &NetworkFields, cx: &mut Context<ShellView>) -> Stateful<Div> {
+pub fn render(
+    flow: &OobeFlow,
+    ui: &OobeUiState,
+    account_fields: &AccountFields,
+    network_fields: &NetworkFields,
+    runtime_fields: &RuntimeAuthFields,
+    cx: &mut Context<ShellView>,
+) -> Stateful<Div> {
     let step = flow.current();
     let palette = flow.palette();
     // Ambient theme for `widgets::OobeTextField` (the ONE OOBE widget that
@@ -78,7 +85,7 @@ pub fn render(flow: &OobeFlow, ui: &OobeUiState, account_fields: &AccountFields,
                 // the approved design boards, where every card is the full
                 // 640 column. Title/subtitle centering is each step root's
                 // own `.items_center()`, not this wrapper's job.
-                .child(div().w(px(640.)).flex().flex_col().gap(px(20.)).child(steps::render(step, flow, ui, account_fields, network_fields, cx))),
+                .child(div().w(px(640.)).flex().flex_col().gap(px(20.)).child(steps::render(step, flow, ui, account_fields, network_fields, runtime_fields, cx))),
         )
         .child(button_row(step, flow, ui, cx))
 }
@@ -111,28 +118,20 @@ fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Contex
         cx.notify();
     });
     // D2-b (2026-08-24): the mouse-driven completion paths below used to
-    // set `view.oobe = None` on `flow.completed()` WITHOUT the two lines
-    // `main.rs`'s keyboard path (`handle_enter_key`'s `EnterOutcome::
-    // Advance` arm) carries out right next to its own `self.oobe = None` —
-    // copying `flow.state().selections.theme` onto `view.theme` and telling
-    // comp via `notify_comp_theme`. `ShellView::render` paints Home from
-    // `self.theme`, never from the (now-gone) `flow.state()`, so OOBE
-    // completed via 完成/略過 (the buttons everyone actually clicks —
-    // `Enter` is a keyboard-only alternate path) landed on Home still
-    // showing whatever `initial_theme` boot loaded, even though `save_
-    // state` had already written the picked theme to disk correctly (which
-    // is why a SHELL RESTART after this same OOBE run picked it up fine —
-    // only the same-process transition was missing it). Both closures below
-    // now mirror `main.rs`'s two lines exactly, so all three completion
-    // sites (Enter, 完成, 略過) agree.
+    // set `view.oobe = None` on `flow.completed()` WITHOUT the theme
+    // adoption `main.rs`'s keyboard path (`handle_enter_key`'s
+    // `EnterOutcome::Advance` arm) carried out — so 完成/略過 (the buttons
+    // everyone actually clicks) landed on Home still showing the boot
+    // theme. 2026-09-05: the same drift repeated for the operator name, so
+    // every completion site now calls the ONE method `ShellView::
+    // complete_oobe` (theme + operator name + comp notify + drop the flow)
+    // instead of mirroring lines by hand — see its own doc comment.
     let skip_click = cx.listener(|view, _ev, _window, cx| {
         if let Some(flow) = view.oobe.as_mut() {
             flow.skip();
             super::save_state(flow.state());
             if flow.completed() {
-                view.theme = flow.state().selections.theme;
-                crate::notify_comp_theme(view.theme);
-                view.oobe = None;
+                view.complete_oobe(cx);
             }
         }
         cx.notify();
@@ -161,11 +160,9 @@ fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Contex
             super::save_state(flow.state());
             if advanced {
                 if flow.completed() {
-                    // D2-b: see this fn's header comment just above `skip_
-                    // click` for why these two lines must run here too.
-                    view.theme = flow.state().selections.theme;
-                    crate::notify_comp_theme(view.theme);
-                    view.oobe = None;
+                    // D2-b: see this fn's header comment just above
+                    // `skip_click`.
+                    view.complete_oobe(cx);
                 } else if flow.current() == OobeStep::Network {
                     // Entered `Network` from the PREVIOUS step's own
                     // Continue click — still click-triggered I/O (the
@@ -248,47 +245,60 @@ fn button_row(step: OobeStep, flow: &OobeFlow, ui: &OobeUiState, cx: &mut Contex
 
 #[cfg(test)]
 mod tests {
-    /// D2-b (2026-08-24): both mouse-driven completion closures in
-    /// [`button_row`] (`continue_click` for 完成/繼續, `skip_click` for 略過)
-    /// must carry `flow.state().selections.theme` onto `view.theme` and call
-    /// `notify_comp_theme` before dropping `view.oobe` — see `ShellView::
-    /// theme`'s own doc comment (`main.rs`) for why. `Enter` (`main.rs`'s
-    /// `handle_enter_key`) already did this; the two button closures here did
-    /// not, which is exactly why a same-process OOBE→Home transition via the
-    /// button everyone actually clicks silently kept the boot-time theme
-    /// while a shell RESTART after the same run picked the persisted choice
-    /// up fine (`oobe::save_state` was never the missing half).
+    /// D2-b (2026-08-24) + 2026-09-05: every OOBE completion site must go
+    /// through the ONE method `ShellView::complete_oobe` (theme + operator
+    /// name + `notify_comp_theme` + drop the flow) instead of a bare
+    /// `view.oobe = None` — see that method's own doc comment (`main.rs`)
+    /// for the two rounds of drift this closes: the theme first (the two
+    /// button closures here skipped what `Enter` did, so Home kept the
+    /// boot-time theme until a restart), then the operator name (adopted
+    /// on the `Enter` site only, so the greeting and lock screen stayed
+    /// nameless after a mouse-driven OOBE — the QEMU walkthrough finding).
     ///
     /// Same "crude but load-bearing" source-scan shape `main.rs`'s own test
     /// module already uses for gpui closures a plain unit test cannot drive
     /// (no `TestAppContext` window round-trip for one assertion) — it cannot
-    /// prove the theme reaches the screen (that's the VM live check), but it
-    /// fails loudly the instant either closure regresses to bare
-    /// `view.oobe = None`.
+    /// prove the name reaches the screen (that's the VM live check), but it
+    /// fails loudly the instant any site regresses to dropping the flow by
+    /// hand, or the helper itself stops adopting one of the selections.
     #[test]
-    fn both_oobe_completion_buttons_carry_the_theme_pick_onto_home() {
-        let source = include_str!("render.rs");
-        let closures = [
-            ("skip_click", "let skip_click ="),
-            ("continue_click", "let continue_click ="),
+    fn every_oobe_completion_site_goes_through_complete_oobe() {
+        let sites = [
+            ("render.rs skip_click", include_str!("render.rs"), "let skip_click ="),
+            ("render.rs continue_click", include_str!("render.rs"), "let continue_click ="),
+            ("templates.rs skip_click", include_str!("steps/templates.rs"), "let skip_click ="),
         ];
-        for (name, marker) in closures {
-            let start = source.find(marker).unwrap_or_else(|| panic!("{name} closure not found in oobe/render.rs"));
+        for (name, source, marker) in sites {
+            let start = source.find(marker).unwrap_or_else(|| panic!("{name} closure not found"));
             // Each closure body is short and self-contained; a fixed forward
             // window comfortably covers it without needing a real brace
             // matcher (same pragmatism the rest of this crate's source-scan
             // tests use).
             let window = &source[start..(start + 1200).min(source.len())];
             assert!(
-                window.contains("view.theme = flow.state().selections.theme"),
-                "{name} completes OOBE without carrying the theme pick onto `view.theme` — \
-                 Home would keep showing the boot-time theme until the next restart"
+                window.contains("view.complete_oobe(cx)"),
+                "{name} completes OOBE without going through ShellView::complete_oobe — \
+                 Home's theme / greeting name and the lock screen would keep boot-time values until the next restart"
             );
-            assert!(
-                window.contains("notify_comp_theme(view.theme)"),
-                "{name} completes OOBE without telling comp the new theme via notify_comp_theme"
-            );
+            assert!(!window.contains("view.oobe = None"), "{name} drops the OOBE flow by hand instead of via ShellView::complete_oobe");
         }
+
+        let main = include_str!("../main.rs");
+        let start = main.find("pub(crate) fn complete_oobe(&mut self, cx").expect("ShellView::complete_oobe not found in main.rs");
+        let body = &main[start..(start + 1400).min(main.len())];
+        for needle in [
+            "self.theme = flow.state().selections.theme",
+            "notify_comp_theme(self.theme)",
+            "oobe::boot_operator_name(flow.state())",
+            "oobe::seed::spawn_seed_default_agent(self, flow.locale(), cx)",
+            "self.operator_name = Some(name)",
+        ] {
+            assert!(body.contains(needle), "ShellView::complete_oobe no longer does `{needle}`");
+        }
+        let advance = main.find("oobe::EnterOutcome::Advance => {").expect("Enter Advance arm not found in main.rs");
+        let arm = &main[advance..(advance + 700).min(main.len())];
+        assert!(arm.contains("self.complete_oobe(cx)"), "main.rs Enter Advance arm must complete OOBE via ShellView::complete_oobe");
+        assert!(!arm.contains("self.oobe = None"), "main.rs Enter Advance arm drops the OOBE flow by hand");
     }
 
     // ── D4a-7 (2026-08-31): the wired-only-machine Continue deadlock fix ──

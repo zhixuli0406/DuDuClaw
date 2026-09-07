@@ -26,7 +26,7 @@
 // ambient `ShellPalette` global instead — see its own doc comment for why.
 
 use gpui::{
-    div, prelude::*, px, App, ClickEvent, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, FontWeight, MouseButton, Render,
+    div, prelude::*, px, App, ClickEvent, Context, CursorStyle, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton, Render,
     SharedString, Stateful, Window,
 };
 
@@ -182,6 +182,83 @@ pub(crate) fn step_button_ex(
         el = el.on_click(on_click);
     }
 
+    el
+}
+
+/// A compact row-action button — WP-C (2026-09-05), the `RuntimeAuth`
+/// step's provider list.
+///
+/// Two things `step_button` above cannot do, both forced by a LIST rather
+/// than a fixed screen: the id has to carry a per-row discriminator (gpui
+/// needs distinct element identities across seventeen rows, so it takes any
+/// `ElementId` — `("oobe-runtime-key", index)` at the call site — not a
+/// single `&'static str`), and the label can be a runtime `SharedString`
+/// (an interpolated 「{} 的 API 金鑰」). Same disabled contract as
+/// `step_button`: no hover, no cursor, and NO click handler attached at all.
+///
+/// 28px tall instead of 36 and `TEXT_XS` instead of `TEXT_SM` — two of these
+/// sit at the right-hand end of a 592px row that also carries a name, a note
+/// and a status badge; at the bottom-nav button's size they would not fit.
+pub(crate) fn small_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    variant: StepButtonVariant,
+    disabled: bool,
+    palette: ShellPalette,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let (bg, bg_hover, text) = match variant {
+        StepButtonVariant::Primary => (palette.brand, palette.brand, palette.brand_foreground),
+        StepButtonVariant::Secondary => (palette.secondary, palette.surface_hover, palette.secondary_foreground),
+        StepButtonVariant::Ghost => (palette.app_shell, palette.surface_hover, palette.muted_foreground),
+    };
+
+    let mut el = div()
+        .id(id)
+        .h(px(28.))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .rounded(px(theme::RADIUS_LG))
+        .text_size(px(theme::TEXT_XS))
+        .font_weight(FontWeight::MEDIUM)
+        .bg(theme::alpha(if disabled { palette.muted } else { bg }, 1.0))
+        .text_color(theme::alpha(if disabled { palette.muted_foreground } else { text }, 1.0))
+        .child(label.into());
+
+    if !disabled {
+        el = el.cursor_pointer().hover(move |style| style.bg(theme::alpha(bg_hover, 0.90))).on_click(on_click);
+    }
+
+    el
+}
+
+/// A square tick-box — WP-C (2026-09-05), the subscription-login risk
+/// disclosure's required 「我了解風險，由我自行承擔」 acknowledgement.
+///
+/// Purely presentational, like `toggle_pill` above: the caller's own
+/// `.on_click(...)` sits on the whole row, not on this box, so the label is
+/// as clickable as the box itself. A checkbox rather than a reuse of
+/// `toggle_pill` on purpose — a pill switch reads as a SETTING the operator
+/// can leave in either position, and this is an acknowledgement that gates
+/// an action.
+pub(crate) fn check_box(checked: bool, palette: ShellPalette) -> Div {
+    let mut el = div()
+        .w(px(16.))
+        .h(px(16.))
+        .flex_shrink_0()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(if checked { theme::alpha(palette.brand, 1.0).into() } else { palette.input_border() })
+        .bg(theme::alpha(if checked { palette.brand } else { palette.surface }, 1.0));
+    if checked {
+        // A plain filled square inside the box, not a glyph: this crate's
+        // icon set (`crate::icons`) has no check mark, and a text "✓" would
+        // depend on whichever font the appliance resolved.
+        el = el.flex().items_center().justify_center().child(div().w(px(8.)).h(px(8.)).rounded(px(2.)).bg(theme::alpha(palette.brand_foreground, 1.0)));
+    }
     el
 }
 
@@ -513,6 +590,12 @@ impl Render for OobeTextField {
                 .w_full()
                 .h(px(36.))
                 .px(px(12.))
+                // 2026-09-05 (QEMU walkthrough finding): a masked value
+                // longer than the box (a held key auto-repeating on the
+                // lock screen) painted its dots straight past the border
+                // and off the screen edge. Clip to the chrome like every
+                // other single-line field does.
+                .overflow_hidden()
                 .rounded(px(theme::RADIUS_LG))
                 .bg(palette.input_bg())
                 .border_1()
@@ -546,6 +629,30 @@ impl Render for OobeTextField {
 pub(crate) struct AccountFields {
     pub(crate) name: Entity<OobeTextField>,
     pub(crate) password: Entity<OobeTextField>,
+}
+
+/// The `RuntimeAuth` step's one field: an AI-provider API key. Masked and
+/// ASCII-only like `AccountFields.password` — a key is a secret, and fcitx5
+/// must stay out of it (see `ime_focus.rs`). Since WP-C the same field is
+/// reused for every provider row, so its placeholder is the neutral
+/// `API key…` rather than Anthropic's `sk-ant-…` prefix (2026-09-06 QEMU
+/// walkthrough: the Codex row showed `sk-ant-…`).
+///
+/// 2026-09-05 (QEMU feature walkthrough): the step's "立即設定" button used
+/// to flip a local flag and nothing else, so a machine that "authorized"
+/// its runtime still had no credential at all and every delegated task
+/// died on dispatch. This field feeds `steps::runtime_auth::try_submit`,
+/// which stores the key through the dashboard's own `accounts.add` RPC.
+pub(crate) struct RuntimeAuthFields {
+    pub(crate) api_key: Entity<OobeTextField>,
+}
+
+impl RuntimeAuthFields {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        // Placeholder is a neutral hint, not a vendor's key prefix: the
+        // field serves all seventeen provider rows.
+        Self { api_key: OobeTextField::new(cx, "API key…", true, true, FieldChrome::Boxed) }
+    }
 }
 
 impl AccountFields {

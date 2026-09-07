@@ -6,6 +6,7 @@ import { api, type AccountInfo, type BudgetSummary, type CliCredentialInfo } fro
 import { toast, formatError } from '@/lib/toast';
 import { ChipEditor } from '@/components/shared/ChipEditor';
 import { SecretSourceField } from '@/components/shared/SecretSourceField';
+import { PROVIDER_CATALOG, DEFAULT_PROVIDER_ID, findProviderEntry, providerDisplayName } from '@/lib/provider-catalog';
 import {
   Button,
   Badge,
@@ -442,11 +443,14 @@ function AddAccountDialog({
   const intl = useIntl();
   const [name, setName] = useState('');
   const [accountType, setAccountType] = useState('api_key');
+  const [provider, setProvider] = useState(DEFAULT_PROVIDER_ID);
   const [apiKey, setApiKey] = useState('');
   const [budget, setBudget] = useState('50');
   const [priority, setPriority] = useState('1');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const providerEntry = findProviderEntry(provider);
 
   const handleSubmit = async () => {
     if (!name.trim()) return;
@@ -460,6 +464,7 @@ function AddAccountDialog({
       await api.accounts.add({
         id: name.trim(),
         type: accountType,
+        provider,
         key: apiKey.trim(),
         monthly_budget_cents: Math.round(Number(budget) * 100),
         priority: Number(priority),
@@ -467,6 +472,7 @@ function AddAccountDialog({
       onCreated();
       onClose();
       setName('');
+      setProvider(DEFAULT_PROVIDER_ID);
       setApiKey('');
       setBudget('50');
       setPriority('1');
@@ -478,6 +484,10 @@ function AddAccountDialog({
   };
 
   const keyLabel = accountType === 'api_key' ? 'API Key' : 'OAuth Token';
+  const keyPlaceholder =
+    accountType === 'api_key'
+      ? (providerEntry?.keyPlaceholder ?? intl.formatMessage({ id: 'accounts.provider.keyPlaceholder.generic' }))
+      : 'oauth-token-...';
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
@@ -496,6 +506,21 @@ function AddAccountDialog({
             />
           </Field>
 
+          <Field label={intl.formatMessage({ id: 'accounts.provider.select' })}>
+            <Select value={provider} onValueChange={(v) => setProvider(String(v))}>
+              <SelectTrigger className="w-full">
+                <SelectValue>{providerEntry?.label ?? provider}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {PROVIDER_CATALOG.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>
+                    {p.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+
           <Field label={intl.formatMessage({ id: 'accounts.provider.authMethod' })}>
             <Select value={accountType} onValueChange={(v) => setAccountType(String(v))}>
               <SelectTrigger className="w-full">
@@ -509,11 +534,19 @@ function AddAccountDialog({
           </Field>
 
           <Field label={keyLabel}>
-            <SecretSourceField
-              value={apiKey}
-              onChange={setApiKey}
-              placeholder={accountType === 'api_key' ? 'sk-ant-...' : 'oauth-token-...'}
-            />
+            <div className="space-y-1.5">
+              <SecretSourceField value={apiKey} onChange={setApiKey} placeholder={keyPlaceholder} />
+              {accountType === 'api_key' && providerEntry && (
+                <a
+                  href={providerEntry.keyUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-block text-xs text-brand underline underline-offset-2 hover:text-brand/80"
+                >
+                  {intl.formatMessage({ id: 'accounts.provider.getKey' }, { provider: providerEntry.label })}
+                </a>
+              )}
+            </div>
           </Field>
 
           <div className="grid grid-cols-2 gap-4">
@@ -591,8 +624,12 @@ function AccountCard({
           </div>
           <div>
             <h3 className="font-medium text-foreground">{account.id}</h3>
-            <p className="text-xs capitalize text-muted-foreground">
-              {(account.auth_method ?? account.account_type ?? 'unknown').replace('_', ' ')}
+            <p className="text-xs text-muted-foreground">
+              <span className="capitalize">
+                {(account.auth_method ?? account.account_type ?? 'unknown').replace('_', ' ')}
+              </span>
+              {' · '}
+              {providerDisplayName(account.provider)}
             </p>
           </div>
         </div>

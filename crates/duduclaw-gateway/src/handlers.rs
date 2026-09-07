@@ -1127,6 +1127,33 @@ fn setup_token_error_frame(
     }
 }
 
+/// Structured error frame for the `finetune.*` family (WP-E).
+///
+/// `code` is [`crate::finetune::FinetuneError::code`]'s stable string. The
+/// dashboard branches on `data_leaves_device_not_acknowledged` to open the
+/// "this leaves your machine" consent dialog instead of showing a red toast,
+/// so this MUST stay structured rather than collapsing to a bare message.
+fn finetune_error_frame(e: &crate::finetune::FinetuneError) -> WsFrame {
+    WsFrame::Response {
+        id: String::new(),
+        ok: false,
+        payload: None,
+        error: Some(json!({
+            "code": e.code(),
+            "message": e.message(),
+        })),
+    }
+}
+
+/// `Result<Value, FinetuneError>` → frame, so each `finetune.*` arm stays one
+/// expression.
+fn finetune_frame(r: Result<Value, crate::finetune::FinetuneError>) -> WsFrame {
+    match r {
+        Ok(v) => WsFrame::ok_response("", v),
+        Err(e) => finetune_error_frame(&e),
+    }
+}
+
 /// Structured refusal for a destructive `device.*` RPC missing
 /// `"confirm": true` (`require_confirm!()` in `dispatch`).
 fn device_confirm_required_frame() -> WsFrame {
@@ -1797,15 +1824,23 @@ fn rule_targets_agent(row: &AutopilotRuleRow, agent_id: &str) -> bool {
 // max_active_skills/stagnation_* nor `[container]` sandbox_enabled/network_access/
 // readonly_project/timeout_ms/max_concurrent.
 
-/// Valid AI runtime providers (mirrors the `AgentRuntime` registry backends).
-const VALID_RUNTIME_PROVIDERS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "antigravity",
-    "grok",
-    "openai_compat",
-];
+/// Is `v` a valid AI runtime provider for `agent.toml [runtime]`?
+///
+/// WP-B: reads `duduclaw_core::runtime_catalog` instead of a hand-written
+/// mirror of the registry backends — the list and the registry can no longer
+/// disagree, and a new runtime is accepted the moment its catalog entry lands.
+/// Canonical ids only (no aliases): what gets written into `agent.toml` should
+/// be the canonical value, so `agy` is rejected here even though
+/// `RuntimeType::parse` accepts it when reading.
+fn is_valid_runtime_provider(v: &str) -> bool {
+    duduclaw_core::types::RuntimeType::from_id(v).is_some()
+}
+
+/// `claude|codex|gemini|…` for the error message. Built from the catalog so it
+/// cannot go stale.
+fn valid_runtime_providers_display() -> String {
+    duduclaw_core::types::RuntimeType::valid_values()
+}
 
 /// Detect a Claude Code OAuth session. Returns `(has_oauth, subscription_tier)`.
 /// Never returns the token itself — only its presence — so this is safe to
@@ -1901,9 +1936,10 @@ fn apply_runtime_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec
         .ok_or_else(|| "Invalid [runtime] section".to_string())?;
 
     if let Some(v) = rt.get("provider").and_then(|v| v.as_str()) {
-        if !VALID_RUNTIME_PROVIDERS.contains(&v) {
+        if !is_valid_runtime_provider(v) {
             return Err(format!(
-                "Invalid runtime.provider '{v}'. Valid: claude, codex, gemini, antigravity, grok, openai_compat"
+                "Invalid runtime.provider '{v}'. Valid: {}",
+                valid_runtime_providers_display()
             ));
         }
         section.insert("provider".into(), toml::Value::String(v.into()));
@@ -1916,9 +1952,10 @@ fn apply_runtime_to_table(table: &mut toml::Table, params: &Value) -> Result<Vec
             section.remove("fallback");
             changes.push("runtime.fallback cleared".to_string());
         } else {
-            if !VALID_RUNTIME_PROVIDERS.contains(&v) {
+            if !is_valid_runtime_provider(v) {
                 return Err(format!(
-                    "Invalid runtime.fallback '{v}'. Valid: claude, codex, gemini, antigravity, grok, openai_compat"
+                    "Invalid runtime.fallback '{v}'. Valid: {}",
+                    valid_runtime_providers_display()
                 ));
             }
             section.insert("fallback".into(), toml::Value::String(v.into()));
@@ -5678,6 +5715,53 @@ impl MethodHandler {
                 self.handle_inference_update(params).await
             }
 
+            // ── WP-D: appliance local model (llama.cpp server on loopback).
+            //    Reads are admin-only like the rest of the `inference.*`
+            //    family — this surface exposes the machine's memory profile
+            //    and the state root's layout. Every response is computed
+            //    from a live scan/probe; nothing is asserted from config
+            //    alone. See `inference_local.rs`. ──
+            "inference.local.catalog" => {
+                require_admin!();
+                WsFrame::ok_response("", crate::inference_local::catalog(&self.home_dir).await)
+            }
+            "inference.local.status" => {
+                require_admin!();
+                WsFrame::ok_response("", crate::inference_local::status(&self.home_dir).await)
+            }
+            "inference.local.download" => {
+                require_admin!();
+                let id = params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if id.is_empty() {
+                    WsFrame::error_response("", "id is required")
+                } else {
+                    match crate::inference_local::download(id, &self.home_dir).await {
+                        Ok(v) => WsFrame::ok_response("", v),
+                        Err(e) => WsFrame::error_response("", &e),
+                    }
+                }
+            }
+            "inference.local.serve" => {
+                require_admin!();
+                let file = params.get("model_file").and_then(|v| v.as_str()).unwrap_or("");
+                let ctx = params
+                    .get("ctx")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok());
+                if file.is_empty() {
+                    WsFrame::error_response("", "model_file is required")
+                } else {
+                    match crate::inference_local::serve(file, ctx, &self.home_dir).await {
+                        Ok(v) => WsFrame::ok_response("", v),
+                        Err(e) => WsFrame::error_response("", &e),
+                    }
+                }
+            }
+            "inference.local.stop" => {
+                require_admin!();
+                WsFrame::ok_response("", crate::inference_local::stop().await)
+            }
+
             // ── MCP API keys (global config.toml [mcp_keys], MK.1–MK.4) ──
             "mcp_keys.list" => {
                 require_admin!();
@@ -6202,6 +6286,126 @@ impl MethodHandler {
                     Err(e) => WsFrame::error_response("", &e),
                 }
             }
+            // ── Fine-tuning / post-training (WP-E, TODO-ai-runtimes-2026-09
+            //    decision 4C). Admin-only across the board: dataset building
+            //    reads every stored conversation, task result and approval on
+            //    the box, and job creation can ship that corpus to a third
+            //    party. That is an owner-level decision, not a manager one.
+            //
+            //    Nothing here trains locally — the appliance's iGPU cannot.
+            //    See `finetune/mod.rs` for the "curate here, train elsewhere,
+            //    deploy here" framing and the privacy gate. ──
+            "finetune.datasets.list" => {
+                require_admin!();
+                finetune_frame(
+                    crate::finetune::dataset::list(&self.home_dir)
+                        .map(|d| json!({ "datasets": d })),
+                )
+            }
+            "finetune.datasets.create" => {
+                require_admin!();
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let format = params.get("format").and_then(|v| v.as_str()).unwrap_or("sharegpt");
+                finetune_frame(
+                    crate::finetune::dataset::create(&self.home_dir, name, format)
+                        .map(|d| json!({ "dataset": d })),
+                )
+            }
+            "finetune.datasets.delete" => {
+                require_admin!();
+                let id = params.get("dataset_id").and_then(|v| v.as_str()).unwrap_or("");
+                finetune_frame(
+                    crate::finetune::dataset::delete(&self.home_dir, id)
+                        .map(|()| json!({ "deleted": true })),
+                )
+            }
+            "finetune.datasets.build" => {
+                require_admin!();
+                let id = params.get("dataset_id").and_then(|v| v.as_str()).unwrap_or("");
+                let format = params.get("format").and_then(|v| v.as_str()).unwrap_or("sharegpt");
+                let prefs = params
+                    .get("preference_pairs")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let sources: crate::finetune::dataset::DatasetSources = params
+                    .get("sources")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .unwrap_or_default()
+                    .unwrap_or_default();
+                finetune_frame(
+                    crate::finetune::dataset::build(&self.home_dir, id, sources, format, prefs)
+                        .map(|d| json!({ "dataset": d })),
+                )
+            }
+            "finetune.datasets.preview" => {
+                require_admin!();
+                let id = params.get("dataset_id").and_then(|v| v.as_str()).unwrap_or("");
+                let n = params.get("n").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                finetune_frame(crate::finetune::dataset::preview(&self.home_dir, id, n))
+            }
+            // Privacy gate: naming the on-disk path is the first step of
+            // moving curated customer data off this machine, so the caller
+            // must acknowledge that explicitly. Absent field = refusal.
+            "finetune.datasets.export" => {
+                require_admin!();
+                let id = params.get("dataset_id").and_then(|v| v.as_str()).unwrap_or("");
+                let ack = params
+                    .get("acknowledged_data_leaves_device")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                finetune_frame(crate::finetune::dataset::export(&self.home_dir, id, ack))
+            }
+            "finetune.jobs.list" => {
+                require_admin!();
+                finetune_frame(
+                    crate::finetune::jobs::list(&self.home_dir).map(|j| json!({ "jobs": j })),
+                )
+            }
+            "finetune.jobs.create" => {
+                require_admin!();
+                let ack = params
+                    .get("acknowledged_data_leaves_device")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match crate::finetune::jobs::config_from_params(&params) {
+                    Ok(cfg) => finetune_frame(
+                        crate::finetune::jobs::create(&self.home_dir, cfg, ack)
+                            .await
+                            .map(|j| json!({ "job": j })),
+                    ),
+                    Err(e) => finetune_error_frame(&e),
+                }
+            }
+            "finetune.jobs.status" => {
+                require_admin!();
+                let id = params.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+                finetune_frame(
+                    crate::finetune::jobs::status(&self.home_dir, id)
+                        .await
+                        .map(|j| json!({ "job": j })),
+                )
+            }
+            "finetune.jobs.cancel" => {
+                require_admin!();
+                let id = params.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+                finetune_frame(
+                    crate::finetune::jobs::cancel(&self.home_dir, id)
+                        .await
+                        .map(|j| json!({ "job": j })),
+                )
+            }
+            // Import moves data ONTO the box, so it is not gated.
+            "finetune.import" => {
+                require_admin!();
+                let src = params
+                    .get("path_or_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                finetune_frame(crate::finetune::import::import(&self.home_dir, src).await)
+            }
+
             "runtime.detect" => self.handle_runtime_detect().await,
             // ── WP2 / D16: onboarding one-click CLI install ──────────────
             // Admin-only. The only accepted parameter is a provider NAME,
@@ -7498,7 +7702,7 @@ impl MethodHandler {
                     { "name": "delegation.set", "description": "Update the delegation policy / cross-department pairs (admin)" },
                     { "name": "system.autostart.status", "description": "Login/boot autostart registration status (admin)" },
                     { "name": "system.autostart.set", "description": "Enable/disable gateway autostart at login/boot (admin)" },
-                    { "name": "accounts.add", "description": "Add a new account" },
+                    { "name": "accounts.add", "description": "Add a new account (provider defaults to anthropic)" },
                     { "name": "accounts.update_budget", "description": "Update account monthly budget" },
                     { "name": "system.version", "description": "Version info" },
                     { "name": "system.check_update", "description": "Check for available updates" },
@@ -9830,13 +10034,22 @@ impl MethodHandler {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 if let Some(model) = preferred {
+                    // An unparseable stored provider means we cannot tell
+                    // whether the model matches it, so the auto-align is
+                    // SKIPPED rather than run against a guessed default —
+                    // rewriting `[runtime] provider` on a guess is exactly the
+                    // kind of silent config damage `RuntimeType::parse` now
+                    // refuses to enable. `load_runtime_settings` already logs
+                    // the bad value on every read of this agent.
                     let provider = table
                         .get("runtime")
                         .and_then(|r| r.get("provider"))
                         .and_then(|v| v.as_str())
                         .map(duduclaw_core::types::RuntimeType::parse)
-                        .unwrap_or_default();
-                    if !crate::runtime_config::model_matches_provider(&model, provider) {
+                        .unwrap_or(Some(duduclaw_core::types::RuntimeType::default()));
+                    if let Some(provider) = provider
+                        && !crate::runtime_config::model_matches_provider(&model, provider)
+                    {
                         if let Some(aligned) =
                             crate::runtime_config::infer_provider_for_model(&model)
                         {
@@ -13321,26 +13534,7 @@ impl MethodHandler {
     async fn handle_accounts_list(&self) -> WsFrame {
         let rotator = self.cached_rotator().await;
         let accounts = rotator.status().await;
-        let accounts_json: Vec<Value> = accounts
-            .iter()
-            .map(|a| {
-                json!({
-                    "id": a.id,
-                    "auth_method": a.auth_method,
-                    "priority": a.priority,
-                    "is_healthy": a.is_healthy,
-                    "spent_this_month": a.spent_this_month,
-                    "monthly_budget_cents": a.monthly_budget_cents,
-                    "total_requests": a.total_requests,
-                    "is_available": a.is_available,
-                    "label": a.label,
-                    "email": a.email,
-                    "subscription": a.subscription,
-                    "expires_at": a.expires_at,
-                    "days_until_expiry": a.days_until_expiry,
-                })
-            })
-            .collect();
+        let accounts_json: Vec<Value> = accounts.iter().map(account_status_to_json).collect();
         WsFrame::ok_response("", json!({ "accounts": accounts_json }))
     }
 
@@ -13377,19 +13571,15 @@ impl MethodHandler {
         // bar (the figure users actually read) is now correct.
         let total_spent = self.telemetry_spent_cents_total().await;
 
-        let accounts_json: Vec<Value> = accounts
-            .iter()
-            .map(|a| {
-                json!({
-                    "id": a.id,
-                    "auth_method": a.auth_method,
-                    "priority": a.priority,
-                    "is_healthy": a.is_healthy,
-                    "spent_this_month": a.spent_this_month,
-                    "monthly_budget_cents": a.monthly_budget_cents,
-                })
-            })
-            .collect();
+        // WP-A: use the same row shape as `accounts.list` (`account_status_to_json`)
+        // instead of a second, narrower hand-rolled subset — the dashboard's
+        // `AccountInfo` type already declared `provider`/`label`/`email`/
+        // `subscription`/`total_requests`/`is_available`/`expires_at`/
+        // `days_until_expiry`, but this RPC (the one `AccountsPage` actually
+        // calls for its account cards) never sent them, so they always read
+        // as `undefined` at runtime. Widening this to the full row fixes that
+        // latent gap for free and lets `provider` reach the accounts table.
+        let accounts_json: Vec<Value> = accounts.iter().map(account_status_to_json).collect();
 
         WsFrame::ok_response(
             "",
@@ -18600,16 +18790,42 @@ impl MethodHandler {
         if runtime_str.is_empty() {
             return WsFrame::error_response(
                 "",
-                "runtime is required (claude|codex|gemini|antigravity|grok)",
+                &format!(
+                    "runtime is required ({})",
+                    duduclaw_core::types::RuntimeType::valid_values()
+                ),
             );
         }
-        let runtime = duduclaw_core::types::RuntimeType::parse(runtime_str);
+        // WP-B: REFUSE an unknown runtime. `RuntimeType::parse` used to map any
+        // unrecognised string to Claude, so `{"runtime": "kimi"}` against a
+        // build that did not know `kimi` silently ran `claude setup-token` and
+        // showed the user Anthropic's login screen. The accepted list comes
+        // from the catalog, so it can never go stale.
+        let Some(runtime) = duduclaw_core::types::RuntimeType::parse(runtime_str) else {
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "unknown runtime '{runtime_str}' ({})",
+                    duduclaw_core::types::RuntimeType::valid_values()
+                ),
+            );
+        };
         let spec = match crate::cli_auth::spec_for(runtime) {
             Some(s) => s,
             None => {
+                // API-key-only runtimes (openai_compat, qwen, vibe): naming the
+                // key variable turns a dead end into an actionable answer.
+                let key_hint = runtime
+                    .spec()
+                    .auth
+                    .api_key_env
+                    .map(|e| format!(" — set {e} instead"))
+                    .unwrap_or_default();
                 return WsFrame::error_response(
                     "",
-                    "this runtime has no interactive login (use an API key)",
+                    &format!(
+                        "'{runtime_str}' has no interactive login (use an API key{key_hint})"
+                    ),
                 );
             }
         };
@@ -22580,42 +22796,68 @@ impl MethodHandler {
     /// step so we can flag detected vs. not-installed backends. Viewer-level:
     /// returns only presence booleans + subscription tier, never any secret.
     async fn handle_runtime_detect(&self) -> WsFrame {
-        // `which_*_in_home` expects the OS USER home (`~`) — its candidates are
-        // `~/.bun/bin`, `~/.nvm/...`, etc. Passing `self.home_dir`
-        // (`~/.duduclaw`) here made every HOME-rooted install invisible; only
-        // the fixed absolute paths (Homebrew) could ever hit. PATH-first
-        // (`which_*()`) so terminal-launched gateways see what the user sees.
+        // `which_runtime_in_home` expects the OS USER home (`~`) — its
+        // candidates are `~/.bun/bin`, `~/.nvm/...`, etc. Passing
+        // `self.home_dir` (`~/.duduclaw`) here made every HOME-rooted install
+        // invisible; only the fixed absolute paths (Homebrew) could ever hit.
+        // PATH-first so terminal-launched gateways see what the user sees.
         let user_home = std::path::PathBuf::from(duduclaw_core::platform::home_dir());
-        let claude_bin = duduclaw_core::which_claude()
-            .or_else(|| duduclaw_core::which_claude_in_home(&user_home));
-        let claude_cli = claude_bin.is_some();
-        let codex = duduclaw_core::which_codex()
-            .or_else(|| duduclaw_core::which_codex_in_home(&user_home))
-            .is_some();
-        let gemini = duduclaw_core::which_gemini()
-            .or_else(|| duduclaw_core::which_gemini_in_home(&user_home))
-            .is_some();
-        let antigravity = duduclaw_core::which_agy()
-            .or_else(|| duduclaw_core::which_agy_in_home(&user_home))
-            .is_some();
-        // R4: `which_grok*` also probes the third-party `grok-cli` fallback.
-        let grok = duduclaw_core::which_grok()
-            .or_else(|| duduclaw_core::which_grok_in_home(&user_home))
-            .is_some();
+
+        // WP-B: one loop over `runtime_catalog` replaces five hand-written
+        // `which_*` probes. Every runtime gets a boolean keyed by its catalog
+        // id, plus a `runtimes` array carrying the metadata the wizard needs to
+        // render a row (display name, install channel, login method, ToS note)
+        // without a second RPC or a duplicated table in the web client.
+        let mut flags = serde_json::Map::new();
+        let mut rows: Vec<Value> = Vec::new();
+        let mut claude_bin: Option<String> = None;
+        for spec in duduclaw_core::runtime_catalog::cli_specs() {
+            let found = duduclaw_core::detect_runtime(spec.id, &user_home);
+            if spec.id == "claude" {
+                claude_bin = found.clone();
+            }
+            flags.insert(spec.id.to_string(), Value::Bool(found.is_some()));
+            let cred_present = spec.auth.credential_paths.first().map(|rel| {
+                Value::Bool(user_home.join(rel).exists())
+            });
+            rows.push(json!({
+                "id": spec.id,
+                "display_name": spec.display_name,
+                "binary": spec.binary,
+                "installed": found.is_some(),
+                "path": found,
+                "install_channel": spec.install.kind(),
+                "install_command": spec.install.command_display(),
+                "login_method": spec.auth.login.kind(),
+                "login_remote_safe": spec.auth.login.remote_safe(),
+                "api_key_env": spec.auth.api_key_env,
+                "credential_present": cred_present,
+                "mcp": spec.mcp,
+                "headless_verified": spec.verified,
+                "vendor_url": spec.vendor_url,
+                "tos_note": spec.auth.tos_note.map(|t| json!({
+                    "en": t.en, "zh-TW": t.zh_tw, "ja-JP": t.ja_jp,
+                })),
+            }));
+        }
         let (claude_oauth, claude_subscription) = detect_claude_oauth(claude_bin.as_deref()).await;
 
-        WsFrame::ok_response(
-            "",
-            json!({
-                "claude_cli": claude_cli,
-                "codex": codex,
-                "gemini": gemini,
-                "antigravity": antigravity,
-                "grok": grok,
-                "claude_oauth": claude_oauth,
-                "claude_subscription": claude_subscription,
-            }),
-        )
+        // Legacy key kept verbatim: the dashboard onboarding wizard and the
+        // OOBE shell both read `claude_cli`, and renaming it would break both
+        // for zero gain. Every other runtime is keyed by its catalog id
+        // (`codex`, `gemini`, `antigravity`, `grok`, … ) exactly as before.
+        flags.insert(
+            "claude_cli".to_string(),
+            Value::Bool(claude_bin.is_some()),
+        );
+        flags.insert("claude_oauth".to_string(), Value::Bool(claude_oauth));
+        flags.insert(
+            "claude_subscription".to_string(),
+            claude_subscription.map(Value::String).unwrap_or(Value::Null),
+        );
+        flags.insert("runtimes".to_string(), Value::Array(rows));
+
+        WsFrame::ok_response("", Value::Object(flags))
     }
 
     /// **WP2 / D16** — install a missing AI CLI on the user's behalf so the
@@ -22640,9 +22882,13 @@ impl MethodHandler {
             .unwrap_or("");
         let Some(spec) = crate::runtime_install::spec_for(provider) else {
             // Fail closed: unknown / malformed provider resolves to nothing.
+            // The accepted list comes from the catalog, so it cannot go stale.
             return WsFrame::error_response(
                 "",
-                "unsupported provider (claude|codex|gemini|antigravity|grok)",
+                &format!(
+                    "unsupported provider ({})",
+                    duduclaw_core::runtime_catalog::id_list_pipe()
+                ),
             );
         };
         let event_tx = self.event_tx.read().await.clone();
@@ -22752,13 +22998,19 @@ impl MethodHandler {
         if let Some(v) = params.get("log_level").and_then(|v| v.as_str()) {
             match v {
                 "trace" | "debug" | "info" | "warn" | "error" => {
-                    let logging = table
-                        .entry("logging")
+                    // `[general] log_level` is the key the CLI actually reads
+                    // at startup (`read_log_level_from_config`, precedence
+                    // RUST_LOG → config → default). Until 2026-09-06 this
+                    // wrote `[logging] level`, which nothing reads — the
+                    // dashboard reported success and the level never
+                    // changed.
+                    let general = table
+                        .entry("general")
                         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
                         .as_table_mut();
-                    if let Some(logging) = logging {
-                        logging.insert("level".into(), toml::Value::String(v.into()));
-                        changes.push(format!("logging.level = \"{v}\""));
+                    if let Some(general) = general {
+                        general.insert("log_level".into(), toml::Value::String(v.into()));
+                        changes.push(format!("general.log_level = \"{v}\""));
                     }
                 }
                 _ => {
@@ -24193,6 +24445,13 @@ impl MethodHandler {
     /// Add a new account to config.toml [[accounts]] array.
     ///
     /// Encrypts the API key before storing. Supports `api_key` and `oauth` types.
+    ///
+    /// WP-A: accepts an optional `provider` (one of
+    /// `duduclaw_core::provider_env::KNOWN_PROVIDER_IDS`; defaults to
+    /// `"anthropic"` for back-compat with every pre-WP-A caller). An unknown
+    /// provider id is rejected fail-closed rather than silently accepted —
+    /// `resolve_env_key`/`select_for_provider` would otherwise treat it as a
+    /// pool nothing ever selects, a confusing way to fail.
     async fn handle_accounts_add(&self, params: Value) -> WsFrame {
         let id = match params.get("id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id,
@@ -24202,6 +24461,25 @@ impl MethodHandler {
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("api_key");
+        if auth_type != "api_key" && auth_type != "oauth" {
+            return WsFrame::error_response(
+                "",
+                &format!("Invalid 'type' parameter '{auth_type}' (must be 'api_key' or 'oauth')"),
+            );
+        }
+        let provider = params
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("anthropic");
+        if !duduclaw_core::provider_env::KNOWN_PROVIDER_IDS.contains(&provider) {
+            return WsFrame::error_response(
+                "",
+                &format!(
+                    "Unknown 'provider' parameter '{provider}' (must be one of: {})",
+                    duduclaw_core::provider_env::KNOWN_PROVIDER_IDS.join(", ")
+                ),
+            );
+        }
         let key = match params.get("key").and_then(|v| v.as_str()) {
             Some(k) if !k.is_empty() => k,
             _ => return WsFrame::error_response("", "Missing 'key' parameter"),
@@ -24238,7 +24516,7 @@ impl MethodHandler {
         // Encrypt the key
         let encrypted = crate::config_crypto::encrypt_value(key, &self.home_dir);
 
-        let entry = build_account_entry(id, auth_type, budget_cents, priority, key, encrypted.as_deref());
+        let entry = build_account_entry(id, auth_type, provider, budget_cents, priority, key, encrypted.as_deref());
         if entry.plaintext_fallback {
             warn!(
                 id,
@@ -24264,13 +24542,14 @@ impl MethodHandler {
         // dispatch/channel-reply call instead of up to 5 minutes later.
         crate::claude_runner::invalidate_rotator_cache().await;
 
-        info!(id, auth_type, "accounts.add completed");
+        info!(id, auth_type, provider, "accounts.add completed");
         WsFrame::ok_response(
             "",
             json!({
                 "success": true,
                 "id": id,
                 "type": auth_type,
+                "provider": provider,
             }),
         )
     }
@@ -28820,6 +29099,30 @@ impl MethodHandler {
 
 // ── Standalone helpers ────────────────────────────────────────
 
+/// Build one `accounts.list` row from a rotator `AccountStatus` (WP-A —
+/// extracted to a pure function for no-I/O testability, matching the
+/// `task_row_to_json` precedent elsewhere in this file; also keeps
+/// `handle_accounts_list` from drifting in shape from a future second
+/// caller).
+fn account_status_to_json(a: &duduclaw_agent::account_rotator::AccountStatus) -> Value {
+    json!({
+        "id": a.id,
+        "auth_method": a.auth_method,
+        "provider": a.provider,
+        "priority": a.priority,
+        "is_healthy": a.is_healthy,
+        "spent_this_month": a.spent_this_month,
+        "monthly_budget_cents": a.monthly_budget_cents,
+        "total_requests": a.total_requests,
+        "is_available": a.is_available,
+        "label": a.label,
+        "email": a.email,
+        "subscription": a.subscription,
+        "expires_at": a.expires_at,
+        "days_until_expiry": a.days_until_expiry,
+    })
+}
+
 /// The `[[accounts]]` TOML entry `handle_accounts_add` is about to push, plus
 /// whether the credential had to fall back to plaintext.
 struct NewAccountEntry {
@@ -28830,8 +29133,9 @@ struct NewAccountEntry {
     /// stays free of side effects and easy to unit test).
     plaintext_fallback: bool,
     /// The TOML field name the credential was written under (`oauth_token`
-    /// for `type = "oauth"`, `anthropic_api_key` otherwise) — echoed back so
-    /// the caller's warning names the right field without recomputing it.
+    /// for `type = "oauth"`; `anthropic_api_key` for provider `"anthropic"`;
+    /// `api_key` for every other provider) — echoed back so the caller's
+    /// warning names the right field without recomputing it.
     key_field: &'static str,
 }
 
@@ -28855,9 +29159,19 @@ struct NewAccountEntry {
 /// keyfile, i.e. `encrypted` is `None`) — refusing outright would leave an
 /// operator unable to add an account at all, so it degrades loudly instead
 /// (via [`NewAccountEntry::plaintext_fallback`]).
+///
+/// WP-A (TODO-ai-runtimes-2026-09.md §3 WP-A) — `provider` is always written
+/// (defaulting to `"anthropic"` at the call site so every existing config
+/// keeps behaving byte-identically), and the credential field name follows
+/// `duduclaw-agent::account_rotator::resolve_api_key`'s precedence: the
+/// Anthropic-only `anthropic_api_key(_enc)` name for provider `"anthropic"`,
+/// the provider-agnostic `api_key(_enc)` name for everything else (the
+/// rotator has read that fallback name since before this WP; this is the
+/// first writer that actually uses it for a non-Anthropic account).
 fn build_account_entry(
     id: &str,
     auth_type: &str,
+    provider: &str,
     budget_cents: u64,
     priority: u64,
     key: &str,
@@ -28866,6 +29180,7 @@ fn build_account_entry(
     let mut account = toml::map::Map::new();
     account.insert("id".into(), toml::Value::String(id.into()));
     account.insert("type".into(), toml::Value::String(auth_type.into()));
+    account.insert("provider".into(), toml::Value::String(provider.into()));
     account.insert(
         "monthly_budget_cents".into(),
         toml::Value::Integer(budget_cents as i64),
@@ -28874,8 +29189,10 @@ fn build_account_entry(
 
     let key_field = if auth_type == "oauth" {
         "oauth_token"
-    } else {
+    } else if provider == "anthropic" {
         "anthropic_api_key"
+    } else {
+        "api_key"
     };
 
     let plaintext_fallback = match encrypted {
@@ -43950,7 +44267,9 @@ mod accounts_add_tests {
 
     #[test]
     fn encryption_success_writes_only_the_enc_field() {
-        let entry = build_account_entry("acct-1", "api_key", 5000, 1, "sk-plain-key", Some("cipher-blob"));
+        let entry = build_account_entry(
+            "acct-1", "api_key", "anthropic", 5000, 1, "sk-plain-key", Some("cipher-blob"),
+        );
         assert!(!entry.plaintext_fallback);
         assert_eq!(entry.key_field, "anthropic_api_key");
         assert_eq!(
@@ -43964,6 +44283,10 @@ mod accounts_add_tests {
         );
         assert_eq!(entry.table.get("id").and_then(|v| v.as_str()), Some("acct-1"));
         assert_eq!(
+            entry.table.get("provider").and_then(|v| v.as_str()),
+            Some("anthropic")
+        );
+        assert_eq!(
             entry.table.get("monthly_budget_cents").and_then(|v| v.as_integer()),
             Some(5000)
         );
@@ -43972,7 +44295,9 @@ mod accounts_add_tests {
 
     #[test]
     fn encryption_failure_falls_back_to_plaintext_and_flags_it() {
-        let entry = build_account_entry("acct-2", "api_key", 5000, 1, "sk-plain-key", None);
+        let entry = build_account_entry(
+            "acct-2", "api_key", "anthropic", 5000, 1, "sk-plain-key", None,
+        );
         assert!(entry.plaintext_fallback, "caller must be told to warn");
         assert_eq!(entry.key_field, "anthropic_api_key");
         assert_eq!(
@@ -43988,7 +44313,9 @@ mod accounts_add_tests {
 
     #[test]
     fn oauth_type_uses_the_oauth_token_field_name() {
-        let ok = build_account_entry("acct-oauth", "oauth", 0, 1, "oauth-secret", Some("cipher"));
+        let ok = build_account_entry(
+            "acct-oauth", "oauth", "anthropic", 0, 1, "oauth-secret", Some("cipher"),
+        );
         assert_eq!(ok.key_field, "oauth_token");
         assert_eq!(
             ok.table.get("oauth_token_enc").and_then(|v| v.as_str()),
@@ -43996,7 +44323,9 @@ mod accounts_add_tests {
         );
         assert!(ok.table.get("anthropic_api_key_enc").is_none());
 
-        let fallback = build_account_entry("acct-oauth-2", "oauth", 0, 1, "oauth-secret", None);
+        let fallback = build_account_entry(
+            "acct-oauth-2", "oauth", "anthropic", 0, 1, "oauth-secret", None,
+        );
         assert_eq!(
             fallback.table.get("oauth_token").and_then(|v| v.as_str()),
             Some("oauth-secret")
@@ -44006,15 +44335,78 @@ mod accounts_add_tests {
     #[test]
     fn every_non_credential_field_is_present_regardless_of_encryption_outcome() {
         for encrypted in [Some("cipher"), None] {
-            let entry = build_account_entry("acct-x", "api_key", 12345, 7, "key", encrypted);
+            let entry =
+                build_account_entry("acct-x", "api_key", "anthropic", 12345, 7, "key", encrypted);
             assert_eq!(entry.table.get("id").and_then(|v| v.as_str()), Some("acct-x"));
             assert_eq!(entry.table.get("type").and_then(|v| v.as_str()), Some("api_key"));
+            assert_eq!(
+                entry.table.get("provider").and_then(|v| v.as_str()),
+                Some("anthropic")
+            );
             assert_eq!(
                 entry.table.get("monthly_budget_cents").and_then(|v| v.as_integer()),
                 Some(12345)
             );
             assert_eq!(entry.table.get("priority").and_then(|v| v.as_integer()), Some(7));
         }
+    }
+
+    // ── WP-A: provider-aware key field name ─────────────────────
+
+    /// A non-Anthropic provider writes the provider-agnostic `api_key(_enc)`
+    /// field name — never `anthropic_api_key*`, which stays reserved for
+    /// provider `"anthropic"` — and always carries its own `provider` value,
+    /// which `duduclaw-agent::account_rotator::load_from_config` reads to
+    /// route the account into that provider's rotation pool.
+    #[test]
+    fn openai_provider_writes_the_api_key_field_and_provider_value() {
+        let entry = build_account_entry(
+            "acct-openai", "api_key", "openai", 5000, 1, "sk-openai-key", Some("cipher-blob"),
+        );
+        assert_eq!(entry.key_field, "api_key");
+        assert_eq!(
+            entry.table.get("api_key_enc").and_then(|v| v.as_str()),
+            Some("cipher-blob")
+        );
+        assert!(entry.table.get("anthropic_api_key_enc").is_none());
+        assert!(entry.table.get("anthropic_api_key").is_none());
+        assert_eq!(
+            entry.table.get("provider").and_then(|v| v.as_str()),
+            Some("openai")
+        );
+    }
+
+    /// Same shape, plaintext fallback path (no writable keyfile).
+    #[test]
+    fn deepseek_provider_plaintext_fallback_uses_api_key_field() {
+        let entry =
+            build_account_entry("acct-ds", "api_key", "deepseek", 5000, 1, "sk-ds-key", None);
+        assert!(entry.plaintext_fallback);
+        assert_eq!(entry.key_field, "api_key");
+        assert_eq!(
+            entry.table.get("api_key").and_then(|v| v.as_str()),
+            Some("sk-ds-key")
+        );
+        assert_eq!(
+            entry.table.get("provider").and_then(|v| v.as_str()),
+            Some("deepseek")
+        );
+    }
+
+    /// An `oauth`-type account keeps writing `oauth_token(_enc)` regardless of
+    /// provider — that field name is shared across providers (see
+    /// `resolve_oauth_token`), only the provider-key API path branches on
+    /// provider.
+    #[test]
+    fn oauth_type_key_field_is_provider_independent() {
+        let entry = build_account_entry(
+            "acct-oauth-openai", "oauth", "openai", 0, 1, "oauth-secret", Some("cipher"),
+        );
+        assert_eq!(entry.key_field, "oauth_token");
+        assert_eq!(
+            entry.table.get("provider").and_then(|v| v.as_str()),
+            Some("openai")
+        );
     }
 
     // ── handle_accounts_add: end-to-end, MethodHandler fixture ──
@@ -44105,6 +44497,134 @@ mod accounts_add_tests {
 
         let raw_after = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
         assert_eq!(raw_before, raw_after, "a rejected duplicate must not touch config.toml");
+    }
+
+    // ── WP-A: `accounts.add` provider param, end-to-end via the RPC ─────
+
+    fn frame_payload(f: &WsFrame) -> Value {
+        match f {
+            WsFrame::Response { payload: Some(p), .. } => p.clone(),
+            other => panic!("expected a payload: {other:?}"),
+        }
+    }
+
+    /// No `provider` param ⇒ defaults to `"anthropic"` and keeps writing the
+    /// legacy `anthropic_api_key*` field name — every pre-WP-A dashboard/OOBE
+    /// caller must keep working byte-for-byte.
+    #[tokio::test]
+    async fn accounts_add_without_provider_defaults_to_anthropic() {
+        let home = tempfile::tempdir().unwrap();
+        let res = added_account(home.path(), "acct-default").await;
+        assert_eq!(frame_payload(&res)["provider"], json!("anthropic"));
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        let acct = table["accounts"].as_array().unwrap()[0].as_table().unwrap();
+        assert_eq!(acct.get("provider").and_then(|v| v.as_str()), Some("anthropic"));
+        assert!(acct.get("anthropic_api_key_enc").is_some());
+    }
+
+    /// An explicit non-Anthropic `provider` is validated, written into the
+    /// entry, and the credential lands under the provider-agnostic `api_key*`
+    /// field name (not `anthropic_api_key*`) — the exact shape
+    /// `duduclaw-agent::account_rotator::load_from_config` /
+    /// `select_for_provider` reads back for Direct-API routing.
+    #[tokio::test]
+    async fn accounts_add_with_openai_provider_writes_api_key_field() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let res = handler
+            .handle_accounts_add(json!({
+                "id": "acct-openai",
+                "type": "api_key",
+                "provider": "openai",
+                "key": "sk-openai-secret",
+                "priority": 1,
+                "monthly_budget_cents": 5000,
+            }))
+            .await;
+        assert!(matches!(res, WsFrame::Response { ok: true, .. }), "{res:?}");
+        assert_eq!(frame_payload(&res)["provider"], json!("openai"));
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        let acct = table["accounts"].as_array().unwrap()[0].as_table().unwrap();
+        assert_eq!(acct.get("provider").and_then(|v| v.as_str()), Some("openai"));
+        assert!(
+            acct.get("api_key_enc").and_then(|v| v.as_str()).is_some(),
+            "openai key must land under `api_key_enc`, not `anthropic_api_key_enc`: {acct:?}"
+        );
+        assert!(acct.get("anthropic_api_key_enc").is_none());
+        assert!(acct.get("anthropic_api_key").is_none());
+    }
+
+    /// An unknown provider id is rejected fail-closed, and the rejected call
+    /// must not touch config.toml at all.
+    #[tokio::test]
+    async fn accounts_add_rejects_unknown_provider() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let res = handler
+            .handle_accounts_add(json!({
+                "id": "acct-bogus",
+                "type": "api_key",
+                "provider": "totally-bogus-vendor",
+                "key": "sk-whatever",
+                "priority": 1,
+                "monthly_budget_cents": 5000,
+            }))
+            .await;
+        assert!(matches!(res, WsFrame::Response { ok: false, .. }), "{res:?}");
+        assert!(!home.path().join("config.toml").exists());
+    }
+
+    /// An unknown `type` is rejected the same way — only `api_key`/`oauth`
+    /// are meaningful to `resolve_api_key`/`resolve_oauth_token`.
+    #[tokio::test]
+    async fn accounts_add_rejects_unknown_type() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let res = handler
+            .handle_accounts_add(json!({
+                "id": "acct-bad-type",
+                "type": "bearer_token",
+                "key": "sk-whatever",
+                "priority": 1,
+                "monthly_budget_cents": 5000,
+            }))
+            .await;
+        assert!(matches!(res, WsFrame::Response { ok: false, .. }), "{res:?}");
+    }
+
+    /// `accounts.list` surfaces `provider` for every account, matching what
+    /// was written by `accounts.add` (WP-A requirement: dashboard needs this
+    /// to render/filter the provider column). No I/O / no rotator cache —
+    /// exercises the pure `account_status_to_json` mapping directly so this
+    /// stays deterministic under parallel `cargo test` (the rotator cache
+    /// `handle_accounts_list` reads through is a single process-global slot
+    /// keyed by nothing, so driving this via the RPC + a real config.toml
+    /// would race against every other test that ever touches it).
+    #[test]
+    fn accounts_list_row_surfaces_provider() {
+        let status = duduclaw_agent::account_rotator::AccountStatus {
+            id: "acct-gemini".to_string(),
+            auth_method: "api_key".to_string(),
+            provider: "gemini".to_string(),
+            priority: 1,
+            is_healthy: true,
+            spent_this_month: 0,
+            monthly_budget_cents: 5000,
+            total_requests: 0,
+            is_available: true,
+            email: String::new(),
+            subscription: String::new(),
+            label: String::new(),
+            expires_at: None,
+            days_until_expiry: None,
+        };
+        let row = account_status_to_json(&status);
+        assert_eq!(row["provider"], json!("gemini"));
+        assert_eq!(row["id"], json!("acct-gemini"));
     }
 }
 
