@@ -197,7 +197,15 @@ pub const LAUNCHER_SECTION_APPS: &str = "應用程式";
 pub const LAUNCHER_SECTION_FILES: &str = "檔案";
 pub const LAUNCHER_DELEGATE_AGENT_BG_HEX: u32 = 0x0f766e;
 pub const LAUNCHER_FOOTER_LEFT: &str = "↑↓ 選擇 · Enter 執行 · Tab 換分類";
-pub const LAUNCHER_FOOTER_RIGHT: &str = "Super 鍵隨時喚起";
+/// Names the binding that ACTUALLY summons the Launcher — `cmd-k` in
+/// `main.rs`'s keymap (gpui maps `cmd` to the Logo/Super key on Linux) and
+/// comp's global Super+K intent, both of which the menu-bar pill already
+/// labels「⌘K」and `docs/features/51-os-keyboard-shortcuts.md` documents as
+/// Cmd+K. The design board's original copy said「Super 鍵隨時喚起」, which
+/// promised a lone-Super tap that no layer of the stack has ever bound
+/// (verified on the appliance VM 2026-09-08: a Super tap does nothing,
+/// Super+K and the pill both open it) — a false promise, not a placeholder.
+pub const LAUNCHER_FOOTER_RIGHT: &str = "⌘K 隨時喚起";
 
 // ── Notifications overlay fake data ───────────────────────────────────────
 // Content lifted verbatim from `commercial/design/duduclaw-os-desktop/
@@ -312,6 +320,15 @@ mod tests {
     }
 
     // ── Launcher ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn launcher_footer_names_the_real_summon_binding() {
+        // The footer must advertise the binding the shell actually has
+        // (`cmd-k` / Super+K, shown as「⌘K」on the menu-bar pill) — never a
+        // lone Super tap, which nothing binds. See the const's own doc.
+        assert!(LAUNCHER_FOOTER_RIGHT.contains("⌘K"), "footer must name ⌘K: {LAUNCHER_FOOTER_RIGHT}");
+        assert!(!LAUNCHER_FOOTER_RIGHT.contains("Super 鍵"), "a lone Super tap is not bound anywhere");
+    }
 
     #[test]
     fn launcher_file_results_has_two_entries_matching_the_design_board() {
