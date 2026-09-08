@@ -128,7 +128,7 @@ ab_glyph = "0.2"
 # trio above — see BUILD.md's XWayland section for what the container build
 # actually required.
 [dependencies.smithay]
-version = "1.63.0"
+version = "0.7.0"
 default-features = false
 features = [
     "backend_winit",

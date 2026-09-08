@@ -417,7 +417,25 @@ echo "Bumping all platform manifests to $NEW_VERSION..."
 while IFS='|' read -r kind file; do
     case "$kind" in
         cargo|pyproject)
-            sed -i '' -E "s/^version = \"$SEMVER\"/version = \"$NEW_VERSION\"/" "$file"
+            # Only the manifest's OWN version line: the first `version = "x.y.z"`
+            # that follows `[package]` / `[workspace.package]` (Cargo) or `[project]`
+            # (pyproject) and
+            # precedes the next table header. The old whole-file sed
+            # ("rewrites ANY semver") hit table-form dependency entries too:
+            # v1.63.0 turned duduclaw-comp's `[dependencies.smithay]
+            # version = "0.7.0"` into `"1.63.0"`, and the OS bake died with
+            # `failed to select a version for the requirement smithay = "^1.63.0"`
+            # (2026-09-08). Drift correction still happens — any semver in the
+            # package's own line is rewritten — just never outside it.
+            awk -v semver_re="^version = \"$SEMVER\"" -v newv="$NEW_VERSION" '
+                /^\[/ { in_pkg = ($0 == "[package]" || $0 == "[workspace.package]" || $0 == "[project]"); done_pkg = 0 }
+                in_pkg && !done_pkg && $0 ~ semver_re {
+                    print "version = \"" newv "\""
+                    done_pkg = 1
+                    next
+                }
+                { print }
+            ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
             # A workspace-EXCLUDED crate (duduclaw-shell / duduclaw-native-gui /
             # duduclaw-comp -- see the root Cargo.toml `[workspace] exclude`
             # list) carries its OWN standalone Cargo.lock with a self-
