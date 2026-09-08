@@ -34,6 +34,8 @@ pub mod access_control;
 pub mod agent_binding;
 pub mod agent_hook_installer;
 pub mod auth;
+// ── D7: "every Claude account failed authentication" alarm bell ──────────
+pub mod auth_outage;
 // ── WP-B: appliance-image device management (`device.*` dashboard RPCs) ──
 pub mod device;
 // ── System-settings app: `device.about` / `device.timedate*` data ─────────

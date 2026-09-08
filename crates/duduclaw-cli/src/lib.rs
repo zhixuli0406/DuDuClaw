@@ -5222,6 +5222,71 @@ fn org_authority_check(home: &std::path::Path) -> (String, CheckStatus, String) 
     )
 }
 
+/// Per-account credential verdicts for `duduclaw doctor` (D5, 2026-09
+/// hardening).
+///
+/// `claude auth status` answers "is a login present?"; this answers "does this
+/// specific stored credential still authenticate?" — the question whose absence
+/// let a 403'd token look healthy on the dashboard for 18 hours on 2026-09-08.
+/// Each Anthropic account carrying a stored token/key is authenticated against
+/// `GET /v1/models` (free, consumes no tokens, 10 s cap each).
+///
+/// Best-effort and offline-safe by construction:
+/// * no accounts / unreadable config ⇒ no rows at all (nothing to say);
+/// * keychain-only OAuth sessions and foreign-provider seats are skipped —
+///   there is no secret here to present, and probing a non-Anthropic seat
+///   against Anthropic would produce a confident, wrong verdict;
+/// * a network failure prints 無法連線 as a `Warn`, never a `Fail` — an
+///   offline box must not be told its credentials are dead.
+///
+/// Read-only: `probe_credentials_report` never mutates rotator state, so
+/// running the doctor cannot perturb a live gateway's rotation.
+async fn account_credential_checks(home: &std::path::Path) -> Vec<(String, CheckStatus, String)> {
+    account_credential_checks_at(home, duduclaw_agent::credential_probe::ANTHROPIC_API_BASE).await
+}
+
+/// [`account_credential_checks`] with an injectable API base, so the row
+/// rendering can be tested against a local listener instead of the network.
+async fn account_credential_checks_at(
+    home: &std::path::Path,
+    probe_base: &str,
+) -> Vec<(String, CheckStatus, String)> {
+    use duduclaw_agent::account_rotator::{AccountRotator, RotationStrategy};
+    use duduclaw_agent::credential_probe::CredentialProbe;
+
+    let rotator =
+        AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(probe_base);
+    if rotator.load_from_config(home).await.unwrap_or(0) == 0 {
+        return Vec::new();
+    }
+
+    let mut rows = Vec::new();
+    for report in rotator.probe_credentials_report().await {
+        let Some(probe) = report.probe else {
+            // Nothing probe-able: say nothing rather than imply a verdict.
+            continue;
+        };
+        let (status, verdict) = match probe {
+            CredentialProbe::Valid => (CheckStatus::Pass, "有效".to_string()),
+            CredentialProbe::InvalidCredential => (
+                CheckStatus::Fail,
+                "token 無效（401）—— 請重新執行 `claude setup-token` 並在 設定→帳號 更新".to_string(),
+            ),
+            CredentialProbe::OrgDisabled => (
+                CheckStatus::Fail,
+                "組織停用（403）—— 此組織已停用 Claude Code 訂閱存取,請改用 API key 或洽組織管理員"
+                    .to_string(),
+            ),
+            // Inconclusive: the probe says nothing about the credential.
+            CredentialProbe::RateLimited | CredentialProbe::Unknown(_) => {
+                (CheckStatus::Warn, "無法連線（無法判定,稍後再試）".to_string())
+            }
+        };
+        rows.push((format!("帳號憑證 {}", report.id), status, verdict));
+    }
+    rows
+}
+
 /// Render one org placement for console output.
 fn org_entry_label(entry: &duduclaw_core::OrgEntry) -> String {
     let parent = if entry.reports_to.is_empty() {
@@ -5630,6 +5695,22 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
             ));
         }
     }
+
+    // Check 3b (D5, 2026-09-08 incident): the check above is a *presence*
+    // check, not a *validity* check — `claude auth status` reports
+    // `loggedIn: true` for any ambient token, including one Anthropic has been
+    // answering with 403 for 18 hours. Say so right under its verdict, then
+    // answer the real question per account below.
+    if let Some((_, _, message)) = checks
+        .iter_mut()
+        .rev()
+        .find(|(name, _, _)| name == "Claude Code")
+    {
+        message.push_str(
+            "\n         注意：`claude auth status` 只代表環境變數/登入檔存在，不代表 token 仍有效",
+        );
+    }
+    checks.extend(account_credential_checks(&home).await);
 
     // Check 4: Docker availability
     match bollard::Docker::connect_with_local_defaults() {
@@ -7631,6 +7712,128 @@ async fn cmd_update(auto_yes: bool) -> duduclaw_core::error::Result<()> {
     } else {
         // [R3:L1] Return error so CLI exits with non-zero code
         Err(DuDuClawError::Gateway(format!("Update failed: {}", result.message)))
+    }
+}
+
+/// D5 (2026-09 credential hardening) — `duduclaw doctor`'s per-account
+/// credential rows.
+#[cfg(test)]
+mod account_credential_row_tests {
+    use super::*;
+
+    /// A loopback listener that answers every connection with the same canned
+    /// HTTP response. A loop (not a single accept) because the rotator may
+    /// legitimately load more than the account this test wrote — an extra
+    /// probe must not turn into a transport failure and make the assertion
+    /// depend on the dev box's own `~/.claude` state.
+    async fn probe_server(response: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn home_with_account(home: &std::path::Path) {
+        std::fs::write(
+            home.join("config.toml"),
+            "[[accounts]]\nid = \"doctor-acct\"\ntype = \"api_key\"\n\
+             provider = \"anthropic\"\nanthropic_api_key = \"sk-ant-api03-doctor\"\n\
+             priority = 1\nmonthly_budget_cents = 5000\n",
+        )
+        .unwrap();
+    }
+
+    fn row<'a>(
+        rows: &'a [(String, CheckStatus, String)],
+        id: &str,
+    ) -> Option<&'a (String, CheckStatus, String)> {
+        rows.iter().find(|(name, _, _)| name == &format!("帳號憑證 {id}"))
+    }
+
+    /// A home with no accounts says nothing at all — the doctor must not
+    /// invent a row (and must not touch the network to find that out).
+    #[tokio::test]
+    async fn no_accounts_produces_no_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "[gateway]\nport = 8080\n").unwrap();
+        let rows = account_credential_checks_at(tmp.path(), "http://192.0.2.1:9").await;
+        assert!(
+            row(&rows, "doctor-acct").is_none(),
+            "no configured account ⇒ no credential row: {rows:?}"
+        );
+    }
+
+    /// 200 ⇒ 有效 / Pass.
+    #[tokio::test]
+    async fn valid_credential_reports_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        home_with_account(tmp.path());
+        let base =
+            probe_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await;
+        let rows = account_credential_checks_at(tmp.path(), &base).await;
+        let (_, status, detail) = row(&rows, "doctor-acct").expect("row present");
+        assert_eq!(*status, CheckStatus::Pass, "{detail}");
+        assert!(detail.contains("有效"), "{detail}");
+    }
+
+    /// 403 ⇒ 組織停用 / Fail — the 2026-09-08 shape. This is the row that
+    /// would have told the operator, in one command, what 18 hours of silent
+    /// scheduled-job failures never did.
+    #[tokio::test]
+    async fn org_disabled_credential_reports_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        home_with_account(tmp.path());
+        let base =
+            probe_server("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        let rows = account_credential_checks_at(tmp.path(), &base).await;
+        let (_, status, detail) = row(&rows, "doctor-acct").expect("row present");
+        assert_eq!(*status, CheckStatus::Fail, "{detail}");
+        assert!(detail.contains("403"), "{detail}");
+    }
+
+    /// 401 ⇒ token 無效 / Fail, naming the fix the operator can act on.
+    #[tokio::test]
+    async fn invalid_credential_reports_fail_with_the_fix() {
+        let tmp = tempfile::tempdir().unwrap();
+        home_with_account(tmp.path());
+        let base = probe_server(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let rows = account_credential_checks_at(tmp.path(), &base).await;
+        let (_, status, detail) = row(&rows, "doctor-acct").expect("row present");
+        assert_eq!(*status, CheckStatus::Fail, "{detail}");
+        assert!(detail.contains("setup-token"), "{detail}");
+    }
+
+    /// An unreachable probe is a WARN, never a FAIL: an offline box must not
+    /// be told its credentials are dead.
+    #[tokio::test]
+    async fn unreachable_probe_warns_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        home_with_account(tmp.path());
+        // Bind then drop → the port is closed, so the probe is a transport
+        // failure (`Unknown`), which says nothing about the credential.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let rows = account_credential_checks_at(tmp.path(), &format!("http://{addr}")).await;
+        let (_, status, detail) = row(&rows, "doctor-acct").expect("row present");
+        assert_eq!(*status, CheckStatus::Warn, "{detail}");
+        assert!(detail.contains("無法連線"), "{detail}");
     }
 }
 

@@ -104,12 +104,59 @@ Account Health States:
      |       OAuth token approaching expiration
      |       Warning at: 30 days and 7 days before expiry
      |
+     +---> Auth-Dead
+     |       Anthropic rejected the credential itself —
+     |       an invalid/expired token, or the organization
+     |       has disabled Claude Code subscription access
+     |       Cooldown: 15 minutes, doubling on every repeat
+     |       failure up to a 6-hour cap
+     |
+     +---> Broken
+     |       The stored credential can't be decrypted (or
+     |       decrypts to nothing) — excluded from rotation
+     |       at startup rather than spawning credential-less
+     |       runs
+     |
      +---> Error
-             Unexpected failures (network, auth, server)
+             Other unexpected failures (network, server)
              Cooldown: exponential backoff
 ```
 
-When an account enters a cooldown state, the rotation strategy automatically skips it and uses the next available account. When the cooldown expires, the account is automatically restored to the rotation pool.
+When an account enters a cooldown state, the rotation strategy automatically skips it and uses the next available account. When the cooldown expires, the account is automatically restored to the rotation pool — except an Auth-Dead account, which only comes back early via a real credential check succeeding (see below) or by saving a fresh credential for it. A Broken account never comes back on its own; the credential has to be re-saved.
+
+### Real Credential Checks, Not Guesses
+
+Restoring an account used to mean running `claude auth status` and trusting its `loggedIn: true`. That check only proves *some* `CLAUDE_CODE_OAUTH_TOKEN` is sitting in the environment — it says nothing about whether *this account's* token still authenticates, and a revoked or organization-disabled token can keep reporting "logged in" indefinitely.
+
+For OAuth accounts that store their own token and for API-key accounts, the rotator now probes the credential directly with a zero-cost call to Anthropic's `GET /v1/models`, using that exact account's secret:
+
+- **200** — the credential works. The account is restored and its failure count resets.
+- **401** — the token itself is invalid. The account stays parked.
+- **403** — the organization has disabled Claude Code subscription access. The account stays parked.
+- **429, or a network error** — inconclusive. The account is left untouched and re-checked next cycle.
+
+A credential the API has conclusively rejected is re-checked on a backoff rather than once every cycle forever: one minute, then two, four, eight, sixteen, capped at thirty. An inconclusive answer never slows the schedule down, and a working credential or a fresh authentication failure from a real request clears it immediately.
+
+Accounts that rely on a keychain login (no stored token to hand the probe) keep using `claude auth status`, since there's no per-account secret to check directly — but once such an account has gone Auth-Dead, this check can no longer resurrect it early; it still has to wait out the cooldown.
+
+### Verifying Credentials Before They're Saved
+
+Adding an account — from the dashboard or via `accounts.add` — now runs the same check before anything is written:
+
+- A rejected credential (401) is refused outright.
+- An organization-disabled credential (403) is refused with guidance to switch to an API key or contact the organization admin.
+- A short-lived access token (`sk-ant-at01-…`, what `claude auth token` prints) is refused with a pointer to `claude setup-token`, which produces the long-lived `sk-ant-oat01-…` token the rotator actually wants.
+- If the check can't complete at all — offline, most likely — the account is still saved, just flagged unverified until the next health cycle confirms it.
+
+### Checking Credentials From the Terminal
+
+`duduclaw doctor` prints one line per Anthropic account that stores its own token or key: valid, invalid token (401), organization disabled (403), or unreachable. It runs the same zero-cost check as the rotator and changes nothing, so it is safe to run against a live gateway. Accounts that rely on a keychain login are skipped — there is no secret here to check. An unreachable network is reported as a warning, never as a dead credential.
+
+The `claude auth status` line above it now carries a caveat, because that check only proves a login file or environment variable exists — not that the token still authenticates.
+
+### Auth Outage Alert
+
+If every account in the pool is failing on authentication at the same time, that's not a per-account cooldown — it's a platform-wide outage. DuDuClaw posts one Activity Feed event and sends one notification to the affected agent's channel, explaining that scheduled work and replies are paused and pointing at the dashboard's account settings. It stays quiet for as long as the outage continues (no repeat pings), then sends exactly one recovery notice the moment any account authenticates successfully again.
 
 ### Budget Enforcement
 

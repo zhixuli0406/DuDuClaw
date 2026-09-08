@@ -569,6 +569,14 @@ docker compose exec duduclaw claude auth status
 
 A common mistake is forgetting to **restart** the container with `docker compose up -d` after editing `.env` — environment variables are only injected at startup, so a hot edit has no effect.
 
+> **Step 3 doesn't prove the token still works.** `claude auth status` reports `loggedIn: true` whenever a `CLAUDE_CODE_OAUTH_TOKEN` env var is present — it never checks whether that token still authenticates. A revoked or organization-disabled token passes this check just as happily as a good one. To find out whether the credential actually works, check that account's credential-state badge on the dashboard's Accounts page (未驗證/憑證損壞/token 無效/組織停用 — a healthy account shows nothing), or run a real probe inside the container:
+>
+> ```bash
+> docker compose exec duduclaw claude -p "reply ok" --model haiku --max-turns 1 --output-format json
+> ```
+>
+> and look at the `is_error` / `api_error_status` fields in the JSON output.
+
 ### The dashboard connects, but the agent replies with "please run `claude auth status`"
 
 This is a leftover message from versions before v1.8.x; v1.8.22+ replaced it with zh-TW messages classified by `FailureReason`. If you're still seeing it:

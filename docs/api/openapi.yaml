@@ -823,6 +823,10 @@ paths:
                 properties:
                   success:
                     type: boolean
+                  verified:
+                    type: boolean
+                    nullable: true
+                    description: Anthropic accounts only. true = the credential was probed OK before saving; false = saved but the probe could not run (offline or rate limited); null = provider not probed. 401/403 credentials and short-lived sk-ant-at01- access tokens are rejected instead of saved.
                   id:
                     type: string
                   type:
@@ -2256,6 +2260,14 @@ components:
           type: integer
         is_available:
           type: boolean
+        credential_state:
+          type: string
+          enum: [ok, unverified, broken, "auth_dead:invalid_token", "auth_dead:org_disabled"]
+          description: Credential health from the rotator. ok = proven by a real request or probe; unverified = loaded but not yet exercised; broken = stored secret cannot be decrypted (never selectable); auth_dead:* = a real 401/403 was observed (exponential cooldown 15 min to 6 h).
+        credential_detail:
+          type: string
+          nullable: true
+          description: Operator-facing zh-TW one-liner explaining a non-ok credential_state.
         label:
           type: string
         email:

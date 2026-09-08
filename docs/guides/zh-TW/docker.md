@@ -599,6 +599,19 @@ docker compose exec duduclaw claude auth status
 常見錯誤是忘了 `docker compose up -d` 在修改 `.env` 後**重啟** container，
 env var 只在啟動時注入，熱改無效。
 
+> **第 3 步不能證明 token 還活著。**只要環境裡有 `CLAUDE_CODE_OAUTH_TOKEN`，
+> `claude auth status` 就會回報 `loggedIn: true`——它從來不檢查這個 token
+> 是否還能實際認證。一顆已被撤銷或組織停用的 token，一樣會通過這個檢查。
+> 要確認憑證是不是真的有效，看儀表板「帳號」頁該帳號卡片上的憑證狀態徽章
+> （未驗證／憑證損壞／token 無效／組織停用——健康帳號不顯示任何徽章），
+> 或在 container 內直接跑一次真探測：
+>
+> ```bash
+> docker compose exec duduclaw claude -p "reply ok" --model haiku --max-turns 1 --output-format json
+> ```
+>
+> 看回傳 JSON 裡的 `is_error` / `api_error_status` 欄位。
+
 ### Dashboard 打得到但 agent 回訊「請先執行 `claude auth status`」
 
 這是 v1.8.x 前版本的殘留訊息；v1.8.22+ 已改成依

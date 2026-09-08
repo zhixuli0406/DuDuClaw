@@ -3074,6 +3074,18 @@ async fn build_reply_with_session_inner(
         Ok(reply) => {
             if !local_first_answered {
                 info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
+                // D7 recovery: a Claude account actually answered, so any
+                // open "all accounts failed authentication" outage is over —
+                // close it and say so once. Deliberately gated on
+                // `!local_first_answered`: a local-model reply proves nothing
+                // about cloud credentials and must not clear the alarm (that
+                // would flap the notification on every alternating turn).
+                let outage_agent = if agent_id.trim().is_empty() {
+                    "system"
+                } else {
+                    agent_id.as_str()
+                };
+                crate::auth_outage::record_recovery(&ctx.home_dir, outage_agent).await;
             }
             Some(reply)
         }
@@ -4833,6 +4845,20 @@ async fn build_reply_with_session_inner(
         "Channel reply fallback — all providers failed"
     );
 
+    // D7 (2026-09-08 incident): an auth-class total failure is an outage, not
+    // a bad minute — schedules and replies stay dead until a human pastes a
+    // new token. Alarm once per outage; `record_outage` debounces and
+    // swallows its own errors, so this can never turn a fallback message into
+    // a hard failure.
+    if reason == FailureReason::AuthFailed {
+        let outage_agent = if agent_id.trim().is_empty() {
+            "system"
+        } else {
+            agent_id.as_str()
+        };
+        crate::auth_outage::record_outage(&ctx.home_dir, outage_agent, &err_str).await;
+    }
+
     // Append a structured audit line so the dashboard can surface failure trends.
     // R3: annotate with the MAST failure-taxonomy label (arXiv:2503.13657) —
     // deterministic from the FailureReason token + embedded diagnostics;
@@ -5219,9 +5245,24 @@ pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
     // Auth failures come through the stream-json `is_error` branch as
     // "claude CLI stream error: Not logged in · Please run /login" or
     // "claude CLI assistant error: authentication_failed".
+    //
+    // 2026-09-08 incident (DESIGN-account-credential-hardening-2026-09 §D2):
+    // an org whose Claude Code subscription access was revoked answers with
+    // `oauth_org_not_allowed` / `oauth_not_allowed_for_organization`, and a
+    // pasted short-lived access token answers with
+    // "OAuth access token is invalid". Neither matched here, so 18 hours of
+    // dead-token failures classified as `Unknown` — the rotator kept retrying
+    // them on the generic error path and the user-facing message pointed at
+    // the debug log instead of the account page.
     if lower.contains("not logged in")
         || lower.contains("authentication_failed")
         || lower.contains("please run /login")
+        || lower.contains("oauth_org_not_allowed")
+        || lower.contains("oauth_not_allowed_for_organization")
+        || lower.contains("not allowed for this organization")
+        || lower.contains("invalid bearer token")
+        || lower.contains("oauth access token is invalid")
+        || lower.contains("disabled claude subscription access")
     {
         return FailureReason::AuthFailed;
     }
@@ -5261,6 +5302,55 @@ pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
         return FailureReason::SpawnError;
     }
     FailureReason::Unknown
+}
+
+/// Sub-classify an [`FailureReason::AuthFailed`] error into the two kinds a
+/// human has to act on differently.
+///
+/// * `"org_disabled"` — Anthropic revoked this organization's Claude Code
+///   subscription access (HTTP 403). A new token from the same org will fail
+///   the same way; the fix is an API key or an admin conversation.
+/// * `"invalid_token"` — the credential itself is wrong or expired (HTTP
+///   401). Re-running `claude setup-token` fixes it.
+/// * `None` — not an auth failure at all.
+///
+/// The string form feeds the operator-facing outage message
+/// (`auth_outage.rs`); [`auth_failure_kind_for`] maps the same verdict onto
+/// the rotator's typed `AuthFailureKind` for the state machine.
+pub(crate) fn auth_failure_kind_hint(err: &str) -> Option<&'static str> {
+    if classify_cli_failure(err) != FailureReason::AuthFailed {
+        return None;
+    }
+    let lower = err.to_lowercase();
+    if lower.contains("oauth_org_not_allowed")
+        || lower.contains("oauth_not_allowed_for_organization")
+        || lower.contains("not allowed for this organization")
+        || lower.contains("disabled claude subscription access")
+    {
+        return Some("org_disabled");
+    }
+    Some("invalid_token")
+}
+
+/// The rotator-facing twin of [`auth_failure_kind_hint`] (D2): the typed
+/// `AuthFailureKind` a spawn failure should be booked against, or `None` when
+/// the failure is not an authentication failure at all.
+///
+/// One classifier, two renderings — deriving both from `auth_failure_kind_hint`
+/// keeps the operator's message and the account's state machine from ever
+/// disagreeing about *why* an account died. Anything auth-shaped that is not
+/// recognisably an org rejection is treated as an invalid token: that is the
+/// safe default (it points the operator at re-issuing their own credential,
+/// an action they can always take).
+pub(crate) fn auth_failure_kind_for(
+    err: &str,
+) -> Option<duduclaw_agent::account_rotator::AuthFailureKind> {
+    use duduclaw_agent::account_rotator::AuthFailureKind;
+    match auth_failure_kind_hint(err) {
+        Some("org_disabled") => Some(AuthFailureKind::OrgDisabled),
+        Some(_) => Some(AuthFailureKind::InvalidToken),
+        None => None,
+    }
 }
 
 /// Summarized-failure retry hint (context decontamination, arXiv:2605.08563).
@@ -5850,6 +5940,62 @@ mod fallback_tests {
         );
     }
 
+    /// 2026-09-08 regression (§D2): every one of these ran for 18 hours
+    /// classified as `Unknown`, which is why nothing escalated.
+    #[test]
+    fn classify_auth_failed_covers_2026_09_incident_strings() {
+        for err in [
+            "All accounts exhausted. Last error: claude CLI assistant error: oauth_org_not_allowed",
+            "oauth_not_allowed_for_organization",
+            "This organization is not allowed for this organization's Claude Code access",
+            "Invalid bearer token",
+            "OAuth access token is invalid",
+            "Your organization has disabled Claude subscription access",
+            // Case-insensitivity is load-bearing: provider text arrives in
+            // several casings across the CLI's error surfaces.
+            "OAUTH_ORG_NOT_ALLOWED",
+        ] {
+            assert_eq!(
+                classify_cli_failure(err),
+                FailureReason::AuthFailed,
+                "must classify as AuthFailed: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_failure_kind_hint_splits_org_from_token() {
+        for err in [
+            "claude CLI assistant error: oauth_org_not_allowed",
+            "oauth_not_allowed_for_organization",
+            "not allowed for this organization",
+            "Your organization has disabled Claude subscription access",
+        ] {
+            assert_eq!(
+                auth_failure_kind_hint(err),
+                Some("org_disabled"),
+                "org-family: {err}"
+            );
+        }
+        for err in [
+            "claude CLI assistant error: authentication_failed",
+            "claude CLI stream error: Not logged in · Please run /login",
+            "Invalid bearer token",
+            "OAuth access token is invalid",
+        ] {
+            assert_eq!(
+                auth_failure_kind_hint(err),
+                Some("invalid_token"),
+                "token-family: {err}"
+            );
+        }
+        // Non-auth failures must not be given an auth kind — a fabricated
+        // cause would send the operator to the wrong dashboard page.
+        assert_eq!(auth_failure_kind_hint("Error 429 rate limit reached"), None);
+        assert_eq!(auth_failure_kind_hint("claude CLI not found"), None);
+        assert_eq!(auth_failure_kind_hint("some weird unrelated thing"), None);
+    }
+
     #[test]
     fn message_auth_failed_tells_user_to_login() {
         let msg = format_fallback_message("Agnes", FailureReason::AuthFailed, Path::new("/nonexistent-duduclaw-test-home"));
@@ -6067,6 +6213,13 @@ mod rotation_tests {
             cooldown_until: None,
             last_used: None,
             total_requests: 0,
+            // §D5: a synthetic fixture has never been exercised, so the
+            // honest state is `Unverified` (the enum's own default) with a
+            // clean strike count — anything else would pre-bias selection.
+            credential_state: Default::default(),
+            auth_dead_strikes: 0,
+            next_probe_at: None,
+            probe_failures: 0,
         }
     }
 
@@ -6359,6 +6512,89 @@ mod rotation_tests {
         assert!(
             !statuses[0].is_healthy,
             "repeated genuine CLI failures must still take the account out of rotation"
+        );
+    }
+
+    /// D2 (2026-09-08 incident) — an org-rejected token dies on the FIRST
+    /// failure, not the third.
+    ///
+    /// The pre-fix path was `on_error`: three strikes, then a 2-minute
+    /// cooldown, then back into rotation. Anthropic answered
+    /// `oauth_org_not_allowed` for 18 hours, so the account was resurrected
+    /// every couple of minutes and every scheduled dispatch burned one more
+    /// spawn on it. Now a single auth failure books
+    /// `AuthDead(OrgDisabled)` with at least the 15-minute base backoff.
+    #[tokio::test]
+    async fn auth_failure_marks_account_auth_dead_on_the_first_strike() {
+        use duduclaw_agent::account_rotator::{AuthFailureKind, CredentialState};
+
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator
+            .push_account_for_test(fake_oauth_account("org-blocked", 1))
+            .await;
+
+        let before = chrono::Utc::now();
+        let result = rotate_cli_spawn(
+            &rotator,
+            &[],
+            |_env_vars, _retry_hint| async move {
+                Err::<String, _>("claude CLI assistant error: oauth_org_not_allowed".to_string())
+            },
+            100,
+        )
+        .await;
+        assert!(result.is_err());
+
+        let statuses = rotator.status().await;
+        let acc = &statuses[0];
+        assert_eq!(
+            acc.credential_state,
+            CredentialState::AuthDead(AuthFailureKind::OrgDisabled),
+            "an org rejection must be recorded as such, not as a generic error"
+        );
+        assert_eq!(
+            acc.auth_dead_strikes, 1,
+            "one failure is enough — waiting for three is what burned 18 hours of spawns"
+        );
+        assert!(!acc.is_healthy && !acc.is_available);
+
+        // …and the cooldown must be the auth-dead ladder's 15-minute base, not
+        // the rotator's 2-minute generic-error cooldown.
+        let cooled_at_least_15_min = rotator
+            .cooldown_until_for_test("org-blocked")
+            .await
+            .is_some_and(|until| until >= before + chrono::Duration::minutes(15));
+        assert!(
+            cooled_at_least_15_min,
+            "auth-dead cooldown must be >= 15 min (got the generic 2-min cooldown?)"
+        );
+    }
+
+    /// The counterpart: a *token* rejection is booked as `InvalidToken`, so the
+    /// dashboard tells the operator to re-run `claude setup-token` rather than
+    /// to go argue with their org admin.
+    #[tokio::test]
+    async fn invalid_token_failure_is_distinguished_from_an_org_rejection() {
+        use duduclaw_agent::account_rotator::{AuthFailureKind, CredentialState};
+
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator
+            .push_account_for_test(fake_oauth_account("stale-token", 1))
+            .await;
+
+        let _ = rotate_cli_spawn(
+            &rotator,
+            &[],
+            |_env_vars, _retry_hint| async move {
+                Err::<String, _>("claude CLI stream error: OAuth access token is invalid".into())
+            },
+            100,
+        )
+        .await;
+
+        assert_eq!(
+            rotator.status().await[0].credential_state,
+            CredentialState::AuthDead(AuthFailureKind::InvalidToken)
         );
     }
 
@@ -7927,6 +8163,19 @@ where
                         error = %e,
                         "PTY transport failure — NOT counted against account health"
                     );
+                } else if let Some(kind) = auth_failure_kind_for(&e) {
+                    // D2 (2026-09-08 incident): an authentication failure is
+                    // terminal until a human acts. `on_error`'s three-strike /
+                    // 2-minute cycle handed the dead account straight back to
+                    // the next message; `on_auth_failed` takes it out on the
+                    // FIRST failure with a 15 min → 6 h backoff ladder.
+                    warn!(
+                        account = %selected.id,
+                        error = %e,
+                        kind = %kind,
+                        "Account authentication failed — marking credential auth-dead"
+                    );
+                    rotator.on_auth_failed(&selected.id, kind).await;
                 } else {
                     warn!(account = %selected.id, error = %e, "Account CLI attempt failed");
                     rotator.on_error(&selected.id).await;

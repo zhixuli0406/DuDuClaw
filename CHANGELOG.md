@@ -42,6 +42,10 @@
 - **features/52 桌面版（三語）**：新特稿 `docs/features/52-desktop-edition.md`——人與 AI 共用一台機器且不影響日常使用：agent 專屬 seat、影子工作區（headless 第二輸出＋子母畫面）、人輸入即凍結（QEMU 實測 3–4 ms）、Super+Enter 明確交還／Super+Esc 急停、watch mode、共駕預設關閉、後果性動作先審批、憑證一律交人、畫面文字視為 DATA；並誠實列出已驗證（容器＋QEMU 真輸入）與未驗證（真機 DRM、雙螢幕、AT-SPI2 真機點擊）項目。索引三語同步。
 
 - **DuDuClaw OS 桌面殼：OOBE「AI Runtime 授權」改為 provider 清單**（`crates/duduclaw-shell`，2026-09-05，`docs/todo/TODO-ai-runtimes-2026-09.md` WP-C）：原本只收一把 Anthropic 金鑰的單欄位，改為可捲動的 17 家清單（Claude Code／Codex／Gemini CLI／Grok／Qwen／Kimi／Copilot／Kiro／Cursor／Mistral Vibe／OpenCode，加上 DeepSeek／MiniMax／Z.ai GLM／Groq／Together／OpenRouter），每列標明未設定／已存金鑰／已登入，並有兩個動作：「輸入 API 金鑰」（`accounts.add` 帶 `provider`，帳號 id `oobe-<provider>`）與「登入帳號」（走 gateway 既有的 `auth.cli_login.*`，畫面顯示解析自 CLI 輸出的裝置代碼與登入網址，可用機器上的瀏覽器開啟）。訂閱登入前先顯示 §1-1 風險告知（Anthropic／Google 自 2026-03 伺服器端封鎖第三方產品使用訂閱憑證、已有帳號被停權；OpenAI 政策不明），勾選「我了解風險，由我自行承擔」才會開始；未勾選時按鈕完全不掛 click handler。**失效即拒**：gateway 的 `RuntimeType::parse` 對未知 runtime 名會預設回 Claude，所以 Kimi／Copilot／Kiro／Cursor／Vibe／OpenCode 這六列在 WP-B 教會 gateway 之前一律不可啟動（會用錯廠商的身分登入），畫面誠實說明。每家的結果持久化到 `OobeSelections::runtime_providers`（`#[serde(default)]`，舊 state 檔照載），完成頁摘要改顯示「已授權 N 家」。三語文案齊備；`auth.cli_login.*` 一路標記 `UNVERIFIED: needs live gateway`（依 TODO §4，活體驗證等 WP-A／WP-B 合併）。
+- **認證失效告警**：所有 Claude 帳號同時因認證錯誤（token 無效或組織停用）失敗時，DuDuClaw 現在會發一則 Activity Feed 事件並推一則通知到受影響 agent 的通知管道，說明排程與自動回覆已停擺、請到「設定→帳號」更新 token；只要有任何帳號恢復成功就再發一則復原通知。告警只在狀態變化時發送一次，故障持續期間不會重複打擾。
+- **帳號卡片憑證狀態徽章**：帳號卡片新增憑證狀態徽章（未驗證／憑證損壞／token 無效／組織停用），健康帳號不顯示任何徽章。
+- **儲存前先驗證憑證**（`accounts.add`，僅 Anthropic）：貼上 token／API key 時先向 `GET /v1/models` 認證一次（不耗 token、不計費）再決定要不要寫進 `config.toml`。401 與 403 直接拒絕並說明該怎麼修；離線或探測被限流時仍然存檔，但回應誠實標記 `verified: false`（成功驗證為 `true`，非 Anthropic 服務商為 `null`）。2026-09-08 事故中被放行的那把「短效 access token」（`sk-ant-at01-`）現在在送出任何網路請求之前就被擋下，並指向 `claude setup-token`。
+- **`duduclaw doctor` 逐帳號憑證檢查**：每個帶有已儲存 token／金鑰的 Anthropic 帳號各印一列——有效／token 無效（401）／組織停用（403）／無法連線。連不上網只會是 WARN，不會謊稱憑證已死；金鑰只存在鑰匙圈、或非 Anthropic 的帳號直接略過（這裡沒有可以拿去認證的東西）。同時在 `claude auth status` 那一列下方加註：它只代表登入檔／環境變數存在，不代表 token 仍然有效。
 
 ### Changed
 - **`compat.d` 的 `from_os` 新增 `linux-container`**（`duduclaw_core::compat_runners::FromOs::LinuxContainer`）：以 OCI 容器（docker／podman）交付的 Linux 工作負載，例如 DuDuClaw OS 的 LLaMA-Factory LlamaBoard 微調工作台 runner。首版宣告檔寫成 `linux-gpu` 被列舉拒絕為 malformed（這正是該列舉存在的目的），故正式加入變體而非放寬解析。
@@ -55,6 +59,9 @@
 - **DuDuClaw OS 文件事實修正（拆開 v0.1.0 發布 wic 查證）**：兩槽 UKI 與 systemd-boot 皆無簽章、GPT 無 verity 分割、無 TPM 套件——這三項是 OS repo 的建置 overlay 選項，v0.1.0 未啟用；安裝器 ISO 寫入的 `duduclaw-image-ab` 也不是無頭，它有同一個桌面殼與 gateway，只是沒有應用層。`docs/features/50` 安裝步驟改「Secure Boot 關閉」、「Optional Kiosk Display」（Debian 線敘述）改為「Editions and the Desktop」、現況段改寫；README 三語 OS 小節同步改為「人機共用且不影響日常使用」框架。
 - **docs/features 與 docs/guides 三語對齊**：2026-08-16「三語規範化」之後累積的落差一次補平——features 48／49／50 與 guides `appliance-build.md` 補齊 zh-TW／ja-JP 譯本；features 51 與 guides `app-compat.md`、`hardware-requirements.md` 原本是繁中直接放在英文 root，改為 root 英文版＋繁中移入 `zh-TW/`＋新增 ja-JP；features 28 的 See also 與 31 的 Provenance（I-2b）段落補進兩語譯本；`guides/zh-TW/custom-mcp-tool.md` 半英文舊稿重譯；三語 features README 索引補 48–51 並更新版本／日期。三語 README 新增 DuDuClaw OS：為什麼表格加一列、架構一覽補出貨形態、安裝一節新增「DuDuClaw OS(值班機映像,pre-GA)」小節、功能總覽加一列、文件清單加入口；OS 小節首句改為「AI 原生住民的作業系統：整碟映像＝自家桌面、安裝器 ISO＝無頭版」，不再把整個 OS 寫成無頭值班機。
 
+- **⚠️ 行為變更：認證失敗的帳號第一次就退場，不再等三振**（`claude_runner` 派工路徑與 `channel_reply::rotate_cli_spawn`）。過去 `oauth_org_not_allowed`／`authentication_failed` 走的是泛用 `on_error`：連續三次才標記不健康，冷卻 2 分鐘後又放回輪換。2026-09-08 的 403 就是這樣被復活了 18 小時，每個 cron tick 再燒一次 spawn。現在這類失敗直接呼叫 `on_auth_failed`，帳號立刻標成 `AuthDead`（區分 token 無效／組織停用），冷卻從 15 分鐘起跳、每次連續失敗加倍、上限 6 小時——重新簽發的 token 仍會自行恢復，真的死掉的則不再拖累排程。速率限制與帳務耗盡的分類與行為完全不變。
+- **`accounts.list`／`accounts.budget_summary` 每列新增 `credential_state` 與 `credential_detail`**：`credential_state` 是帶種類的字串（`ok`／`unverified`／`broken`／`auth_dead:invalid_token`／`auth_dead:org_disabled`）——刻意不用 `CredentialState` 的 serde 形式（那會塌成沒有種類的 `auth_dead`），因為「重發 token」與「找組織管理員」是兩個不同的動作。
+
 ### Security
 - **Kiro CLI 的廠商條款明文禁止第三方 harness**：AWS 的 Kiro FAQ 寫著「不允許透過第三方自動化 harness、將請求繞過 Kiro 原生介面」，而用 DuDuClaw 驅動 Kiro 正屬此類（自行在 CI 直接呼叫 `kiro-cli` 則被允許）。Kiro 的 catalog 條目因此把安裝管道設為 `Manual`、decline reason 為 `vendor_tos_restricts_third_party_harness`，並在三語 `tos_note` 中原文載明——gateway 不會替使用者自動安裝，啟用與否是使用者明確的決定。
 - **catalog 的 `verified` 欄位**：headless 旗標若無法對照廠商文件或實機驗證，條目必須標 `verified: false` 並在註解寫明是哪一項——嚴禁臆造旗標。此欄位會經 `runtime.detect` 上浮到 dashboard，讓 UI 誠實顯示「尚未實機驗證」。目前全部 12 條皆為 `verified: true`（旗標來源已在各條目註明），未實機跑過的部分在 `docs/features/13-multi-runtime.md` 與本節如實說明。
@@ -62,6 +69,7 @@
 - **h2 0.4.13 → 0.4.18 修補 RUSTSEC-2026-0258**（unbounded empty DATA frames，2026-08-17 公告）——透過 reqwest/hyper 間接依賴，`cargo update -p h2` 鎖檔升版。
 
 ### Fixed
+- **Launcher 底部提示「Super 鍵隨時喚起」承諾了一個不存在的手勢**（`crates/duduclaw-shell` `fake_data::LAUNCHER_FOOTER_RIGHT`）：整個堆疊沒有任何一層綁定單擊 Super——shell 綁的是 `cmd-k`（Linux 上 gpui 把 cmd 對到 Super）、comp 的全域手勢是 Super+K、選單列膠囊也標「⌘K」。2026-09-08 在 appliance VM 實測：單擊 Super 無反應，Super+K 與膠囊點擊皆可開啟。提示改為「⌘K 隨時喚起」並加單元測試鎖住。
 - **本地引擎第一次探測失敗就整個程序永久停用**（`claude_runner::get_inference_engine`）：appliance 上第一件交辦若發生在模型尚未下載／服務前，`INFERENCE_UNAVAILABLE` 旗標會讓之後 `inference.local.serve` 起好的模型完全不被使用，直到 gateway 重啟（2026-09-06 fix12 走查發現）。改為 60 秒重探視窗，且 `inference.local.serve`／`stop` 完成後立即清掉引擎快取重探。
 - **OOBE 完成頁在有線網路下顯示「網路 未連線」**（`crates/duduclaw-shell`）：只有 Wi-Fi 連線會設 `network_connected`，以有線上線通過網路步驟時旗標仍是 false。現在離開網路步驟時若有線在線即記錄已連線，完成頁顯示「有線網路已連線」（三語）。
 - **goal loop：派工同步失敗仍占用並行配額**（`goal_loop.rs`）：work message 被 dispatcher 標為 `failed`（runtime 未安裝、本地引擎未就緒、憑證被拒…）時，任務仍留在 in-flight 並持有 RFC-27 edition lease，Personal 版 cap=2 之下所有後續交辦都被「edition concurrency cap reached」擱置到 30 分鐘 TTL 到期；gateway 重啟也不會解除（2026-09-06 appliance 走查重現兩次）。現在 in-flight 記錄帶 `message_id`，每個 tick 檢查該訊息是否 `failed`：是則立刻釋放 slot 與 lease、寫 activity、進入退避（60→120→240 秒），連續三次轉 `needs_human`（原因 `infra`）並附錯誤文字；driver 啟動時清掉前一個程序殘留的 `goal` lease（`duduclaw_core::concurrency_release_class`）。四個回歸測試。
@@ -120,6 +128,9 @@
   ⑦ 走查時發現的其餘問題（輸入法附著時序、硬殺後重開慢）記在 OS repo `wiki/eval/desktop-iso-qemu-walkthrough-2026-09-05.md`。
 - **sysd 拒絕未授權連線時，拒絕回應可能被 Linux RST 摧毀**：server 對 uid 不符的 peer 寫完 `unauthorized` 回應後直接關閉，socket 收件佇列裡未讀的 request 使 close 變成 RST——client 收到 `ECONNRESET` 而非結構化錯誤（macOS 語義不同從未在本機重現，只在 Linux CI 以 `mismatched_uid_is_rejected` 閃失敗現形）。現在回應寫出後做尺寸與時間雙重上限（500ms）的 bounded drain 再關閉，未授權 peer 也無法藉此拖住連線。
 - **`resolve_duduclaw_bin_from_exe` 測試在 Windows 矩陣必失敗**：解析器在 Windows 探測的是 `duduclaw.exe`（與實際出貨檔名一致，生產行為正確），但測試 fixture 用無副檔名檔名。fixture 改依平台命名。
+- **帳號健康探測改成真的問 Anthropic，不再被 `claude auth status` 的假陽性騙過**：`claude auth status` 的 `loggedIn: true` 只代表環境裡有某個 `CLAUDE_CODE_OAUTH_TOKEN`，跟「這個帳號的 token 還能用」是兩件事——2026-09-08 一顆已被組織停用的 token 就這樣每 60 秒被「復活」一次，燒了 18 小時的排程。有存 token 的 OAuth 帳號與 API key 帳號，健康檢查現在改打一次零成本的 `GET /v1/models`：200 才視為有效並復活帳號，401/403 維持不健康，429／網路錯誤則不動、下一輪再試。沒有存 token、依賴 keychain 登入的帳號維持用 `claude auth status`。另加探測排程退避：401/403 這類確定性失敗會把下次探測往後排（1 分鐘起跳、逐次加倍、30 分鐘封頂），確定已死的憑證不再每 60 秒被重問一次；無法判斷的結果（429／網路錯誤）不改排程，探測成功、實際請求成功或又撞上一次認證失敗都會立刻把排程歸零，`accounts.list` 一併帶出 `next_probe_at` / `probe_failures` 供儀表板顯示。
+- **無法解密的憑證在載入時就被排除，不再靜默用空憑證開子行程**：帳號的加密憑證解不出來（或解出空字串）時，開機時記一筆警告並標記為憑證損壞，永遠不進入輪替候選，直到憑證被重新儲存為止。
+- **新增帳號對話框終於會顯示伺服器實際的錯誤訊息**：先前伺服器回傳的錯誤文字被前端丟棄、一律顯示通用失敗訊息；現在會原樣顯示（例如上述憑證驗證的拒絕原因）。
 
 ## [1.62.0] - 2026-08-21 — goal 意圖路由×代碼安全審計×記憶與停滯修復
 

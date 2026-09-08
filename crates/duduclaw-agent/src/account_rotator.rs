@@ -18,9 +18,118 @@ use duduclaw_security::secret_ref::SecretRef;
 use zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::credential_probe::{
+    ANTHROPIC_API_BASE, CredentialKind, CredentialProbe, probe_anthropic_credential_at,
+};
 
 // ── Types ───────────────────────────────────────────────────
+
+/// Why an account's authentication is dead (2026-09 hardening, D2).
+///
+/// Split because the two need different operator action: an invalid token is
+/// re-issued (`claude setup-token`), an org-disabled one cannot be fixed by
+/// the account holder at all. Both are terminal until a human intervenes —
+/// neither heals by waiting, which is exactly why the old
+/// "3 errors → 2-min cooldown → resurrect" cycle burned a spawn per cron tick
+/// for 18 hours on 2026-09-08.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthFailureKind {
+    /// The credential was rejected (HTTP 401): expired, revoked, malformed, or
+    /// a short-lived `sk-ant-at01-` access token used as an account credential.
+    InvalidToken,
+    /// The credential authenticates but the organization has disabled this
+    /// access path (HTTP 403 `oauth_not_allowed_for_organization`).
+    OrgDisabled,
+}
+
+impl std::fmt::Display for AuthFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidToken => "invalid_token",
+            Self::OrgDisabled => "org_disabled",
+        })
+    }
+}
+
+/// What we currently know about an account's credential (2026-09 hardening,
+/// D5). Orthogonal to `is_healthy` / `cooldown_until`, which describe *usage*
+/// outcomes; this describes the credential itself.
+///
+/// Serializes as a flat lowercase snake string (`"ok"`, `"unverified"`,
+/// `"broken"`, `"auth_dead"`) for `accounts.list`; the failure kind travels
+/// alongside it via [`CredentialState::credential_detail`] and the richer
+/// [`Display`](std::fmt::Display) token (`auth_dead:org_disabled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CredentialState {
+    /// Proven good — a real request (or a real probe) succeeded with it.
+    Ok,
+    /// Loaded but never exercised. The honest default: we have a credential,
+    /// we have not yet seen it work.
+    #[default]
+    Unverified,
+    /// The stored credential could not be turned into a usable secret
+    /// (undecryptable `*_enc`, or decrypted to an empty string). Never
+    /// selectable — waiting cannot fix it; only re-saving the credential can,
+    /// and that rebuilds the rotator.
+    Broken,
+    /// A real authentication failure was observed. Comes back only via
+    /// cooldown expiry (one retry), never via a health probe's `Valid`-less
+    /// signal.
+    AuthDead(AuthFailureKind),
+}
+
+impl std::fmt::Display for CredentialState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => f.write_str("ok"),
+            Self::Unverified => f.write_str("unverified"),
+            Self::Broken => f.write_str("broken"),
+            Self::AuthDead(kind) => write!(f, "auth_dead:{kind}"),
+        }
+    }
+}
+
+impl Serialize for CredentialState {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Self::Ok => "ok",
+            Self::Unverified => "unverified",
+            Self::Broken => "broken",
+            Self::AuthDead(_) => "auth_dead",
+        })
+    }
+}
+
+impl CredentialState {
+    /// One-line, operator-facing (zh-TW) explanation of a bad state, or `None`
+    /// when there is nothing to explain.
+    ///
+    /// Written for the dashboard account card — it names the fix, not the
+    /// internal mechanism.
+    pub fn credential_detail(&self) -> Option<&'static str> {
+        match self {
+            Self::Ok | Self::Unverified => None,
+            Self::Broken => Some("憑證無法解密或為空，請檢查 ~/.duduclaw/.keyfile 後重新儲存憑證"),
+            Self::AuthDead(AuthFailureKind::InvalidToken) => {
+                Some("token 無效（401），請重新執行 `claude setup-token` 並更新此帳號")
+            }
+            Self::AuthDead(AuthFailureKind::OrgDisabled) => {
+                Some("此組織已停用 Claude Code 訂閱存取（403），請改用 API key 或洽組織管理員")
+            }
+        }
+    }
+
+    /// Whether this state permanently bars the account from selection.
+    ///
+    /// `AuthDead` is deliberately NOT blocking: it is bounded by a cooldown so
+    /// a re-issued token starts working again without an operator restart.
+    pub fn is_blocking(&self) -> bool {
+        matches!(self, Self::Broken)
+    }
+}
 
 /// Authentication method for a Claude Code SDK account.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -93,6 +202,37 @@ pub struct Account {
     pub last_used: Option<DateTime<Utc>>,
     #[serde(skip)]
     pub total_requests: u64,
+    /// What we know about this account's credential (2026-09 hardening).
+    /// Loaded accounts start [`CredentialState::Unverified`]; a real success
+    /// or a `Valid` probe promotes to `Ok`.
+    #[serde(skip)]
+    pub credential_state: CredentialState,
+    /// How many consecutive authentication failures this account has taken.
+    /// Drives the exponential auth-dead backoff (15 min → 6 h cap); reset by
+    /// [`AccountRotator::on_success`].
+    #[serde(skip)]
+    pub auth_dead_strikes: u32,
+    /// Earliest moment the health cycle may credential-probe this account
+    /// again. `None` — the default — means "probe on the next tick", i.e. the
+    /// behaviour that existed before the probe schedule.
+    ///
+    /// Set only after a *conclusive* probe failure (401 / 403). Without it a
+    /// token Anthropic keeps rejecting was re-probed every 60 s forever:
+    /// free in dollars, but pointless traffic and one alarming log line a
+    /// minute. Inconclusive probes (429 / transport) deliberately leave it
+    /// alone so an API outage cannot silently slow down recovery.
+    #[serde(skip)]
+    pub next_probe_at: Option<DateTime<Utc>>,
+    /// Consecutive conclusive probe failures — drives [`probe_backoff`].
+    ///
+    /// Distinct from [`auth_dead_strikes`](Self::auth_dead_strikes), which
+    /// counts *observed spawn* auth failures and schedules the rotation
+    /// cooldown. This one schedules only the probe. Reset by a `Valid` probe
+    /// and by [`AccountRotator::on_success`]; deliberately NOT bumped by
+    /// [`AccountRotator::on_auth_failed`], whose whole point is to get the
+    /// next tick to classify the freshly-observed failure.
+    #[serde(skip)]
+    pub probe_failures: u32,
 }
 
 impl Drop for Account {
@@ -106,6 +246,15 @@ impl Drop for Account {
 
 impl Account {
     pub fn is_available(&self) -> bool {
+        // D4 hard filter: a credential we could not even decrypt is never a
+        // rotation candidate, regardless of health/cooldown. Checked FIRST so
+        // no later "recovery" branch can talk its way past it — the 2026-09-08
+        // incident's second half was a rotator that happily spawned
+        // credential-less children from an `oauth_token_enc` that decrypted to
+        // an empty string.
+        if self.credential_state.is_blocking() {
+            return false;
+        }
         if !self.is_healthy {
             // Allow recovery after cooldown expires (e.g., billing-exhausted 24h).
             // Without this, is_healthy=false + expired cooldown = permanently dead.
@@ -218,7 +367,11 @@ pub enum UnavailableReason {
 }
 
 /// Public status for monitoring.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Default` is implemented so a caller constructing one field-by-field (the
+/// gateway's `account_status_to_json` test) can use `..Default::default()` and
+/// survive future field additions.
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct AccountStatus {
     pub id: String,
     pub auth_method: String,
@@ -237,15 +390,73 @@ pub struct AccountStatus {
     pub label: String,
     pub expires_at: Option<String>,
     pub days_until_expiry: Option<i64>,
+    /// Credential state as a flat string (`ok` / `unverified` / `broken` /
+    /// `auth_dead`) — see [`CredentialState`].
+    pub credential_state: CredentialState,
+    /// zh-TW one-liner explaining a bad `credential_state`, or `None`.
+    pub credential_detail: Option<&'static str>,
+    /// Consecutive authentication failures (drives the auth-dead backoff).
+    pub auth_dead_strikes: u32,
+    /// RFC 3339 timestamp of the earliest next credential probe, or `None`
+    /// when the next health tick may probe. See [`Account::next_probe_at`].
+    pub next_probe_at: Option<String>,
+    /// Consecutive conclusive probe failures (drives the probe backoff).
+    pub probe_failures: u32,
 }
 
 // ── AccountRotator ──────────────────────────────────────────
+
+/// Base auth-dead cooldown; doubles per consecutive strike up to
+/// [`AUTH_DEAD_CAP_MINUTES`].
+const AUTH_DEAD_BASE_MINUTES: i64 = 15;
+
+/// Ceiling for any auth-dead / probe-failure cooldown (6 hours).
+const AUTH_DEAD_CAP_MINUTES: i64 = 6 * 60;
+
+/// Cooldown for the `strikes`-th consecutive authentication failure:
+/// `min(15 min × 2^(strikes-1), 6 h)`.
+///
+/// Pure so the backoff ladder is testable without a clock. `strikes == 0`
+/// (never expected — callers increment first) is treated as the first strike.
+pub(crate) fn auth_dead_backoff(strikes: u32) -> chrono::Duration {
+    // 2^16 × 15 min is already three orders of magnitude past the cap; the
+    // clamp exists purely so the shift can never overflow.
+    let exp = strikes.saturating_sub(1).min(16);
+    let minutes = AUTH_DEAD_BASE_MINUTES.saturating_mul(1i64 << exp);
+    chrono::Duration::minutes(minutes.min(AUTH_DEAD_CAP_MINUTES))
+}
+
+/// Base delay before a conclusively-dead credential is probed again.
+const PROBE_BACKOFF_BASE_MINUTES: i64 = 1;
+
+/// Ceiling for the probe schedule (30 minutes). Much shorter than
+/// [`AUTH_DEAD_CAP_MINUTES`] on purpose: a probe is free, so the only thing
+/// being rationed here is noise, and a re-issued token should still be noticed
+/// within half an hour without an operator restarting anything.
+const PROBE_BACKOFF_CAP_MINUTES: i64 = 30;
+
+/// Delay before the `failures`-th consecutive **conclusive** probe failure is
+/// re-probed: `min(1 min × 2^(failures-1), 30 min)` — 1, 2, 4, 8, 16, 30, 30…
+///
+/// Pure so the ladder is testable without a clock. `failures == 0` (never
+/// expected — callers increment first) is treated as the first failure.
+pub(crate) fn probe_backoff(failures: u32) -> chrono::Duration {
+    // 2^16 min is already three orders of magnitude past the cap; the clamp
+    // exists purely so the shift can never overflow.
+    let exp = failures.saturating_sub(1).min(16);
+    let minutes = PROBE_BACKOFF_BASE_MINUTES.saturating_mul(1i64 << exp);
+    chrono::Duration::minutes(minutes.min(PROBE_BACKOFF_CAP_MINUTES))
+}
 
 pub struct AccountRotator {
     accounts: Arc<RwLock<Vec<Account>>>,
     strategy: RotationStrategy,
     round_robin_index: Arc<RwLock<usize>>,
     cooldown_seconds: u64,
+    /// API base the health probe authenticates against. Real Anthropic in
+    /// production; a local listener under test (see
+    /// [`with_probe_base_url`](Self::with_probe_base_url)).
+    probe_base_url: String,
 }
 
 impl AccountRotator {
@@ -255,7 +466,18 @@ impl AccountRotator {
             strategy,
             round_robin_index: Arc::new(RwLock::new(0)),
             cooldown_seconds,
+            probe_base_url: ANTHROPIC_API_BASE.to_string(),
         }
+    }
+
+    /// Point the credential health probe at a different API base.
+    ///
+    /// Builder-style; production never calls this (the default is the real
+    /// Anthropic API). Tests use it to drive `probe_and_restore` against a
+    /// local listener with no network access.
+    pub fn with_probe_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.probe_base_url = base_url.into();
+        self
     }
 
     /// Load accounts from config.toml + detect OAuth sessions from ~/.claude/
@@ -277,7 +499,23 @@ impl AccountRotator {
 
                     if auth_type == "api_key" {
                         let api_key = resolve_api_key(home_dir, acc_table).await;
-                        if api_key.is_empty() { continue; }
+                        // D4: an entry that *declares* an encrypted key but
+                        // resolves to nothing is BROKEN, not absent. Skipping
+                        // it (the old behavior) hid a wrong/rotated `.keyfile`
+                        // behind a silently smaller pool.
+                        let broken =
+                            api_key.is_empty() && has_nonempty_field(acc_table, API_KEY_ENC_FIELDS);
+                        if broken {
+                            warn!(
+                                account = id,
+                                reason = "api_key_enc present but decrypted to nothing",
+                                "Account credential is BROKEN — it will never be selected. \
+                                 Check `~/.duduclaw/.keyfile` (was it regenerated or copied \
+                                 from another machine?) and re-save this account's API key."
+                            );
+                        } else if api_key.is_empty() {
+                            continue;
+                        }
                         let provider = acc_table
                             .get("provider")
                             .and_then(|v| v.as_str())
@@ -298,12 +536,20 @@ impl AccountRotator {
                             api_key,
                             oauth_token: None,
                             credentials_dir: None,
-                            is_healthy: true,
+                            is_healthy: !broken,
                             consecutive_errors: 0,
                             spent_this_month: 0,
                             cooldown_until: None,
                             last_used: None,
                             total_requests: 0,
+                            credential_state: if broken {
+                                CredentialState::Broken
+                            } else {
+                                CredentialState::Unverified
+                            },
+                            auth_dead_strikes: 0,
+                            next_probe_at: None,
+                            probe_failures: 0,
                         });
                     } else if auth_type == "oauth" {
                         let profile = acc_table.get("profile").and_then(|v| v.as_str()).unwrap_or("default");
@@ -323,6 +569,31 @@ impl AccountRotator {
                         let creds_dir = resolve_oauth_credentials(profile);
                         let oauth_token = resolve_oauth_token(home_dir, acc_table).await;
 
+                        // D4: `oauth_token_enc` declared but resolving to
+                        // None/"" is the exact trap `detect_default_oauth_session`'s
+                        // own doc comment describes and nothing enforced — the
+                        // account loaded normally and spawned credential-less
+                        // children with zero warnings. An OAuth entry with NO
+                        // `_enc` field is not broken: it legitimately relies on
+                        // the OS keychain (behavior unchanged).
+                        let token_usable =
+                            oauth_token.as_ref().is_some_and(|t| !t.trim().is_empty());
+                        let broken =
+                            !token_usable && has_nonempty_field(acc_table, OAUTH_TOKEN_ENC_FIELDS);
+                        if broken {
+                            warn!(
+                                account = id,
+                                reason = "oauth_token_enc present but decrypted to nothing",
+                                "Account credential is BROKEN — it will never be selected. \
+                                 Check `~/.duduclaw/.keyfile` (was it regenerated or copied \
+                                 from another machine?) and re-save this account's token \
+                                 (`claude setup-token`)."
+                            );
+                        }
+                        // An empty-string token must never reach the spawn env
+                        // as `CLAUDE_CODE_OAUTH_TOKEN=`; normalize it away.
+                        let oauth_token = if token_usable { oauth_token } else { None };
+
                         let has_auth = oauth_token.is_some() || creds_dir.is_some();
 
                         loaded.push(Account {
@@ -340,12 +611,20 @@ impl AccountRotator {
                             api_key: String::new(),
                             oauth_token,
                             credentials_dir: creds_dir,
-                            is_healthy: has_auth,
+                            is_healthy: has_auth && !broken,
                             consecutive_errors: 0,
                             spent_this_month: 0,
                             cooldown_until: None,
                             last_used: None,
                             total_requests: 0,
+                            credential_state: if broken {
+                                CredentialState::Broken
+                            } else {
+                                CredentialState::Unverified
+                            },
+                            auth_dead_strikes: 0,
+                            next_probe_at: None,
+                            probe_failures: 0,
                         });
                     }
                 }
@@ -396,6 +675,10 @@ impl AccountRotator {
                         cooldown_until: None,
                         last_used: None,
                         total_requests: 0,
+                        credential_state: CredentialState::Unverified,
+                        auth_dead_strikes: 0,
+                        next_probe_at: None,
+                        probe_failures: 0,
                     });
                 }
             }
@@ -424,6 +707,10 @@ impl AccountRotator {
                         cooldown_until: None,
                         last_used: None,
                         total_requests: 0,
+                        credential_state: CredentialState::Unverified,
+                        auth_dead_strikes: 0,
+                        next_probe_at: None,
+                        probe_failures: 0,
                     });
                 }
 
@@ -651,9 +938,67 @@ impl AccountRotator {
             if !in_cooldown {
                 acc.is_healthy = true;
             }
+            // A completed request is the strongest possible evidence that the
+            // credential works, so it clears an AuthDead verdict and the
+            // backoff ladder even mid-cooldown (mirroring the existing
+            // `consecutive_errors = 0`). `Broken` is deliberately sticky: it
+            // means we never produced a usable secret in the first place, so a
+            // success attributed to this id cannot be evidence about it — and
+            // a Broken account is never selectable, so this branch is
+            // unreachable in practice. Fail closed rather than resurrect.
+            if acc.credential_state != CredentialState::Broken {
+                acc.credential_state = CredentialState::Ok;
+            }
+            acc.auth_dead_strikes = 0;
+            // A completed request also settles the probe schedule: there is
+            // nothing left to back off from.
+            acc.probe_failures = 0;
+            acc.next_probe_at = None;
             acc.spent_this_month += cost_cents;
             acc.total_requests += 1;
             acc.last_used = Some(Utc::now());
+        }
+    }
+
+    /// Record an **authentication** failure (2026-09 hardening, D2).
+    ///
+    /// Distinct from [`on_error`](Self::on_error) because a dead credential is
+    /// not a transient fault: three strikes and a 2-minute cooldown were
+    /// exactly wrong for it. The account goes unhealthy immediately, is marked
+    /// [`CredentialState::AuthDead`], and books an exponential cooldown
+    /// (15 min → 30 → 60 → … capped at 6 h) so a re-issued token still recovers
+    /// on its own, but a genuinely dead one stops burning one spawn per cron
+    /// tick.
+    ///
+    /// Callers classify the failure (`oauth_not_allowed_for_organization` and
+    /// friends → [`AuthFailureKind::OrgDisabled`]; `invalid bearer token` /
+    /// `authentication_failed` → [`AuthFailureKind::InvalidToken`]).
+    pub async fn on_auth_failed(&self, account_id: &str, kind: AuthFailureKind) {
+        let mut accounts = self.accounts.write().await;
+        if let Some(acc) = accounts.iter_mut().find(|a| a.id == account_id) {
+            acc.is_healthy = false;
+            acc.credential_state = CredentialState::AuthDead(kind);
+            acc.auth_dead_strikes = acc.auth_dead_strikes.saturating_add(1);
+            // A real spawn just failed, so the next health tick must be free
+            // to probe and classify *this* failure — clear any probe schedule
+            // an earlier round booked. `probe_failures` is deliberately NOT
+            // bumped here: it counts probe verdicts, not spawn outcomes, and
+            // bumping it would let an observed failure silently lengthen the
+            // schedule without a single probe having been answered.
+            acc.next_probe_at = None;
+            let backoff = auth_dead_backoff(acc.auth_dead_strikes);
+            let until = Utc::now() + backoff;
+            // Never shorten an existing (e.g. 24 h billing) cooldown.
+            acc.cooldown_until = Some(acc.cooldown_until.map_or(until, |cur| cur.max(until)));
+            warn!(
+                account = account_id,
+                kind = %kind,
+                strikes = acc.auth_dead_strikes,
+                cooldown_minutes = backoff.num_minutes(),
+                "Account authentication FAILED — credential marked auth-dead. \
+                 It will be retried once when the cooldown expires; fix the \
+                 credential in 設定→帳號 to recover sooner."
+            );
         }
     }
 
@@ -775,6 +1120,11 @@ impl AccountRotator {
             label: a.label.clone(),
             expires_at: a.expires_at.clone(),
             days_until_expiry: a.days_until_expiry(),
+            credential_state: a.credential_state,
+            credential_detail: a.credential_state.credential_detail(),
+            auth_dead_strikes: a.auth_dead_strikes,
+            next_probe_at: a.next_probe_at.map(|t| t.to_rfc3339()),
+            probe_failures: a.probe_failures,
         }).collect()
     }
 
@@ -796,33 +1146,229 @@ impl AccountRotator {
         self.accounts.write().await.push(account);
     }
 
-    /// Probe all unhealthy accounts and restore those that respond successfully.
+    /// Test-only: the account's current cooldown deadline.
     ///
-    /// For OAuth accounts: runs `claude auth status` to verify the session is valid.
-    /// For API key accounts: does a lightweight `/v1/messages` health check.
-    /// Restored accounts are sorted back by priority — highest priority first.
+    /// [`AccountStatus`] deliberately exposes only `is_available` (a boolean),
+    /// which cannot tell a 2-minute generic-error cooldown from the 15-minute
+    /// auth-dead base — a distinction the gateway's D2 wiring tests must be
+    /// able to make. Read-only and `#[doc(hidden)]`, like
+    /// [`push_account_for_test`](Self::push_account_for_test).
+    #[doc(hidden)]
+    pub async fn cooldown_until_for_test(&self, account_id: &str) -> Option<DateTime<Utc>> {
+        self.accounts
+            .read()
+            .await
+            .iter()
+            .find(|a| a.id == account_id)
+            .and_then(|a| a.cooldown_until)
+    }
+
+    /// Probe every account that carries a probe-able Anthropic secret and
+    /// report the verdict, **without touching account state** (D5).
+    ///
+    /// The diagnostic twin of [`probe_and_restore`](Self::probe_and_restore):
+    /// that one is a control loop and only looks at unavailable accounts; this
+    /// one looks at *all* of them and changes nothing, so `duduclaw doctor`
+    /// can answer "is this token still good?" without perturbing a running
+    /// gateway's rotation. Secrets never leave this crate — only the
+    /// [`CredentialProbe`] outcome does.
+    ///
+    /// Probes run sequentially (each capped by the probe's own 10 s timeout);
+    /// an account with nothing probe-able reports `probe: None` and costs no
+    /// request at all.
+    pub async fn probe_credentials_report(&self) -> Vec<CredentialReport> {
+        let snapshot: Vec<(CredentialReport, Option<(CredentialKind, String)>)> = {
+            let accounts = self.accounts.read().await;
+            accounts
+                .iter()
+                .map(|a| {
+                    (
+                        CredentialReport {
+                            id: a.id.clone(),
+                            provider: a.provider.clone(),
+                            auth_method: a.auth_method.clone(),
+                            state: a.credential_state,
+                            probe: None,
+                        },
+                        probe_secret_for(a),
+                    )
+                })
+                .collect()
+        };
+
+        let mut out = Vec::with_capacity(snapshot.len());
+        for (mut report, secret) in snapshot {
+            if let Some((kind, secret)) = secret {
+                report.probe =
+                    Some(probe_anthropic_credential_at(&self.probe_base_url, kind, &secret).await);
+            }
+            out.push(report);
+        }
+        out
+    }
+
+    /// Probe all unhealthy accounts and restore those whose credential really
+    /// still authenticates.
+    ///
+    /// ## 2026-09 rewrite (D3)
+    ///
+    /// This used to "verify" every OAuth account by running `claude auth
+    /// status` and accepting `loggedIn: true`. That signal is true whenever
+    /// *any* `CLAUDE_CODE_OAUTH_TOKEN` exists in the environment and says
+    /// nothing about the account being probed — so a token that Anthropic had
+    /// started answering with `403 oauth_not_allowed_for_organization` was
+    /// resurrected every 60 s for 18 hours, each resurrection costing one more
+    /// failed scheduled dispatch.
+    ///
+    /// Now, for accounts that carry a probe-able Anthropic secret (an OAuth
+    /// setup-token, or an API key), the probe authenticates **that secret**:
+    ///
+    /// | outcome | action |
+    /// |---|---|
+    /// | `Valid` | restore (healthy, no cooldown, state `Ok`, strikes reset, probe schedule cleared) |
+    /// | `InvalidCredential` | stay dead, state `AuthDead(InvalidToken)`, cooldown doubled (cap 6 h), next probe backed off |
+    /// | `OrgDisabled` | stay dead, state `AuthDead(OrgDisabled)`, cooldown doubled (cap 6 h), next probe backed off |
+    /// | `RateLimited` / `Unknown` | untouched — retry next tick |
+    ///
+    /// A conclusive failure also books [`Account::next_probe_at`], so a
+    /// credential the API keeps rejecting is re-checked on a widening
+    /// schedule ([`probe_backoff`]: 1 min doubling to a 30 min ceiling)
+    /// rather than once a minute forever. Inconclusive outcomes leave the
+    /// schedule alone, and a real spawn failure
+    /// ([`on_auth_failed`](Self::on_auth_failed)) clears it so the very next
+    /// tick classifies the fresh failure.
+    ///
+    /// Accounts with no probe-able secret (an OS-keychain OAuth session, a
+    /// foreign-provider subscription seat) keep the legacy `claude auth
+    /// status` / cooldown-expiry path — it remains the only signal available —
+    /// **except** when they are already `AuthDead`, which that signal is not
+    /// strong enough to clear. Those wait for cooldown expiry and get exactly
+    /// one real retry. [`CredentialState::Broken`] accounts are never probed
+    /// and never restored.
     ///
     /// Call this periodically (e.g. every 60s) from a background task.
     pub async fn probe_and_restore(&self) -> usize {
-        let unhealthy_ids: Vec<(String, AuthMethod)> = {
+        let now = Utc::now();
+        let candidates: Vec<ProbeCandidate> = {
             let accounts = self.accounts.read().await;
             accounts.iter()
                 .filter(|a| !a.is_healthy || a.cooldown_until.is_some_and(|cd| Utc::now() >= cd))
                 .filter(|a| !a.is_available()) // truly unavailable, not just cooled-down-and-ready
-                .map(|a| (a.id.clone(), a.auth_method.clone()))
+                // D4: an undecryptable credential cannot be probed and must
+                // never be restored — only re-saving it (which rebuilds the
+                // rotator) can fix it.
+                .filter(|a| !a.credential_state.is_blocking())
+                // Probe schedule: a credential the API has already rejected
+                // conclusively waits out its backoff (1 min → 30 min) instead
+                // of being re-asked on every 60 s tick. `None` = probe now,
+                // which is what every account looks like until its first
+                // conclusive failure.
+                .filter(|a| a.next_probe_at.is_none_or(|t| now >= t))
+                .map(|a| ProbeCandidate {
+                    id: a.id.clone(),
+                    method: a.auth_method.clone(),
+                    state: a.credential_state,
+                    secret: probe_secret_for(a),
+                })
                 .collect()
         };
 
-        if unhealthy_ids.is_empty() {
+        if candidates.is_empty() {
             return 0;
         }
 
         let mut restored = 0u64;
 
-        for (id, method) in &unhealthy_ids {
+        for candidate in &candidates {
+            let id = &candidate.id;
+            let method = &candidate.method;
+
+            // ── Path A: a real credential we can actually authenticate ──
+            if let Some((kind, secret)) = &candidate.secret {
+                let outcome =
+                    probe_anthropic_credential_at(&self.probe_base_url, *kind, secret).await;
+                match outcome {
+                    CredentialProbe::Valid => {
+                        let mut accounts = self.accounts.write().await;
+                        if let Some(acc) = accounts.iter_mut().find(|a| a.id == *id) {
+                            acc.is_healthy = true;
+                            acc.consecutive_errors = 0;
+                            acc.cooldown_until = None;
+                            acc.credential_state = CredentialState::Ok;
+                            acc.auth_dead_strikes = 0;
+                            acc.probe_failures = 0;
+                            acc.next_probe_at = None;
+                            restored += 1;
+                            info!(
+                                account = id.as_str(),
+                                method = ?method,
+                                priority = acc.priority,
+                                "Account restored by credential probe (200 from /v1/models)"
+                            );
+                        }
+                    }
+                    CredentialProbe::InvalidCredential | CredentialProbe::OrgDisabled => {
+                        let failure = if outcome == CredentialProbe::OrgDisabled {
+                            AuthFailureKind::OrgDisabled
+                        } else {
+                            AuthFailureKind::InvalidToken
+                        };
+                        let mut accounts = self.accounts.write().await;
+                        if let Some(acc) = accounts.iter_mut().find(|a| a.id == *id) {
+                            acc.is_healthy = false;
+                            acc.credential_state = CredentialState::AuthDead(failure);
+                            let until = doubled_cooldown(acc.cooldown_until);
+                            acc.cooldown_until =
+                                Some(acc.cooldown_until.map_or(until, |cur| cur.max(until)));
+                            // Space out the *probe* as well as the rotation
+                            // cooldown: re-asking the API every 60 s about a
+                            // credential it has conclusively rejected buys
+                            // nothing and drowns the log.
+                            acc.probe_failures = acc.probe_failures.saturating_add(1);
+                            let probe_delay = probe_backoff(acc.probe_failures);
+                            acc.next_probe_at = Some(Utc::now() + probe_delay);
+                            warn!(
+                                account = id.as_str(),
+                                kind = %failure,
+                                until = %until,
+                                next_probe_in_minutes = probe_delay.num_minutes(),
+                                "Credential probe confirms the account is auth-dead — \
+                                 staying out of rotation with a doubled cooldown"
+                            );
+                        }
+                    }
+                    // Inconclusive: the probe says nothing about the
+                    // credential, so account state must not move in either
+                    // direction. Retry on the next tick.
+                    CredentialProbe::RateLimited | CredentialProbe::Unknown(_) => {
+                        debug!(
+                            account = id.as_str(),
+                            outcome = ?outcome,
+                            "Credential probe inconclusive — leaving account state untouched"
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // ── Path B: nothing to authenticate with ────────────────────
+            // D3: `claude auth status` is the only signal for a keychain
+            // session, but it is far too weak to overturn an observed
+            // authentication failure.
+            if !legacy_status_probe_may_restore(candidate.state) {
+                debug!(
+                    account = id.as_str(),
+                    state = %candidate.state,
+                    "Auth-dead account has no probe-able secret — `claude auth status` \
+                     must not restore it; waiting for cooldown expiry"
+                );
+                continue;
+            }
+
             let ok = match method {
                 AuthMethod::OAuth => {
-                    // Probe by running `claude auth status` — if it succeeds, OAuth is valid
+                    // Legacy path: keychain / profile sessions and foreign
+                    // subscription seats have no secret we can present.
                     tokio::task::spawn_blocking(|| {
                         let claude = duduclaw_core::which_claude();
                         claude.and_then(|bin| {
@@ -871,6 +1417,97 @@ impl AccountRotator {
 
         restored as usize
     }
+}
+
+/// One account's credential verdict, for an operator-facing report
+/// (`duduclaw doctor`, D5).
+///
+/// Carries no secret: the credential is probed inside this crate and only the
+/// outcome crosses the boundary.
+#[derive(Debug, Clone)]
+pub struct CredentialReport {
+    pub id: String,
+    pub provider: String,
+    pub auth_method: AuthMethod,
+    /// The account's last known state (before this probe) — surfaced so the
+    /// report can say "already marked auth-dead" even when the probe itself
+    /// comes back inconclusive.
+    pub state: CredentialState,
+    /// `None` when the account carries no probe-able Anthropic secret (an
+    /// OS-keychain OAuth session, a foreign-provider seat): nothing was sent
+    /// and nothing can be concluded.
+    pub probe: Option<CredentialProbe>,
+}
+
+/// One account's worth of snapshot state for [`AccountRotator::probe_and_restore`].
+///
+/// Snapshotted under the read lock so no lock is held across the probe's
+/// `await` — the pool must stay selectable while a 10-second probe is in
+/// flight.
+struct ProbeCandidate {
+    id: String,
+    method: AuthMethod,
+    state: CredentialState,
+    secret: Option<(CredentialKind, String)>,
+}
+
+/// Whether the weak `claude auth status` signal is allowed to restore an
+/// account in this credential state (pure, so the rule is testable without a
+/// `claude` binary on PATH).
+///
+/// `AuthDead` is excluded: `loggedIn: true` is reported for *any* ambient
+/// session — including one backed by a token Anthropic is currently answering
+/// with 403 — so it cannot overturn an observed authentication failure. That
+/// false positive is what resurrected a dead account every 60 s for 18 hours
+/// on 2026-09-08. `Broken` is excluded because there is nothing to restore.
+fn legacy_status_probe_may_restore(state: CredentialState) -> bool {
+    !matches!(
+        state,
+        CredentialState::AuthDead(_) | CredentialState::Broken
+    )
+}
+
+/// The Anthropic secret this account can be probed with, if any.
+///
+/// `None` for: a non-Anthropic provider (its seat credential means nothing to
+/// `api.anthropic.com` — probing it there would produce a confident, wrong
+/// verdict), an OS-keychain OAuth session (the secret lives in the keychain,
+/// not here), and an empty credential.
+fn probe_secret_for(a: &Account) -> Option<(CredentialKind, String)> {
+    if a.provider != "anthropic" {
+        return None;
+    }
+    match a.auth_method {
+        AuthMethod::ApiKey => {
+            (!a.api_key.trim().is_empty()).then(|| (CredentialKind::ApiKey, a.api_key.clone()))
+        }
+        AuthMethod::OAuth => a
+            .oauth_token
+            .as_ref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| (CredentialKind::OAuthToken, t.clone())),
+    }
+}
+
+/// Next cooldown deadline after a probe confirms the credential is dead:
+/// double whatever is left, capped at 6 h.
+///
+/// An expired / absent cooldown has nothing to double, so it restarts at the
+/// [`AUTH_DEAD_BASE_MINUTES`] base — doubling zero would hand the account
+/// straight back to the next tick, which is the loop this whole change exists
+/// to break.
+fn doubled_cooldown(current: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    let now = Utc::now();
+    let next = match current
+        .map(|cd| cd - now)
+        .filter(|d| *d > chrono::Duration::zero())
+    {
+        Some(remaining) => remaining
+            .checked_mul(2)
+            .unwrap_or_else(|| chrono::Duration::minutes(AUTH_DEAD_CAP_MINUTES)),
+        None => chrono::Duration::minutes(AUTH_DEAD_BASE_MINUTES),
+    };
+    now + next.min(chrono::Duration::minutes(AUTH_DEAD_CAP_MINUTES))
 }
 
 // ── OAuth helpers ───────────────────────────────────────────
@@ -975,6 +1612,13 @@ fn detect_default_oauth_session() -> Option<Account> {
         cooldown_until: None,
         last_used: None,
         total_requests: 0,
+        // `claude auth status` said `loggedIn: true` — which, per this
+        // function's own doc comment, proves only that *some* session exists.
+        // Unverified until a real request (or a real probe) succeeds.
+        credential_state: CredentialState::Unverified,
+        auth_dead_strikes: 0,
+        next_probe_at: None,
+        probe_failures: 0,
     })
 }
 
@@ -1027,6 +1671,28 @@ async fn load_secret_manager_config(home_dir: &Path) -> SecretManagerConfig {
                 .and_then(|v| v.try_into().ok())
         })
         .unwrap_or_default()
+}
+
+/// Encrypted-field names an `[[accounts]] type = "api_key"` entry may carry.
+/// Mirrors `resolve_api_key`'s `*_enc` precedence list.
+const API_KEY_ENC_FIELDS: &[&str] = &["anthropic_api_key_enc", "api_key_enc"];
+
+/// Encrypted-field name an `[[accounts]] type = "oauth"` entry may carry.
+const OAUTH_TOKEN_ENC_FIELDS: &[&str] = &["oauth_token_enc"];
+
+/// Whether the entry declares at least one of `fields` with a non-empty value.
+///
+/// The D4 detector's precondition: "the operator stored a credential here".
+/// A field that is absent (or present but blank) is *not* a broken credential
+/// — an OAuth entry with no `oauth_token_enc` legitimately relies on the OS
+/// keychain, and must keep behaving exactly as before.
+fn has_nonempty_field(table: &toml::Table, fields: &[&str]) -> bool {
+    fields.iter().any(|name| {
+        table
+            .get(*name)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    })
 }
 
 /// Resolve an `[[accounts]]` entry's OAuth token from a TOML table.
@@ -1380,6 +2046,10 @@ mod select_env_tests {
             cooldown_until: None,
             last_used: None,
             total_requests: 0,
+            credential_state: CredentialState::Unverified,
+            auth_dead_strikes: 0,
+            next_probe_at: None,
+            probe_failures: 0,
         }
     }
 
@@ -1482,6 +2152,10 @@ mod select_env_tests {
             cooldown_until: None,
             last_used: None,
             total_requests: 0,
+            credential_state: CredentialState::Unverified,
+            auth_dead_strikes: 0,
+            next_probe_at: None,
+            probe_failures: 0,
         }
     }
 
@@ -1583,6 +2257,10 @@ mod provider_rotation_tests {
             cooldown_until: None,
             last_used: None,
             total_requests: 0,
+            credential_state: CredentialState::Unverified,
+            auth_dead_strikes: 0,
+            next_probe_at: None,
+            probe_failures: 0,
         }
     }
 
@@ -1775,6 +2453,10 @@ mod subscription_oauth_tests {
             cooldown_until: None,
             last_used: None,
             total_requests: 0,
+            credential_state: CredentialState::Unverified,
+            auth_dead_strikes: 0,
+            next_probe_at: None,
+            probe_failures: 0,
         }
     }
 
@@ -1939,6 +2621,10 @@ mod wp10_on_error_recovery_tests {
             cooldown_until: None,
             last_used: None,
             total_requests: 0,
+            credential_state: CredentialState::Unverified,
+            auth_dead_strikes: 0,
+            next_probe_at: None,
+            probe_failures: 0,
         }
     }
 
@@ -2086,6 +2772,10 @@ mod account_pool_tests {
             cooldown_until: None,
             last_used: None,
             total_requests: 0,
+            credential_state: CredentialState::Unverified,
+            auth_dead_strikes: 0,
+            next_probe_at: None,
+            probe_failures: 0,
         }
     }
 
@@ -2652,5 +3342,1107 @@ mod wp10c_provider_env_delegation_tests {
     #[test]
     fn unknown_provider_is_empty() {
         assert!(provider_env_key_names("totally-unknown-vendor").is_empty());
+    }
+}
+
+// ── 2026-09 credential-hardening regression tests (D2 / D3 / D4 / D5) ───
+//
+// The incident these pin down: a setup-token started returning
+// `403 oauth_not_allowed_for_organization`; the rotator benched the account
+// after three generic errors and a fake health probe (`claude auth status` →
+// `loggedIn: true`) resurrected it 60 seconds later, forever — burning one
+// scheduled dispatch per resurrection for 18 hours. Separately, an
+// `oauth_token_enc` that decrypted to an empty string loaded as a perfectly
+// normal account and spawned credential-less children with zero warnings.
+#[cfg(test)]
+mod credential_hardening_tests {
+    use super::*;
+    use crate::credential_probe::CredentialKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // ── fixtures ────────────────────────────────────────────────────
+
+    /// An Anthropic OAuth account carrying an explicit setup-token — the shape
+    /// the credential probe can actually authenticate.
+    fn token_account(id: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            auth_method: AuthMethod::OAuth,
+            provider: "anthropic".to_string(),
+            priority: 1,
+            monthly_budget_cents: 0,
+            tags: vec![],
+            profile: "default".to_string(),
+            email: String::new(),
+            subscription: "max".to_string(),
+            label: id.to_string(),
+            expires_at: None,
+            api_key: String::new(),
+            oauth_token: Some(format!("sk-ant-oat01-{id}")),
+            credentials_dir: None,
+            is_healthy: true,
+            consecutive_errors: 0,
+            spent_this_month: 0,
+            cooldown_until: None,
+            last_used: None,
+            total_requests: 0,
+            credential_state: CredentialState::Unverified,
+            auth_dead_strikes: 0,
+            next_probe_at: None,
+            probe_failures: 0,
+        }
+    }
+
+    /// An Anthropic OAuth account with NO explicit token — an OS-keychain
+    /// session, which has no secret we can present to the API.
+    fn keychain_account(id: &str) -> Account {
+        let mut a = token_account(id);
+        a.oauth_token = None;
+        a.credentials_dir = Some(PathBuf::from("/tmp/duduclaw-fake-credentials"));
+        a
+    }
+
+    async fn snapshot(rotator: &AccountRotator, id: &str) -> Account {
+        let accounts = rotator.accounts.read().await;
+        accounts
+            .iter()
+            .find(|a| a.id == id)
+            .expect("account present")
+            .clone()
+    }
+
+    /// Fixed-response HTTP server that keeps answering until the test drops
+    /// its handle. Dependency-free on purpose (this crate carries no test
+    /// HTTP-server dependency and does not need one).
+    async fn spawn_repeating_server(
+        response: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Like [`spawn_repeating_server`], but answers the FIRST request with
+    /// `first` and every later one with `rest`, and hands back a counter of
+    /// how many requests actually reached the wire.
+    ///
+    /// The counter is the only honest way to assert a probe was *skipped*:
+    /// account state alone cannot tell "we asked and nothing changed" apart
+    /// from "we never asked". The sequencing lets one account walk from a
+    /// conclusive rejection into a recovery without rebuilding the rotator
+    /// (`with_probe_base_url` is a constructor-time builder).
+    async fn spawn_sequenced_server(
+        first: &'static str,
+        rest: &'static str,
+    ) -> (String, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&hits);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                // Counted after the request head is in hand, and before the
+                // reply — so a probe that has returned to its caller is
+                // always already counted (no flaky ordering).
+                let nth = counter.fetch_add(1, Ordering::SeqCst);
+                let body = if nth == 0 { first } else { rest };
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits, handle)
+    }
+
+    /// Every request gets the same answer; the counter still records them.
+    async fn spawn_counting_server(
+        response: &'static str,
+    ) -> (String, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+        spawn_sequenced_server(response, response).await
+    }
+
+    const RESP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    const RESP_401: &str =
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const RESP_403: &str =
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const RESP_500: &str =
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    // ── (a) auth-dead backoff ladder ────────────────────────────────
+
+    /// 15 min → 30 → 60 → 120 → 240 → capped at 360 (6 h) and never beyond.
+    #[test]
+    fn auth_dead_backoff_doubles_then_caps_at_six_hours() {
+        let expect = [
+            (1u32, 15i64),
+            (2, 30),
+            (3, 60),
+            (4, 120),
+            (5, 240),
+            (6, 360),
+            (7, 360),
+            (50, 360),
+            (u32::MAX, 360),
+        ];
+        for (strikes, minutes) in expect {
+            assert_eq!(
+                auth_dead_backoff(strikes).num_minutes(),
+                minutes,
+                "strike {strikes} should book {minutes} minutes"
+            );
+        }
+        // Defensive: a zero strike count is treated as the first one, never as
+        // "no cooldown at all".
+        assert_eq!(auth_dead_backoff(0).num_minutes(), 15);
+    }
+
+    /// `on_auth_failed` walks that ladder on the live account, marks it
+    /// auth-dead, and takes it out of rotation immediately (no three-strike
+    /// grace period — a dead token does not become alive by being retried).
+    #[tokio::test]
+    async fn on_auth_failed_marks_dead_and_escalates_the_cooldown() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(token_account("acct")).await;
+
+        assert!(rotator.select().await.is_some(), "healthy account selects");
+
+        for (nth, expected_minutes) in [(1u32, 15i64), (2, 30), (3, 60), (4, 120)] {
+            let before = Utc::now();
+            rotator
+                .on_auth_failed("acct", AuthFailureKind::OrgDisabled)
+                .await;
+            let acc = snapshot(&rotator, "acct").await;
+            assert!(!acc.is_healthy, "strike {nth}: account must go unhealthy");
+            assert_eq!(acc.auth_dead_strikes, nth);
+            assert_eq!(
+                acc.credential_state,
+                CredentialState::AuthDead(AuthFailureKind::OrgDisabled)
+            );
+            let booked = (acc.cooldown_until.expect("cooldown") - before).num_minutes();
+            assert!(
+                (expected_minutes - 1..=expected_minutes).contains(&booked),
+                "strike {nth}: expected ~{expected_minutes} min, got {booked}"
+            );
+            assert!(
+                rotator.select().await.is_none(),
+                "strike {nth}: an auth-dead account must not be selectable"
+            );
+        }
+    }
+
+    /// `on_success` is the reset: strikes back to zero, state back to `Ok`.
+    /// Without it the ladder would ratchet forever across unrelated incidents.
+    #[tokio::test]
+    async fn on_success_resets_the_auth_dead_ladder() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(token_account("acct")).await;
+
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+        assert_eq!(snapshot(&rotator, "acct").await.auth_dead_strikes, 2);
+
+        // A success can only follow the cooldown elapsing (that is what puts
+        // the account back in rotation), so simulate that first. `on_success`
+        // deliberately does not clear `cooldown_until` itself — the
+        // never-shorten rule predates this work and guards against a stale
+        // success overriding a concurrent rate-limit.
+        {
+            let mut accounts = rotator.accounts.write().await;
+            let a = accounts.iter_mut().find(|a| a.id == "acct").unwrap();
+            a.cooldown_until = Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        rotator.on_success("acct", 0).await;
+        let acc = snapshot(&rotator, "acct").await;
+        assert_eq!(acc.auth_dead_strikes, 0);
+        assert_eq!(acc.credential_state, CredentialState::Ok);
+
+        // The ladder restarts from the bottom, not from where it left off.
+        let before = Utc::now();
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+        let acc = snapshot(&rotator, "acct").await;
+        assert_eq!(acc.auth_dead_strikes, 1);
+        let booked = (acc.cooldown_until.expect("cooldown") - before).num_minutes();
+        assert!(
+            (14..=15).contains(&booked),
+            "expected ~15 min, got {booked}"
+        );
+    }
+
+    /// A `Broken` credential is never "successful", so a stray `on_success`
+    /// for its id must not launder it back into rotation.
+    #[tokio::test]
+    async fn on_success_never_un_breaks_a_broken_credential() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        let mut acc = token_account("acct");
+        acc.credential_state = CredentialState::Broken;
+        acc.is_healthy = false;
+        rotator.push_account_for_test(acc).await;
+
+        rotator.on_success("acct", 0).await;
+        assert_eq!(
+            snapshot(&rotator, "acct").await.credential_state,
+            CredentialState::Broken
+        );
+        assert!(rotator.select().await.is_none());
+    }
+
+    // ── (b) health probe drives real credential state ───────────────
+
+    /// A 200 from `/v1/models` is the ONLY thing that restores an auth-dead
+    /// account — and it does so completely (healthy, no cooldown, state `Ok`,
+    /// ladder reset).
+    #[tokio::test]
+    async fn probe_200_restores_an_auth_dead_token_account() {
+        let (base, server) = spawn_repeating_server(RESP_200).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+        assert!(rotator.select().await.is_none());
+
+        assert_eq!(rotator.probe_and_restore().await, 1);
+
+        let acc = snapshot(&rotator, "acct").await;
+        assert!(acc.is_healthy);
+        assert_eq!(acc.cooldown_until, None);
+        assert_eq!(acc.credential_state, CredentialState::Ok);
+        assert_eq!(acc.auth_dead_strikes, 0);
+        assert!(
+            rotator.select().await.is_some(),
+            "a verified account is selectable again"
+        );
+
+        server.abort();
+    }
+
+    /// The incident itself: a 403 must keep the account dead and push the
+    /// cooldown OUT, not resurrect it. Same for a 401.
+    #[tokio::test]
+    async fn probe_401_and_403_keep_the_account_dead_and_double_the_cooldown() {
+        for (response, expected_kind) in [
+            (RESP_401, AuthFailureKind::InvalidToken),
+            (RESP_403, AuthFailureKind::OrgDisabled),
+        ] {
+            let (base, server) = spawn_repeating_server(response).await;
+            let rotator =
+                AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+            rotator.push_account_for_test(token_account("acct")).await;
+            rotator
+                .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+                .await;
+            let before = snapshot(&rotator, "acct")
+                .await
+                .cooldown_until
+                .expect("cooldown");
+
+            assert_eq!(
+                rotator.probe_and_restore().await,
+                0,
+                "a rejected credential must never count as restored"
+            );
+
+            let acc = snapshot(&rotator, "acct").await;
+            assert!(!acc.is_healthy);
+            assert_eq!(
+                acc.credential_state,
+                CredentialState::AuthDead(expected_kind)
+            );
+            let after = acc.cooldown_until.expect("cooldown still booked");
+            let grew = (after - before).num_minutes();
+            assert!(
+                grew >= 13,
+                "cooldown should roughly double (15 → ~30 min); grew only {grew} min"
+            );
+            assert!(
+                (after - Utc::now()).num_minutes() <= AUTH_DEAD_CAP_MINUTES,
+                "cooldown must stay under the 6 h cap"
+            );
+            assert!(rotator.select().await.is_none());
+
+            server.abort();
+        }
+    }
+
+    /// Repeated 403s escalate but never blow past the 6 h ceiling.
+    #[tokio::test]
+    async fn repeated_probe_failures_saturate_at_the_six_hour_cap() {
+        let (base, hits, server) = spawn_counting_server(RESP_403).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        let mut acc = token_account("acct");
+        // Start already dead with a short *live* cooldown. It must stay in the
+        // future: an expired cooldown makes `is_available()` true, and the
+        // candidate filter skips available accounts — which is how this test
+        // used to run zero probes and assert the cap vacuously. `doubled_cooldown`
+        // doubles whatever remains, so the ladder still climbs to the cap
+        // without a second of wall clock.
+        acc.is_healthy = false;
+        acc.credential_state = CredentialState::AuthDead(AuthFailureKind::OrgDisabled);
+        acc.cooldown_until = Some(Utc::now() + chrono::Duration::minutes(1));
+        rotator.push_account_for_test(acc).await;
+
+        for _ in 0..12 {
+            {
+                // Clear only the probe schedule, so this stays a test about
+                // *repeated* probe failures rather than silently becoming a
+                // single-probe test under the new backoff.
+                let mut accounts = rotator.accounts.write().await;
+                let a = accounts.iter_mut().find(|a| a.id == "acct").unwrap();
+                a.next_probe_at = None;
+            }
+            rotator.probe_and_restore().await;
+            let a = snapshot(&rotator, "acct").await;
+            let minutes = (a.cooldown_until.expect("cooldown") - Utc::now()).num_minutes();
+            assert!(
+                minutes <= AUTH_DEAD_CAP_MINUTES,
+                "cooldown {minutes} min exceeded the 6 h cap"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            12,
+            "every round must actually have reached the probe — otherwise the \
+             cap assertion above passes vacuously"
+        );
+        server.abort();
+    }
+
+    // ── (b2) probe schedule backoff ─────────────────────────────────
+    //
+    // A conclusively-dead credential used to be re-asked every 60 s forever.
+    // Free in dollars, but pointless traffic and one alarming log line a
+    // minute. These pin the widening schedule that replaced it.
+
+    /// 1 min → 2 → 4 → 8 → 16 → capped at 30 and never beyond.
+    #[test]
+    fn probe_backoff_doubles_then_caps_at_thirty_minutes() {
+        let expect = [
+            (1u32, 1i64),
+            (2, 2),
+            (3, 4),
+            (4, 8),
+            (5, 16),
+            (6, 30),
+            (7, 30),
+            (50, 30),
+            (u32::MAX, 30),
+        ];
+        for (failures, minutes) in expect {
+            assert_eq!(
+                probe_backoff(failures).num_minutes(),
+                minutes,
+                "failure {failures} should book {minutes} minutes"
+            );
+        }
+        // Defensive: a zero count is treated as the first failure, never as
+        // "probe again immediately".
+        assert_eq!(probe_backoff(0).num_minutes(), 1);
+        // The probe ceiling is deliberately far below the rotation ceiling —
+        // a probe is free, so only the noise is being rationed.
+        assert!(PROBE_BACKOFF_CAP_MINUTES < AUTH_DEAD_CAP_MINUTES);
+    }
+
+    /// (a) One 401 books a ~1-minute schedule, and the very next tick must not
+    /// reach the wire at all. The request counter is the assertion that
+    /// matters: account state alone cannot tell "asked and nothing changed"
+    /// apart from "never asked".
+    #[tokio::test]
+    async fn a_conclusive_probe_failure_suppresses_the_next_tick() {
+        let (base, hits, server) = spawn_counting_server(RESP_401).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+
+        let before = Utc::now();
+        assert_eq!(rotator.probe_and_restore().await, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the first tick probes");
+
+        let acc = snapshot(&rotator, "acct").await;
+        assert_eq!(acc.probe_failures, 1);
+        let booked = (acc.next_probe_at.expect("probe schedule booked") - before).num_seconds();
+        assert!(
+            (60..=65).contains(&booked),
+            "expected ~1 min until the next probe, got {booked}s"
+        );
+
+        // Second tick, immediately — this is the once-a-minute loop the
+        // schedule exists to break.
+        assert_eq!(rotator.probe_and_restore().await, 0);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a scheduled account must not be re-probed before its time"
+        );
+        assert_eq!(
+            snapshot(&rotator, "acct").await.probe_failures,
+            1,
+            "a skipped tick must not count as a failure"
+        );
+
+        server.abort();
+    }
+
+    /// (b) One integration step on the ladder: consecutive conclusive
+    /// failures book 1, then 2, then 4 minutes on the live account.
+    #[tokio::test]
+    async fn consecutive_conclusive_failures_walk_the_probe_ladder() {
+        let (base, hits, server) = spawn_counting_server(RESP_403).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::OrgDisabled)
+            .await;
+
+        for (nth, expected_minutes) in [(1u32, 1i64), (2, 2), (3, 4)] {
+            {
+                // Let the previous booking elapse without burning wall clock.
+                let mut accounts = rotator.accounts.write().await;
+                let a = accounts.iter_mut().find(|a| a.id == "acct").unwrap();
+                a.next_probe_at = None;
+            }
+            let before = Utc::now();
+            assert_eq!(rotator.probe_and_restore().await, 0);
+            let acc = snapshot(&rotator, "acct").await;
+            assert_eq!(acc.probe_failures, nth);
+            let booked = (acc.next_probe_at.expect("booked") - before).num_seconds();
+            let want = expected_minutes * 60;
+            assert!(
+                (want..=want + 5).contains(&booked),
+                "failure {nth}: expected ~{expected_minutes} min, got {booked}s"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        server.abort();
+    }
+
+    /// (c) A 200 (the operator re-issued the token) clears the schedule
+    /// completely, so recovery is never held back by a stale backoff.
+    #[tokio::test]
+    async fn a_valid_probe_clears_the_probe_schedule() {
+        // 401 first (books the backoff), 200 afterwards.
+        let (base, hits, server) = spawn_sequenced_server(RESP_401, RESP_200).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+
+        assert_eq!(rotator.probe_and_restore().await, 0);
+        let acc = snapshot(&rotator, "acct").await;
+        assert_eq!(acc.probe_failures, 1);
+        assert!(acc.next_probe_at.is_some());
+
+        {
+            let mut accounts = rotator.accounts.write().await;
+            let a = accounts.iter_mut().find(|a| a.id == "acct").unwrap();
+            a.next_probe_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        assert_eq!(rotator.probe_and_restore().await, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let acc = snapshot(&rotator, "acct").await;
+        assert_eq!(acc.probe_failures, 0);
+        assert_eq!(acc.next_probe_at, None);
+        assert_eq!(acc.credential_state, CredentialState::Ok);
+        assert!(rotator.select().await.is_some());
+
+        server.abort();
+    }
+
+    /// …and so does a completed request, which is even stronger evidence than
+    /// a probe.
+    #[tokio::test]
+    async fn on_success_clears_the_probe_schedule() {
+        let (base, _hits, server) = spawn_counting_server(RESP_401).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+        rotator.probe_and_restore().await;
+        assert!(snapshot(&rotator, "acct").await.next_probe_at.is_some());
+
+        rotator.on_success("acct", 0).await;
+        let acc = snapshot(&rotator, "acct").await;
+        assert_eq!(acc.probe_failures, 0);
+        assert_eq!(acc.next_probe_at, None);
+
+        server.abort();
+    }
+
+    /// (d) A real spawn failure clears the schedule so the next tick can
+    /// classify *that* failure — and must not itself bump the probe counter
+    /// (it is a spawn outcome, not a probe verdict).
+    #[tokio::test]
+    async fn on_auth_failed_reopens_the_probe_schedule() {
+        let (base, hits, server) = spawn_counting_server(RESP_403).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::OrgDisabled)
+            .await;
+
+        assert_eq!(rotator.probe_and_restore().await, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(
+            snapshot(&rotator, "acct")
+                .await
+                .next_probe_at
+                .is_some_and(|t| t > Utc::now()),
+            "a conclusive failure books a future probe"
+        );
+
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::OrgDisabled)
+            .await;
+        let acc = snapshot(&rotator, "acct").await;
+        assert_eq!(
+            acc.next_probe_at, None,
+            "a fresh spawn failure must let the next tick re-classify"
+        );
+        assert_eq!(
+            acc.probe_failures, 1,
+            "on_auth_failed counts spawn failures, not probe verdicts"
+        );
+
+        assert_eq!(rotator.probe_and_restore().await, 0);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the next tick must actually probe again"
+        );
+        assert_eq!(snapshot(&rotator, "acct").await.probe_failures, 2);
+
+        server.abort();
+    }
+
+    /// (e) An inconclusive answer (500) must not slow the probe down: an API
+    /// outage saying nothing about the credential is the mirror image of the
+    /// original bug, and delaying recovery on it would be a real cost.
+    #[tokio::test]
+    async fn an_inconclusive_probe_schedules_no_backoff() {
+        let (base, hits, server) = spawn_counting_server(RESP_500).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+
+        assert_eq!(rotator.probe_and_restore().await, 0);
+        let acc = snapshot(&rotator, "acct").await;
+        assert_eq!(acc.next_probe_at, None);
+        assert_eq!(acc.probe_failures, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // …so the very next tick probes again, exactly as before this change.
+        assert_eq!(rotator.probe_and_restore().await, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        server.abort();
+    }
+
+    /// `status()` (and therefore `accounts.list`) carries the schedule, so an
+    /// operator can see a dead token is being re-checked on a backoff rather
+    /// than silently forgotten.
+    #[tokio::test]
+    async fn status_surfaces_the_probe_schedule() {
+        let (base, _hits, server) = spawn_counting_server(RESP_401).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        rotator.push_account_for_test(token_account("acct")).await;
+
+        // Never probed → nothing scheduled.
+        let row = rotator.status().await.remove(0);
+        assert_eq!(row.next_probe_at, None);
+        assert_eq!(row.probe_failures, 0);
+
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+        rotator.probe_and_restore().await;
+
+        let row = rotator.status().await.remove(0);
+        assert_eq!(row.probe_failures, 1);
+        let stamp = row.next_probe_at.expect("schedule surfaced");
+        let parsed = stamp
+            .parse::<DateTime<Utc>>()
+            .expect("next_probe_at must be RFC 3339");
+        assert!(parsed > Utc::now());
+
+        server.abort();
+    }
+
+    /// A 500 (or any inconclusive answer) says nothing about the credential:
+    /// account state must be byte-identical afterwards. Reading a server
+    /// outage as a dead token would be the mirror image of the original bug.
+    #[tokio::test]
+    async fn probe_500_leaves_the_account_untouched() {
+        let (base, server) = spawn_repeating_server(RESP_500).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::OrgDisabled)
+            .await;
+        let before = snapshot(&rotator, "acct").await;
+
+        assert_eq!(rotator.probe_and_restore().await, 0);
+
+        let after = snapshot(&rotator, "acct").await;
+        assert_eq!(after.cooldown_until, before.cooldown_until);
+        assert_eq!(after.credential_state, before.credential_state);
+        assert_eq!(after.auth_dead_strikes, before.auth_dead_strikes);
+        assert_eq!(after.is_healthy, before.is_healthy);
+
+        server.abort();
+    }
+
+    /// An unreachable API (transport error → `Unknown`) is inconclusive too.
+    #[tokio::test]
+    async fn probe_transport_failure_leaves_the_account_untouched() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120)
+            .with_probe_base_url(format!("http://{addr}"));
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::InvalidToken)
+            .await;
+        let before = snapshot(&rotator, "acct").await;
+
+        assert_eq!(rotator.probe_and_restore().await, 0);
+
+        let after = snapshot(&rotator, "acct").await;
+        assert_eq!(after.cooldown_until, before.cooldown_until);
+        assert_eq!(after.credential_state, before.credential_state);
+    }
+
+    /// An API-key account is probed with its own key (`x-api-key`), same
+    /// three-way verdict.
+    #[tokio::test]
+    async fn api_key_account_is_probed_with_its_own_key() {
+        let (base, server) = spawn_repeating_server(RESP_200).await;
+        let rotator =
+            AccountRotator::new(RotationStrategy::Priority, 120).with_probe_base_url(&base);
+        let mut acc = token_account("api-acct");
+        acc.auth_method = AuthMethod::ApiKey;
+        acc.oauth_token = None;
+        acc.api_key = "sk-ant-api03-test".to_string();
+        acc.monthly_budget_cents = 5000;
+        rotator.push_account_for_test(acc).await;
+        rotator
+            .on_auth_failed("api-acct", AuthFailureKind::InvalidToken)
+            .await;
+
+        assert_eq!(rotator.probe_and_restore().await, 1);
+        assert_eq!(
+            snapshot(&rotator, "api-acct").await.credential_state,
+            CredentialState::Ok
+        );
+
+        server.abort();
+    }
+
+    /// A foreign-provider seat's credential means nothing to
+    /// `api.anthropic.com` — probing it there would produce a confident, wrong
+    /// verdict, so it must not be probe-able at all.
+    #[test]
+    fn non_anthropic_seats_are_never_probed_against_anthropic() {
+        let mut seat = token_account("copilot-seat");
+        seat.provider = "github".to_string();
+        assert!(probe_secret_for(&seat).is_none());
+
+        let mut key = token_account("openai-key");
+        key.provider = "openai".to_string();
+        key.auth_method = AuthMethod::ApiKey;
+        key.api_key = "sk-openai".to_string();
+        assert!(probe_secret_for(&key).is_none());
+
+        // …while the Anthropic equivalents are.
+        assert!(matches!(
+            probe_secret_for(&token_account("anth")),
+            Some((CredentialKind::OAuthToken, _))
+        ));
+        let mut anth_key = token_account("anth-key");
+        anth_key.auth_method = AuthMethod::ApiKey;
+        anth_key.oauth_token = None;
+        anth_key.api_key = "sk-ant-api03".to_string();
+        assert!(matches!(
+            probe_secret_for(&anth_key),
+            Some((CredentialKind::ApiKey, _))
+        ));
+        // An empty credential is not probe-able (and never was usable).
+        let mut empty = token_account("empty");
+        empty.oauth_token = Some("   ".to_string());
+        assert!(probe_secret_for(&empty).is_none());
+    }
+
+    // ── (c) the weak `claude auth status` signal ────────────────────
+
+    /// The heart of the incident: `loggedIn: true` must never resurrect an
+    /// account we have watched fail authentication.
+    #[test]
+    fn claude_auth_status_may_not_restore_auth_dead_or_broken() {
+        assert!(legacy_status_probe_may_restore(CredentialState::Unverified));
+        assert!(legacy_status_probe_may_restore(CredentialState::Ok));
+        assert!(!legacy_status_probe_may_restore(CredentialState::Broken));
+        assert!(!legacy_status_probe_may_restore(CredentialState::AuthDead(
+            AuthFailureKind::InvalidToken
+        )));
+        assert!(!legacy_status_probe_may_restore(CredentialState::AuthDead(
+            AuthFailureKind::OrgDisabled
+        )));
+    }
+
+    /// End-to-end version: a keychain account (no probe-able secret) that has
+    /// been marked auth-dead stays dead across a probe tick, even on a machine
+    /// where `claude auth status` happily reports `loggedIn: true`.
+    #[tokio::test]
+    async fn auth_dead_keychain_account_is_not_restored_by_the_status_probe() {
+        // Unroutable probe base: if this account were ever routed to the
+        // credential probe (it must not be — it has no secret), the test would
+        // notice via a changed state rather than a silent pass.
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120)
+            .with_probe_base_url("http://127.0.0.1:1");
+        rotator
+            .push_account_for_test(keychain_account("keychain"))
+            .await;
+        rotator
+            .on_auth_failed("keychain", AuthFailureKind::OrgDisabled)
+            .await;
+        let before = snapshot(&rotator, "keychain").await;
+
+        assert_eq!(
+            rotator.probe_and_restore().await,
+            0,
+            "`claude auth status` must not resurrect an auth-dead account"
+        );
+
+        let after = snapshot(&rotator, "keychain").await;
+        assert!(!after.is_healthy);
+        assert_eq!(
+            after.credential_state,
+            CredentialState::AuthDead(AuthFailureKind::OrgDisabled)
+        );
+        assert_eq!(after.cooldown_until, before.cooldown_until);
+        assert!(rotator.select().await.is_none());
+    }
+
+    // ── (d) load-time broken-credential detection ───────────────────
+
+    static HOME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_home(label: &str) -> tempfile::TempDir {
+        let _ = HOME_COUNTER.fetch_add(1, Ordering::Relaxed);
+        tempfile::Builder::new()
+            .prefix(&format!("duduclaw-cred-{label}-"))
+            .tempdir()
+            .expect("tempdir")
+    }
+
+    /// An `oauth_token_enc` that cannot be decrypted (wrong / regenerated
+    /// `.keyfile`) must load as BROKEN and never be selected — instead of
+    /// quietly spawning children with no credential at all. An OAuth entry
+    /// with no `_enc` field at all is untouched (it relies on the OS keychain).
+    #[tokio::test]
+    async fn undecryptable_oauth_token_loads_as_broken_and_is_never_selected() {
+        let home = temp_home("broken-oauth");
+        // A real keyfile exists — the ciphertext is simply not ours.
+        std::fs::write(
+            home.path().join(".keyfile"),
+            duduclaw_security::crypto::CryptoEngine::generate_key().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+[[accounts]]
+id = "broken-oauth"
+type = "oauth"
+label = "壞掉的帳號"
+oauth_token_enc = "this-is-not-valid-ciphertext"
+
+[[accounts]]
+id = "keychain-oauth"
+type = "oauth"
+profile = "default"
+label = "鑰匙圈帳號"
+"#,
+        )
+        .unwrap();
+
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.load_from_config(home.path()).await.unwrap();
+
+        let broken = snapshot(&rotator, "broken-oauth").await;
+        assert_eq!(broken.credential_state, CredentialState::Broken);
+        assert!(!broken.is_healthy, "a broken credential is not healthy");
+        assert!(
+            !broken.is_available(),
+            "a broken credential is never available"
+        );
+        assert!(
+            broken.oauth_token.is_none(),
+            "an unusable token must not reach the spawn env"
+        );
+        assert!(broken.credential_state.credential_detail().is_some());
+
+        // The no-`_enc` sibling keeps its previous behavior exactly.
+        let keychain = snapshot(&rotator, "keychain-oauth").await;
+        assert_eq!(
+            keychain.credential_state,
+            CredentialState::Unverified,
+            "an OAuth entry with no `_enc` field must NOT be judged broken"
+        );
+
+        // Whatever else is selectable, it is never the broken account.
+        for _ in 0..5 {
+            if let Some(sel) = rotator.select().await {
+                assert_ne!(sel.id, "broken-oauth");
+            }
+        }
+    }
+
+    /// Same rule on the API-key side: an `api_key_enc` that resolves to
+    /// nothing loads as BROKEN (previously the row was silently skipped, so a
+    /// wrong `.keyfile` just made the pool quietly smaller).
+    #[tokio::test]
+    async fn undecryptable_api_key_loads_as_broken() {
+        let home = temp_home("broken-apikey");
+        std::fs::write(
+            home.path().join(".keyfile"),
+            duduclaw_security::crypto::CryptoEngine::generate_key().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+[[accounts]]
+id = "broken-key"
+type = "api_key"
+provider = "anthropic"
+api_key_enc = "not-real-ciphertext"
+"#,
+        )
+        .unwrap();
+
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.load_from_config(home.path()).await.unwrap();
+
+        let acc = snapshot(&rotator, "broken-key").await;
+        assert_eq!(acc.credential_state, CredentialState::Broken);
+        assert!(!acc.is_healthy);
+        assert!(!acc.is_available());
+    }
+
+    /// The precondition helper: only a *declared, non-empty* encrypted field
+    /// makes an entry a broken-credential candidate.
+    #[test]
+    fn has_nonempty_field_requires_a_real_declaration() {
+        let with_enc: toml::Table = "oauth_token_enc = \"abc\"\n".parse().unwrap();
+        assert!(has_nonempty_field(&with_enc, OAUTH_TOKEN_ENC_FIELDS));
+
+        let blank: toml::Table = "oauth_token_enc = \"   \"\n".parse().unwrap();
+        assert!(!has_nonempty_field(&blank, OAUTH_TOKEN_ENC_FIELDS));
+
+        let absent: toml::Table = "profile = \"default\"\n".parse().unwrap();
+        assert!(!has_nonempty_field(&absent, OAUTH_TOKEN_ENC_FIELDS));
+
+        // Either api-key field name counts.
+        let alt: toml::Table = "anthropic_api_key_enc = \"abc\"\n".parse().unwrap();
+        assert!(has_nonempty_field(&alt, API_KEY_ENC_FIELDS));
+        assert!(!has_nonempty_field(&alt, OAUTH_TOKEN_ENC_FIELDS));
+    }
+
+    // ── (e) Broken is a hard exclusion under every strategy ─────────
+
+    #[tokio::test]
+    async fn broken_accounts_are_excluded_under_priority_and_round_robin() {
+        for strategy in [RotationStrategy::Priority, RotationStrategy::RoundRobin] {
+            let rotator = AccountRotator::new(strategy, 120);
+            let mut broken = token_account("broken");
+            broken.priority = 1; // would win on Priority
+            broken.credential_state = CredentialState::Broken;
+            // Deliberately left `is_healthy = true`: the exclusion must come
+            // from the credential state alone, not from a health side effect.
+            rotator.push_account_for_test(broken).await;
+            let mut good = token_account("good");
+            good.priority = 9;
+            rotator.push_account_for_test(good).await;
+
+            for _ in 0..6 {
+                let sel = rotator
+                    .select()
+                    .await
+                    .expect("the healthy account must answer");
+                assert_eq!(sel.id, "good", "a Broken account leaked into rotation");
+            }
+        }
+    }
+
+    /// An agent whose `account_pool` names ONLY the broken account must still
+    /// not get it — the pool's fail-open rule widens the candidate set, it
+    /// never re-admits a hard-excluded account.
+    #[tokio::test]
+    async fn broken_account_is_not_reachable_through_the_account_pool() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        let mut broken = token_account("broken");
+        broken.credential_state = CredentialState::Broken;
+        rotator.push_account_for_test(broken).await;
+        rotator.push_account_for_test(token_account("good")).await;
+
+        let sel = rotator
+            .select_with_pool(&["broken".to_string()])
+            .await
+            .expect("fail-open must still hand back a usable account");
+        assert_eq!(sel.id, "good");
+    }
+
+    /// With nothing but a broken account configured, selection returns None
+    /// rather than falling through to the ambient `ANTHROPIC_API_KEY`.
+    #[tokio::test]
+    async fn only_broken_accounts_means_no_selection() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        let mut broken = token_account("broken");
+        broken.credential_state = CredentialState::Broken;
+        rotator.push_account_for_test(broken).await;
+        assert!(rotator.select().await.is_none());
+    }
+
+    // ── (D5) the shapes the dashboard / gateway wave codes against ──
+
+    #[test]
+    fn credential_state_display_and_serialization_are_stable() {
+        assert_eq!(CredentialState::Ok.to_string(), "ok");
+        assert_eq!(CredentialState::Unverified.to_string(), "unverified");
+        assert_eq!(CredentialState::Broken.to_string(), "broken");
+        assert_eq!(
+            CredentialState::AuthDead(AuthFailureKind::InvalidToken).to_string(),
+            "auth_dead:invalid_token"
+        );
+        assert_eq!(
+            CredentialState::AuthDead(AuthFailureKind::OrgDisabled).to_string(),
+            "auth_dead:org_disabled"
+        );
+
+        let json = |s: CredentialState| serde_json::to_string(&s).unwrap();
+        assert_eq!(json(CredentialState::Ok), "\"ok\"");
+        assert_eq!(json(CredentialState::Unverified), "\"unverified\"");
+        assert_eq!(json(CredentialState::Broken), "\"broken\"");
+        assert_eq!(
+            json(CredentialState::AuthDead(AuthFailureKind::OrgDisabled)),
+            "\"auth_dead\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthFailureKind::OrgDisabled).unwrap(),
+            "\"org_disabled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthFailureKind::InvalidToken).unwrap(),
+            "\"invalid_token\""
+        );
+
+        // `Unverified` is the honest default — a credential we have not seen
+        // work is neither Ok nor dead.
+        assert_eq!(CredentialState::default(), CredentialState::Unverified);
+        assert!(CredentialState::Broken.is_blocking());
+        assert!(!CredentialState::AuthDead(AuthFailureKind::OrgDisabled).is_blocking());
+    }
+
+    /// `accounts.list` (via `status()`) must carry the new fields, or the
+    /// dashboard badge has nothing to render.
+    #[tokio::test]
+    async fn status_surfaces_credential_state_and_detail() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(token_account("acct")).await;
+        rotator
+            .on_auth_failed("acct", AuthFailureKind::OrgDisabled)
+            .await;
+
+        let rows = rotator.status().await;
+        let row = rows.iter().find(|r| r.id == "acct").expect("row");
+        assert_eq!(
+            row.credential_state,
+            CredentialState::AuthDead(AuthFailureKind::OrgDisabled)
+        );
+        assert_eq!(row.auth_dead_strikes, 1);
+        let detail = row
+            .credential_detail
+            .expect("a bad state must explain itself");
+        assert!(
+            detail.contains("403"),
+            "detail should name the failure: {detail}"
+        );
+        assert!(!row.is_available);
+
+        // Serialized shape (what the gateway forwards to the dashboard).
+        let json = serde_json::to_value(row).unwrap();
+        assert_eq!(json["credential_state"], serde_json::json!("auth_dead"));
+        assert_eq!(json["auth_dead_strikes"], serde_json::json!(1));
+    }
+
+    /// `doubled_cooldown` never returns something shorter than the base and
+    /// never exceeds the cap — including from an absent / already-expired
+    /// cooldown, where "double nothing" would mean "retry immediately".
+    #[test]
+    fn doubled_cooldown_restarts_at_base_and_respects_the_cap() {
+        let now = Utc::now();
+
+        let from_none = (doubled_cooldown(None) - now).num_minutes();
+        assert!((14..=15).contains(&from_none), "got {from_none}");
+
+        let expired =
+            (doubled_cooldown(Some(now - chrono::Duration::hours(3))) - now).num_minutes();
+        assert!((14..=15).contains(&expired), "got {expired}");
+
+        let doubled =
+            (doubled_cooldown(Some(now + chrono::Duration::minutes(30))) - now).num_minutes();
+        assert!((59..=60).contains(&doubled), "got {doubled}");
+
+        let capped = (doubled_cooldown(Some(now + chrono::Duration::hours(5))) - now).num_minutes();
+        assert_eq!(capped, AUTH_DEAD_CAP_MINUTES);
     }
 }

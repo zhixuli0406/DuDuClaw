@@ -24453,6 +24453,25 @@ impl MethodHandler {
     /// `resolve_env_key`/`select_for_provider` would otherwise treat it as a
     /// pool nothing ever selects, a confusing way to fail.
     async fn handle_accounts_add(&self, params: Value) -> WsFrame {
+        self.handle_accounts_add_with_probe_base(
+            params,
+            duduclaw_agent::credential_probe::ANTHROPIC_API_BASE,
+        )
+        .await
+    }
+
+    /// `accounts.add` with an injectable probe base URL (D6).
+    ///
+    /// Production always calls this with the real Anthropic API base via
+    /// [`handle_accounts_add`](Self::handle_accounts_add); tests point it at a
+    /// local listener so write-time verification is exercised without a
+    /// network round-trip (and without ever sending a fixture "secret"
+    /// anywhere).
+    async fn handle_accounts_add_with_probe_base(
+        &self,
+        params: Value,
+        probe_base: &str,
+    ) -> WsFrame {
         let id = match params.get("id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id,
             _ => return WsFrame::error_response("", "Missing 'id' parameter"),
@@ -24513,6 +24532,79 @@ impl MethodHandler {
             return WsFrame::error_response("", &format!("Account '{id}' already exists"));
         }
 
+        // D6 (2026-09 credential hardening): verify BEFORE persisting.
+        //
+        // On 2026-09-08 an operator pasted a short-lived `sk-ant-at01-` access
+        // token into this form. It was accepted, encrypted, written, and every
+        // scheduled job in the install failed for 18 hours. A credential the
+        // dashboard has never authenticated must not be presented to the user
+        // as a working account.
+        //
+        // Three-way outcome, mirroring `CredentialProbe`'s own honesty split:
+        // a *conclusive* rejection (401/403) refuses the write; a *proven*
+        // credential is saved with `verified: true`; an inconclusive probe
+        // (offline install, rate-limited probe) still saves — configuring an
+        // account must work without connectivity — but says so honestly with
+        // `verified: false`. Non-Anthropic providers have no probe endpoint
+        // here at all (D8) and report `verified: null`.
+        //
+        // Runs after every id/type/provider/duplicate check (a rejected call
+        // still costs zero network) and before the encrypt/write.
+        let verified: Option<bool> = if provider == "anthropic" {
+            use duduclaw_agent::credential_probe::{
+                CredentialKind, CredentialProbe, looks_like_access_token,
+                probe_anthropic_credential_at,
+            };
+            // Shape check first: no network call can improve on knowing the
+            // paste is the wrong *kind* of token (a fresh at01 authenticates
+            // fine right now and dies in a few hours — probing it would
+            // cheerfully return 200 and enshrine the incident).
+            if auth_type == "oauth" && looks_like_access_token(key) {
+                return WsFrame::error_response(
+                    "",
+                    "這是短效 access token（sk-ant-at01-），幾小時就會失效；請在終端執行 \
+                     `claude setup-token` 取得 sk-ant-oat01- 開頭的 token 再貼上",
+                );
+            }
+            let kind = if auth_type == "oauth" {
+                CredentialKind::OAuthToken
+            } else {
+                CredentialKind::ApiKey
+            };
+            match probe_anthropic_credential_at(probe_base, kind, key).await {
+                CredentialProbe::Valid => Some(true),
+                CredentialProbe::InvalidCredential => {
+                    return WsFrame::error_response(
+                        "",
+                        "憑證無效（401）：Anthropic 拒絕了這個 token/key，請確認是否貼錯或已撤銷",
+                    );
+                }
+                CredentialProbe::OrgDisabled => {
+                    return WsFrame::error_response(
+                        "",
+                        "此組織已停用 Claude Code 訂閱存取（403）：請改用 API key 帳號，或請組織管理員在 Anthropic 後台開啟",
+                    );
+                }
+                // Inconclusive — says nothing about the credential, so it must
+                // not block the write. `detail` is secret-redacted at the
+                // source (`credential_probe::unknown_detail`).
+                other => {
+                    let detail = match &other {
+                        CredentialProbe::Unknown(d) => d.as_str(),
+                        _ => "rate limited",
+                    };
+                    warn!(
+                        id,
+                        detail,
+                        "credential could not be verified (network/rate limit) — saved unverified"
+                    );
+                    Some(false)
+                }
+            }
+        } else {
+            None
+        };
+
         // Encrypt the key
         let encrypted = crate::config_crypto::encrypt_value(key, &self.home_dir);
 
@@ -24542,7 +24634,7 @@ impl MethodHandler {
         // dispatch/channel-reply call instead of up to 5 minutes later.
         crate::claude_runner::invalidate_rotator_cache().await;
 
-        info!(id, auth_type, provider, "accounts.add completed");
+        info!(id, auth_type, provider, verified, "accounts.add completed");
         WsFrame::ok_response(
             "",
             json!({
@@ -24550,6 +24642,10 @@ impl MethodHandler {
                 "id": id,
                 "type": auth_type,
                 "provider": provider,
+                // D6: `true` = authenticated just now, `false` = saved but the
+                // probe could not reach a verdict, `null` = not probe-able
+                // (non-Anthropic provider). The dashboard renders all three.
+                "verified": verified,
             }),
         )
     }
@@ -29120,6 +29216,19 @@ fn account_status_to_json(a: &duduclaw_agent::account_rotator::AccountStatus) ->
         "subscription": a.subscription,
         "expires_at": a.expires_at,
         "days_until_expiry": a.days_until_expiry,
+        // D5 — credential state, deliberately the `Display` form
+        // (`auth_dead:org_disabled`), NOT `CredentialState`'s serde form
+        // (bare `auth_dead`). The dashboard badge distinguishes "re-issue the
+        // token" from "ask your org admin", which the flat serde token cannot
+        // express; `credential_detail` carries the zh-TW one-liner beside it.
+        "credential_state": a.credential_state.to_string(),
+        "credential_detail": a.credential_detail,
+        // Probe schedule: when the credential probe may next run (RFC 3339,
+        // `null` = next tick) and how many conclusive rejections have stacked
+        // up. Surfaced so an operator can see that a dead token is being
+        // re-checked on a backoff rather than silently forgotten.
+        "next_probe_at": a.next_probe_at,
+        "probe_failures": a.probe_failures,
     })
 }
 
@@ -44411,17 +44520,54 @@ mod accounts_add_tests {
 
     // ── handle_accounts_add: end-to-end, MethodHandler fixture ──
 
+    /// Minimal fixed-response HTTP server for the D6 write-time probe.
+    ///
+    /// Mirrors `duduclaw_agent::credential_probe`'s own test harness: one
+    /// connection, one canned response, no HTTP-server dependency. Returns the
+    /// base URL to hand `handle_accounts_add_with_probe_base`.
+    async fn probe_server(response: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    const PROBE_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    const PROBE_401: &str =
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const PROBE_403: &str =
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// Add an account through the RPC with the D6 probe pointed at a local
+    /// listener that answers 200 — i.e. "the credential authenticates", which
+    /// is what every pre-D6 caller of this helper implicitly assumed.
     async fn added_account(home: &std::path::Path, id: &str) -> WsFrame {
         let handler = MethodHandler::new(home.to_path_buf()).await;
-        handler
-            .handle_accounts_add(json!({
-                "id": id,
-                "type": "api_key",
-                "key": format!("sk-{id}-secret"),
-                "priority": 1,
-                "monthly_budget_cents": 5000,
-            }))
-            .await
+        let (base, server) = probe_server(PROBE_200).await;
+        let res = handler
+            .handle_accounts_add_with_probe_base(
+                json!({
+                    "id": id,
+                    "type": "api_key",
+                    "key": format!("sk-{id}-secret"),
+                    "priority": 1,
+                    "monthly_budget_cents": 5000,
+                }),
+                &base,
+            )
+            .await;
+        let _ = server.await;
+        res
     }
 
     #[tokio::test]
@@ -44621,10 +44767,257 @@ mod accounts_add_tests {
             label: String::new(),
             expires_at: None,
             days_until_expiry: None,
+            credential_state: Default::default(),
+            credential_detail: None,
+            auth_dead_strikes: 0,
+            next_probe_at: None,
+            probe_failures: 0,
         };
         let row = account_status_to_json(&status);
         assert_eq!(row["provider"], json!("gemini"));
         assert_eq!(row["id"], json!("acct-gemini"));
+
+        // D5: the credential badge fields must reach the dashboard. The
+        // default state is the honest "we have it, we've never seen it work".
+        assert_eq!(row["credential_state"], json!("unverified"));
+        assert_eq!(row["credential_detail"], json!(null));
+
+        // Probe schedule: a never-probed account is due on the next tick.
+        assert_eq!(row["next_probe_at"], json!(null));
+        assert_eq!(row["probe_failures"], json!(0));
+    }
+
+    /// D5 — an auth-dead row must carry the *kind* (`auth_dead:org_disabled`),
+    /// not `CredentialState`'s flat serde token (`auth_dead`). The dashboard
+    /// badge and its zh-TW hint both key off this: "re-issue your token" and
+    /// "ask your org admin" are different actions.
+    #[test]
+    fn accounts_list_row_surfaces_auth_dead_kind_and_detail() {
+        use duduclaw_agent::account_rotator::{AuthFailureKind, CredentialState};
+
+        let status = duduclaw_agent::account_rotator::AccountStatus {
+            id: "acct-org".to_string(),
+            credential_state: CredentialState::AuthDead(AuthFailureKind::OrgDisabled),
+            credential_detail: CredentialState::AuthDead(AuthFailureKind::OrgDisabled)
+                .credential_detail(),
+            auth_dead_strikes: 2,
+            ..Default::default()
+        };
+        let row = account_status_to_json(&status);
+        assert_eq!(
+            row["credential_state"],
+            json!("auth_dead:org_disabled"),
+            "the Display form (with the kind) must win over the serde form: {row}"
+        );
+        let detail = row["credential_detail"].as_str().expect("detail present");
+        assert!(
+            detail.contains("403"),
+            "operator-facing detail should name the failure: {detail}"
+        );
+
+        // …and the invalid-token variant must be distinguishable from it.
+        let status = duduclaw_agent::account_rotator::AccountStatus {
+            id: "acct-tok".to_string(),
+            credential_state: CredentialState::AuthDead(AuthFailureKind::InvalidToken),
+            credential_detail: CredentialState::AuthDead(AuthFailureKind::InvalidToken)
+                .credential_detail(),
+            ..Default::default()
+        };
+        assert_eq!(
+            account_status_to_json(&status)["credential_state"],
+            json!("auth_dead:invalid_token")
+        );
+    }
+
+    // ── D6: write-time credential verification ─────────────────────────
+
+    /// The user-facing error string of a rejected frame (empty when the frame
+    /// carries no error, which every caller below asserts against).
+    fn frame_error_message(f: &WsFrame) -> String {
+        match f {
+            WsFrame::Response { error: Some(e), .. } => {
+                e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string())
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// A short-lived `sk-ant-at01-` access token is refused on shape alone —
+    /// BEFORE any network call. The base URL below is unroutable on purpose:
+    /// if the handler probed, this test would hang for the probe timeout and
+    /// then (wrongly) save the account.
+    #[tokio::test]
+    async fn accounts_add_rejects_short_lived_access_token_without_a_probe() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let started = std::time::Instant::now();
+        let res = handler
+            .handle_accounts_add_with_probe_base(
+                json!({
+                    "id": "acct-at01",
+                    "type": "oauth",
+                    "key": "sk-ant-at01-short-lived",
+                    "priority": 1,
+                    "monthly_budget_cents": 0,
+                }),
+                "http://192.0.2.1:9",
+            )
+            .await;
+        assert!(matches!(res, WsFrame::Response { ok: false, .. }), "{res:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the at01 rejection must not pay for a network probe"
+        );
+        let msg = frame_error_message(&res);
+        assert!(msg.contains("setup-token"), "message must name the fix: {msg}");
+        assert!(
+            !home.path().join("config.toml").exists(),
+            "a rejected credential must never be persisted"
+        );
+    }
+
+    /// 401 ⇒ the account is refused, not saved-and-broken.
+    #[tokio::test]
+    async fn accounts_add_rejects_401_credential() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let (base, server) = probe_server(PROBE_401).await;
+        let res = handler
+            .handle_accounts_add_with_probe_base(
+                json!({
+                    "id": "acct-401",
+                    "type": "oauth",
+                    "key": "sk-ant-oat01-revoked",
+                    "priority": 1,
+                    "monthly_budget_cents": 0,
+                }),
+                &base,
+            )
+            .await;
+        let _ = server.await;
+        assert!(matches!(res, WsFrame::Response { ok: false, .. }), "{res:?}");
+        assert!(!home.path().join("config.toml").exists());
+    }
+
+    /// 403 ⇒ refused with the org-specific message (the 2026-09-08 incident
+    /// shape: the token is fine, the organization disabled the access path).
+    #[tokio::test]
+    async fn accounts_add_rejects_403_org_disabled() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let (base, server) = probe_server(PROBE_403).await;
+        let res = handler
+            .handle_accounts_add_with_probe_base(
+                json!({
+                    "id": "acct-403",
+                    "type": "oauth",
+                    "key": "sk-ant-oat01-org-disabled",
+                    "priority": 1,
+                    "monthly_budget_cents": 0,
+                }),
+                &base,
+            )
+            .await;
+        let _ = server.await;
+        assert!(matches!(res, WsFrame::Response { ok: false, .. }), "{res:?}");
+        let msg = frame_error_message(&res);
+        assert!(msg.contains("403"), "message must name the 403: {msg}");
+        assert!(!home.path().join("config.toml").exists());
+    }
+
+    /// 200 ⇒ saved, and the response says so.
+    #[tokio::test]
+    async fn accounts_add_saves_verified_true_on_200() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let (base, server) = probe_server(PROBE_200).await;
+        let res = handler
+            .handle_accounts_add_with_probe_base(
+                json!({
+                    "id": "acct-ok",
+                    "type": "oauth",
+                    "key": "sk-ant-oat01-good",
+                    "priority": 1,
+                    "monthly_budget_cents": 0,
+                }),
+                &base,
+            )
+            .await;
+        let _ = server.await;
+        assert!(matches!(res, WsFrame::Response { ok: true, .. }), "{res:?}");
+        assert_eq!(frame_payload(&res)["verified"], json!(true));
+
+        let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        let acct = table["accounts"].as_array().unwrap()[0].as_table().unwrap();
+        assert_eq!(acct.get("id").and_then(|v| v.as_str()), Some("acct-ok"));
+    }
+
+    /// An unreachable probe (offline install, DNS down, a listener that
+    /// closes without answering) must NOT block configuration — the account is
+    /// saved with an honest `verified: false`.
+    #[tokio::test]
+    async fn accounts_add_saves_unverified_when_the_probe_cannot_answer() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+
+        // A listener that accepts and immediately closes: a transport failure,
+        // which `CredentialProbe` classifies as `Unknown` — inconclusive.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                drop(sock);
+            }
+        });
+
+        let res = handler
+            .handle_accounts_add_with_probe_base(
+                json!({
+                    "id": "acct-offline",
+                    "type": "oauth",
+                    "key": "sk-ant-oat01-unknown",
+                    "priority": 1,
+                    "monthly_budget_cents": 0,
+                }),
+                &format!("http://{addr}"),
+            )
+            .await;
+        let _ = server.await;
+        assert!(matches!(res, WsFrame::Response { ok: true, .. }), "{res:?}");
+        assert_eq!(
+            frame_payload(&res)["verified"],
+            json!(false),
+            "an unverifiable credential must be saved, but never claimed verified"
+        );
+        assert!(home.path().join("config.toml").exists());
+    }
+
+    /// A non-Anthropic provider has no probe endpoint here (D8): saved,
+    /// `verified: null`, and byte-identical to the pre-D6 behavior — in
+    /// particular it must never reach the network. The base URL is unroutable
+    /// on purpose.
+    #[tokio::test]
+    async fn accounts_add_does_not_probe_foreign_providers() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let started = std::time::Instant::now();
+        let res = handler
+            .handle_accounts_add_with_probe_base(
+                json!({
+                    "id": "acct-deepseek",
+                    "type": "api_key",
+                    "provider": "deepseek",
+                    "key": "sk-deepseek-secret",
+                    "priority": 1,
+                    "monthly_budget_cents": 5000,
+                }),
+                "http://192.0.2.1:9",
+            )
+            .await;
+        assert!(matches!(res, WsFrame::Response { ok: true, .. }), "{res:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(frame_payload(&res)["verified"], json!(null));
     }
 }
 

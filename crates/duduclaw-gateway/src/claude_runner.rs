@@ -2844,6 +2844,13 @@ async fn call_with_rotation(
                 };
                 rotator.on_success(&selected.id, cost).await;
 
+                // D7: an account answered ⇒ if a previous run had declared an
+                // "all accounts failed authentication" outage, close it and
+                // tell the operator once. Cheap in the healthy case (see
+                // `auth_outage::record_recovery` — a process that never saw an
+                // outage touches disk at most once per 60 s).
+                crate::auth_outage::record_recovery(home_dir, outage_agent_id(agent_id)).await;
+
                 // Record telemetry
                 if let Some(ref usage) = response.usage {
                     if let Some(telemetry) = crate::cost_telemetry::get_telemetry() {
@@ -2861,6 +2868,13 @@ async fn call_with_rotation(
                     rotator.on_billing_exhausted(&selected.id).await;
                 } else if is_rate_limit_error(&e) {
                     rotator.on_rate_limited(&selected.id).await;
+                } else if let Some(kind) = crate::channel_reply::auth_failure_kind_for(&e) {
+                    // D2 (2026-09-08 incident): a dead credential is not a
+                    // transient fault. `on_error` needed three strikes and then
+                    // released the account after 2 minutes, so a 403'd token
+                    // burned one spawn per cron tick for 18 hours. Mark it
+                    // auth-dead immediately with an exponential backoff.
+                    rotator.on_auth_failed(&selected.id, kind).await;
                 } else {
                     rotator.on_error(&selected.id).await;
                 }
@@ -2872,7 +2886,30 @@ async fn call_with_rotation(
     // All rotated accounts failed.
     // Note: the AccountRotator already includes env-var and [api]-section keys
     // as accounts, so retrying with get_api_key() here would be redundant.
+    //
+    // D7 (2026-09-08 incident): when the last error is an *authentication*
+    // failure, this is not "a bad minute" — every scheduled job in the
+    // install is dead until a human pastes a new token. Raise the alarm once
+    // per outage. Non-fatal and non-blocking-by-design: `record_outage`
+    // swallows its own errors, so the caller's error string is unchanged.
+    if crate::channel_reply::classify_cli_failure(&last_error)
+        == crate::channel_reply::FailureReason::AuthFailed
+    {
+        crate::auth_outage::record_outage(home_dir, outage_agent_id(agent_id), &last_error).await;
+    }
     Err(format!("All accounts exhausted. Last error: {last_error}"))
+}
+
+/// Attribution for an auth-outage record. Dispatch/cron/heartbeat always
+/// carry a real agent id; the handful of agent-less system callers (utility
+/// prompts, dashboard widgets) get `"system"` so the outage row is never
+/// keyed on an empty string.
+fn outage_agent_id(agent_id: &str) -> &str {
+    if agent_id.trim().is_empty() {
+        "system"
+    } else {
+        agent_id
+    }
 }
 
 /// Public API key getter for use by other modules (e.g., sandbox dispatcher).

@@ -597,6 +597,22 @@ docker compose exec duduclaw claude auth status
 よくある間違いは、`.env` を編集した後に `docker compose up -d` で container を**再起動**するのを忘れることです。
 env varは起動時にのみ注入されるため、ホット変更は反映されません。
 
+> **ステップ3はトークンが実際に機能していることを証明しません。**
+> `claude auth status` は `CLAUDE_CODE_OAUTH_TOKEN` 環境変数が存在しさえすれば
+> `loggedIn: true` を報告します——そのトークンが依然として認証できるかは
+> 一切チェックしません。失効または組織で無効化されたトークンも、良好な
+> トークンと同じようにこのチェックを通過します。認証情報が実際に機能して
+> いるか確認するには、ダッシュボードのAccountsページでそのアカウントの
+> 認証情報ステータスバッジを確認するか（未確認／認証情報が破損／トークン
+> 無効／組織で無効化——ヘルシーなアカウントは何も表示しません）、
+> container内で実際にプローブを実行してください：
+>
+> ```bash
+> docker compose exec duduclaw claude -p "reply ok" --model haiku --max-turns 1 --output-format json
+> ```
+>
+> JSON出力の `is_error` / `api_error_status` フィールドを確認します。
+
 ### Dashboardには接続できるがagentが「まず `claude auth status` を実行してください」と返信する
 
 これはv1.8.x以前のバージョンの残存メッセージです。v1.8.22以降は
