@@ -38,6 +38,7 @@
 #   6. cargo check
 #   7. git commit + tag
 #   8. Print next steps + the registry-verify command
+#
 # Runtime note (2026-09-08 incident): a full bump run takes roughly 20-45
 # minutes end to end — `cargo check --workspace` right after the version
 # bump, then the enterprise pro-image build and the bare-metal binary asset
@@ -442,12 +443,26 @@ while IFS='|' read -r kind file; do
                 _crate_name="${BASH_REMATCH[1]}"
                 _crate_lock="crates/${_crate_name}/Cargo.lock"
                 if [[ -f "$_crate_lock" ]] && grep -qE "^name = \"${_crate_name}\"\$" "$_crate_lock"; then
-                    # Only rewrite the version line immediately following this
-                    # crate's own `name = "..."` line (its self-entry), never
-                    # a dependency pinned to the same old version number.
-                    awk -v name="$_crate_name" -v newv="$NEW_VERSION" '
+                    # Rewrite the version line immediately following the
+                    # `name = "..."` line of this crate's own self-entry AND of
+                    # every other platform crate that appears in this lock as a
+                    # path dependency -- never a third-party dependency pinned
+                    # to the same old version number. Why "every platform
+                    # crate", not just self (2026-09-08, DuDuClaw-OS fix14
+                    # bake): duduclaw-shell's Cargo.lock also carries
+                    # duduclaw-native-gui (a `path = "../duduclaw-native-gui"`
+                    # dependency, workspace-excluded, no lock of its own that
+                    # matters here). The self-only rewrite left that entry at
+                    # the old version; the OS layer vendored the lock as-is and
+                    # bitbake's `cargo build --frozen` -- which cannot re-sync a
+                    # lock -- treated native-gui's dependencies as unlocked,
+                    # tried to load the zed git source and died offline. All
+                    # platform crates share ONE version, so any of their entries
+                    # in any sibling lock must move together.
+                    _platform_crates_re="$(ls -d crates/*/ | sed -E 's|^crates/||; s|/$||' | paste -sd'|' -)"
+                    awk -v names_re="^name = \"(${_platform_crates_re})\"\$" -v newv="$NEW_VERSION" '
                         BEGIN { in_self = 0 }
-                        /^name = / { in_self = ($0 == "name = \"" name "\"") }
+                        /^name = / { in_self = ($0 ~ names_re) }
                         in_self && /^version = / {
                             print "version = \"" newv "\""
                             in_self = 0
@@ -455,7 +470,7 @@ while IFS='|' read -r kind file; do
                         }
                         { print }
                     ' "$_crate_lock" > "${_crate_lock}.tmp" && mv "${_crate_lock}.tmp" "$_crate_lock"
-                    echo "  Updated: $_crate_lock (self version entry only)"
+                    echo "  Updated: $_crate_lock (self entry + sibling platform-crate path deps)"
                 fi
             fi
             ;;

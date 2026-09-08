@@ -71,6 +71,7 @@
 - **h2 0.4.13 → 0.4.18 修補 RUSTSEC-2026-0258**（unbounded empty DATA frames，2026-08-17 公告）——透過 reqwest/hyper 間接依賴，`cargo update -p h2` 鎖檔升版。
 
 ### Fixed
+- **`release.sh` bump 漏掉 detached crate lock 裡的 sibling 路徑依賴**：`crates/duduclaw-shell/Cargo.lock` 同時記錄 `duduclaw-native-gui`（`path = "../duduclaw-native-gui"`），舊的 awk 只改 crate 自己的版本項，v1.63.0 bump 後該項仍是 1.62.0。DuDuClaw-OS 2026-09-08 fix14 烤製把這份 lock vendor 進去，bitbake 的 `cargo build --frozen` 無法自行同步 lock，把 native-gui 的依賴當成未鎖定、去載入 zed 的 git 來源而離線失敗。現在 awk 對 lock 裡每個平台 crate 的 `name = …` 項都改版本（第三方套件不動）；本次 lock 已用 `cargo metadata --offline` 同步。
 - **Launcher 底部提示「Super 鍵隨時喚起」承諾了一個不存在的手勢**（`crates/duduclaw-shell` `fake_data::LAUNCHER_FOOTER_RIGHT`）：整個堆疊沒有任何一層綁定單擊 Super——shell 綁的是 `cmd-k`（Linux 上 gpui 把 cmd 對到 Super）、comp 的全域手勢是 Super+K、選單列膠囊也標「⌘K」。2026-09-08 在 appliance VM 實測：單擊 Super 無反應，Super+K 與膠囊點擊皆可開啟。提示改為「⌘K 隨時喚起」並加單元測試鎖住。
 - **本地引擎第一次探測失敗就整個程序永久停用**（`claude_runner::get_inference_engine`）：appliance 上第一件交辦若發生在模型尚未下載／服務前，`INFERENCE_UNAVAILABLE` 旗標會讓之後 `inference.local.serve` 起好的模型完全不被使用，直到 gateway 重啟（2026-09-06 fix12 走查發現）。改為 60 秒重探視窗，且 `inference.local.serve`／`stop` 完成後立即清掉引擎快取重探。
 - **OOBE 完成頁在有線網路下顯示「網路 未連線」**（`crates/duduclaw-shell`）：只有 Wi-Fi 連線會設 `network_connected`，以有線上線通過網路步驟時旗標仍是 false。現在離開網路步驟時若有線在線即記錄已連線，完成頁顯示「有線網路已連線」（三語）。
