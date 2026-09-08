@@ -84,6 +84,25 @@ else
   echo "  SKIP: ${WIN_ZIP} not found"
 fi
 
+# Idempotency (2026-09-08 incident): a partial run had published all five
+# platform packages before the wrapper failed on a token-permission 403. A
+# plain re-run then dies on the FIRST platform package ("cannot publish over
+# previously published version") and never reaches the wrapper. Skip anything
+# the registry already has at exactly this version, so a re-run only publishes
+# what is still missing. Dry runs never skip (nothing was published).
+already_published() {  # <name> <version>
+  [ -z "${DRY_RUN}" ] || return 1
+  [ "$(npm view "$1@$2" version 2>/dev/null || true)" = "$2" ]
+}
+publish_pkg() {  # <name> <dir>
+  if already_published "$1" "$VERSION"; then
+    echo "  SKIP: $1@$VERSION already on the registry"
+    return 0
+  fi
+  echo "  Publishing $1..."
+  npm publish "$2" --access public ${DRY_RUN}
+}
+
 # Step 3: Publish platform packages first, then main package
 echo "--- Publishing platform packages ---"
 for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
@@ -92,20 +111,18 @@ for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
     echo "  SKIP: ${dir} (no binary)"
     continue
   fi
-  echo "  Publishing @duduclaw/${dir}..."
-  npm publish "$pkg_dir" --access public ${DRY_RUN}
+  publish_pkg "@duduclaw/${dir}" "$pkg_dir"
 done
 
 # Publish Windows package
 if [ -f "${NPM_DIR}/win32-x64/bin/duduclaw.exe" ]; then
-  echo "  Publishing @duduclaw/win32-x64..."
-  npm publish "${NPM_DIR}/win32-x64" --access public ${DRY_RUN}
+  publish_pkg "@duduclaw/win32-x64" "${NPM_DIR}/win32-x64"
 else
   echo "  SKIP: win32-x64 (no binary)"
 fi
 
 echo "--- Publishing main package ---"
-npm publish "${NPM_DIR}/duduclaw" --access public ${DRY_RUN}
+publish_pkg "duduclaw" "${NPM_DIR}/duduclaw"
 
 echo "=== Done ==="
 echo "Install: npm install -g duduclaw"
