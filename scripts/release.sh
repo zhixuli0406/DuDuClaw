@@ -38,6 +38,25 @@
 #   6. cargo check
 #   7. git commit + tag
 #   8. Print next steps + the registry-verify command
+# Runtime note (2026-09-08 incident): a full bump run takes roughly 20-45
+# minutes end to end — `cargo check --workspace` right after the version
+# bump, then the enterprise pro-image build and the bare-metal binary asset
+# steps further down, are the bulk of that time. Always run this DETACHED,
+# e.g.:
+#   nohup ./scripts/release.sh minor --title "..." > release.log 2>&1 &
+# Never invoke it from inside a tool/CI wrapper with a short (~10 min)
+# foreground timeout — on 2026-09-08 exactly that killed a run right after
+# the commit+tag but before the pro image / binary asset / allowlist steps
+# ran, and those had to be replayed by hand afterward.
+#
+# The enterprise pro-image step below calls
+# commercial/duduclaw-pro-gateway/build-image.sh, which supports CLOUD_BUILD=1
+# to build the amd64 image on Google Cloud Build instead of a local `docker
+# build --platform linux/amd64` (the latter runs under QEMU on Apple Silicon
+# and takes 6+ hours). No extra plumbing is needed to use it here — env vars
+# set on this script's own invocation (e.g. `CLOUD_BUILD=1
+# ./scripts/release.sh minor ...`) are inherited by every subprocess it
+# calls, build-image.sh included, by default.
 set -euo pipefail
 
 # --- Config ---
