@@ -216,6 +216,13 @@ export interface AccountInfo {
   subscription: string;
   expires_at: string | null;
   days_until_expiry: number | null;
+  /** Credential health as probed by the backend, independent of rotation
+   * health/cooldown (`is_healthy`). Absent on older gateways that predate
+   * the probe. */
+  credential_state?: 'ok' | 'unverified' | 'broken' | 'auth_dead:invalid_token' | 'auth_dead:org_disabled';
+  /** Short operator-facing zh-TW sentence explaining `credential_state`;
+   * `null`/absent when there is nothing more to say. */
+  credential_detail?: string | null;
 }
 
 export interface BudgetSummary {
@@ -4889,7 +4896,15 @@ export const api = {
       key: string;
       monthly_budget_cents: number;
       priority: number;
-    }) => client.call('accounts.add', params) as Promise<{ success: boolean; provider: string }>,
+    }) =>
+      client.call('accounts.add', params) as Promise<{
+        success: boolean;
+        provider: string;
+        /** `true` = credential probed OK before saving; `false` = saved but
+         * the probe could not run (e.g. network); `null`/absent = provider
+         * not probed. */
+        verified?: boolean | null;
+      }>,
     /** G.5 — general per-account edit (no secret). Send only changed fields. */
     update: (params: {
       account_id: string;

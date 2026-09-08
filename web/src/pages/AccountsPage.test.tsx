@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -95,5 +95,78 @@ describe('AccountsPage (MDS)', () => {
       await screen.findByText('The staff roster could not be loaded, so this cannot be shown.'),
     ).toBeInTheDocument();
     expect(screen.queryByText(/No staff member names this account yet/)).not.toBeInTheDocument();
+  });
+
+  // Backend contract addition: `accounts.list`/`accounts.budget_summary`
+  // items may carry `credential_state` — a signal independent of the
+  // existing `is_healthy` rotation/cooldown badge. `ok` must stay quiet
+  // (no extra badge); a broken credential must surface a clear error badge
+  // with the backend's detail sentence as its tooltip.
+  it('shows a credential-state badge only for the account whose credential is not ok', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'accounts.budget_summary') {
+        return Promise.resolve({
+          total_budget_cents: 5000,
+          total_spent_cents: 0,
+          accounts: [
+            {
+              id: 'main',
+              auth_method: 'oauth',
+              priority: 1,
+              is_healthy: true,
+              spent_this_month: 0,
+              monthly_budget_cents: 5000,
+              credential_state: 'ok',
+            },
+            {
+              id: 'broken-one',
+              auth_method: 'apikey',
+              priority: 2,
+              is_healthy: true,
+              spent_this_month: 0,
+              monthly_budget_cents: 1000,
+              credential_state: 'broken',
+              credential_detail: 'Credential probe failed: 401',
+            },
+          ],
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    renderWithProviders(<AccountsPage />);
+
+    const brokenBadge = await screen.findByText('Credential broken');
+    expect(brokenBadge).toBeInTheDocument();
+    expect(brokenBadge).toHaveAttribute('title', 'Credential probe failed: 401');
+
+    const mainHeading = await screen.findByText('main');
+    const mainCard = mainHeading.closest('.rounded-xl');
+    expect(mainCard).not.toBeNull();
+    expect(within(mainCard as HTMLElement).queryByText('Credential broken')).not.toBeInTheDocument();
+    expect(within(mainCard as HTMLElement).queryByText('Unverified')).not.toBeInTheDocument();
+  });
+
+  it('renders no credential-state badge when the field is absent (older gateway)', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'accounts.budget_summary') {
+        return Promise.resolve({
+          total_budget_cents: 5000,
+          total_spent_cents: 0,
+          accounts: [
+            { id: 'main', auth_method: 'oauth', priority: 1, is_healthy: true, spent_this_month: 0, monthly_budget_cents: 5000 },
+          ],
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    renderWithProviders(<AccountsPage />);
+
+    await screen.findByText('main');
+    expect(screen.queryByText('Credential broken')).not.toBeInTheDocument();
+    expect(screen.queryByText('Unverified')).not.toBeInTheDocument();
+    expect(screen.queryByText('Token invalid')).not.toBeInTheDocument();
+    expect(screen.queryByText('Org disabled')).not.toBeInTheDocument();
   });
 });

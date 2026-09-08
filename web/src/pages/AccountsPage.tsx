@@ -117,6 +117,40 @@ interface PoolUser {
   readonly display: string;
 }
 
+/** i18n id for each non-`ok` `credential_state` badge label. `ok` renders no
+ *  badge at all — green "all is well" stays the dominant, quiet state. */
+const CREDENTIAL_STATE_LABEL_IDS: Record<Exclude<NonNullable<AccountInfo['credential_state']>, 'ok'>, string> = {
+  unverified: 'accounts.credentialState.unverified',
+  broken: 'accounts.credentialState.broken',
+  'auth_dead:invalid_token': 'accounts.credentialState.authDeadInvalidToken',
+  'auth_dead:org_disabled': 'accounts.credentialState.authDeadOrgDisabled',
+};
+
+/**
+ * Compact status badge for `AccountInfo.credential_state` (independent of
+ * the existing `is_healthy` rotation/cooldown badge next to it). `ok` and
+ * missing state (older gateways) render nothing — no noise for the healthy
+ * majority. `credential_detail`, when present, becomes the badge's `title`
+ * tooltip.
+ */
+function CredentialStateBadge({
+  state,
+  detail,
+  intl,
+}: {
+  state: AccountInfo['credential_state'];
+  detail: string | null | undefined;
+  intl: ReturnType<typeof useIntl>;
+}) {
+  if (!state || state === 'ok') return null;
+  const labelId = CREDENTIAL_STATE_LABEL_IDS[state];
+  return (
+    <Badge variant={state === 'unverified' ? 'outline' : 'destructive'} title={detail ?? undefined}>
+      {intl.formatMessage({ id: labelId })}
+    </Badge>
+  );
+}
+
 /**
  * AccountsPage — multi-account rotation surface (MDS, the accounts tab of
  * `/manage/billing` + legacy `/accounts`). Budget KPIs, a usage bar, and a grid
@@ -461,7 +495,7 @@ function AddAccountDialog({
     setSubmitting(true);
     setError(null);
     try {
-      await api.accounts.add({
+      const result = await api.accounts.add({
         id: name.trim(),
         type: accountType,
         provider,
@@ -476,8 +510,19 @@ function AddAccountDialog({
       setApiKey('');
       setBudget('50');
       setPriority('1');
-    } catch {
-      setError(intl.formatMessage({ id: 'accounts.provider.addFailed' }));
+      // verified === false: saved, but the backend couldn't reach the
+      // provider to confirm the credential is actually good (network, most
+      // likely) — not an error, but worth a nudge to go check.
+      if (result.verified === false) {
+        toast.info(intl.formatMessage({ id: 'accounts.add.unverifiedNotice' }));
+      }
+    } catch (e) {
+      // The gateway now returns human-written zh-TW sentences for credential
+      // failures ("憑證無效（401）…" / "此組織已停用…" / short-lived token…) —
+      // formatError() passes short CJK server sentences through verbatim
+      // (sanitized) instead of the generic 加入失敗 clause that used to
+      // swallow them here (this catch previously discarded `e` entirely).
+      setError(formatError(e));
     } finally {
       setSubmitting(false);
     }
@@ -643,6 +688,7 @@ function AccountCard({
           >
             <Settings2 />
           </Button>
+          <CredentialStateBadge state={account.credential_state} detail={account.credential_detail} intl={intl} />
           {account.is_healthy ? (
             <Badge variant="secondary" className="bg-success/15 text-success">
               <CheckCircle />
