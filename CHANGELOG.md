@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.63.0] - 2026-09-08 — 多 runtime 開箱即用×裝置內建本地模型×帳號憑證硬化
+
 ### Added
 - **WP-A：provider-aware `[[accounts]]`（`docs/todo/TODO-ai-runtimes-2026-09.md` §3）**：
   `accounts.add` 新增 `provider` 參數（`duduclaw_core::provider_env::KNOWN_PROVIDER_IDS` 之一，

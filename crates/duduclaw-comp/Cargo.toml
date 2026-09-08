@@ -8,7 +8,7 @@ name = "duduclaw-comp"
 # flags exactly this kind of drift. Kept in sync going forward by that
 # script's generic crates/*/Cargo.toml bump loop (same mechanism as shell/
 # native-gui) — see its "cargo|pyproject" bump case.
-version = "1.62.0"
+version = "1.63.0"
 edition = "2021"
 publish = false
 description = "Shell-S0 spike: a self-built Wayland compositor (smithay), adapted from the smithay `smallvil` example."
@@ -128,7 +128,7 @@ ab_glyph = "0.2"
 # trio above — see BUILD.md's XWayland section for what the container build
 # actually required.
 [dependencies.smithay]
-version = "0.7.0"
+version = "1.63.0"
 default-features = false
 features = [
     "backend_winit",

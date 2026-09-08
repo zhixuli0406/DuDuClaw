@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "duduclaw-native-gui"
-version = "1.62.0"
+version = "1.63.0"
 dependencies = [
  "chrono",
  "flate2",
