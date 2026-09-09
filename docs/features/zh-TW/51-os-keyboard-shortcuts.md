@@ -12,7 +12,7 @@ DuDuClaw OS 開機後直接進入一套精簡的桌面環境——主畫面、�
 快捷鍵分組列出，省去在選單裡（其實也沒什麼選單）翻找或用猜的。
 
 本頁有兩個快捷鍵是這一輪新增的：**Tab** 鍵可以在首次設定過程中的輸入欄位間移動；
-**⌘K** 現在無論目前在用哪一個 app，都能叫出全域交辦欄。
+**⌘K** 現在無論目前在用哪一個 app，都能叫出全域交辦欄。在 DuDuClaw OS 的實體鍵盤上，⌘ 就是 Super（Windows／Logo）鍵；[52-desktop-edition.md](52-desktop-edition.md) 裡 compositor 層的 Super+Enter、Super+Esc 用的是同一顆鍵。
 
 ## 全域——在裝置上任何 app 之上都有效
 

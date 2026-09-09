@@ -182,7 +182,7 @@ args = ["-y", "@chatwoot/mcp-server-chatwoot"]
 env = { CHATWOOT_BASE_URL = "https://app.chatwoot.com", CHATWOOT_API_TOKEN = "secret://vault/chatwoot_token" }
 allowed_tools = ["chatwoot_list_conversations", "chatwoot_get_conversation", "chatwoot_create_message"]
 ```
-9つのチャネルの受信箱を1エージェントに集約し、下書き返信はApprovalBroker経由にします（送信前に人間のレビューを挟みたい場合は `chatwoot_create_message` に⚠を付ける）。用意するもの：Chatwoot APIアクセストークン。
+11のチャネルの受信箱を1エージェントに集約し、下書き返信はApprovalBroker経由にします（送信前に人間のレビューを挟みたい場合は `chatwoot_create_message` に⚠を付ける）。用意するもの：Chatwoot APIアクセストークン。
 
 ### WooCommerce（公式ネイティブMCP — 開発プレビュー）
 

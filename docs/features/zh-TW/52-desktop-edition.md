@@ -32,9 +32,9 @@ Windows 與 Android 應用程式；同時 DuDuClaw gateway 與它的 AI 員工�
 - **首次開機精靈**：第一次開機時設定語言、網路、管理員帳號和幾項偏好；
   live 安裝器 ISO 本身也是一套圖形化精靈。
 - **AI runtime 授權**：精靈其中一步列出映像內建 runtime 的每一家 AI 服務
-  （Claude Code、Codex、Gemini CLI、Grok、Qwen、Kimi、Copilot、Kiro、
-  Cursor、Mistral Vibe、OpenCode，以及純 API 金鑰的幾家），每一列標明目
-  前是未設定、已存金鑰還是已登入。可以貼上 API 金鑰（走跟管理面同一條加
+  （Claude Code、Codex、Gemini CLI、Grok、Qwen、Kimi、Copilot、Cursor、
+  Mistral Vibe、OpenCode，以及純 API 金鑰的幾家；Kiro 是支援的 runtime，
+  但刻意沒有內建進映像），每一列標明目前是未設定、已存金鑰還是已登入。可以貼上 API 金鑰（走跟管理面同一條加
   密的 `[[accounts]]` 路徑），CLI 有登入流程的也可以直接登入帳號：機器會
   代跑那支 CLI 自己的登入，把裝置代碼和登入網址顯示在畫面上，並提供按鈕
   用機器上的瀏覽器開啟。用消費者訂閱登入前會先顯示風險，你勾選同意才會
@@ -110,7 +110,7 @@ compositor 認得一個共駕 session 的三種駕駛模式：
 
 ## 目前狀態
 
-- v0.1.0 整碟映像內建這套桌面。共駕功能已經編譯進去，但**預設關閉**。
+- 截至現行版本 v0.2.0（自 v0.1.0 起即如此），整碟映像內建這套桌面。共駕功能已經編譯進去，但**預設關閉**。
 - 目前已驗證的項目（用真實輸入事件，不是模擬器）：凍結／交還／急停、目
   標高亮、稽核、socket token 輪替、帶子母畫面的影子工作區、agent 主動交
   棒、watch mode、以及邊框狀態，驗證環境是容器（Xvfb + 真實 Chromium）

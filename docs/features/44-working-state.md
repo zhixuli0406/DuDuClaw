@@ -6,7 +6,7 @@
 
 ## The problem: three stop-loss lines in one day
 
-A resident AI employee is more than "a conversation". Scheduled patrols, heartbeats, the goal loop, messages from nine channels — every wake-up is a brand-new invocation, and none of them share conversation history. That creates a real, incident-grade failure mode: **an operating rule the employee set for itself may be forgotten by the next wake-up, or replaced by a different version read out of a different note.**
+A resident AI employee is more than "a conversation". Scheduled patrols, heartbeats, the goal loop, messages from eleven channels — every wake-up is a brand-new invocation, and none of them share conversation history. That creates a real, incident-grade failure mode: **an operating rule the employee set for itself may be forgotten by the next wake-up, or replaced by a different version read out of a different note.**
 
 On day three of the autonomous investing experiment, the trading employee wrote down three mutually contradictory stop-loss lines within a single day:
 

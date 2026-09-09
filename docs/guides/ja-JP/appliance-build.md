@@ -24,11 +24,13 @@ changelogを持っています。
 - **署名済みリリースをダウンロードする。**
   [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases)
   では、マシンごとにディスク全体のimage
-  （`duduclaw-os-<machine>-v<ver>.wic.zst`）とliveインストーラーISO
-  （`duduclaw-os-installer-<machine>-v<ver>.iso`）が公開されており、それ
-  ぞれに`.sha256`とminisignの`.minisig`が付いています。書き込む前に必ず
-  検証してください。公開鍵と具体的なコマンドは、そのリポジトリのREADME
-  （「快速開始」／"Quick start"）と`SECURITY.md`にあります。
+  （`duduclaw-os-<machine>-v<ver>.wic.zst`）と、2種類のliveインストーラー
+  ISO——ベースイメージ（`duduclaw-os-installer-<machine>-v<ver>.iso`）と
+  デスクトップ版（`duduclaw-os-installer-desktop-<machine>-v<ver>.iso`）
+  ——が公開されており、それぞれに`.sha256`とminisignの`.minisig`が付いて
+  います。書き込む前に必ず検証してください。公開鍵と具体的なコマンドは
+  [ドキュメントサイトのOS READMEとSECURITY](https://os.duduclaw.dudustudio.monster/docs/os/readme/)
+  （「快速開始」／"Quick start"）にあります。
 - **ソースからビルドする。** DuDuClaw-OSをこのリポジトリの隣にcloneし、
   そのREADME（「從原始碼建置」／"Build from source"）と
   `meta-duduclaw/README.md`（"Usage"）に従います。Dockerビルダーコンテナ、
@@ -40,15 +42,25 @@ changelogを持っています。
 ## 2. ビルドしているものは何か
 
 出荷されるimageは、`meta-duduclaw/`のYocto layer（Yocto 6.0
-"wrynose"、kernel 6.18）から作られる`duduclaw-image-appliance`です。A/B
-デュアルスロット構成でアトミックな更新とロールバックに対応し、読み取り
-専用ルートはdm-verityで検証され、自己署名Secure Bootはスロットごとに
-二重署名されたUKIを使い、DuDuClaw gateway＋dashboardのpayloadを含みます。
-定義されているマシンは2つです。`duduclaw-qemux86-64`（QEMUの
-bring-upターゲットで、起動を検証済み）と`duduclaw-genericx86-64`（実機
-x86-64ハードウェアで、設定は監査済み。実機での起動検証は今も未解決の
-項目です）。image ごとの役割分担とパーティション／起動チェーンの詳細は
-OSリポジトリ側に記載されており、ここでは重複させません。
+"wrynose"、kernel 6.18）から作られる`duduclaw-image-appliance`——デスク
+トップ版です。A/Bデュアルスロット構成でアトミックな更新とロールバック
+に対応し、読み取り専用ルート、DuDuClaw自身のデスクトップ（compositor＋
+shell）とgateway＋dashboard、プリロード済みアプリ、アプリ互換レイヤーを
+備えます。Secure Boot署名、dm-verityによるルート検証、TPM2鍵封印は、こ
+のlayerの中ではビルド時のオーバーレイオプション
+（`kas/sb-signing.yml`、`kas/tpm-luks.yml`）として存在しますが、現行の
+v0.2.0（プラットフォームv1.63.0を同梱）時点でも**まだ有効化されていま
+せん**。公開されているimageは今もSecure Bootをオフにした状態で起動しま
+す——`release-os.sh`は現在`serial1.yml`というreleaseオーバーレイのみを
+連結します。インストーラーISOはベースイメージ`duduclaw-image-ab`（同じ
+構成とデスクトップシェルだが、アプリ層なし）を書き込みます。デスクトッ
+プ版専用のインストーラーISO（`duduclaw-os-installer-desktop-…`）は
+v0.1.0（2026-09-04）以降、これと並んで出荷されています。定義されている
+マシンは2つです。`duduclaw-qemux86-64`（QEMUのbring-upターゲットで、起
+動を検証済み）と`duduclaw-genericx86-64`（実機x86-64ハードウェアで、設
+定は監査済み。実機での起動検証は今も未解決の項目です）。imageごとの役
+割分担とパーティション／起動チェーンの詳細はOSリポジトリ側に記載されて
+おり、ここでは重複させません。
 
 ## 3. Debian/mkosiのライン
 

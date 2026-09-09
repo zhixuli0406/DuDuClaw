@@ -84,8 +84,8 @@ compositor 與 shell，附鎖定畫面、首次啟動精靈，還有一個能從
 
 | 映像 | 是什麼 | 出貨形式 |
 |---|---|---|
-| **桌面版**（`duduclaw-image-appliance`） | 完整機器：桌面加上離線預載的 Chromium／LibreOffice／Steam、app 相容層（Bottles、Windows VM、Waydroid）、唯讀 root、防火牆、首次開機 provision，以及登入硬化。 | 整碟 `.wic.zst`，以及自己的 live 安裝器 ISO（`installer-desktop`，2026-09-04 補進 v0.1.0）。 |
-| **基礎版**（`duduclaw-image-ab`） | 同樣的 A/B 架構、桌面殼層與 gateway，但沒有 app 相容層、唯讀 root 或防火牆。是一份 bring-up 產物，而非產品。 | v0.1.0 live 安裝器 ISO 打包的內容。 |
+| **桌面版**（`duduclaw-image-appliance`） | 完整機器：桌面加上離線預載的 Chromium／LibreOffice／Steam、app 相容層（Bottles、Windows VM、Waydroid）、唯讀 root、防火牆、首次開機 provision，以及登入硬化。 | 整碟 `.wic.zst`，以及自己的 live 安裝器 ISO（`installer-desktop`，自 v0.1.0（2026-09-04）起出貨）。 |
+| **基礎版**（`duduclaw-image-ab`） | 同樣的 A/B 架構、桌面殼層與 gateway，但沒有 app 相容層、唯讀 root 或防火牆。是一份 bring-up 產物，而非產品。 | 純安裝器 ISO（`installer`）打包的內容。 |
 
 沒接螢幕時桌面會怎麼表現，例如是否會退回成純儀表板的無頭模式，這件事還沒有
 在真實硬體上定案，仍是一個待解的 bring-up 項目。上面說明的「儀表板在區網上
@@ -119,28 +119,38 @@ compositor 與 shell，附鎖定畫面、首次啟動精靈，還有一個能從
 release 流水線搬到獨立的
 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo；下載已
 簽署的 release 或從原始碼建置的方法，見[建置指南](../../guides/zh-TW/appliance-build.md)。
+官網 [os.duduclaw.dudustudio.monster](https://os.duduclaw.dudustudio.monster)
+的 `/docs/` 底下同步了完整的 OS 文件——包含這頁、OS 的 README、CHANGELOG
+與 SECURITY 說明。
 
 ## 目前狀態
 
 這是平台裡還很年輕的一塊，老實講清楚它目前站在哪裡，比往好處說更重要。
-截至 DuDuClaw OS v0.1.0（2026-09-04，DuDuClaw-OS repo 的第一個 tagged
-release）：
+截至 DuDuClaw OS v0.2.0（2026-09-09，內嵌平台 v1.63.0；上一版 v0.1.0
+〔2026-09-04〕保留作為回滾目標）：
 
-- x86-64 映像已經存在，兩種機型、兩種形式（整碟映像與 live 安裝器
-  ISO）都有發布，而且都簽了章。QEMU 機型兩種形式都已經過開機驗證；真
-  實硬體機型（`duduclaw-genericx86-64`）目前只做過設定稽核。
+- x86-64 映像已經存在，兩種機型、每種機型三種形式（桌面版整碟映像、桌
+  面版 live 安裝器 ISO、基礎版 live 安裝器 ISO）都有發布，而且都附上
+  SHA-256 與 minisign 簽章（整碟映像另外附一份僅供溯源的 `.manifest.json`）。
+  QEMU 機型每種形式都已經過開機驗證；真實硬體機型
+  （`duduclaw-genericx86-64`）目前只做過設定稽核，還沒有在真實硬體上開
+  機過。
 - 完整的真實硬體驗證（燒錄媒介、開機、安裝、走一遍設定流程、在聊天通
   道來回一則訊息、套用一次 OS 更新、強制觸發一次回滾、跑一次恢復原廠
   設定，而且全部要在真正拿到認證的硬體上做）還沒有發生過。這是目前最
   重要的待辦事項。
-- 信任鏈已經接進建置層，但已發布的映像只開啟了其中一部分。v0.1.0 出貨的部
-  分：A/B 原子更新與回滾，以及桌面版裡的唯讀 root。v0.1.0 產物**沒有**啟用
-  的建置期選項：UKI 的 Secure Boot 簽署與 dm-verity root 驗證（兩者都來自
-  `sb-signing` 建置 overlay，已發布的映像開機時 Secure Boot 是關閉的），以
-  及 TPM2 + LUKS 金鑰封裝（`tpm-luks` overlay；它的自動註冊仍是一個待解的
-  缺陷，需要真實硬體上的 TPM 才能收尾）。
+- 信任鏈已經接進建置層，但已發布的映像只開啟了其中一部分。自 v0.1.0
+  出貨、延續到 v0.2.0 沒變的部分：A/B 原子更新與回滾、桌面版裡的唯讀
+  root，以及每個 release 產物上的 minisign 簽章。截至 v0.2.0**仍然沒有**
+  啟用的建置期選項：UKI 的 Secure Boot 簽署與 dm-verity root 驗證（兩者
+  都來自 `sb-signing` 建置 overlay），以及 TPM2 + LUKS 金鑰封裝
+  （`tpm-luks` overlay；它的自動註冊仍是一個待解的缺陷，需要真實硬體上
+  的 TPM 才能收尾）。v0.2.0 的建置沒有串連這兩個 overlay 中的任何一個
+  ——`release-os.sh` 目前只串連 `serial1.yml` 這個 release overlay——所
+  以已發布的映像開機時 Secure Boot 仍是關閉的。
 - OS 的版本號跟平台本身是分開算的（`0.x` 代表 bring-up 階段；`1.0.0`
-  才會是第一個 GA）。逐版狀態記在 DuDuClaw-OS repo 的 `CHANGELOG.md`
+  才會是第一個 GA）。逐版狀態記在
+  [DuDuClaw-OS 的 CHANGELOG](https://os.duduclaw.dudustudio.monster/docs/os/changelog/)
   裡。
 
 這些都不妨礙你今天就燒一份 release 來試用；但要讓值班機變成一個可以放

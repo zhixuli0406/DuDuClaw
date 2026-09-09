@@ -36,8 +36,9 @@ them.
   preferences on first boot; the live installer ISO is a graphical wizard too.
 - **AI runtime authorization** — one step of that wizard lists every AI
   provider the image ships a runtime for (Claude Code, Codex, Gemini CLI,
-  Grok, Qwen, Kimi, Copilot, Kiro, Cursor, Mistral Vibe, OpenCode, plus the
-  plain API-key providers), each row showing whether it is unset, has a key
+  Grok, Qwen, Kimi, Copilot, Cursor, Mistral Vibe, OpenCode, plus the
+  plain API-key providers — Kiro is a supported runtime but is deliberately
+  not bundled in the image), each row showing whether it is unset, has a key
   stored, or is signed in. A row takes an API key — stored through the same
   encrypted `[[accounts]]` path the dashboard uses — or, for the CLIs that
   have one, an interactive sign-in: the machine drives that CLI's own login
@@ -120,8 +121,9 @@ The rules, all enforced in `duduclaw-comp` rather than in the agent:
 
 ## Current Status
 
-- The v0.1.0 whole-disk image ships this desktop. Co-driving is compiled in
-  and **off by default**.
+- As of v0.2.0 (the current release; shipped this way since v0.1.0), the
+  whole-disk image ships this desktop. Co-driving is compiled in and
+  **off by default**.
 - Verified so far, with real input events rather than simulators: freeze /
   hand-back / emergency stop, target highlight, audit, socket-token rotation,
   the shadow workspace with picture-in-picture, agent-initiated handover,

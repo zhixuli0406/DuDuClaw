@@ -17,7 +17,7 @@ guess.
 
 Two shortcuts on this page are new this round: **Tab** moves between input
 fields during first-time setup, and **Cmd+K** now summons the global
-delegation bar no matter which app currently has focus.
+delegation bar no matter which app currently has focus. On DuDuClaw OS hardware, Cmd is the Super (Windows/Logo) key; the shell labels it ⌘, and the compositor-level shortcuts in [52-desktop-edition.md](52-desktop-edition.md) (Super+Enter, Super+Esc) use the same key.
 
 ## Global — active over any app on the device
 

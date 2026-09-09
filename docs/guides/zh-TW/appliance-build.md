@@ -19,10 +19,12 @@ OS 本身有自己的 repo、自己的 release 線、自己的 changelog。
 
 - **下載已簽章的 release。** [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases)
   上每個 release 都會依機型發布一份整碟 image
-  （`duduclaw-os-<machine>-v<ver>.wic.zst`）與一份 live 安裝器 ISO
-  （`duduclaw-os-installer-<machine>-v<ver>.iso`），各自附上 `.sha256` 與
-  minisign `.minisig`。燒錄前務必驗證；公鑰與確切指令在該 repo 的
-  README（「快速開始」／"Quick start"）與 `SECURITY.md` 裡。
+  （`duduclaw-os-<machine>-v<ver>.wic.zst`）與兩份 live 安裝器 ISO——基礎版
+  （`duduclaw-os-installer-<machine>-v<ver>.iso`）與桌面版
+  （`duduclaw-os-installer-desktop-<machine>-v<ver>.iso`），各自附上
+  `.sha256` 與 minisign `.minisig`。燒錄前務必驗證；公鑰與確切指令見
+  [文件站上的 OS README 與 SECURITY 說明](https://os.duduclaw.dudustudio.monster/docs/os/readme/)
+  （「快速開始」／"Quick start"）。
 - **從原始碼建置。** 把 DuDuClaw-OS clone 到這個 repo 旁邊，照它的 README
   （「從原始碼建置」／"Build from source"）與 `meta-duduclaw/README.md`
   （"Usage"）走：一個 Docker builder 容器、`kas build`，以及
@@ -33,13 +35,20 @@ OS 本身有自己的 repo、自己的 release 線、自己的 changelog。
 ## 2. 你在建置什麼
 
 出貨的 image 是 `meta-duduclaw/` 這個 Yocto layer（Yocto 6.0
-"wrynose"，kernel 6.18）產出的 `duduclaw-image-appliance`：A/B 雙槽配置、
-支援原子更新與回滾、唯讀 root 由 dm-verity 驗證、自簽 Secure Boot 搭配每個
-槽位各自雙簽的 UKI，加上 DuDuClaw gateway ＋ dashboard payload。目前定義了
-兩個機型：`duduclaw-qemux86-64`（QEMU bring-up 目標，已驗證可開機）與
-`duduclaw-genericx86-64`（真實 x86-64 硬體，已做設定審查；真實硬體開機仍是
-待驗證項目）。每個 image 的角色分工與分割區／開機鏈細節記載在 OS repo
-裡，這裡不重複。
+"wrynose"，kernel 6.18）產出的 `duduclaw-image-appliance`——桌面版：A/B
+雙槽配置、支援原子更新與回滾、唯讀 root、DuDuClaw 自己的桌面（compositor
+＋ shell）搭配 gateway ＋ dashboard、預載應用程式，以及 app 相容層。
+Secure Boot 簽章、dm-verity root 驗證與 TPM2 金鑰封裝在這個 layer 裡都是
+建置期的 overlay 選項（`kas/sb-signing.yml`、`kas/tpm-luks.yml`），但截至
+現行 v0.2.0（內嵌平台 v1.63.0）**仍然沒有**啟用，開機時 Secure Boot 依舊
+是關閉的——`release-os.sh` 目前只串連 `serial1.yml` 這個 release
+overlay。安裝器 ISO 寫入的是基礎版 `duduclaw-image-ab`（同樣的架構與桌面
+殼層，但沒有 app 層）；桌面版專屬的安裝器 ISO
+（`duduclaw-os-installer-desktop-…`）自 v0.1.0（2026-09-04）起就與它一起
+出貨。目前定義了兩個機型：`duduclaw-qemux86-64`（QEMU bring-up 目標，已
+驗證可開機）與 `duduclaw-genericx86-64`（真實 x86-64 硬體，已做設定審查；
+真實硬體開機仍是待驗證項目）。每個 image 的角色分工與分割區／開機鏈細節
+記載在 OS repo 裡，這裡不重複。
 
 ## 3. Debian/mkosi 那條線
 

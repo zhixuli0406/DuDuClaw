@@ -226,7 +226,7 @@ args = ["-y", "@chatwoot/mcp-server-chatwoot"]
 env = { CHATWOOT_BASE_URL = "https://app.chatwoot.com", CHATWOOT_API_TOKEN = "secret://vault/chatwoot_token" }
 allowed_tools = ["chatwoot_list_conversations", "chatwoot_get_conversation", "chatwoot_create_message"]
 ```
-Nine-channel inbox → one agent; draft replies through the ApprovalBroker
+Eleven-channel inbox → one agent; draft replies through the ApprovalBroker
 (`chatwoot_create_message` ⚠ if you want human review before send). Provision: a
 Chatwoot API access token.
 

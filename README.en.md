@@ -6,7 +6,7 @@
 
 </div>
 
-DuDuClaw turns Claude Code, Codex, and Gemini into AI employees who actually deliver: they staff nine messaging apps like Telegram, LINE, and Discord, an independent judge reviews their work before it ships, and every dollar they spend gets logged.
+DuDuClaw turns Claude Code, Codex, and Gemini into AI employees who actually deliver: they staff eleven messaging apps like Telegram, LINE, and Discord, an independent judge reviews their work before it ships, and every dollar they spend gets logged.
 
 All you need is one Rust binary. Channel routing, conversation memory, multi-account rotation, behavioral guardrails, local inference, and a web dashboard are built in; swap the AI brain for Claude, Codex, Gemini, Antigravity, or any OpenAI-compatible API whenever you like, and your config and memory stay on your own machine. The core is Apache 2.0.
 
@@ -40,7 +40,7 @@ If you run `claude` or `gemini` in a terminal now and then, the native CLIs are 
 
 | Need | Native CLI | DuDuClaw |
 |---|---|---|
-| Telegram / LINE / Discord access | Terminal only | 9 channels, per-agent bot tokens |
+| Telegram / LINE / Discord access | Terminal only | 11 channels, per-agent bot tokens |
 | Multi-LLM failover | Manual restart | 4 rotation strategies + cross-provider failover |
 | Context survives switching LLMs | Lost | Preserved |
 | Conversation memory and knowledge base | Single session | SQLite temporal memory + layered wiki, auto-injected |
@@ -59,7 +59,7 @@ AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compa
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
-  │                    / Google Chat / Microsoft Teams / WebChat
+  │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 5 backends, auto-detected, configured per agent
   ├─ Session Memory — native --resume + temporal memory + key facts + layered wiki
   ├─ MCP Server — 200+ tools (channels, memory, agents, skills, tasks, wiki, ERP)
@@ -114,9 +114,9 @@ This installs a prebuilt binary for your platform (macOS ARM64/x64, Linux x64/AR
 
 ### DuDuClaw OS (appliance image, pre-GA)
 
-If you would rather not dedicate a computer, get a box that runs the moment you plug it in: [DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) is a Yocto-built Linux operating system in which the AI agent is a native resident: it boots into its own desktop (compositor / shell, lock screen, Cmd+K delegation bar), so a person and the AI share one x86-64 box without getting in each other's way — the agent's GUI work runs in a shadow workspace by default, and the moment you touch the keyboard or mouse, whatever it was driving on your desktop yields. The desktop edition ships with A/B atomic updates and rollback, a read-only root, and preloaded Chromium / LibreOffice / Steam plus a Chinese IME; Secure Boot signing, dm-verity and TPM2 are build-time overlay options that the v0.1.0 images do not enable.
+If you would rather not dedicate a computer, get a box that runs the moment you plug it in: [DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) is a Yocto-built Linux operating system in which the AI agent is a native resident: it boots into its own desktop (compositor / shell, lock screen, Cmd+K delegation bar), so a person and the AI share one x86-64 box without getting in each other's way — the agent's GUI work runs in a shadow workspace by default, and the moment you touch the keyboard or mouse, whatever it was driving on your desktop yields. The desktop edition ships with A/B atomic updates and rollback, a read-only root, and preloaded Chromium / LibreOffice / Steam plus a Chinese IME; Secure Boot signing, dm-verity and TPM2 are build-time overlay options that remain disabled as of the current v0.2.0 release, so boot with Secure Boot turned off in the BIOS/UEFI.
 
-Download the whole-disk `.wic.zst` (desktop edition) or the installer `.iso` (in v0.1.0 it writes the base image: the same desktop shell and gateway without the app layer; a desktop-edition `installer-desktop` `.iso` was added to v0.1.0 on 2026-09-04) from [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases); every file comes with a `.sha256` and a minisign signature, and the verification commands are in that repo's README. This is a bring-up line (0.x): QEMU-verified, **not yet booted on real hardware**. Hardware requirements and compatible machines: [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md); product overview: [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md).
+The current release is v0.2.0 (embedding platform v1.63.0; the prior v0.1.0 is kept as a rollback target). Download the whole-disk `.wic.zst` (desktop edition), the `installer-desktop` installer `.iso` (writes the desktop edition), or the plain `installer` `.iso` (writes the base image, without the app layer) from [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases); every file comes with a `.sha256` and a minisign signature, and the verification commands are on [the OS README on the docs site](https://os.duduclaw.dudustudio.monster/docs/os/readme/). This is a bring-up line (0.x): QEMU-verified, **not yet booted on real hardware**. Hardware requirements and compatible machines: [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md); product overview: [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md).
 
 ### Build from source
 
@@ -168,7 +168,7 @@ duduclaw service install   # start on boot (launchd / systemd)
 
 | Area | What's built in | Read more |
 |------|-----------------|-----------|
-| Channels | 9 channels (Telegram / LINE / Discord + voice / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards | [docs/features](docs/features/README.md) |
+| Channels | 11 channels (Telegram / LINE / Discord + voice / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat), per-agent bots, hot start/stop, platform-native formatting, typing indicators, live task-progress boards | [docs/features](docs/features/README.md) |
 | Multi-runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat, auto-detected, per-agent config, context survives backend switches | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Unified LLM API layer | `duduclaw-llm` covers 4 native protocols (Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat) with one normalized request, plus 8 OpenAI-compat presets (DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen), a pricing registry, and cross-provider fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | MCP server | 200+ tools: channels, memory, agent orchestration, skill market, task board, shared wiki, Odoo ERP, computer use, live forking; stdio and HTTP/SSE transports, with only 7 whitelisted tools exposed externally | [docs/api](docs/api/README.md) |
@@ -182,7 +182,7 @@ duduclaw service install   # start on boot (launchd / systemd)
 | Auto-update | One click from the dashboard or unattended (`auto_update = true`); SHA-256 + Ed25519 verification, in-place restart, open tabs reload themselves | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web dashboard | React 19 + TypeScript SPA, 32 pages, embedded in the binary; zh-TW / en / ja | [docs/features](docs/features/README.md) |
 | ERP | Odoo bridge with 17 MCP tools (CRM / sales / inventory / accounting), CE/EE auto-detection, per-agent credential isolation | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
-| DuDuClaw OS | Yocto appliance image: own compositor / shell with keyboard shortcuts, human–AI co-driving (dedicated agent seat, shadow workspace, human input freezes the agent, Super+Esc emergency stop; off by default), A/B atomic update with rollback, read-only root, first-boot provisioning + LAN dashboard, app compatibility layer (Flatpak / Bottles / Waydroid); Secure Boot signing / dm-verity / TPM2 are build overlay options (not enabled in v0.1.0); separate repo and version line, pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
+| DuDuClaw OS | Yocto appliance image (current release v0.2.0, embedding platform v1.63.0): own compositor / shell with keyboard shortcuts, human–AI co-driving (dedicated agent seat, shadow workspace, human input freezes the agent, Super+Esc emergency stop; compiled in, off by default), A/B atomic update with rollback, read-only root, first-boot provisioning + LAN dashboard, app compatibility layer (Flatpak / Bottles / Waydroid); Secure Boot signing / dm-verity / TPM2 are build overlay options (still not enabled as of v0.2.0); separate repo and version line, pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
 Full feature list in [docs/features/feature-inventory.md](docs/features/feature-inventory.md); version history in [CHANGELOG.md](CHANGELOG.md).
 
@@ -245,7 +245,7 @@ Don't trust prebuilt binaries? [Building from source](#install) takes three comm
 | | DuDuClaw | OpenClaw | IronClaw | Dify |
 |---|---|---|---|---|
 | Language | Rust | TypeScript | Rust | Python |
-| Channels | 9 | 25+ | 8 | 0 (API) |
+| Channels | 11 | 25+ | 8 | 0 (API) |
 | Multi-runtime | 5 backends | single | single | multi-LLM |
 | MCP server | 200+ tools | no | no | no |
 | Self-evolution engine | GVU² dual loop | no | no | no |

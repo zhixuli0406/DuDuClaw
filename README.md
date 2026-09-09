@@ -6,7 +6,7 @@
 
 </div>
 
-DuDuClaw 把 Claude Code、Codex、Gemini 這類 AI 指令列工具，變成公司裡交得出東西的 AI 員工：常駐 Telegram、LINE、Discord 等九個通訊軟體，交件前有獨立判官驗收，花掉的每一塊錢都記在帳上。
+DuDuClaw 把 Claude Code、Codex、Gemini 這類 AI 指令列工具，變成公司裡交得出東西的 AI 員工：常駐 Telegram、LINE、Discord 等 11 個通訊軟體，交件前有獨立判官驗收，花掉的每一塊錢都記在帳上。
 
 你只需要一個 Rust binary。通道路由、對話記憶、多帳號輪替、行為安全邊界、本地推論、Web 管理後台全部內建;AI 大腦要用 Claude、Codex、Gemini、Antigravity 還是任何 OpenAI 相容 API 隨你換,設定和記憶都留在你自己的機器上。核心採 Apache 2.0 授權。
 
@@ -40,7 +40,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 | 需求 | 原生 CLI | DuDuClaw |
 |---|---|---|
-| 接上 Telegram / LINE / Discord | 只能在終端機用 | 9 個通道,per-agent bot token |
+| 接上 Telegram / LINE / Discord | 只能在終端機用 | 11 個通道,per-agent bot token |
 | 多 LLM 容錯切換 | 手動重啟 | 4 種輪替策略 + 跨供應商 failover |
 | 換 LLM 時保留上下文 | 遺失 | 完整保留 |
 | 對話記憶與知識庫 | 單次 session | SQLite 時態記憶 + 分層 wiki + 自動注入 |
@@ -59,7 +59,7 @@ AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compa
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
-  │                    / Google Chat / Microsoft Teams / WebChat
+  │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 5 種後端自動偵測,per-agent 設定
   ├─ Session Memory — 原生 --resume + 時態記憶 + key-fact 累積 + 分層 wiki
   ├─ MCP Server — 200+ 工具(通訊、記憶、Agent、Skill、任務、知識庫、ERP)
@@ -114,9 +114,9 @@ npm install -g duduclaw
 
 ### DuDuClaw OS(值班機映像,pre-GA)
 
-不想佔用一台電腦,想要一台插電就跑的 AI 員工值班機:[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的 Linux 作業系統,AI agent 是原生住民:開機就是自家桌面(compositor / 殼、鎖定畫面、Cmd+K 交辦列),人和 AI 共用同一台 x86-64 主機,而且不影響日常使用:agent 的 GUI 工作預設在影子工作區跑,你一動鍵盤滑鼠,正在你桌面上操作的 agent 立刻讓位。桌面版內建 A/B 原子更新與回滾、唯讀 root,並預載 Chromium / LibreOffice / Steam 與注音輸入法;Secure Boot 簽章、dm-verity、TPM2 為建置期 overlay 選項,v0.1.0 發布映像未啟用。
+不想佔用一台電腦,想要一台插電就跑的 AI 員工值班機:[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) 是以 Yocto 建出的 Linux 作業系統,AI agent 是原生住民:開機就是自家桌面(compositor / 殼、鎖定畫面、Cmd+K 交辦列),人和 AI 共用同一台 x86-64 主機,而且不影響日常使用:agent 的 GUI 工作預設在影子工作區跑,你一動鍵盤滑鼠,正在你桌面上操作的 agent 立刻讓位。桌面版內建 A/B 原子更新與回滾、唯讀 root,並預載 Chromium / LibreOffice / Steam 與注音輸入法;Secure Boot 簽章、dm-verity、TPM2 為建置期 overlay 選項,截至最新版 v0.2.0 仍未啟用,開機需先在 BIOS/UEFI 關閉 Secure Boot。
 
-到 [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) 下載整碟 `.wic.zst`(桌面版)或安裝器 `.iso`(v0.1.0 寫入的是基礎版:同樣的桌面殼與 gateway,沒有應用層;桌面版安裝器 `installer-desktop` `.iso` 已於 2026-09-04 補進 v0.1.0),每個檔案都附 `.sha256` 與 minisign 簽章,驗簽指令在該 repo 的 README。目前是 bring-up 版(0.x):QEMU 驗證通過,**尚未在真實硬體開機驗證**。硬體條件與相容機型見 [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md),產品說明見 [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md)。
+現行版本是 v0.2.0(內嵌平台 v1.63.0;上一版 v0.1.0 保留作為回滾目標)。到 [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) 下載整碟 `.wic.zst`(桌面版)、`installer-desktop` 安裝器 `.iso`(寫入桌面版)或 `installer` 安裝器 `.iso`(寫入基礎版,沒有應用層),每個檔案都附 `.sha256` 與 minisign 簽章,驗簽指令見[官方文件站的 OS README](https://os.duduclaw.dudustudio.monster/docs/os/readme/)。目前是 bring-up 版(0.x):QEMU 驗證通過,**尚未在真實硬體開機驗證**。硬體條件與相容機型見 [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md),產品說明見 [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md)。
 
 ### 從原始碼建構
 
@@ -168,7 +168,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 
 | 領域 | 內建能力 | 深入閱讀 |
 |------|----------|----------|
-| 通訊通道 | 9 通道(Telegram / LINE / Discord + 語音 / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板 | [docs/features](docs/features/README.md) |
+| 通訊通道 | 11 通道(Telegram / LINE / Discord + 語音 / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat),per-agent bot、熱啟停、平台原生排版、輸入中指示、長任務進度看板 | [docs/features](docs/features/README.md) |
 | Multi-Runtime | Claude / Codex / Gemini / Antigravity / OpenAI-compat 五後端,自動偵測、per-agent 設定、換後端保留上下文 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 統一 LLM API 層 | `duduclaw-llm` 用一套正規化請求覆蓋 4 種原生協定(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat),內建 8 個 OpenAI-compat preset(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 計價 registry + 跨供應商 fallback | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | MCP Server | 200+ 個工具:通訊、記憶、agent 編排、skill 市場、任務看板、共享 wiki、Odoo ERP、computer use、live forking;stdio 與 HTTP/SSE 雙 transport,對外只暴露 7 個白名單工具 | [docs/api](docs/api/README.md) |
@@ -182,7 +182,7 @@ duduclaw service install   # 開機自動啟動(launchd / systemd)
 | 自動更新 | Dashboard 一鍵更新或背景自動更新(`auto_update = true`),SHA-256 + Ed25519 雙重驗證後原地重啟,前台分頁自動重載 | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web Dashboard | React 19 + TypeScript SPA 32 頁,嵌入 binary 零額外部署;zh-TW / en / ja 三語 | [docs/features](docs/features/README.md) |
 | ERP 整合 | Odoo 中間層 17 個 MCP 工具(CRM / 銷售 / 庫存 / 會計),CE/EE 自動偵測、per-agent 認證隔離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
-| DuDuClaw OS | Yocto 值班機映像:自家 compositor / 殼與快捷鍵、人機共駕(agent 專屬 seat、影子工作區、人輸入即凍結、Super+Esc 急停,預設關閉)、A/B 原子更新與回滾、唯讀 root、首次開機自動 provision + 區網後台、app 相容層(Flatpak / Bottles / Waydroid);Secure Boot 簽章 / dm-verity / TPM2 為建置 overlay 選項(v0.1.0 未啟用);獨立 repo 與版號,pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
+| DuDuClaw OS | Yocto 值班機映像(現行 v0.2.0,內嵌平台 v1.63.0):自家 compositor / 殼與快捷鍵、人機共駕(agent 專屬 seat、影子工作區、人輸入即凍結、Super+Esc 急停,已編譯進映像但預設關閉)、A/B 原子更新與回滾、唯讀 root、首次開機自動 provision + 區網後台、app 相容層(Flatpak / Bottles / Waydroid);Secure Boot 簽章 / dm-verity / TPM2 為建置 overlay 選項,截至 v0.2.0 仍未啟用;獨立 repo 與版號,pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
 完整功能清單見 [docs/features/feature-inventory.md](docs/features/feature-inventory.md),版本演進見 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -245,7 +245,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | | DuDuClaw | OpenClaw | IronClaw | Dify |
 |---|---|---|---|---|
 | 語言 | Rust | TypeScript | Rust | Python |
-| 通道 | 9 | 25+ | 8 | 0(API)|
+| 通道 | 11 | 25+ | 8 | 0(API)|
 | Multi-Runtime | 5 後端 | 單一 | 單一 | 多 LLM |
 | MCP Server | 200+ 工具 | 無 | 無 | 無 |
 | 自我進化引擎 | GVU² 雙迴圈 | 無 | 無 | 無 |

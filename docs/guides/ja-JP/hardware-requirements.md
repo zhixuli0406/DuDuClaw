@@ -208,9 +208,9 @@ DuDuClaw OSはx86-64です。Apple Silicon Mac上でUTM/QEMUを使ってx86-64�
 
 ## 起動メディアの正しい書き込み方
 
-リリースごと、machineごとに2種類の成果物があり、書き込み方が異なります（成果物の一覧、検証用の公開鍵とコマンドは[DuDuClaw-OSリポジトリ](https://github.com/zhixuli0406/DuDuClaw-OS)のREADME「Quick start」を参照してください。書き込む前に必ず`.minisig`と`.sha256`を検証してください）：
+リリースごと、machineごとに3つの成果物(ディスク全体image1つと、live インストーラー ISO 2種類——ベースイメージを書き込む`installer`とデスクトップ版を書き込む`installer-desktop`)があり、書き込み方は2通りです(成果物の一覧、検証用の公開鍵とコマンドは[ドキュメントサイトのOS README「Quick start」](https://os.duduclaw.dudustudio.monster/docs/os/readme/)を参照してください。書き込む前に必ず`.minisig`と`.sha256`を検証してください)：
 
-- **インストーラー `.iso`（推奨）**：balenaEtcherまたは`dd`でUSBに書き込むか、ディスクに焼きます。UEFIで起動するとグラフィカルなインストールウィザードに入り、対象のSSDを選んでインストールしたあと再起動します。「ディスク／Boot from ISO」による起動に対応している唯一の成果物です。
+- **インストーラー `.iso`(推奨)**：どちらのISOもbalenaEtcherまたは`dd`でUSBに書き込むか、ディスクに焼きます。UEFIで起動するとグラフィカルなインストールウィザードに入り、対象のSSDを選んでインストールしたあと再起動します。「ディスク／Boot from ISO」による起動に対応している唯一の成果物形式です。
 - **ディスク全体イメージ `.wic.zst`**：`zstd -d`で展開してから、そのまま対象ディスクに書き込みます（またはUSBに書き込んでディスクとして起動することもできます）：
 
 ```bash

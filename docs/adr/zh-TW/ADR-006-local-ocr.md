@@ -47,7 +47,7 @@ macOS 跑，gateway 部署到 Linux 就沒了)。
 **無論 OCR 選哪家，block-first fallback 照樣先出。** WP12-T12.1 的封鎖 gate
 與 OCR 引擎無關，而且便宜又 fail-closed：`agent.toml [capabilities]
 allow_image_input`(預設 true 向後相容)，設 false 時各 channel 收到圖片就
-不下載、不進 context，回一則 zh-TW 說明。九個 channel 下載媒體的 choke-point
+不下載、不進 context，回一則 zh-TW 說明。十一個 channel 下載媒體的 choke-point
 各不相同，逐一接、逐項勾。這條先交付，把「機敏圖片外流」這個最尖銳的風險
 用最保守的方式堵住，不等 OCR 選型。
 

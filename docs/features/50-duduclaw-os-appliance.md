@@ -106,8 +106,8 @@ desktop:
 
 | Image | What it is | Ships as |
 |---|---|---|
-| **Desktop edition** (`duduclaw-image-appliance`) | The full machine: the desktop plus Chromium / LibreOffice / Steam preloaded offline, the app compatibility layer (Bottles, Windows VM, Waydroid), read-only root, the firewall, first-boot provisioning, and login hardening. | The whole-disk `.wic.zst`, and its own live installer ISO (`installer-desktop`, added to v0.1.0 on 2026-09-04). |
-| **Base image** (`duduclaw-image-ab`) | The same A/B layout, desktop shell and gateway, without the app layer, read-only root or firewall. A bring-up artifact rather than a product. | The payload of the v0.1.0 live installer ISO. |
+| **Desktop edition** (`duduclaw-image-appliance`) | The full machine: the desktop plus Chromium / LibreOffice / Steam preloaded offline, the app compatibility layer (Bottles, Windows VM, Waydroid), read-only root, the firewall, first-boot provisioning, and login hardening. | The whole-disk `.wic.zst`, and its own live installer ISO (`installer-desktop`, shipping since v0.1.0 on 2026-09-04). |
+| **Base image** (`duduclaw-image-ab`) | The same A/B layout, desktop shell and gateway, without the app layer, read-only root or firewall. A bring-up artifact rather than a product. | The payload of the plain live installer ISO (`installer`). |
 
 What the desktop does when no monitor is attached — whether it falls back
 to a headless dashboard-only box — has not been defined on real hardware
@@ -148,33 +148,43 @@ release artifact is published with a SHA-256 and a minisign signature.
 Since 2026-09 the layer and its release pipeline live in the standalone
 [DuDuClaw-OS](https://github.com/zhixuli0406/DuDuClaw-OS) repo; see
 [the build guide](../guides/appliance-build.md) for where to download a
-signed release or build one from source.
+signed release or build one from source. The project's own site,
+[os.duduclaw.dudustudio.monster](https://os.duduclaw.dudustudio.monster),
+mirrors the full OS documentation — including this page, the OS README,
+CHANGELOG, and SECURITY notes — under `/docs/`.
 
 ## Current Status
 
 This is a young part of the platform, and it's worth being direct about
-where it stands rather than rounding up. As of DuDuClaw OS v0.1.0
-(2026-09-04, the first tagged release from the DuDuClaw-OS repo):
+where it stands rather than rounding up. As of DuDuClaw OS v0.2.0
+(2026-09-09, embedding platform v1.63.0; v0.1.0 from 2026-09-04 stays
+available as a rollback target):
 
-- x86-64 images exist and are published for both machines, in both forms
-  (whole-disk image and live installer ISO), all signed. The QEMU machine
-  is boot-verified for both forms; the real-hardware machine
-  (`duduclaw-genericx86-64`) has been config-audited only.
+- x86-64 images exist and are published for both machines, in three forms
+  per machine (the desktop-edition whole-disk image, a live installer ISO
+  for the desktop edition, and a live installer ISO for the base image),
+  all signed with SHA-256 and minisign (the whole-disk image also ships a
+  `.manifest.json` for provenance only). The QEMU machine is boot-verified
+  for every form; the real-hardware machine (`duduclaw-genericx86-64`) has
+  been config-audited only — it has not booted on real hardware yet.
 - Full real-hardware validation — burn the media, boot it, install, walk
   through setup, exchange a message on a chat channel, apply an OS update,
   force a rollback, and run a factory reset, all on the actual certified
   hardware — hasn't happened yet. It is the most important open item.
 - The trust chain is wired in the build layer but only partly switched on
-  in the published images. Shipped in v0.1.0: A/B atomic update with
-  rollback, and a read-only root in the desktop edition. Build-time options
-  **not** enabled for the v0.1.0 artifacts: Secure Boot signing of the UKIs
-  and dm-verity root verification (both come from the `sb-signing` build
-  overlay — the published images boot with Secure Boot off), and TPM2 + LUKS
-  key sealing (the `tpm-luks` overlay; its automatic enrollment is still an
-  open defect that needs a real-hardware TPM to close).
+  in the published images. Shipped since v0.1.0 and unchanged in v0.2.0:
+  A/B atomic update with rollback, a read-only root in the desktop edition,
+  and a minisign signature on every release artifact. Still **not** enabled
+  as of v0.2.0: Secure Boot signing of the UKIs and dm-verity root
+  verification (both come from the `sb-signing` build overlay), and TPM2 +
+  LUKS key sealing (the `tpm-luks` overlay; its automatic enrollment is
+  still an open defect that needs a real-hardware TPM to close). The
+  v0.2.0 build chains neither overlay — `release-os.sh` today chains only
+  the `serial1.yml` release overlay — so the published images still boot
+  with Secure Boot off.
 - The OS is versioned independently of the platform (`0.x` = bring-up;
   `1.0.0` will mark the first GA). Release-by-release status lives in the
-  DuDuClaw-OS repo's `CHANGELOG.md`.
+  [DuDuClaw-OS CHANGELOG](https://os.duduclaw.dudustudio.monster/docs/os/changelog/).
 
 None of this blocks flashing and experimenting with a release today; it's
 what's left before the appliance is something you'd hand to someone who

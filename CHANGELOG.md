@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- **Documentation currency pass (README / docs, 三語)**：修正一批已過期的公開文件敘述，讓文件跟上 v1.63.0 平台與 DuDuClaw OS v0.2.0 的實際狀態。通道數「九個 / nine channels」全面更新為現行的十一個（新增 WeCom、DingTalk），僅 `docs/adr/ADR-003-excluded-channels.md`（三語）保留「九」並加註這是該 ADR 撰寫當時的計數。DuDuClaw OS 相關文件（`docs/features/50-duduclaw-os-appliance.md`／`52-desktop-edition.md`／`docs/guides/appliance-build.md`／`hardware-requirements.md`，三語）由 v0.1.0 更新為現行 v0.2.0（內嵌平台 v1.63.0），trust-chain「現況」章節改為「截至 v0.2.0 仍未啟用 Secure Boot／dm-verity／TPM2」；同時修正 `appliance-build.md` 中文／日文版一段誤稱 dm-verity 與 Secure Boot「已啟用」的錯誤敘述（與英文版說法不一致，且與事實相反）；`docs/features/52-desktop-edition.md`（三語）移除映像未內建的 Kiro CLI。文件連結改指向已上線的官方文件站 `https://os.duduclaw.dudustudio.monster/docs/...`（OS README／CHANGELOG／硬體需求等頁面），GitHub 連結只保留給 repo／Releases 本身。`docs/README.md` 索引版本號與 feature 篇數（50→54）更新為現況。
+
 ## [1.63.0] - 2026-09-08 — 多 runtime 開箱即用×裝置內建本地模型×帳號憑證硬化
 
 ### Added

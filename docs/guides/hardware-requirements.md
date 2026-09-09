@@ -208,9 +208,9 @@ DuDuClaw OS is x86-64. Emulating x86-64 on an Apple Silicon Mac with UTM/QEMU is
 
 ## The right way to flash boot media
 
-Each release ships two artifact forms per machine, and they're flashed differently (for the artifact list, verification public key, and commands, see the [DuDuClaw-OS repo](https://github.com/zhixuli0406/DuDuClaw-OS) README's Quick Start section; verify the `.minisig` and `.sha256` before flashing):
+Each release ships three artifacts per machine — a whole-disk image and two live installer ISO variants (`installer`, which installs the base image, and `installer-desktop`, which installs the desktop edition) — and they come in two flashable forms (for the artifact list, verification public key, and commands, see [the OS README's Quick Start section on the docs site](https://os.duduclaw.dudustudio.monster/docs/os/readme/); verify the `.minisig` and `.sha256` before flashing):
 
-- **Installer `.iso` (recommended)**: flash it to USB with balenaEtcher or `dd`, or burn it to a disc. Booting in UEFI mode drops you into the graphical installer wizard — pick the target SSD, install, and reboot. This is the only artifact that supports "boot from disc / Boot from ISO."
+- **Installer `.iso` (recommended)**: flash either ISO variant to USB with balenaEtcher or `dd`, or burn it to a disc. Booting in UEFI mode drops you into the graphical installer wizard — pick the target SSD, install, and reboot. This is the only artifact form that supports "boot from disc / Boot from ISO."
 - **Whole-disk `.wic.zst`**: decompress it with `zstd -d` and write it straight to the target disk (or to a USB drive to boot it as a disk):
 
 ```bash

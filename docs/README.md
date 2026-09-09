@@ -1,6 +1,6 @@
 # DuDuClaw Documentation
 
-> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.21.1).
+> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.63.0).
 
 ---
 
@@ -201,7 +201,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 ├── features/                          # Feature highlight articles (+ ja-JP, zh-TW)
 │   ├── README.md
 │   ├── feature-inventory.md
-│   └── 01-…-50-…                      #   50 feature deep-dives
+│   └── 01-…-54-…                      #   54 feature deep-dives
 ├── spec/                              # Open format specifications
 │   ├── soul-md-spec.md                #   SOUL.md format v1.0
 │   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0

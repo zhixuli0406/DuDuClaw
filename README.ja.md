@@ -6,7 +6,7 @@
 
 </div>
 
-DuDuClaw は、Claude Code・Codex・Gemini などの AI コマンドラインツールを、Telegram・LINE・Discord をはじめとする 9 つのメッセージングアプリに常駐し、納品前には独立した判定役の検証を通過し、使った費用を一円単位で記録する AI社員に変えます。
+DuDuClaw は、Claude Code・Codex・Gemini などの AI コマンドラインツールを、Telegram・LINE・Discord をはじめとする 11 のメッセージングアプリに常駐し、納品前には独立した判定役の検証を通過し、使った費用を一円単位で記録する AI社員に変えます。
 
 必要なのは Rust バイナリ 1 つだけ。チャネルルーティング、会話メモリ、マルチアカウントローテーション、行動ガードレール、ローカル推論、Web ダッシュボードをすべて内蔵。AI の頭脳は Claude・Codex・Gemini・Antigravity、あるいは任意の OpenAI 互換 API へいつでも切り替えられ、設定とメモリは自分のマシンに残ります。コアは Apache 2.0 ライセンスです。
 
@@ -40,7 +40,7 @@ https://github.com/user-attachments/assets/9f18408a-cf46-4db2-9ab0-dcc8db2486fc
 
 | ニーズ | 純正 CLI | DuDuClaw |
 |---|---|---|
-| Telegram / LINE / Discord 対応 | ターミナルのみ | 9 チャネル、エージェントごとの bot token |
+| Telegram / LINE / Discord 対応 | ターミナルのみ | 11 チャネル、エージェントごとの bot token |
 | マルチ LLM フェイルオーバー | 手動再起動 | 4 種のローテーション戦略 + クロスプロバイダ failover |
 | LLM 切替時のコンテキスト | 消失 | 完全保持 |
 | 会話メモリと知識ベース | 単発セッション | SQLite 時系列メモリ + 階層 wiki を自動注入 |
@@ -59,7 +59,7 @@ AI Runtime (brain) — Claude Code / Codex / Gemini / Antigravity / OpenAI-compa
   ↕ MCP Protocol (JSON-RPC 2.0, stdin/stdout)
 DuDuClaw (plumbing)
   ├─ Channel Router — Telegram / LINE / Discord / Slack / WhatsApp / Feishu
-  │                    / Google Chat / Microsoft Teams / WebChat
+  │                    / Google Chat / Microsoft Teams / WeCom / DingTalk / WebChat
   ├─ Multi-Runtime — 5 バックエンド自動検出、エージェントごとに設定
   ├─ Session Memory — ネイティブ --resume + 時系列メモリ + key facts + 階層 wiki
   ├─ MCP Server — 200+ ツール(チャネル、メモリ、エージェント、スキル、タスク、wiki、ERP)
@@ -114,9 +114,9 @@ npm install -g duduclaw
 
 ### DuDuClaw OS(アプライアンスイメージ、pre-GA)
 
-PC を一台専有したくないなら、電源を入れるだけで動く AI スタッフ専用機という選択肢があります。[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) は Yocto でビルドした Linux OS で、AI エージェントがネイティブに住み着いています。起動するとそのまま自前のデスクトップ(コンポジタ / シェル、ロック画面、Cmd+K の委任バー)に入り、人と AI が一台の x86-64 マシンを共用しつつ、日常利用の邪魔はしません。エージェントの GUI 作業は既定でシャドウワークスペースで実行され、あなたがキーボードやマウスに触れた瞬間、デスクトップ上で操作中のエージェントは手を止めます。デスクトップ版は A/B アトミックアップデートとロールバック、読み取り専用ルートを備え、Chromium / LibreOffice / Steam と中国語 IME をプリロード済みです。Secure Boot 署名、dm-verity、TPM2 はビルド時のオーバーレイオプションで、v0.1.0 のリリースイメージでは有効化されていません。
+PC を一台専有したくないなら、電源を入れるだけで動く AI スタッフ専用機という選択肢があります。[DuDuClaw OS](https://github.com/zhixuli0406/DuDuClaw-OS) は Yocto でビルドした Linux OS で、AI エージェントがネイティブに住み着いています。起動するとそのまま自前のデスクトップ(コンポジタ / シェル、ロック画面、Cmd+K の委任バー)に入り、人と AI が一台の x86-64 マシンを共用しつつ、日常利用の邪魔はしません。エージェントの GUI 作業は既定でシャドウワークスペースで実行され、あなたがキーボードやマウスに触れた瞬間、デスクトップ上で操作中のエージェントは手を止めます。デスクトップ版は A/B アトミックアップデートとロールバック、読み取り専用ルートを備え、Chromium / LibreOffice / Steam と中国語 IME をプリロード済みです。Secure Boot 署名、dm-verity、TPM2 はビルド時のオーバーレイオプションで、現行の v0.2.0 でもまだ有効化されていません。起動時は BIOS/UEFI で Secure Boot をオフにしてください。
 
-[DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) からディスク全体イメージ `.wic.zst`(デスクトップ版)またはインストーラー `.iso`(v0.1.0 ではベースイメージ、つまり同じデスクトップシェルと gateway でアプリ層なしを書き込みます。デスクトップ版インストーラー `installer-desktop` `.iso` は 2026-09-04 に v0.1.0 へ追加済み)をダウンロードしてください。各ファイルには `.sha256` と minisign 署名が付属し、検証コマンドは同リポジトリの README にあります。現在は bring-up 段階(0.x)で、QEMU での検証は済んでいますが、**実機での起動検証はまだ行っていません**。ハードウェア要件と対応機種は [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md)、製品概要は [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md) を参照してください。
+現行バージョンは v0.2.0(プラットフォーム v1.63.0 を同梱、旧バージョンの v0.1.0 はロールバック先として保持)です。[DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases) からディスク全体イメージ `.wic.zst`(デスクトップ版)、デスクトップ版を書き込む `installer-desktop` インストーラー `.iso`、またはベースイメージ(アプリ層なし)を書き込む `installer` インストーラー `.iso` をダウンロードしてください。各ファイルには `.sha256` と minisign 署名が付属し、検証コマンドは[ドキュメントサイトの OS README](https://os.duduclaw.dudustudio.monster/docs/os/readme/)にあります。現在は bring-up 段階(0.x)で、QEMU での検証は済んでいますが、**実機での起動検証はまだ行っていません**。ハードウェア要件と対応機種は [docs/guides/hardware-requirements.md](docs/guides/hardware-requirements.md)、製品概要は [docs/features/50-duduclaw-os-appliance.md](docs/features/50-duduclaw-os-appliance.md) を参照してください。
 
 ### ソースからビルド
 
@@ -168,7 +168,7 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 
 | 領域 | 内蔵機能 | 詳細 |
 |------|----------|------|
-| チャネル | 9 チャネル(Telegram / LINE / Discord + 音声 / Slack / WhatsApp / Feishu / Google Chat / Teams / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード | [docs/features](docs/features/README.md) |
+| チャネル | 11 チャネル(Telegram / LINE / Discord + 音声 / Slack / WhatsApp / Feishu / Google Chat / Teams / WeCom / DingTalk / WebChat)、エージェントごとの bot、ホット起動/停止、プラットフォーム最適レンダリング、入力中インジケータ、長時間タスクの進捗ボード | [docs/features](docs/features/README.md) |
 | マルチランタイム | Claude / Codex / Gemini / Antigravity / OpenAI-compat、自動検出、エージェントごとの設定、切替時もコンテキスト保持 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 統一 LLM API 層 | `duduclaw-llm` が 4 つのネイティブプロトコル(Anthropic Messages / OpenAI Responses / Gemini / OpenAI-compat)を単一の正規化リクエストでカバー。8 つの OpenAI-compat プリセット(DeepSeek / MiniMax / Groq / Together / Mistral / OpenRouter / xAI / Qwen)+ 価格レジストリ + クロスプロバイダ fallback を内蔵 | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | MCP サーバー | 200+ ツール:チャネル、メモリ、エージェント編成、スキルマーケット、タスクボード、共有 wiki、Odoo ERP、computer use、live forking。stdio と HTTP/SSE の両トランスポート、外部には 7 ツールのみ公開 | [docs/api](docs/api/README.md) |
@@ -182,7 +182,7 @@ duduclaw service install   # 起動時に自動開始(launchd / systemd)
 | 自動アップデート | ダッシュボードからワンクリック、または無人更新(`auto_update = true`)。SHA-256 + Ed25519 の二重検証後にその場で再起動、開いているタブは自動リロード | [deployment-guide.md](docs/guides/deployment-guide.md) |
 | Web ダッシュボード | React 19 + TypeScript SPA 32 ページ、バイナリに内蔵で追加デプロイ不要。zh-TW / en / ja 対応 | [docs/features](docs/features/README.md) |
 | ERP 連携 | Odoo ブリッジ 17 MCP ツール(CRM / 販売 / 在庫 / 会計)、CE/EE 自動検出、エージェントごとの認証分離 | [docs/rfc](docs/rfc/RFC-21-operator-guide.md) |
-| DuDuClaw OS | Yocto アプライアンスイメージ:自前コンポジタ / シェルとショートカット、人と AI の共同運転(エージェント専用シート、シャドウワークスペース、人の入力でエージェントを凍結、Super+Esc 緊急停止;既定オフ)、A/B アトミックアップデートとロールバック、読み取り専用ルート、初回起動時の自動プロビジョニング + LAN ダッシュボード、アプリ互換レイヤー(Flatpak / Bottles / Waydroid);Secure Boot 署名 / dm-verity / TPM2 はビルドオーバーレイオプション(v0.1.0 では未有効化);独立リポジトリ・独立バージョン、pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
+| DuDuClaw OS | Yocto アプライアンスイメージ(現行 v0.2.0、プラットフォーム v1.63.0 を同梱):自前コンポジタ / シェルとショートカット、人と AI の共同運転(エージェント専用シート、シャドウワークスペース、人の入力でエージェントを凍結、Super+Esc 緊急停止;ビルドには組み込み済みで既定オフ)、A/B アトミックアップデートとロールバック、読み取り専用ルート、初回起動時の自動プロビジョニング + LAN ダッシュボード、アプリ互換レイヤー(Flatpak / Bottles / Waydroid);Secure Boot 署名 / dm-verity / TPM2 はビルドオーバーレイオプション(v0.2.0 でもまだ未有効化);独立リポジトリ・独立バージョン、pre-GA | [docs/features/50](docs/features/50-duduclaw-os-appliance.md) · [52](docs/features/52-desktop-edition.md) |
 
 全機能リストは [docs/features/feature-inventory.md](docs/features/feature-inventory.md)、バージョン履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
@@ -245,7 +245,7 @@ minisign -Vm duduclaw-darwin-arm64.tar.gz \
 | | DuDuClaw | OpenClaw | IronClaw | Dify |
 |---|---|---|---|---|
 | 言語 | Rust | TypeScript | Rust | Python |
-| チャネル | 9 | 25+ | 8 | 0(API)|
+| チャネル | 11 | 25+ | 8 | 0(API)|
 | マルチランタイム | 5 バックエンド | 単一 | 単一 | マルチ LLM |
 | MCP サーバー | 200+ ツール | なし | なし | なし |
 | 自己進化エンジン | GVU² 二重ループ | なし | なし | なし |

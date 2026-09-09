@@ -183,7 +183,7 @@ args = ["-y", "@chatwoot/mcp-server-chatwoot"]
 env = { CHATWOOT_BASE_URL = "https://app.chatwoot.com", CHATWOOT_API_TOKEN = "secret://vault/chatwoot_token" }
 allowed_tools = ["chatwoot_list_conversations", "chatwoot_get_conversation", "chatwoot_create_message"]
 ```
-九個通道的收件匣統一交給一個 agent 處理；草稿回覆走 ApprovalBroker（如果想在寄出前經人工審閱，把 `chatwoot_create_message` 標 ⚠）。準備：一組 Chatwoot API access token。
+十一個通道的收件匣統一交給一個 agent 處理；草稿回覆走 ApprovalBroker（如果想在寄出前經人工審閱，把 `chatwoot_create_message` 標 ⚠）。準備：一組 Chatwoot API access token。
 
 ### WooCommerce（官方原生 MCP，開發預覽版）
 

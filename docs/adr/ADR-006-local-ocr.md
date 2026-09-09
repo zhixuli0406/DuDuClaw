@@ -60,7 +60,7 @@ The blocking gate in WP12-T12.1 is independent of the OCR engine, and it's cheap
 fail-closed: `agent.toml [capabilities] allow_image_input` (defaults to `true` for backward
 compatibility); when set to `false`, each channel simply doesn't download images or let them
 into context on receipt, and replies with a zh-TW explanation instead. The media-download
-choke point differs per channel across all nine channels, so each is wired up and checked
+choke point differs per channel across all eleven channels, so each is wired up and checked
 off individually. This ships first, closing off the sharpest risk — sensitive images
 leaking out — in the most conservative way possible, without waiting on the OCR selection.
 

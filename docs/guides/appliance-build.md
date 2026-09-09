@@ -23,10 +23,13 @@ Two routes:
 - **Download a signed release.** Each release on
   [DuDuClaw-OS Releases](https://github.com/zhixuli0406/DuDuClaw-OS/releases)
   publishes, per machine, a whole-disk image (`duduclaw-os-<machine>-v<ver>.wic.zst`)
-  and a live installer ISO (`duduclaw-os-installer-<machine>-v<ver>.iso`),
-  each with a `.sha256` and a minisign `.minisig`. Verify before flashing;
-  the public key and the exact commands are in that repo's README
-  ("快速開始" / "Quick start") and `SECURITY.md`.
+  and two live installer ISOs — the base image
+  (`duduclaw-os-installer-<machine>-v<ver>.iso`) and the desktop edition
+  (`duduclaw-os-installer-desktop-<machine>-v<ver>.iso`) — each with a
+  `.sha256` and a minisign `.minisig`. Verify before flashing; the public
+  key and the exact commands are on [the OS README and SECURITY notes on
+  the docs site](https://os.duduclaw.dudustudio.monster/docs/os/readme/)
+  ("快速開始" / "Quick start").
 - **Build from source.** Clone DuDuClaw-OS next to this repo and follow its
   README ("從原始碼建置" / "Build from source") and
   `meta-duduclaw/README.md` ("Usage"): a Docker builder container, `kas build`,
@@ -42,11 +45,13 @@ dual-slot layout with atomic update and rollback, a read-only root, DuDuClaw's
 own desktop (compositor + shell) with the gateway + dashboard, preloaded
 apps, and the app compatibility layer. Secure Boot signing, dm-verity root
 verification and TPM2 key sealing exist in the layer as build-time overlays
-(`kas/sb-signing.yml`, `kas/tpm-luks.yml`) but are **not** enabled in the
-v0.1.0 artifacts, which boot with Secure Boot off. The v0.1.0 installer ISO
-writes the base image `duduclaw-image-ab` (same layout and desktop shell,
-without the app layer); a desktop-edition installer ISO (`duduclaw-os-installer-desktop-…`) was
-added to v0.1.0 on 2026-09-04. Two machines are defined:
+(`kas/sb-signing.yml`, `kas/tpm-luks.yml`) but are **still not** enabled as of
+the current v0.2.0 release (embedding platform v1.63.0), which continues to
+boot with Secure Boot off — `release-os.sh` today chains only the
+`serial1.yml` release overlay. The installer ISO writes the base image
+`duduclaw-image-ab` (same layout and desktop shell, without the app layer);
+the desktop-edition installer ISO (`duduclaw-os-installer-desktop-…`) has
+shipped alongside it since v0.1.0 (2026-09-04). Two machines are defined:
 `duduclaw-qemux86-64` (QEMU bring-up target, boot-verified) and
 `duduclaw-genericx86-64` (real x86-64 hardware, config-audited; a real
 hardware boot is still the open validation item). The per-image roles and

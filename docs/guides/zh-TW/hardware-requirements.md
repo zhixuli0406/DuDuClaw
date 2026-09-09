@@ -208,9 +208,9 @@ DuDuClaw OS 是 x86-64。在 Apple Silicon Mac 上用 UTM/QEMU 模擬 x86-64 是
 
 ## 燒錄開機媒體的正確做法
 
-每個 release 每種 machine 有兩式產物，燒法不同（產物清單、驗簽公鑰與指令見 [DuDuClaw-OS repo](https://github.com/zhixuli0406/DuDuClaw-OS) 的 README「快速開始」；燒之前先驗 `.minisig` 與 `.sha256`）：
+每個 release、每種 machine 都有三份產物——一份整碟映像，加上兩種 live 安裝器 ISO（`installer` 寫入基礎版，`installer-desktop` 寫入桌面版）——燒法分兩種（產物清單、驗簽公鑰與指令見[文件站上的 OS README「快速開始」](https://os.duduclaw.dudustudio.monster/docs/os/readme/)；燒之前先驗 `.minisig` 與 `.sha256`）：
 
-- **安裝器 `.iso`（建議）**：用 balenaEtcher 或 `dd` 燒到 USB，或燒成光碟；UEFI 開機進圖形安裝精靈，選目標 SSD 安裝後重開。這是唯一支援「光碟／Boot from ISO」開機的產物。
+- **安裝器 `.iso`（建議）**：兩種 ISO 都用 balenaEtcher 或 `dd` 燒到 USB，或燒成光碟；UEFI 開機進圖形安裝精靈，選目標 SSD 安裝後重開。這是唯一支援「光碟／Boot from ISO」開機的產物形式。
 - **整碟 `.wic.zst`**：`zstd -d` 解壓後直接寫進目標磁碟（或寫到 USB 當硬碟開機）：
 
 ```bash
