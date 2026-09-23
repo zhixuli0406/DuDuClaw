@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.64.0] - 2026-09-23 — 去識別化資料表欄位規則×資料來源與資料庫連接器×MCP proxy
+
 ### Added
 - **去識別化新增「資料表欄位」規則**：新增 `type = "db_field"`（`fields = ["res.partner.name", "hr.employee.*"]`，Odoo `model.field` 語法糖，`*` 排除 `id`）與通用 `type = "json_path"`（`paths`／`match_tool` 尾碼 glob／`match_args`／`exclude_keys`，自製路徑子集無新依賴）兩種去識別化規則；命中欄位整值 token 化，不靠 pattern 比對。先前 `engine.rs` 遇到 `JsonPath` 一律 `tracing::warn!` 後跳過，現在 `JsonPath` 真的編譯進結構化引擎：結構化 pass 對工具回傳的 `Value` 與 `content[].text` 內嵌的 JSON 字串皆生效，跑完再接既有文字 pass。新不變量：文字 pass 先掃出既有 token 的 span 再比對，token 不會被二次去識別化（`\d{8}` 類規則不再誤中 token hash 裡連續的 8 位數字）。`AuditEvent::Redact` 新增可選欄位 `path`（JSON pointer）；MCP 節流點（`mcp_redaction.rs`）把工具呼叫引數一併傳進管線；`duduclaw redaction verify` 新增 JSON 模式（`--tool <name>`／`--arg key=value`），附樣本 `docs/examples/redaction-sample-odoo.json`。dashboard 欄位規則編輯器留作後續。
 - **去識別化補上 `IdentityRule`（讀組織名冊自動遮人名）**：RFC-23 v1.14.0 曾標記完成、實際從未落地的欠帳補齊。新增 `type = "identity"`（`source = "wiki"`，可省略或留空字串、效果相同，其他值在載入時直接報錯）；讀 `<home>/shared/wiki/identity/people/*.md` frontmatter 的 `display_name`（透過 `duduclaw-identity` 新增的同步介面 `WikiCacheIdentityProvider::list_people_sync`，不重複 YAML 解析；email 已由既有 regex profile 涵蓋、人員檔案本身也沒有 alias 欄位，故都不重複遮）。比對語意與 `KeywordRule` 相同（ASCII whole-word／CJK 子字串、不分大小寫，兩者共用抽出的 `match_needles`）；名單是快照，目錄 mtime 變動或距上次掃描逾 60 秒即重掃，新人到職／改名免重啟。`source` 填未知值、或人名目錄不存在，是設定錯誤，規則編譯失敗並拖垮整份 `RedactionManager::open`（fail-closed）；目錄存在但零筆人名是正常狀態（identity 同步尚未跑過），只 warn 不報錯。新增 `EngineOptions.identity_people_dir` / `ManagerPaths.identity_people_dir` 把名冊路徑帶進引擎。
