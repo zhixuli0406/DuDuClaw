@@ -1074,6 +1074,7 @@ mod tests {
         assert!(matches!(err, GenericCliError::Spawn { .. }), "{err:?}");
     }
 
+    #[cfg(unix)] // `fake_bin` writes a shell script; the Windows probe looks for `.exe`/`.cmd`
     #[test]
     fn detect_finds_a_binary_on_a_temp_path() {
         // Detection through the catalog: a fake `copilot` in a HOME-rooted

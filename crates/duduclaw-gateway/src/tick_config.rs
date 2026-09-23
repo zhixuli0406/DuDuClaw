@@ -1186,7 +1186,7 @@ mod tests {
             [[tick.sources]]
             id = "feed"
             kind = "file_tail"
-            path = "{}"
+            path = '{}'
             "#,
             file.display()
         ));
@@ -1203,7 +1203,7 @@ mod tests {
             [[tick.sources]]
             id = "feed"
             kind = "file_tail"
-            path = "{}"
+            path = '{}'
             "#,
             dir.path().join("nope.jsonl").display()
         ));
@@ -1857,7 +1857,7 @@ mod tests {
             [[tick.sources]]
             id = "feed"
             kind = "file_tail"
-            path = "{}"
+            path = '{}'
             headers = {{ "X-API-Key" = "secret-value" }}
             "#,
             file.display()

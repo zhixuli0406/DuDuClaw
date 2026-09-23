@@ -323,7 +323,21 @@ mod tests {
             let p = backups_root.join(format!("pre-update-0.{i}.0"));
             std::fs::create_dir_all(&p).unwrap();
             let mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i as u64 * 100);
-            std::fs::File::open(&p).unwrap().set_modified(mtime).unwrap();
+            #[cfg(not(windows))]
+            let dir_handle = std::fs::File::open(&p).unwrap();
+            #[cfg(windows)]
+            let dir_handle = {
+                // A directory handle on Windows needs FILE_FLAG_BACKUP_SEMANTICS
+                // or `CreateFile` refuses it with "Access is denied".
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(&p)
+                    .unwrap()
+            };
+            dir_handle.set_modified(mtime).unwrap();
         }
         // A non-`pre-update-` directory must survive pruning untouched —
         // this function only ever touches its own naming shape.

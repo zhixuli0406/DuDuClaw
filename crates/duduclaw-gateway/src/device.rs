@@ -374,6 +374,7 @@ mod tests {
         assert!(usage.total_mb > 0);
     }
 
+    #[cfg(unix)] // the non-unix `read_disk_usage` is a deliberate `None` stub
     #[test]
     fn disk_usage_real_statvfs_on_this_host_does_not_panic() {
         // Real syscall smoke test — nix's statvfs/fs feature is available
@@ -411,6 +412,7 @@ mod tests {
         assert!(!grouped[0].is_up);
     }
 
+    #[cfg(unix)] // the non-unix `read_network_interfaces` is a deliberate empty stub
     #[test]
     fn network_interfaces_real_getifaddrs_on_this_host_does_not_panic() {
         // Real syscall smoke test on the dev/CI host — must return at least

@@ -278,8 +278,11 @@ impl RemoteGpuConfig {
     /// used without needing it on PATH.
     pub fn llamafactory_cli(&self) -> String {
         match Path::new(&self.python).parent() {
+            // The interpreter path names a file on the *remote* (POSIX) host,
+            // so join with '/' explicitly — `Path::join` would use the local
+            // OS separator and hand a Windows host's `\` to the GPU box.
             Some(p) if !p.as_os_str().is_empty() && self.python.contains('/') => {
-                p.join("llamafactory-cli").display().to_string()
+                format!("{}/llamafactory-cli", p.display().to_string().trim_end_matches('/'))
             }
             _ => "llamafactory-cli".to_string(),
         }

@@ -2685,9 +2685,13 @@ mod tests {
         assert!(ws.contains(&ActionGuardFinding::TargetScopeWorkspaceInternal), "{ws:?}");
 
         // System path: something clearly outside any home directory.
+        // (`/etc/hosts` is not absolute on Windows — no drive — so use that
+        // platform's own hosts file there.)
+        let system_path =
+            if cfg!(windows) { r"C:\Windows\System32\drivers\etc\hosts" } else { "/etc/hosts" };
         let sys = analyze_action_guard_findings(
             "custom_tool",
-            &json!({"arguments": {"path": "/etc/hosts"}}),
+            &json!({"arguments": {"path": system_path}}),
             &dir,
         );
         assert!(sys.contains(&ActionGuardFinding::TargetScopeSystemPath), "{sys:?}");

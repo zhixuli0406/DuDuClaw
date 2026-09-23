@@ -462,13 +462,15 @@ mod tests {
             resolve_eval_suites_root(home.path()),
             home.path().join("corpus/evals")
         );
-        // config.toml, absolute → used verbatim.
+        // config.toml, absolute → used verbatim. (`/opt/evals` is not an
+        // absolute path on Windows — no drive — so pick one per platform.)
+        let abs = if cfg!(windows) { "C:/opt/evals" } else { "/opt/evals" };
         std::fs::write(
             home.path().join("config.toml"),
-            "[evolution]\neval_suites_root = \"/opt/evals\"\n",
+            format!("[evolution]\neval_suites_root = \"{abs}\"\n"),
         )
         .unwrap();
-        assert_eq!(resolve_eval_suites_root(home.path()), PathBuf::from("/opt/evals"));
+        assert_eq!(resolve_eval_suites_root(home.path()), PathBuf::from(abs));
         // Malformed TOML degrades to the default, never panics.
         std::fs::write(home.path().join("config.toml"), "not = = toml").unwrap();
         assert_eq!(
