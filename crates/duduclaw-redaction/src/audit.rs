@@ -26,6 +26,11 @@ pub enum AuditEvent {
         rule_id: String,
         category: String,
         token: String,
+        /// RFC-6901 pointer of the node a structured (field) rule tokenised.
+        /// `None` for text-pattern hits — and absent from the wire form, so
+        /// pre-2026-09 JSONL lines still deserialise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     /// A token was successfully restored.
     RestoreOk {
@@ -210,6 +215,7 @@ mod tests {
             rule_id: "email".into(),
             category: "EMAIL".into(),
             token: "<REDACT:EMAIL:abcdef01abcdef01abcdef01abcdef01>".into(),
+            path: None,
         });
         sink.emit(AuditEvent::VaultGc {
             expired_marked: 3,
@@ -245,5 +251,50 @@ mod tests {
     fn null_sink_does_nothing() {
         let sink = NullAuditSink;
         sink.emit(AuditEvent::VaultGc { expired_marked: 0, purged: 0 });
+    }
+
+    #[test]
+    fn redact_path_is_omitted_when_absent_and_legacy_lines_still_parse() {
+        // Text-pass hit: no `path` key on the wire at all.
+        let text_hit = AuditEvent::Redact {
+            agent_id: "agnes".into(),
+            session_id: None,
+            source_category: "tool_result".into(),
+            source_detail: Some("odoo_search".into()),
+            rule_id: "email".into(),
+            category: "EMAIL".into(),
+            token: "<REDACT:EMAIL:abcdef01abcdef01abcdef01abcdef01>".into(),
+            path: None,
+        };
+        let wire = serde_json::to_string(&text_hit.to_record()).unwrap();
+        assert!(!wire.contains("\"path\""), "{wire}");
+
+        // Structured hit: the pointer rides along.
+        let field_hit = AuditEvent::Redact {
+            agent_id: "agnes".into(),
+            session_id: None,
+            source_category: "tool_result".into(),
+            source_detail: Some("odoo_search".into()),
+            rule_id: "customers".into(),
+            category: "DB_FIELD".into(),
+            token: "<REDACT:DB_FIELD:abcdef01abcdef01abcdef01abcdef01>".into(),
+            path: Some("/0/name".into()),
+        };
+        let wire = serde_json::to_string(&field_hit.to_record()).unwrap();
+        assert!(wire.contains("\"path\":\"/0/name\""), "{wire}");
+
+        // A pre-2026-09 line (no `path` key) still deserialises.
+        let legacy = r#"{"event":"redact","agent_id":"agnes","session_id":null,
+            "source_category":"tool_result","source_detail":"odoo_search",
+            "rule_id":"email","category":"EMAIL",
+            "token":"<REDACT:EMAIL:abcdef01abcdef01abcdef01abcdef01>"}"#;
+        let parsed: AuditEvent = serde_json::from_str(legacy).unwrap();
+        match parsed {
+            AuditEvent::Redact { path, rule_id, .. } => {
+                assert!(path.is_none());
+                assert_eq!(rule_id, "email");
+            }
+            other => panic!("expected Redact, got {other:?}"),
+        }
     }
 }

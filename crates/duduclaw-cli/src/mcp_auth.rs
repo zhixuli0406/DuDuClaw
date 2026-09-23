@@ -88,6 +88,23 @@ pub enum Scope {
     /// the tool cannot transmit — what it grants is the ability to put a draft
     /// in front of a human, which is the step worth authorising separately.
     MailSend,
+    /// WP-D (§13.7): gates the read-only SQL connector tools (`db_sources` /
+    /// `db_tables` / `db_select` / `db_query`). Its own scope so a customer
+    /// database can be granted without `Admin`; the dispatch gate
+    /// ADDITIONALLY requires the per-agent `[capabilities] db_sources` list
+    /// to name the source (defence-in-depth, deny-by-default). There is no
+    /// write counterpart on purpose — the connector cannot write.
+    DbRead,
+    /// WP-F2 (§14.2): gates the local data-file tools (`file_read` /
+    /// `csv_read` / `xlsx_read`). Its own scope — reading a customer's CSV is
+    /// not the same authority as reading memory or a wiki page — and
+    /// deliberately NOT in [`EXTERNALLY_GRANTABLE_SCOPES`]: a remote MCP
+    /// client has no business reading this host's filesystem. Unlike
+    /// [`Scope::DbRead`] there is no second per-agent grant, because the path
+    /// fence in `mcp_files::vet_path` (the caller's own agent directory,
+    /// `<home>/attachments`, and the operator's `[files] allowed_roots`)
+    /// already bounds what any caller can reach.
+    FilesRead,
     Admin,
 }
 
@@ -115,6 +132,8 @@ impl std::fmt::Display for Scope {
             Scope::Recording => "recording",
             Scope::MailRead => "mail:read",
             Scope::MailSend => "mail:send",
+            Scope::DbRead => "db:read",
+            Scope::FilesRead => "files:read",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -622,6 +641,8 @@ fn scope_from_str(s: &str) -> Option<Scope> {
         "skill:execute" => Scope::SkillExecute,
         "mail:read" => Scope::MailRead,
         "mail:send" => Scope::MailSend,
+        "db:read" => Scope::DbRead,
+        "files:read" => Scope::FilesRead,
         "recording" => Scope::Recording,
         "admin" => Scope::Admin,
         _ => return None,
@@ -792,6 +813,20 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // Execute class: workflow buttons + generic execute_kw + report
         // generation. These can fire arbitrary Odoo-side actions.
         "odoo_sale_confirm" | "odoo_execute" | "odoo_report" => Some(Scope::OdooExecute),
+        // WP-D §13.7: read-only SQL connector. One read scope for all four
+        // tools — the connector has no write surface at all, so splitting a
+        // `db:write` out would describe something that does not exist. The
+        // dispatch gate ADDITIONALLY requires `[capabilities] db_sources` to
+        // name the source (deny-by-default), so scope alone never reaches a
+        // customer database.
+        "db_sources" | "db_tables" | "db_select" | "db_query" => Some(Scope::DbRead),
+        // WP-F2 §14.2: local data files. One read scope for all three — none
+        // of them writes. There is no per-agent capability gate on top (unlike
+        // the db family): `mcp_files::vet_path` confines every read to the
+        // caller's own agent directory, `<home>/attachments`, and the
+        // operator-declared `[files] allowed_roots`, which is the same
+        // "whose data is this?" answer a capability list would give.
+        "file_read" | "csv_read" | "xlsx_read" => Some(Scope::FilesRead),
         // Google Workspace native tools. Read class: connection diagnostics,
         // mail search/read, calendar listing, spreadsheet read — no external
         // side-effects.
@@ -1179,6 +1214,8 @@ is_external = {is_external}
             Scope::Recording,
             Scope::MailRead,
             Scope::MailSend,
+            Scope::DbRead,
+            Scope::FilesRead,
             Scope::Admin,
         ];
 
@@ -1889,6 +1926,50 @@ mod external_scope_tests {
         assert!(external_tool_allowed("working_state_set", &p));
         // Different family still needs its own grant.
         assert!(!external_tool_allowed("memory_fetch_batch", &p), "read tier not granted");
+    }
+
+    /// WP-D §13.7: all four SQL connector tools sit on the one read scope,
+    /// and no external key can reach them whatever it claims.
+    #[test]
+    fn db_tools_require_db_read_and_are_never_external() {
+        for tool in ["db_sources", "db_tables", "db_select", "db_query"] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::DbRead),
+                "{tool} must require db:read"
+            );
+            let p = ext(&[Scope::DbRead, Scope::Admin]);
+            assert!(
+                !external_tool_allowed(tool, &p),
+                "{tool} must never be reachable by an external key"
+            );
+        }
+        assert_eq!(Scope::DbRead.to_string(), "db:read");
+        let scopes = parse_scopes("db:read").expect("db:read must parse");
+        assert!(scopes.contains(&Scope::DbRead));
+    }
+
+    /// WP-F2 §14.2: the three local data-file tools sit on one read scope and
+    /// are never reachable from an external key — a remote MCP client must not
+    /// be able to read this host's filesystem, whatever scopes it claims.
+    #[test]
+    fn file_tools_require_files_read_and_are_never_external() {
+        for tool in ["file_read", "csv_read", "xlsx_read"] {
+            assert_eq!(
+                tool_requires_scope(tool),
+                Some(Scope::FilesRead),
+                "{tool} must require files:read"
+            );
+            let p = ext(&[Scope::FilesRead, Scope::Admin]);
+            assert!(
+                !external_tool_allowed(tool, &p),
+                "{tool} must never be reachable by an external key"
+            );
+        }
+        assert_eq!(Scope::FilesRead.to_string(), "files:read");
+        let scopes = parse_scopes("files:read").expect("files:read must parse");
+        assert!(scopes.contains(&Scope::FilesRead));
+        assert!(!EXTERNALLY_GRANTABLE_SCOPES.contains(&Scope::FilesRead));
     }
 
     #[test]

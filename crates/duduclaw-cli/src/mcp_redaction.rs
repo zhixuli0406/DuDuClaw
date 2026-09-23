@@ -2,11 +2,13 @@
 //!
 //! Two concerns:
 //!
-//! 1. **Outgoing (tool result → LLM)**: tool result JSON returned from
-//!    `handle_tools_call` is walked; every string value is run through
-//!    [`RedactionPipeline::redact`] with `Source::ToolResult { tool_name }`.
-//!    The vault stores `(agent_id, session_id, token)` keyed on the values
-//!    so the gateway's channel-reply layer can later restore them.
+//! 1. **Outgoing (tool result → LLM)**: the whole tool result `Value` goes
+//!    through [`RedactionPipeline::redact_value`] with the call's
+//!    `(tool_name, arguments)` as context. That runs the structured field
+//!    rules (which see JSON *keys*, so a customer name with no recognisable
+//!    pattern still gets masked) and then the text-pattern rules over every
+//!    string leaf. The vault stores `(agent_id, session_id, token)` keyed on
+//!    the values so the gateway's channel-reply layer can later restore them.
 //!
 //! 2. **Incoming (tool args restoration)**: before a tool is executed,
 //!    arguments that contain `<REDACT:...>` tokens are decided by
@@ -21,9 +23,7 @@
 
 use std::sync::Arc;
 
-use duduclaw_redaction::{
-    EgressDecision, RedactionConfig, RedactionManager, RestoreScope, Source,
-};
+use duduclaw_redaction::{EgressDecision, RedactionConfig, RedactionManager, RestoreScope};
 use serde_json::Value;
 
 /// Per-MCP-server-process redaction state.
@@ -47,20 +47,43 @@ impl McpRedactionLayer {
         default_agent: &str,
     ) -> Result<Option<Self>, duduclaw_redaction::RedactionError> {
         let cfg_path = home_dir.join("config.toml");
-        let parsed: Option<RedactionConfig> = std::fs::read_to_string(&cfg_path)
-            .ok()
-            .and_then(|s| {
-                #[derive(serde::Deserialize)]
-                struct Wrap {
-                    #[serde(default)]
-                    redaction: RedactionConfig,
-                }
-                toml::from_str::<Wrap>(&s).ok().map(|w| w.redaction)
-            });
-
-        let Some(rcfg) = parsed.filter(|c| c.enabled) else {
+        // Fail-closed on a config we cannot read the truth out of. A malformed
+        // `[redaction]` block used to collapse (via `.ok()`) into "no config" →
+        // "not enabled" → `Ok(None)`, so the server came up serving tool
+        // results unredacted while the operator's config said `enabled = true`.
+        // Only two things may yield `Ok(None)`: no config.toml at all, and a
+        // config that parses and says `enabled = false`.
+        let raw = match std::fs::read_to_string(&cfg_path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(duduclaw_redaction::RedactionError::config(format!(
+                    "cannot read {}: {e}",
+                    cfg_path.display()
+                )));
+            }
+        };
+        let Some(raw) = raw else {
             return Ok(None);
         };
+
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            #[serde(default)]
+            redaction: RedactionConfig,
+        }
+        let rcfg = toml::from_str::<Wrap>(&raw)
+            .map_err(|e| {
+                duduclaw_redaction::RedactionError::config(format!(
+                    "{} has a malformed [redaction] block: {e}",
+                    cfg_path.display()
+                ))
+            })?
+            .redaction;
+
+        if !rcfg.enabled {
+            return Ok(None);
+        }
 
         let paths = duduclaw_redaction::ManagerPaths::under_home(home_dir);
         let manager = Arc::new(RedactionManager::open(rcfg, paths)?);
@@ -81,20 +104,28 @@ impl McpRedactionLayer {
         }))
     }
 
-    /// Apply redaction to every string in a tool-call result Value.
+    /// Apply redaction to a tool-call result Value.
     ///
-    /// Walks recursively through arrays / objects. Strings get rewritten
-    /// in place. Tokens hit the shared vault keyed on
-    /// `(self.agent_id, self.session_id)` so the channel-reply layer can
-    /// restore them when this turn's final text reaches the user.
+    /// `args` is the call's `arguments` object; structured field rules use it
+    /// to decide which model a generic tool like `odoo_search` just returned.
+    /// Tokens hit the shared vault keyed on `(self.agent_id, self.session_id)`
+    /// so the channel-reply layer can restore them when this turn's final text
+    /// reaches the user.
     ///
     /// Thin wrapper over the free function [`redact_tool_result_with`] with
     /// this layer's env-derived agent / session — the stdio serve loop path.
     /// `McpDispatcher` calls the free function directly with the authenticated
     /// `principal.client_id`, so both transports share one implementation
     /// (P2-4: egress pushed to a single choke point, no logic fork).
-    pub fn redact_tool_result(&self, tool_name: &str, value: &mut Value) {
-        redact_tool_result_with(&self.manager, tool_name, value, &self.agent_id, &self.session_id);
+    pub fn redact_tool_result(&self, tool_name: &str, value: &mut Value, args: Option<&Value>) {
+        redact_tool_result_with(
+            &self.manager,
+            tool_name,
+            value,
+            &self.agent_id,
+            &self.session_id,
+            args,
+        );
     }
 
     /// Decide what to do with a tool call whose arguments may contain
@@ -174,78 +205,61 @@ pub fn decide_tool_args_with(
         })
 }
 
-/// Redact every string leaf of a tool-call result — the pure form taking an
-/// explicit `(manager, agent_id, session_id)`.
+/// Placeholder substituted for a tool result the pipeline could not redact.
+pub const REDACTION_FAILED_PLACEHOLDER: &str = "[redaction failed — value withheld]";
+
+/// Redact a tool-call result — the pure form taking an explicit
+/// `(manager, agent_id, session_id)`.
 ///
 /// Shared by the stdio serve loop (via [`McpRedactionLayer::redact_tool_result`])
 /// and `McpDispatcher`. Vault writes are keyed on `(agent_id, session_id)` so
-/// the channel-reply layer can restore the same tokens later. Fail-closed: a
-/// vault-write failure replaces the value with an explicit placeholder rather
-/// than leaking raw PII to the model.
+/// the channel-reply layer can restore the same tokens later.
+///
+/// `args` carries the call's `arguments` object so structured field rules can
+/// resolve which model the result belongs to (`match_args`). Passing `None`
+/// only disables rules that declare an argument gate; everything else, the
+/// text rules included, is unaffected.
+///
+/// Fail-closed (spec §10.2): every failure on this path — the pipeline failing
+/// to build (unreadable key directory, unusable agent key) as much as a
+/// vault-write abort mid-redaction — replaces the whole value with a
+/// placeholder. Both used to differ: a build failure warned and let the raw
+/// result through untouched, which is precisely the leak redaction exists to
+/// prevent, and it was invisible to the operator because the tool still
+/// "worked".
 pub fn redact_tool_result_with(
     manager: &RedactionManager,
     tool_name: &str,
     value: &mut Value,
     agent_id: &str,
     session_id: &str,
+    args: Option<&Value>,
 ) {
-    let source = Source::ToolResult {
-        tool_name: tool_name.to_string(),
-    };
-    walk_strings(value, &mut |s| {
-        // Only run through the pipeline if it actually has potential PII —
-        // very cheap pre-filter, the engine itself is the source of truth.
-        if s.is_empty() {
+    let pipeline = match manager.pipeline(agent_id, Some(session_id.to_string())) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                target: "duduclaw_cli::mcp_redaction",
+                error = %e,
+                agent = %agent_id,
+                tool = %tool_name,
+                "redact_tool_result: pipeline build failed; withholding the whole result"
+            );
+            *value = Value::String(REDACTION_FAILED_PLACEHOLDER.to_string());
             return;
         }
-        let pipeline = match manager.pipeline(agent_id, Some(session_id.to_string())) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(
-                    target: "duduclaw_cli::mcp_redaction",
-                    error = %e,
-                    agent = %agent_id,
-                    "redact_tool_result: pipeline build failed; passthrough"
-                );
-                return;
-            }
-        };
-        match pipeline.redact(s, &source) {
-            Ok(out) => {
-                if !out.tokens_written.is_empty() {
-                    *s = out.redacted_text;
-                }
-            }
-            Err(e) => {
-                // Fail-closed: replace text with an explicit placeholder
-                // so the LLM cannot see raw PII on a vault write failure.
-                tracing::error!(
-                    target: "duduclaw_cli::mcp_redaction",
-                    error = %e,
-                    agent = %agent_id,
-                    "redact_tool_result: redact failed; emitting placeholder"
-                );
-                *s = "[redaction failed — value withheld]".to_string();
-            }
-        }
-    });
-}
+    };
 
-/// Recursive in-place walk over every string leaf of a `serde_json::Value`.
-fn walk_strings(v: &mut Value, f: &mut dyn FnMut(&mut String)) {
-    match v {
-        Value::String(s) => f(s),
-        Value::Array(arr) => {
-            for x in arr.iter_mut() {
-                walk_strings(x, f);
-            }
-        }
-        Value::Object(map) => {
-            for x in map.values_mut() {
-                walk_strings(x, f);
-            }
-        }
-        _ => {}
+    let ctx = duduclaw_redaction::ToolContext { tool_name, args };
+    if let Err(e) = pipeline.redact_value(value, &ctx) {
+        tracing::error!(
+            target: "duduclaw_cli::mcp_redaction",
+            error = %e,
+            agent = %agent_id,
+            tool = %tool_name,
+            "redact_tool_result: redact failed; withholding the whole result"
+        );
+        *value = Value::String(REDACTION_FAILED_PLACEHOLDER.to_string());
     }
 }
 
@@ -276,16 +290,213 @@ fn _scope_marker(_s: &RestoreScope) {}
 mod tests {
     use super::*;
 
+    /// Build a manager with one `db_field` rule over `res.partner.name`.
+    fn db_field_manager(home: &std::path::Path) -> RedactionManager {
+        let mut cfg = RedactionConfig::default();
+        cfg.enabled = true;
+        cfg.rules.insert(
+            "customer_master".to_string(),
+            duduclaw_redaction::RuleSpec {
+                id: "customer_master".into(),
+                category: "DB_FIELD".into(),
+                restore_scope: RestoreScope::Owner,
+                priority: 70,
+                cross_session_stable: false,
+                apply_to_system_prompt: false,
+                kind: duduclaw_redaction::RuleKind::DbField {
+                    source: Some("odoo".into()),
+                    connector: None,
+                    fields: vec!["res.partner.name".into()],
+                },
+            },
+        );
+        RedactionManager::open(cfg, duduclaw_redaction::ManagerPaths::under_home(home)).unwrap()
+    }
+
     #[test]
-    fn walk_strings_visits_nested() {
-        let mut v = serde_json::json!({
-            "a": "hello",
-            "b": ["world", {"c": "deep"}],
+    fn tool_args_reach_the_structured_match_args_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = db_field_manager(tmp.path());
+
+        let rows = serde_json::json!([{"id": 7, "name": "王小明"}]);
+        let right = serde_json::json!({"model": "res.partner", "limit": "20"});
+        let wrong = serde_json::json!({"model": "crm.lead"});
+
+        // Matching model ⇒ the field rule fires and the name is tokenised.
+        let mut value = rows.clone();
+        redact_tool_result_with(
+            &manager,
+            "odoo_search",
+            &mut value,
+            "agnes",
+            "s1",
+            Some(&right),
+        );
+        assert!(
+            value[0]["name"].as_str().unwrap().starts_with("<REDACT:DB_FIELD:"),
+            "args must reach match_args: {value}"
+        );
+        assert_eq!(value[0]["id"], serde_json::json!(7));
+
+        // Different model ⇒ the gate blocks it.
+        let mut value = rows.clone();
+        redact_tool_result_with(
+            &manager,
+            "odoo_search",
+            &mut value,
+            "agnes",
+            "s1",
+            Some(&wrong),
+        );
+        assert_eq!(value[0]["name"], serde_json::json!("王小明"));
+
+        // No args at all ⇒ the gate is unsatisfiable, same outcome.
+        let mut value = rows;
+        redact_tool_result_with(&manager, "odoo_search", &mut value, "agnes", "s1", None);
+        assert_eq!(value[0]["name"], serde_json::json!("王小明"));
+    }
+
+    #[test]
+    fn structured_rule_reaches_into_json_in_text_results() {
+        // The shape the odoo_* tools actually return: records pretty-printed
+        // into `content[0].text`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = db_field_manager(tmp.path());
+
+        let rows = serde_json::json!([{"id": 7, "name": "王小明"}]);
+        let mut value = serde_json::json!({
+            "content": [{"type": "text", "text": serde_json::to_string_pretty(&rows).unwrap()}]
         });
-        let mut seen: Vec<String> = Vec::new();
-        walk_strings(&mut v, &mut |s| seen.push(s.clone()));
-        seen.sort();
-        assert_eq!(seen, vec!["deep", "hello", "world"]);
+        let args = serde_json::json!({"model": "res.partner"});
+        redact_tool_result_with(
+            &manager,
+            "odoo_search",
+            &mut value,
+            "agnes",
+            "s1",
+            Some(&args),
+        );
+        let text = value["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("王小明"), "{text}");
+        assert!(text.contains("<REDACT:DB_FIELD:"), "{text}");
+    }
+
+    #[test]
+    fn pipeline_build_failure_withholds_the_whole_result() {
+        // §10.2: a pipeline that cannot be built must never degrade to
+        // passthrough. Force the failure by replacing the key directory (which
+        // `RedactionManager::open` created) with a regular file, so the next
+        // uncached agent's `load_or_generate` cannot `create_dir_all` it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = db_field_manager(tmp.path());
+
+        let key_dir = tmp.path().join("redaction").join("keys");
+        std::fs::remove_dir_all(&key_dir).unwrap();
+        std::fs::write(&key_dir, b"not a directory").unwrap();
+
+        let mut value = serde_json::json!([{"id": 7, "name": "王小明"}]);
+        let args = serde_json::json!({"model": "res.partner"});
+        redact_tool_result_with(
+            &manager,
+            "odoo_search",
+            &mut value,
+            // An agent whose key has never been cached, so the build really runs.
+            "never-seen-agent",
+            "s1",
+            Some(&args),
+        );
+
+        assert_eq!(
+            value,
+            Value::String(REDACTION_FAILED_PLACEHOLDER.to_string()),
+            "a failed pipeline build must withhold the result, not pass it through"
+        );
+    }
+
+    /// Write a `config.toml` into `home` and run `try_init` against it.
+    fn try_init_with_config(
+        home: &std::path::Path,
+        body: &str,
+    ) -> Result<Option<McpRedactionLayer>, duduclaw_redaction::RedactionError> {
+        std::fs::write(home.join("config.toml"), body).unwrap();
+        McpRedactionLayer::try_init(home, "agnes")
+    }
+
+    #[test]
+    fn malformed_redaction_config_is_an_error_not_a_silent_disable() {
+        // The live defect: a `[redaction]` block that fails to deserialise used
+        // to collapse into `Ok(None)` — "redaction not enabled" — and the MCP
+        // server came up serving tool results in the clear.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = try_init_with_config(
+            tmp.path(),
+            r#"
+[redaction]
+enabled = true
+
+[redaction.rules.known_people]
+type = "identity"
+category = "PERSON"
+priority = "not-a-number"
+"#,
+        )
+        .err()
+        .expect("a malformed [redaction] block must fail, never disable silently");
+        assert!(
+            err.to_string().contains("malformed [redaction] block"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn disabled_redaction_config_still_returns_ok_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let got = try_init_with_config(
+            tmp.path(),
+            "[redaction]
+enabled = false
+",
+        )
+        .expect("a well-formed disabled config is not an error");
+        assert!(got.is_none(), "disabled ⇒ the zero-overhead path");
+    }
+
+    #[test]
+    fn missing_config_file_still_returns_ok_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let got = McpRedactionLayer::try_init(tmp.path(), "agnes")
+            .expect("no config.toml is the fresh-install case, not an error");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn bare_identity_rule_now_parses_and_initialises() {
+        // End-to-end of the two fixes: `source` may be omitted, and the block
+        // parses instead of vanishing. With a real people directory the layer
+        // comes up enabled.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let people = tmp.path().join("shared/wiki/identity/people");
+        std::fs::create_dir_all(&people).unwrap();
+        std::fs::write(
+            people.join("ruby.md"),
+            "---\nperson_id: p1\ndisplay_name: Ruby Lin\n---\n",
+        )
+        .unwrap();
+
+        let layer = try_init_with_config(
+            tmp.path(),
+            r#"
+[redaction]
+enabled = true
+
+[redaction.rules.known_people]
+type = "identity"
+category = "PERSON"
+"#,
+        )
+        .expect("bare identity rule must initialise")
+        .expect("enabled ⇒ Some(layer)");
+        assert_eq!(layer.manager.engine().rule_count(), 1);
     }
 
     #[test]

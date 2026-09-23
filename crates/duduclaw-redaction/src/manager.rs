@@ -15,8 +15,9 @@ use serde_json::Value;
 
 use crate::audit::{AuditSink, JsonlAuditSink, NullAuditSink};
 use crate::config::{Profile, RedactionConfig, SourcePolicy};
+use crate::data_source::{DataSource, registry};
 use crate::egress::{EgressDecision, EgressEvaluator};
-use crate::engine::RuleEngine;
+use crate::engine::{EngineOptions, RuleEngine};
 use crate::error::{RedactionError, Result};
 use crate::pipeline::RedactionPipeline;
 use crate::profiles;
@@ -34,6 +35,11 @@ pub struct ManagerPaths {
     pub audit_log: Option<PathBuf>,
     /// Path to the force-override flag file.
     pub override_flag: PathBuf,
+    /// Directory holding the shared wiki's identity records
+    /// (`<home>/shared/wiki/identity/people`), the name source for
+    /// `type = "identity"` rules. `None` ⇒ no identity source in this context
+    /// and an identity rule fails to compile (fail-closed).
+    pub identity_people_dir: Option<PathBuf>,
 }
 
 impl ManagerPaths {
@@ -45,6 +51,9 @@ impl ManagerPaths {
             vault_db: base.join("vault.db"),
             audit_log: Some(base.join("audit.jsonl")),
             override_flag: base.join("override.flag"),
+            identity_people_dir: Some(
+                home.join("shared").join("wiki").join("identity").join("people"),
+            ),
         }
     }
 }
@@ -61,6 +70,60 @@ pub struct RedactionManager {
     egress: Arc<EgressEvaluator>,
 }
 
+/// Materialise the data-source registry a config resolves to: the built-in
+/// `odoo` / `duduclaw_db` / `duduclaw_files` entries plus the operator's
+/// `[redaction.data_sources.*]` blocks.
+///
+/// Split out of [`RedactionManager::open`] for the same reason as
+/// [`resolve_rule_specs`]: the dashboard dry-compiles a candidate config and
+/// must resolve sources exactly the way the live manager does.
+pub fn resolve_data_sources(config: &RedactionConfig) -> Result<HashMap<String, DataSource>> {
+    registry(&config.data_sources)
+}
+
+/// Materialise the full rule-spec list a config resolves to: built-in and
+/// custom profiles first, then the inline `[redaction.rules.*]` entries which
+/// override profile rules on id collision.
+///
+/// Split out of [`RedactionManager::open`] so callers that need to *dry-compile*
+/// a candidate config (the dashboard's `redaction.update` field-rule editor)
+/// resolve exactly the same specs the live manager would — a second copy of
+/// this walk would drift the moment profile resolution changes.
+pub fn resolve_rule_specs(config: &RedactionConfig, paths: &ManagerPaths) -> Result<Vec<RuleSpec>> {
+    let mut specs: Vec<RuleSpec> = Vec::new();
+    for profile_name in &config.profiles {
+        let Some(profile) = profiles::load_builtin(profile_name)? else {
+            // Custom profile: try `<key_dir>/../profiles/<name>.toml`.
+            let custom_path = paths
+                .key_dir
+                .parent()
+                .unwrap_or(&paths.key_dir)
+                .join("profiles")
+                .join(format!("{profile_name}.toml"));
+            if !custom_path.exists() {
+                return Err(RedactionError::config(format!(
+                    "redaction profile '{profile_name}' not found (neither built-in nor at {})",
+                    custom_path.display()
+                )));
+            }
+            let custom = Profile::from_path(custom_path)?;
+            specs.extend(custom.into_specs());
+            continue;
+        };
+        specs.extend(profile.into_specs());
+    }
+    // Inline rules override profile rules on id collision: walk last so
+    // they end up later in the specs vec — same-id earlier specs are
+    // shadowed by the engine's later compile-and-overwrite by id.
+    for (id, mut spec) in config.rules.clone() {
+        spec.id = id;
+        // Drop any earlier spec with the same id.
+        specs.retain(|s| s.id != spec.id);
+        specs.push(spec);
+    }
+    Ok(specs)
+}
+
 impl RedactionManager {
     /// Build a manager from a [`RedactionConfig`] and on-disk paths.
     ///
@@ -71,39 +134,15 @@ impl RedactionManager {
         config.validate()?;
 
         // Materialise rule specs from profiles + inline rules.
-        let mut specs: Vec<RuleSpec> = Vec::new();
-        for profile_name in &config.profiles {
-            let Some(profile) = profiles::load_builtin(profile_name)? else {
-                // Custom profile: try `<key_dir>/../profiles/<name>.toml`.
-                let custom_path = paths
-                    .key_dir
-                    .parent()
-                    .unwrap_or(&paths.key_dir)
-                    .join("profiles")
-                    .join(format!("{profile_name}.toml"));
-                if !custom_path.exists() {
-                    return Err(RedactionError::config(format!(
-                        "redaction profile '{profile_name}' not found (neither built-in nor at {})",
-                        custom_path.display()
-                    )));
-                }
-                let custom = Profile::from_path(custom_path)?;
-                specs.extend(custom.into_specs());
-                continue;
-            };
-            specs.extend(profile.into_specs());
-        }
-        // Inline rules override profile rules on id collision: walk last so
-        // they end up later in the specs vec — same-id earlier specs are
-        // shadowed by the engine's later compile-and-overwrite by id.
-        for (id, mut spec) in config.rules.clone() {
-            spec.id = id;
-            // Drop any earlier spec with the same id.
-            specs.retain(|s| s.id != spec.id);
-            specs.push(spec);
-        }
+        let specs = resolve_rule_specs(&config, &paths)?;
 
-        let engine = Arc::new(RuleEngine::from_specs(specs)?);
+        let engine = Arc::new(RuleEngine::from_specs_with(
+            specs,
+            &EngineOptions {
+                identity_people_dir: paths.identity_people_dir.clone(),
+                data_sources: resolve_data_sources(&config)?,
+            },
+        )?);
         let vault = Arc::new(VaultStore::open(&paths.vault_db, &paths.key_dir)?);
         let audit: Arc<dyn AuditSink> = match &paths.audit_log {
             Some(p) => Arc::new(JsonlAuditSink::new(p.clone())),

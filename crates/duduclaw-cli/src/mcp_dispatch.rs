@@ -114,6 +114,19 @@ const SYSTEM_OPERATOR_TOOLS: &[&str] = &[
 /// learning whether a human is currently at the shared desktop.
 const CODRIVE_TOOLS: &[&str] = &["codrive_run", "codrive_status"];
 
+/// The read-only SQL connector tools gated by the per-agent
+/// `[capabilities] db_sources` grant list (WP-D,
+/// `DESIGN-redaction-field-rules-2026-09` §13.7). Same deny-by-default shape
+/// as [`OS_NATIVE_TOOLS`] / [`RECORDING_TOOLS`]: `Scope::DbRead` alone is an
+/// opt-out posture, and a customer database is not something an agent should
+/// reach because nobody thought to deny it.
+///
+/// This gate answers only "may this agent touch a database at all". *Which*
+/// source it may touch is checked inside each handler, which is the layer that
+/// knows the `source` argument — `db_sources` (the listing tool) takes none
+/// and simply lists what the agent was granted.
+const DB_SOURCE_TOOLS: &[&str] = &["db_sources", "db_tables", "db_select", "db_query"];
+
 /// Neutralize `os_notify` `title`/`body` in place for the user's visual surface
 /// (P2-5). Each value is replaced by its perception-sanitized form (control
 /// chars stripped, angle brackets defanged, CJK-safe truncation) and any
@@ -171,6 +184,7 @@ struct AgentGateConfig {
     codrive: bool,
     denied_tools: Vec<String>,
     allowed_tools: Vec<String>,
+    db_sources: Vec<String>,
 }
 
 /// Read `<home>/agents/<id>/agent.toml` once and extract the gate-relevant
@@ -198,13 +212,15 @@ async fn load_agent_gate_config(home_dir: &Path, agent_id: &str) -> AgentGateCon
             codrive: cfg.capabilities.codrive,
             denied_tools: cfg.capabilities.denied_tools,
             allowed_tools: cfg.capabilities.allowed_tools,
+            db_sources: cfg.capabilities.db_sources,
         },
         Err(e) => {
             warn!(
                 agent = %agent_id,
                 error = %e,
                 "malformed agent.toml [capabilities] — PolicyKernel abstains (empty policy) \
-                 and os_native / recording / system_operator / codrive default to false (fail-closed)"
+                 and os_native / recording / system_operator / codrive default to false, \
+                 db_sources to empty (fail-closed)"
             );
             AgentGateConfig::default()
         }
@@ -832,6 +848,26 @@ impl McpDispatcher {
             return jsonrpc_error(id, -32003, &msg);
         }
 
+        // ── 3.628 SQL data-source capability gate (WP-D §13.7, deny-by-default)
+        // The four `db_*` tools require the agent's own
+        // `[capabilities] db_sources = ["<name>", …]` grant list. Empty or
+        // absent denies all four — a customer database must be an explicit
+        // per-agent decision, not something `Scope::DbRead` alone unlocks.
+        // Fail-closed: a missing/malformed agent.toml resolved to an empty
+        // list in `load_agent_gate_config`. External clients carry the empty
+        // default gate and are additionally excluded upstream (`db:read` is
+        // not in `EXTERNALLY_GRANTABLE_SCOPES`).
+        if DB_SOURCE_TOOLS.contains(&tool_name) && agent_gate.db_sources.is_empty() {
+            duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+            let msg = format!(
+                "工具「{tool_name}」需要資料庫來源授權，但此代理沒有任何授權。請在 agent.toml \
+                 設定 [capabilities] db_sources = [\"<資料來源名稱>\"]（名稱對應 config.toml 的 \
+                 [db_sources.<名稱>]）後再使用。"
+            );
+            self.audit_dispatch_denial(tool_name, &params_owned, "db_sources_capability_missing", &msg);
+            return jsonrpc_error(id, -32003, &msg);
+        }
+
         // ── 3.63 os_notify perception-load neutralization (P2-5) ────────────
         // os_notify content is rendered on the USER's visual surface. A poisoned
         // agent could craft a title/body that social-engineers the user (fake
@@ -962,7 +998,13 @@ impl McpDispatcher {
         // Redact the tool result so the LLM never sees raw internal data; the
         // vault holds the (token → original) mapping for the channel-reply
         // restore step. Same choke point → covers stdio / HTTP / SSE uniformly.
+        //
+        // The call's `arguments` ride along so structured field rules can tell
+        // which model a generic tool (`odoo_search` / `odoo_execute`) just
+        // returned — that is what binds a `res.partner.name` rule to this one
+        // call and not to every search the agent makes.
         if let Some(ref layer) = self.redaction {
+            let redaction_args = params_owned.get("arguments").cloned();
             if let Some(res) = result.get_mut("result") {
                 crate::mcp_redaction::redact_tool_result_with(
                     &layer.manager,
@@ -970,6 +1012,7 @@ impl McpDispatcher {
                     res,
                     redaction_agent,
                     &layer.session_id,
+                    redaction_args.as_ref(),
                 );
             }
         }
@@ -1367,6 +1410,112 @@ effect = "forbid"
             !msg.contains("capability_request"),
             "non-scoped agent must never hit the WP3 gate, got: {result}"
         );
+    }
+
+    // ── WP-D §13.7: db_sources capability gate ────────────────────────────────
+
+    /// All four `db_*` tools are denied fail-closed when no agent.toml exists.
+    #[tokio::test]
+    async fn db_tools_denied_when_db_sources_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+
+        // Admin bypasses the scope check so the call reaches the db gate.
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        for (n, tool, args) in [
+            (60, "db_sources", serde_json::json!({})),
+            (61, "db_tables", serde_json::json!({ "source": "demo" })),
+            (
+                62,
+                "db_select",
+                serde_json::json!({ "source": "demo", "table": "customers" }),
+            ),
+            (
+                63,
+                "db_query",
+                serde_json::json!({ "source": "demo", "sql": "SELECT 1" }),
+            ),
+        ] {
+            let result = dispatcher
+                .dispatch_tool_call(&principal, &ns_ctx, &make_params(tool, args), &serde_json::json!(n))
+                .await;
+            assert_eq!(
+                result["error"]["code"], -32003,
+                "{tool} without a db_sources grant must be denied, got: {result}"
+            );
+            let msg = result["error"]["message"].as_str().unwrap_or("");
+            assert!(
+                msg.contains("db_sources"),
+                "{tool} denial must name the missing grant, got: {msg}"
+            );
+        }
+    }
+
+    /// An explicitly empty grant list is denied too (not "absent means all").
+    #[tokio::test]
+    async fn db_tools_denied_when_db_sources_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\ndb_sources = []\n");
+
+        let principal = make_principal(vec![Scope::DbRead], false);
+        let ns_ctx = make_ns_ctx(false);
+        let result = dispatcher
+            .dispatch_tool_call(
+                &principal,
+                &ns_ctx,
+                &make_params("db_sources", serde_json::json!({})),
+                &serde_json::json!(64),
+            )
+            .await;
+        assert_eq!(result["error"]["code"], -32003, "got: {result}");
+    }
+
+    /// A granted agent passes the capability gate — it may still fail later for
+    /// unrelated reasons, but never with the capability guidance.
+    #[tokio::test]
+    async fn db_tools_pass_gate_when_granted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\ndb_sources = [\"demo\"]\n");
+
+        let principal = make_principal(vec![Scope::DbRead], false);
+        let ns_ctx = make_ns_ctx(false);
+        let result = dispatcher
+            .dispatch_tool_call(
+                &principal,
+                &ns_ctx,
+                &make_params("db_sources", serde_json::json!({})),
+                &serde_json::json!(65),
+            )
+            .await;
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("需要資料庫來源授權"),
+            "a granted agent must pass the db gate, got: {result}"
+        );
+    }
+
+    /// Agents with no database grant are unaffected on every other tool.
+    #[tokio::test]
+    async fn non_db_tools_unaffected_by_the_db_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        write_scoped_toml(&tmp, "[capabilities]\nallowed_tools = []\n");
+
+        let principal = make_principal(vec![Scope::Admin], false);
+        let ns_ctx = make_ns_ctx(false);
+        let result = dispatcher
+            .dispatch_tool_call(
+                &principal,
+                &ns_ctx,
+                &make_params("memory_search", serde_json::json!({ "query": "x" })),
+                &serde_json::json!(66),
+            )
+            .await;
+        let msg = result["error"]["message"].as_str().unwrap_or("");
+        assert!(!msg.contains("db_sources"), "got: {result}");
     }
 
     // ── OS-native Phase 1: os_native capability gate ───────────────────────────

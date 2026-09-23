@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1001,
+    "name": "王大福",
+    "email": "dafu.wang@example.invalid",
+    "phone": "0912345678",
+    "street": "臺北市中正區虛構路 100 號 5 樓",
+    "comment": "偏好下午三點後聯絡，付款方式為月結三十天。"
+  },
+  {
+    "id": 1002,
+    "name": "陳美玲",
+    "email": "meiling.chen@example.invalid",
+    "phone": "0987654321",
+    "street": "臺中市西屯區範例大道 7 號",
+    "comment": "此筆為示範資料，統編 12345678 亦為虛構。"
+  },
+  {
+    "id": 1003,
+    "name": "測試工程行有限公司",
+    "email": "contact@example.invalid",
+    "phone": "0223456789",
+    "street": "高雄市前鎮區樣板街 22 巷 3 號",
+    "comment": "示範用客戶，聯絡人 林小華，合約自虛構年度起算。"
+  }
+]

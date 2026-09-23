@@ -1,0 +1,64 @@
+[package]
+name = "duduclaw-db"
+version.workspace = true
+edition.workspace = true
+
+# WP-D (DESIGN-redaction-field-rules-2026-09 §13.7) — read-only SQL data
+# sources.
+#
+# A thin, deliberately small connector layer over sqlx (PostgreSQL / MySQL /
+# SQLite) that gives DuDuClaw its own first-party database tool surface, so a
+# customer without an existing MCP server can still expose business tables to
+# an agent *through* the redaction pipeline's single MCP choke point.
+#
+# Everything here is read-only by construction: the SQLite pool is opened
+# read-only, the PostgreSQL / MySQL pools run every statement inside an
+# explicit READ ONLY transaction, and free-form SQL additionally passes a
+# statement guard (single statement, must start with SELECT / WITH).
+
+[dependencies]
+# Internal
+duduclaw-core = { workspace = true }
+duduclaw-security = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Streams — row streaming with an early stop at max_rows
+futures-util = { workspace = true }
+
+# Value mapping (chrono / uuid types come from `sqlx::types` so the versions
+# can never drift apart from the driver's)
+base64 = { workspace = true }
+
+# SQL drivers — launchbadge/sqlx. Minimal feature set: no `any` driver, no
+# `macros` (compile-time checked queries need a live DB at build time), no
+# `migrate`. `chrono` / `json` / `uuid` / `bigdecimal` are decode-side only and
+# are what make the §13.7 value mapping (timestamps → ISO, JSON → parsed,
+# decimal → string) possible at all.
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "mysql",
+    "sqlite",
+    "chrono",
+    "json",
+    "uuid",
+    "bigdecimal",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util", "macros"] }

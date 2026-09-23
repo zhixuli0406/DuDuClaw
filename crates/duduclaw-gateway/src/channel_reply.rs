@@ -8308,6 +8308,15 @@ async fn spawn_claude_cli_with_env(
             cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");
         }
 
+        // RFC-23 §14.4: arm the data-file guard PreToolUse hook. Set ONLY
+        // when redaction is actually active for this home AND the operator
+        // has not turned the guard off — absent ⇒ the installed hook exits 0
+        // immediately, so a gateway without redaction spawns exactly as it
+        // did before §14.4.
+        if let Some(mode) = crate::redaction_proxy::data_file_guard_env_for_spawn(home_dir) {
+            cmd.env(duduclaw_core::ENV_DATA_FILE_GUARD, mode);
+        }
+
         // WP-7A minimal-context: drop the operator's *user*-global settings and
         // memory (~14.8k tokens) and expose only a curated built-in tool subset
         // (~10k tokens) instead of the full ~21k built-in schema. `project,local`
@@ -8325,6 +8334,11 @@ async fn spawn_claude_cli_with_env(
             cmd.args(["--tools", &tools.join(",")]);
         }
     }
+    // RFC-23 §13.6: when redaction is active this holds the per-spawn
+    // rewritten `.mcp.json` (external stdio servers routed through
+    // `duduclaw mcp-proxy`). Declared out here so the temp file outlives the
+    // child — same discipline as `_prompt_guard` below.
+    let _mcp_proxy_guard: Option<tempfile::TempPath>;
     // Set working directory to agent dir so Claude can access agent config
     // (.claude/, CLAUDE.md, .mcp.json) and project files (docs/, etc.)
     if let Some(dir) = work_dir {
@@ -8347,9 +8361,22 @@ async fn spawn_claude_cli_with_env(
         // --strict-mcp-config ensures no ambient global MCP leaks into agent context.
         let mcp_json = dir.join(".mcp.json");
         if mcp_json.exists() {
-            cmd.args(["--mcp-config", &mcp_json.to_string_lossy()]);
+            // RFC-23 §13.6: external MCP servers are launched by the Claude
+            // CLI, so their tool results never pass DuDuClaw's MCP choke
+            // point. With redaction active, hand the CLI a rewritten config
+            // that routes each of them through `duduclaw mcp-proxy` instead.
+            // `None` (redaction off / nothing to proxy) ⇒ byte-identical.
+            _mcp_proxy_guard = crate::redaction_proxy::maybe_proxy_mcp_config(home_dir, &mcp_json);
+            match _mcp_proxy_guard.as_ref() {
+                Some(proxied) => cmd.args(["--mcp-config", &proxied.to_string_lossy()]),
+                None => cmd.args(["--mcp-config", &mcp_json.to_string_lossy()]),
+            };
             cmd.arg("--strict-mcp-config");
+        } else {
+            _mcp_proxy_guard = None;
         }
+    } else {
+        _mcp_proxy_guard = None;
     }
     if let Some(ref key) = api_key {
         cmd.env("ANTHROPIC_API_KEY", key);
@@ -9396,6 +9423,11 @@ fn build_claude_cli_args(
     // curated `--tools`). Resolved by the caller from
     // `agent_toml::resolve_minimal_context`.
     minimal_context: bool,
+    // RFC-23 §13.6: when redaction is active the caller hands over the
+    // per-spawn rewritten `.mcp.json` (external stdio servers routed through
+    // `duduclaw mcp-proxy`) and it is passed instead of the agent's own.
+    // `None` ⇒ byte-identical to the pre-RFC-23 behaviour.
+    mcp_config_override: Option<&Path>,
 ) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
@@ -9449,7 +9481,12 @@ fn build_claude_cli_args(
         let mcp_json = dir.join(".mcp.json");
         if mcp_json.exists() {
             args.push("--mcp-config".to_string());
-            args.push(mcp_json.to_string_lossy().to_string());
+            args.push(
+                mcp_config_override
+                    .unwrap_or(mcp_json.as_path())
+                    .to_string_lossy()
+                    .to_string(),
+            );
             args.push("--strict-mcp-config".to_string());
         }
     }
@@ -9535,6 +9572,15 @@ async fn spawn_claude_cli_pty_with_env(
     };
     let system_prompt_path = prompt_guard.as_deref();
 
+    // RFC-23 §13.6 (PTY parity with `spawn_claude_cli_with_env`): route this
+    // spawn's external MCP servers through `duduclaw mcp-proxy` when
+    // redaction is active. The guard must outlive the child, so it is bound
+    // here and dropped at the end of this function, like `prompt_guard`.
+    let mcp_proxy_guard: Option<tempfile::TempPath> = work_dir
+        .map(|dir| dir.join(".mcp.json"))
+        .filter(|p| p.exists())
+        .and_then(|p| crate::redaction_proxy::maybe_proxy_mcp_config(home_dir, &p));
+
     let args = build_claude_cli_args(
         user_message,
         model,
@@ -9543,6 +9589,7 @@ async fn spawn_claude_cli_pty_with_env(
         work_dir,
         system_prompt_path,
         duduclaw_core::agent_toml::resolve_minimal_context(work_dir),
+        mcp_proxy_guard.as_deref(),
     );
 
     // Assemble env: allowlisted base → API key fallback → caps env vars →
@@ -9579,6 +9626,14 @@ async fn spawn_claude_cli_pty_with_env(
         if caps.browser_via_bash {
             env.insert("DUDUCLAW_BROWSER_VIA_BASH".to_string(), "1".to_string());
         }
+    }
+
+    // RFC-23 §14.4 (PTY parity with `spawn_claude_cli_with_env`): arm the
+    // data-file guard hook only when redaction is active and the guard is not
+    // switched off. `None` ⇒ the key is never inserted, so with `clear_env:
+    // true` below the child genuinely does not see it.
+    if let Some(mode) = crate::redaction_proxy::data_file_guard_env_for_spawn(home_dir) {
+        env.insert(duduclaw_core::ENV_DATA_FILE_GUARD.to_string(), mode);
     }
 
     let git_env_granted = duduclaw_core::git_credentials_granted_names(capabilities);
@@ -10400,12 +10455,33 @@ async fn try_operator_direct_api_tool_loop(
         .unwrap_or(&empty_policy);
     let guarded = duduclaw_llm::PolicyExecutor::new(&registry, policy, agent_id);
 
+    // RFC-23 §13.6: this loop dispatches MCP tools in-process, so nothing
+    // upstream redacts their results. Redaction inactive ⇒ `None` ⇒
+    // byte-identical. Enabled-but-broken ⇒ skip the tool loop entirely
+    // (fail-closed: the caller degrades to the tools-less call rather than
+    // feeding the model unredacted tool output).
+    let interceptor = match crate::redaction_proxy::try_build_interceptor(
+        &duduclaw_core::duduclaw_home(),
+        agent_id,
+        &crate::redaction_proxy::current_session_id(),
+    ) {
+        Ok(i) => i.map(|i| i as std::sync::Arc<dyn duduclaw_llm::ToolInterceptor>),
+        Err(e) => {
+            warn!(
+                agent = %agent_id, error = %e,
+                "operator Direct-API tool loop skipped — redaction is enabled but failed to initialise"
+            );
+            return None;
+        }
+    };
+
     let loop_result = duduclaw_llm::run_tool_loop_with_provenance(
         &provider,
         req,
         &guarded,
         duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
         duduclaw_llm::ProvenanceConfig::default(),
+        interceptor,
     )
     .await;
 

@@ -28,6 +28,98 @@ use duduclaw_redaction::{
     RedactionManager, ToggleDecision, ToggleInputs, compute_effective_enabled,
 };
 
+/// Byte cap for a poison `reason` — a TOML error can carry a long excerpt and
+/// this string ends up in a dashboard banner. CJK-safe (never slices mid-char).
+pub const POISON_REASON_MAX_BYTES: usize = 500;
+
+/// What `config.toml` says about redaction at gateway boot.
+///
+/// The three outcomes are deliberately distinct: before 2026-09 a deserialize
+/// failure collapsed into `None` and took the same silent path as "not
+/// configured", so a typo'd `[redaction]` block ran the gateway unredacted with
+/// nothing louder than a DEBUG line. See DESIGN-redaction-field-rules-2026-09 §12.
+#[derive(Debug, Clone)]
+pub enum BootOutcome {
+    /// No `config.toml`, no `[redaction]` section, or `enabled = false`.
+    /// Nothing is built — identical to the pre-2026-09 behaviour.
+    Disabled,
+    /// `[redaction]` parsed and `enabled = true`.
+    Enabled(Box<RedactionConfig>),
+    /// Redaction could not be resolved from config. The gateway still boots,
+    /// but enters the poison state (loud log + Activity Feed + dashboard
+    /// banner) instead of silently running without protection.
+    Poisoned(String),
+}
+
+/// Classify the `[redaction]` boot outcome from raw `config.toml` text.
+///
+/// `None` = the file does not exist (fresh install) ⇒ [`BootOutcome::Disabled`].
+///
+/// A whole-file TOML syntax error poisons rather than disabling: with the
+/// document unparseable we cannot prove redaction was *not* requested, and
+/// "cannot tell" must never resolve to "run unprotected" (fail closed).
+pub fn classify_redaction_boot(raw_config_text: Option<&str>) -> BootOutcome {
+    let Some(raw) = raw_config_text else {
+        return BootOutcome::Disabled;
+    };
+    let table: toml::Table = match toml::from_str(raw) {
+        Ok(t) => t,
+        Err(e) => {
+            return BootOutcome::Poisoned(poison_reason(format!("config.toml 解析失敗：{e}")));
+        }
+    };
+    let Some(section) = table.get("redaction") else {
+        return BootOutcome::Disabled;
+    };
+    let cfg: RedactionConfig = match section.clone().try_into() {
+        Ok(c) => c,
+        Err(e) => {
+            return BootOutcome::Poisoned(poison_reason(format!("[redaction] 設定解析失敗：{e}")));
+        }
+    };
+    if cfg.enabled {
+        BootOutcome::Enabled(Box::new(cfg))
+    } else {
+        BootOutcome::Disabled
+    }
+}
+
+/// Normalise a poison reason for storage/display: single line, byte-capped
+/// (CJK-safe — never a raw byte slice, per the project's coding conventions).
+pub fn poison_reason(raw: impl AsRef<str>) -> String {
+    let flat = raw.as_ref().replace(['\n', '\r'], " ");
+    let trimmed = flat.trim();
+    duduclaw_core::truncate_bytes(trimmed, POISON_REASON_MAX_BYTES).to_string()
+}
+
+/// Best-effort Activity Feed row for a redaction lifecycle event
+/// (`redaction_init_failed` / `redaction_recovered`).
+///
+/// Mirrors `auth_outage::post_activity` — telemetry, never control flow: if
+/// the task store cannot be opened or the append fails we log at debug and
+/// move on, because an alarm bell must not be the reason the gateway fails.
+pub async fn post_redaction_activity(home_dir: &Path, event_type: &str, summary: &str) {
+    let store = match crate::task_store::TaskStore::open(home_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "redaction activity: task store unavailable (non-fatal)");
+            return;
+        }
+    };
+    let row = crate::task_store::ActivityRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        event_type: event_type.to_string(),
+        agent_id: String::new(),
+        task_id: None,
+        summary: summary.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        metadata: None,
+    };
+    if let Err(e) = store.append_activity(&row).await {
+        tracing::debug!(error = %e, "redaction activity: append failed (non-fatal)");
+    }
+}
+
 /// Read the CLI `--redact=on/off` flag persisted in `DUDUCLAW_REDACT_CLI_FLAG`.
 /// `entry_point()` writes this env var before dispatching to subcommands.
 pub fn cli_flag_from_env() -> CliFlag {
@@ -113,6 +205,90 @@ pub fn is_redaction_active(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // ── §12 boot classification ──────────────────────────────
+
+    #[test]
+    fn missing_config_is_disabled_not_poisoned() {
+        assert!(matches!(classify_redaction_boot(None), BootOutcome::Disabled));
+    }
+
+    #[test]
+    fn config_without_redaction_section_is_disabled() {
+        let raw = "[general]\ndefault_agent = \"kiki\"\n";
+        assert!(matches!(
+            classify_redaction_boot(Some(raw)),
+            BootOutcome::Disabled
+        ));
+    }
+
+    #[test]
+    fn redaction_disabled_is_disabled() {
+        let raw = "[redaction]\nenabled = false\nprofiles = [\"general\"]\n";
+        assert!(matches!(
+            classify_redaction_boot(Some(raw)),
+            BootOutcome::Disabled
+        ));
+    }
+
+    #[test]
+    fn redaction_enabled_yields_the_parsed_config() {
+        let raw = "[redaction]\nenabled = true\nprofiles = [\"general\"]\n";
+        match classify_redaction_boot(Some(raw)) {
+            BootOutcome::Enabled(cfg) => {
+                assert!(cfg.enabled);
+                assert_eq!(cfg.profiles, vec!["general".to_string()]);
+            }
+            other => panic!("expected Enabled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_redaction_section_poisons_instead_of_disabling() {
+        // `vault_ttl_hours` must be an integer — the old `.ok()` path turned
+        // this into `None` and ran the gateway unredacted in silence.
+        let raw = "[redaction]\nenabled = true\nvault_ttl_hours = \"forever\"\n";
+        match classify_redaction_boot(Some(raw)) {
+            BootOutcome::Poisoned(reason) => assert!(
+                reason.contains("[redaction]"),
+                "reason should name the section: {reason}"
+            ),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_rule_type_poisons() {
+        let raw = concat!(
+            "[redaction]\nenabled = true\n",
+            "[redaction.rules.oops]\ntype = \"not_a_kind\"\ncategory = \"X\"\n"
+        );
+        assert!(matches!(
+            classify_redaction_boot(Some(raw)),
+            BootOutcome::Poisoned(_)
+        ));
+    }
+
+    #[test]
+    fn whole_file_syntax_error_poisons() {
+        let raw = "[redaction\nenabled = true\n";
+        match classify_redaction_boot(Some(raw)) {
+            BootOutcome::Poisoned(reason) => {
+                assert!(reason.contains("config.toml"), "{reason}")
+            }
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poison_reason_is_single_line_and_byte_capped() {
+        let long = format!("壞掉了\n{}", "壞".repeat(1000));
+        let r = poison_reason(&long);
+        assert!(!r.contains('\n'));
+        assert!(r.len() <= POISON_REASON_MAX_BYTES);
+        // CJK-safe: the cap walked back to a char boundary.
+        assert!(std::str::from_utf8(r.as_bytes()).is_ok());
+    }
 
     #[test]
     fn none_manager_always_disabled() {

@@ -188,6 +188,7 @@ pub mod external_factors;
 pub mod cli_auth;
 pub mod setup_token_wizard;
 pub mod cli_noise;
+pub mod db_sources_rpc;        // §13.7 WP-D: operator RPCs for [db_sources.*]
 pub mod handlers;
 pub mod knowledge_guard;
 pub mod memory_factory;
@@ -293,6 +294,9 @@ pub mod llm_fallback;
 
 // ── RFC-23 redaction-pipeline integration shim ──
 pub mod redaction_integration;
+
+// ── RFC-23 §13.6: redaction for external MCP servers + the direct-API loop ──
+pub mod redaction_proxy;
 
 pub use extension::{GatewayExtension, NullExtension};
 pub use server::{start_gateway, GatewayConfig};

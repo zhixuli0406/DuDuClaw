@@ -11,6 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::data_source::DataSourceDef;
 use crate::error::{RedactionError, Result};
 use crate::rules::RuleSpec;
 
@@ -50,6 +51,16 @@ pub struct RedactionConfig {
 
     /// Inline rule definitions (override + supplement profile rules).
     pub rules: HashMap<String, RuleSpec>,
+
+    /// Operator-defined data sources (`[redaction.data_sources.<name>]`) —
+    /// which tools return records of which table, and where those records
+    /// sit in the tool result. `db_field` rules name one of these (or one of
+    /// the built-ins) in `source`.
+    ///
+    /// Deliberately distinct from [`Self::sources`], which is the *input
+    /// source* policy (user_input / tool_results / …); the two words collide
+    /// in English but never in the TOML.
+    pub data_sources: HashMap<String, DataSourceDef>,
 }
 
 impl Default for RedactionConfig {
@@ -63,6 +74,7 @@ impl Default for RedactionConfig {
             sources: SourcePolicy::default(),
             tool_egress: HashMap::new(),
             rules: HashMap::new(),
+            data_sources: HashMap::new(),
         }
     }
 }

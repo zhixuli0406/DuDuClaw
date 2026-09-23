@@ -1624,8 +1624,17 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
     let externals =
         crate::mcp_external::load_external_mcp_servers_resolved(&agent_dir, &home_dir).await;
 
+    // RFC-23 §13.6: server names are recorded so `ToolExecutor::server_of`
+    // can give a `ToolInterceptor` the `<server>.<tool>` namespace the
+    // redaction rules match on — the same namespace `duduclaw mcp-proxy`
+    // applies on the CLI path. Routing/collision behaviour is unchanged.
     if externals.is_empty() {
-        return match duduclaw_llm::ToolRegistry::from_clients(vec![internal]).await {
+        return match duduclaw_llm::ToolRegistry::from_clients_named(
+            vec![("duduclaw".to_string(), internal)],
+            Vec::new(),
+        )
+        .await
+        {
             Ok(reg) => Some(reg),
             Err(e) => {
                 warn!(error = %e, "MCP tools/list failed — Direct-API reply will be tools-less");
@@ -1634,7 +1643,7 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
         };
     }
 
-    let mut clients = vec![internal];
+    let mut clients = vec![("duduclaw".to_string(), internal)];
     let mut filters = vec![duduclaw_llm::ToolFilter::default()];
     for ext in externals {
         // Transport per entry: `url` ⇒ remote Streamable HTTP (Google
@@ -1662,7 +1671,7 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
         match connected {
             Ok(c) => {
                 info!(server = %ext.name, "external MCP server mounted");
-                clients.push(c);
+                clients.push((ext.name.clone(), c));
                 filters.push(ext.filter);
             }
             // A single external server failing must not sink the whole reply —
@@ -1673,16 +1682,19 @@ pub(crate) async fn build_mcp_tool_registry(agent_id: &str) -> Option<duduclaw_l
         }
     }
 
-    match duduclaw_llm::ToolRegistry::from_clients_filtered(clients, filters).await {
+    match duduclaw_llm::ToolRegistry::from_clients_named(clients, filters).await {
         Ok(reg) => Some(reg),
         Err(e) => {
             // A misbehaving external server can fail the combined tools/list.
             // Degrade to internal-only rather than losing all tools.
             warn!(error = %e, "combined MCP registry build failed — retrying internal-only");
             let internal = connect_internal().await.ok()?;
-            duduclaw_llm::ToolRegistry::from_clients(vec![internal])
-                .await
-                .ok()
+            duduclaw_llm::ToolRegistry::from_clients_named(
+                vec![("duduclaw".to_string(), internal)],
+                Vec::new(),
+            )
+            .await
+            .ok()
         }
     }
 }
@@ -1812,7 +1824,29 @@ async fn run_llm_provider(
     };
 
     // G2: MCP tool registry (fail-safe → tools-less bare completion).
-    let registry = build_mcp_tool_registry(agent_id).await;
+    let mut registry = build_mcp_tool_registry(agent_id).await;
+
+    // RFC-23 §13.6: the tool loop below dispatches MCP tools in-process, so
+    // no `mcp-server` / `mcp-proxy` choke point sees their results. Redaction
+    // inactive ⇒ `None` ⇒ byte-identical. Enabled-but-broken ⇒ drop the tool
+    // surface for this call (fail-closed §10.2: the existing `None` arm does
+    // a plain tools-less completion rather than leaking unredacted results).
+    let redaction_interceptor = match crate::redaction_proxy::try_build_interceptor(
+        &duduclaw_core::duduclaw_home(),
+        agent_id,
+        &crate::redaction_proxy::current_session_id(),
+    ) {
+        Ok(i) => i.map(|i| i as std::sync::Arc<dyn duduclaw_llm::ToolInterceptor>),
+        Err(e) => {
+            warn!(
+                agent = %agent_id, error = %e,
+                "Direct-API tool loop disabled — redaction is enabled but failed to initialise"
+            );
+            registry = None;
+            None
+        }
+    };
+
     info!(
         provider = provider_id,
         model,
@@ -1860,6 +1894,7 @@ async fn run_llm_provider(
                 &guarded,
                 duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
                 prov_cfg,
+                redaction_interceptor,
             )
             .await;
             // Before the error is mapped away: a partially-run turn is still a
@@ -3382,6 +3417,53 @@ tokio::task_local! {
 ///
 /// When `capabilities` is provided, high-risk tools not explicitly enabled
 /// are added to `--disallowedTools` (deny-by-default security posture).
+/// RFC-23 §13.6: compute this spawn's `--mcp-config` override.
+///
+/// Unlike `channel_reply.rs`, this path deliberately passes **no**
+/// `--mcp-config` at all — the CLI auto-discovers `<work_dir>/.mcp.json`
+/// from the working directory. That auto-discovery is exactly what lets a
+/// customer's external MCP servers run unproxied on every dispatch / cron /
+/// heartbeat / goal-loop turn, so when redaction is active we take the
+/// discovery over: rewrite the config (external stdio servers routed through
+/// `duduclaw mcp-proxy`) into a per-spawn temp file and point the CLI at it.
+///
+/// `None` ⇒ nothing is added and the command line stays byte-identical to
+/// the pre-RFC-23 behaviour (no `--mcp-config`, no `--strict-mcp-config`,
+/// auto-discovery unchanged). `--strict-mcp-config` is only ever added
+/// together with the rewritten file — it is what stops the CLI from ALSO
+/// merging the ambient/global config once we start naming one explicitly.
+pub(crate) fn mcp_proxy_cli_args(
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+) -> Option<(Vec<String>, tempfile::TempPath)> {
+    let mcp_json = work_dir?.join(".mcp.json");
+    if !mcp_json.exists() {
+        return None;
+    }
+    let proxied = crate::redaction_proxy::maybe_proxy_mcp_config(home_dir, &mcp_json)?;
+    let args = vec![
+        "--mcp-config".to_string(),
+        proxied.to_string_lossy().to_string(),
+        "--strict-mcp-config".to_string(),
+    ];
+    Some((args, proxied))
+}
+
+/// Guards whose lifetime must cover the spawned child: the temp files the
+/// command line points at are deleted when these drop.
+///
+/// Pure RAII — the fields exist for their `Drop`, never to be read, so
+/// `dead_code` is expected here rather than a sign of an unused field. The
+/// caller binds the whole struct (`_cmd_guards`) for the duration of the
+/// child and drops it afterwards.
+#[allow(dead_code)]
+pub(crate) struct ClaudeCmdGuards {
+    /// `--system-prompt-file` temp file (BE-C1).
+    prompt: Option<tempfile::TempPath>,
+    /// RFC-23 §13.6 `--mcp-config` rewritten config, when redaction is active.
+    mcp_proxy: Option<tempfile::TempPath>,
+}
+
 fn prepare_claude_cmd(
     claude_path: &str,
     prompt: &str,
@@ -3389,7 +3471,11 @@ fn prepare_claude_cmd(
     system_prompt: &str,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
     work_dir: Option<&Path>,
-) -> (tokio::process::Command, Option<tempfile::TempPath>) {
+    // RFC-23 §13.6: DuDuClaw home used to resolve whether redaction is active
+    // for this spawn. Production passes the process home; tests pass a temp
+    // root so the gate can be exercised without touching process state.
+    home_dir: &Path,
+) -> (tokio::process::Command, ClaudeCmdGuards) {
     let mut cmd = duduclaw_core::platform::async_command_for(claude_path);
 
     // WP-8B (credentials doctrine P3, 2026-08): the child used to inherit the
@@ -3438,6 +3524,16 @@ fn prepare_claude_cmd(
     if let Some(dir) = work_dir {
         cmd.current_dir(dir);
     }
+    // RFC-23 §13.6: override that auto-discovery with a proxied copy when
+    // redaction is active (see `mcp_proxy_cli_args`). `None` ⇒ no flags at
+    // all, auto-discovery unchanged.
+    let mcp_proxy_guard = match mcp_proxy_cli_args(home_dir, work_dir) {
+        Some((args, guard)) => {
+            cmd.args(&args);
+            Some(guard)
+        }
+        None => None,
+    };
     // #15 (2026-05-12) — opt in to `--bare` when the calling site has
     // wrapped this invocation in a `BARE_MODE.scope(true, ...)`. The
     // flag disables CLAUDE.md auto-discovery (the leak from #15's
@@ -3533,6 +3629,16 @@ fn prepare_claude_cmd(
         cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");
     }
 
+    // RFC-23 §14.4: arm the data-file guard PreToolUse hook for this spawn.
+    // Same predicate as the two `channel_reply` spawn sites so dispatch /
+    // cron / heartbeat / goal-loop turns are protected identically to a
+    // channel reply — a CSV read on a cron wake-up is exactly as sensitive.
+    // `None` (redaction inactive, or the guard switched off) ⇒ the env var is
+    // never set and the installed hook exits 0 immediately.
+    if let Some(mode) = crate::redaction_proxy::data_file_guard_env_for_spawn(home_dir) {
+        cmd.env(duduclaw_core::ENV_DATA_FILE_GUARD, mode);
+    }
+
     // CACHE_SPLIT_MARKER is a Direct-API-only layering hint — strip it here.
     let system_prompt_cli: std::borrow::Cow<'_, str> = if system_prompt
         .contains(crate::direct_api::CACHE_SPLIT_MARKER)
@@ -3606,7 +3712,10 @@ fn prepare_claude_cmd(
         cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
     }
 
-    (cmd, prompt_guard)
+    (
+        cmd,
+        ClaudeCmdGuards { prompt: prompt_guard, mcp_proxy: mcp_proxy_guard },
+    )
 }
 
 /// Call claude CLI with custom env vars (supports both OAuth and API key).
@@ -3619,13 +3728,16 @@ async fn call_claude_with_env(
     work_dir: Option<&Path>,
 ) -> Result<ClaudeResponse, String> {
     let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
-    let (mut cmd, _prompt_guard) = prepare_claude_cmd(
+    // `_cmd_guards` holds the `--system-prompt-file` and (RFC-23 §13.6)
+    // `--mcp-config` temp files; both must outlive the child below.
+    let (mut cmd, _cmd_guards) = prepare_claude_cmd(
         &claude,
         prompt,
         model,
         system_prompt,
         capabilities,
         work_dir,
+        &duduclaw_core::platform::duduclaw_home(),
     );
 
     for (key, value) in env_vars {
@@ -4347,5 +4459,144 @@ mod chain_tests {
         // Nothing usable → None.
         assert_eq!(choose_key_source(None, None), None);
         assert_eq!(choose_key_source(Some(("oauth".into(), None)), None), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — RFC-23 §13.6 `.mcp.json` proxy rewrite on the dispatch spawn path
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod redaction_proxy_cli_args_tests {
+    use super::mcp_proxy_cli_args;
+    use serde_json::json;
+
+    /// `<home>/agents/<id>/.mcp.json` with the built-in server plus one
+    /// third-party stdio server — the shape a customer's Postgres / 鼎新
+    /// bridge produces.
+    fn agent_dir_with_mcp_json(home: &std::path::Path) -> std::path::PathBuf {
+        let dir = home.join("agents").join("agnes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".mcp.json"),
+            json!({
+                "mcpServers": {
+                    "duduclaw": {
+                        "command": "/opt/duduclaw/bin/duduclaw",
+                        "args": ["mcp-server"],
+                        "env": {
+                            "DUDUCLAW_HOME": home.to_string_lossy(),
+                            "DUDUCLAW_AGENT_ID": "agnes"
+                        }
+                    },
+                    "crm_pg": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-postgres"],
+                        "env": {"PGPASSWORD": "hunter2"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn enable_redaction(home: &std::path::Path) {
+        std::fs::write(
+            home.join("config.toml"),
+            "[redaction]\nenabled = true\nprofiles = [\"general\"]\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn redaction_off_adds_no_mcp_flags_at_all() {
+        // The dispatch path relies on the CLI auto-discovering `.mcp.json`
+        // from the working directory. With redaction off that must stay
+        // byte-identical — in particular `--strict-mcp-config` must NOT
+        // appear on its own, or the ambient/global MCP config would be
+        // dropped for every dispatch turn.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = agent_dir_with_mcp_json(tmp.path());
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_none());
+    }
+
+    #[test]
+    fn redaction_on_points_the_cli_at_a_rewritten_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = agent_dir_with_mcp_json(tmp.path());
+        enable_redaction(tmp.path());
+
+        let (args, guard) =
+            mcp_proxy_cli_args(tmp.path(), Some(&dir)).expect("an external stdio server to proxy");
+        assert_eq!(args[0], "--mcp-config");
+        assert_eq!(args[1], guard.to_string_lossy());
+        assert_eq!(args[2], "--strict-mcp-config");
+        assert_eq!(args.len(), 3);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&guard).unwrap()).unwrap();
+        // The built-in server is untouched — it already redacts.
+        assert_eq!(body["mcpServers"]["duduclaw"]["args"], json!(["mcp-server"]));
+        assert_eq!(
+            body["mcpServers"]["duduclaw"]["command"],
+            json!("/opt/duduclaw/bin/duduclaw")
+        );
+        // The third-party one now launches through the proxy.
+        let pg = &body["mcpServers"]["crm_pg"];
+        assert_eq!(pg["args"][0], json!("mcp-proxy"));
+        assert_eq!(pg["args"][1], json!("--server"));
+        assert_eq!(pg["args"][2], json!("crm_pg"));
+        assert_eq!(pg["args"][3], json!("--"));
+        assert_eq!(pg["args"][4], json!("npx"));
+        // Its credential rides in an env var, never argv.
+        assert!(!pg["args"].to_string().contains("hunter2"));
+
+        // The agent's own file on disk is never modified.
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(original["mcpServers"]["crm_pg"]["command"], json!("npx"));
+    }
+
+    #[test]
+    fn no_work_dir_or_no_mcp_json_is_a_no_op() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        enable_redaction(tmp.path());
+        assert!(mcp_proxy_cli_args(tmp.path(), None).is_none());
+
+        let bare = tmp.path().join("agents").join("no-config");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&bare)).is_none());
+    }
+
+    #[test]
+    fn a_config_with_only_the_builtin_server_is_a_no_op() {
+        // Nothing to proxy ⇒ no flags, so auto-discovery (and the ambient
+        // config) keep working exactly as before.
+        let tmp = tempfile::TempDir::new().unwrap();
+        enable_redaction(tmp.path());
+        let dir = tmp.path().join("agents").join("solo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".mcp.json"),
+            json!({"mcpServers": {"duduclaw": {"command": "/x", "args": ["mcp-server"]}}})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(mcp_proxy_cli_args(tmp.path(), Some(&dir)).is_none());
+    }
+
+    #[test]
+    fn the_rewritten_config_is_deleted_when_the_guard_drops() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = agent_dir_with_mcp_json(tmp.path());
+        enable_redaction(tmp.path());
+
+        let (_args, guard) = mcp_proxy_cli_args(tmp.path(), Some(&dir)).unwrap();
+        let path = guard.to_path_buf();
+        assert!(path.exists());
+        drop(guard);
+        assert!(!path.exists(), "the per-spawn temp config must not linger");
     }
 }

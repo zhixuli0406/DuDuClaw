@@ -310,6 +310,56 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "identity:read",
         "identity",
     ),
+    // ── Read-only SQL data sources (db:read, WP-D §13.7) ─────────────────
+    // One read scope for all four: the connector has no write surface. The
+    // dispatch gate ADDITIONALLY requires `[capabilities] db_sources` to name
+    // the source, so scope alone never reaches a customer database.
+    (
+        "db_sources",
+        "List the SQL data sources this agent may query",
+        "db:read",
+        "db",
+    ),
+    (
+        "db_tables",
+        "List a data source's tables and columns",
+        "db:read",
+        "db",
+    ),
+    (
+        "db_select",
+        "Read rows from one allowed table (structured, parameterized)",
+        "db:read",
+        "db",
+    ),
+    (
+        "db_query",
+        "Run a read-only SELECT/WITH query against a data source",
+        "db:read",
+        "db",
+    ),
+    // ── Local data files (files:read, WP-F2 §14.2) ───────────────────────
+    // The ONLY de-identified route to a local CSV / spreadsheet / text file.
+    // No per-agent grant: the path fence (agent dir + attachments +
+    // `[files] allowed_roots`) is what bounds these, so they are always listed.
+    (
+        "file_read",
+        "Read a plain-text file (txt/md/json/log/yaml)",
+        "files:read",
+        "files",
+    ),
+    (
+        "csv_read",
+        "Read a CSV/TSV file as columns and rows",
+        "files:read",
+        "files",
+    ),
+    (
+        "xlsx_read",
+        "Read one worksheet of an Excel/ODS workbook as columns and rows",
+        "files:read",
+        "files",
+    ),
     // ── Odoo: read (odoo:read) ───────────────────────────────────────────
     (
         "odoo_status",

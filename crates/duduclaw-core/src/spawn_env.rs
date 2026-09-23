@@ -108,6 +108,15 @@ pub const AGENT_CLI_ENV_ALLOWLIST: &[&str] = &[
     // scrub silently kept this off even when the operator set `=1` — the
     // TODO-spawn-env-allowlist-fallout sweep's one silent in-child casualty.
     "DUDUCLAW_SEMANTIC_VECTORS",
+    // RFC-23 §14.4 data-file guard mode ("on" / "read_only" / "off"). Not a
+    // credential — a three-value policy word the PreToolUse hook reads to
+    // decide whether a built-in `Read`/`Bash` may touch a CSV/spreadsheet.
+    // The gateway sets it explicitly at each spawn site when redaction is
+    // active for that agent (that explicit `cmd.env` wins over this list);
+    // the allowlist entry is what lets an operator set the mode on the
+    // gateway process itself and have it reach a spawn the gateway did not
+    // decorate. Absent ⇒ the hook is inert, which is the pre-§14.4 behavior.
+    "DUDUCLAW_DATA_FILE_GUARD",
 ];
 
 /// macOS only: Cocoa `NSString`/Keychain Services initialization reads this
@@ -385,6 +394,21 @@ mod tests {
                     "`{name}` looks like a credential (suffix `{suffix}`) — must not be in the spawn-env allowlist"
                 );
             }
+        }
+    }
+
+    /// RFC-23 §14.4: the guard-mode variable is on the list and is a policy
+    /// word, not a credential — pinned by name so a future rename cannot
+    /// silently disable the guard on every spawn.
+    #[test]
+    fn data_file_guard_mode_is_allowlisted_and_is_not_secret_shaped() {
+        assert!(
+            AGENT_CLI_ENV_ALLOWLIST.contains(&crate::ENV_DATA_FILE_GUARD),
+            "the §14.4 guard mode must survive the spawn-env scrub"
+        );
+        assert_eq!(crate::ENV_DATA_FILE_GUARD, "DUDUCLAW_DATA_FILE_GUARD");
+        for suffix in ["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_KEY"] {
+            assert!(!"DUDUCLAW_DATA_FILE_GUARD".ends_with(suffix));
         }
     }
 

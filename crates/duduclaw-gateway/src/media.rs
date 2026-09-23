@@ -240,7 +240,31 @@ pub fn format_attachment_ref(media_type: &MediaType, filename: &str, path: &std:
         MediaType::Video => "video",
         MediaType::File => "file",
     };
-    format!("[{emoji} {filename} ({type_label})]({})", path.display())
+    let hint = data_file_tool_hint(filename);
+    format!("[{emoji} {filename} ({type_label})]({}){hint}", path.display())
+}
+
+/// Extensions whose content must reach the model through an MCP tool, never
+/// through the built-in `Read`. RFC-23 §14.2/§14.4: only the MCP route passes
+/// the redaction choke point, and for the spreadsheet family the
+/// `data-file-guard` hook actively refuses the built-in one — so an
+/// attachment reference that did not say which tool to use would hand the
+/// model a path it is about to be blocked from opening.
+const DATA_FILE_HINT_EXTENSIONS: &[&str] =
+    &["csv", "tsv", "xlsx", "xlsm", "xls", "ods", "txt", "md", "json"];
+
+/// The sentence appended to an attachment reference for a readable data file.
+/// Empty for every other extension, so those references stay byte-identical.
+fn data_file_tool_hint(filename: &str) -> &'static str {
+    let ext = filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if DATA_FILE_HINT_EXTENSIONS.contains(&ext.as_str()) {
+        " 請用 csv_read／xlsx_read／file_read 讀取"
+    } else {
+        ""
+    }
 }
 
 /// Download a file from a URL with an optional auth header.
@@ -452,6 +476,47 @@ mod tests {
         assert_eq!(mime_from_extension("pdf"), "application/pdf");
         assert_eq!(mime_from_extension("csv"), "text/csv");
         assert_eq!(mime_from_extension("unknown"), "application/octet-stream");
+    }
+
+    #[test]
+    fn attachment_ref_hints_the_mcp_tool_for_data_files() {
+        let path = std::path::Path::new("/a/customers.csv");
+        let line = format_attachment_ref(&MediaType::File, "customers.csv", path);
+        assert!(line.contains("customers.csv"));
+        assert!(line.contains("/a/customers.csv"));
+        assert!(
+            line.ends_with("請用 csv_read／xlsx_read／file_read 讀取"),
+            "line: {line}"
+        );
+    }
+
+    #[test]
+    fn attachment_ref_hint_covers_every_readable_extension_case_insensitively() {
+        for name in [
+            "a.csv", "a.tsv", "a.XLSX", "a.xlsm", "a.xls", "a.ods", "a.txt", "notes.MD",
+            "data.json", "客戶清單.xlsx",
+        ] {
+            let line =
+                format_attachment_ref(&MediaType::File, name, std::path::Path::new("/a"));
+            assert!(line.contains("csv_read"), "{name} should be hinted: {line}");
+        }
+    }
+
+    #[test]
+    fn attachment_ref_is_unchanged_for_other_extensions() {
+        for (mt, name) in [
+            (MediaType::Image, "photo.png"),
+            (MediaType::Audio, "voice.ogg"),
+            (MediaType::Video, "clip.mp4"),
+            (MediaType::File, "report.pdf"),
+            (MediaType::File, "deck.pptx"),
+            (MediaType::File, "no-extension"),
+        ] {
+            let path = std::path::Path::new("/a/x");
+            let line = format_attachment_ref(&mt, name, path);
+            assert!(!line.contains("csv_read"), "{name} must stay plain: {line}");
+            assert!(line.ends_with(')'), "{name}: {line}");
+        }
     }
 
     #[test]

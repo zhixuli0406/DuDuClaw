@@ -249,6 +249,18 @@ pub const ENV_REPLY_CHANNEL: &str = "DUDUCLAW_REPLY_CHANNEL";
 pub const ENV_TRUST_TURN_ID: &str = "DUDUCLAW_TURN_ID";
 pub const ENV_TRUST_SESSION_ID: &str = "DUDUCLAW_SESSION_ID";
 
+/// RFC-23 §14.4 data-file guard mode: `"on"` / `"read_only"` / `"off"`.
+///
+/// Written by the gateway at each Claude-CLI spawn site, but ONLY when
+/// redaction is actually active for that spawn
+/// (`redaction_proxy::data_file_guard_env_for_spawn`); read by the
+/// `data-file-guard.sh` PreToolUse hook installed in each agent's
+/// `.claude/hooks/`. Absent ⇒ the hook exits 0 immediately, which is the
+/// pre-§14.4 behavior. Named here rather than as a literal in two crates
+/// because the writer (gateway) and the reader (the shell script, plus
+/// `spawn_env`'s allowlist in this crate) must never drift apart.
+pub const ENV_DATA_FILE_GUARD: &str = "DUDUCLAW_DATA_FILE_GUARD";
+
 /// `working_state` key used for the agent-body update vertical slice's
 /// cross-restart result report handshake (Y8-3, T1 —
 /// `commercial/docs/DESIGN-agent-body-update-2026-08.md` §13). Shared here

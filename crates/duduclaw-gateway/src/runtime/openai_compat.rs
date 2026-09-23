@@ -396,6 +396,29 @@ impl OpenAiCompatRuntime {
         // task-local that claude_runner.rs (WP-A4) and codex/gemini (T10)
         // use, so `dispatcher.rs`'s bridging logic doesn't need a
         // runtime-specific branch.
+        // RFC-23 §13.6: this loop dispatches MCP tools IN PROCESS, so no
+        // `mcp-server` / `mcp-proxy` choke point sees their results. The
+        // interceptor is that choke point for this path. `None` ⇒ redaction
+        // inactive (byte-identical to before). Enabled-but-unbuildable ⇒
+        // drop the tool surface for this turn (§10.2 fail-closed) and degrade
+        // to the plain-messages path — the same fail-safe shape this function
+        // already uses for an unreachable MCP registry, never a leak.
+        let interceptor = match crate::redaction_proxy::try_build_interceptor(
+            &context.home_dir,
+            &context.agent_id,
+            &crate::redaction_proxy::current_session_id(),
+        ) {
+            Ok(i) => i.map(|i| i as std::sync::Arc<dyn duduclaw_llm::ToolInterceptor>),
+            Err(e) => {
+                warn!(
+                    agent = %context.agent_id, error = %e,
+                    "OpenAiCompatRuntime: MCP tool loop disabled — redaction is enabled but \
+                     failed to initialise; degrading to plain messages"
+                );
+                return Ok(None);
+            }
+        };
+
         // WP-6E: Code Mode Phase 0 measurement gate
         // (`commercial/docs/DESIGN-code-mode-2026-08.md` §8.1). A pure
         // observation decorator layered OVER the billing tap — it forwards
@@ -409,6 +432,7 @@ impl OpenAiCompatRuntime {
             &guarded,
             duduclaw_llm::DEFAULT_MAX_TOOL_ITERS,
             duduclaw_llm::ProvenanceConfig::default(),
+            interceptor,
         )
         .await;
         // Recorded BEFORE the `?`: a turn that died mid-loop still measured

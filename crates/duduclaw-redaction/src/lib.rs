@@ -29,17 +29,21 @@
 //! - [`vault`]  — encrypted SQLite mapping store
 //! - [`pipeline`] — top-level redact / restore API
 //! - [`config`] — `RedactionConfig`, `Profile`
+//! - [`data_source`] — data-source registry (`db_field` tool bindings)
 //! - [`egress`] — tool egress whitelist + arg restoration
 //! - [`audit`]  — JSONL audit sink
 //! - [`profiles`] — embedded built-in profiles
+//! - [`locate`] — pointer/token location helpers for evidence reports
 
 pub mod audit;
 pub mod config;
 pub mod dashboard;
+pub mod data_source;
 pub mod egress;
 pub mod engine;
 pub mod error;
 pub mod gc;
+pub mod locate;
 pub mod manager;
 pub mod pipeline;
 pub mod profiles;
@@ -53,13 +57,18 @@ pub use audit::{AuditEvent, AuditSink, JsonlAuditSink, NullAuditSink};
 pub use config::{
     Profile, ProfileMeta, RedactionConfig, RestoreArgsMode, SourceMode, SourcePolicy, ToolEgressRule,
 };
+pub use data_source::{
+    BUILTIN_SOURCE_NAMES, DataSource, DataSourceDef, TableSource, ToolBinding, builtin_sources,
+    is_builtin_source, is_valid_data_source_name,
+};
 pub use egress::{EgressDecision, EgressEvaluator};
-pub use engine::{MatchedSpan, RuleEngine};
+pub use engine::{EngineOptions, MatchedSpan, RuleEngine, StructuredHit};
 pub use error::{RedactionError, Result};
 pub use gc::{GcConfig, GcTask, spawn_gc};
-pub use manager::{ManagerPaths, RedactionManager};
-pub use pipeline::{RedactionOutput, RedactionPipeline};
-pub use rules::{Match, RestoreScope, Rule, RuleKind, RuleSpec};
+pub use locate::{collect_token_locations, escape_pointer, scan_tokens};
+pub use manager::{ManagerPaths, RedactionManager, resolve_data_sources, resolve_rule_specs};
+pub use pipeline::{RedactionOutput, RedactionPipeline, ToolContext};
+pub use rules::{IdentityRule, JsonPathRule, Match, RestoreScope, Rule, RuleKind, RuleSpec};
 pub use source::{Caller, RestoreTarget, Source};
 pub use toggle::{
     ChannelPolicy, CliFlag, EnvSetting, ForceOverrideFlag, ForceOverrideRecord, ToggleDecision,

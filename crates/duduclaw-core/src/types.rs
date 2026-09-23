@@ -822,6 +822,26 @@ pub struct CapabilitiesConfig {
     #[serde(default)]
     pub codrive: bool,
 
+    /// Read-only SQL data sources this agent may query (WP-D,
+    /// `DESIGN-redaction-field-rules-2026-09` §13.7). Each entry names a
+    /// `config.toml [db_sources.<name>]` block.
+    ///
+    /// **Deny-by-default**: empty or absent means the `db_sources` /
+    /// `db_tables` / `db_select` / `db_query` MCP tools are refused at the
+    /// dispatch gate and hidden from `tools/list`, so a customer database is
+    /// never reachable by an agent nobody granted it to. Granting a source
+    /// here is not the whole authorization — the source's own
+    /// `allowed_tables` still bounds what `db_select` / `db_tables` can see.
+    ///
+    /// Uses [`crate::lenient::string_vec`] like its `*_tools` siblings: one
+    /// stray non-string element drops that element rather than making the
+    /// agent fail to parse (and therefore vanish from the registry).
+    /// `skip_serializing_if` keeps the on-disk shape unchanged for the
+    /// overwhelming majority of agents that have no database grant.
+    #[serde(default, deserialize_with = "crate::lenient::string_vec")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub db_sources: Vec<String>,
+
     // ── Formerly-untyped `[capabilities]` keys (R2 unification) ─────────
     //
     // These six lived in the same `[capabilities]` table as the fields above
@@ -1027,6 +1047,7 @@ impl Default for CapabilitiesConfig {
             git_credentials: false,
             system_operator: false,
             codrive: false,
+            db_sources: Vec::new(),
             scoped_tools: Vec::new(),
             grant_ttl_secs: None,
             approval_required_tools: Vec::new(),
@@ -1111,6 +1132,21 @@ pub const DISPATCH_DEFAULT_BUILTIN_TOOLS: [&str; 9] = [
 ];
 
 impl CapabilitiesConfig {
+    /// Does this agent hold a grant for the `db_sources.<name>` block?
+    ///
+    /// Exact, trimmed, ASCII-case-insensitive equality — never a substring
+    /// test (coding convention 2), so a grant for `crm` cannot reach
+    /// `crm_payroll`. An empty grant list denies everything (deny-by-default).
+    pub fn db_source_granted(&self, name: &str) -> bool {
+        let want = name.trim();
+        if want.is_empty() {
+            return false;
+        }
+        self.db_sources
+            .iter()
+            .any(|g| g.trim().eq_ignore_ascii_case(want))
+    }
+
     /// Curated `--tools` value for a minimal-context spawn.
     ///
     /// `--tools` controls which *built-in* Claude Code tool schemas are sent to
@@ -3511,6 +3547,35 @@ mod tests {
         let caps: CapabilitiesConfig = toml::from_str(toml_src).unwrap();
         assert!(caps.policy.is_empty());
         assert!(caps.browser_via_bash);
+    }
+
+    /// WP-D §13.7: `db_sources` is deny-by-default, exact-match, lenient about
+    /// a stray non-string element, and invisible on the wire when empty.
+    #[test]
+    fn capabilities_db_sources_grant_semantics() {
+        let none: CapabilitiesConfig = toml::from_str("computer_use = false").unwrap();
+        assert!(none.db_sources.is_empty());
+        assert!(!none.db_source_granted("crm"), "absent must deny");
+
+        let caps: CapabilitiesConfig =
+            toml::from_str("db_sources = [\"crm\", \"warehouse_pg\"]").unwrap();
+        assert!(caps.db_source_granted("crm"));
+        assert!(caps.db_source_granted(" CRM "), "trimmed, case-insensitive");
+        assert!(caps.db_source_granted("warehouse_pg"));
+        // Never a substring match (coding convention 2).
+        assert!(!caps.db_source_granted("crm_payroll"));
+        assert!(!caps.db_source_granted("cr"));
+        assert!(!caps.db_source_granted(""));
+
+        // One bad element drops that element, it does not sink the agent.
+        let lenient: CapabilitiesConfig =
+            toml::from_str("db_sources = [\"crm\", 7]").unwrap();
+        assert_eq!(lenient.db_sources, vec!["crm".to_string()]);
+
+        // Empty stays off the wire, so an agent.toml round-trip does not grow
+        // a `db_sources = []` line it never had.
+        let rendered = toml::to_string(&CapabilitiesConfig::default()).unwrap();
+        assert!(!rendered.contains("db_sources"), "{rendered}");
     }
 
     #[test]

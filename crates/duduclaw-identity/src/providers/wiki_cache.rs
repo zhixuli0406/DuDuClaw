@@ -49,25 +49,44 @@ pub const PROVIDER_NAME: &str = "wiki-cache";
 /// Reads identity records from `<wiki_root>/identity/people/*.md`.
 #[derive(Debug, Clone)]
 pub struct WikiCacheIdentityProvider {
-    /// Path to the shared wiki root, i.e. `<home>/shared/wiki`.
-    wiki_root: PathBuf,
+    /// Directory actually scanned, i.e. `<wiki_root>/identity/people`. Stored
+    /// resolved (rather than as the wiki root) so a caller that only knows the
+    /// people directory — the redaction crate's `IdentityRule`, which receives
+    /// it from `ManagerPaths` — can point the provider at it directly instead
+    /// of reconstructing a wiki root by stripping path components.
+    people_dir: PathBuf,
 }
 
 impl WikiCacheIdentityProvider {
     /// Build a provider rooted at `<home>/shared/wiki`.
     pub fn for_home(home_dir: impl Into<PathBuf>) -> Self {
         let home: PathBuf = home_dir.into();
-        Self { wiki_root: home.join("shared").join("wiki") }
+        Self::for_wiki_root(home.join("shared").join("wiki"))
     }
 
     /// Build a provider rooted at an explicit wiki directory. Mostly for
     /// tests; production code should prefer [`for_home`].
     pub fn for_wiki_root(wiki_root: impl Into<PathBuf>) -> Self {
-        Self { wiki_root: wiki_root.into() }
+        let root: PathBuf = wiki_root.into();
+        Self { people_dir: root.join("identity").join("people") }
     }
 
-    fn people_dir(&self) -> PathBuf {
-        self.wiki_root.join("identity").join("people")
+    /// Build a provider that scans an explicit `identity/people` directory.
+    pub fn for_people_dir(people_dir: impl Into<PathBuf>) -> Self {
+        Self { people_dir: people_dir.into() }
+    }
+
+    /// The directory this provider scans (`<wiki_root>/identity/people`).
+    pub fn people_dir(&self) -> PathBuf {
+        self.people_dir.clone()
+    }
+
+    /// Synchronous listing of every record that parses — the blocking twin of
+    /// the async trait methods, for callers outside a runtime (the redaction
+    /// engine compiles rules on a plain thread). Same parser, same skip-and-warn
+    /// behaviour; no I/O beyond one directory scan.
+    pub fn list_people_sync(&self) -> Vec<ResolvedPerson> {
+        self.iter_people()
     }
 
     /// Iterate `<wiki_root>/identity/people/*.md` and yield successfully
@@ -488,6 +507,54 @@ mod tests {
             .expect("record with dashes in a value should still resolve");
         assert_eq!(resolved.person_id, "person_dash");
         assert_eq!(resolved.display_name, "Dash --- Person");
+    }
+
+    #[test]
+    fn list_people_sync_returns_every_parseable_record() {
+        let tmp = TempDir::new().unwrap();
+        let provider = WikiCacheIdentityProvider::for_wiki_root(tmp.path().to_path_buf());
+        // Empty (missing) directory ⇒ empty list, never an error.
+        assert!(provider.list_people_sync().is_empty());
+
+        write_person(
+            tmp.path(),
+            "ruby.md",
+            "person_id: person_2f9\ndisplay_name: Ruby Lin\n",
+        );
+        write_person(
+            tmp.path(),
+            "ming.md",
+            "person_id: person_ming\ndisplay_name: 王小明\n",
+        );
+        // Junk must be skipped, not abort the scan.
+        let dir = tmp.path().join("identity").join("people");
+        fs::write(dir.join("junk.md"), "no frontmatter").unwrap();
+
+        let mut names: Vec<String> = provider
+            .list_people_sync()
+            .into_iter()
+            .map(|p| p.display_name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Ruby Lin".to_string(), "王小明".to_string()]);
+    }
+
+    #[test]
+    fn for_people_dir_scans_that_directory_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("custom").join("people");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("a.md"),
+            "---\nperson_id: p1\ndisplay_name: Solo\n---\n",
+        )
+        .unwrap();
+
+        let provider = WikiCacheIdentityProvider::for_people_dir(dir.clone());
+        assert_eq!(provider.people_dir(), dir);
+        let people = provider.list_people_sync();
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].display_name, "Solo");
     }
 
     #[test]

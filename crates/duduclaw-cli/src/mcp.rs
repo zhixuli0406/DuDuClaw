@@ -1849,6 +1849,101 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "fork_id", description: "Fork id", required: true },
         ],
     },
+    // ── WP-D §13.7: read-only SQL data sources ────────────────────────────────
+    // Gated twice: `Scope::DbRead` + a non-empty agent.toml
+    // `[capabilities] db_sources` at the dispatch choke point (deny-by-default),
+    // then the specific source name inside each handler. Results flow through
+    // the RFC-23 redaction pipeline like every other MCP tool result — that is
+    // the entire reason this connector is first-party.
+    ToolDef {
+        name: "db_sources",
+        description: "List the read-only SQL data sources this agent may query (name, label, driver). \
+            Call this first to discover what is available. Requires the agent's [capabilities] db_sources grant.",
+        params: &[],
+    },
+    ToolDef {
+        name: "db_tables",
+        description: "List the tables (and views) a data source exposes, with each table's columns and types. \
+            Only tables in the source's allowed_tables are returned. Use this before db_select to learn the schema.",
+        params: &[
+            ParamDef { name: "source", description: "Data source name, as returned by db_sources", required: true },
+        ],
+    },
+    ToolDef {
+        name: "db_select",
+        description: "Read rows from one allowed table. Structured and safe: identifiers are validated, every value \
+            is bound as a parameter, and the query is read-only. Returns {rows, row_count, truncated}; \
+            truncated=true means the source had more rows than max_rows allows.",
+        params: &[
+            ParamDef { name: "source", description: "Data source name, as returned by db_sources", required: true },
+            ParamDef { name: "table", description: "Table name (must be in the source's allowed_tables)", required: true },
+            ParamDef { name: "columns", description: "JSON array of column names, e.g. [\"id\",\"name\"]. Omit for all columns.", required: false },
+            ParamDef { name: "filter", description: "JSON array of conditions, e.g. [{\"column\":\"name\",\"op\":\"=\",\"value\":\"Amy\"}]. op is one of = != < <= > >= like in (in takes an array value).", required: false },
+            ParamDef { name: "order_by", description: "Column name, optionally followed by asc or desc", required: false },
+            ParamDef { name: "limit", description: "Max rows to return (capped by the source's max_rows)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "db_query",
+        description: "Run a read-only SQL query against a data source. ONLY available on a source whose \
+            allowed_tables is exactly [\"*\"] — a source with a real table allowlist refuses this tool, because an \
+            allowlist cannot be enforced against arbitrary SQL; use db_select there. The statement must be a SINGLE \
+            statement starting with SELECT or WITH, with no semicolon outside string literals; it runs inside a \
+            read-only transaction. Returns {rows, row_count, truncated}. Prefer db_select when it can express the question.",
+        params: &[
+            ParamDef { name: "source", description: "Data source name, as returned by db_sources", required: true },
+            ParamDef { name: "sql", description: "A single read-only SQL statement (SELECT / WITH)", required: true },
+            ParamDef { name: "limit", description: "Max rows to return (capped by the source's max_rows)", required: false },
+        ],
+    },
+    // ── WP-F2 §14.2: local data files ─────────────────────────────────────────
+    // THE way to read a data file. The built-in Read / Bash route bypasses
+    // DuDuClaw's MCP choke point, so nothing read that way can be
+    // de-identified — which is why `data-file-guard` blocks it and why these
+    // descriptions say so out loud.
+    ToolDef {
+        name: "file_read",
+        description: "Read a plain-text file (txt / md / json / log / yaml) from an allowed directory. \
+            USE THIS instead of the built-in Read tool for any data file: only this route passes \
+            DuDuClaw's de-identification pipeline. Returns {path, table, text, truncated}; \
+            at most 512 KiB, cut back to a character boundary (CJK-safe). Spreadsheet and CSV \
+            files are REFUSED here — use csv_read / xlsx_read for those, because only a \
+            structured read lets the column-level rules apply.",
+        params: &[
+            ParamDef { name: "path", description: "Absolute path to the file", required: true },
+            ParamDef { name: "max_bytes", description: "Max bytes to read (default and maximum 524288)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "csv_read",
+        description: "Read a CSV / TSV file as structured rows. USE THIS instead of the built-in Read \
+            tool or a shell command (head/cat/awk) — only this route passes DuDuClaw's \
+            de-identification pipeline, so customer names, phones and addresses are protected. \
+            Returns {path, table, columns, rows, row_count, truncated}; `table` is the file's basename \
+            WITH its extension (e.g. customers.csv), each row is an object keyed by column name, and \
+            every cell is a string. File limit 64 MiB.",
+        params: &[
+            ParamDef { name: "path", description: "Absolute path to the .csv / .tsv file", required: true },
+            ParamDef { name: "delimiter", description: "Single character, or \\t for tab. Default ,", required: false },
+            ParamDef { name: "has_header", description: "true (default) treats row 1 as the header; false synthesizes c1..cN", required: false },
+            ParamDef { name: "limit", description: "Max data rows to return (default 200, maximum 2000)", required: false },
+            ParamDef { name: "offset", description: "Data rows to skip before returning (default 0)", required: false },
+        ],
+    },
+    ToolDef {
+        name: "xlsx_read",
+        description: "Read one worksheet of an Excel or OpenDocument workbook (xlsx / xlsm / xls / ods) \
+            as structured rows. USE THIS instead of the built-in Read tool or any shell/python command — \
+            only this route passes DuDuClaw's de-identification pipeline. Row 1 is the header. Returns \
+            {path, table, sheet, sheets, columns, rows, row_count, truncated}; numbers stay numbers, \
+            blanks are null, dates come back as ISO 8601 text. File limit 32 MiB.",
+        params: &[
+            ParamDef { name: "path", description: "Absolute path to the workbook", required: true },
+            ParamDef { name: "sheet", description: "Worksheet name. Omit for the first sheet; `sheets` in the result lists them all.", required: false },
+            ParamDef { name: "limit", description: "Max data rows to return (default 200, maximum 2000)", required: false },
+            ParamDef { name: "offset", description: "Data rows to skip before returning (default 0)", required: false },
+        ],
+    },
     // ── OS-native Phase 1 (requires [capabilities] os_native = true) ──────────
     ToolDef {
         name: "os_notify",
@@ -10026,7 +10121,11 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     );
 
     // ── RFC-23 redaction layer init ─────────────────────────────
-    // None ⇒ pipeline not enabled in config.toml (existing behaviour).
+    // None ⇒ pipeline not enabled in config.toml (the normal zero-overhead
+    // path). An Err means the operator DID enable it and it failed to
+    // initialise — spec §10.2 makes that fatal: an MCP server that keeps
+    // serving tool results unredacted after the operator asked for redaction
+    // is the exact leak the pipeline exists to prevent. Refuse to serve.
     let redaction_layer = match crate::mcp_redaction::McpRedactionLayer::try_init(
         home_dir,
         &default_agent,
@@ -10043,8 +10142,15 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             opt
         }
         Err(e) => {
-            tracing::error!(error = %e, "MCP redaction layer failed to init — continuing WITHOUT redaction");
-            None
+            tracing::error!(
+                error = %e,
+                "MCP redaction layer failed to init — refusing to serve \
+                 (config.toml [redaction] enabled = true). Fix the redaction \
+                 config or disable it explicitly."
+            );
+            return Err(DuDuClawError::Gateway(format!(
+                "redaction is enabled but failed to initialise; refusing to start the MCP server without it: {e}"
+            )));
         }
     };
 
@@ -10181,6 +10287,12 @@ fn handle_initialize(id: &Value, _request: &Value) -> Value {
     )
 }
 
+/// WP-D §13.7: the read-only SQL connector tools, hidden from `tools/list` for
+/// an agent whose `agent.toml [capabilities] db_sources` grant list is empty.
+/// Must stay identical to `mcp_dispatch::DB_SOURCE_TOOLS` — the gate there is
+/// what actually denies the call; this list only keeps discovery honest.
+const DB_SOURCE_TOOLS: &[&str] = &["db_sources", "db_tables", "db_select", "db_query"];
+
 /// Tools hidden while the Google Workspace integration gate is off
 /// (`config.toml [integrations] google_workspace`, default false).
 const GOOGLE_WORKSPACE_TOOLS: &[&str] = &[
@@ -10254,6 +10366,22 @@ pub(crate) fn handle_tools_list(
         } else {
             None
         };
+    // WP-D §13.7: the four `db_*` tools are deny-by-default per agent, so an
+    // agent with no `[capabilities] db_sources` grant must not even see them
+    // (discoverable ⊆ callable, same rule the `os_*` family follows). Read
+    // from the same canonical preset-aware reader as the gate.
+    let db_grant_present: bool = if !principal.is_external && !principal.client_id.is_empty() {
+        let agent_dir = home_dir.join("agents").join(&principal.client_id);
+        !duduclaw_core::agent_toml::load(&agent_dir)
+            .capabilities
+            .db_sources
+            .is_empty()
+    } else {
+        // External callers can never hold `db:read` (not externally grantable)
+        // and an unresolved caller has no agent config to consult — in both
+        // cases the dispatch gate denies, so hide the tools here too.
+        false
+    };
     let tool_allowed_by_capability = |name: &str| -> bool {
         let Some((denied, allowed)) = cap_gate.as_ref() else {
             return true; // external / unresolved caller → not gated here
@@ -10282,6 +10410,8 @@ pub(crate) fn handle_tools_list(
             !principal.is_external || crate::mcp_auth::external_tool_allowed(t.name, principal)
         })
         .filter(|t| google_enabled || !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
+        // WP-D §13.7: hide the SQL connector from agents with no grant.
+        .filter(|t| db_grant_present || !DB_SOURCE_TOOLS.contains(&t.name))
         // WP-7A bug2: internal per-agent capability filter (mirror of §3.45).
         .filter(|t| tool_allowed_by_capability(t.name))
         .map(build_tool_schema)
@@ -10734,6 +10864,51 @@ pub(crate) async fn handle_tools_call(
         "merge_or_select" => crate::mcp_fork::handle_merge_or_select(&arguments, home_dir, default_agent).await,
         "terminate_branch" => crate::mcp_fork::handle_terminate_branch(&arguments, home_dir, default_agent).await,
         "fork_cost" => crate::mcp_fork::handle_fork_cost(&arguments, home_dir, default_agent).await,
+        // WP-D §13.7: read-only SQL data sources. `Scope::DbRead` and the
+        // per-agent `[capabilities] db_sources` grant are enforced upstream in
+        // mcp_dispatch; the specific source name is checked inside each
+        // handler. Source ownership follows the CALLER (same rationale as
+        // os_watch_status): an internal stdio caller may present an empty
+        // client_id, in which case the process's default agent is the caller.
+        "db_sources" | "db_tables" | "db_select" | "db_query" => {
+            let db_agent = if caller_client_id.is_empty() {
+                default_agent
+            } else {
+                caller_client_id
+            };
+            match tool_name {
+                "db_sources" => crate::mcp_db::handle_db_sources(home_dir, db_agent).await,
+                "db_tables" => {
+                    crate::mcp_db::handle_db_tables(&arguments, home_dir, db_agent).await
+                }
+                "db_select" => {
+                    crate::mcp_db::handle_db_select(&arguments, home_dir, db_agent).await
+                }
+                _ => crate::mcp_db::handle_db_query(&arguments, home_dir, db_agent).await,
+            }
+        }
+        // WP-F2 §14.2: local data files. `Scope::FilesRead` is enforced
+        // upstream; the path fence lives in `mcp_files::vet_path` and is keyed
+        // to the CALLER (same rationale as the db family above): an internal
+        // stdio caller may present an empty client_id, in which case the
+        // process's default agent is the caller. Getting this wrong would let
+        // one agent read another agent's attachments.
+        "file_read" | "csv_read" | "xlsx_read" => {
+            let files_agent = if caller_client_id.is_empty() {
+                default_agent
+            } else {
+                caller_client_id
+            };
+            match tool_name {
+                "file_read" => {
+                    crate::mcp_files::handle_file_read(&arguments, home_dir, files_agent)
+                }
+                "csv_read" => {
+                    crate::mcp_files::handle_csv_read(&arguments, home_dir, files_agent)
+                }
+                _ => crate::mcp_files::handle_xlsx_read(&arguments, home_dir, files_agent),
+            }
+        }
         // OS-native Phase 1 tools. The os_native capability + scope + (for
         // os_open) ActionGuard gates are enforced upstream in mcp_dispatch;
         // these handlers are the mechanism.

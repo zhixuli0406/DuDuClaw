@@ -45,9 +45,12 @@ pub(crate) mod mcp_recording_distill; // WP3.3 R2: HAR redaction/parsing + skill
 pub(crate) mod mcp_os_ops;     // O-0: device.*/system.* → agent-facing os_* MCP tool bridge
 pub mod mcp_redact;
 pub mod mcp_redaction;         // RFC-23 redaction pipeline integration
+pub mod mcp_proxy;             // §13.6 WP-P: redacting stdio JSON-RPC proxy for external MCP servers
 pub mod redaction_verify;      // WP2: `duduclaw redaction verify` evidence report
 pub(crate) mod mcp_sse_store;  // W20-P1 Phase 2C: SSE event ring buffer
 pub mod mcp_wiki;
+pub mod mcp_db;                 // §13.7 WP-D: read-only SQL data-source MCP tools
+pub mod mcp_files;              // §14.2 WP-F2: local data-file MCP tools (file/csv/xlsx read)
 pub mod license;               // M1: license activate/status/refresh/export/import/deactivate
 mod migrate;
 mod os_drive;                  // A7a: `duduclaw os <group> <verb>` self-drive CLI surface
@@ -512,6 +515,25 @@ enum Commands {
 
     /// Start DuDuClaw MCP server (for Claude Code integration)
     McpServer,
+
+    /// (internal) Redacting stdio JSON-RPC pass-through for an EXTERNAL MCP
+    /// server. Spawned by the Claude CLI, not by a human: when an agent has
+    /// RFC-23 redaction active the gateway rewrites that agent's `.mcp.json`
+    /// so every third-party stdio server launches through this wrapper, which
+    /// applies the same egress / result redaction the built-in
+    /// `duduclaw mcp-server` choke point applies.
+    ///
+    /// `duduclaw mcp-proxy --server <name> -- <cmd> [args…]`
+    #[command(hide = true)]
+    McpProxy {
+        /// Logical server name from `.mcp.json`; tool names are namespaced
+        /// `<server>.<tool>` for rule matching.
+        #[arg(long)]
+        server: String,
+        /// The upstream command and its arguments, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        upstream: Vec<String>,
+    },
 
     /// (internal) Desktop recording worker loop — spawned detached by the
     /// `desktop_record_start` MCP tool (WP3.3 R3). Hidden from help.
@@ -1559,7 +1581,8 @@ enum RedactionCommands {
     /// pipeline (vault writes included, tagged as a verify-run for later GC), so
     /// the report reflects exactly what a real conversation would redact.
     Verify {
-        /// CSV or plain-text file to scan.
+        /// CSV / plain-text file to scan, or a `.json` sample to run through
+        /// the structured field rules as a simulated tool result.
         #[arg(long)]
         file: PathBuf,
         /// Redaction profile to load (default: whatever config.toml enables, else `general`).
@@ -1571,6 +1594,14 @@ enum RedactionCommands {
         /// Write the Markdown report here instead of stdout.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// JSON mode only: MCP tool name to simulate (default: `odoo_search`).
+        /// Must satisfy the rule's `match_tool`.
+        #[arg(long)]
+        tool: Option<String>,
+        /// JSON mode only: one tool argument, repeatable
+        /// (e.g. `--arg model=res.partner`). Feeds the rule's `match_args` gate.
+        #[arg(long = "arg", value_name = "KEY=VALUE")]
+        args: Vec<String>,
     },
 }
 
@@ -2184,8 +2215,8 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
             cmd_audit_export(since, out, webhook, webhook_auth, format).await
         }
         Commands::Redaction { command } => match command {
-            RedactionCommands::Verify { file, profile, agent, out } => {
-                redaction_verify::run(file, profile, agent, out).await
+            RedactionCommands::Verify { file, profile, agent, out, tool, args } => {
+                redaction_verify::run(file, profile, agent, out, tool, args).await
             }
         },
         Commands::Credit { command } => cmd_credit(command).await,
@@ -2214,6 +2245,20 @@ async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
         },
         Commands::Import { file, force } => cmd_import_data(file, force).await,
         Commands::McpServer => cmd_mcp_server().await,
+        Commands::McpProxy { server, upstream } => {
+            // stdout is the JSON-RPC channel (CLI-H7) — tracing already goes
+            // to stderr from `entry_point`, same as `mcp-server`.
+            let home = duduclaw_home();
+            let (cmd, args) = upstream
+                .split_first()
+                .ok_or_else(|| {
+                    duduclaw_core::error::DuDuClawError::Gateway(
+                        "mcp-proxy: missing upstream command after `--`".to_string(),
+                    )
+                })?;
+            let code = mcp_proxy::run_mcp_proxy(&home, &server, cmd, args).await?;
+            std::process::exit(code);
+        }
         Commands::DesktopRecordWorker { dir, interval_ms, max_seconds } => {
             let code =
                 mcp_recording::run_desktop_record_worker(dir, interval_ms, max_seconds).await;
@@ -5987,6 +6032,7 @@ async fn mcp_server_diagnostic(home: &std::path::Path) {
             println!("         這正是「agent 完全叫不到 duduclaw 工具」的根因：");
             println!("         1. 升級後先跑一次 `duduclaw run`（gateway 會自動配發 internal key");
             println!("            並寫入 config.toml [mcp_keys]，spawn 的 CLI 全部自動帶上）。");
+            println!("            internal key 30 天到期，gateway 開機也會自動輪替 — 金鑰過期時重啟即可修復。");
             println!("         2. 或手動設定 env DUDUCLAW_MCP_API_KEY=<config.toml [mcp_keys] 其中一把>。");
         }
         O::Abnormal { exit, stderr_tail } => {
@@ -7145,14 +7191,22 @@ async fn cmd_http_server(
 
     // P2-4: initialise the RFC-23 egress layer for the HTTP/SSE transport too.
     // `None` ⇒ redaction not enabled in config.toml (zero-overhead skip). An
-    // init failure logs and continues WITHOUT redaction (matches the stdio
-    // path's behaviour). Built before `default_agent` is moved into `new`.
+    // init failure is fatal (spec §10.2, same as the stdio path): serving tool
+    // results unredacted after the operator enabled redaction is the leak the
+    // pipeline exists to prevent. Built before `default_agent` is moved into
+    // `new`.
     let redaction_layer =
         match crate::mcp_redaction::McpRedactionLayer::try_init(&home, &default_agent) {
             Ok(opt) => opt,
             Err(e) => {
-                tracing::error!(error = %e, "MCP redaction layer failed to init — HTTP server continuing WITHOUT redaction");
-                None
+                tracing::error!(
+                    error = %e,
+                    "MCP redaction layer failed to init — refusing to start the HTTP server \
+                     (config.toml [redaction] enabled = true)"
+                );
+                return Err(DuDuClawError::Gateway(format!(
+                    "redaction is enabled but failed to initialise; refusing to start the MCP HTTP server without it: {e}"
+                )));
             }
         };
 

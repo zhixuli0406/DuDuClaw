@@ -420,22 +420,44 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // unchanged. When enabled, `swap_redaction_manager` installs the
     // manager AND its paired vault-GC task (the handler owns both, so
     // `redaction.update` can later hot-swap them without a restart).
+    //
+    // Three outcomes, never conflated (DESIGN-redaction-field-rules-2026-09
+    // §12, decision B): not configured ⇒ nothing; configured+enabled ⇒ build;
+    // unparseable config OR a manager that refuses to open ⇒ **poison state**.
+    // Poison is loud (ERROR log + Activity Feed + dashboard banner) and
+    // recoverable via `redaction.update`; the gateway still boots, because
+    // redaction of tool results happens in the `duduclaw mcp-server`
+    // subprocess (which already refuses to start on a broken config), not here.
     {
         let cfg_path = home_dir.join("config.toml");
-        let parsed: Option<duduclaw_redaction::RedactionConfig> =
-            std::fs::read_to_string(&cfg_path).ok().and_then(|s| {
-                #[derive(serde::Deserialize)]
-                struct Wrap {
-                    #[serde(default)]
-                    redaction: duduclaw_redaction::RedactionConfig,
-                }
-                toml::from_str::<Wrap>(&s).ok().map(|w| w.redaction)
-            });
+        let raw = match std::fs::read_to_string(&cfg_path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                // Unreadable (permissions, I/O) is not "absent" — treat it as
+                // a poison cause rather than silently running unprotected.
+                let reason = crate::redaction_integration::poison_reason(format!(
+                    "config.toml 無法讀取：{e}"
+                ));
+                error!(error = %e, "RFC-23 redaction: config.toml unreadable — entering poison state");
+                handler
+                    .set_redaction_poison(Some(crate::handlers::RedactionPoison::new(
+                        reason.clone(),
+                    )))
+                    .await;
+                crate::redaction_integration::post_redaction_activity(
+                    &home_dir,
+                    "redaction_init_failed",
+                    &format!("去識別化保護未能啟動：{reason}"),
+                )
+                .await;
+                None
+            }
+        };
 
-        match parsed {
-            Some(rcfg) if rcfg.enabled => {
-                match crate::redaction_integration::build_manager_from_home(&home_dir, rcfg.clone())
-                {
+        match crate::redaction_integration::classify_redaction_boot(raw.as_deref()) {
+            crate::redaction_integration::BootOutcome::Enabled(rcfg) => {
+                match crate::redaction_integration::build_manager_from_home(&home_dir, *rcfg) {
                     Ok(manager) => {
                         info!(
                             rules = manager.engine().rule_count(),
@@ -445,20 +467,46 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                         handler.swap_redaction_manager(Some(manager)).await;
                     }
                     Err(e) => {
-                        // Fail-closed at startup: if redaction was requested
-                        // but cannot be initialised, we surface the failure
-                        // loudly. We still continue (no redaction) — operator
-                        // must observe and act.
-                        warn!(
+                        let reason = crate::redaction_integration::poison_reason(e.to_string());
+                        error!(
                             error = %e,
                             "RFC-23 redaction pipeline FAILED to initialise — \
-                             gateway continues WITHOUT redaction. Check \
+                             gateway enters the redaction POISON state. Check \
                              config.toml [redaction] and ~/.duduclaw/redaction/."
                         );
+                        handler
+                            .set_redaction_poison(Some(crate::handlers::RedactionPoison::new(
+                                reason.clone(),
+                            )))
+                            .await;
+                        crate::redaction_integration::post_redaction_activity(
+                            &home_dir,
+                            "redaction_init_failed",
+                            &format!("去識別化保護未能啟動：{reason}"),
+                        )
+                        .await;
                     }
                 }
             }
-            _ => {
+            crate::redaction_integration::BootOutcome::Poisoned(reason) => {
+                error!(
+                    reason = %reason,
+                    "RFC-23 redaction config could not be parsed — gateway enters \
+                     the redaction POISON state (no redaction manager installed)."
+                );
+                handler
+                    .set_redaction_poison(Some(crate::handlers::RedactionPoison::new(
+                        reason.clone(),
+                    )))
+                    .await;
+                crate::redaction_integration::post_redaction_activity(
+                    &home_dir,
+                    "redaction_init_failed",
+                    &format!("去識別化保護未能啟動：{reason}"),
+                )
+                .await;
+            }
+            crate::redaction_integration::BootOutcome::Disabled => {
                 tracing::debug!("Redaction pipeline not enabled in config.toml");
             }
         }

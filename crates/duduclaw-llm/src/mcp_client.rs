@@ -667,6 +667,11 @@ pub struct ToolRegistry {
     /// tool name → index into `clients`.
     routes: HashMap<String, usize>,
     defs: Vec<ToolDef>,
+    /// Logical server name per client index, parallel to `clients`. Empty
+    /// (or a shorter vec) ⇒ the registry was built without names and
+    /// [`ToolExecutor::server_of`] answers `None`. Only used to give a
+    /// [`crate::ToolInterceptor`] the RFC-23 `<server>.<tool>` namespace.
+    server_names: Vec<String>,
 }
 
 /// Per-server tool visibility filter for mounted MCP servers.
@@ -715,7 +720,30 @@ impl ToolRegistry {
         }
         let (routes, defs) = build_routes_filtered(&per_client, &filters);
         let clients = clients.into_iter().map(Mutex::new).collect();
-        Ok(Self { clients, routes, defs })
+        Ok(Self { clients, routes, defs, server_names: Vec::new() })
+    }
+
+    /// Like [`from_clients_filtered`](Self::from_clients_filtered) but records
+    /// each client's logical `.mcp.json` / `agent.toml` server name, so
+    /// [`ToolExecutor::server_of`] can answer and a
+    /// [`crate::ToolInterceptor`] sees the RFC-23 `<server>.<tool>` namespace
+    /// (§13.6). Names are positional; a short list simply leaves the trailing
+    /// clients unnamed.
+    pub async fn from_clients_named(
+        clients: Vec<(String, McpClient)>,
+        filters: Vec<ToolFilter>,
+    ) -> Result<Self, McpError> {
+        let (server_names, clients): (Vec<String>, Vec<McpClient>) = clients.into_iter().unzip();
+        let mut registry = Self::from_clients_filtered(clients, filters).await?;
+        registry.server_names = server_names;
+        Ok(registry)
+    }
+
+    /// Logical server name owning `tool`, when this registry was built with
+    /// names. Exposed for callers that want the namespace outside the loop.
+    pub fn server_for_tool(&self, tool: &str) -> Option<&str> {
+        let idx = *self.routes.get(tool)?;
+        self.server_names.get(idx).map(String::as_str)
     }
 
     /// Tool definitions to seed [`ChatRequest::tools`](crate::ChatRequest).
@@ -774,6 +802,10 @@ fn build_routes_filtered(
 impl ToolExecutor for ToolRegistry {
     fn defs(&self) -> Vec<ToolDef> {
         self.tool_defs()
+    }
+
+    fn server_of(&self, tool: &str) -> Option<String> {
+        self.server_for_tool(tool).map(str::to_string)
     }
 
     async fn call(&self, name: &str, args: Value) -> Result<ToolOutcome, String> {

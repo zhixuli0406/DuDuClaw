@@ -50,7 +50,35 @@ pub struct EgressEvaluator {
 }
 
 impl EgressEvaluator {
-    pub fn new(rules: HashMap<String, ToolEgressRule>) -> Self {
+    /// Build the evaluator from the resolved `tool_egress` table.
+    ///
+    /// This is the single construction point every config-load path goes
+    /// through (`RedactionManager::open`, plus the dashboard's dry-compile),
+    /// so a legacy-key alias fixed up here applies everywhere without a
+    /// second copy of the logic.
+    ///
+    /// **Legacy alias**: the dashboard's Odoo egress preset (and older
+    /// docs) wrote the key as `odoo.*` — a prefix-glob (see [`find_rule`])
+    /// that never matches the built-in Odoo MCP tool names, which are all
+    /// `odoo_search` / `odoo_partner_search` / … (underscore-joined, not
+    /// dot-joined). An operator who enabled "需要時還原真實值" for Odoo in
+    /// the dashboard therefore silently stayed on default-deny. External
+    /// servers routed through `duduclaw mcp-proxy` are genuinely named
+    /// `<server>.<tool>` (e.g. `crm_pg.*`), so this alias is intentionally
+    /// scoped to the one legacy key — it must NOT generalise `.` → `_` for
+    /// other keys.
+    ///
+    /// [`find_rule`]: Self::find_rule
+    pub fn new(mut rules: HashMap<String, ToolEgressRule>) -> Self {
+        if let Some(legacy) = rules.get("odoo.*").cloned()
+            && !rules.contains_key("odoo_*")
+        {
+            tracing::warn!(
+                "redaction: tool_egress key `odoo.*` never matched the built-in Odoo tools \
+                 (`odoo_*`); treating it as `odoo_*` — please rename it"
+            );
+            rules.insert("odoo_*".to_string(), legacy);
+        }
         Self { rules }
     }
 
@@ -587,6 +615,173 @@ mod tests {
         assert!(toks2.is_empty());
         let toks3 = extract_tokens_from_str("<REDACT:bad:abc> ok");
         assert!(toks3.is_empty());
+    }
+
+    // -- odoo.* → odoo_* legacy alias (2026-09 fix) --------------------
+
+    #[test]
+    fn legacy_odoo_dot_key_aliases_to_underscore_glob() {
+        // The dashboard preset (and older docs) wrote the key as `odoo.*`,
+        // which as a prefix-glob only ever matches tool names starting with
+        // the literal `odoo.` — but the built-in Odoo MCP tools are named
+        // `odoo_search`, `odoo_partner_search`, etc. (underscore-joined).
+        // `EgressEvaluator::new` must alias the legacy key so the rule
+        // still takes effect.
+        let mut rules = HashMap::new();
+        rules.insert("odoo.*".into(), rule_restore());
+        let ev = EgressEvaluator::new(rules);
+        let (vault, _t) = fresh_vault();
+        vault
+            .insert_mapping(
+                "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>",
+                "alice",
+                "a",
+                Some("s"),
+                "E",
+                "r",
+                &RestoreScope::Owner,
+                false,
+                24,
+            )
+            .unwrap();
+        let dec = ev
+            .decide(
+                "odoo_search",
+                &json!({"q": "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>"}),
+                "a",
+                Some("s"),
+                &Caller::owner("test"),
+                &vault,
+                &NullAuditSink,
+            )
+            .unwrap();
+        assert!(matches!(dec, EgressDecision::Allow { .. }), "expected legacy `odoo.*` to alias to `odoo_*`, got {dec:?}");
+    }
+
+    #[test]
+    fn explicit_odoo_underscore_glob_wins_over_legacy_alias() {
+        // If the operator has already migrated (or the config has both an
+        // old and a new key from some upgrade path), the explicit `odoo_*`
+        // rule must win — the legacy key is never allowed to overwrite it.
+        let mut rules = HashMap::new();
+        rules.insert("odoo.*".into(), rule_deny());
+        rules.insert("odoo_*".into(), rule_restore());
+        let ev = EgressEvaluator::new(rules);
+        let (vault, _t) = fresh_vault();
+        vault
+            .insert_mapping(
+                "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>",
+                "alice",
+                "a",
+                Some("s"),
+                "E",
+                "r",
+                &RestoreScope::Owner,
+                false,
+                24,
+            )
+            .unwrap();
+        let dec = ev
+            .decide(
+                "odoo_search",
+                &json!({"q": "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>"}),
+                "a",
+                Some("s"),
+                &Caller::owner("test"),
+                &vault,
+                &NullAuditSink,
+            )
+            .unwrap();
+        assert!(matches!(dec, EgressDecision::Allow { .. }), "explicit `odoo_*` (restore) must win over legacy `odoo.*` (deny), got {dec:?}");
+    }
+
+    #[test]
+    fn other_dotted_glob_keys_are_not_aliased() {
+        // Only the exact legacy key `odoo.*` is aliased. Other dot-joined
+        // presets (external MCP-proxy servers, e.g. `crm_pg.*`) legitimately
+        // use `.` as the server/tool separator and must be left alone.
+        let mut rules = HashMap::new();
+        rules.insert("crm_pg.*".into(), rule_restore());
+        let ev = EgressEvaluator::new(rules);
+        let (vault, _t) = fresh_vault();
+        vault
+            .insert_mapping(
+                "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>",
+                "alice",
+                "a",
+                Some("s"),
+                "E",
+                "r",
+                &RestoreScope::Owner,
+                false,
+                24,
+            )
+            .unwrap();
+
+        // The proxy-style dotted tool name still matches directly.
+        let dec = ev
+            .decide(
+                "crm_pg.search",
+                &json!({"q": "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>"}),
+                "a",
+                Some("s"),
+                &Caller::owner("test"),
+                &vault,
+                &NullAuditSink,
+            )
+            .unwrap();
+        assert!(matches!(dec, EgressDecision::Allow { .. }));
+
+        // But it was NOT generalised into an underscore glob — an unrelated
+        // underscore-joined tool name must stay denied (not on any whitelist).
+        let dec2 = ev
+            .decide(
+                "crm_pg_search",
+                &json!({"q": "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>"}),
+                "a",
+                Some("s"),
+                &Caller::owner("test"),
+                &vault,
+                &NullAuditSink,
+            )
+            .unwrap();
+        assert!(matches!(dec2, EgressDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn exact_key_beats_wildcard_after_alias() {
+        // An exact match for the real tool name must still win over the
+        // aliased wildcard.
+        let mut rules = HashMap::new();
+        rules.insert("odoo.*".into(), rule_deny());
+        rules.insert("odoo_search".into(), rule_restore());
+        let ev = EgressEvaluator::new(rules);
+        let (vault, _t) = fresh_vault();
+        vault
+            .insert_mapping(
+                "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>",
+                "alice",
+                "a",
+                Some("s"),
+                "E",
+                "r",
+                &RestoreScope::Owner,
+                false,
+                24,
+            )
+            .unwrap();
+        let dec = ev
+            .decide(
+                "odoo_search",
+                &json!({"q": "<REDACT:E:abcdef01abcdef01abcdef01abcdef01>"}),
+                "a",
+                Some("s"),
+                &Caller::owner("test"),
+                &vault,
+                &NullAuditSink,
+            )
+            .unwrap();
+        assert!(matches!(dec, EgressDecision::Allow { .. }), "exact key `odoo_search` (restore) must win over glob `odoo.*`/`odoo_*` (deny), got {dec:?}");
     }
 }
 

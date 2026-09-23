@@ -389,9 +389,12 @@ mod known_mcp_scopes_tests {
     /// asserting the shared list itself — but it pins the count at the call
     /// site the dashboard actually validates against, catching a future
     /// accidental re-introduction of a local override here.
+    ///
+    /// 24 since WP-F2 added `files:read` (§14.2 local data-file tools), on
+    /// top of WP-D's `db:read` (§13.7 read-only SQL data sources).
     #[test]
-    fn known_mcp_scopes_has_all_22_entries() {
-        assert_eq!(KNOWN_MCP_SCOPES.len(), 22);
+    fn known_mcp_scopes_has_all_24_entries() {
+        assert_eq!(KNOWN_MCP_SCOPES.len(), 24);
     }
 
     /// Spot-check a sample of the 12 scopes that were previously missing —
@@ -3519,6 +3522,43 @@ fn contract_table_to_response(table: &toml::Table) -> Value {
     })
 }
 
+/// The redaction poison state (DESIGN-redaction-field-rules-2026-09 §12).
+///
+/// Set when `[redaction]` was configured but could not be resolved into a live
+/// manager — an unparseable section, a rule that will not compile, a broken
+/// key directory. It is deliberately NOT the same thing as
+/// `redaction_manager: None` (which is the ordinary "redaction not enabled"
+/// state): the gateway keeps serving, but says so loudly instead of running
+/// unprotected in silence.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RedactionPoison {
+    /// Operator-facing cause — the parse / open error text, single-lined and
+    /// byte-capped by `redaction_integration::poison_reason`.
+    pub reason: String,
+    /// When this poison state was entered.
+    pub since: DateTime<Utc>,
+}
+
+impl RedactionPoison {
+    /// Enter the poison state now with `reason` as the cause.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            since: Utc::now(),
+        }
+    }
+
+    /// Wire shape for `redaction.get` / `redaction.policy_status`.
+    fn to_wire(&self) -> Value {
+        json!({ "reason": self.reason, "since": self.since.to_rfc3339() })
+    }
+}
+
+/// `poisoned` field value for an RPC response: the poison object, or `null`.
+fn poison_wire(poison: Option<&RedactionPoison>) -> Value {
+    poison.map(RedactionPoison::to_wire).unwrap_or(Value::Null)
+}
+
 /// Validate a redaction source mode string.
 fn is_valid_source_mode(v: &str) -> bool {
     matches!(v, "on" | "off" | "selective" | "inherit")
@@ -3737,7 +3777,463 @@ fn apply_redaction_to_table(
         }
     }
 
+    // ── [redaction.rules.<id>] structured-field rules (§11.2) ──
+    // Upsert-merge keyed by rule id, `null` removes. Only db_field /
+    // json_path rules are reachable from here; the caller dry-compiles the
+    // resulting table before anything is written to disk.
+    if let Some(field_rules) = params.get("field_rules").and_then(|v| v.as_object()) {
+        apply_field_rules_to_table(red, field_rules, &mut changes)?;
+    }
+
+    // ── [redaction.data_sources.<name>] registry entries (§13.5) ──
+    // Applied AFTER field_rules on purpose: one call may retire a rule and the
+    // source it was the last user of, and the "still referenced" guard must
+    // see the rule list as it will be written, not as it was.
+    if let Some(data_sources) = params.get("data_sources").and_then(|v| v.as_object()) {
+        apply_data_sources_to_table(red, data_sources, &mut changes)?;
+    }
+
     Ok(changes)
+}
+
+/// Structured-field rule kinds the dashboard editor owns. Everything else
+/// (`regex`, `keyword`, `identity`) stays TOML-only: those rules are neither
+/// listed by `redaction.get` nor writable through `redaction.update`, so an
+/// editor round-trip can never silently rewrite a detection rule it cannot
+/// render.
+const FIELD_RULE_KINDS: [&str; 2] = ["db_field", "json_path"];
+
+/// Rule id charset for the field-rule editor: `^[a-z][a-z0-9_-]{0,63}$`.
+/// Checked by hand rather than by regex — the id becomes a TOML key and an
+/// audit-log field, so the accepted set stays small and explicit.
+fn is_valid_field_rule_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    if id.len() > 64 {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// The `type` of an existing `[redaction.rules.<id>]` entry, if any.
+fn existing_rule_kind<'a>(red: &'a toml::Table, id: &str) -> Option<&'a str> {
+    red.get("rules")
+        .and_then(|v| v.as_table())
+        .and_then(|rules| rules.get(id))
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str())
+}
+
+/// Wire shape of one structured-field rule for `redaction.get`.
+fn field_rule_to_wire(spec: &duduclaw_redaction::RuleSpec) -> Option<Value> {
+    use duduclaw_redaction::RuleKind;
+    let restore_scope = serde_json::to_value(&spec.restore_scope).ok()?;
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".into(), json!(spec.id));
+    obj.insert("category".into(), json!(spec.category));
+    obj.insert("restore_scope".into(), restore_scope);
+    obj.insert("priority".into(), json!(spec.priority));
+    obj.insert(
+        "cross_session_stable".into(),
+        json!(spec.cross_session_stable),
+    );
+    match &spec.kind {
+        RuleKind::DbField {
+            source,
+            connector,
+            fields,
+        } => {
+            // The wire keeps the historical `connector` key and fills it with
+            // the RESOLVED data-source name (`source` wins, `connector` is its
+            // deprecated alias, neither ⇒ `odoo`). An editor round-trip
+            // therefore stays lossless whichever spelling the TOML uses, and
+            // the dashboard never has to re-implement the resolution.
+            let resolved =
+                duduclaw_redaction::rules::db_field::resolve_source(
+                    &spec.id,
+                    source.as_deref(),
+                    connector.as_deref(),
+                )
+                .ok()?;
+            obj.insert("kind".into(), json!("db_field"));
+            obj.insert("connector".into(), json!(resolved));
+            obj.insert("fields".into(), json!(fields));
+        }
+        RuleKind::JsonPath {
+            paths,
+            match_tool,
+            match_args,
+            match_result,
+            exclude_keys,
+        } => {
+            obj.insert("kind".into(), json!("json_path"));
+            obj.insert("paths".into(), json!(paths));
+            obj.insert("match_tool".into(), json!(match_tool));
+            obj.insert("match_args".into(), json!(match_args));
+            // Rendered even though the editor has no widget for it yet: the
+            // update path parses it straight back, so shipping it keeps an
+            // editor round-trip lossless. Dropping it would silently widen a
+            // rule bound to one table into one that fires on every result of
+            // that tool.
+            obj.insert("match_result".into(), json!(match_result));
+            obj.insert("exclude_keys".into(), json!(exclude_keys));
+        }
+        // Not an editor-owned kind — never listed.
+        _ => return None,
+    }
+    Some(Value::Object(obj))
+}
+
+/// The `field_rules` array for `redaction.get`: every `[redaction.rules.*]`
+/// entry whose `type` is `db_field` / `json_path`, in id order. Entries that
+/// do not deserialise are skipped rather than half-rendered — a rule the
+/// editor cannot round-trip must not appear editable.
+fn redaction_field_rules(table: &toml::Table) -> Vec<Value> {
+    let Some(rules) = table
+        .get("redaction")
+        .and_then(|v| v.as_table())
+        .and_then(|r| r.get("rules"))
+        .and_then(|v| v.as_table())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (id, body) in rules {
+        let kind = body.as_table().and_then(|t| t.get("type")).and_then(|v| v.as_str());
+        if !kind.is_some_and(|k| FIELD_RULE_KINDS.contains(&k)) {
+            continue;
+        }
+        let Ok(mut spec) = body.clone().try_into::<duduclaw_redaction::RuleSpec>() else {
+            continue;
+        };
+        spec.id = id.clone();
+        if let Some(v) = field_rule_to_wire(&spec) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Apply the `field_rules` upsert-merge onto `[redaction.rules.*]`.
+///
+/// Same semantics as `tool_egress`: `null` removes that id, an absent id is
+/// untouched. Every write is validated BEFORE the table is mutated —
+/// id charset, deserialisable body, editor-owned kind, and (both for upsert
+/// and delete) that the id does not already belong to a non-field rule.
+fn apply_field_rules_to_table(
+    red: &mut toml::Table,
+    field_rules: &serde_json::Map<String, Value>,
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    use duduclaw_redaction::RuleKind;
+
+    // ── Validate everything first (no partial writes) ──
+    let mut planned: Vec<(String, Option<toml::Value>)> = Vec::new();
+    for (id, rule) in field_rules {
+        let id_trim = id.trim();
+        if !is_valid_field_rule_id(id_trim) {
+            return Err(format!(
+                "Invalid field_rules id '{id_trim}'. Must match ^[a-z][a-z0-9_-]{{0,63}}$"
+            ));
+        }
+        // Never let this path touch a rule kind the editor does not own.
+        if let Some(kind) = existing_rule_kind(red, id_trim)
+            && !FIELD_RULE_KINDS.contains(&kind)
+        {
+            return Err(format!(
+                "redaction.rules.{id_trim} is a '{kind}' rule — field_rules only manages db_field / json_path rules. Edit it in config.toml."
+            ));
+        }
+        if rule.is_null() {
+            planned.push((id_trim.to_string(), None));
+            continue;
+        }
+        let Some(body) = rule.as_object() else {
+            return Err(format!("field_rules.{id_trim} must be an object or null"));
+        };
+        // `redaction.get` renders the discriminator as `kind` (it reads better
+        // in the editor); serde's tag on `RuleKind` is `type`. Accept either so
+        // a rule fetched from `get` can be posted straight back, and refuse a
+        // body that carries both with different values rather than silently
+        // picking one.
+        let mut body = body.clone();
+        match (body.get("type").cloned(), body.remove("kind")) {
+            (Some(t), Some(k)) if t != k => {
+                return Err(format!(
+                    "field_rules.{id_trim} has conflicting 'type' and 'kind' values"
+                ));
+            }
+            (None, Some(k)) => {
+                body.insert("type".into(), k);
+            }
+            _ => {}
+        }
+        let mut spec: duduclaw_redaction::RuleSpec = serde_json::from_value(Value::Object(body))
+            .map_err(|e| format!("field_rules.{id_trim} is not a valid rule: {e}"))?;
+        if !matches!(spec.kind, RuleKind::DbField { .. } | RuleKind::JsonPath { .. }) {
+            return Err(format!(
+                "field_rules.{id_trim} must be type = \"db_field\" or \"json_path\""
+            ));
+        }
+        spec.id = id_trim.to_string();
+        let mut body = toml::Value::try_from(&spec)
+            .map_err(|e| format!("field_rules.{id_trim} cannot be serialised: {e}"))?;
+        // The id lives in the TOML key, not the body (that is where the
+        // loader reads it from); carrying both invites them to disagree.
+        if let Some(t) = body.as_table_mut() {
+            t.remove("id");
+        }
+        planned.push((id_trim.to_string(), Some(body)));
+    }
+
+    // ── Commit ──
+    for (id, body) in planned {
+        match body {
+            None => {
+                // Idempotent: removing an id that is already absent still
+                // reports a change, so the editor's delete never looks like a
+                // failure ("No valid redaction fields to update") on a retry.
+                if let Some(rules) = red.get_mut("rules").and_then(|v| v.as_table_mut()) {
+                    rules.remove(&id);
+                }
+                changes.push(format!("redaction.rules.{id} removed"));
+            }
+            Some(body) => {
+                let kind = body
+                    .as_table()
+                    .and_then(|t| t.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let rules = red
+                    .entry("rules")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| "Invalid [redaction.rules] section".to_string())?;
+                rules.insert(id.clone(), body);
+                changes.push(format!("redaction.rules.{id} = {{ type = \"{kind}\" }}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dry-compile a candidate `config.toml` table: resolve the whole rule-spec
+/// list exactly the way `RedactionManager::open` does and build the engine.
+/// Errors carry the compiler's own text so the editor can show it verbatim.
+fn dry_compile_redaction_table(table: &toml::Table, home_dir: &Path) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct Wrap {
+        #[serde(default)]
+        redaction: duduclaw_redaction::RedactionConfig,
+    }
+    let raw = toml::to_string(table).map_err(|e| format!("serialize config: {e}"))?;
+    let cfg = toml::from_str::<Wrap>(&raw)
+        .map_err(|e| format!("parse [redaction]: {e}"))?
+        .redaction;
+    cfg.validate().map_err(|e| e.to_string())?;
+    let paths = duduclaw_redaction::ManagerPaths::under_home(home_dir);
+    let specs =
+        duduclaw_redaction::resolve_rule_specs(&cfg, &paths).map_err(|e| e.to_string())?;
+    // The data-source registry is resolved the same way `RedactionManager::open`
+    // does, so a `db_field` rule pointing at a source this config does not
+    // define (or a source whose record paths do not parse) fails HERE rather
+    // than at the next boot.
+    let data_sources = duduclaw_redaction::resolve_data_sources(&cfg).map_err(|e| e.to_string())?;
+    duduclaw_redaction::RuleEngine::from_specs_with(
+        specs,
+        &duduclaw_redaction::EngineOptions {
+            identity_people_dir: paths.identity_people_dir.clone(),
+            data_sources,
+        },
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Wire shape of one data source for `redaction.get` (§13.5).
+fn data_source_wire(
+    name: &str,
+    def: &duduclaw_redaction::DataSourceDef,
+    builtin: bool,
+) -> Value {
+    json!({
+        "name": name,
+        "label": if def.label.trim().is_empty() { name } else { def.label.as_str() },
+        "builtin": builtin,
+        "tools": def.tools,
+        "table_arg": def.table_arg,
+        "table": def.table,
+        "table_result": def.table_result,
+        "record_paths": def.record_paths,
+        "free_form_names": def.free_form_names,
+        "key_alias": def.key_alias,
+    })
+}
+
+/// The `data_sources` array for `redaction.get`: the built-ins first
+/// (`builtin: true`, not editable), then the operator's
+/// `[redaction.data_sources.*]` entries in name order.
+///
+/// A built-in shows the simple form its bindings can actually prove — Odoo
+/// mixes per-tool tables and aliases, so its `table` / `table_arg` come back
+/// `null` rather than as a summary that reads like fact. A config entry that
+/// does not deserialise is skipped (there is nothing to render); one that
+/// deserialises but will not load is shown verbatim, so the operator can see
+/// and fix the entry that is blocking the boot.
+fn redaction_data_sources(table: &toml::Table) -> Vec<Value> {
+    let mut out: Vec<Value> = duduclaw_redaction::builtin_sources()
+        .iter()
+        .map(|s| data_source_wire(&s.name, &s.simple_form(), true))
+        .collect();
+
+    let Some(defs) = table
+        .get("redaction")
+        .and_then(|v| v.as_table())
+        .and_then(|r| r.get("data_sources"))
+        .and_then(|v| v.as_table())
+    else {
+        return out;
+    };
+    for (name, body) in defs {
+        // A config entry may not shadow a built-in (the loader refuses it);
+        // the built-in row above is the one that takes effect.
+        if duduclaw_redaction::is_builtin_source(name) {
+            continue;
+        }
+        let Ok(def) = body
+            .clone()
+            .try_into::<duduclaw_redaction::DataSourceDef>()
+        else {
+            continue;
+        };
+        let shown = def
+            .clone()
+            .into_source(name)
+            .map(|s| s.simple_form())
+            .unwrap_or(def);
+        out.push(data_source_wire(name, &shown, false));
+    }
+    out
+}
+
+/// Rule ids whose `db_field` source resolves to `name`, in id order.
+///
+/// Resolution matches the crate's (`source` wins, `connector` is its
+/// deprecated alias, neither ⇒ `odoo`) so a rule written either way still
+/// pins its source against deletion.
+fn data_source_referenced_by(red: &toml::Table, name: &str) -> Vec<String> {
+    let Some(rules) = red.get("rules").and_then(|v| v.as_table()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (id, body) in rules {
+        let Some(body) = body.as_table() else { continue };
+        if body.get("type").and_then(|v| v.as_str()) != Some("db_field") {
+            continue;
+        }
+        let source = body
+            .get("source")
+            .and_then(|v| v.as_str())
+            .or_else(|| body.get("connector").and_then(|v| v.as_str()))
+            .unwrap_or(duduclaw_redaction::rules::db_field::DEFAULT_SOURCE);
+        if source == name {
+            out.push(id.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Apply the `data_sources` upsert-merge onto `[redaction.data_sources.*]`
+/// (§13.5).
+///
+/// Same semantics as `field_rules`: `null` removes that name, an absent name
+/// is untouched, and everything is validated BEFORE the table is mutated.
+/// Two refusals are specific to sources: a built-in name is never writable
+/// (shadowing `odoo` with a half-specified copy would quietly unbind columns
+/// that used to be masked), and a source still named by a `db_field` rule
+/// cannot be deleted — the rule would stop compiling at the next boot.
+fn apply_data_sources_to_table(
+    red: &mut toml::Table,
+    data_sources: &serde_json::Map<String, Value>,
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    // ── Validate everything first (no partial writes) ──
+    let mut planned: Vec<(String, Option<toml::Value>)> = Vec::new();
+    for (name, body) in data_sources {
+        let name_trim = name.trim();
+        if !duduclaw_redaction::is_valid_data_source_name(name_trim) {
+            return Err(format!(
+                "Invalid data_sources name '{name_trim}'. Must match ^[a-z][a-z0-9_-]{{0,63}}$"
+            ));
+        }
+        if duduclaw_redaction::is_builtin_source(name_trim) {
+            return Err(format!(
+                "'{name_trim}' is a built-in data source — it cannot be edited or removed."
+            ));
+        }
+        if body.is_null() {
+            let refs = data_source_referenced_by(red, name_trim);
+            if !refs.is_empty() {
+                return Err(format!(
+                    "data source '{name_trim}' is still referenced by rule {} — change or remove the rule first",
+                    refs.join(", ")
+                ));
+            }
+            planned.push((name_trim.to_string(), None));
+            continue;
+        }
+        if !body.is_object() {
+            return Err(format!(
+                "data_sources.{name_trim} must be an object or null"
+            ));
+        }
+        let def: duduclaw_redaction::DataSourceDef = serde_json::from_value(body.clone())
+            .map_err(|e| format!("data_sources.{name_trim} is not a valid definition: {e}"))?;
+        // Surface the precise reason here (empty tools / table XOR / bad
+        // record path) instead of leaving it to the whole-config dry compile.
+        def.clone()
+            .into_source(name_trim)
+            .map_err(|e| e.to_string())?;
+        let toml_body = toml::Value::try_from(&def)
+            .map_err(|e| format!("data_sources.{name_trim} cannot be serialised: {e}"))?;
+        planned.push((name_trim.to_string(), Some(toml_body)));
+    }
+
+    // ── Commit ──
+    for (name, body) in planned {
+        match body {
+            None => {
+                if let Some(srcs) = red.get_mut("data_sources").and_then(|v| v.as_table_mut()) {
+                    srcs.remove(&name);
+                }
+                changes.push(format!("redaction.data_sources.{name} removed"));
+            }
+            Some(body) => {
+                let tools = body
+                    .as_table()
+                    .and_then(|t| t.get("tools"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let srcs = red
+                    .entry("data_sources")
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| "Invalid [redaction.data_sources] section".to_string())?;
+                srcs.insert(name.clone(), body);
+                changes.push(format!(
+                    "redaction.data_sources.{name} = {{ tools = {tools} }}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Profile catalogue for the dashboard's field picker: every built-in profile
@@ -3794,6 +4290,156 @@ fn redaction_available_profiles(home_dir: &std::path::Path) -> Vec<Value> {
 
 /// Parse a config.toml `[redaction]` section into the `redaction.get`
 /// response shape.
+// ── RFC-23 §14.4: `[redaction] data_file_guard` (WP-F2) ─────────────────────
+//
+// Deliberately two small standalone functions rather than fields threaded
+// through `redaction_table_to_response` / `apply_redaction_to_table`: the
+// field is owned by a different work package from the data-source editor that
+// shares those two functions, and keeping the edit surface disjoint is what
+// lets both land without stepping on each other.
+
+/// Read `[redaction] data_file_guard` for the wire response.
+///
+/// Absent / non-string / unrecognized ⇒ the default `"on"`, matching
+/// [`crate::redaction_proxy::data_file_guard_mode`] — the dashboard must show
+/// the value the spawn sites will actually use, not the literal file content.
+fn redaction_data_file_guard(table: &toml::Table) -> String {
+    let raw = table
+        .get("redaction")
+        .and_then(|r| r.as_table())
+        .and_then(|r| r.get("data_file_guard"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(crate::redaction_proxy::DATA_FILE_GUARD_DEFAULT)
+        .trim()
+        .to_ascii_lowercase();
+    if crate::redaction_proxy::DATA_FILE_GUARD_MODES.contains(&raw.as_str()) {
+        raw
+    } else {
+        crate::redaction_proxy::DATA_FILE_GUARD_DEFAULT.to_string()
+    }
+}
+
+/// Apply a `data_file_guard` field from a `redaction.update` payload.
+///
+/// Three-value validated: an unrecognized string is an ERROR here (unlike the
+/// read path's fail-safe default) because a dashboard that silently turned
+/// the operator's `"readonly"` typo into `"on"` would be lying about what it
+/// saved. Absent ⇒ no change, no entry in `changes`.
+fn apply_data_file_guard_to_table(
+    table: &mut toml::Table,
+    params: &Value,
+    changes: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(raw) = params.get("data_file_guard") else {
+        return Ok(());
+    };
+    let mode = raw
+        .as_str()
+        .ok_or_else(|| "data_file_guard must be a string".to_string())?
+        .trim()
+        .to_ascii_lowercase();
+    if !crate::redaction_proxy::DATA_FILE_GUARD_MODES.contains(&mode.as_str()) {
+        return Err(format!(
+            "data_file_guard must be one of {}",
+            crate::redaction_proxy::DATA_FILE_GUARD_MODES.join(" / ")
+        ));
+    }
+    let red = table
+        .entry("redaction")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Invalid [redaction] section".to_string())?;
+    red.insert("data_file_guard".into(), toml::Value::String(mode.clone()));
+    changes.push(format!("redaction.data_file_guard = {mode}"));
+    Ok(())
+}
+
+#[cfg(test)]
+mod data_file_guard_field_tests {
+    use super::*;
+
+    fn table(body: &str) -> toml::Table {
+        toml::from_str(body).expect("test fixture must parse")
+    }
+
+    #[test]
+    fn read_defaults_to_on() {
+        assert_eq!(redaction_data_file_guard(&table("")), "on");
+        assert_eq!(
+            redaction_data_file_guard(&table("[redaction]\nenabled = true\n")),
+            "on"
+        );
+    }
+
+    #[test]
+    fn read_round_trips_the_three_modes_and_fails_safe_on_a_typo() {
+        for mode in ["on", "read_only", "off"] {
+            let t = table(&format!("[redaction]\ndata_file_guard = \"{mode}\"\n"));
+            assert_eq!(redaction_data_file_guard(&t), mode);
+        }
+        let typo = table("[redaction]\ndata_file_guard = \"readonly\"\n");
+        assert_eq!(redaction_data_file_guard(&typo), "on");
+        let wrong_type = table("[redaction]\ndata_file_guard = 1\n");
+        assert_eq!(redaction_data_file_guard(&wrong_type), "on");
+    }
+
+    #[test]
+    fn update_writes_the_value_and_records_the_change() {
+        let mut t = table("[redaction]\nenabled = true\n");
+        let mut changes = Vec::new();
+        apply_data_file_guard_to_table(
+            &mut t,
+            &json!({ "data_file_guard": "READ_ONLY" }),
+            &mut changes,
+        )
+        .expect("valid mode");
+        assert_eq!(redaction_data_file_guard(&t), "read_only");
+        assert_eq!(changes, vec!["redaction.data_file_guard = read_only"]);
+    }
+
+    #[test]
+    fn update_refuses_an_unrecognized_mode_instead_of_silently_correcting_it() {
+        let mut t = table("[redaction]\n");
+        let mut changes = Vec::new();
+        let err = apply_data_file_guard_to_table(
+            &mut t,
+            &json!({ "data_file_guard": "readonly" }),
+            &mut changes,
+        )
+        .expect_err("typo must be rejected");
+        assert!(err.contains("read_only"), "{err}");
+        assert!(changes.is_empty());
+        assert!(
+            t.get("redaction")
+                .and_then(|r| r.get("data_file_guard"))
+                .is_none(),
+            "a rejected update must write nothing"
+        );
+
+        let mut changes = Vec::new();
+        assert!(
+            apply_data_file_guard_to_table(
+                &mut t,
+                &json!({ "data_file_guard": true }),
+                &mut changes
+            )
+            .is_err(),
+            "a non-string must be rejected"
+        );
+    }
+
+    #[test]
+    fn an_absent_field_is_a_no_op() {
+        let mut t = table("[redaction]\nenabled = true\n");
+        let before = t.clone();
+        let mut changes = Vec::new();
+        apply_data_file_guard_to_table(&mut t, &json!({ "enabled": false }), &mut changes)
+            .unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(t, before);
+    }
+}
+
 fn redaction_table_to_response(table: &toml::Table) -> Value {
     let red = table.get("redaction").and_then(|v| v.as_table());
     let enabled = red
@@ -4644,6 +5290,11 @@ pub struct MethodHandler {
         RwLock<Option<tokio::sync::broadcast::Sender<crate::autopilot_engine::AutopilotEvent>>>,
     /// RFC-23 redaction manager. `None` ⇒ pipeline disabled at this layer.
     redaction_manager: RwLock<Option<Arc<duduclaw_redaction::RedactionManager>>>,
+    /// RFC-23 poison state — set when redaction was *requested* but could not
+    /// be resolved (unparseable `[redaction]`, manager that refuses to open).
+    /// Distinct from `redaction_manager: None`, which is the legitimate
+    /// "not configured" state. See DESIGN-redaction-field-rules-2026-09 §12.
+    redaction_poison: RwLock<Option<RedactionPoison>>,
     /// Vault GC task paired with the live redaction manager — restarted on
     /// every hot swap so exactly one sweeper runs against the active vault.
     redaction_gc: tokio::sync::Mutex<Option<duduclaw_redaction::GcTask>>,
@@ -4788,6 +5439,7 @@ impl MethodHandler {
             event_tx: RwLock::new(None),
             autopilot_event_tx: RwLock::new(None),
             redaction_manager: RwLock::new(None),
+            redaction_poison: RwLock::new(None),
             redaction_gc: tokio::sync::Mutex::new(None),
             audit_index: tokio::sync::OnceCell::new(),
             message_queue: RwLock::new(None),
@@ -4897,6 +5549,16 @@ impl MethodHandler {
     /// Read the redaction manager handle.
     pub async fn get_redaction_manager(&self) -> Option<Arc<duduclaw_redaction::RedactionManager>> {
         self.redaction_manager.read().await.clone()
+    }
+
+    /// Enter (or clear) the redaction poison state. `None` clears it.
+    pub async fn set_redaction_poison(&self, poison: Option<RedactionPoison>) {
+        *self.redaction_poison.write().await = poison;
+    }
+
+    /// Read the current redaction poison state, if any.
+    pub async fn get_redaction_poison(&self) -> Option<RedactionPoison> {
+        self.redaction_poison.read().await.clone()
     }
 
     /// Inject the SQLite-backed cron task store (called once after gateway start).
@@ -5679,6 +6341,12 @@ impl MethodHandler {
             "redaction.update" => {
                 require_admin!();
                 self.handle_redaction_update(params).await
+            }
+            // Same gating as `redaction.update`: a dry run writes vault rows
+            // and reads the live rule set, so it is an operator action.
+            "redaction.dry_run" => {
+                require_admin!();
+                self.handle_redaction_dry_run(params).await
             }
 
             // IDR: identity resolution (RFC-21 §1 dashboard surface)
@@ -6653,6 +7321,18 @@ impl MethodHandler {
             "cost.recent" => {
                 require_admin!();
                 self.handle_cost_recent(params).await
+            }
+
+            // ── Read-only SQL data sources (admin only, §13.7 WP-D) ──────────
+            // One arm, exact method names (never a `starts_with` prefix — see
+            // coding convention 2). Everything else lives in `db_sources_rpc`.
+            "db_sources.list"
+            | "db_sources.test"
+            | "db_sources.upsert"
+            | "db_sources.remove"
+            | "db_sources.tables" => {
+                require_admin!();
+                crate::db_sources_rpc::dispatch(&self.home_dir, method, params).await
             }
 
             // ── Odoo (admin only) ────────────────────────────
@@ -10287,6 +10967,7 @@ impl MethodHandler {
     async fn handle_redaction_get(&self) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
         let table = self.read_config_table(&config_path).await;
+        let poison = self.get_redaction_poison().await;
         let mut resp = redaction_table_to_response(&table);
         if let Some(obj) = resp.as_object_mut() {
             // Field-picker catalogue: which profiles exist and which PII
@@ -10295,6 +10976,26 @@ impl MethodHandler {
                 "available_profiles".into(),
                 Value::Array(redaction_available_profiles(&self.home_dir)),
             );
+            // §11.2: the editable structured-field rules (db_field / json_path
+            // only — regex / keyword / identity rules stay TOML-only and are
+            // never listed here, so the editor cannot touch them).
+            obj.insert(
+                "field_rules".into(),
+                Value::Array(redaction_field_rules(&table)),
+            );
+            // §13.5: the data-source registry a `db_field` rule's `source`
+            // may name — the built-ins plus the operator's own entries.
+            obj.insert(
+                "data_sources".into(),
+                Value::Array(redaction_data_sources(&table)),
+            );
+            // §14.4: the data-file guard mode the spawn sites will apply.
+            obj.insert(
+                "data_file_guard".into(),
+                Value::String(redaction_data_file_guard(&table)),
+            );
+            // §12: poison state — `null` when redaction resolved cleanly.
+            obj.insert("poisoned".into(), poison_wire(poison.as_ref()));
         }
         WsFrame::ok_response("", resp)
     }
@@ -10304,16 +11005,35 @@ impl MethodHandler {
     /// purge_after_expire_days, profiles[], sources{user_input|tool_results|
     /// system_prompt|sub_agent|cron_context = on|off|selective|inherit},
     /// tool_egress{<tool>: {restore_args: restore|passthrough|deny, audit_reveal}
-    /// | null} }`. Response: `{ success, changes[] }`.
+    /// | null}, field_rules{<id>: <db_field|json_path rule> | null},
+    /// data_file_guard: on|read_only|off }`.
+    /// Response: `{ success, changes[], applied, warning }`.
     async fn handle_redaction_update(&self, params: Value) -> WsFrame {
         let config_path = self.home_dir.join("config.toml");
         let mut table = self.read_config_table(&config_path).await;
-        let changes = match apply_redaction_to_table(&mut table, &params) {
+        let mut changes = match apply_redaction_to_table(&mut table, &params) {
             Ok(c) => c,
             Err(e) => return WsFrame::error_response("", &e),
         };
+        // §14.4 (WP-F2) — applied here, before the "nothing to do" check, so a
+        // payload carrying only `data_file_guard` is a valid update.
+        if let Err(e) = apply_data_file_guard_to_table(&mut table, &params, &mut changes) {
+            return WsFrame::error_response("", &e);
+        }
         if changes.is_empty() {
             return WsFrame::error_response("", "No valid redaction fields to update");
+        }
+        // §11.2 dry-compile: a field-rule edit must prove the WHOLE resolved
+        // rule set still compiles (profiles + every inline rule, merge applied)
+        // before anything touches the disk. A bad path expression / unknown
+        // source otherwise lands in config.toml and poisons the next boot.
+        // §13.5: a data-source edit is the same hazard from the other end (a
+        // rule that compiled yesterday stops compiling when its source
+        // changes), so it goes through the identical gate.
+        if (params.get("field_rules").is_some() || params.get("data_sources").is_some())
+            && let Err(e) = dry_compile_redaction_table(&table, &self.home_dir)
+        {
+            return WsFrame::error_response("", &format!("規則試編失敗，未寫入：{e}"));
         }
         if let Err(e) = self.atomic_write_toml(&config_path, &table).await {
             return WsFrame::error_response("", &e);
@@ -10332,16 +11052,33 @@ impl MethodHandler {
                 }
                 toml::from_str::<Wrap>(&s).ok().map(|w| w.redaction)
             });
+        // §12 recovery: a successful rebuild clears the poison state (and
+        // announces it once); a failure while poisoned keeps it, refreshing the
+        // reason so the banner names the *current* cause. A failure while NOT
+        // poisoned does not newly poison — the live manager is untouched and
+        // the response already carries the warning.
+        let was_poisoned = self.get_redaction_poison().await;
+        let mut recovered = false;
         let (applied, warning) = match parsed {
             Some(rcfg) if rcfg.enabled => {
                 match crate::redaction_integration::build_manager_from_home(&self.home_dir, rcfg) {
                     Ok(m) => {
                         info!(rules = m.engine().rule_count(), "redaction hot-reloaded");
                         self.swap_redaction_manager(Some(m)).await;
+                        if was_poisoned.is_some() {
+                            self.set_redaction_poison(None).await;
+                            recovered = true;
+                        }
                         (true, None)
                     }
                     Err(e) => {
                         warn!(error = %e, "redaction config saved but hot reload FAILED — live pipeline unchanged");
+                        if was_poisoned.is_some() {
+                            self.set_redaction_poison(Some(RedactionPoison::new(
+                                crate::redaction_integration::poison_reason(e.to_string()),
+                            )))
+                            .await;
+                        }
                         (
                             false,
                             Some(format!(
@@ -10353,6 +11090,10 @@ impl MethodHandler {
             }
             Some(_) => {
                 self.swap_redaction_manager(None).await;
+                if was_poisoned.is_some() {
+                    self.set_redaction_poison(None).await;
+                    recovered = true;
+                }
                 (true, None)
             }
             None => (
@@ -10360,6 +11101,16 @@ impl MethodHandler {
                 Some("設定已儲存，但無法解析新設定以即時套用，請重啟 gateway".to_string()),
             ),
         };
+
+        if recovered {
+            info!("redaction poison state cleared by redaction.update");
+            crate::redaction_integration::post_redaction_activity(
+                &self.home_dir,
+                "redaction_recovered",
+                "去識別化保護已恢復：設定更新後成功套用。",
+            )
+            .await;
+        }
 
         info!(?changes, applied, "redaction.update completed");
         WsFrame::ok_response(
@@ -33918,6 +34669,10 @@ impl MethodHandler {
     }
 
     async fn handle_redaction_policy_status(&self) -> WsFrame {
+        // §12: the poison state rides on BOTH shapes — the manager-absent
+        // fallback is exactly the case a poisoned boot lands in, so omitting it
+        // there would hide the very failure this field exists to surface.
+        let poison = self.get_redaction_poison().await;
         let Some(manager) = self.get_redaction_manager().await else {
             return WsFrame::ok_response(
                 "",
@@ -33927,16 +34682,192 @@ impl MethodHandler {
                     "purge_after_expire_days": 0,
                     "rule_count": 0,
                     "override_active": false,
+                    "poisoned": poison_wire(poison.as_ref()),
                 }),
             );
         };
         match duduclaw_redaction::dashboard::handle_policy_status(&manager) {
             Ok(s) => match serde_json::to_value(&s) {
-                Ok(v) => WsFrame::ok_response("", v),
+                Ok(mut v) => {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("poisoned".into(), poison_wire(poison.as_ref()));
+                    }
+                    WsFrame::ok_response("", v)
+                }
                 Err(e) => WsFrame::error_response("", &format!("serialize policy: {e}")),
             },
             Err(e) => WsFrame::error_response("", &format!("redaction policy: {e}")),
         }
+    }
+
+    /// `redaction.dry_run` — run a pasted JSON sample through the LIVE
+    /// pipeline and report WHERE it would be tokenised.
+    ///
+    /// Params: `{ sample_json: string, tool?: string (default "odoo_search"),
+    /// args?: object (default {}) }`. Response:
+    /// `{ hits: [{ pointer, rule_id, category, token }], token_count, restored_ok }`.
+    ///
+    /// The sample is wrapped exactly the way `duduclaw redaction verify` JSON
+    /// mode wraps it (`{"content":[{"type":"text","text": pretty}]}`) so the
+    /// embedded-JSON pass is exercised, and the response deliberately carries
+    /// **no original values** — not even masked ones. The operator is checking
+    /// coverage ("did `res.partner.street` get caught?"), which the pointer and
+    /// rule id answer; echoing the PII back through the dashboard would defeat
+    /// the feature it is verifying.
+    async fn handle_redaction_dry_run(&self, params: Value) -> WsFrame {
+        use duduclaw_redaction::{Caller, RestoreTarget, ToolContext};
+
+        /// Cap on the pasted sample. Large enough for a realistic Odoo page,
+        /// small enough that a paste cannot tie up the vault.
+        const SAMPLE_MAX_BYTES: usize = 256 * 1024;
+        const DRY_RUN_SESSION: &str = "dashboard-dry-run";
+
+        let Some(sample) = params.get("sample_json").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "Missing 'sample_json' parameter");
+        };
+        if sample.trim().is_empty() {
+            return WsFrame::error_response("", "sample_json is empty");
+        }
+        if sample.len() > SAMPLE_MAX_BYTES {
+            return WsFrame::error_response(
+                "",
+                &format!("sample_json too large (max {SAMPLE_MAX_BYTES} bytes)"),
+            );
+        }
+        let tool_name = params
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("odoo_search")
+            .to_string();
+        let args = match params.get("args") {
+            None | Some(Value::Null) => json!({}),
+            Some(v) if v.is_object() => v.clone(),
+            Some(_) => return WsFrame::error_response("", "args must be an object"),
+        };
+        let parsed: Value = match serde_json::from_str(sample) {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &format!("sample_json 不是合法 JSON：{e}")),
+        };
+
+        // Fail closed with the state named: "disabled" and "poisoned" are very
+        // different answers to "why did nothing get redacted?".
+        let Some(manager) = self.get_redaction_manager().await else {
+            let msg = match self.get_redaction_poison().await {
+                Some(p) => format!(
+                    "去識別化目前處於毒化狀態，無法試跑（設定修好後會自動恢復）：{}",
+                    p.reason
+                ),
+                None => "去識別化未啟用，無法試跑。請先在本頁開啟保護並儲存。".to_string(),
+            };
+            return WsFrame::error_response("", &msg);
+        };
+
+        let agent_id = self.resolve_dry_run_agent().await;
+        let pipeline = match manager.pipeline(&agent_id, Some(DRY_RUN_SESSION.to_string())) {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &format!("pipeline build failed: {e}")),
+        };
+
+        let pretty = match serde_json::to_string_pretty(&parsed) {
+            Ok(p) => p,
+            Err(e) => return WsFrame::error_response("", &format!("cannot re-serialise sample: {e}")),
+        };
+        let mut wrapped = json!({ "content": [{ "type": "text", "text": pretty }] });
+        let ctx = ToolContext {
+            tool_name: &tool_name,
+            args: Some(&args),
+        };
+        let tokens = match pipeline.redact_value(&mut wrapped, &ctx) {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &format!("redact_value failed: {e}")),
+        };
+
+        // Owner round-trip: proves each token is reversible for the caller who
+        // is allowed to see it. The restored text stays local to this function.
+        let redacted_text = match serde_json::to_string(&wrapped) {
+            Ok(t) => t,
+            Err(e) => return WsFrame::error_response("", &format!("cannot serialise result: {e}")),
+        };
+        let restored = pipeline
+            .restore(
+                &redacted_text,
+                &Caller::owner(&agent_id),
+                RestoreTarget::UserChannel,
+            )
+            .unwrap_or_default();
+
+        let mut locations: Vec<(String, String)> = Vec::new();
+        duduclaw_redaction::collect_token_locations(&wrapped, "", &mut locations);
+
+        let mut hits: Vec<Value> = Vec::with_capacity(locations.len());
+        let mut restored_ok = 0usize;
+        for (pointer, token) in locations {
+            let entry = manager
+                .vault()
+                .lookup_mapping(&token, &agent_id, Some(DRY_RUN_SESSION))
+                .ok()
+                .flatten();
+            let (rule_id, category, reversible) = match entry {
+                Some(e) => {
+                    let original = e.original.unwrap_or_default();
+                    let ok = !original.is_empty() && restored.contains(&original);
+                    (e.rule_id, e.category, ok)
+                }
+                // A token in the output with no vault row is a real defect —
+                // surface the row rather than dropping it.
+                None => ("(not in vault)".to_string(), "?".to_string(), false),
+            };
+            if reversible {
+                restored_ok += 1;
+            }
+            hits.push(json!({
+                "pointer": pointer,
+                "rule_id": rule_id,
+                "category": category,
+                "token": token,
+            }));
+        }
+
+        WsFrame::ok_response(
+            "",
+            json!({
+                "hits": hits,
+                "token_count": tokens.len(),
+                "restored_ok": restored_ok,
+            }),
+        )
+    }
+
+    /// Agent identity used for a dashboard dry run: `[general] default_agent`
+    /// when it names a valid id, else the first registered agent, else
+    /// `"default"`. The id only picks which per-agent key salts the sample's
+    /// tokens, but it still reaches a filename under `redaction/keys/`, so an
+    /// invalid id is rejected rather than trusted.
+    async fn resolve_dry_run_agent(&self) -> String {
+        let table = self
+            .read_config_table(&self.home_dir.join("config.toml"))
+            .await;
+        if let Some(a) = table
+            .get("general")
+            .and_then(|v| v.as_table())
+            .and_then(|g| g.get("default_agent"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|a| duduclaw_core::is_valid_agent_id(a))
+        {
+            return a.to_string();
+        }
+        let reg = self.registry.read().await;
+        let mut names: Vec<String> = reg
+            .list()
+            .iter()
+            .map(|a| a.config.agent.name.clone())
+            .filter(|n| duduclaw_core::is_valid_agent_id(n))
+            .collect();
+        names.sort();
+        names.into_iter().next().unwrap_or_else(|| "default".to_string())
     }
 
     // ── Shared Skills handlers ──────────────────────────────
@@ -34822,7 +35753,7 @@ mod outfit_tests {
 #[cfg(test)]
 mod redaction_config_tests {
     use super::{apply_redaction_to_table, redaction_table_to_response};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn sources_round_trip_string_and_detail_forms() {
@@ -34923,6 +35854,1001 @@ mod redaction_config_tests {
                 .unwrap()
                 .iter()
                 .any(|c| c == "EMAIL")
+        );
+    }
+
+    // ── §11.2 structured-field rule editor ───────────────────
+
+    fn db_field_rule() -> serde_json::Value {
+        json!({
+            "type": "db_field",
+            "category": "CUSTOMER_PII",
+            "fields": ["res.partner.name", "res.partner.street"],
+        })
+    }
+
+    #[test]
+    fn get_lists_only_field_rules() {
+        let mut table = toml::Table::new();
+        let params = json!({
+            "enabled": true,
+            "field_rules": {
+                "partner": db_field_rule(),
+                "orders": {
+                    "type": "json_path",
+                    "category": "ORDER",
+                    "paths": ["$[*].partner_id"],
+                    "match_tool": "odoo_*",
+                    "match_args": { "model": "sale.order" },
+                    "exclude_keys": ["id"],
+                },
+            },
+        });
+        apply_redaction_to_table(&mut table, &params).unwrap();
+        // A regex rule written straight into TOML must NOT be listed.
+        table["redaction"]["rules"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "email".into(),
+                toml::Value::Table(
+                    toml::toml! { type = "regex" category = "EMAIL" pattern = "a@b" }.clone(),
+                ),
+            );
+
+        let listed = super::redaction_field_rules(&table);
+        let ids: Vec<&str> = listed.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["orders", "partner"], "regex rule must not be listed");
+
+        let partner = listed.iter().find(|r| r["id"] == "partner").unwrap();
+        assert_eq!(partner["kind"], "db_field");
+        assert_eq!(partner["connector"], "odoo");
+        assert_eq!(partner["fields"][1], "res.partner.street");
+        assert_eq!(partner["restore_scope"]["kind"], "owner");
+        assert_eq!(partner["priority"], 50);
+        assert_eq!(partner["cross_session_stable"], false);
+
+        let orders = listed.iter().find(|r| r["id"] == "orders").unwrap();
+        assert_eq!(orders["kind"], "json_path");
+        assert_eq!(orders["match_tool"], "odoo_*");
+        assert_eq!(orders["match_args"]["model"], "sale.order");
+        assert_eq!(orders["exclude_keys"][0], "id");
+    }
+
+    #[test]
+    fn field_rules_upsert_null_and_absent() {
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({ "field_rules": { "a": db_field_rule(), "b": db_field_rule() } }),
+        )
+        .unwrap();
+        assert_eq!(super::redaction_field_rules(&table).len(), 2);
+
+        // Upsert `a`, delete `b`, leave `a`'s sibling keys alone.
+        let changes = apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "field_rules": {
+                    "a": { "type": "db_field", "category": "OTHER", "fields": ["hr.employee.*"] },
+                    "b": null,
+                }
+            }),
+        )
+        .unwrap();
+        assert!(changes.iter().any(|c| c.contains("redaction.rules.b removed")), "{changes:?}");
+        let listed = super::redaction_field_rules(&table);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], "a");
+        assert_eq!(listed[0]["category"], "OTHER");
+        assert_eq!(listed[0]["fields"][0], "hr.employee.*");
+
+        // An absent id is untouched.
+        apply_redaction_to_table(&mut table, &json!({ "enabled": true })).unwrap();
+        assert_eq!(super::redaction_field_rules(&table).len(), 1);
+    }
+
+    #[test]
+    fn field_rules_written_toml_round_trips_through_the_crate() {
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({ "enabled": true, "field_rules": { "partner": db_field_rule() } }),
+        )
+        .unwrap();
+        // The atomic write serialises the whole table — prove it survives that
+        // trip and deserialises back into a real RuleSpec.
+        let raw = toml::to_string(&table).expect("serialisable");
+        #[derive(serde::Deserialize)]
+        struct W {
+            redaction: duduclaw_redaction::config::RedactionConfig,
+        }
+        let w: W = toml::from_str(&raw).unwrap();
+        let spec = w.redaction.rules.get("partner").expect("rule present");
+        assert!(matches!(
+            spec.kind,
+            duduclaw_redaction::RuleKind::DbField { .. }
+        ));
+    }
+
+    #[test]
+    fn field_rules_validation_rejects_bad_input() {
+        // Bad id charset / shape.
+        for bad_id in ["Partner", "1partner", "-partner", "", "par tner", &"a".repeat(65)] {
+            let mut table = toml::Table::new();
+            let params = json!({ "field_rules": { bad_id: db_field_rule() } });
+            assert!(
+                apply_redaction_to_table(&mut table, &params).is_err(),
+                "id {bad_id:?} should be refused"
+            );
+        }
+        // Wrong kind — the editor owns db_field / json_path only.
+        let mut table = toml::Table::new();
+        assert!(
+            apply_redaction_to_table(
+                &mut table,
+                &json!({ "field_rules": { "x": { "type": "regex", "category": "E", "pattern": "a" } } })
+            )
+            .is_err()
+        );
+        // Unknown rule type entirely.
+        let mut table = toml::Table::new();
+        assert!(
+            apply_redaction_to_table(
+                &mut table,
+                &json!({ "field_rules": { "x": { "type": "nope", "category": "E" } } })
+            )
+            .is_err()
+        );
+        // Not an object.
+        let mut table = toml::Table::new();
+        assert!(
+            apply_redaction_to_table(&mut table, &json!({ "field_rules": { "x": 42 } })).is_err()
+        );
+    }
+
+    #[test]
+    fn field_rules_refuse_to_touch_a_non_field_rule_id() {
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(&mut table, &json!({ "enabled": true })).unwrap();
+        let red = table["redaction"].as_table_mut().unwrap();
+        let mut rules = toml::map::Map::new();
+        rules.insert(
+            "email".into(),
+            toml::Value::Table(toml::toml! { type = "regex" category = "EMAIL" pattern = "a@b" }.clone()),
+        );
+        red.insert("rules".into(), toml::Value::Table(rules));
+
+        // Overwriting a regex rule id with a db_field rule is refused …
+        let err = apply_redaction_to_table(
+            &mut table,
+            &json!({ "field_rules": { "email": db_field_rule() } }),
+        )
+        .unwrap_err();
+        assert!(err.contains("regex"), "{err}");
+        // … and so is deleting it through this path.
+        assert!(
+            apply_redaction_to_table(&mut table, &json!({ "field_rules": { "email": null } }))
+                .is_err()
+        );
+        // The rule itself is untouched.
+        assert_eq!(table["redaction"]["rules"]["email"]["type"].as_str(), Some("regex"));
+    }
+
+    #[test]
+    fn dry_compile_rejects_malformed_paths_and_unknown_connectors() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Malformed json_path expression.
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "enabled": true,
+                "profiles": ["general"],
+                "field_rules": { "bad": { "type": "json_path", "category": "X", "paths": ["not-a-path"] } },
+            }),
+        )
+        .unwrap();
+        let err = super::dry_compile_redaction_table(&table, tmp.path()).unwrap_err();
+        assert!(!err.is_empty(), "compile error text must be surfaced");
+
+        // Unknown db_field connector.
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "enabled": true,
+                "profiles": ["general"],
+                "field_rules": {
+                    "bad": { "type": "db_field", "category": "X", "connector": "sap", "fields": ["a.b"] }
+                },
+            }),
+        )
+        .unwrap();
+        assert!(super::dry_compile_redaction_table(&table, tmp.path()).is_err());
+
+        // Malformed model.field entry.
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "enabled": true,
+                "profiles": ["general"],
+                "field_rules": {
+                    "bad": { "type": "db_field", "category": "X", "fields": ["NotAModel"] }
+                },
+            }),
+        )
+        .unwrap();
+        assert!(super::dry_compile_redaction_table(&table, tmp.path()).is_err());
+
+        // A good pair compiles.
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "enabled": true,
+                "profiles": ["general"],
+                "field_rules": { "ok": db_field_rule() },
+            }),
+        )
+        .unwrap();
+        super::dry_compile_redaction_table(&table, tmp.path()).expect("valid rules compile");
+    }
+
+    #[test]
+    fn get_output_can_be_posted_straight_back_to_update() {
+        // The editor's round trip: `redaction.get` renders `kind`, and
+        // `redaction.update` must accept that body verbatim (minus the id).
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({ "field_rules": { "partner": db_field_rule() } }),
+        )
+        .unwrap();
+        let listed = super::redaction_field_rules(&table);
+        let mut body = listed[0].as_object().unwrap().clone();
+        body.remove("id");
+        assert_eq!(body["kind"], "db_field", "get renders `kind`");
+
+        let mut table2 = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table2,
+            &json!({ "field_rules": { "partner": serde_json::Value::Object(body) } }),
+        )
+        .expect("a `kind`-shaped body must be accepted");
+        assert_eq!(
+            super::redaction_field_rules(&table2),
+            listed,
+            "round trip must be lossless"
+        );
+
+        // A body carrying both spellings in disagreement is refused.
+        let mut table3 = toml::Table::new();
+        assert!(
+            apply_redaction_to_table(
+                &mut table3,
+                &json!({ "field_rules": { "x": {
+                    "type": "db_field", "kind": "json_path",
+                    "category": "X", "fields": ["a.b"]
+                } } })
+            )
+            .is_err()
+        );
+    }
+
+    // ── §13.5 data-source registry ──────────────────────────────────────────
+
+    fn pg_source() -> serde_json::Value {
+        json!({
+            "label": "客戶 CRM 資料庫",
+            "tools": ["pg_query", "pg_select"],
+            "table_arg": "table",
+            "key_alias": { "name": "customer_name" },
+        })
+    }
+
+    #[test]
+    fn get_lists_builtin_and_custom_data_sources() {
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(&mut table, &json!({ "data_sources": { "crm_pg": pg_source() } }))
+            .unwrap();
+
+        let listed = super::redaction_data_sources(&table);
+        let names: Vec<&str> = listed.iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            ["odoo", "duduclaw_db", "duduclaw_files", "crm_pg"],
+            "built-ins first"
+        );
+
+        let odoo = &listed[0];
+        assert_eq!(odoo["builtin"], true);
+        assert_eq!(odoo["tools"].as_array().unwrap().len(), 9);
+        // Odoo mixes per-tool tables and aliases — the simple form reports
+        // nothing it cannot prove rather than inventing a summary.
+        assert_eq!(odoo["table"], Value::Null);
+        assert_eq!(odoo["table_arg"], Value::Null);
+        assert_eq!(odoo["table_result"], Value::Null);
+        assert_eq!(odoo["free_form_names"], false);
+        assert_eq!(odoo["record_paths"], json!(["$[*]", "$"]));
+
+        let db = &listed[1];
+        assert_eq!(db["builtin"], true);
+        assert_eq!(db["tools"], json!(["db_select"]));
+        assert_eq!(db["table_arg"], "table");
+        assert_eq!(db["table_result"], Value::Null);
+        assert_eq!(db["free_form_names"], false);
+        assert_eq!(db["record_paths"], json!(["$.rows[*]"]));
+
+        // The local data-file readers: the table comes from the RESULT and the
+        // names are free-form (file names / spreadsheet headers).
+        let files = &listed[2];
+        assert_eq!(files["builtin"], true);
+        assert_eq!(files["tools"], json!(["csv_read", "xlsx_read"]));
+        assert_eq!(files["table_arg"], Value::Null);
+        assert_eq!(files["table"], Value::Null);
+        assert_eq!(files["table_result"], "/table");
+        assert_eq!(files["free_form_names"], true);
+        assert_eq!(files["record_paths"], json!(["$.rows[*]"]));
+
+        let pg = &listed[3];
+        assert_eq!(pg["builtin"], false);
+        assert_eq!(pg["label"], "客戶 CRM 資料庫");
+        assert_eq!(pg["tools"], json!(["pg_query", "pg_select"]));
+        assert_eq!(pg["table_arg"], "table");
+        assert_eq!(pg["table"], Value::Null);
+        assert_eq!(pg["table_result"], Value::Null);
+        assert_eq!(pg["free_form_names"], false);
+        // Omitted record_paths come back as the defaults that take effect.
+        assert_eq!(pg["record_paths"], json!(["$.rows[*]", "$[*]", "$"]));
+        assert_eq!(pg["key_alias"]["name"], "customer_name");
+    }
+
+    #[test]
+    fn data_sources_upsert_null_and_absent() {
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({ "data_sources": { "crm_pg": pg_source(), "erp": {
+                "tools": ["erp_customers"], "table": "customers"
+            } } }),
+        )
+        .unwrap();
+        let builtins = duduclaw_redaction::BUILTIN_SOURCE_NAMES.len();
+        assert_eq!(super::redaction_data_sources(&table).len(), builtins + 2);
+
+        // Upsert one, delete the other; an absent name is untouched.
+        let changes = apply_redaction_to_table(
+            &mut table,
+            &json!({ "data_sources": {
+                "crm_pg": { "label": "改名", "tools": ["pg_select"], "table_arg": "table" },
+                "erp": null,
+            } }),
+        )
+        .unwrap();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("redaction.data_sources.erp removed")),
+            "{changes:?}"
+        );
+        let listed = super::redaction_data_sources(&table);
+        assert_eq!(listed.len(), builtins + 1);
+        let pg = listed.iter().find(|s| s["name"] == "crm_pg").unwrap();
+        assert_eq!(pg["label"], "改名");
+        assert_eq!(pg["tools"], json!(["pg_select"]));
+        // The replaced entry no longer carries the old alias.
+        assert_eq!(pg["key_alias"], json!({}));
+
+        apply_redaction_to_table(&mut table, &json!({ "enabled": true })).unwrap();
+        assert_eq!(super::redaction_data_sources(&table).len(), builtins + 1);
+    }
+
+    #[test]
+    fn data_sources_refuse_builtin_names() {
+        for builtin in duduclaw_redaction::BUILTIN_SOURCE_NAMES {
+            let builtin = *builtin;
+            let mut table = toml::Table::new();
+            let err = apply_redaction_to_table(
+                &mut table,
+                &json!({ "data_sources": { builtin: pg_source() } }),
+            )
+            .unwrap_err();
+            assert!(err.contains("built-in"), "{err}");
+            // …and deleting one is refused through the same door.
+            let mut table = toml::Table::new();
+            assert!(
+                apply_redaction_to_table(
+                    &mut table,
+                    &json!({ "data_sources": { builtin: null } })
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn data_sources_validation_rejects_bad_input() {
+        for bad_name in ["Crm", "1crm", "-crm", "", "crm.pg", &"a".repeat(65)] {
+            let mut table = toml::Table::new();
+            assert!(
+                apply_redaction_to_table(
+                    &mut table,
+                    &json!({ "data_sources": { bad_name: pg_source() } })
+                )
+                .is_err(),
+                "name {bad_name:?} should be refused"
+            );
+        }
+        // Semantic refusals, each with its own reason.
+        for (body, needle) in [
+            (json!({ "tools": [], "table_arg": "table" }), "no tools"),
+            (json!({ "tools": ["pg_select"] }), "exactly one"),
+            // The XOR error names all three options, whichever pair collided.
+            (
+                json!({ "tools": ["pg_select"], "table_arg": "table", "table": "customers" }),
+                "table_result",
+            ),
+            (
+                json!({ "tools": ["pg_select"], "table_arg": "table", "table": "customers" }),
+                "sets table_arg and table",
+            ),
+            (
+                json!({ "tools": ["csv_read"], "table_arg": "table", "table_result": "/table" }),
+                "sets table_arg and table_result",
+            ),
+            (
+                json!({ "tools": ["csv_read"], "table_result": "table" }),
+                "JSON pointer",
+            ),
+            (
+                json!({ "tools": ["pg_select"], "table_arg": "table", "record_paths": ["rows[*]"] }),
+                "rows[*]",
+            ),
+        ] {
+            let mut table = toml::Table::new();
+            let err = apply_redaction_to_table(
+                &mut table,
+                &json!({ "data_sources": { "crm_pg": body } }),
+            )
+            .unwrap_err();
+            assert!(err.contains(needle), "expected {needle:?} in: {err}");
+        }
+        // Not an object.
+        let mut table = toml::Table::new();
+        assert!(
+            apply_redaction_to_table(&mut table, &json!({ "data_sources": { "crm_pg": 42 } }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn data_sources_accept_table_result_and_free_form_names() {
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({ "data_sources": { "excel_drop": {
+                "label": "匯入的試算表",
+                "tools": ["sheet_read"],
+                "table_result": "/table",
+                "record_paths": ["$.rows[*]"],
+                "free_form_names": true,
+            } } }),
+        )
+        .unwrap();
+
+        let listed = super::redaction_data_sources(&table);
+        let src = listed
+            .iter()
+            .find(|s| s["name"] == "excel_drop")
+            .expect("custom source listed");
+        assert_eq!(src["table_result"], "/table");
+        assert_eq!(src["table_arg"], Value::Null);
+        assert_eq!(src["table"], Value::Null);
+        assert_eq!(src["free_form_names"], true);
+        assert_eq!(src["record_paths"], json!(["$.rows[*]"]));
+
+        // …and the written TOML really carries them (the wire is rendered from
+        // the stored entry, so a serialisation slip would be invisible above).
+        let stored = table["redaction"]["data_sources"]["excel_drop"]
+            .as_table()
+            .unwrap();
+        assert_eq!(stored["table_result"].as_str(), Some("/table"));
+        assert_eq!(stored["free_form_names"].as_bool(), Some(true));
+        assert!(!stored.contains_key("table_arg"));
+    }
+
+    #[test]
+    fn a_referenced_data_source_cannot_be_deleted() {
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "data_sources": { "crm_pg": { "tools": ["pg_select"], "table_arg": "table" } },
+                "field_rules": { "crm_customers": {
+                    "type": "db_field", "category": "CUSTOMER_PII",
+                    "source": "crm_pg", "fields": ["customers.name"],
+                } },
+            }),
+        )
+        .unwrap();
+
+        let err = apply_redaction_to_table(&mut table, &json!({ "data_sources": { "crm_pg": null } }))
+            .unwrap_err();
+        assert!(err.contains("still referenced by rule crm_customers"), "{err}");
+        let builtins = duduclaw_redaction::BUILTIN_SOURCE_NAMES.len();
+        assert_eq!(
+            super::redaction_data_sources(&table).len(),
+            builtins + 1,
+            "nothing removed"
+        );
+
+        // Retiring the rule and the source in ONE call works — field_rules are
+        // applied first, so the reference is already gone.
+        apply_redaction_to_table(
+            &mut table,
+            &json!({ "field_rules": { "crm_customers": null }, "data_sources": { "crm_pg": null } }),
+        )
+        .unwrap();
+        assert_eq!(super::redaction_data_sources(&table).len(), builtins);
+
+        // The deprecated `connector` spelling pins its source just as well.
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "data_sources": { "crm_pg": { "tools": ["pg_select"], "table_arg": "table" } },
+                "field_rules": { "legacy": {
+                    "type": "db_field", "category": "X",
+                    "connector": "crm_pg", "fields": ["customers.name"],
+                } },
+            }),
+        )
+        .unwrap();
+        assert!(
+            apply_redaction_to_table(&mut table, &json!({ "data_sources": { "crm_pg": null } }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn dry_compile_covers_custom_sources_in_both_directions() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A rule naming a source nobody defined must not reach the disk.
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "enabled": true,
+                "profiles": ["general"],
+                "field_rules": { "crm": {
+                    "type": "db_field", "category": "X",
+                    "source": "crm_pg", "fields": ["customers.name"],
+                } },
+            }),
+        )
+        .unwrap();
+        let err = super::dry_compile_redaction_table(&table, tmp.path()).unwrap_err();
+        assert!(err.contains("crm_pg"), "{err}");
+
+        // Defining the source makes the same rule compile.
+        apply_redaction_to_table(
+            &mut table,
+            &json!({ "data_sources": { "crm_pg": { "tools": ["pg_select"], "table_arg": "table" } } }),
+        )
+        .unwrap();
+        super::dry_compile_redaction_table(&table, tmp.path())
+            .expect("a defined source compiles");
+
+        // `source` and `connector` disagreeing is a compile error, not a
+        // silent winner.
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "enabled": true,
+                "profiles": ["general"],
+                "field_rules": { "conflict": {
+                    "type": "db_field", "category": "X",
+                    "source": "duduclaw_db", "connector": "odoo",
+                    "fields": ["customers.name"],
+                } },
+            }),
+        )
+        .unwrap();
+        assert!(super::dry_compile_redaction_table(&table, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn db_field_rule_wire_reports_the_resolved_source() {
+        let mut table = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table,
+            &json!({
+                "data_sources": { "crm_pg": { "tools": ["pg_select"], "table_arg": "table" } },
+                "field_rules": {
+                    // No source / connector at all ⇒ the historical default.
+                    "legacy": { "type": "db_field", "category": "X", "fields": ["res.partner.name"] },
+                    "modern": { "type": "db_field", "category": "X", "source": "crm_pg", "fields": ["customers.name"] },
+                },
+            }),
+        )
+        .unwrap();
+        let listed = super::redaction_field_rules(&table);
+        let by = |id: &str| -> Value {
+            listed.iter().find(|r| r["id"] == id).unwrap().clone()
+        };
+        assert_eq!(by("legacy")["connector"], "odoo");
+        assert_eq!(by("modern")["connector"], "crm_pg");
+
+        // Posting the rendered body straight back stays lossless.
+        let mut body = by("modern").as_object().unwrap().clone();
+        body.remove("id");
+        let mut table2 = toml::Table::new();
+        apply_redaction_to_table(
+            &mut table2,
+            &json!({ "field_rules": { "modern": Value::Object(body) } }),
+        )
+        .unwrap();
+        assert_eq!(super::redaction_field_rules(&table2)[0]["connector"], "crm_pg");
+    }
+
+    #[test]
+    fn field_rule_id_charset_is_anchored() {
+        assert!(super::is_valid_field_rule_id("a"));
+        assert!(super::is_valid_field_rule_id("partner_pii-2"));
+        assert!(!super::is_valid_field_rule_id("Partner"));
+        assert!(!super::is_valid_field_rule_id("2partner"));
+        assert!(!super::is_valid_field_rule_id("partner."));
+        assert!(!super::is_valid_field_rule_id("partner/../x"));
+        assert!(!super::is_valid_field_rule_id(""));
+    }
+}
+
+#[cfg(test)]
+mod redaction_rpc_tests {
+    //! Handler-level coverage for the §12 poison surface and the §11.2 editor
+    //! RPCs. Same harness as the other async RPC test modules in this file.
+    use super::*;
+    use serde_json::json;
+
+    fn payload(frame: &WsFrame) -> Value {
+        match frame {
+            WsFrame::Response {
+                ok: true,
+                payload: Some(p),
+                ..
+            } => p.clone(),
+            WsFrame::Response { ok: false, error, .. } => {
+                panic!("RPC returned an error frame: {error:?}")
+            }
+            other => panic!("unexpected frame shape: {other:?}"),
+        }
+    }
+
+    fn error_text(frame: &WsFrame) -> String {
+        match frame {
+            WsFrame::Response { error: Some(e), .. } => e.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    async fn handler_with_config(home: &std::path::Path, config_toml: &str) -> MethodHandler {
+        std::fs::write(home.join("config.toml"), config_toml).unwrap();
+        MethodHandler::new(home.to_path_buf()).await
+    }
+
+    #[tokio::test]
+    async fn data_sources_round_trip_through_get_and_update() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = false\n").await;
+
+        // `get` always carries the built-ins, even with nothing configured.
+        let p = payload(&handler.handle_redaction_get().await);
+        let names: Vec<String> = p["data_sources"]
+            .as_array()
+            .expect("data_sources array")
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["odoo", "duduclaw_db", "duduclaw_files"]);
+
+        // An update adds a custom source AND the rule that uses it in one go.
+        let frame = handler
+            .handle_redaction_update(json!({
+                "data_sources": { "crm_pg": {
+                    "label": "客戶 CRM 資料庫",
+                    "tools": ["pg_select"],
+                    "table_arg": "table",
+                    "record_paths": ["$.rows[*]"],
+                } },
+                "field_rules": { "crm_customers": {
+                    "type": "db_field", "category": "CUSTOMER_PII",
+                    "source": "crm_pg", "fields": ["customers.name"],
+                } },
+            }))
+            .await;
+        assert_eq!(payload(&frame)["success"], true);
+
+        let p = payload(&handler.handle_redaction_get().await);
+        let pg = p["data_sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "crm_pg")
+            .expect("custom source listed");
+        assert_eq!(pg["builtin"], false);
+        assert_eq!(pg["record_paths"], json!(["$.rows[*]"]));
+        assert_eq!(p["field_rules"][0]["connector"], "crm_pg");
+
+        // Deleting the source while the rule still points at it is refused,
+        // and nothing is written.
+        let frame = handler
+            .handle_redaction_update(json!({ "data_sources": { "crm_pg": null } }))
+            .await;
+        assert!(
+            error_text(&frame).contains("still referenced by rule crm_customers"),
+            "{}",
+            error_text(&frame)
+        );
+        let p = payload(&handler.handle_redaction_get().await);
+        assert!(
+            p["data_sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == "crm_pg")
+        );
+
+        // A built-in name is never writable.
+        let frame = handler
+            .handle_redaction_update(json!({ "data_sources": { "odoo": { "tools": ["x"], "table_arg": "t" } } }))
+            .await;
+        assert!(error_text(&frame).contains("built-in"), "{}", error_text(&frame));
+    }
+
+    #[tokio::test]
+    async fn get_and_policy_status_report_no_poison_by_default() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = false\n").await;
+
+        let p = payload(&handler.handle_redaction_get().await);
+        assert_eq!(p["poisoned"], Value::Null);
+        assert!(p["field_rules"].is_array());
+
+        let p = payload(&handler.handle_redaction_policy_status().await);
+        assert_eq!(p["poisoned"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn poison_state_surfaces_on_both_rpcs() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = false\n").await;
+        handler
+            .set_redaction_poison(Some(RedactionPoison::new("rule 'x' failed to compile")))
+            .await;
+
+        let p = payload(&handler.handle_redaction_get().await);
+        assert_eq!(p["poisoned"]["reason"], "rule 'x' failed to compile");
+        assert!(p["poisoned"]["since"].as_str().unwrap().contains('T'));
+
+        // The manager-absent fallback shape is exactly where a poisoned boot
+        // lands — it must carry the field too.
+        let p = payload(&handler.handle_redaction_policy_status().await);
+        assert_eq!(p["poisoned"]["reason"], "rule 'x' failed to compile");
+    }
+
+    #[tokio::test]
+    async fn successful_hot_reload_clears_the_poison() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = false\n").await;
+        handler
+            .set_redaction_poison(Some(RedactionPoison::new("boot failed")))
+            .await;
+
+        let frame = handler
+            .handle_redaction_update(json!({ "enabled": true, "profiles": ["general"] }))
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["applied"], true, "{p}");
+        assert!(handler.get_redaction_poison().await.is_none());
+        assert!(handler.get_redaction_manager().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_hot_reload_keeps_the_poison_and_refreshes_the_reason() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = false\n").await;
+        handler
+            .set_redaction_poison(Some(RedactionPoison::new("boot failed")))
+            .await;
+
+        // A profile that does not exist fails `RedactionManager::open`.
+        let frame = handler
+            .handle_redaction_update(json!({ "enabled": true, "profiles": ["no_such_profile"] }))
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["applied"], false, "{p}");
+        assert!(p["warning"].as_str().unwrap().contains("no_such_profile"));
+        let poison = handler.get_redaction_poison().await.expect("still poisoned");
+        assert!(
+            poison.reason.contains("no_such_profile"),
+            "reason should be refreshed: {}",
+            poison.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_redaction_also_clears_the_poison() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = true\n").await;
+        handler
+            .set_redaction_poison(Some(RedactionPoison::new("boot failed")))
+            .await;
+
+        let p = payload(&handler.handle_redaction_update(json!({ "enabled": false })).await);
+        assert_eq!(p["applied"], true, "{p}");
+        assert!(handler.get_redaction_poison().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_refuses_to_write_a_rule_that_does_not_compile() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = true\nprofiles = [\"general\"]\n").await;
+
+        let frame = handler
+            .handle_redaction_update(json!({
+                "field_rules": {
+                    "bad": { "type": "json_path", "category": "X", "paths": ["not-a-path"] }
+                }
+            }))
+            .await;
+        assert!(error_text(&frame).contains("試編"), "{:?}", frame);
+        // Nothing was written.
+        let saved = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(!saved.contains("[redaction.rules.bad]"), "{saved}");
+    }
+
+    #[tokio::test]
+    async fn update_writes_a_valid_field_rule_and_get_lists_it() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = true\nprofiles = [\"general\"]\n").await;
+
+        let frame = handler
+            .handle_redaction_update(json!({
+                "field_rules": {
+                    "partner": {
+                        "type": "db_field",
+                        "category": "CUSTOMER_PII",
+                        "fields": ["res.partner.name"],
+                    }
+                }
+            }))
+            .await;
+        let p = payload(&frame);
+        assert_eq!(p["applied"], true, "{p}");
+
+        let p = payload(&handler.handle_redaction_get().await);
+        let rules = p["field_rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["id"], "partner");
+        assert_eq!(rules[0]["kind"], "db_field");
+    }
+
+    #[tokio::test]
+    async fn dry_run_errors_when_redaction_is_off() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = false\n").await;
+        let frame = handler
+            .handle_redaction_dry_run(json!({ "sample_json": "{\"a\":1}" }))
+            .await;
+        assert!(error_text(&frame).contains("未啟用"), "{:?}", frame);
+    }
+
+    #[tokio::test]
+    async fn dry_run_error_names_the_poison_state() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = false\n").await;
+        handler
+            .set_redaction_poison(Some(RedactionPoison::new("rule 'x' failed to compile")))
+            .await;
+        let frame = handler
+            .handle_redaction_dry_run(json!({ "sample_json": "{\"a\":1}" }))
+            .await;
+        let err = error_text(&frame);
+        assert!(err.contains("毒化"), "{err}");
+        assert!(err.contains("rule 'x' failed to compile"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_hits_without_original_values() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(
+            home.path(),
+            "[redaction]\nenabled = true\nprofiles = [\"general\"]\n\
+             [redaction.sources]\ntool_results = \"on\"\n\
+             [redaction.rules.partner]\ntype = \"db_field\"\ncategory = \"CUSTOMER_PII\"\n\
+             fields = [\"res.partner.name\", \"res.partner.street\"]\n",
+        )
+        .await;
+        // Install the live manager the way boot does.
+        let cfg = duduclaw_redaction::RedactionConfig {
+            enabled: true,
+            profiles: vec!["general".into()],
+            ..Default::default()
+        };
+        let mut cfg = cfg;
+        cfg.rules.insert(
+            "partner".into(),
+            duduclaw_redaction::RuleSpec {
+                id: "partner".into(),
+                category: "CUSTOMER_PII".into(),
+                restore_scope: duduclaw_redaction::RestoreScope::Owner,
+                priority: 50,
+                cross_session_stable: false,
+                apply_to_system_prompt: false,
+                kind: duduclaw_redaction::RuleKind::DbField {
+                    source: Some("odoo".into()),
+                    connector: None,
+                    fields: vec!["res.partner.name".into(), "res.partner.street".into()],
+                },
+            },
+        );
+        cfg.sources.tool_results = duduclaw_redaction::SourceMode::On.into();
+        let manager =
+            crate::redaction_integration::build_manager_from_home(home.path(), cfg).unwrap();
+        handler.swap_redaction_manager(Some(manager)).await;
+
+        let sample = r#"[{"id": 7, "name": "王小明", "street": "台北市信義路 1 號"}]"#;
+        let frame = handler
+            .handle_redaction_dry_run(json!({
+                "sample_json": sample,
+                "tool": "odoo_search",
+                "args": { "model": "res.partner" },
+            }))
+            .await;
+        let p = payload(&frame);
+        let hits = p["hits"].as_array().expect("hits array");
+        assert!(!hits.is_empty(), "expected structured hits: {p}");
+        assert_eq!(p["token_count"].as_u64().unwrap() as usize, hits.len());
+        assert_eq!(p["restored_ok"].as_u64().unwrap() as usize, hits.len());
+
+        let rendered = serde_json::to_string(&p).unwrap();
+        assert!(!rendered.contains("王小明"), "originals must never be returned: {rendered}");
+        assert!(!rendered.contains("信義路"), "originals must never be returned: {rendered}");
+        for hit in hits {
+            assert!(hit["pointer"].as_str().unwrap().starts_with("/content/0/text#"));
+            assert_eq!(hit["rule_id"], "partner");
+            assert_eq!(hit["category"], "CUSTOMER_PII");
+            assert!(hit["token"].as_str().unwrap().starts_with("<REDACT:"));
+            assert!(hit.get("masked").is_none(), "no masked column either");
+            assert!(hit.get("original").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_rejects_bad_input() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), "[redaction]\nenabled = false\n").await;
+        assert!(!error_text(&handler.handle_redaction_dry_run(json!({})).await).is_empty());
+        assert!(
+            !error_text(
+                &handler
+                    .handle_redaction_dry_run(json!({ "sample_json": "   " }))
+                    .await
+            )
+            .is_empty()
+        );
+        assert!(
+            !error_text(
+                &handler
+                    .handle_redaction_dry_run(json!({ "sample_json": "{", "args": 5 }))
+                    .await
+            )
+            .is_empty()
         );
     }
 }

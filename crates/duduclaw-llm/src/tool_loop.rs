@@ -108,6 +108,90 @@ pub trait ToolExecutor: Send + Sync {
 
     /// Dispatch one tool call by name with parsed JSON arguments.
     async fn call(&self, name: &str, args: Value) -> Result<ToolOutcome, String>;
+
+    /// Which MCP server owns `tool`, when the executor knows.
+    ///
+    /// Only used to give a [`ToolInterceptor`] the `<server>.<tool>`
+    /// namespace the RFC-23 redaction rules match on — the loop itself never
+    /// routes on it. Default `None` keeps every existing executor (and every
+    /// mock) source-compatible; [`crate::ToolRegistry`] overrides it when it
+    /// was built with server names.
+    fn server_of(&self, _tool: &str) -> Option<String> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool interceptor (RFC-23 §13.6 — redaction for the non-CLI tool surface)
+// ---------------------------------------------------------------------------
+
+/// What an interceptor decided about a pending tool call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InterceptDecision {
+    /// Dispatch with these arguments (possibly rewritten — e.g. `<REDACT:…>`
+    /// tokens restored to real values for a whitelisted tool).
+    Allow(Value),
+    /// Do not dispatch. The reason is fed back to the model as an `is_error`
+    /// tool result so it can re-plan, exactly like a policy denial.
+    Deny(String),
+}
+
+/// A per-call hook around tool dispatch, sitting *inside* the loop so it
+/// covers every provider.
+///
+/// This is the direct-API twin of the MCP choke point: the CLI backends get
+/// redaction from `duduclaw mcp-server` / `duduclaw mcp-proxy`, but a model
+/// driven through [`run_tool_loop`] talks to the `ToolRegistry` in-process,
+/// where no such choke point exists. An interceptor closes that gap without
+/// the loop knowing anything about redaction.
+///
+/// `server` is `""` when the executor cannot attribute the tool to a server
+/// (see [`ToolExecutor::server_of`]) — implementations must treat that as
+/// "unknown", never as a server literally named the empty string.
+///
+/// Both hooks are synchronous on purpose: they run between two provider
+/// round-trips on the loop's own task, and the RFC-23 pipeline they wrap is
+/// itself synchronous (SQLite vault + in-memory rule engine).
+pub trait ToolInterceptor: Send + Sync {
+    /// Called before dispatch. Returning [`InterceptDecision::Deny`] means the
+    /// tool is **never invoked**.
+    fn before_call(&self, server: &str, tool: &str, args: Value) -> InterceptDecision;
+
+    /// Called after a dispatched tool returned, with the parsed result so
+    /// structured (JSON-path) rules can see keys rather than raw text.
+    ///
+    /// `result` is the tool's `content` parsed as JSON when it parses, and
+    /// `Value::String(content)` otherwise; the loop converts whatever is left
+    /// in it back into the string the model sees.
+    fn after_call(&self, server: &str, tool: &str, args: &Value, result: &mut Value);
+}
+
+/// Parse a tool's textual output into the `Value` an interceptor sees.
+///
+/// JSON in ⇒ JSON out (so structured field rules can address keys); anything
+/// else becomes a string leaf (the text rules still run over it).
+fn result_to_value(content: &str) -> Value {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return Value::String(content.to_string());
+    }
+    serde_json::from_str::<Value>(content)
+        .unwrap_or_else(|_| Value::String(content.to_string()))
+}
+
+/// Inverse of [`result_to_value`]. `pretty` mirrors the original's layout so
+/// a pretty-printed record dump does not come back as one compact line.
+fn value_to_result(value: Value, pretty: bool) -> String {
+    match value {
+        Value::String(s) => s,
+        other => {
+            if pretty {
+                serde_json::to_string_pretty(&other).unwrap_or_else(|_| other.to_string())
+            } else {
+                other.to_string()
+            }
+        }
+    }
 }
 
 /// Extract the `(id, name, args)` of every tool call in a response, in order.
@@ -134,9 +218,15 @@ pub async fn run_tool_loop(
     tools: &dyn ToolExecutor,
     max_iters: usize,
 ) -> Result<ChatResponse, LlmError> {
-    let outcome =
-        run_tool_loop_with_provenance(provider, req, tools, max_iters, ProvenanceConfig::default())
-            .await?;
+    let outcome = run_tool_loop_with_provenance(
+        provider,
+        req,
+        tools,
+        max_iters,
+        ProvenanceConfig::default(),
+        None,
+    )
+    .await?;
     Ok(outcome.response)
 }
 
@@ -206,12 +296,19 @@ pub struct LoopToolCall {
 ///   `cfg.tool_trust` overrides that tool (e.g. a wiki-read tool declared
 ///   [`SourceKind::Wiki`] never taints). The loop's own synthesized block
 ///   message is not registered (it is deterministic and payload-free).
+///
+/// `interceptor` (RFC-23 §13.6) wraps every dispatch: `before_call` may
+/// rewrite the arguments or refuse the call outright (the refusal is fed back
+/// as an `is_error` tool result, never dispatched), and `after_call` may
+/// rewrite the result text before it re-enters the conversation. `None` ⇒
+/// byte-identical to the pre-interceptor loop.
 pub async fn run_tool_loop_with_provenance(
     provider: &dyn ChatProvider,
     mut req: ChatRequest,
     tools: &dyn ToolExecutor,
     max_iters: usize,
     mut cfg: ProvenanceConfig,
+    interceptor: Option<std::sync::Arc<dyn ToolInterceptor>>,
 ) -> Result<ToolLoopOutcome, LlmError> {
     // Seed the tool schemas unless the caller supplied their own.
     if req.tools.is_empty() {
@@ -266,12 +363,38 @@ pub async fn run_tool_loop_with_provenance(
                 None => None,
             };
 
-            let (content, is_error, executed) = match block_reason {
+            // RFC-23 §13.6 egress gate. Runs after the provenance gate (a
+            // provenance-blocked call is already refused; there is nothing to
+            // restore) and before dispatch, so a `Deny` never reaches the tool.
+            let server = interceptor
+                .as_ref()
+                .and_then(|_| tools.server_of(&name))
+                .unwrap_or_default();
+            let (args, intercept_denial) = match (&interceptor, &block_reason) {
+                (Some(icept), None) => match icept.before_call(&server, &name, args) {
+                    InterceptDecision::Allow(a) => (a, None),
+                    InterceptDecision::Deny(reason) => (Value::Null, Some(reason)),
+                },
+                _ => (args, None),
+            };
+
+            let (content, is_error, executed) = match (block_reason, intercept_denial) {
                 // Enforce: sensitive tool with tainted args is NOT executed —
                 // the structured refusal goes back so the model can re-plan.
-                Some(reason) => (reason, true, false),
-                None => match tools.call(&name, args).await {
-                    Ok(outcome) => (outcome.content, outcome.is_error, true),
+                (Some(reason), _) => (reason, true, false),
+                // Interceptor refusal — same shape: fed back, never dispatched.
+                (None, Some(reason)) => (reason, true, false),
+                (None, None) => match tools.call(&name, args.clone()).await {
+                    Ok(outcome) => {
+                        let mut content = outcome.content;
+                        if let Some(icept) = interceptor.as_ref() {
+                            let pretty = content.contains('\n');
+                            let mut value = result_to_value(&content);
+                            icept.after_call(&server, &name, &args, &mut value);
+                            content = value_to_result(value, pretty);
+                        }
+                        (content, outcome.is_error, true)
+                    }
                     // Dispatch failure → feed back as an error result, not a
                     // loop abort, so the model can pick a different tool.
                     Err(reason) => (format!("tool dispatch failed: {reason}"), true, true),
@@ -357,6 +480,12 @@ impl<'a> PolicyExecutor<'a> {
 impl ToolExecutor for PolicyExecutor<'_> {
     fn defs(&self) -> Vec<ToolDef> {
         self.inner.defs()
+    }
+
+    /// Delegate so a decorated registry still tells a [`ToolInterceptor`]
+    /// which server owns the tool.
+    fn server_of(&self, tool: &str) -> Option<String> {
+        self.inner.server_of(tool)
     }
 
     async fn call(&self, name: &str, args: Value) -> Result<ToolOutcome, String> {
@@ -650,6 +779,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             ProvenanceConfig::default(),
+            None,
         )
         .await
         .unwrap();
@@ -674,6 +804,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             ProvenanceConfig::default(),
+            None,
         )
         .await
         .unwrap();
@@ -698,6 +829,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             ProvenanceConfig::default(),
+            None,
         )
         .await
         .unwrap();
@@ -725,6 +857,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             ProvenanceConfig::default(),
+            None,
         )
         .await
         .unwrap();
@@ -762,6 +895,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             enforce_cfg(&["send_email"]),
+            None,
         )
         .await
         .unwrap();
@@ -800,6 +934,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             ProvenanceConfig::default(),
+            None,
         )
         .await
         .unwrap();
@@ -825,6 +960,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             ProvenanceConfig::default(),
+            None,
         )
         .await
         .unwrap();
@@ -851,6 +987,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             ProvenanceConfig::default(),
+            None,
         )
         .await
         .unwrap();
@@ -931,6 +1068,241 @@ mod tests {
             .unwrap();
         assert_eq!(resp.text(), "ok, I won't use that tool");
         assert_eq!(inner.call_count(), 0, "forbidden tool must never dispatch");
+    }
+
+    // ── RFC-23 §13.6: ToolInterceptor ─────────────────────────────────────
+
+    /// Records what it saw and can be told to deny, rewrite args, or rewrite
+    /// the result. Stands in for the gateway's redaction interceptor.
+    struct SpyInterceptor {
+        deny: Option<String>,
+        rewrite_args: Option<Value>,
+        seen: Mutex<Vec<(String, String, Value)>>,
+        after_seen: Mutex<Vec<(String, String)>>,
+    }
+
+    impl SpyInterceptor {
+        fn allow_all() -> Self {
+            Self {
+                deny: None,
+                rewrite_args: None,
+                seen: Mutex::new(Vec::new()),
+                after_seen: Mutex::new(Vec::new()),
+            }
+        }
+        fn denying(reason: &str) -> Self {
+            Self { deny: Some(reason.into()), ..Self::allow_all() }
+        }
+        fn rewriting(args: Value) -> Self {
+            Self { rewrite_args: Some(args), ..Self::allow_all() }
+        }
+    }
+
+    impl ToolInterceptor for SpyInterceptor {
+        fn before_call(&self, server: &str, tool: &str, args: Value) -> InterceptDecision {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((server.to_string(), tool.to_string(), args.clone()));
+            match (&self.deny, &self.rewrite_args) {
+                (Some(reason), _) => InterceptDecision::Deny(reason.clone()),
+                (None, Some(new_args)) => InterceptDecision::Allow(new_args.clone()),
+                (None, None) => InterceptDecision::Allow(args),
+            }
+        }
+
+        fn after_call(&self, server: &str, tool: &str, _args: &Value, result: &mut Value) {
+            self.after_seen
+                .lock()
+                .unwrap()
+                .push((server.to_string(), tool.to_string()));
+            // Stand-in for redaction: tokenise a `name` field, and mark plain
+            // text so the string-leaf round trip is observable too.
+            match result {
+                Value::Object(map) => {
+                    if map.contains_key("name") {
+                        map.insert("name".into(), Value::String("<REDACT:X>".into()));
+                    }
+                }
+                Value::String(s) => *s = format!("[redacted]{s}"),
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interceptor_deny_short_circuits_and_never_dispatches() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("understood"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok("SECRET ROWS".into()));
+        let icept = std::sync::Arc::new(SpyInterceptor::denying("egress denied: not whitelisted"));
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            ChatRequest::new("m"),
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+            Some(icept.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(exec.call_count(), 0, "a denied call must never reach the tool");
+        assert_eq!(out.response.text(), "understood");
+        // The refusal is fed back to the model as an error tool result.
+        let fed_back = provider.last_request();
+        let last = fed_back.messages.last().unwrap();
+        match &last.parts[0] {
+            ContentPart::ToolResult { content, is_error, .. } => {
+                assert!(*is_error);
+                assert!(content.contains("egress denied"), "{content}");
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+        // And it is recorded as an attempted-but-failed call.
+        assert_eq!(out.tool_calls.len(), 1);
+        assert!(!out.tool_calls[0].success);
+    }
+
+    #[tokio::test]
+    async fn interceptor_after_call_mutates_the_result_the_model_sees() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("done"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok(
+            r#"{"name":"王小明","id":7}"#.to_string(),
+        ));
+        let icept = std::sync::Arc::new(SpyInterceptor::allow_all());
+
+        run_tool_loop_with_provenance(
+            &provider,
+            ChatRequest::new("m"),
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+            Some(icept.clone()),
+        )
+        .await
+        .unwrap();
+
+        let fed_back = provider.last_request();
+        let last = fed_back.messages.last().unwrap();
+        match &last.parts[0] {
+            ContentPart::ToolResult { content, .. } => {
+                assert!(content.contains("<REDACT:X>"), "{content}");
+                assert!(!content.contains("王小明"), "{content}");
+                assert!(content.contains("\"id\""), "non-matching keys survive: {content}");
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+        assert_eq!(icept.after_seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interceptor_sees_plain_text_results_as_string_leaves() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("done"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok("just prose".into()));
+        let icept = std::sync::Arc::new(SpyInterceptor::allow_all());
+
+        run_tool_loop_with_provenance(
+            &provider,
+            ChatRequest::new("m"),
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+            Some(icept),
+        )
+        .await
+        .unwrap();
+
+        let fed_back = provider.last_request();
+        match &fed_back.messages.last().unwrap().parts[0] {
+            ContentPart::ToolResult { content, .. } => {
+                assert_eq!(content, "[redacted]just prose");
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn interceptor_can_rewrite_arguments_before_dispatch() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("done"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok("ok".into()));
+        let icept =
+            std::sync::Arc::new(SpyInterceptor::rewriting(serde_json::json!({"q": "restored"})));
+
+        let out = run_tool_loop_with_provenance(
+            &provider,
+            ChatRequest::new("m"),
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+            Some(icept.clone()),
+        )
+        .await
+        .unwrap();
+
+        let calls = exec.calls.lock().unwrap();
+        assert_eq!(calls[0].1, serde_json::json!({"q": "restored"}));
+        // `server` is "" because MockExecutor does not attribute tools.
+        assert_eq!(icept.seen.lock().unwrap()[0].0, "");
+        assert_eq!(icept.seen.lock().unwrap()[0].1, "search");
+        // The audit record keeps the PRE-rewrite args (never the restored PII).
+        assert!(out.tool_calls[0].input_text.as_deref().unwrap().contains("rust"));
+    }
+
+    #[tokio::test]
+    async fn no_interceptor_is_byte_identical_to_the_previous_loop() {
+        let provider = ScriptedProvider::new(vec![
+            tool_use_resp("call-1", "search"),
+            final_resp("done"),
+        ]);
+        let exec = MockExecutor::new(MockBehavior::Ok(r#"{"name":"王小明"}"#.into()));
+
+        run_tool_loop_with_provenance(
+            &provider,
+            ChatRequest::new("m"),
+            &exec,
+            DEFAULT_MAX_TOOL_ITERS,
+            ProvenanceConfig::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        match &provider.last_request().messages.last().unwrap().parts[0] {
+            ContentPart::ToolResult { content, .. } => {
+                assert_eq!(content, r#"{"name":"王小明"}"#);
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_value_round_trip_preserves_shape() {
+        // JSON in ⇒ JSON out; prose in ⇒ prose out, verbatim.
+        let v = result_to_value(r#"{"a":1}"#);
+        assert_eq!(v, serde_json::json!({"a": 1}));
+        assert_eq!(value_to_result(v, false), r#"{"a":1}"#);
+
+        let v = result_to_value("not json {");
+        assert_eq!(v, Value::String("not json {".into()));
+        assert_eq!(value_to_result(v, false), "not json {");
+
+        // A multi-line (pretty) payload comes back pretty, not squashed.
+        let pretty = "{\n  \"a\": 1\n}";
+        let v = result_to_value(pretty);
+        assert_eq!(value_to_result(v, true), pretty);
     }
 
     // ── S2: argument-level provenance (PACT v1) ───────────────────────────
@@ -1027,6 +1399,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             enforce_cfg(&["send_email"]),
+            None,
         )
         .await
         .unwrap();
@@ -1085,6 +1458,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             enforce_cfg(&["send_email"]),
+            None,
         )
         .await
         .unwrap();
@@ -1110,7 +1484,7 @@ mod tests {
         cfg.policy = ProvenancePolicy::Warn;
         let req = ChatRequest::new("m");
 
-        let out = run_tool_loop_with_provenance(&provider, req, &exec, DEFAULT_MAX_TOOL_ITERS, cfg)
+        let out = run_tool_loop_with_provenance(&provider, req, &exec, DEFAULT_MAX_TOOL_ITERS, cfg, None)
             .await
             .unwrap();
 
@@ -1141,7 +1515,7 @@ mod tests {
         assert_eq!(cfg.policy, ProvenancePolicy::Off);
         let req = ChatRequest::new("m");
 
-        let out = run_tool_loop_with_provenance(&provider, req, &exec, DEFAULT_MAX_TOOL_ITERS, cfg)
+        let out = run_tool_loop_with_provenance(&provider, req, &exec, DEFAULT_MAX_TOOL_ITERS, cfg, None)
             .await
             .unwrap();
 
@@ -1169,6 +1543,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             enforce_cfg(&["send_email"]),
+            None,
         )
         .await
         .unwrap();
@@ -1193,7 +1568,7 @@ mod tests {
         cfg.tool_trust.insert("wiki_read".into(), SourceKind::Wiki);
         let req = ChatRequest::new("m");
 
-        let out = run_tool_loop_with_provenance(&provider, req, &exec, DEFAULT_MAX_TOOL_ITERS, cfg)
+        let out = run_tool_loop_with_provenance(&provider, req, &exec, DEFAULT_MAX_TOOL_ITERS, cfg, None)
             .await
             .unwrap();
 
@@ -1228,6 +1603,7 @@ mod tests {
             &exec,
             DEFAULT_MAX_TOOL_ITERS,
             enforce_cfg(&["send_email"]),
+            None,
         )
         .await
         .unwrap();

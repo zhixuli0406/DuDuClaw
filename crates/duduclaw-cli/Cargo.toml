@@ -18,6 +18,8 @@ duduclaw-fork = { workspace = true }
 duduclaw-container = { workspace = true }
 duduclaw-security = { workspace = true }
 duduclaw-odoo = { workspace = true }
+# §13.7 WP-D: read-only SQL data sources (db_sources / db_tables / db_select / db_query).
+duduclaw-db = { workspace = true }
 duduclaw-inference = { workspace = true }
 # G2 Part B: local reverse-proxy reuses the unified provider layer to forward
 # rotator-selected accounts to their real upstream (OpenAI-compat endpoint out).
@@ -75,6 +77,13 @@ async-trait = { workspace = true }
 # WP2.1/WP2.2: expert-pack install/pack (zip read + write). deflate only —
 # matches the gateway's updater dependency; no zip-bomb-prone extra codecs.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# RFC-23 §14.2 (WP-F2): local data-file MCP tools (`csv_read` / `xlsx_read`).
+# `csv` is already a workspace-wide dependency (duduclaw-memory); `calamine`
+# is new — pure Rust, MIT, no C toolchain, reads xlsx/xlsm/xls/ods. Pinned
+# exact: a spreadsheet parser is an attack surface reached by customer files,
+# so the version that was reviewed is the version that ships.
+csv = "1"
+calamine = { version = "=0.36.1", default-features = false, features = ["dates"] }
 
 [dev-dependencies]
 tempfile = "3"

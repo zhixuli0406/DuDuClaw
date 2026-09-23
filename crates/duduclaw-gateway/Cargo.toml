@@ -17,6 +17,8 @@ duduclaw-memory = { workspace = true }
 duduclaw-security = { workspace = true }
 duduclaw-container = { workspace = true }
 duduclaw-odoo = { workspace = true }
+# §13.7 WP-D: read-only SQL data sources (db_sources.* operator RPCs).
+duduclaw-db = { workspace = true }
 duduclaw-identity = { workspace = true }
 duduclaw-redaction = { workspace = true }
 duduclaw-cli-runtime = { workspace = true }

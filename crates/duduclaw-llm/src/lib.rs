@@ -66,8 +66,8 @@ pub use provenance::{
     PREVIEW_MAX_CHARS,
 };
 pub use tool_loop::{
-    run_tool_loop, run_tool_loop_with_provenance, PolicyExecutor, ToolExecutor, ToolLoopOutcome,
-    ToolOutcome, DEFAULT_MAX_TOOL_ITERS, MAX_ITERS_STOP,
+    run_tool_loop, run_tool_loop_with_provenance, InterceptDecision, PolicyExecutor, ToolExecutor,
+    ToolInterceptor, ToolLoopOutcome, ToolOutcome, DEFAULT_MAX_TOOL_ITERS, MAX_ITERS_STOP,
 };
 
 #[cfg(feature = "mcp-client")]
