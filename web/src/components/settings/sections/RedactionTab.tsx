@@ -3,13 +3,9 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import {
   api,
-  type RedactionConfig,
   type RedactionSourceMode,
   type RedactionSourceSetting,
   type RedactionSources,
-  type RedactionRestoreArgs,
-  type RedactionEgressRule,
-  type RedactionUpdate,
   type RedactionStats,
   type RedactionPolicyStatus,
   type RedactionAuditEntry,
@@ -32,15 +28,20 @@ import {
   SelectItem,
 } from '@/components/mds';
 import { FieldBlock } from '@/pages/agent-form/form-rows';
+import { RedactionFieldRulesCard } from './RedactionFieldRulesCard';
+import { RedactionSystemsCard } from './RedactionSystemsCard';
 import {
-  Plus,
-  Trash2,
+  DATA_FILE_GUARD_MODES,
+  type DataFileGuardMode,
+  type RedactionConfigWithGuard,
+  type RedactionUpdateWithGuard,
+} from './redactionFieldRules';
+import {
   ScrollText,
   ShieldCheck,
   RefreshCw,
   AlertTriangle,
   ChevronDown,
-  Database,
   Info,
 } from 'lucide-react';
 
@@ -115,42 +116,15 @@ const REDACTION_SOURCE_KEYS: ReadonlyArray<keyof RedactionSources> = [
   'cron_context',
 ];
 const REDACTION_MODES: ReadonlyArray<RedactionSourceMode> = ['on', 'off', 'selective', 'inherit'];
-const REDACTION_RESTORE: ReadonlyArray<RedactionRestoreArgs> = ['deny', 'restore', 'passthrough'];
 
-/**
- * Known external business systems → the tool-name prefix their MCP tools use.
- * Every tool RESULT is already de-identified by the `tool_results` source policy;
- * a `tool_egress` rule keyed by this prefix governs the reverse direction —
- * whether the AI may write REAL (restored) values BACK into that system.
- *
- * `connected` distinguishes a system with a shipping connector (Odoo) from a
- * template whose connector is still on the roadmap — we pre-arm the rule either
- * way (defense in depth: protection is already on the day the connector lands),
- * but we never pretend a live integration exists.
- */
-interface ExternalSystemPreset {
-  id: string;
-  toolKey: string;
-  labelId: string;
-  connected: boolean;
-}
-const EXTERNAL_SYSTEM_PRESETS: ReadonlyArray<ExternalSystemPreset> = [
-  { id: 'odoo', toolKey: 'odoo.*', labelId: 'redaction.ext.odoo', connected: true },
-  { id: 'digiwin', toolKey: 'digiwin.*', labelId: 'redaction.ext.digiwin', connected: false },
-  { id: 'salesforce', toolKey: 'salesforce.*', labelId: 'redaction.ext.salesforce', connected: false },
-  { id: 'hubspot', toolKey: 'hubspot.*', labelId: 'redaction.ext.hubspot', connected: false },
-];
-
-function presetForKey(key: string): ExternalSystemPreset | undefined {
-  return EXTERNAL_SYSTEM_PRESETS.find((p) => p.toolKey === key);
-}
-
-/** Human label for a PII category — i18n when we know it, raw tag otherwise. */
-function categoryLabel(intl: ReturnType<typeof useIntl>, cat: string): string {
+/** Human label for a PII category — i18n when we know it, raw tag otherwise.
+ *  Exported for reuse by the field-rules card's category picker (both draw
+ *  from the same `redaction.cat.*` catalogue). */
+export function categoryLabel(intl: ReturnType<typeof useIntl>, cat: string): string {
   return intl.formatMessage({ id: `redaction.cat.${cat}`, defaultMessage: cat });
 }
 
-/** Which field-filter shape a source setting is currently in. */
+/** Which category-filter shape a source setting is currently in. */
 type FieldScope = 'all' | 'only' | 'exclude';
 function scopeOf(s: RedactionSourceSetting): FieldScope {
   if (s.only_categories.length > 0) return 'only';
@@ -158,7 +132,7 @@ function scopeOf(s: RedactionSourceSetting): FieldScope {
   return 'all';
 }
 
-/** One source row: mode select + expandable per-field scope editor. */
+/** One source row: mode select + expandable per-category scope editor. */
 function SourceSettingRow({
   sourceKey,
   setting,
@@ -174,7 +148,7 @@ function SourceSettingRow({
   const intl = useIntl();
   const [open, setOpen] = useState(false);
   const scope = scopeOf(setting);
-  // The field filter only matters when this source actually redacts.
+  // The category filter only matters when this source actually redacts.
   const filterable =
     setting.mode === 'on' || (sourceKey === 'system_prompt' && setting.mode === 'selective');
   const activeList = scope === 'only' ? setting.only_categories : setting.exclude_categories;
@@ -298,33 +272,43 @@ function SourceSettingRow({
 
 export function RedactionTab() {
   const intl = useIntl();
-  const [config, setConfig] = useState<RedactionConfig | null>(null);
+  const [config, setConfig] = useState<RedactionConfigWithGuard | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   // P05: the audit section below already had a proper inline error card; the
   // main form did not, so a failed read left it on "載入中…" indefinitely.
   const [loadError, setLoadError] = useState<unknown>(null);
   const [saveError, setSaveError] = useState<unknown>(null);
-  const [newTool, setNewTool] = useState('');
-  const [customOpen, setCustomOpen] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Keys the server currently holds. `redaction.update` merges tool_egress as an
-  // upsert (a value of `null` removes; an absent key is left untouched), so on
-  // save we must explicitly null out any key the operator deleted — otherwise a
-  // removed external system silently reappears on the next load.
-  const savedEgressKeysRef = useRef<string[]>([]);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
-  const load = useCallback(async () => {
+  // Which system the "資料表欄位規則" card below is currently filtered to —
+  // set by the merged systems card's "N 條欄位規則" chip (§15.1). `fieldRulesRef`
+  // is what that chip scrolls into view.
+  const [ruleSourceFilter, setRuleSourceFilter] = useState<string | null>(null);
+  const [ruleSourceFilterLabel, setRuleSourceFilterLabel] = useState<string | null>(null);
+  const fieldRulesRef = useRef<HTMLDivElement>(null);
+  const jumpToRules = useCallback((source: string, label: string) => {
+    setRuleSourceFilter(source);
+    setRuleSourceFilterLabel(label);
+    fieldRulesRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, []);
+
+  // Returns the fresh config so callers (the field-rules / systems cards,
+  // which save independently of this tab's own big batched Save button) can
+  // read an accurate post-save count without racing this component's own
+  // re-render.
+  const load = useCallback(async (): Promise<RedactionConfigWithGuard | null> => {
     setLoadError(null);
     try {
       const res = await api.redaction.get();
       setConfig(res);
-      savedEgressKeysRef.current = Object.keys(res.tool_egress);
+      return res;
     } catch (e) {
       setLoadError(e);
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      return null;
     }
   }, [intl]);
 
@@ -335,20 +319,19 @@ export function RedactionTab() {
     setSaving(true);
     setSaveError(null);
     try {
-      const egress: Record<string, RedactionEgressRule | null> = { ...config.tool_egress };
-      for (const k of savedEgressKeysRef.current) {
-        if (!(k in config.tool_egress)) egress[k] = null; // explicit removal
-      }
-      const payload: RedactionUpdate = {
+      // `tool_egress` is deliberately NOT part of this batched payload: the
+      // 外部系統與資料來源 card below saves it immediately, per-row, via its
+      // own `redaction.update` calls (matching the field-rules / data-sources
+      // cards' pattern) — nothing on this form's own controls touches it.
+      const payload: RedactionUpdateWithGuard = {
         enabled: config.enabled,
         vault_ttl_hours: config.vault_ttl_hours,
         purge_after_expire_days: config.purge_after_expire_days,
         profiles: config.profiles,
         sources: config.sources,
-        tool_egress: egress,
+        data_file_guard: config.data_file_guard,
       };
       const res = await api.redaction.update(payload);
-      savedEgressKeysRef.current = Object.keys(config.tool_egress);
       if (res.warning) {
         // Saved to disk but NOT live — say so instead of pretending success.
         toast.error(res.warning);
@@ -362,31 +345,6 @@ export function RedactionTab() {
     } finally {
       setSaving(false);
     }
-  };
-
-  // Add an external system by its tool-name prefix. Default to the safest egress
-  // policy (deny — never send real values back out) so a one-click add can only
-  // tighten, never loosen, protection.
-  const addEgressKey = (rawKey: string) => {
-    const tool = rawKey.trim();
-    if (!tool || !config || config.tool_egress[tool]) return;
-    setConfig({
-      ...config,
-      tool_egress: { ...config.tool_egress, [tool]: { restore_args: 'deny', audit_reveal: false } },
-    });
-  };
-
-  const addCustom = () => {
-    addEgressKey(newTool);
-    setNewTool('');
-    setCustomOpen(false);
-  };
-
-  const removeEgress = (tool: string) => {
-    if (!config) return;
-    const next = { ...config.tool_egress };
-    delete next[tool];
-    setConfig({ ...config, tool_egress: next });
   };
 
   if (!config) {
@@ -403,9 +361,8 @@ export function RedactionTab() {
     );
   }
 
-  const egressEntries = Object.entries(config.tool_egress) as Array<[string, RedactionEgressRule]>;
-  // Fields the current profile selection can recognise — feeds every source
-  // row's per-field scope picker.
+  // Categories the current profile selection can recognise — feeds every source
+  // row's per-category scope picker.
   const selectedCategories = Array.from(
     new Set(
       (config.available_profiles ?? [])
@@ -418,6 +375,28 @@ export function RedactionTab() {
     <div className="space-y-6">
       <Card>
         <CardContent className="space-y-6">
+          {/* Poison banner (canvas screen 7) — fixed at the very top, above the
+              master toggle: this is the whole card's precondition, everything
+              below is moot until it clears. Destructive tone, not warning —
+              this isn't a heads-up, protection genuinely isn't running. */}
+          {config.poisoned && (
+            <div className="flex gap-2.5 rounded-lg border border-destructive/30 bg-destructive/10 px-3.5 py-3 text-sm">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+              <div className="space-y-1">
+                <p className="font-medium text-foreground">{intl.formatMessage({ id: 'redaction.poison.title' })}</p>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  <code className="rounded bg-muted px-1 py-0.5 font-mono text-foreground">{config.poisoned.reason}</code>
+                </p>
+                <p className="font-mono text-xs text-muted-foreground">
+                  {intl.formatMessage(
+                    { id: 'redaction.poison.since' },
+                    { time: new Date(config.poisoned.since).toLocaleString(intl.locale) },
+                  )}
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Plain-language explainer: what this feature actually does. */}
           <div className="flex gap-2.5 rounded-lg bg-warning/5 px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
             <Info className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
@@ -434,7 +413,7 @@ export function RedactionTab() {
             />
           </div>
 
-          {/* Detection rule sets (profiles) — what fields CAN be recognised */}
+          {/* Detection rule sets (profiles) — what categories CAN be recognised */}
           <div className="border-t border-surface-border pt-4">
             <h4 className="mb-1 text-xs font-semibold uppercase text-muted-foreground">{intl.formatMessage({ id: 'redaction.profiles.title' })}</h4>
             <p className="mb-3 text-xs text-muted-foreground">{intl.formatMessage({ id: 'redaction.profiles.desc' })}</p>
@@ -494,7 +473,7 @@ export function RedactionTab() {
             )}
           </div>
 
-          {/* Sources — mode + per-field scope per row */}
+          {/* Sources — mode + per-category scope per row */}
           <div className="border-t border-surface-border pt-4">
             <h4 className="mb-1 text-xs font-semibold uppercase text-muted-foreground">{intl.formatMessage({ id: 'redaction.sources' })}</h4>
             <p className="mb-3 text-xs text-muted-foreground">{intl.formatMessage({ id: 'redaction.sources.hint' })}</p>
@@ -511,106 +490,38 @@ export function RedactionTab() {
             </div>
           </div>
 
-          {/* External systems (ERP / CRM / database) — friendly wrapper over tool_egress */}
-          <div className="border-t border-surface-border pt-4">
-            <h4 className="mb-1 flex items-center gap-1.5 text-xs font-semibold uppercase text-muted-foreground">
-              <Database className="h-3.5 w-3.5" />
-              {intl.formatMessage({ id: 'redaction.ext.title' })}
-            </h4>
-            <p className="mb-3 text-xs text-muted-foreground">{intl.formatMessage({ id: 'redaction.ext.desc' })}</p>
+          {/* Merged "外部系統與資料來源" card (canvas screen 9, §15) — replaces
+              the old separate "外部系統" tool_egress block AND the standalone
+              資料來源 card below it: one row per configured system (Odoo /
+              each db_sources connection / each custom data source / the
+              fixed "地端檔案" row), "讀進來" + "寫回去" side by side. Saves
+              through its own immediate RPC calls, independent of this tab's
+              batched Save button below. */}
+          <RedactionSystemsCard
+            toolEgress={config.tool_egress}
+            dataSources={config.data_sources ?? []}
+            fieldRules={config.field_rules ?? []}
+            onReload={load}
+            onJumpToRules={jumpToRules}
+          />
 
-            {/* One-click presets */}
-            <div className="mb-3 flex flex-wrap gap-2">
-              {EXTERNAL_SYSTEM_PRESETS.map((p) => {
-                const added = !!config.tool_egress[p.toolKey];
-                return (
-                  <button
-                    key={p.id}
-                    onClick={() => addEgressKey(p.toolKey)}
-                    disabled={added}
-                    className={cn(
-                      'inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors',
-                      added
-                        ? 'cursor-not-allowed border-input text-muted-foreground/40'
-                        : 'border-brand/40 text-brand hover:bg-brand/10',
-                    )}
-                  >
-                    <Plus className="h-3 w-3" />
-                    {intl.formatMessage({ id: p.labelId })}
-                  </button>
-                );
-              })}
-              <button
-                onClick={() => setCustomOpen((v) => !v)}
-                className="inline-flex items-center gap-1.5 rounded-full border border-input px-3 py-1 text-xs font-medium text-muted-foreground hover:bg-muted"
-              >
-                <Plus className="h-3 w-3" />
-                {intl.formatMessage({ id: 'redaction.ext.custom' })}
-              </button>
-            </div>
-
-            {/* Custom tool-prefix input (revealed on demand) */}
-            {customOpen && (
-              <div className="mb-3 flex gap-2">
-                <Input
-                  type="text"
-                  value={newTool}
-                  onChange={(e) => setNewTool(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') addCustom(); }}
-                  placeholder={intl.formatMessage({ id: 'redaction.ext.customPlaceholder' })}
-                  className="flex-1"
-                />
-                <Button variant="secondary" size="sm" onClick={addCustom}>
-                  <Plus />
-                  {intl.formatMessage({ id: 'common.add' })}
-                </Button>
-              </div>
-            )}
-
-            {/* Configured systems */}
-            <div className="space-y-2">
-              {egressEntries.map(([tool, rule]) => {
-                const preset = presetForKey(tool);
-                const name = preset ? intl.formatMessage({ id: preset.labelId }) : tool;
-                return (
-                  <div key={tool} className="flex flex-wrap items-center gap-2 rounded-lg bg-muted/50 p-2.5">
-                    <span className="flex items-center gap-1.5 text-sm font-medium text-foreground">
-                      {name}
-                      {preset && (
-                        preset.connected
-                          ? <ToneBadge tone="success">{intl.formatMessage({ id: 'redaction.ext.connected' })}</ToneBadge>
-                          : <Badge variant="outline">{intl.formatMessage({ id: 'redaction.ext.template' })}</Badge>
-                      )}
-                    </span>
-                    {!preset && (
-                      <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">{tool}</code>
-                    )}
-                    <div className="ml-auto flex flex-wrap items-center gap-2">
-                      <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                        {intl.formatMessage({ id: 'redaction.ext.egressPolicy' })}
-                        <EnumSelect
-                          value={rule.restore_args}
-                          onChange={(v) => setConfig({ ...config, tool_egress: { ...config.tool_egress, [tool]: { ...rule, restore_args: v as RedactionRestoreArgs } } })}
-                          options={REDACTION_RESTORE.map((r) => ({ value: r, label: intl.formatMessage({ id: `redaction.restore.${r}` }) }))}
-                          className="w-44"
-                          ariaLabel={intl.formatMessage({ id: 'redaction.ext.egressPolicy' })}
-                        />
-                      </label>
-                      <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <input type="checkbox" checked={rule.audit_reveal} onChange={(e) => setConfig({ ...config, tool_egress: { ...config.tool_egress, [tool]: { ...rule, audit_reveal: e.target.checked } } })} className="accent-primary" />
-                        {intl.formatMessage({ id: 'redaction.auditReveal' })}
-                      </label>
-                      <button onClick={() => removeEgress(tool)} title={intl.formatMessage({ id: 'common.remove' })} className="rounded p-1 text-destructive hover:bg-destructive/10">
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-              {egressEntries.length === 0 && (
-                <p className="rounded-lg bg-muted/50 px-3 py-4 text-center text-xs text-muted-foreground">{intl.formatMessage({ id: 'redaction.ext.empty' })}</p>
-              )}
-            </div>
+          {/* Table field rules (§13, canvas screens 1-6) — directly under the
+              merged systems card: that card governs "restore on write-back",
+              this one governs "which fields get masked on read". Same data
+              sources, two directions, so they sit next to each other. Saves
+              through its own immediate RPC calls (field_rules is an
+              upsert-merge map), independent of this tab's batched Save
+              button below. Wrapped so the systems card's "N 條欄位規則" chip
+              has a scroll target. */}
+          <div ref={fieldRulesRef}>
+            <RedactionFieldRulesCard
+              fieldRules={config.field_rules ?? []}
+              dataSources={config.data_sources ?? []}
+              onReload={load}
+              sourceFilter={ruleSourceFilter}
+              sourceFilterLabel={ruleSourceFilterLabel}
+              onClearSourceFilter={() => { setRuleSourceFilter(null); setRuleSourceFilterLabel(null); }}
+            />
           </div>
 
           {/* Advanced — the raw retention / profile knobs, folded away by default */}
@@ -633,6 +544,26 @@ export function RedactionTab() {
                     <Input type="number" min={0} max={3650} value={config.purge_after_expire_days} onChange={(e) => setConfig({ ...config, purge_after_expire_days: Number(e.target.value) })} />
                   </FieldBlock>
                 </div>
+
+                {/* Data-file guard (§14.4) — whether the built-in Read/Bash
+                    tools can be used to route around de-identified
+                    csv_read/xlsx_read/file_read. */}
+                <FieldBlock label={intl.formatMessage({ id: 'redaction.guard.label' })} description={intl.formatMessage({ id: 'redaction.guard.hint' })}>
+                  <Select
+                    value={config.data_file_guard ?? 'on'}
+                    onValueChange={(v) => setConfig({ ...config, data_file_guard: (v ?? 'on') as DataFileGuardMode })}
+                  >
+                    <SelectTrigger className="w-full sm:w-72">
+                      <SelectValue>{intl.formatMessage({ id: `redaction.guard.mode.${config.data_file_guard ?? 'on'}` })}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {DATA_FILE_GUARD_MODES.map((m) => (
+                        <SelectItem key={m} value={m}>{intl.formatMessage({ id: `redaction.guard.mode.${m}` })}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="mt-1.5 text-xs text-muted-foreground">{intl.formatMessage({ id: 'redaction.guard.note' })}</p>
+                </FieldBlock>
               </div>
             )}
           </div>
@@ -755,12 +686,16 @@ function RedactionAuditSection() {
           </div>
         ) : (
           <>
-            {/* Policy status pills */}
+            {/* Policy status pills. A poisoned config takes precedence over
+                "on" — this pill and the settings-card banner above must never
+                disagree about whether protection is actually running. */}
             <div className="flex flex-wrap items-center gap-2">
-              <ToneBadge tone={enabled ? 'success' : 'neutral'} dot>
-                {enabled
-                  ? intl.formatMessage({ id: 'redaction.audit.policyOn' })
-                  : intl.formatMessage({ id: 'redaction.audit.policyOff' })}
+              <ToneBadge tone={policy?.poisoned ? 'danger' : enabled ? 'success' : 'neutral'} dot>
+                {policy?.poisoned
+                  ? intl.formatMessage({ id: 'redaction.poison.policyPill' })
+                  : enabled
+                    ? intl.formatMessage({ id: 'redaction.audit.policyOn' })
+                    : intl.formatMessage({ id: 'redaction.audit.policyOff' })}
               </ToneBadge>
               {policy && (
                 <>

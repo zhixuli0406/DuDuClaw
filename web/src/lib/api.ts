@@ -2064,6 +2064,93 @@ export interface OdooTestParams {
   password?: string;
 }
 
+// ── Read-only SQL data sources (`db_sources.*`, WP-D §13.7) ──
+/** Which SQL dialect a data source speaks. */
+export type DbDriver = 'postgres' | 'mysql' | 'sqlite';
+
+/** Where a data source's connection string lives. Never the value itself —
+ *  same shape as the credential inventory's status, reusing its source kinds. */
+export interface DbSourceUrlStatus {
+  configured: boolean;
+  source: CredentialSourceKind;
+  /** Non-secret description, e.g. "encrypted(keyfile)" or "vault:crm-dsn". */
+  source_label: string;
+  /** False for external references — those rotate in their own backend. */
+  writable: boolean;
+  /** A plaintext twin sits next to an encrypted twin. */
+  residue: boolean;
+}
+
+/** One configured source, as `db_sources.list` returns it. */
+export interface DbSourceSummary {
+  name: string;
+  label: string;
+  driver: DbDriver;
+  /** Tables agents may read. `["*"]` means every table in the default schema. */
+  allowed_tables: string[];
+  max_rows: number;
+  timeout_ms: number;
+  url_status: DbSourceUrlStatus;
+}
+
+/** A `[db_sources.<name>]` block that failed to load, with the reason. */
+export interface DbSourceLoadError {
+  name: string;
+  message: string;
+}
+
+export interface DbSourceListResult {
+  sources: DbSourceSummary[];
+  /** Blocks present in config.toml that did not validate. */
+  errors: DbSourceLoadError[];
+}
+
+export interface DbSourceColumn {
+  name: string;
+  type: string;
+}
+
+export interface DbSourceTable {
+  name: string;
+  columns: DbSourceColumn[];
+}
+
+/** Write payload for `db_sources.upsert`. Provide exactly one of `url` /
+ *  `url_secret_ref`, or neither to keep the stored credential. A literal
+ *  PostgreSQL / MySQL DSN is encrypted server-side; a plaintext `url` is
+ *  stored as-is only for SQLite, where it is a file path. */
+export interface DbSourceUpsert {
+  name: string;
+  driver: DbDriver;
+  url?: string;
+  url_secret_ref?: string;
+  allowed_tables?: string[];
+  max_rows?: number;
+  timeout_ms?: number;
+  label?: string;
+  /** Persist without a successful connection test. */
+  skip_test?: boolean;
+}
+
+/** Inline params for `db_sources.test`. Pass `driver` (plus a credential) to
+ *  test unsaved form values; pass only `name` to test what is stored. */
+export interface DbSourceTestParams {
+  name: string;
+  driver?: DbDriver;
+  url?: string;
+  url_secret_ref?: string;
+  allowed_tables?: string[];
+  max_rows?: number;
+  timeout_ms?: number;
+  label?: string;
+}
+
+export interface DbSourceTestResult {
+  success: boolean;
+  message: string;
+  tables: DbSourceTable[];
+}
+
 export interface McpServerDef {
   command: string;
   args: string[];
@@ -3343,6 +3430,97 @@ export interface RedactionEgressRule {
   audit_reveal: boolean;
 }
 
+/** Who may restore a structured-field rule's tokens. Matches the Rust
+ *  `RestoreScope` wire form (`{ kind: "owner" }` / `{ kind: "any_scope",
+ *  scope }` / `{ kind: "all_scopes", scopes }`). */
+export type RedactionRestoreScope =
+  | { kind: 'owner' }
+  | { kind: 'any_scope'; scope: string }
+  | { kind: 'all_scopes'; scopes: string[] };
+
+/** One structured-field rule from `[redaction.rules.*]`. Only `db_field` and
+ *  `json_path` rules are listed / editable here — regex, keyword and identity
+ *  rules stay TOML-only and are never returned by `redaction.get`. */
+export interface RedactionFieldRule {
+  id: string;
+  kind: 'db_field' | 'json_path';
+  category: string;
+  restore_scope: RedactionRestoreScope;
+  priority: number;
+  cross_session_stable: boolean;
+  /** db_field only — today always `"odoo"`. */
+  connector?: string;
+  /** db_field only — `"model.field"` / `"model.*"` entries. */
+  fields?: string[];
+  /** json_path only — exact tool name or a trailing-`*` prefix glob. */
+  match_tool?: string | null;
+  /** json_path only — top-level tool-argument equality gate. */
+  match_args?: Record<string, string>;
+  /** json_path only — path expressions. */
+  paths?: string[];
+  /** json_path only — object keys never tokenised under a matched node. */
+  exclude_keys?: string[];
+}
+
+/** One entry of the data-source registry a `db_field` rule's source may name.
+ *
+ *  `builtin` entries (`odoo`, `duduclaw_db`, `duduclaw_files`) ship with the
+ *  product and are neither editable nor removable. A built-in whose tools
+ *  disagree on how the table is decided (Odoo does) reports `table`,
+ *  `table_arg` and `table_result` as `null` and an empty `key_alias` — the
+ *  simple form cannot express per-tool bindings, so it reports nothing it
+ *  cannot prove. */
+export interface RedactionDataSource {
+  name: string;
+  label: string;
+  builtin: boolean;
+  /** Tools that return this source's records — exact names or trailing-`*`. */
+  tools: string[];
+  /** Tool argument naming the table. Mutually exclusive with `table` /
+   *  `table_result`. */
+  table_arg: string | null;
+  /** Fixed table for every bound tool. Mutually exclusive with `table_arg` /
+   *  `table_result`. */
+  table: string | null;
+  /** JSON pointer into the tool *result* naming the table (`"/table"`), for
+   *  tools asked for a path rather than a table (`csv_read` / `xlsx_read`).
+   *  Mutually exclusive with `table_arg` / `table`. */
+  table_result: string | null;
+  /** Where records sit in the tool's JSON result. */
+  record_paths: string[];
+  /** Accept table / column names that are not SQL identifiers — file names and
+   *  spreadsheet headers (`客戶清單.xlsx` / `地址`). */
+  free_form_names: boolean;
+  /** `column -> returned key`, only for tools that rename columns. */
+  key_alias: Record<string, string>;
+}
+
+/** Write shape for one entry in `redaction.update`'s `data_sources` map. The
+ *  map key is the name, so `name` / `builtin` are omitted from the body.
+ *  Exactly one of `table_arg` / `table` / `table_result` must be given. */
+export type RedactionDataSourceInput = {
+  label?: string;
+  tools: string[];
+  table_arg?: string;
+  table?: string;
+  /** JSON pointer, must start with `/`. */
+  table_result?: string;
+  /** Omitted ⇒ `["$.rows[*]", "$[*]", "$"]`. */
+  record_paths?: string[];
+  /** Omitted ⇒ `false` (names must be lowercase SQL identifiers). */
+  free_form_names?: boolean;
+  key_alias?: Record<string, string>;
+};
+
+/** Gateway redaction poison state: redaction was configured but could not be
+ *  started (unparseable `[redaction]`, a rule that will not compile, a broken
+ *  key directory). `null` = healthy. Distinct from `enabled: false`. */
+export interface RedactionPoison {
+  reason: string;
+  /** RFC-3339 timestamp of when the poison state was entered. */
+  since: string;
+}
+
 export interface RedactionConfig {
   enabled: boolean;
   vault_ttl_hours: number;
@@ -3352,6 +3530,13 @@ export interface RedactionConfig {
   tool_egress: Record<string, RedactionEgressRule>;
   /** Catalogue of selectable profiles + the fields each covers. */
   available_profiles: RedactionProfileInfo[];
+  /** Editable structured-field rules (db_field / json_path only). */
+  field_rules: RedactionFieldRule[];
+  /** Data-source registry a `db_field` rule's source may name: the two
+   *  built-ins first, then the operator's own entries in name order. */
+  data_sources: RedactionDataSource[];
+  /** Non-null when redaction failed to start — render the banner. */
+  poisoned: RedactionPoison | null;
 }
 
 /** Partial update payload for `redaction.update`. A `tool_egress` value of
@@ -3363,6 +3548,46 @@ export interface RedactionUpdate {
   profiles?: string[];
   sources?: Partial<RedactionSources>;
   tool_egress?: Record<string, RedactionEgressRule | null>;
+  /** Upsert-merge keyed by rule id: `null` removes that rule, an absent id is
+   *  left untouched. The whole rule set is dry-compiled before anything is
+   *  written — a rejected edit changes nothing on disk. */
+  field_rules?: Record<string, RedactionFieldRuleInput | null>;
+  /** Upsert-merge keyed by source name: `null` removes that source, an absent
+   *  name is left untouched. Built-in names are refused, and a source still
+   *  named by a `db_field` rule cannot be removed. Sending this key
+   *  dry-compiles the whole rule set before anything is written. */
+  data_sources?: Record<string, RedactionDataSourceInput | null>;
+}
+
+/** Write shape for one rule in `redaction.update`'s `field_rules` map.
+ *  The map key is the id, so `id` is omitted from the body. The discriminator
+ *  may be spelled `kind` (as `redaction.get` renders it, so a fetched rule can
+ *  be posted straight back) or `type` (as config.toml spells it); supplying
+ *  both with different values is an error. */
+export type RedactionFieldRuleInput = Omit<RedactionFieldRule, 'id' | 'kind'> & {
+  kind?: RedactionFieldRule['kind'];
+  type?: RedactionFieldRule['kind'];
+};
+
+/** One hit from `redaction.dry_run`. Deliberately carries NO original value
+ *  (not even masked): the operator is checking coverage, and echoing the PII
+ *  back would defeat the feature being verified. */
+export interface RedactionDryRunHit {
+  /** RFC-6901 pointer into the synthesised tool result. `#` separates the
+   *  outer pointer from the pointer inside an embedded-JSON leaf. */
+  pointer: string;
+  rule_id: string;
+  category: string;
+  token: string;
+}
+
+export interface RedactionDryRunResult {
+  hits: RedactionDryRunHit[];
+  /** Tokens minted by this run (may differ from `hits.length` when one token
+   *  appears at several pointers). */
+  token_count: number;
+  /** How many tokens round-tripped back to their original under owner restore. */
+  restored_ok: number;
 }
 
 /** Vault counters from `redaction.stats`. `by_category` is a list of
@@ -3408,6 +3633,9 @@ export interface RedactionPolicyStatus {
   purge_after_expire_days: number;
   rule_count: number;
   override_active: boolean;
+  /** Non-null when redaction failed to start (present on both the live and
+   *  the manager-absent response shapes). */
+  poisoned: RedactionPoison | null;
 }
 
 /** Response of `redaction.override_status`. `record` carries the operator +
@@ -3552,12 +3780,14 @@ export type McpScope =
   | 'recording'
   | 'mail:read'
   | 'mail:send'
+  | 'db:read'
+  | 'files:read'
   | 'admin';
 
 /** All known MCP scopes — mirrors the shared canonical list
  *  (`duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS`, read by both the gateway's
  *  `KNOWN_MCP_SCOPES` validator and `duduclaw-cli::mcp_auth::Scope`). Was a
- *  10-entry list that had drifted from the real 22 scopes (2026-08 audit) —
+ *  10-entry list that had drifted from the real scopes (2026-08 audit) —
  *  dashboard operators could not grant 12 of them without hand-editing
  *  config.toml. */
 export const MCP_SCOPES: ReadonlyArray<McpScope> = [
@@ -3582,6 +3812,8 @@ export const MCP_SCOPES: ReadonlyArray<McpScope> = [
   'recording',
   'mail:read',
   'mail:send',
+  'db:read',
+  'files:read',
   'admin',
 ];
 
@@ -5777,6 +6009,30 @@ export const api = {
         maxModels ? { max_models: maxModels } : {},
       ) as Promise<OdooDiscoverSchemaResult>,
   },
+  /** Read-only SQL data sources (`config.toml [db_sources.*]`). Admin only.
+   *  The connection string is never returned — `url_status` says whether one
+   *  is set and where it lives. */
+  dbSources: {
+    list: () => client.call('db_sources.list') as Promise<DbSourceListResult>,
+    /** Connect + SELECT 1 + list tables. Writes nothing. */
+    test: (params: DbSourceTestParams) =>
+      client.call('db_sources.test', { ...params }) as Promise<DbSourceTestResult>,
+    /** Create or replace a source. Refuses to save what it cannot connect to
+     *  unless `skip_test` is set. */
+    upsert: (params: DbSourceUpsert) =>
+      client.call('db_sources.upsert', { ...params }) as Promise<{
+        success: boolean;
+        name: string;
+      }>,
+    remove: (name: string) =>
+      client.call('db_sources.remove', { name }) as Promise<{
+        success: boolean;
+        name: string;
+      }>,
+    /** Tables and columns the source exposes, for a table/column picker. */
+    tables: (name: string) =>
+      client.call('db_sources.tables', { name }) as Promise<{ tables: DbSourceTable[] }>,
+  },
   identity: {
     configGet: () =>
       client.call('identity.config_get') as Promise<IdentityConfig>,
@@ -6181,6 +6437,14 @@ export const api = {
       }>,
     policyStatus: () =>
       client.call('redaction.policy_status') as Promise<RedactionPolicyStatus>,
+    /** Run a pasted JSON sample through the LIVE pipeline and report where it
+     *  would be tokenised. Errors when redaction is disabled or poisoned. */
+    dryRun: (sampleJson: string, tool = 'odoo_search', args: Record<string, unknown> = {}) =>
+      client.call('redaction.dry_run', {
+        sample_json: sampleJson,
+        tool,
+        args,
+      }) as Promise<RedactionDryRunResult>,
     overrideStatus: () =>
       client.call('redaction.override_status') as Promise<RedactionOverrideStatus>,
   },

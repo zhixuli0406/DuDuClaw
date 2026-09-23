@@ -32,13 +32,16 @@ describe('McpKeysPage', () => {
   // rendering the raw i18n id, which is exactly the failure mode a scope
   // added to the array without its `mcpKeys.scopeDesc.*` locale entry would
   // produce).
-  it('offers a checkbox with a translated description for all 22 known scopes', async () => {
+  //
+  // 24 as of §14.2 (DESIGN-redaction-field-rules-2026-09) — `files:read`
+  // gates the `file_read`/`csv_read`/`xlsx_read` local-file MCP tools.
+  it('offers a checkbox with a translated description for all 24 known scopes', async () => {
     mockWsClient.call.mockResolvedValue({ keys: [] });
     renderWithProviders(<McpKeysPage />);
 
     fireEvent.click(screen.getByRole('button', { name: /create key/i }));
 
-    expect(MCP_SCOPES.length).toBe(22);
+    expect(MCP_SCOPES.length).toBe(24);
 
     // The dialog renders through a portal (appended to document.body, not
     // under the render container), so query via `screen` (document-scoped)
