@@ -69,7 +69,7 @@ pub fn mcp_cold_start_status_and_message(
         McpColdStartOutcome::AuthFailed => (
             "fail",
             format!(
-                "MCP server 因認證被拒而終止 — agent 會完全叫不到 duduclaw 工具。{}重啟 gateway 讓它自動配發 internal key，或設定 env DUDUCLAW_MCP_API_KEY。",
+                "MCP server 因認證被拒而終止 — agent 會完全叫不到 duduclaw 工具。{}internal key 30 天到期，gateway 開機會自動配發並輪替，重啟即可修復過期的金鑰；或設定 env DUDUCLAW_MCP_API_KEY。",
                 provision_error
                     .map(|e| format!("（internal key 配發失敗：{e}）"))
                     .unwrap_or_default()
@@ -99,7 +99,10 @@ pub fn mcp_cold_start_status_and_message(
 /// spawn one `mcp-server` child and classify its cold-start behavior.
 /// Idempotent and side-effect-light: provisioning reuses the existing
 /// `gateway-internal` key (or mints it on a fresh home, exactly like a first
-/// gateway boot would).
+/// gateway boot would). Same age rules as boot — a key past
+/// `mcp_internal_key::ROTATE_AFTER_DAYS` is rotated here too, so running
+/// `duduclaw doctor` on an install whose key expired both reports and repairs
+/// it.
 pub async fn mcp_cold_start_probe(home: &Path) -> McpColdStartReport {
     let bin = duduclaw_core::resolve_duduclaw_bin();
     if !bin.is_absolute() {

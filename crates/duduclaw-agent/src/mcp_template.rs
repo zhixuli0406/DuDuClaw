@@ -855,6 +855,23 @@ mod tests {
         }
     }
 
+    /// Scoped `DUDUCLAW_MCP_API_KEY` override — the forward-set var whose
+    /// value `ensure_duduclaw_absolute_path` must keep in sync inside
+    /// `.mcp.json`. Same locking contract as [`BinEnvOverride`].
+    struct ApiKeyEnvOverride;
+    impl ApiKeyEnvOverride {
+        fn set(value: &str) -> Self {
+            // SAFETY: serialized via `BIN_ENV_LOCK` in each test.
+            unsafe { std::env::set_var(duduclaw_core::ENV_MCP_API_KEY, value); }
+            Self
+        }
+    }
+    impl Drop for ApiKeyEnvOverride {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(duduclaw_core::ENV_MCP_API_KEY); }
+        }
+    }
+
     static BIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Acquire `BIN_ENV_LOCK`, tolerating poisoning. The guarded data is `()`, so
@@ -1067,6 +1084,76 @@ mod tests {
             read_mcp_json(&path)["mcpServers"]["duduclaw"]["env"]["DUDUCLAW_AGENT_TOKEN"].as_str(),
             Some(token)
         );
+    }
+
+    /// The gateway rotates its internal MCP key before the authenticator's
+    /// 30-day hard expiry (`duduclaw-gateway::mcp_internal_key`), and this
+    /// boot fixup is what carries the rotated value into every agent's
+    /// `.mcp.json`. A *stale* `DUDUCLAW_MCP_API_KEY` already present in the
+    /// file must therefore be overwritten, not left alone — otherwise the
+    /// rotation never reaches the CLI-spawned MCP children. Everything else
+    /// in the env block (identity token, operator-set vars) must survive.
+    #[test]
+    fn mcp_json_migration_overwrites_stale_forward_api_key() {
+        let _guard = lock_bin_env();
+        let _bin = BinEnvOverride::new(&fake_bin_path());
+
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agent_dir = home.join("agents").join("sales-rep");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let identity_key = duduclaw_core::ensure_identity_key(home).unwrap();
+        let path = agent_dir.join(".mcp.json");
+
+        // Boot 1: the pre-rotation key lands in .mcp.json.
+        let stale_key = "ddc_prod_11111111111111111111111111111111";
+        let old_env = ApiKeyEnvOverride::set(stale_key);
+        assert!(ensure_duduclaw_absolute_path(&agent_dir).unwrap());
+        let token = read_mcp_json(&path)["mcpServers"]["duduclaw"]["env"]
+            ["DUDUCLAW_AGENT_TOKEN"]
+            .as_str()
+            .expect("identity token written")
+            .to_string();
+
+        // An operator-set var the fixup has no business touching.
+        let mut seeded = read_mcp_json(&path);
+        seeded["mcpServers"]["duduclaw"]["env"]
+            .as_object_mut()
+            .unwrap()
+            .insert("FOO".into(), serde_json::Value::String("bar".into()));
+        write_json(&path, &seeded);
+
+        // Boot 2: gateway rotated the internal key.
+        drop(old_env);
+        let fresh_key = "ddc_prod_22222222222222222222222222222222";
+        let _new_env = ApiKeyEnvOverride::set(fresh_key);
+
+        assert!(
+            ensure_duduclaw_absolute_path(&agent_dir).unwrap(),
+            "a stale forward key must be detected as needing an update"
+        );
+
+        let env = read_mcp_json(&path)["mcpServers"]["duduclaw"]["env"].clone();
+        assert_eq!(
+            env["DUDUCLAW_MCP_API_KEY"].as_str(),
+            Some(fresh_key),
+            "the rotated key must overwrite the stale one"
+        );
+        assert_eq!(
+            env["DUDUCLAW_AGENT_TOKEN"].as_str(),
+            Some(token.as_str()),
+            "identity token preserved"
+        );
+        assert!(duduclaw_core::verify_identity_token(
+            &identity_key,
+            "sales-rep",
+            &token
+        ));
+        assert_eq!(env["DUDUCLAW_AGENT_ID"].as_str(), Some("sales-rep"));
+        assert_eq!(env["FOO"].as_str(), Some("bar"), "foreign env var preserved");
+
+        // Idempotent once the fresh key is in place.
+        assert!(!ensure_duduclaw_absolute_path(&agent_dir).unwrap());
     }
 
     /// ...and with no key, the env block is byte-identical to pre-WP21.
