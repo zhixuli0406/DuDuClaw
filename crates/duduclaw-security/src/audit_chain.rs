@@ -76,6 +76,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 
 use ring::digest;
+#[cfg(unix)]
 use tracing::warn;
 
 /// Sentinel `_prev_hash` for the first record in a chain — a brand-new file,
@@ -135,7 +136,7 @@ pub fn last_line_hash(path: &Path) -> io::Result<String> {
 /// See the module doc for the concurrency contract (lock spans read+write).
 pub fn append_chained_line(
     path: &Path,
-    mut record: serde_json::Map<String, serde_json::Value>,
+    record: serde_json::Map<String, serde_json::Value>,
     unix_create_mode: Option<u32>,
 ) -> io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -153,28 +154,49 @@ pub fn append_chained_line(
     }
     let file = opts.open(path)?;
 
-    // Widen the lock to cover the read-tail step below too — see module doc
-    // "Concurrency" section. Warn-not-fail matches the pre-existing
-    // convention in `duduclaw_security::audit`'s writers.
-    if let Err(e) = duduclaw_core::platform::flock_exclusive(&file) {
-        warn!("flock failed on {}: {e}", path.display());
-    }
-
     #[cfg(unix)]
-    if let Some(mode) = unix_create_mode {
-        tighten_permissions(&file, mode, path);
+    {
+        // Widen the lock to cover the read-tail step below too — see module
+        // doc "Concurrency" section. Warn-not-fail matches the pre-existing
+        // convention in `duduclaw_security::audit`'s writers.
+        if let Err(e) = duduclaw_core::platform::flock_exclusive(&file) {
+            warn!("flock failed on {}: {e}", path.display());
+        }
+        if let Some(mode) = unix_create_mode {
+            tighten_permissions(&file, mode, path);
+        }
+        chain_and_write(path, &file, record)
+        // Lock automatically released when `file` drops at end of scope (same
+        // convention as the pre-existing `audit.rs` writers — no explicit
+        // unlock primitive is exposed by `duduclaw_core::platform`).
     }
+    #[cfg(not(unix))]
+    {
+        // Windows: `LockFileEx` on an append-only handle does not serialize
+        // writers the way `flock` does (the Windows CI test leg reproduced
+        // concurrent appends forking the chain), and a mandatory lock on the
+        // data file would also block the second handle `last_line_hash`
+        // opens to read the tail. Serialize on the sidecar `<path>.lock`
+        // instead — the same cross-process primitive `bus_queue.jsonl` uses.
+        // (`unix_create_mode` is, as named, unix-only; NTFS ACLs apply here.)
+        let _ = unix_create_mode;
+        duduclaw_core::with_file_lock(path, || chain_and_write(path, &file, record))
+    }
+}
 
+/// The critical section: read the current tail hash, chain the record to it,
+/// append. Must run under the writer lock taken by [`append_chained_line`].
+fn chain_and_write(
+    path: &Path,
+    file: &fs::File,
+    mut record: serde_json::Map<String, serde_json::Value>,
+) -> io::Result<()> {
     let prev_hash = last_line_hash(path)?;
     record.insert("_prev_hash".to_string(), serde_json::Value::String(prev_hash));
     let line = serde_json::to_string(&serde_json::Value::Object(record))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    let mut f = &file;
+    let mut f = file;
     writeln!(f, "{line}")?;
-    // Lock automatically released when `file` drops at end of scope (same
-    // convention as the pre-existing `audit.rs` writers — no explicit
-    // unlock primitive is exposed by `duduclaw_core::platform`).
     Ok(())
 }
 

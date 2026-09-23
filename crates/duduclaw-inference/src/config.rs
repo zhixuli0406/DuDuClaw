@@ -665,8 +665,11 @@ mod home_aware_defaults_tests {
             "enabled = true".parse().unwrap(),
             Path::new("/data/duduclaw"),
         );
-        assert_eq!(cfg.models_dir, "/data/duduclaw/models");
-        assert_eq!(cfg.models_path(), Path::new("/data/duduclaw/models"));
+        // Compare through `Path::join` — the string form is `\`-joined on
+        // Windows, which is what the Windows CI test leg sees.
+        let expected = Path::new("/data/duduclaw").join("models");
+        assert_eq!(cfg.models_dir, expected.to_string_lossy());
+        assert_eq!(cfg.models_path(), expected);
     }
 
     #[test]
@@ -687,7 +690,10 @@ mod home_aware_defaults_tests {
         assert!(!cfg.enabled);
         assert!(cfg.backend.is_none());
         assert!(cfg.openai_compat.is_none());
-        assert_eq!(cfg.models_dir, "/home/kai/.duduclaw/models");
+        assert_eq!(
+            cfg.models_dir,
+            Path::new("/home/kai/.duduclaw").join("models").to_string_lossy()
+        );
     }
 
     /// A file that does not deserialize (right TOML, wrong types) falls back

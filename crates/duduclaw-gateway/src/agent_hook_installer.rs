@@ -672,12 +672,15 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("bash must be available");
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(payload.as_bytes())
-            .unwrap();
+        // The script may exit without ever reading stdin (`off`/unset mode
+        // returns before the `cat`), so the write can race the child's exit
+        // and fail with EPIPE on a loaded runner. That is the behaviour under
+        // test, not a harness failure — tolerate exactly BrokenPipe.
+        match child.stdin.as_mut().unwrap().write_all(payload.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("writing hook payload to stdin: {e}"),
+        }
         let out = child.wait_with_output().unwrap();
         (
             out.status.code().unwrap_or(-1),
