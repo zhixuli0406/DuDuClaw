@@ -54,7 +54,11 @@ pub mod server {
     /// Never constructible — [`bind`] always errors on non-unix targets.
     pub struct SysdListener(());
 
-    pub fn bind(_socket_path: &Path) -> io::Result<SysdListener> {
+    /// Signature mirrors the unix `server::bind(socket_path, allowed_uid)`
+    /// exactly — `main.rs` calls it unconditionally, so a drift here is a
+    /// Windows-only compile error the unix CI legs never see (the v1.63.0
+    /// / v1.64.0 windows CI leg broke on exactly that).
+    pub fn bind(_socket_path: &Path, _allowed_uid: Option<u32>) -> io::Result<SysdListener> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "duduclaw-sysd requires Unix domain sockets — it only runs on the Linux appliance image",

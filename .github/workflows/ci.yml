@@ -147,4 +147,5 @@ jobs:
             --ignore RUSTSEC-2026-0150 \
             --ignore RUSTSEC-2026-0173 \
             --ignore RUSTSEC-2026-0176 \
-            --ignore RUSTSEC-2026-0177
+            --ignore RUSTSEC-2026-0177 \
+            --ignore RUSTSEC-2026-0293

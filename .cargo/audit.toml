@@ -30,4 +30,14 @@ ignore = [
 
     # rand: unsound with custom logger — no custom logger used in DuDuClaw
     "RUSTSEC-2026-0097",
+
+    # ringbuf 0.4.8: double free / UAF in Consumer::skip / clear when an
+    # element's Drop panics. Fix is 0.5.2 but songbird (0.5.0 AND upstream
+    # 0.6.0 / `current` branch) still pins `ringbuf = "0.4"`, so no lockfile
+    # bump can reach it. Not reachable here: songbird's only ring buffers are
+    # `HeapProd<u8>` / `HeapCons<u8>` (input/adapters/async_adapter.rs) —
+    # `u8` has no Drop, so the panicking-Drop precondition cannot occur; and
+    # `discord-voice` is a non-default gateway feature. Remove once songbird
+    # publishes a release on ringbuf >= 0.5.2.
+    "RUSTSEC-2026-0293",
 ]

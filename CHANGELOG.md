@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- **CI (Windows leg)**: `duduclaw-sysd`'s non-unix `server::bind` stub had drifted from the unix signature (`allowed_uid` argument), so the workspace failed to compile on Windows since the 1.63.0 tag build. The stub now mirrors the unix signature exactly.
+
+### Security
+- Bumped `rustls` 0.23.38 → 0.23.45 (RUSTSEC-2026-0285, TLS 1.3 handshake messages accepted across encryption-level boundaries).
+- `cargo audit` now ignores RUSTSEC-2026-0293 (`ringbuf` 0.4.8, double free when an element's `Drop` panics) with a documented reachability argument in `.cargo/audit.toml`: songbird — the only consumer, behind the non-default `discord-voice` feature — only ever stores `u8` in its ring buffers, and upstream songbird (0.6.0) still pins `ringbuf = "0.4"`, so no lockfile bump can reach the 0.5.2 fix.
+
 ## [1.64.0] - 2026-09-23 — 去識別化資料表欄位規則×資料來源與資料庫連接器×MCP proxy
 
 ### Added
