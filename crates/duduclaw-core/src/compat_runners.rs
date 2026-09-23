@@ -295,7 +295,11 @@ pub fn discover_runners_from(roots: &[PathBuf]) -> Vec<RunnerStatus> {
 fn compat_roots() -> Vec<PathBuf> {
     if let Ok(raw) = std::env::var(COMPAT_DIRS_ENV) {
         let roots: Vec<PathBuf> =
-            raw.split(':').map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).collect();
+            // `std::env::split_paths`, not `split(':')` — the latter splits a
+            // Windows `C:\...` entry at the drive colon (Windows CI test leg).
+            std::env::split_paths(&raw)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect();
         if !roots.is_empty() {
             return roots;
         }
@@ -393,13 +397,26 @@ require_tool = ["flatpak"]
 
     /// RAII `$PATH` override for tests. Callers must hold [`ENV_LOCK`] for
     /// the guard's lifetime — `PATH` is process-global.
+    ///
+    /// `dir` is *prepended* to the real `PATH`, never substituted for it:
+    /// `PATH` is process-global, and other test modules in this crate spawn
+    /// tools through it concurrently (`data_migrations` runs `bash`) — a
+    /// wholesale replacement made those fail whenever the scheduler
+    /// interleaved them with these tests. The assertions here only need
+    /// "present-tool is findable" and "definitely-missing-tool-xyz is not",
+    /// which prepending preserves.
     struct PathOverride {
         prev: Option<std::ffi::OsString>,
     }
     impl PathOverride {
         fn set(dir: &Path) -> Self {
             let prev = std::env::var_os("PATH");
-            unsafe { std::env::set_var("PATH", dir) };
+            let mut entries = vec![dir.to_path_buf()];
+            if let Some(p) = &prev {
+                entries.extend(std::env::split_paths(p));
+            }
+            let joined = std::env::join_paths(entries).expect("PATH entries contain no separator");
+            unsafe { std::env::set_var("PATH", joined) };
             Self { prev }
         }
     }

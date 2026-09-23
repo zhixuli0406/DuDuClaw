@@ -53,9 +53,9 @@ jobs:
       - name: Build gateway (no dashboard)
         run: cargo build -p duduclaw-gateway --no-default-features
       - name: Test (no dashboard)
-        run: cargo test --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
+        run: cargo test --no-fail-fast --workspace --exclude duduclaw-bridge --exclude duduclaw-dashboard --exclude duduclaw-gateway
       - name: Test gateway
-        run: cargo test -p duduclaw-gateway --no-default-features
+        run: cargo test --no-fail-fast -p duduclaw-gateway --no-default-features
       # Clippy is advisory for now: `-D warnings` was never enforced (CI never
       # went green before, so the step never ran), leaving accumulated pre-existing
       # lints across the workspace. Kept running for visibility via continue-on-error
