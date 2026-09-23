@@ -1760,10 +1760,12 @@ mod tests {
                 tool_name: "Write".into(),
                 success: true,
                 result_text: None,
-                input_text: Some(format!(
-                    r#"{{"file_path":"{}","content":"x"}}"#,
-                    src.display()
-                )),
+                // Real JSON, not `format!` — Windows path backslashes would
+                // otherwise be read as escapes and the path never matches.
+                input_text: Some(
+                    serde_json::json!({"file_path": src.display().to_string(), "content": "x"})
+                        .to_string(),
+                ),
             }],
         );
 

@@ -328,11 +328,13 @@ mod tests {
             #[cfg(windows)]
             let dir_handle = {
                 // A directory handle on Windows needs FILE_FLAG_BACKUP_SEMANTICS
-                // or `CreateFile` refuses it with "Access is denied".
+                // to open at all, and FILE_WRITE_ATTRIBUTES (not a read-only
+                // handle) for SetFileTime — otherwise "Access is denied".
                 use std::os::windows::fs::OpenOptionsExt;
                 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+                const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
                 std::fs::OpenOptions::new()
-                    .read(true)
+                    .access_mode(FILE_WRITE_ATTRIBUTES)
                     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
                     .open(&p)
                     .unwrap()

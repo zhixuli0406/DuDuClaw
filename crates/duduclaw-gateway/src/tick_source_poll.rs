@@ -551,7 +551,13 @@ mod tests {
             enabled: true,
             interval_secs: 1,
             url: None,
-            command: Some(vec!["sh".into(), "-c".into(), "exit 1".into()]),
+            // A command that exits non-zero on every platform (`sh` is not a
+            // given on the Windows CI runner).
+            command: Some(if cfg!(windows) {
+                vec!["cmd".into(), "/c".into(), "exit 1".into()]
+            } else {
+                vec!["sh".into(), "-c".into(), "exit 1".into()]
+            }),
             path: None,
             subscribe: Vec::new(),
             headers: BTreeMap::new(),
@@ -570,11 +576,19 @@ mod tests {
         });
         // `run_source` sleeps `interval_secs` (1s) before its first poll —
         // real time, not paused (this crate's tests don't depend on the
-        // tokio `test-util` feature). Give it enough margin for one full
-        // iteration on a loaded CI box, then stop the loop.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // tokio `test-util` feature). Poll for the first fetch-error drop
+        // with a generous ceiling instead of a fixed sleep: a fixed 1.5s
+        // margin was not enough on a loaded Windows runner (the whole suite
+        // took 5× longer there), and the ceiling only matters on failure.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let snap = loop {
+            let snap = hub.counters_snapshot("failing-cmd").await;
+            if snap.dropped_fetch_error >= 1 || tokio::time::Instant::now() >= deadline {
+                break snap;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
         handle.abort();
-        let snap = hub.counters_snapshot("failing-cmd").await;
         assert!(
             snap.dropped_fetch_error >= 1,
             "expected at least one fetch_error drop, got {snap:?}"
