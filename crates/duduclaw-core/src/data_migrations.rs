@@ -368,6 +368,7 @@ pub fn read_failure(home: &Path) -> Option<MigrationFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn write_script(dir: &Path, name: &str, body: &str) {
@@ -604,6 +605,7 @@ mod tests {
         assert!(marker_dir.is_dir());
     }
 
+    #[cfg(unix)] // PermissionsExt::mode() — unix-only by definition
     #[test]
     fn permissions_helper_sanity_for_the_first_shipped_migration() {
         // Not testing the shipped script itself here (that is covered by

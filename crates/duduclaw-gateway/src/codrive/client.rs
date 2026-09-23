@@ -406,6 +406,7 @@ pub use unix_impl::CodriveClient;
 /// pattern that broke Windows release CI once already when a unix-only
 /// transport compiled ungated.
 #[cfg(not(unix))]
+#[derive(Debug)] // `Result<Self, _>::unwrap_err()` in the stub's own test needs it
 pub struct CodriveClient;
 
 #[cfg(not(unix))]

@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
-- **CI (Windows leg)**: `duduclaw-sysd`'s non-unix `server::bind` stub had drifted from the unix signature (`allowed_uid` argument), so the workspace failed to compile on Windows since the 1.63.0 tag build. The stub now mirrors the unix signature exactly.
+- **CI (Windows leg)**: `duduclaw-sysd`'s non-unix `server::bind` stub had drifted from the unix signature (`allowed_uid` argument), so the workspace failed to compile on Windows since the 1.63.0 tag build. The stub now mirrors the unix signature exactly. The Windows test build then surfaced three more unix-only leaks in test code, all gated to `cfg(unix)`: `duduclaw-core` `data_migrations` (`PermissionsExt`), the gateway's UDS-backed `sysd_integration` tests (`nix` is a `cfg(unix)` dependency), and the non-unix `CodriveClient` stub now derives `Debug` so its own fail-closed test compiles.
 
 ### Security
 - Bumped `rustls` 0.23.38 → 0.23.45 (RUSTSEC-2026-0285, TLS 1.3 handshake messages accepted across encryption-level boundaries).

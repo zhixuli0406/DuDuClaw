@@ -678,6 +678,9 @@ mod tests {
     // tempdir-backed socket path and drives `SysdDeviceOps` at it exactly
     // as the gateway would in production, just pointed at a throwaway
     // socket instead of `/run/duduclaw/sysd.sock`. ─────────────────────
+    // unix-only: needs a real UDS server (`duduclaw_sysd::bind` is a
+    // fail-closed stub elsewhere) and `nix` (a `cfg(unix)` dependency).
+    #[cfg(unix)]
     mod sysd_integration {
         use super::*;
         use std::time::Duration;
