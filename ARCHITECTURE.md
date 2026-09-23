@@ -142,7 +142,7 @@ Agent B runner (subprocess) 讀取並執行
 ### 4.1 Crate 架構
 
 ```
-crates/                            # v1.9.4 共 16 個 crate
+crates/                            # v1.9.4 共 16 個 crate（`duduclaw-db` 為 2026-09 新增，此列表其餘部分未逐一更新到目前 workspace 全貌）
 ├── duduclaw-core/                 # 共用型別、traits、錯誤定義
 ├── duduclaw-agent/                # Agent 掃描、agent.toml 解析、心跳、預算
 ├── duduclaw-auth/                 # 多用戶認證（Argon2、JWT、ACL）
@@ -154,6 +154,7 @@ crates/                            # v1.9.4 共 16 個 crate
 ├── duduclaw-bus/                  # tokio broadcast + mpsc 訊息路由
 ├── duduclaw-bridge/               # PyO3 Rust↔Python 橋接（bus_queue 寫入）
 ├── duduclaw-odoo/                 # Odoo ERP 中間層（JSON-RPC, 17 MCP tools）
+├── duduclaw-db/  ← 2026-09        # 唯讀 SQL 資料來源連接器（sqlx：PostgreSQL/MySQL/SQLite，四個 MCP 工具）
 ├── duduclaw-cli/                  # clap CLI 入口、mcp-server (stdio/HTTP/SSE)、migrate
 ├── duduclaw-dashboard/            # rust-embed 嵌入 React SPA
 ├── duduclaw-desktop/              # 桌面端 wrapper（macOS/Windows/Linux）

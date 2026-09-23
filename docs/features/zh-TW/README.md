@@ -64,6 +64,7 @@
 | 52 | [DuDuClaw OS 桌面版](52-desktop-edition.md) | 人與 AI 共用一台機器：影子工作區、人輸入永遠優先、明確交還、共駕預設關閉 |
 | 53 | [裝置上的本地模型](53-local-models.md) | 六個查證過的 GGUF，一鍵下載、一鍵啟用；預設 hybrid，速度誠實不灌水 |
 | 54 | [微調與後訓練](54-finetune.md) | 資料在這裡整理、訓練到別的 GPU 上跑、GGUF／LoRA 再收回來——這台機器不做訓練 |
+| 55 | [資料來源與原生資料庫連接器](55-data-sources.md) | 任何 `db_field` 規則都能指向的登錄表，讓客戶自接的外部 MCP server 也去識別化的 proxy，以及第一方的唯讀 PostgreSQL／MySQL／SQLite 連接器 |
 
 ---
 

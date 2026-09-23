@@ -65,6 +65,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/52-desktop-edition.md](features/52-desktop-edition.md) | DuDuClaw OS desktop edition — one machine shared by a person and the AI: shadow workspace, human input always wins, explicit hand-back, off-by-default co-driving |
 | [features/53-local-models.md](features/53-local-models.md) | Local models on the device — six verified GGUFs served by the image's llama.cpp `llama-server`, one click to download and one to switch on; hybrid by default |
 | [features/54-finetune.md](features/54-finetune.md) | Fine-tuning and post-training — curate the dataset from stored conversations/tasks/approvals here, train on a remote GPU host or Together, import the GGUF/LoRA back into the local models directory; never trains locally |
+| [features/55-data-sources.md](features/55-data-sources.md) | Data sources & native DB connector — a registry any `db_field` rule can bind to, an MCP proxy that redacts a customer's own external MCP servers, and a first-party read-only PostgreSQL/MySQL/SQLite connector (`duduclaw-db`) with four MCP tools |
 | [features/live-forking.md](features/live-forking.md) | Live forking usage scenarios — when to use, when not to, vs `duduclaw eval` |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
@@ -201,7 +202,7 @@ docs/                                  # L1 PUBLIC — product & developer docum
 ├── features/                          # Feature highlight articles (+ ja-JP, zh-TW)
 │   ├── README.md
 │   ├── feature-inventory.md
-│   └── 01-…-54-…                      #   54 feature deep-dives
+│   └── 01-…-55-…                      #   55 feature deep-dives
 ├── spec/                              # Open format specifications
 │   ├── soul-md-spec.md                #   SOUL.md format v1.0
 │   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0

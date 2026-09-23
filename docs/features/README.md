@@ -64,6 +64,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 52 | [DuDuClaw OS Desktop Edition](52-desktop-edition.md) | One machine shared by a person and the AI — shadow workspace, human input always wins, explicit hand-back, off-by-default co-driving |
 | 53 | [Local Models on the Device](53-local-models.md) | Six verified GGUFs, one click to download and one to switch on; hybrid by default, honest about speed |
 | 54 | [Fine-tuning and Post-training](54-finetune.md) | Curate the dataset here, train it on a GPU elsewhere, import the GGUF/LoRA back — this machine never trains |
+| 55 | [Data Sources & Native DB Connector](55-data-sources.md) | A registry any `db_field` rule can bind to, an MCP proxy that redacts a customer's own MCP servers, and a first-party read-only PostgreSQL/MySQL/SQLite connector |
 
 ---
 
