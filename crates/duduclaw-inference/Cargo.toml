@@ -26,10 +26,10 @@ zeroize = "1"
 
 # ONNX Runtime for Embedding (prediction engine semantic similarity)
 ort = { version = "2.0.0-rc.12", optional = true }
-ndarray = { version = "0.16", optional = true }
+ndarray = { version = "0.17", optional = true }
 
 # Tokenizer for embedding models (BERT WordPiece, etc.)
-tokenizers = { version = "0.21", optional = true, default-features = false }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
 
 # Local Whisper ASR (whisper.cpp binding)
 whisper-rs = { version = "0.13", optional = true }
@@ -59,3 +59,7 @@ mistralrs-flash-attn = ["mistralrs-cuda", "mistralrs-core/flash-attn"]
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "opf_spike"
+required-features = ["onnx"]

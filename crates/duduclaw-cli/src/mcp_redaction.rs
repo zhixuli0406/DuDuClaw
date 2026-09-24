@@ -303,6 +303,7 @@ mod tests {
                 priority: 70,
                 cross_session_stable: false,
                 apply_to_system_prompt: false,
+                enabled: true,
                 kind: duduclaw_redaction::RuleKind::DbField {
                     source: Some("odoo".into()),
                     connector: None,
@@ -467,6 +468,45 @@ enabled = false
         let got = McpRedactionLayer::try_init(tmp.path(), "agnes")
             .expect("no config.toml is the fresh-install case, not an error");
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn ai_pii_profile_without_the_model_refuses_to_serve() {
+        // §13.4 fail-closed. The MCP server resolves the model under
+        // `DUDUCLAW_HOME`; with no model installed the `ner` rule must fail to
+        // compile, which surfaces here as `try_init` erroring — and the caller
+        // (mcp.rs) then refuses to start rather than serving unredacted tool
+        // results under a rule set the operator believes is protecting them.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = try_init_with_config(
+            tmp.path(),
+            r#"
+[redaction]
+enabled = true
+profiles = ["ai_pii"]
+"#,
+        )
+        .err()
+        .expect("an uninstalled NER model must fail the layer, never disable it silently");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ai_pii") || msg.contains("模型"),
+            "the error must name the model problem: {msg}"
+        );
+    }
+
+    #[test]
+    fn ai_pii_model_dir_is_resolved_under_duduclaw_home() {
+        // Not a behaviour test of the model — a wiring test: whichever home
+        // the MCP server was given is the home the model is looked for in.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = duduclaw_redaction::ManagerPaths::under_home(tmp.path());
+        let dirs = paths.ner_dirs.expect("under_home must set the model dirs");
+        assert_eq!(
+            dirs.model_dir,
+            tmp.path().join("models").join("privacy-filter")
+        );
+        assert_eq!(dirs.ort_lib_root, tmp.path().join("lib").join("onnxruntime"));
     }
 
     #[test]

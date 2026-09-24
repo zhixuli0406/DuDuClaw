@@ -18,6 +18,7 @@ use crate::config::{Profile, RedactionConfig, SourcePolicy};
 use crate::data_source::{DataSource, registry};
 use crate::egress::{EgressDecision, EgressEvaluator};
 use crate::engine::{EngineOptions, RuleEngine};
+use crate::ner::{InstallDirs, NerConfig};
 use crate::error::{RedactionError, Result};
 use crate::pipeline::RedactionPipeline;
 use crate::profiles;
@@ -40,6 +41,11 @@ pub struct ManagerPaths {
     /// `type = "identity"` rules. `None` ⇒ no identity source in this context
     /// and an identity rule fails to compile (fail-closed).
     pub identity_people_dir: Option<PathBuf>,
+    /// Where the NER model and the ONNX Runtime library live
+    /// (`<home>/models/privacy-filter`, `<home>/lib/onnxruntime`). `None` ⇒
+    /// no model directory in this context and a `type = "ner"` rule fails to
+    /// compile (fail-closed).
+    pub ner_dirs: Option<InstallDirs>,
 }
 
 impl ManagerPaths {
@@ -54,6 +60,10 @@ impl ManagerPaths {
             identity_people_dir: Some(
                 home.join("shared").join("wiki").join("identity").join("people"),
             ),
+            // Deliberately NOT under `redaction/`: the model is a shared
+            // ~945 MB artefact, and `<home>/models/` is where every other
+            // local model already lives.
+            ner_dirs: Some(InstallDirs::under_home(home)),
         }
     }
 }
@@ -141,6 +151,8 @@ impl RedactionManager {
             &EngineOptions {
                 identity_people_dir: paths.identity_people_dir.clone(),
                 data_sources: resolve_data_sources(&config)?,
+                ner_dirs: paths.ner_dirs.clone(),
+                ner: config.ner.clone(),
             },
         )?);
         let vault = Arc::new(VaultStore::open(&paths.vault_db, &paths.key_dir)?);
@@ -181,6 +193,11 @@ impl RedactionManager {
 
     pub fn engine(&self) -> &Arc<RuleEngine> {
         &self.engine
+    }
+
+    /// `[redaction.ner]` as this manager resolved it.
+    pub fn ner_config(&self) -> &NerConfig {
+        &self.config.ner
     }
 
     pub fn source_policy(&self) -> &SourcePolicy {
@@ -402,6 +419,7 @@ mod tests {
                 priority: 80,
                 cross_session_stable: false,
                 apply_to_system_prompt: false,
+                enabled: true,
                 kind: RuleKind::Regex { pattern: r"strict@example\.com".into() },
             },
         );

@@ -842,6 +842,7 @@ mod interceptor_tests {
                 priority: 70,
                 cross_session_stable: false,
                 apply_to_system_prompt: false,
+                enabled: true,
                 kind: RuleKind::JsonPath {
                     paths: vec!["$.rows[*].name".into()],
                     match_tool: Some("crm_pg.pg_select".into()),

@@ -9,6 +9,8 @@ pub mod db_field;
 pub mod identity;
 pub mod json_path;
 pub mod keyword;
+#[cfg(feature = "ner")]
+pub mod ner;
 pub mod regex;
 
 use std::collections::HashMap;
@@ -164,6 +166,32 @@ pub enum RuleKind {
         /// or `customers.email`.
         fields: Vec<String>,
     },
+
+    /// Model-backed detection of PII with no fixed shape — names, street
+    /// addresses, birthdays, account numbers (2026-09, "AI 智慧偵測").
+    ///
+    /// Runs the OpenAI Privacy Filter (Apache-2.0) locally through ONNX
+    /// Runtime; nothing is sent anywhere. One spec compiles into one rule per
+    /// label, each carrying the DuDuClaw category that label maps to
+    /// ([`crate::ner::labels`]) — so the spec's own `category` is unused.
+    ///
+    /// The variant exists in EVERY build, feature `ner` or not, so profiles
+    /// stay wire-compatible: a build without the feature parses the rule and
+    /// then refuses to compile it (fail-closed), rather than silently
+    /// dropping a rule the operator believes is protecting them.
+    Ner {
+        /// Model labels to surface. Empty ⇒ all eight.
+        #[serde(default)]
+        labels: Vec<String>,
+        /// Minimum input length (characters) before the model is consulted.
+        /// `None` ⇒ `[redaction.ner] min_chars`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_chars: Option<usize>,
+        /// Chunk size (characters) for longer inputs. `None` ⇒
+        /// `[redaction.ner] max_chars`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_chars: Option<usize>,
+    },
 }
 
 fn default_true() -> bool {
@@ -203,6 +231,17 @@ pub struct RuleSpec {
     #[serde(default)]
     pub apply_to_system_prompt: bool,
 
+    /// Whether this rule is live. `false` ⇒ the engine skips it at compile
+    /// time (every kind), so a dashboard toggle can park a rule without
+    /// deleting it.
+    ///
+    /// Defaults to `true` so every pre-existing profile and inline rule keeps
+    /// firing, and is ALWAYS serialised (no `skip_serializing_if`) so a rule
+    /// written back by the dashboard states its state explicitly rather than
+    /// relying on a default that a future edit could change.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
     /// The actual matcher.
     #[serde(flatten)]
     pub kind: RuleKind,
@@ -236,6 +275,20 @@ pub trait Rule: Send + Sync + std::fmt::Debug {
     /// Find all matches in `text`. Implementors MAY return overlapping
     /// spans; the engine resolves overlaps globally.
     fn match_text(&self, text: &str) -> Vec<Match>;
+
+    /// Which detection engine produced this rule's matches, for the audit
+    /// trail: `"rule"` for every deterministic matcher, `"ner"` for the
+    /// model. Defaults to `"rule"` so adding a matcher never silently
+    /// mislabels itself as model output.
+    fn engine_kind(&self) -> &'static str {
+        "rule"
+    }
+
+    /// Model revision behind this rule, when `engine_kind()` is `"ner"`.
+    /// `None` for deterministic rules — there is no model to attribute.
+    fn model_revision(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]

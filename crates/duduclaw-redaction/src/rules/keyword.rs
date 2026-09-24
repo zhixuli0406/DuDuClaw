@@ -202,6 +202,7 @@ mod tests {
             priority: 60,
             cross_session_stable: true,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Keyword {
                 values: values.iter().map(|s| s.to_string()).collect(),
                 case_sensitive,

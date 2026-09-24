@@ -12,6 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::data_source::DataSourceDef;
+use crate::ner::NerConfig;
 use crate::error::{RedactionError, Result};
 use crate::rules::RuleSpec;
 
@@ -61,6 +62,11 @@ pub struct RedactionConfig {
     /// source* policy (user_input / tool_results / …); the two words collide
     /// in English but never in the TOML.
     pub data_sources: HashMap<String, DataSourceDef>,
+
+    /// `[redaction.ner]` — settings for the local NER model ("AI 智慧偵測").
+    /// Inert unless a `type = "ner"` rule is active, so the default costs
+    /// nothing; see [`crate::ner`].
+    pub ner: NerConfig,
 }
 
 impl Default for RedactionConfig {
@@ -75,6 +81,7 @@ impl Default for RedactionConfig {
             tool_egress: HashMap::new(),
             rules: HashMap::new(),
             data_sources: HashMap::new(),
+            ner: NerConfig::default(),
         }
     }
 }
@@ -324,6 +331,16 @@ pub struct ProfileMeta {
     pub description: String,
     #[serde(default)]
     pub version: String,
+
+    /// `[meta.labels]` — category id → the name a human sees for it
+    /// (`CUSTOM_EMPLOYEE_ID = "員工編號"`). Category ids are machine-shaped by
+    /// construction (`[A-Z0-9_]{1,32}`, see [`crate::token`]), so a profile
+    /// that invents its own categories needs somewhere to say what they mean;
+    /// the dashboard merges this map across every loaded profile.
+    ///
+    /// Empty by default — every pre-2026-09 profile parses unchanged.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 impl Profile {
@@ -344,6 +361,48 @@ impl Profile {
             spec.id = id.clone();
             self.rules.insert(id, spec);
         }
+    }
+
+    /// Every PII category this profile can actually produce, sorted and
+    /// deduplicated.
+    ///
+    /// Not simply `rules.values().map(|r| r.category)`: a `type = "ner"` rule
+    /// declares one placeholder category but emits one category **per label**
+    /// it was asked for. Reading the declared field would tell the dashboard
+    /// that `ai_pii` redacts a category called `PII`, which does not exist.
+    pub fn categories(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for spec in self.rules.values() {
+            match &spec.kind {
+                crate::rules::RuleKind::Ner { labels, .. } => {
+                    match crate::ner::labels::resolve_labels(labels) {
+                        Ok(resolved) => {
+                            out.extend(resolved.iter().map(|l| l.category.to_string()))
+                        }
+                        // A bad label list will fail the load anyway; showing
+                        // the declared category is better than showing nothing.
+                        Err(_) => out.push(spec.category.clone()),
+                    }
+                }
+                _ => out.push(spec.category.clone()),
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Does this profile need the NER model downloaded before it can be
+    /// used?
+    ///
+    /// True when any rule is `type = "ner"`. The dashboard uses this to show
+    /// the download button on exactly the profiles that need one, instead of
+    /// hard-coding the name `ai_pii` in the UI — an imported rule pack with a
+    /// `ner` rule gets the same treatment.
+    pub fn requires_model(&self) -> bool {
+        self.rules
+            .values()
+            .any(|r| matches!(r.kind, crate::rules::RuleKind::Ner { .. }))
     }
 
     /// Flatten the profile's rules into a Vec, ensuring each spec's `id`
@@ -505,6 +564,51 @@ restore_args = "deny"
             w.redaction.tool_egress.get("web_fetch").unwrap().restore_args,
             RestoreArgsMode::Deny
         );
+    }
+
+    #[test]
+    fn profile_meta_labels_round_trip() {
+        let src = r#"
+[meta]
+name = "我的規則"
+description = "在儀表板建立的自訂規則"
+version = "1"
+
+[meta.labels]
+CUSTOM_EMPLOYEE_ID = "員工編號"
+CUSTOM_01 = "內部專案代號"
+
+[rules.employee_id]
+type = "regex"
+pattern = 'EMP-\d{4}-\d{4}'
+category = "CUSTOM_EMPLOYEE_ID"
+priority = 60
+enabled = true
+"#;
+        let p = Profile::from_toml_str(src).expect("profile with [meta.labels] parses");
+        assert_eq!(p.meta.labels.len(), 2);
+        assert_eq!(p.meta.labels["CUSTOM_EMPLOYEE_ID"], "員工編號");
+        assert_eq!(p.meta.labels["CUSTOM_01"], "內部專案代號");
+
+        // Round-trips through serialization without losing the map.
+        let out = toml::to_string(&p).expect("profile serialises");
+        let again = Profile::from_toml_str(&out).expect("re-parses");
+        assert_eq!(again.meta.labels, p.meta.labels);
+        assert_eq!(
+            again.rules["employee_id"].category,
+            "CUSTOM_EMPLOYEE_ID"
+        );
+        assert!(again.rules["employee_id"].enabled);
+    }
+
+    #[test]
+    fn profile_meta_labels_default_to_empty() {
+        // Every pre-2026-09 profile has no `[meta.labels]` and must still parse.
+        let p = Profile::from_toml_str(
+            "[meta]\nname = \"A\"\n\n[rules.x]\ntype = \"regex\"\npattern = 'a'\ncategory = \"X\"\n",
+        )
+        .unwrap();
+        assert!(p.meta.labels.is_empty());
     }
 
     #[test]

@@ -90,7 +90,8 @@ mod onnx_impl {
     /// Performs mean pooling over token embeddings with attention mask weighting,
     /// then L2-normalizes the result.
     pub struct OnnxEmbeddingProvider {
-        session: Session,
+        // ort 2.0.0-rc.12: `Session::run` takes `&mut self`; the trait exposes `&self`.
+        session: std::sync::Mutex<Session>,
         tokenizer: Tokenizer,
         dimension: usize,
         model_name: String,
@@ -182,7 +183,7 @@ mod onnx_impl {
             );
 
             Ok(Self {
-                session,
+                session: std::sync::Mutex::new(session),
                 tokenizer,
                 dimension,
                 model_name: model_name.to_string(),
@@ -266,33 +267,40 @@ mod onnx_impl {
                 .map_err(|e| InferenceError::Other(format!("Array shape error: {e}")))?;
 
             // Run ONNX inference (CPU-bound, ~5ms for BGE-small-zh)
-            let outputs = self
+            let mk = |a: Array2<i64>| -> Result<ort::value::Tensor<i64>, InferenceError> {
+                ort::value::Tensor::from_array(a)
+                    .map_err(|e| InferenceError::Other(format!("ONNX input error: {e}")))
+            };
+            let mut guard = self
                 .session
-                .run(ort::inputs![ids_array, mask_array, type_array].map_err(|e| {
-                    InferenceError::Other(format!("ONNX input error: {e}"))
-                })?)
+                .lock()
+                .map_err(|_| InferenceError::Other("ONNX session mutex poisoned".into()))?;
+            let outputs = guard
+                .run(ort::inputs![
+                    mk(ids_array)?,
+                    mk(mask_array)?,
+                    mk(type_array)?
+                ])
                 .map_err(|e| InferenceError::Other(format!("ONNX inference error: {e}")))?;
 
             // Extract output tensor: [1, seq_len, hidden_size]
-            let output = outputs.first().ok_or_else(|| {
-                InferenceError::Other("No output from ONNX model".into())
-            })?;
+            let output = &outputs[0];
 
-            let tensor = output.try_extract_tensor::<f32>().map_err(|e| {
+            let tensor = output.try_extract_array::<f32>().map_err(|e| {
                 InferenceError::Other(format!("Failed to extract output tensor: {e}"))
             })?;
 
             // Handle both 2D [1, hidden_size] and 3D [1, seq_len, hidden_size] outputs
             let mut pooled = if tensor.ndim() == 3 {
                 let view = tensor.view();
-                let shape = view.shape();
+                let (rows, cols) = (view.shape()[1], view.shape()[2]);
                 let token_emb = view
-                    .into_shape_with_order((shape[1], shape[2]))
+                    .into_shape_with_order((rows, cols))
                     .map_err(|e| InferenceError::Other(format!("Reshape error: {e}")))?;
                 Self::mean_pool(&token_emb, &attention_mask)
             } else if tensor.ndim() == 2 {
                 // Already pooled by the model
-                tensor.index_axis(Axis(0), 0).to_vec()
+                tensor.index_axis(Axis(0), 0).iter().copied().collect()
             } else {
                 return Err(InferenceError::Other(format!(
                     "Unexpected output tensor dimensions: {}",

@@ -148,6 +148,7 @@ pub fn expand(spec: &RuleSpec, registry: &HashMap<String, DataSource>) -> Result
                 priority: spec.priority,
                 cross_session_stable: spec.cross_session_stable,
                 apply_to_system_prompt: spec.apply_to_system_prompt,
+                enabled: spec.enabled,
                 kind: RuleKind::JsonPath {
                     paths,
                     match_tool: Some(binding.tool.clone()),
@@ -368,6 +369,7 @@ mod tests {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::DbField {
                 source: source.map(str::to_string),
                 connector: connector.map(str::to_string),

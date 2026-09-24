@@ -345,6 +345,7 @@ fn config_with_db_field() -> RedactionConfig {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::DbField {
                 source: Some("odoo".into()),
                 connector: None,
@@ -460,6 +461,7 @@ fn wildcard_field_rule_masks_records_without_eating_the_envelope() {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::DbField {
                 source: Some("odoo".into()),
                 connector: None,
@@ -554,6 +556,7 @@ fn custom_data_source_reaches_a_non_odoo_tool_end_to_end() {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::DbField {
                 source: Some("crm_pg".into()),
                 connector: None,
@@ -674,6 +677,7 @@ fn local_data_files_are_masked_by_table_and_cjk_column() {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::DbField {
                 source: Some("duduclaw_files".into()),
                 connector: None,
@@ -874,6 +878,7 @@ fn config_with_identity() -> RedactionConfig {
             priority: 80,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Identity { source: "wiki".into() },
         },
     );

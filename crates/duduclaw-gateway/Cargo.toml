@@ -20,7 +20,12 @@ duduclaw-odoo = { workspace = true }
 # §13.7 WP-D: read-only SQL data sources (db_sources.* operator RPCs).
 duduclaw-db = { workspace = true }
 duduclaw-identity = { workspace = true }
-duduclaw-redaction = { workspace = true }
+# `ner` is default-on in the redaction crate; named explicitly here because
+# the gateway HARD-REQUIRES it — `redaction_ner_model.rs` (the
+# `redaction.model.*` RPCs) drives the model install and runtime directly.
+# The feature exists so a size-constrained embedder of the library can drop
+# the model; the dashboard is not such an embedder.
+duduclaw-redaction = { workspace = true, features = ["ner"] }
 duduclaw-cli-runtime = { workspace = true }
 duduclaw-cli-worker = { workspace = true }
 duduclaw-license = { workspace = true }

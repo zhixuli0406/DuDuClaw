@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::config::SourceSetting;
 use crate::data_source::DataSource;
 use crate::error::{RedactionError, Result};
+use crate::ner::{InstallDirs, NerConfig};
 use crate::pipeline::ToolContext;
 use crate::rules::{Match, Rule, RuleKind, RuleSpec};
 use crate::rules::db_field;
@@ -77,6 +78,17 @@ pub struct EngineOptions {
     /// through loses custom sources loudly (unknown source ⇒ load error)
     /// rather than losing Odoo silently.
     pub data_sources: std::collections::HashMap<String, DataSource>,
+
+    /// Where the NER model lives — required by [`RuleKind::Ner`]. `None` ⇒
+    /// this engine was built in a context with no model directory (a unit
+    /// test, a dry-compile with no home), and a `ner` rule fails to compile
+    /// rather than silently matching nothing. Same fail-closed shape as
+    /// `identity_people_dir`.
+    pub ner_dirs: Option<InstallDirs>,
+
+    /// `[redaction.ner]` runtime settings. Defaults are usable; the manager
+    /// threads the operator's block through.
+    pub ner: NerConfig,
 }
 
 impl Default for EngineOptions {
@@ -84,6 +96,8 @@ impl Default for EngineOptions {
         Self {
             identity_people_dir: None,
             data_sources: crate::data_source::builtin_registry(),
+            ner_dirs: None,
+            ner: NerConfig::default(),
         }
     }
 }
@@ -125,6 +139,15 @@ impl RuleEngine {
         let mut rules: Vec<Arc<dyn Rule>> = Vec::new();
         let mut structured: Vec<Arc<JsonPathRule>> = Vec::new();
         for spec in specs {
+            // `enabled = false` parks a rule without deleting it — applied
+            // here, before the kind match, so it holds for EVERY kind
+            // (regex / keyword / identity / json_path / db_field) and can
+            // never be forgotten when the next kind is added. The dedup above
+            // has already run, so a later profile's disabled spec correctly
+            // overrides (and silences) an earlier profile's enabled one.
+            if !spec.enabled {
+                continue;
+            }
             match &spec.kind {
                 RuleKind::Regex { .. } => {
                     let rule = RegexRule::compile(spec)?;
@@ -151,6 +174,38 @@ impl RuleEngine {
                 RuleKind::JsonPath { .. } => {
                     let rule = JsonPathRule::compile(spec)?;
                     structured.push(Arc::new(rule));
+                }
+                RuleKind::Ner { .. } => {
+                    // One spec becomes one rule per label (each with its own
+                    // category); they share a single model session.
+                    //
+                    // Fail-closed in three places: no model directory in this
+                    // context, no model installed, or a build without the
+                    // `ner` feature. None of them may degrade to "compiles and
+                    // matches nothing".
+                    #[cfg(feature = "ner")]
+                    {
+                        let Some(dirs) = options.ner_dirs.clone() else {
+                            return Err(RedactionError::rule_compile(
+                                spec.id.clone(),
+                                "AI 智慧偵測在這個情境下沒有模型目錄可用",
+                            ));
+                        };
+                        for rule in crate::rules::ner::NerRule::compile(
+                            spec,
+                            &dirs,
+                            &options.ner.sanitized(),
+                        )? {
+                            rules.push(rule);
+                        }
+                    }
+                    #[cfg(not(feature = "ner"))]
+                    {
+                        return Err(RedactionError::rule_compile(
+                            spec.id.clone(),
+                            "這個版本的 DuDuClaw 未內建 AI 智慧偵測（缺少 `ner` 編譯功能）",
+                        ));
+                    }
                 }
                 RuleKind::DbField { .. } => {
                     // Sugar: expand to one JsonPath spec per bound tool, then
@@ -314,8 +369,83 @@ mod tests {
             priority,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Regex { pattern: pattern.into() },
         }
+    }
+
+    fn ner_spec() -> RuleSpec {
+        RuleSpec {
+            id: "ai_pii".into(),
+            category: "PII".into(),
+            restore_scope: RestoreScope::Owner,
+            priority: crate::ner::DEFAULT_NER_PRIORITY,
+            cross_session_stable: false,
+            apply_to_system_prompt: false,
+            enabled: true,
+            kind: RuleKind::Ner {
+                labels: Vec::new(),
+                min_chars: None,
+                max_chars: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_ner_rule_with_no_model_directory_fails_the_load() {
+        // Same fail-closed shape as an identity rule without a people
+        // directory: a rule that compiled but matched nothing would be
+        // indistinguishable from a working one at runtime.
+        let Err(err) = RuleEngine::from_specs(vec![ner_spec()]) else {
+            panic!("a NER rule with no model directory must not compile");
+        };
+        assert!(
+            matches!(err, RedactionError::RuleCompile { .. }),
+            "expected a rule-compile failure, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "ner"))]
+    fn a_build_without_the_ner_feature_refuses_the_rule_rather_than_skipping_it() {
+        let opts = EngineOptions {
+            ner_dirs: Some(crate::ner::InstallDirs::under_home(std::path::Path::new("/nope"))),
+            ..EngineOptions::default()
+        };
+        let Err(err) = RuleEngine::from_specs_with(vec![ner_spec()], &opts) else {
+            panic!("a build without the feature must not compile a NER rule");
+        };
+        assert!(
+            format!("{err}").contains("AI 智慧偵測"),
+            "the error must say the build cannot do this: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "ner")]
+    fn a_ner_rule_with_an_empty_model_directory_fails_the_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opts = EngineOptions {
+            ner_dirs: Some(crate::ner::InstallDirs::under_home(tmp.path())),
+            ..EngineOptions::default()
+        };
+        let Err(err) = RuleEngine::from_specs_with(vec![ner_spec()], &opts) else {
+            panic!("an uninstalled model must not compile");
+        };
+        assert!(
+            matches!(err, RedactionError::RuleCompile { .. }),
+            "an uninstalled model must fail the load: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_ner_rule_is_skipped_before_the_model_is_consulted() {
+        // `enabled = false` is checked ahead of the kind match, so parking the
+        // rule must work even on a machine that could never load the model.
+        let mut spec = ner_spec();
+        spec.enabled = false;
+        let engine = RuleEngine::from_specs(vec![spec]).expect("a parked rule must not need a model");
+        assert_eq!(engine.rule_count(), 0);
     }
 
     #[test]
@@ -416,6 +546,7 @@ mod tests {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Identity { source: source.into() },
         }
     }
@@ -494,6 +625,7 @@ mod tests {
             priority: 50,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::JsonPath {
                 paths: paths.iter().map(|s| s.to_string()).collect(),
                 match_tool: tool.map(|s| s.to_string()),
@@ -537,6 +669,7 @@ mod tests {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::DbField {
                 source: Some("odoo".into()),
                 connector: None,
@@ -564,6 +697,7 @@ mod tests {
             priority: 50,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::DbField {
                 source: Some("sqlserver".into()),
                 connector: None,
@@ -649,6 +783,7 @@ mod tests {
             priority: 60,
             cross_session_stable: true,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Keyword {
                 values: vec!["Amazon".into()],
                 case_sensitive: false,
@@ -656,5 +791,119 @@ mod tests {
         };
         let engine = RuleEngine::from_specs(vec![spec]).unwrap();
         assert_eq!(engine.rule_count(), 1);
+    }
+
+    // ── `enabled = false` (2026-09 custom-rules card) ────────
+
+    #[test]
+    fn disabled_text_rule_is_not_compiled() {
+        let mut spec = rspec("email", r"[\w.+-]+@[\w-]+\.[\w.-]+", 50);
+        spec.enabled = false;
+        let engine = RuleEngine::from_specs(vec![spec]).unwrap();
+        assert_eq!(engine.rule_count(), 0);
+        let hits = engine.apply(
+            "contact alice@acme.com",
+            &Source::ToolResult { tool_name: "x".into() },
+        );
+        assert!(hits.is_empty(), "a disabled rule must never fire");
+    }
+
+    #[test]
+    fn disabled_structured_rule_is_not_compiled() {
+        let mut spec = json_path_spec("customer", &["$.name"], None);
+        spec.enabled = false;
+        let engine = RuleEngine::from_specs(vec![spec]).unwrap();
+        assert_eq!(engine.structured_rule_count(), 0);
+        assert_eq!(engine.rule_count(), 0);
+    }
+
+    #[test]
+    fn disabled_keyword_rule_is_not_compiled() {
+        let spec = RuleSpec {
+            id: "customer".into(),
+            category: "CUSTOMER".into(),
+            restore_scope: RestoreScope::Owner,
+            priority: 60,
+            cross_session_stable: false,
+            apply_to_system_prompt: false,
+            enabled: false,
+            kind: RuleKind::Keyword {
+                values: vec!["Amazon".into()],
+                case_sensitive: false,
+            },
+        };
+        assert_eq!(RuleEngine::from_specs(vec![spec]).unwrap().rule_count(), 0);
+    }
+
+    #[test]
+    fn disabled_identity_rule_skips_the_fail_closed_gate() {
+        // An identity rule normally refuses to compile without a people
+        // directory. Disabled, it is not compiled at all — so parking a rule
+        // must not resurrect that error.
+        let spec = RuleSpec {
+            id: "people".into(),
+            category: "PERSON".into(),
+            restore_scope: RestoreScope::Owner,
+            priority: 50,
+            cross_session_stable: false,
+            apply_to_system_prompt: false,
+            enabled: false,
+            kind: RuleKind::Identity { source: String::new() },
+        };
+        assert_eq!(RuleEngine::from_specs(vec![spec]).unwrap().rule_count(), 0);
+    }
+
+    #[test]
+    fn disabled_db_field_rule_is_not_expanded() {
+        let spec = RuleSpec {
+            id: "partner".into(),
+            category: "CUSTOMER_PII".into(),
+            restore_scope: RestoreScope::Owner,
+            priority: 50,
+            cross_session_stable: false,
+            apply_to_system_prompt: false,
+            enabled: false,
+            kind: RuleKind::DbField {
+                source: Some("odoo".into()),
+                connector: None,
+                fields: vec!["res.partner.name".into()],
+            },
+        };
+        assert_eq!(RuleEngine::from_specs(vec![spec]).unwrap().rule_count(), 0);
+    }
+
+    #[test]
+    fn enabled_defaults_to_true_when_absent_from_toml() {
+        let spec: RuleSpec =
+            toml::from_str("type = \"regex\"\npattern = 'a'\ncategory = \"X\"\n").unwrap();
+        assert!(spec.enabled, "an existing profile must keep firing");
+    }
+
+    #[test]
+    fn enabled_is_always_serialised() {
+        let spec = rspec("email", "a", 50);
+        let v = toml::Value::try_from(&spec).unwrap();
+        assert_eq!(
+            v.get("enabled").and_then(|b| b.as_bool()),
+            Some(true),
+            "enabled must be stated explicitly, not left to the default"
+        );
+    }
+
+    #[test]
+    fn a_later_disabled_spec_overrides_an_earlier_enabled_one() {
+        // Last-wins dedup runs before the enabled gate, so a custom profile
+        // listed after a built-in can park one of its rules.
+        let on = rspec("email", r"[\w.+-]+@[\w-]+\.[\w.-]+", 50);
+        let mut off = on.clone();
+        off.enabled = false;
+        assert_eq!(
+            RuleEngine::from_specs(vec![on.clone(), off]).unwrap().rule_count(),
+            0
+        );
+        // ...and the reverse order re-enables it.
+        let mut off2 = on.clone();
+        off2.enabled = false;
+        assert_eq!(RuleEngine::from_specs(vec![off2, on]).unwrap().rule_count(), 1);
     }
 }

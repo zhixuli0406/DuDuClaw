@@ -4022,6 +4022,51 @@ fn apply_field_rules_to_table(
     Ok(())
 }
 
+/// Per-caller rate limit for `redaction.suggest_pattern` (§13.2: 10/min).
+///
+/// Reuses `duduclaw_security::rate_limiter::RateLimiter` — the same sliding
+/// window `device.power_local` uses — rather than hand-rolling a bucket.
+fn suggest_pattern_limiter() -> &'static duduclaw_security::rate_limiter::RateLimiter {
+    static LIMITER: std::sync::LazyLock<duduclaw_security::rate_limiter::RateLimiter> =
+        std::sync::LazyLock::new(|| {
+            duduclaw_security::rate_limiter::RateLimiter::new(
+                10,
+                std::time::Duration::from_secs(60),
+            )
+        });
+    &LIMITER
+}
+
+/// Build the [`duduclaw_redaction::EngineOptions`] a config table resolves to
+/// — the identity directory plus the operator's data-source registry.
+///
+/// Shared by the rule-pack importer so an imported rule is validated against
+/// exactly the ambient resources the live manager will hand it.
+fn redaction_engine_options(
+    table: &toml::Table,
+    home_dir: &Path,
+) -> Result<duduclaw_redaction::EngineOptions, String> {
+    #[derive(serde::Deserialize)]
+    struct Wrap {
+        #[serde(default)]
+        redaction: duduclaw_redaction::RedactionConfig,
+    }
+    let raw = toml::to_string(table).map_err(|e| format!("serialize config: {e}"))?;
+    let cfg = toml::from_str::<Wrap>(&raw)
+        .map_err(|e| format!("parse [redaction]: {e}"))?
+        .redaction;
+    let paths = duduclaw_redaction::ManagerPaths::under_home(home_dir);
+    Ok(duduclaw_redaction::EngineOptions {
+        identity_people_dir: paths.identity_people_dir,
+        data_sources: duduclaw_redaction::resolve_data_sources(&cfg).map_err(|e| e.to_string())?,
+        // §13.4: a dry-compile must resolve the model exactly where the live
+        // manager would, or an `ai_pii` rule would pass validation here and
+        // fail at boot.
+        ner_dirs: paths.ner_dirs,
+        ner: cfg.ner.clone(),
+    })
+}
+
 /// Dry-compile a candidate `config.toml` table: resolve the whole rule-spec
 /// list exactly the way `RedactionManager::open` does and build the engine.
 /// Errors carry the compiler's own text so the editor can show it verbatim.
@@ -4049,6 +4094,8 @@ fn dry_compile_redaction_table(table: &toml::Table, home_dir: &Path) -> Result<(
         &duduclaw_redaction::EngineOptions {
             identity_people_dir: paths.identity_people_dir.clone(),
             data_sources,
+            ner_dirs: paths.ner_dirs.clone(),
+            ner: cfg.ner.clone(),
         },
     )
     .map(|_| ())
@@ -4241,15 +4288,26 @@ fn apply_data_sources_to_table(
 /// its rule count and the PII categories (fields) it covers.
 fn redaction_available_profiles(home_dir: &std::path::Path) -> Vec<Value> {
     fn summary(name: &str, p: &duduclaw_redaction::config::Profile, builtin: bool) -> Value {
-        let mut cats: Vec<String> = p.rules.values().map(|r| r.category.clone()).collect();
-        cats.sort();
-        cats.dedup();
+        // Not the declared `category` fields: a `ner` rule declares one
+        // placeholder and emits one category per label, so the profile's own
+        // accessor is the only thing that knows what `ai_pii` actually covers.
+        let cats: Vec<String> = p.categories();
         json!({
             "name": name,
             "description": p.meta.description,
             "builtin": builtin,
+            // §13.2: the explicit inverse of `builtin` — a custom profile is
+            // the only kind `redaction.profiles.remove` may delete, and the
+            // card needs to know that without re-deriving the rule.
+            "custom": !builtin,
+            "label": p.meta.name,
             "rule_count": p.rules.len(),
             "categories": cats,
+            // §13.4: true for any profile holding a `type = "ner"` rule, so
+            // the card shows the download button by capability rather than by
+            // hard-coding the name `ai_pii` (an imported rule pack with a
+            // `ner` rule gets the same treatment).
+            "requires_model": p.requires_model(),
         })
     }
 
@@ -6347,6 +6405,59 @@ impl MethodHandler {
             "redaction.dry_run" => {
                 require_admin!();
                 self.handle_redaction_dry_run(params).await
+            }
+
+            // §13.2 「我的規則」 — same operator gate as the rest of
+            // `redaction.*`: every one of these writes the rule set that
+            // decides what leaves the deployment.
+            "redaction.custom_rules.list" => {
+                require_admin!();
+                self.handle_redaction_custom_rules_list().await
+            }
+            "redaction.custom_rules.upsert" => {
+                require_admin!();
+                self.handle_redaction_custom_rules_upsert(params).await
+            }
+            "redaction.custom_rules.remove" => {
+                require_admin!();
+                self.handle_redaction_custom_rules_remove(params).await
+            }
+            "redaction.custom_rules.set_enabled" => {
+                require_admin!();
+                self.handle_redaction_custom_rules_set_enabled(params).await
+            }
+            "redaction.suggest_pattern" => {
+                require_admin!();
+                self.handle_redaction_suggest_pattern(params, &ctx.user_id)
+                    .await
+            }
+            "redaction.profiles.import" => {
+                require_admin!();
+                self.handle_redaction_profiles_import(params).await
+            }
+            "redaction.profiles.remove" => {
+                require_admin!();
+                self.handle_redaction_profiles_remove(params).await
+            }
+
+            // §13.4 「AI 智慧偵測」 model lifecycle. Same operator gate as the
+            // rest of `redaction.*`: installing a 945 MB artefact and changing
+            // what the detector can see are both operator actions.
+            "redaction.model.status" => {
+                require_admin!();
+                self.handle_redaction_model_status().await
+            }
+            "redaction.model.install" => {
+                require_admin!();
+                self.handle_redaction_model_install().await
+            }
+            "redaction.model.cancel" => {
+                require_admin!();
+                self.handle_redaction_model_cancel().await
+            }
+            "redaction.model.remove" => {
+                require_admin!();
+                self.handle_redaction_model_remove().await
             }
 
             // IDR: identity resolution (RFC-21 §1 dashboard surface)
@@ -10994,6 +11105,16 @@ impl MethodHandler {
                 "data_file_guard".into(),
                 Value::String(redaction_data_file_guard(&table)),
             );
+            // §13.2: category id → the name a human sees, merged across every
+            // profile currently listed in `[redaction] profiles`. The frontend
+            // falls back to `redaction.cat.<id>` i18n and then the raw id.
+            obj.insert(
+                "category_labels".into(),
+                json!(crate::redaction_custom_rules::merged_category_labels(
+                    &self.home_dir,
+                    &table
+                )),
+            );
             // §12: poison state — `null` when redaction resolved cleanly.
             obj.insert("poisoned".into(), poison_wire(poison.as_ref()));
         }
@@ -11039,12 +11160,31 @@ impl MethodHandler {
             return WsFrame::error_response("", &e);
         }
 
-        // ── Hot reload ── rebuild the live pipeline from the just-written
-        // config so profile/field/source changes apply immediately (no
-        // gateway restart). A rebuild failure leaves the previous live
-        // manager untouched and is reported honestly in the response.
+        let (applied, warning) = self.apply_redaction_hot_reload(&table).await;
+
+        info!(?changes, applied, "redaction.update completed");
+        WsFrame::ok_response(
+            "",
+            json!({ "success": true, "changes": changes, "applied": applied, "warning": warning }),
+        )
+    }
+
+    /// Rebuild the live redaction pipeline from a just-written config table.
+    ///
+    /// Extracted from `redaction.update` so every writer of redaction state —
+    /// the settings form, the custom-rules card, the rule-pack importer —
+    /// goes through ONE reload with one poison-recovery story. A rebuild
+    /// failure leaves the previous live manager untouched and is reported
+    /// honestly in the returned warning.
+    ///
+    /// §12 recovery: a successful rebuild clears the poison state (and
+    /// announces it once); a failure while poisoned keeps it, refreshing the
+    /// reason so the banner names the *current* cause. A failure while NOT
+    /// poisoned does not newly poison — the live manager is untouched and the
+    /// caller's response already carries the warning.
+    async fn apply_redaction_hot_reload(&self, table: &toml::Table) -> (bool, Option<String>) {
         let parsed: Option<duduclaw_redaction::RedactionConfig> =
-            toml::to_string(&table).ok().and_then(|s| {
+            toml::to_string(table).ok().and_then(|s| {
                 #[derive(serde::Deserialize)]
                 struct Wrap {
                     #[serde(default)]
@@ -11052,11 +11192,6 @@ impl MethodHandler {
                 }
                 toml::from_str::<Wrap>(&s).ok().map(|w| w.redaction)
             });
-        // §12 recovery: a successful rebuild clears the poison state (and
-        // announces it once); a failure while poisoned keeps it, refreshing the
-        // reason so the banner names the *current* cause. A failure while NOT
-        // poisoned does not newly poison — the live manager is untouched and
-        // the response already carries the warning.
         let was_poisoned = self.get_redaction_poison().await;
         let mut recovered = false;
         let (applied, warning) = match parsed {
@@ -11103,7 +11238,7 @@ impl MethodHandler {
         };
 
         if recovered {
-            info!("redaction poison state cleared by redaction.update");
+            info!("redaction poison state cleared by redaction hot reload");
             crate::redaction_integration::post_redaction_activity(
                 &self.home_dir,
                 "redaction_recovered",
@@ -11111,11 +11246,294 @@ impl MethodHandler {
             )
             .await;
         }
+        (applied, warning)
+    }
 
-        info!(?changes, applied, "redaction.update completed");
+    // ── RED §13: 「我的規則」custom rules + imported rule packs ───────────────
+
+    /// Make sure a custom profile file is listed in `[redaction] profiles`,
+    /// then hot-reload the live pipeline so the just-written rules apply.
+    ///
+    /// Listing only happens when the file actually EXISTS: listing a profile
+    /// with no file behind it is a load error (`profile '<name>' not found`)
+    /// that would poison the pipeline — which is exactly what a `remove` of
+    /// the last rule, or of a rule that was never there, would otherwise do.
+    async fn ensure_custom_profile_active(
+        &self,
+        name: &str,
+    ) -> Result<(bool, Option<String>), String> {
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        if crate::redaction_custom_rules::profile_path(&self.home_dir, name).exists()
+            && crate::redaction_custom_rules::ensure_profile_listed(&mut table, name)
+        {
+            self.atomic_write_toml(&config_path, &table).await?;
+        }
+        Ok(self.apply_redaction_hot_reload(&table).await)
+    }
+
+    /// `redaction.custom_rules.list` → `{ rules: [...] }` (§13.2).
+    async fn handle_redaction_custom_rules_list(&self) -> WsFrame {
+        match crate::redaction_custom_rules::list_rules(&self.home_dir) {
+            Ok(rules) => WsFrame::ok_response("", json!({ "rules": rules })),
+            // Fail closed: an unreadable custom.toml is an error the operator
+            // must see, never an empty list that reads as "you have no rules".
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `redaction.custom_rules.upsert` — create or edit one rule (§13.2).
+    async fn handle_redaction_custom_rules_upsert(&self, params: Value) -> WsFrame {
+        let input = match crate::redaction_custom_rules::parse_upsert(&params) {
+            Ok(i) => i,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let rule = match crate::redaction_custom_rules::upsert_rule(&self.home_dir, &input) {
+            Ok(r) => r,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        self.finish_custom_rule_write(rule).await
+    }
+
+    /// Rebuild the live pipeline if an install / removal just changed whether
+    /// a `type = "ner"` rule can compile.
+    ///
+    /// The download runs in a detached task that has no `&self`, so the flag
+    /// it sets is consumed here, on the next `redaction.model.*` call. The
+    /// card polls `status` every two seconds while a download runs, so the
+    /// reload lands within one poll of the download finishing.
+    async fn reload_redaction_if_model_changed(&self) -> Option<String> {
+        if !crate::redaction_ner_model::take_pending_reload() {
+            return None;
+        }
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let (_applied, warning) = self.apply_redaction_hot_reload(&table).await;
+        warning
+    }
+
+    /// `redaction.model.status` — install state, progress and live latency
+    /// telemetry for the NER model (§13.4).
+    async fn handle_redaction_model_status(&self) -> WsFrame {
+        let warning = self.reload_redaction_if_model_changed().await;
+        let mut resp = crate::redaction_ner_model::status(&self.home_dir);
+        if let (Some(obj), Some(w)) = (resp.as_object_mut(), warning) {
+            obj.insert("warning".into(), Value::String(w));
+        }
+        WsFrame::ok_response("", resp)
+    }
+
+    /// `redaction.model.install` — start the background download. Idempotent.
+    async fn handle_redaction_model_install(&self) -> WsFrame {
+        match crate::redaction_ner_model::install_start(&self.home_dir) {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `redaction.model.cancel` — stop a running download, keeping the
+    /// partial files so the next attempt resumes.
+    async fn handle_redaction_model_cancel(&self) -> WsFrame {
+        match crate::redaction_ner_model::cancel() {
+            Ok(v) => WsFrame::ok_response("", v),
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `redaction.model.remove` — delete the model files (not the ONNX
+    /// Runtime library) and rebuild the pipeline, which will now refuse any
+    /// active `ner` rule rather than pretend it is working.
+    async fn handle_redaction_model_remove(&self) -> WsFrame {
+        match crate::redaction_ner_model::remove(&self.home_dir) {
+            Ok(mut v) => {
+                if let (Some(obj), Some(w)) =
+                    (v.as_object_mut(), self.reload_redaction_if_model_changed().await)
+                {
+                    obj.insert("warning".into(), Value::String(w));
+                }
+                WsFrame::ok_response("", v)
+            }
+            Err(e) => WsFrame::error_response("", &e),
+        }
+    }
+
+    /// `redaction.custom_rules.remove` → `{ ok }` (§13.2).
+    async fn handle_redaction_custom_rules_remove(&self, params: Value) -> WsFrame {
+        let Some(id) = params.get("id").and_then(|v| v.as_str()).map(str::trim) else {
+            return WsFrame::error_response("", "Missing 'id' parameter");
+        };
+        let removed = match crate::redaction_custom_rules::remove_rule(&self.home_dir, id) {
+            Ok(r) => r,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let (applied, warning) = match self
+            .ensure_custom_profile_active(crate::redaction_custom_rules::CUSTOM_PROFILE)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         WsFrame::ok_response(
             "",
-            json!({ "success": true, "changes": changes, "applied": applied, "warning": warning }),
+            json!({ "ok": true, "removed": removed, "applied": applied, "warning": warning }),
+        )
+    }
+
+    /// `redaction.custom_rules.set_enabled` — toggle one rule (§13.2).
+    async fn handle_redaction_custom_rules_set_enabled(&self, params: Value) -> WsFrame {
+        let Some(id) = params.get("id").and_then(|v| v.as_str()).map(str::trim) else {
+            return WsFrame::error_response("", "Missing 'id' parameter");
+        };
+        let Some(enabled) = params.get("enabled").and_then(|v| v.as_bool()) else {
+            return WsFrame::error_response("", "Missing 'enabled' parameter");
+        };
+        let rule =
+            match crate::redaction_custom_rules::set_rule_enabled(&self.home_dir, id, enabled) {
+                Ok(r) => r,
+                Err(e) => return WsFrame::error_response("", &e),
+            };
+        self.finish_custom_rule_write(rule).await
+    }
+
+    /// Shared tail for `upsert` / `set_enabled`: make sure the profile is
+    /// listed, hot-reload, answer with the single rule row plus the reload
+    /// verdict.
+    async fn finish_custom_rule_write(&self, rule: Value) -> WsFrame {
+        let (applied, warning) = match self
+            .ensure_custom_profile_active(crate::redaction_custom_rules::CUSTOM_PROFILE)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let mut resp = rule;
+        if let Some(obj) = resp.as_object_mut() {
+            obj.insert("applied".into(), json!(applied));
+            obj.insert("warning".into(), json!(warning));
+        }
+        WsFrame::ok_response("", resp)
+    }
+
+    /// `redaction.suggest_pattern` — examples → regex (§13.2).
+    ///
+    /// Engine order: local inference → cloud utility model → heuristic. The
+    /// example VALUES never reach a log or the audit trail; only counts and
+    /// the chosen engine are recorded.
+    async fn handle_redaction_suggest_pattern(&self, params: Value, caller: &str) -> WsFrame {
+        let input = match crate::redaction_custom_rules::parse_suggest(&params) {
+            Ok(i) => i,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        if !suggest_pattern_limiter()
+            .check_and_record(&format!("redaction.suggest_pattern:{caller}"))
+            .await
+        {
+            return WsFrame::error_response(
+                "",
+                "產生樣式的次數太頻繁，請稍候再試（每分鐘最多 10 次）",
+            );
+        }
+        let out = crate::redaction_custom_rules::suggest_pattern(&self.home_dir, &input).await;
+        info!(
+            examples = input.examples.len(),
+            counter_examples = input.counter_examples.len(),
+            engine = out.get("engine").and_then(|v| v.as_str()).unwrap_or("?"),
+            all_ok = out.get("all_ok").and_then(|v| v.as_bool()).unwrap_or(false),
+            "redaction.suggest_pattern completed"
+        );
+        WsFrame::ok_response("", out)
+    }
+
+    /// `redaction.profiles.import` — bring a TOML rule pack in as a second
+    /// custom profile (§13.2). `dry_run` reports without writing.
+    async fn handle_redaction_profiles_import(&self, params: Value) -> WsFrame {
+        let Some(source) = params.get("toml").and_then(|v| v.as_str()) else {
+            return WsFrame::error_response("", "Missing 'toml' parameter");
+        };
+        let requested = params.get("name").and_then(|v| v.as_str());
+        let dry_run = params
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Compile imported rules against the SAME engine options the live
+        // manager resolves, so a rule that would poison the next reload is
+        // skipped here rather than written to disk.
+        let config_path = self.home_dir.join("config.toml");
+        let table = self.read_config_table(&config_path).await;
+        let options = match redaction_engine_options(&table, &self.home_dir) {
+            Ok(o) => o,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+
+        let report = match crate::redaction_custom_rules::import_profile(
+            &self.home_dir,
+            source,
+            requested,
+            dry_run,
+            &options,
+        ) {
+            Ok(r) => r,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let mut resp = report.to_wire();
+        if !dry_run {
+            let (applied, warning) = match self.ensure_custom_profile_active(&report.name).await {
+                Ok(v) => v,
+                Err(e) => return WsFrame::error_response("", &e),
+            };
+            if let Some(obj) = resp.as_object_mut() {
+                obj.insert("applied".into(), json!(applied));
+                obj.insert("warning".into(), json!(warning));
+            }
+            info!(
+                profile = %report.name,
+                imported = report.imported,
+                skipped = report.skipped.len(),
+                "redaction rule pack imported"
+            );
+        }
+        WsFrame::ok_response("", resp)
+    }
+
+    /// `redaction.profiles.remove` — delete a CUSTOM profile file, drop it
+    /// from `[redaction] profiles`, reload (§13.2). Built-ins are refused.
+    async fn handle_redaction_profiles_remove(&self, params: Value) -> WsFrame {
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if name.is_empty() {
+            return WsFrame::error_response("", "Missing 'name' parameter");
+        }
+        if !crate::redaction_custom_rules::is_valid_profile_slug(name) {
+            return WsFrame::error_response("", &format!("規則集名稱 '{name}' 不合法"));
+        }
+        // Built-ins are compiled in — there is no file to delete, and
+        // unlisting one silently would look like a delete that "worked".
+        if duduclaw_redaction::profiles::builtin_profiles().contains_key(name) {
+            return WsFrame::error_response(
+                "",
+                &format!("'{name}' 是內建規則集，不能刪除（可在偵測規則集取消勾選）"),
+            );
+        }
+        let removed = match crate::redaction_custom_rules::delete_profile(&self.home_dir, name) {
+            Ok(r) => r,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
+        let config_path = self.home_dir.join("config.toml");
+        let mut table = self.read_config_table(&config_path).await;
+        if crate::redaction_custom_rules::unlist_profile(&mut table, name)
+            && let Err(e) = self.atomic_write_toml(&config_path, &table).await
+        {
+            return WsFrame::error_response("", &e);
+        }
+        let (applied, warning) = self.apply_redaction_hot_reload(&table).await;
+        info!(profile = %name, removed, "redaction custom profile removed");
+        WsFrame::ok_response(
+            "",
+            json!({ "ok": true, "removed": removed, "applied": applied, "warning": warning }),
         )
     }
 
@@ -34700,12 +35118,28 @@ impl MethodHandler {
         }
     }
 
-    /// `redaction.dry_run` — run a pasted JSON sample through the LIVE
-    /// pipeline and report WHERE it would be tokenised.
+    /// `redaction.dry_run` — run a pasted sample through the live pipeline
+    /// (optionally plus unsaved draft rules) and report WHERE it would be
+    /// tokenised.
     ///
-    /// Params: `{ sample_json: string, tool?: string (default "odoo_search"),
-    /// args?: object (default {}) }`. Response:
+    /// Params: `{ sample_json?: string, sample_text?: string,
+    /// tool?: string (default "odoo_search"), args?: object (default {}),
+    /// draft_rules?: [{ id, label?, category, kind, keywords?, pattern? }] }`.
+    /// Response:
     /// `{ hits: [{ pointer, rule_id, category, token }], token_count, restored_ok }`.
+    ///
+    /// `sample_text` is the plain-text alternative to `sample_json` — it is
+    /// wrapped as a JSON string value internally, so the wizard's「試一試」
+    /// step can paste prose without hand-building JSON. `sample_json` wins
+    /// when both are given.
+    ///
+    /// `draft_rules` previews rules that have NOT been saved. They are
+    /// compiled into a candidate rule set for this call only — never written
+    /// anywhere — layered on top of the live config's inline rules, so a draft
+    /// sharing an id with an existing rule overrides it (the "edit preview"
+    /// case). Events a draft produced carry the draft's own `rule_id`, so the
+    /// UI can count "this rule · N hits"; every other rule reports exactly as
+    /// it does today.
     ///
     /// The sample is wrapped exactly the way `duduclaw redaction verify` JSON
     /// mode wraps it (`{"content":[{"type":"text","text": pretty}]}`) so the
@@ -34722,9 +35156,30 @@ impl MethodHandler {
         const SAMPLE_MAX_BYTES: usize = 256 * 1024;
         const DRY_RUN_SESSION: &str = "dashboard-dry-run";
 
-        let Some(sample) = params.get("sample_json").and_then(|v| v.as_str()) else {
-            return WsFrame::error_response("", "Missing 'sample_json' parameter");
+        // `sample_json` wins when both are present. `sample_text` is wrapped
+        // as a JSON string value — the exact `JSON.stringify(text)` the
+        // frontend would otherwise have had to build itself.
+        let sample_owned: String = match params.get("sample_json").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => match params.get("sample_text").and_then(|v| v.as_str()) {
+                Some(t) if !t.trim().is_empty() => match serde_json::to_string(&Value::String(
+                    t.to_string(),
+                )) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return WsFrame::error_response("", &format!("cannot wrap sample_text: {e}"));
+                    }
+                },
+                Some(_) => return WsFrame::error_response("", "sample_text is empty"),
+                None => {
+                    return WsFrame::error_response(
+                        "",
+                        "Missing 'sample_json' parameter (or 'sample_text')",
+                    );
+                }
+            },
         };
+        let sample = sample_owned.as_str();
         if sample.trim().is_empty() {
             return WsFrame::error_response("", "sample_json is empty");
         }
@@ -34734,6 +35189,12 @@ impl MethodHandler {
                 &format!("sample_json too large (max {SAMPLE_MAX_BYTES} bytes)"),
             );
         }
+        // Validated BEFORE anything else runs: an invalid draft is an error
+        // for the whole call, never a partial run against the rest.
+        let draft_specs = match crate::redaction_custom_rules::parse_draft_rules(&params) {
+            Ok(d) => d,
+            Err(e) => return WsFrame::error_response("", &e),
+        };
         let tool_name = params
             .get("tool")
             .and_then(|v| v.as_str())
@@ -34753,7 +35214,7 @@ impl MethodHandler {
 
         // Fail closed with the state named: "disabled" and "poisoned" are very
         // different answers to "why did nothing get redacted?".
-        let Some(manager) = self.get_redaction_manager().await else {
+        let Some(live_manager) = self.get_redaction_manager().await else {
             let msg = match self.get_redaction_poison().await {
                 Some(p) => format!(
                     "去識別化目前處於毒化狀態，無法試跑（設定修好後會自動恢復）：{}",
@@ -34762,6 +35223,25 @@ impl MethodHandler {
                 None => "去識別化未啟用，無法試跑。請先在本頁開啟保護並儲存。".to_string(),
             };
             return WsFrame::error_response("", &msg);
+        };
+
+        // With drafts, build a CANDIDATE manager from the on-disk config plus
+        // the drafts as inline rules. Inline rules are resolved last and
+        // override a profile rule with the same id, which is exactly the
+        // "previewing an edit" semantics the wizard needs. Nothing is written:
+        // the candidate lives only for this call.
+        let manager = if draft_specs.is_empty() {
+            live_manager
+        } else {
+            let table = self
+                .read_config_table(&self.home_dir.join("config.toml"))
+                .await;
+            match self.build_dry_run_manager(&table, draft_specs) {
+                Ok(m) => m,
+                Err(e) => {
+                    return WsFrame::error_response("", &format!("試跑規則無法編譯：{e}"));
+                }
+            }
         };
 
         let agent_id = self.resolve_dry_run_agent().await;
@@ -34838,6 +35318,39 @@ impl MethodHandler {
                 "restored_ok": restored_ok,
             }),
         )
+    }
+
+    /// Build a throwaway [`duduclaw_redaction::RedactionManager`] for one dry
+    /// run: the on-disk `[redaction]` config plus `drafts` as inline rules.
+    ///
+    /// Drafts go into `RedactionConfig::rules`, the inline map that
+    /// `resolve_rule_specs` walks LAST — so a draft sharing an id with a
+    /// profile rule shadows it, which is what previewing an edit means. The
+    /// candidate manager is dropped when the call returns; nothing about it
+    /// reaches disk or the live pipeline.
+    fn build_dry_run_manager(
+        &self,
+        table: &toml::Table,
+        drafts: Vec<duduclaw_redaction::RuleSpec>,
+    ) -> Result<Arc<duduclaw_redaction::RedactionManager>, String> {
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            #[serde(default)]
+            redaction: duduclaw_redaction::RedactionConfig,
+        }
+        let raw = toml::to_string(table).map_err(|e| format!("serialize config: {e}"))?;
+        let mut cfg = toml::from_str::<Wrap>(&raw)
+            .map_err(|e| format!("parse [redaction]: {e}"))?
+            .redaction;
+        for spec in drafts {
+            cfg.rules.insert(spec.id.clone(), spec);
+        }
+        // A dry run must work even while the operator is still deciding
+        // whether to turn protection on; the live-manager gate above already
+        // answered "is redaction configured at all?".
+        cfg.enabled = true;
+        crate::redaction_integration::build_manager_from_home(&self.home_dir, cfg)
+            .map_err(|e| e.to_string())
     }
 
     /// Agent identity used for a dashboard dry run: `[general] default_agent`
@@ -36790,6 +37303,7 @@ mod redaction_rpc_tests {
                 priority: 50,
                 cross_session_stable: false,
                 apply_to_system_prompt: false,
+                enabled: true,
                 kind: duduclaw_redaction::RuleKind::DbField {
                     source: Some("odoo".into()),
                     connector: None,
@@ -36850,6 +37364,597 @@ mod redaction_rpc_tests {
             )
             .is_empty()
         );
+    }
+
+    // ── §13.2 「我的規則」 custom rules + rule-pack import ───────────────
+
+    /// A config with redaction enabled so the hot-reload arm actually runs.
+    const ENABLED_CONFIG: &str = "[redaction]\nenabled = true\nprofiles = [\"general\"]\n";
+
+    fn listed_profiles(home: &std::path::Path) -> Vec<String> {
+        let body = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        let table: toml::Table = toml::from_str(&body).unwrap();
+        crate::redaction_custom_rules::listed_profiles(&table)
+    }
+
+    /// `MethodHandler::new` does not build the redaction manager — `server.rs`
+    /// injects it at boot. This does the same thing through the shared hot
+    /// reload, so a test can call `dry_run` without first writing a rule.
+    async fn handler_with_live_redaction(
+        home: &std::path::Path,
+        config_toml: &str,
+    ) -> MethodHandler {
+        let handler = handler_with_config(home, config_toml).await;
+        let table = handler.read_config_table(&home.join("config.toml")).await;
+        let (applied, warning) = handler.apply_redaction_hot_reload(&table).await;
+        assert!(applied, "test setup: redaction must load — {warning:?}");
+        handler
+    }
+
+    #[tokio::test]
+    async fn custom_rules_create_list_toggle_remove() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+
+        // Empty to start with — an absent custom.toml is a list, not an error.
+        let p = payload(&handler.handle_redaction_custom_rules_list().await);
+        assert_eq!(p["rules"].as_array().unwrap().len(), 0);
+
+        let created = payload(
+            &handler
+                .handle_redaction_custom_rules_upsert(json!({
+                    "label": "Employee ID",
+                    "kind": "regex",
+                    "pattern": r"EMP-\d{4}-\d{4}",
+                }))
+                .await,
+        );
+        assert_eq!(created["id"], "employee_id");
+        assert_eq!(created["category"], "CUSTOM_EMPLOYEE_ID");
+        assert_eq!(created["example"], "EMP-0000-0000");
+        assert_eq!(created["enabled"], true);
+        assert_eq!(created["applied"], true, "hot reload must have run: {created}");
+
+        // The profile is now listed in config.toml — without that the rule
+        // file on disk would never be resolved.
+        assert!(listed_profiles(home.path()).contains(&"custom".to_string()));
+
+        // ...and the LIVE engine is carrying it.
+        let manager = handler
+            .get_redaction_manager()
+            .await
+            .expect("manager rebuilt");
+        let hits = manager.engine().apply(
+            "工號 EMP-2024-0133",
+            &duduclaw_redaction::Source::ToolResult { tool_name: "x".into() },
+        );
+        assert!(
+            hits.iter().any(|h| h.rule.category() == "CUSTOM_EMPLOYEE_ID"),
+            "custom rule must reach the live engine"
+        );
+
+        let p = payload(&handler.handle_redaction_custom_rules_list().await);
+        assert_eq!(p["rules"].as_array().unwrap().len(), 1);
+
+        let toggled = payload(
+            &handler
+                .handle_redaction_custom_rules_set_enabled(
+                    json!({ "id": "employee_id", "enabled": false }),
+                )
+                .await,
+        );
+        assert_eq!(toggled["enabled"], false);
+        let manager = handler.get_redaction_manager().await.unwrap();
+        assert!(
+            !manager
+                .engine()
+                .rule_catalogue()
+                .iter()
+                .any(|(id, _)| id == "employee_id"),
+            "a disabled rule must leave the live engine"
+        );
+
+        let removed = payload(
+            &handler
+                .handle_redaction_custom_rules_remove(json!({ "id": "employee_id" }))
+                .await,
+        );
+        assert_eq!(removed["removed"], true);
+        let p = payload(&handler.handle_redaction_custom_rules_list().await);
+        assert!(p["rules"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn custom_rule_labels_surface_in_redaction_get() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        payload(
+            &handler
+                .handle_redaction_custom_rules_upsert(json!({
+                    "label": "內部專案代號",
+                    "kind": "keyword",
+                    "keywords": ["獵鷹專案", "北極星"],
+                }))
+                .await,
+        );
+
+        let p = payload(&handler.handle_redaction_get().await);
+        assert_eq!(p["category_labels"]["CUSTOM_01"], "內部專案代號");
+        let custom = p["available_profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "custom")
+            .expect("custom profile listed");
+        assert_eq!(custom["custom"], true);
+        assert_eq!(custom["builtin"], false);
+        // Built-ins report the inverse.
+        let general = p["available_profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "general")
+            .unwrap();
+        assert_eq!(general["custom"], false);
+    }
+
+    #[tokio::test]
+    async fn custom_rules_reject_invalid_payloads() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        for bad in [
+            json!({ "kind": "keyword", "keywords": ["ab"] }),
+            json!({ "label": "a", "kind": "keyword", "keywords": ["x"] }),
+            json!({ "label": "a", "kind": "regex", "pattern": "[bad" }),
+            json!({ "label": "a", "kind": "identity" }),
+        ] {
+            let frame = handler
+                .handle_redaction_custom_rules_upsert(bad.clone())
+                .await;
+            assert!(!error_text(&frame).is_empty(), "should reject {bad}");
+        }
+        // Missing params on the other two methods.
+        assert!(
+            !error_text(
+                &handler
+                    .handle_redaction_custom_rules_remove(json!({}))
+                    .await
+            )
+            .is_empty()
+        );
+        assert!(
+            !error_text(
+                &handler
+                    .handle_redaction_custom_rules_set_enabled(json!({ "id": "x" }))
+                    .await
+            )
+            .is_empty()
+        );
+        // Toggling a rule that does not exist is an error, not a silent no-op.
+        assert!(
+            !error_text(
+                &handler
+                    .handle_redaction_custom_rules_set_enabled(
+                        json!({ "id": "nope", "enabled": false })
+                    )
+                    .await
+            )
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_rule_that_never_existed_does_not_poison_the_pipeline() {
+        // `custom.toml` has never been written. Listing the profile anyway
+        // would make the next resolve fail with "profile 'custom' not found",
+        // i.e. a self-inflicted poison on a no-op delete.
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        let p = payload(
+            &handler
+                .handle_redaction_custom_rules_remove(json!({ "id": "nope" }))
+                .await,
+        );
+        assert_eq!(p["removed"], false);
+        assert_eq!(p["applied"], true, "{p}");
+        assert!(!listed_profiles(home.path()).contains(&"custom".to_string()));
+        assert!(handler.get_redaction_poison().await.is_none());
+        assert!(handler.get_redaction_manager().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn unreadable_custom_profile_surfaces_as_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        let dir = crate::redaction_custom_rules::profiles_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("custom.toml"), "not toml [[[").unwrap();
+
+        let frame = handler.handle_redaction_custom_rules_list().await;
+        assert!(
+            error_text(&frame).contains("無法解析"),
+            "fail closed, got: {}",
+            error_text(&frame)
+        );
+    }
+
+    const PACK_TOML: &str = r#"
+[meta]
+name = "Acme Pack"
+
+[meta.labels]
+CUSTOM_ACME_ID = "Acme 編號"
+
+[rules.acme_id]
+type = "regex"
+pattern = 'ACME-\d{5}'
+category = "CUSTOM_ACME_ID"
+
+[rules.broken]
+type = "regex"
+pattern = '[unclosed'
+category = "CUSTOM_ACME_ID"
+"#;
+
+    #[tokio::test]
+    async fn profile_import_dry_run_then_write() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+
+        let dry = payload(
+            &handler
+                .handle_redaction_profiles_import(
+                    json!({ "toml": PACK_TOML, "dry_run": true }),
+                )
+                .await,
+        );
+        assert_eq!(dry["name"], "acme-pack");
+        assert_eq!(dry["imported"], 1);
+        assert_eq!(dry["skipped"].as_array().unwrap().len(), 1);
+        assert_eq!(dry["skipped"][0]["rule_id"], "broken");
+        assert!(dry["skipped"][0]["line"].as_u64().is_some());
+        assert_eq!(dry["dry_run"], true);
+        // Nothing written, nothing listed.
+        assert!(!listed_profiles(home.path()).contains(&"acme-pack".to_string()));
+
+        let wet = payload(
+            &handler
+                .handle_redaction_profiles_import(json!({ "toml": PACK_TOML }))
+                .await,
+        );
+        assert_eq!(wet["imported"], 1);
+        assert_eq!(wet["applied"], true);
+        assert!(listed_profiles(home.path()).contains(&"acme-pack".to_string()));
+
+        let p = payload(&handler.handle_redaction_get().await);
+        assert_eq!(p["category_labels"]["CUSTOM_ACME_ID"], "Acme 編號");
+
+        // Remove it again: file gone, unlisted, reloaded.
+        let gone = payload(
+            &handler
+                .handle_redaction_profiles_remove(json!({ "name": "acme-pack" }))
+                .await,
+        );
+        assert_eq!(gone["removed"], true);
+        assert!(!listed_profiles(home.path()).contains(&"acme-pack".to_string()));
+    }
+
+    #[tokio::test]
+    async fn profile_import_of_a_cjk_pack_derives_its_own_slug() {
+        // Live-test regression: a Taiwanese pack named 「製造業客戶包」 sent
+        // with no `name` param used to fail with 「請自行指定」, and the
+        // approved import dialog has no name field to specify one from.
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        const CJK_PACK: &str = r#"
+[meta]
+name = "製造業客戶包"
+
+[meta.labels]
+CUSTOM_ACME_ID = "客戶編號"
+
+[rules.acme_id]
+type = "regex"
+pattern = 'ACME-\d{5}'
+category = "CUSTOM_ACME_ID"
+"#;
+
+        let dry = payload(
+            &handler
+                .handle_redaction_profiles_import(json!({ "toml": CJK_PACK, "dry_run": true }))
+                .await,
+        );
+        let slug = dry["name"].as_str().expect("name").to_string();
+        assert!(slug.starts_with("pack_"), "{slug}");
+        assert_eq!(slug.chars().count(), 13, "{slug}");
+        assert_eq!(dry["imported"], 1);
+        assert!(!listed_profiles(home.path()).contains(&slug));
+
+        let wet = payload(
+            &handler
+                .handle_redaction_profiles_import(json!({ "toml": CJK_PACK }))
+                .await,
+        );
+        assert_eq!(wet["name"], slug.as_str(), "the slug must be stable");
+        assert_eq!(wet["applied"], true, "{wet}");
+        assert!(listed_profiles(home.path()).contains(&slug));
+
+        // The readable name survives as the profile's label, and the pack's
+        // own category label reaches `redaction.get`.
+        let p = payload(&handler.handle_redaction_get().await);
+        let row = p["available_profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == slug.as_str())
+            .expect("imported profile listed");
+        assert_eq!(row["label"], "製造業客戶包");
+        assert_eq!(row["custom"], true);
+        assert_eq!(p["category_labels"]["CUSTOM_ACME_ID"], "客戶編號");
+
+        // Re-import overwrites: still exactly one file, still listed once.
+        payload(
+            &handler
+                .handle_redaction_profiles_import(json!({ "toml": CJK_PACK }))
+                .await,
+        );
+        assert_eq!(
+            listed_profiles(home.path())
+                .iter()
+                .filter(|n| *n == &slug)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_import_refuses_reserved_and_builtin_names() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        for name in ["custom", "general", "taiwan_strict"] {
+            let frame = handler
+                .handle_redaction_profiles_import(
+                    json!({ "toml": PACK_TOML, "name": name, "dry_run": true }),
+                )
+                .await;
+            assert!(
+                error_text(&frame).contains("保留"),
+                "{name}: {}",
+                error_text(&frame)
+            );
+        }
+        // And a built-in can never be deleted.
+        let frame = handler
+            .handle_redaction_profiles_remove(json!({ "name": "general" }))
+            .await;
+        assert!(
+            error_text(&frame).contains("內建規則集"),
+            "{}",
+            error_text(&frame)
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_import_with_no_usable_rules_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        let frame = handler
+            .handle_redaction_profiles_import(json!({
+                "toml": "[meta]\nname = \"x\"\n\n[rules.a]\ntype = \"regex\"\npattern = '[bad'\ncategory = \"X\"\n",
+                "dry_run": true,
+            }))
+            .await;
+        assert!(
+            error_text(&frame).contains("沒有任何可用的規則"),
+            "{}",
+            error_text(&frame)
+        );
+        // Missing param.
+        assert!(
+            !error_text(&handler.handle_redaction_profiles_import(json!({})).await).is_empty()
+        );
+    }
+
+    // ── dry_run: unsaved draft rules + plain-text samples ──────────────
+
+    #[tokio::test]
+    async fn dry_run_previews_an_unsaved_draft_rule_over_plain_text() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_live_redaction(home.path(), ENABLED_CONFIG).await;
+
+        let p = payload(
+            &handler
+                .handle_redaction_dry_run(json!({
+                    "sample_text": "工號 EMP-2024-0133 與 EMP-2025-0007 都已離職",
+                    "draft_rules": [{
+                        "id": "employee_id",
+                        "label": "員工編號",
+                        "category": "CUSTOM_EMPLOYEE_ID",
+                        "kind": "regex",
+                        "pattern": r"EMP-\d{4}-\d{4}",
+                    }],
+                }))
+                .await,
+        );
+        let hits = p["hits"].as_array().expect("hits array");
+        let mine: Vec<&Value> = hits
+            .iter()
+            .filter(|h| h["rule_id"] == "employee_id")
+            .collect();
+        assert_eq!(mine.len(), 2, "two hits expected, got {hits:?}");
+        for h in mine {
+            assert_eq!(h["category"], "CUSTOM_EMPLOYEE_ID");
+            assert!(h["token"].as_str().unwrap().starts_with("<REDACT:"));
+        }
+
+        // Nothing was persisted: the draft must not appear in the saved rules
+        // and must not be listed as a profile.
+        assert!(
+            crate::redaction_custom_rules::list_rules(home.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!listed_profiles(home.path()).contains(&"custom".to_string()));
+    }
+
+    #[tokio::test]
+    async fn dry_run_draft_keyword_rule_also_previews() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_live_redaction(home.path(), ENABLED_CONFIG).await;
+        let p = payload(
+            &handler
+                .handle_redaction_dry_run(json!({
+                    "sample_text": "客戶是台積電，聯絡人待補",
+                    "draft_rules": [{
+                        "id": "customer_code",
+                        "category": "CUSTOM_01",
+                        "kind": "keyword",
+                        "keywords": ["台積電"],
+                    }],
+                }))
+                .await,
+        );
+        assert!(
+            p["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["rule_id"] == "customer_code" && h["category"] == "CUSTOM_01"),
+            "{p}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_draft_overrides_a_saved_rule_with_the_same_id() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        // Save a rule that does NOT match the sample...
+        payload(
+            &handler
+                .handle_redaction_custom_rules_upsert(json!({
+                    "label": "Employee ID",
+                    "kind": "regex",
+                    "pattern": r"OLD-\d{4}",
+                }))
+                .await,
+        );
+        // ...then preview an edit to it under the same id.
+        let p = payload(
+            &handler
+                .handle_redaction_dry_run(json!({
+                    "sample_text": "工號 EMP-2024-0133",
+                    "draft_rules": [{
+                        "id": "employee_id",
+                        "category": "CUSTOM_EMPLOYEE_ID",
+                        "kind": "regex",
+                        "pattern": r"EMP-\d{4}-\d{4}",
+                    }],
+                }))
+                .await,
+        );
+        assert!(
+            p["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["rule_id"] == "employee_id"),
+            "the draft must shadow the saved rule: {p}"
+        );
+        // The saved rule is untouched.
+        let saved = crate::redaction_custom_rules::list_rules(home.path()).unwrap();
+        assert_eq!(saved[0]["pattern"], r"OLD-\d{4}");
+    }
+
+    #[tokio::test]
+    async fn dry_run_rejects_a_bad_draft_without_running_anything() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        for bad in [
+            json!([{ "id": "x", "category": "CUSTOM_X", "kind": "regex", "pattern": "[unclosed" }]),
+            json!([{ "id": "x", "category": "CUSTOM_X", "kind": "keyword", "keywords": ["a"] }]),
+            json!([{ "id": "X", "category": "CUSTOM_X", "kind": "regex", "pattern": "a" }]),
+            json!([{ "id": "x", "category": "bad-cat", "kind": "regex", "pattern": "a" }]),
+            json!([{ "id": "x", "kind": "regex", "pattern": "a" }]),
+            json!([{ "category": "CUSTOM_X", "kind": "regex", "pattern": "a" }]),
+            json!([{ "id": "x", "category": "CUSTOM_X", "kind": "ner" }]),
+            json!("not-an-array"),
+            json!([
+                { "id": "x", "category": "CUSTOM_X", "kind": "regex", "pattern": "a" },
+                { "id": "x", "category": "CUSTOM_Y", "kind": "regex", "pattern": "b" },
+            ]),
+        ] {
+            let frame = handler
+                .handle_redaction_dry_run(json!({
+                    "sample_text": "anything",
+                    "draft_rules": bad,
+                }))
+                .await;
+            assert!(
+                !error_text(&frame).is_empty(),
+                "should reject draft_rules = {bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_without_drafts_is_unchanged_and_sample_json_wins() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_live_redaction(home.path(), ENABLED_CONFIG).await;
+
+        // No drafts, plain text: still runs against the live rule set.
+        let p = payload(
+            &handler
+                .handle_redaction_dry_run(json!({ "sample_text": "mail me at a@b.com" }))
+                .await,
+        );
+        assert!(
+            p["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["category"] == "EMAIL"),
+            "the general profile's email rule should fire: {p}"
+        );
+
+        // Both given ⇒ sample_json wins.
+        let p = payload(
+            &handler
+                .handle_redaction_dry_run(json!({
+                    "sample_json": "{\"email\":\"a@b.com\"}",
+                    "sample_text": "no email here at all",
+                }))
+                .await,
+        );
+        assert_eq!(p["token_count"], 1, "{p}");
+
+        // Neither given ⇒ the same error as before this parameter existed.
+        assert!(
+            !error_text(&handler.handle_redaction_dry_run(json!({})).await).is_empty()
+        );
+        assert!(
+            !error_text(
+                &handler
+                    .handle_redaction_dry_run(json!({ "sample_text": "   " }))
+                    .await
+            )
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn suggest_pattern_validates_before_calling_any_engine() {
+        let home = tempfile::tempdir().unwrap();
+        let handler = handler_with_config(home.path(), ENABLED_CONFIG).await;
+        for bad in [
+            json!({ "examples": ["only-one"] }),
+            json!({ "examples": [] }),
+            json!({ "examples": "not-an-array" }),
+        ] {
+            let frame = handler
+                .handle_redaction_suggest_pattern(bad.clone(), "tester")
+                .await;
+            assert!(!error_text(&frame).is_empty(), "should reject {bad}");
+        }
     }
 }
 

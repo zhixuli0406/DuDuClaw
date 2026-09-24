@@ -98,6 +98,7 @@ mod tests {
             priority: 50,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Regex {
                 pattern: r"[\w.+-]+@[\w-]+\.[\w.-]+".into(),
             },
@@ -128,6 +129,7 @@ mod tests {
             priority: 50,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Regex { pattern: "(unclosed".into() },
         };
         let err = RegexRule::compile(bad).unwrap_err();
@@ -144,6 +146,7 @@ mod tests {
             priority: 50,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Regex { pattern: huge },
         };
         assert!(RegexRule::compile(bad).is_err());
@@ -167,6 +170,7 @@ mod tests {
             priority: 100,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Regex { pattern: r"[A-Z][12]\d{8}".into() },
         };
         let rule = RegexRule::compile(spec).unwrap();

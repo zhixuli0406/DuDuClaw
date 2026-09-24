@@ -575,6 +575,7 @@ mod tests {
             priority: 50,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::JsonPath {
                 paths: paths.iter().map(|s| s.to_string()).collect(),
                 match_tool: None,

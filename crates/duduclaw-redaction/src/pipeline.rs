@@ -243,6 +243,11 @@ impl RedactionPipeline {
             category: rule.category().into(),
             token: tok.as_str().into(),
             path,
+            // Read off the rule itself so the attribution cannot drift from
+            // what actually produced the span (a `ner` rule always answers
+            // `"ner"`; every deterministic matcher takes the trait default).
+            engine: rule.engine_kind().to_string(),
+            model_revision: rule.model_revision().map(str::to_string),
         });
 
         Ok(tok)
@@ -712,6 +717,7 @@ mod tests {
             priority,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Regex {
                 pattern: r"[\w.+-]+@[\w-]+\.[\w.-]+".into(),
             },
@@ -726,6 +732,7 @@ mod tests {
             priority: 80,
             cross_session_stable: true,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Regex { pattern: r"Project Falcon".into() },
         }
     }
@@ -889,6 +896,7 @@ mod tests {
             priority: 50,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Regex { pattern: r"09\d{8}".into() },
         };
         let text = "mail alice@acme.com phone 0912345678";
@@ -1068,6 +1076,7 @@ mod tests {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::JsonPath {
                 paths: vec!["$[*].name".into(), "$.name".into()],
                 match_tool: Some("odoo_search".into()),
@@ -1088,6 +1097,7 @@ mod tests {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::JsonPath {
                 paths: paths.iter().map(|s| s.to_string()).collect(),
                 match_tool: tool.map(|s| s.to_string()),
@@ -1278,6 +1288,7 @@ mod tests {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::DbField {
                 source: Some("odoo".into()),
                 connector: None,
@@ -1456,6 +1467,7 @@ mod tests {
             priority: 70,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::JsonPath {
                 paths: vec![column_path.to_string()],
                 match_tool: Some("csv_read".into()),
@@ -1604,6 +1616,7 @@ mod tests {
             priority: 50,
             cross_session_stable: false,
             apply_to_system_prompt: false,
+            enabled: true,
             kind: RuleKind::Regex { pattern: r"\d{8}".into() },
         };
         let (p, _t) = build_pipeline(vec![biz_id], Some("s1"));

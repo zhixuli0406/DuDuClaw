@@ -292,6 +292,12 @@ pub mod skill_synthesis_pipeline;
 // ── LLM fallback helpers (timeout / rate-limit → lighter model) ──
 pub mod llm_fallback;
 
+// ── Dashboard-authored redaction rules + imported rule packs (§13) ──
+pub mod redaction_custom_rules;
+// `redaction.model.*` — install / inspect / remove the local NER model
+// that the "AI 智慧偵測" rule set needs.
+pub mod redaction_ner_model;
+
 // ── RFC-23 redaction-pipeline integration shim ──
 pub mod redaction_integration;
 

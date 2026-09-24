@@ -1,0 +1,31 @@
+# "AI 智慧偵測" — model-backed detection of PII that has no fixed shape.
+#
+# The other built-in profiles match patterns: a national ID, a credit card, an
+# API key. Names, street addresses, birthdays and account numbers have no
+# pattern to match, so before this profile they were only caught when an
+# operator named the exact database column they sat in.
+#
+# This profile runs the OpenAI Privacy Filter (Apache-2.0) locally through
+# ONNX Runtime. Nothing is sent anywhere. It needs a ~945 MB model download
+# before it does anything — until then the rule refuses to compile, which the
+# gateway surfaces as the redaction poison state rather than as silence.
+#
+# It is NOT an anonymisation guarantee. Measured recall on zh-TW text is
+# ~80% overall and ~72% for person names, so keep the pattern profiles on:
+# this is a second layer, not a replacement.
+
+[meta]
+name = "AI 智慧偵測"
+description = "用本機 AI 模型找人名、地址、生日、帳號等沒有固定樣態的個資（Apache-2.0，離線執行）。會漏也會多抓，請搭配其他規則集使用。"
+version = "1.0.0"
+
+[rules.ai_pii]
+type = "ner"
+# A `ner` rule detects eight kinds of data at once, so each match is
+# categorised by the label the model assigned it (PERSON / ADDRESS / EMAIL /
+# PHONE / URL / DATE / ACCOUNT_NUMBER / SECRET). This field is required by the
+# rule schema and is overwritten per label at compile time.
+category = "PII"
+# Below every built-in pattern rule (50–100): where a precise regex and the
+# model overlap, the regex wins and the model only fills the gaps.
+priority = 30
