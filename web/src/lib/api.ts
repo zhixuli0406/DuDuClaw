@@ -3421,6 +3421,26 @@ export interface RedactionProfileInfo {
   rule_count: number;
   /** PII categories (fields) this profile detects, e.g. "TW_ID", "EMAIL". */
   categories: string[];
+  /** DESIGN-redaction-ner-and-custom-rules §13.2 — explicit negation of
+   *  `builtin`, so the "我的規則" / imported-profile UI never has to derive
+   *  it itself. Optional so an older gateway (pre-§13.2) still type-checks;
+   *  callers should fall back to `!builtin` when absent. */
+  custom?: boolean;
+  /** The profile's `[meta] name` — a CUSTOM profile's only display name (no
+   *  `redaction.profile.<name>` i18n entry exists for one). A BUILT-IN
+   *  profile also carries this, but its curated, translated
+   *  `redaction.profile.<name>` i18n string remains the one to render —
+   *  `label` here is the untranslated TOML value, not a substitute. */
+  label: string;
+  /** DESIGN-redaction-ner-and-custom-rules-2026-09 §13.4 — `true` only for
+   *  the built-in `ai_pii` profile (`type = "ner"`): its detection rule
+   *  cannot even COMPILE until the local model is installed (§12.1's
+   *  fail-closed poison semantics), so the dashboard renders it with the
+   *  `redaction.model.status` three-state chip instead of the plain
+   *  checkbox+categories row every other profile gets. Optional so an older
+   *  gateway (pre-§13.4) still type-checks and every existing profile falls
+   *  back to the plain row. */
+  requires_model?: boolean;
 }
 
 export type RedactionRestoreArgs = 'restore' | 'passthrough' | 'deny';
@@ -3537,6 +3557,12 @@ export interface RedactionConfig {
   data_sources: RedactionDataSource[];
   /** Non-null when redaction failed to start — render the banner. */
   poisoned: RedactionPoison | null;
+  /** DESIGN-redaction-ner-and-custom-rules §13.2 — category id → user-typed
+   *  display name, merged from every loaded profile's `[meta.labels]` (the
+   *  "我的規則" custom profile and any imported rule pack). Optional so an
+   *  older gateway still type-checks; `categoryLabel()` treats a missing map
+   *  the same as an empty one. */
+  category_labels?: Record<string, string>;
 }
 
 /** Partial update payload for `redaction.update`. A `tool_egress` value of
@@ -3588,6 +3614,170 @@ export interface RedactionDryRunResult {
   token_count: number;
   /** How many tokens round-tripped back to their original under owner restore. */
   restored_ok: number;
+}
+
+// ── "我的規則" custom rules + suggest-pattern + profile import ──────────────
+// DESIGN-redaction-ner-and-custom-rules-2026-09 §13.2. These are separate
+// from `RedactionFieldRule` (db_field / json_path, §13 table-field rules) —
+// a custom rule is always `keyword` or `regex`, stored in the reserved
+// `custom.toml` profile (or an imported `<slug>.toml` pack), and listed
+// through its own `redaction.custom_rules.*` RPC family rather than living on
+// `RedactionConfig.field_rules`.
+
+/** One entry from `redaction.custom_rules.list` / the write-back of
+ *  `upsert` / `set_enabled`. `example` is a representative value the
+ *  backend synthesises for display — regex rules never echo the pattern
+ *  itself as "the value", and keyword rules never dump the whole list — so
+ *  the list row can show something concrete without a second round trip. */
+export interface RedactionCustomRule {
+  id: string;
+  category: string;
+  /** User-typed display name (also the value keyed by `category` in
+   *  `RedactionConfig.category_labels`). */
+  label: string;
+  kind: 'keyword' | 'regex';
+  /** Always an array — empty (never absent) for a `kind: "regex"` row. */
+  keywords?: string[];
+  /** `null` (not absent) for a `kind: "keyword"` row — the gateway always
+   *  sends the key. */
+  pattern?: string | null;
+  example: string;
+  enabled: boolean;
+}
+
+/** `upsert` / `set_enabled`'s actual write-back: the saved row plus the same
+ *  save/apply verdict every other `redaction.*` mutation in this dashboard
+ *  reports (`RedactionUpdate`'s `applied`/`warning`) — a rule can be written
+ *  to `custom.toml` successfully yet fail to take effect live (e.g. it made
+ *  the compiled rule set unloadable), and that must never render as a plain
+ *  success. */
+export type RedactionCustomRuleWriteResult = RedactionCustomRule & {
+  applied: boolean;
+  warning: string | null;
+};
+
+/** Write shape for `redaction.custom_rules.upsert`. Omitting `id` creates a
+ *  new rule (the backend derives the id from `label`); omitting `category`
+ *  lets the backend derive a fresh `CUSTOM_*` id from `label` instead of
+ *  reusing an existing one. */
+export interface RedactionCustomRuleUpsert {
+  id?: string;
+  label: string;
+  category?: string;
+  kind: 'keyword' | 'regex';
+  keywords?: string[];
+  pattern?: string;
+  enabled?: boolean;
+}
+
+/** One entry of `redaction.dry_run`'s `draft_rules` — previews a rule that
+ *  has NOT been saved. Compiled for that single call only (never written
+ *  anywhere); a draft sharing `id` with an already-saved rule overrides it
+ *  for the call, which is how the wizard previews an in-progress EDIT.
+ *  Unlike `RedactionCustomRuleUpsert`, both `id` and `category` are
+ *  REQUIRED — there is no server-side derivation step for a throwaway
+ *  preview, so the caller must supply both up front (see
+ *  `deriveDraftCategoryToken` in `redactionMyRules.ts` for the free-text
+ *  case). `id` must match `^[a-z0-9][a-z0-9_-]{0,63}$` (lowercase — NOT the
+ *  same shape as `category`). */
+export interface RedactionDraftRule {
+  id: string;
+  label?: string;
+  category: string;
+  kind: 'keyword' | 'regex';
+  keywords?: string[];
+  pattern?: string;
+}
+
+export type RedactionSuggestPatternEngine = 'local' | 'cloud' | 'heuristic';
+
+/** One example/counter-example's verdict from `redaction.suggest_pattern`. */
+export interface RedactionSuggestPatternCheck {
+  value: string;
+  kind: 'example' | 'counter';
+  matched: boolean;
+  ok: boolean;
+}
+
+export interface RedactionSuggestPatternResult {
+  /** `null` when NO engine (local, cloud, nor the heuristic fallback)
+   *  produced a pattern that survives its own `checks` — an honest "found
+   *  nothing" rather than inventing a pattern that would fail anyway.
+   *  `all_ok` is always `false` in that case. */
+  pattern: string | null;
+  /** Which engine produced `pattern` — the dashboard renders this as
+   *  "由本機模型協助" / "由雲端模型協助" / "未用 AI，可能較粗略" (§12.2). */
+  engine: RedactionSuggestPatternEngine;
+  checks: RedactionSuggestPatternCheck[];
+  all_ok: boolean;
+}
+
+/** One skipped rule row from `redaction.profiles.import`'s report — a rule
+ *  that failed to compile / validate and was left out rather than failing
+ *  the whole import. */
+export interface RedactionProfileImportSkipped {
+  rule_id: string;
+  line?: number;
+  reason: string;
+}
+
+export interface RedactionProfileImportResult {
+  name: string;
+  imported: number;
+  skipped: RedactionProfileImportSkipped[];
+  categories: string[];
+  /** Only present when the call was NOT `dry_run` — the same save/apply
+   *  verdict as every other `redaction.*` mutation (see
+   *  `RedactionCustomRuleWriteResult`'s doc comment). */
+  applied?: boolean;
+  warning?: string | null;
+}
+
+// ── AI 智慧偵測 (local NER model) — WP-N §13.4 ───────────────────────────
+// The `ai_pii` profile's `type = "ner"` rule needs a ~917MB local ONNX model
+// on disk before it can compile at all. These are the RPCs that manage that
+// model's lifecycle — separate from `RedactionConfig`/`redaction.get`
+// because the model's install/download state changes on its own clock (a
+// background download), not on the config-save cycle.
+
+export type RedactionModelState = 'absent' | 'downloading' | 'ready' | 'loaded' | 'error';
+
+/** Present only while `state === 'downloading'`. */
+export interface RedactionModelProgress {
+  done_bytes: number;
+  total_bytes: number;
+  /** Which manifest file is currently being fetched (model weights, ORT
+   *  runtime library, tokenizer, …) — the manifest lists several files. */
+  file: string;
+}
+
+export interface RedactionModelStatus {
+  installed: boolean;
+  /** HF revision (commit hash) of the installed model. `null` before install. */
+  model_revision: string | null;
+  /** Installed ONNX Runtime dynamic library version. `null` before install. */
+  ort_version: string | null;
+  /** Total on-disk size of the full model manifest, in bytes — present even
+   *  when `state === "absent"` so the "未安裝 (917 MB)" chip can show a size
+   *  before anything has been downloaded. */
+  size_bytes: number;
+  state: RedactionModelState;
+  progress: RedactionModelProgress | null;
+  /** Set when `state === "error"` — why the last install/download failed. */
+  error: string | null;
+  /** Rolling average / p50 over the last 100 inference calls (§13.4). `null`
+   *  when `calls === 0` — never render a latency figure with no calls behind it. */
+  avg_latency_ms: number | null;
+  p50_latency_ms: number | null;
+  calls: number;
+  last_used_at: string | null;
+}
+
+/** `redaction.model.install`'s response. Idempotent — calling it while a
+ *  download is already running (or the model is already installed) is safe
+ *  and simply reports whether THIS call actually kicked off a new download. */
+export interface RedactionModelInstallResult {
+  started: boolean;
 }
 
 /** Vault counters from `redaction.stats`. `by_category` is a list of
@@ -6445,8 +6635,85 @@ export const api = {
         tool,
         args,
       }) as Promise<RedactionDryRunResult>,
+    /** `redaction.dry_run` with `sample_text` (plain text — the gateway
+     *  wraps it, so callers never hand-build `sample_json`) plus exactly one
+     *  UNSAVED `draft_rules` entry, for the "我的規則" wizard's step 3
+     *  「試一試」. Hits produced by the draft carry the draft's own `id` as
+     *  `rule_id` — filter on that to separate "this rule" from every other
+     *  already-active rule's real hits (see `RedactionDraftRule`'s doc
+     *  comment). A blank `sampleText` is refused server-side. */
+    dryRunDraft: (params: {
+      sampleText: string;
+      draftRule: RedactionDraftRule;
+      tool?: string;
+      args?: Record<string, unknown>;
+    }) =>
+      client.call('redaction.dry_run', {
+        sample_text: params.sampleText,
+        draft_rules: [params.draftRule],
+        tool: params.tool ?? 'dashboard_my_rule_test',
+        args: params.args ?? {},
+      }) as Promise<RedactionDryRunResult>,
     overrideStatus: () =>
       client.call('redaction.override_status') as Promise<RedactionOverrideStatus>,
+    // ── "我的規則" (§13.2) ──────────────────────────────────────────
+    customRules: {
+      list: () => client.call('redaction.custom_rules.list') as Promise<{ rules: RedactionCustomRule[] }>,
+      /** Returns the saved rule (same shape as a `list` row) plus the
+       *  save/apply verdict — check `.warning` before treating this as a
+       *  plain success (see `RedactionCustomRuleWriteResult`'s doc comment). */
+      upsert: (fields: RedactionCustomRuleUpsert) =>
+        client.call('redaction.custom_rules.upsert', { ...fields }) as Promise<RedactionCustomRuleWriteResult>,
+      remove: (id: string) =>
+        client.call('redaction.custom_rules.remove', { id }) as Promise<{
+          ok: boolean;
+          removed: boolean;
+          applied: boolean;
+          warning: string | null;
+        }>,
+      setEnabled: (id: string, enabled: boolean) =>
+        client.call('redaction.custom_rules.set_enabled', { id, enabled }) as Promise<RedactionCustomRuleWriteResult>,
+    },
+    /** Turn 2-5 real example values (+ 0-3 counter-examples) into a regex.
+     *  Values never reach the audit log or config — only the produced
+     *  pattern is ever persisted, and only after the caller saves it via
+     *  `customRules.upsert`. Rate-limited server-side to 10/min. */
+    suggestPattern: (examples: string[], counterExamples: string[] = []) =>
+      client.call('redaction.suggest_pattern', {
+        examples,
+        counter_examples: counterExamples,
+      }) as Promise<RedactionSuggestPatternResult>,
+    profiles: {
+      /** `dryRun: true` returns the preview report without writing
+       *  anything to disk. */
+      import: (toml: string, name?: string, dryRun = false) =>
+        client.call('redaction.profiles.import', {
+          toml,
+          name,
+          dry_run: dryRun,
+        }) as Promise<RedactionProfileImportResult>,
+      /** Custom profiles only — refused for any built-in name. */
+      remove: (name: string) =>
+        client.call('redaction.profiles.remove', { name }) as Promise<{
+          ok: boolean;
+          removed: boolean;
+          applied: boolean;
+          warning: string | null;
+        }>,
+    },
+    // ── AI 智慧偵測 local model lifecycle (§13.4) ────────────────────────
+    model: {
+      status: () => client.call('redaction.model.status') as Promise<RedactionModelStatus>,
+      /** Background, idempotent — see `RedactionModelInstallResult`'s doc
+       *  comment. Poll `status()` afterwards to observe progress. */
+      install: () => client.call('redaction.model.install') as Promise<RedactionModelInstallResult>,
+      cancel: () => client.call('redaction.model.cancel') as Promise<{ ok: boolean }>,
+      /** Deletes the model files only — never the shared ORT runtime library
+       *  (§13.4: "刪模型檔，不刪 ORT 庫"). Not exposed in the screen-1 UI
+       *  today; wired here so a future "移除模型" affordance is a pure UI
+       *  addition. */
+      remove: () => client.call('redaction.model.remove') as Promise<{ ok: boolean }>,
+    },
   },
   skillSynthesis: {
     get: () => client.call('skill_synthesis.get') as Promise<SkillSynthesisConfig>,

@@ -28,8 +28,11 @@ import {
   SelectItem,
 } from '@/components/mds';
 import { FieldBlock } from '@/pages/agent-form/form-rows';
+import { ConfirmDialog } from '@/components/settings/controls';
 import { RedactionFieldRulesCard } from './RedactionFieldRulesCard';
 import { RedactionSystemsCard } from './RedactionSystemsCard';
+import { RedactionMyRulesCard } from './RedactionMyRulesCard';
+import { RedactionAiDetectionRow } from './RedactionAiDetectionRow';
 import {
   DATA_FILE_GUARD_MODES,
   type DataFileGuardMode,
@@ -60,7 +63,7 @@ const TONE_CLASS: Record<'success' | 'warning' | 'danger' | 'neutral', string> =
   neutral: 'bg-muted text-muted-foreground',
 };
 
-function ToneBadge({
+export function ToneBadge({
   tone,
   dot,
   children,
@@ -117,10 +120,20 @@ const REDACTION_SOURCE_KEYS: ReadonlyArray<keyof RedactionSources> = [
 ];
 const REDACTION_MODES: ReadonlyArray<RedactionSourceMode> = ['on', 'off', 'selective', 'inherit'];
 
-/** Human label for a PII category — i18n when we know it, raw tag otherwise.
- *  Exported for reuse by the field-rules card's category picker (both draw
- *  from the same `redaction.cat.*` catalogue). */
-export function categoryLabel(intl: ReturnType<typeof useIntl>, cat: string): string {
+/** Human label for a PII category. DESIGN-redaction-ner-and-custom-rules
+ *  §13.2: a user-typed "我的規則" / imported-profile category (`CUSTOM_*`)
+ *  has no `redaction.cat.*` i18n entry — its display name instead lives in
+ *  `RedactionConfig.category_labels` (merged from every loaded profile's
+ *  `[meta.labels]`), which this checks FIRST. `labels` is optional and
+ *  defaults to "none" so every pre-existing call site keeps working
+ *  byte-for-byte without passing it. */
+export function categoryLabel(
+  intl: ReturnType<typeof useIntl>,
+  cat: string,
+  labels?: Record<string, string>,
+): string {
+  const custom = labels?.[cat];
+  if (custom) return custom;
   return intl.formatMessage({ id: `redaction.cat.${cat}`, defaultMessage: cat });
 }
 
@@ -137,12 +150,15 @@ function SourceSettingRow({
   sourceKey,
   setting,
   categories,
+  categoryLabels,
   onChange,
 }: {
   sourceKey: keyof RedactionSources;
   setting: RedactionSourceSetting;
   /** Union of categories covered by the currently selected profiles. */
   categories: string[];
+  /** `RedactionConfig.category_labels` — passed through to `categoryLabel`. */
+  categoryLabels?: Record<string, string>;
   onChange: (next: RedactionSourceSetting) => void;
 }) {
   const intl = useIntl();
@@ -248,7 +264,7 @@ function SourceSettingRow({
                       )}
                       aria-pressed={checked}
                     >
-                      {categoryLabel(intl, cat)}
+                      {categoryLabel(intl, cat, categoryLabels)}
                     </button>
                   );
                 })}
@@ -282,6 +298,28 @@ export function RedactionTab() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
+
+  // §13.2 `redaction.profiles.remove` — removing an imported rule pack (or
+  // the "我的規則" profile itself) from the 偵測規則集 list above.
+  const [removeProfileTarget, setRemoveProfileTarget] = useState<string | null>(null);
+  const [removingProfile, setRemovingProfile] = useState(false);
+  const confirmRemoveProfile = async () => {
+    if (!removeProfileTarget) return;
+    setRemovingProfile(true);
+    try {
+      const result = await api.redaction.profiles.remove(removeProfileTarget);
+      setRemoveProfileTarget(null);
+      await load();
+      // Deleted on disk but the reload after removal failed to apply — say
+      // so rather than a plain success toast.
+      if (result.warning) toast.error(result.warning);
+      else toast.success(intl.formatMessage({ id: 'redaction.savedLive' }));
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setRemovingProfile(false);
+    }
+  };
 
   // Which system the "資料表欄位規則" card below is currently filtered to —
   // set by the merged systems card's "N 條欄位規則" chip (§15.1). `fieldRulesRef`
@@ -420,6 +458,28 @@ export function RedactionTab() {
             <div className="space-y-2">
               {(config.available_profiles ?? []).map((p) => {
                 const checked = config.profiles.includes(p.name);
+                // §13.4 — the `ai_pii` (NER) profile can't compile until its
+                // local model is installed, so it gets the model-status
+                // three-state row instead of the plain checkbox+categories
+                // row below (canvas screen 1, WP-N2).
+                if (p.requires_model) {
+                  return (
+                    <RedactionAiDetectionRow
+                      key={p.name}
+                      profile={p}
+                      checked={checked}
+                      categoryLabels={config.category_labels}
+                      onToggle={() =>
+                        setConfig({
+                          ...config,
+                          profiles: checked
+                            ? config.profiles.filter((n) => n !== p.name)
+                            : [...config.profiles, p.name],
+                        })
+                      }
+                    />
+                  );
+                }
                 return (
                   <label key={p.name} className="flex cursor-pointer items-start gap-2.5 rounded-lg bg-muted/50 p-2.5">
                     <input
@@ -437,17 +497,41 @@ export function RedactionTab() {
                     />
                     <span className="min-w-0 flex-1">
                       <span className="flex flex-wrap items-center gap-1.5 text-sm font-medium text-foreground">
-                        {intl.formatMessage({ id: `redaction.profile.${p.name}`, defaultMessage: p.name })}
-                        {!p.builtin && <Badge variant="outline">{intl.formatMessage({ id: 'redaction.profile.custom' })}</Badge>}
+                        {/* A custom profile (「我的規則」or an imported pack) has
+                            no curated `redaction.profile.<name>` i18n entry —
+                            `p.label` (the profile's own `[meta] name`) is its
+                            only display name. A BUILT-IN profile still uses the
+                            translated i18n string; `p.label` there is the raw,
+                            untranslated TOML value, not a substitute. */}
+                        {(p.custom ?? !p.builtin)
+                          ? p.label
+                          : intl.formatMessage({ id: `redaction.profile.${p.name}`, defaultMessage: p.name })}
+                        {(p.custom ?? !p.builtin) && <Badge variant="outline">{intl.formatMessage({ id: 'redaction.profile.custom' })}</Badge>}
                       </span>
                       <span className="mt-1 flex flex-wrap gap-1">
                         {p.categories.map((cat) => (
                           <span key={cat} className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                            {categoryLabel(intl, cat)}
+                            {categoryLabel(intl, cat, config.category_labels)}
                           </span>
                         ))}
                       </span>
                     </span>
+                    {/* §13.2 `available_profiles[].custom` — an imported rule pack
+                        (or the "我的規則" profile itself) can be removed as a
+                        whole unit; built-in profiles never render this. */}
+                    {(p.custom ?? !p.builtin) && (
+                      <Button
+                        variant="ghost"
+                        size="xs"
+                        className="shrink-0 text-destructive hover:bg-destructive/10"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setRemoveProfileTarget(p.name);
+                        }}
+                      >
+                        {intl.formatMessage({ id: 'redaction.import.removeProfile' })}
+                      </Button>
+                    )}
                   </label>
                 );
               })}
@@ -473,6 +557,32 @@ export function RedactionTab() {
             )}
           </div>
 
+          <ConfirmDialog
+            open={removeProfileTarget !== null}
+            onClose={() => setRemoveProfileTarget(null)}
+            onConfirm={() => void confirmRemoveProfile()}
+            busy={removingProfile}
+            title={intl.formatMessage({ id: 'redaction.import.removeProfile.confirm.title' })}
+            message={intl.formatMessage(
+              { id: 'redaction.import.removeProfile.confirm.message' },
+              { name: removeProfileTarget ?? '' },
+            )}
+          />
+
+          {/* "我的規則" (canvas screens 2-9, §12.2) — directly below the
+              detection rule-set list above (§12.2: "放在偵測規則集卡正下
+              方"): that section decides WHICH built-in or imported profiles
+              are active, this one lets the operator add their own
+              keyword/pattern rules without writing TOML. Fetches and saves
+              independently of this tab's batched Save button; `onReload`
+              re-pulls `redaction.get` so a saved rule's profile ("我的規則")
+              shows up ticked in the list above without a page refresh. */}
+          <RedactionMyRulesCard
+            config={config}
+            selectedCategories={selectedCategories}
+            onReload={load}
+          />
+
           {/* Sources — mode + per-category scope per row */}
           <div className="border-t border-surface-border pt-4">
             <h4 className="mb-1 text-xs font-semibold uppercase text-muted-foreground">{intl.formatMessage({ id: 'redaction.sources' })}</h4>
@@ -484,6 +594,7 @@ export function RedactionTab() {
                   sourceKey={key}
                   setting={config.sources[key]}
                   categories={selectedCategories}
+                  categoryLabels={config.category_labels}
                   onChange={(next) => setConfig({ ...config, sources: { ...config.sources, [key]: next } })}
                 />
               ))}
@@ -517,6 +628,7 @@ export function RedactionTab() {
             <RedactionFieldRulesCard
               fieldRules={config.field_rules ?? []}
               dataSources={config.data_sources ?? []}
+              categoryLabels={config.category_labels}
               onReload={load}
               sourceFilter={ruleSourceFilter}
               sourceFilterLabel={ruleSourceFilterLabel}

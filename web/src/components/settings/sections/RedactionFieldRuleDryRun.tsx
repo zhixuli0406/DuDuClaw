@@ -40,6 +40,7 @@ export function DryRunPanel({
   onRun,
   onClose,
   fieldRuleIds,
+  categoryLabels,
 }: {
   rule: RedactionFieldRule;
   state: DryRunState;
@@ -47,6 +48,9 @@ export function DryRunPanel({
   onRun: () => void;
   onClose: () => void;
   fieldRuleIds: Set<string>;
+  /** `RedactionConfig.category_labels` — passed through to `categoryLabel`
+   *  for the hit table's category column. */
+  categoryLabels?: Record<string, string>;
 }) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
@@ -139,7 +143,7 @@ export function DryRunPanel({
                     <TableRow key={i}>
                       <TableCell className="font-mono text-xs">{hit.pointer}</TableCell>
                       <TableCell className="font-mono text-xs">{hit.rule_id}</TableCell>
-                      <TableCell className="text-xs">{categoryLabel(intl, hit.category)}</TableCell>
+                      <TableCell className="text-xs">{categoryLabel(intl, hit.category, categoryLabels)}</TableCell>
                       <TableCell className="font-mono text-xs">{hit.token}</TableCell>
                     </TableRow>
                   ))}

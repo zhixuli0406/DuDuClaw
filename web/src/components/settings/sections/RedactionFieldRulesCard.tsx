@@ -89,11 +89,13 @@ function CoverageLineText({ line }: { line: ReturnType<typeof summarizeFieldRule
 
 function FieldRuleRow({
   rule,
+  categoryLabels,
   onEdit,
   onDryRun,
   onDelete,
 }: {
   rule: RedactionFieldRule;
+  categoryLabels?: Record<string, string>;
   onEdit: () => void;
   onDryRun: () => void;
   onDelete: () => void;
@@ -108,7 +110,7 @@ function FieldRuleRow({
           <Badge variant={rule.kind === 'db_field' ? 'default' : 'outline'}>
             {intl.formatMessage({ id: `redaction.fieldRules.kind.${rule.kind}` })}
           </Badge>
-          <Badge variant="secondary">{categoryLabel(intl, rule.category)}</Badge>
+          <Badge variant="secondary">{categoryLabel(intl, rule.category, categoryLabels)}</Badge>
         </div>
         <div className="flex shrink-0 items-center gap-1">
           <Button variant="ghost" size="xs" onClick={onEdit}>
@@ -134,6 +136,7 @@ function FieldRuleRow({
 export function RedactionFieldRulesCard({
   fieldRules,
   dataSources,
+  categoryLabels,
   onReload,
   sourceFilter = null,
   sourceFilterLabel = null,
@@ -141,6 +144,10 @@ export function RedactionFieldRulesCard({
 }: {
   fieldRules: Array<RedactionFieldRule>;
   dataSources: RedactionDataSource[];
+  /** `RedactionConfig.category_labels` (DESIGN-redaction-ner-and-custom-
+   *  rules-2026-09 §13.2) — passed through to `categoryLabel` for both the
+   *  row badge and the dry-run hit table below. */
+  categoryLabels?: Record<string, string>;
   onReload: () => Promise<RedactionConfig | null>;
   /** Set by the merged systems card's "N 條欄位規則" chip — narrows the list
    *  below to rules whose `connector` resolves to this system name. `null`
@@ -332,6 +339,7 @@ export function RedactionFieldRulesCard({
               ) : (
                 <FieldRuleRow
                   rule={rule}
+                  categoryLabels={categoryLabels}
                   onEdit={() => openEdit(rule)}
                   onDryRun={() => openDryRun(rule)}
                   onDelete={() => setDeleteTarget(rule.id)}
@@ -346,6 +354,7 @@ export function RedactionFieldRulesCard({
                     onRun={() => void runDryRun()}
                     onClose={closePanel}
                     fieldRuleIds={fieldRuleIds}
+                    categoryLabels={categoryLabels}
                   />
                 </div>
               )}
