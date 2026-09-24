@@ -189,6 +189,7 @@ pub mod cli_auth;
 pub mod setup_token_wizard;
 pub mod cli_noise;
 pub mod db_sources_rpc;        // §13.7 WP-D: operator RPCs for [db_sources.*]
+pub mod db_source_grants;      // §13.7 WP-A: per-agent [capabilities] db_sources grants
 pub mod handlers;
 pub mod knowledge_guard;
 pub mod memory_factory;

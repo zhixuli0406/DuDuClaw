@@ -2,7 +2,10 @@
 //! `DESIGN-redaction-field-rules-2026-09` §13.7).
 //!
 //! Five admin-only methods behind one dispatch arm in `handlers.rs`:
-//! `db_sources.list` / `test` / `upsert` / `remove` / `tables`.
+//! `db_sources.list` / `test` / `upsert` / `remove` / `tables`. The same arm
+//! also carries `db_sources.grants.list` / `grants.set` (per-agent
+//! authorization), which this dispatcher forwards to
+//! [`crate::db_source_grants`].
 //!
 //! ## The connection string never comes back out
 //!
@@ -38,27 +41,42 @@ use crate::protocol::WsFrame;
 /// Longest error text forwarded to the dashboard (mirrors `scrub_odoo_error`).
 const MAX_ERROR_LEN: usize = 240;
 
-/// The five methods this module owns. Kept here so the `handlers.rs` arm and
-/// this dispatcher can never disagree about the surface.
+/// The methods this dispatch arm owns. Kept here so the `handlers.rs` arm and
+/// this dispatcher can never disagree about the surface. The last two are
+/// implemented in [`crate::db_source_grants`] (per-agent authorization) but
+/// route through here so the dashboard sees one `db_sources.*` family.
 pub const METHODS: &[&str] = &[
     "db_sources.list",
     "db_sources.test",
     "db_sources.upsert",
     "db_sources.remove",
     "db_sources.tables",
+    "db_sources.grants.list",
+    "db_sources.grants.set",
 ];
 
 /// Route one already-admin-authorized `db_sources.*` call.
 ///
 /// Admin gating lives in the `handlers.rs` arm (`require_admin!()`), next to
 /// every other privileged method, rather than being re-derived here.
-pub async fn dispatch(home_dir: &Path, method: &str, params: Value) -> WsFrame {
+///
+/// `registry` is needed by the two grant methods and by `remove` (which
+/// revokes the removed source from every agent that held it) — all three
+/// write `agent.toml` through the shared `update_agent_toml_with` path.
+pub async fn dispatch(
+    registry: &crate::db_source_grants::Registry,
+    home_dir: &Path,
+    method: &str,
+    params: Value,
+) -> WsFrame {
     match method {
         "db_sources.list" => list(home_dir).await,
         "db_sources.test" => test(home_dir, params).await,
         "db_sources.upsert" => upsert(home_dir, params).await,
-        "db_sources.remove" => remove(home_dir, params).await,
+        "db_sources.remove" => remove(registry, home_dir, params).await,
         "db_sources.tables" => tables(home_dir, params).await,
+        "db_sources.grants.list" => crate::db_source_grants::list(home_dir).await,
+        "db_sources.grants.set" => crate::db_source_grants::set(registry, home_dir, params).await,
         other => WsFrame::error_response("", &format!("Unknown db_sources method: {other}")),
     }
 }
@@ -186,7 +204,11 @@ async fn upsert(home_dir: &Path, params: Value) -> WsFrame {
 
 // ── remove ──────────────────────────────────────────────────────────────────
 
-async fn remove(home_dir: &Path, params: Value) -> WsFrame {
+async fn remove(
+    registry: &crate::db_source_grants::Registry,
+    home_dir: &Path,
+    params: Value,
+) -> WsFrame {
     let name = match required_name(&params) {
         Ok(n) => n,
         Err(msg) => return WsFrame::error_response("", &msg),
@@ -207,12 +229,31 @@ async fn remove(home_dir: &Path, params: Value) -> WsFrame {
     if let Err(msg) = commit(&config_path, &doc).await {
         return WsFrame::error_response("", &msg);
     }
-    // Agents that still list this source in `[capabilities] db_sources` are
-    // left alone on purpose: the grant is harmless once the source is gone
-    // (every tool refuses an unconfigured source by name), and silently
-    // rewriting other people's agent.toml files is not this RPC's business.
-    tracing::info!(source = %name, "db_sources.remove completed");
-    WsFrame::ok_response("", json!({ "success": true, "name": name }))
+    // WP-A: the grants go with the source. Leaving them behind was defensible
+    // while grants were hand-edited (an orphan grant is inert — every db tool
+    // refuses an unconfigured name), but now that the dashboard owns the grant
+    // matrix, a name nothing explains any more is a permanent "stale" row on
+    // that screen. Revocation runs AFTER the source is gone from config.toml:
+    // the reverse order would risk stripping access to a source that then
+    // fails to be removed. Failures are reported, never silent.
+    let (revoked_from, revoke_failed) =
+        crate::db_source_grants::revoke_everywhere(registry, home_dir, &name).await;
+    tracing::info!(
+        source = %name,
+        revoked = revoked_from.len(),
+        "db_sources.remove completed"
+    );
+    let mut payload = json!({
+        "success": true,
+        "name": name,
+        "revoked_from": revoked_from,
+    });
+    if !revoke_failed.is_empty()
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("revoke_failed".into(), json!(revoke_failed));
+    }
+    WsFrame::ok_response("", payload)
 }
 
 // ── tables ──────────────────────────────────────────────────────────────────
@@ -636,6 +677,16 @@ mod tests {
         frame_payload(&frame)
     }
 
+    /// A registry over an agents dir that does not exist — `remove`'s grant
+    /// revocation then finds no agent to touch, which is what these
+    /// config-only tests are asserting about. Grant revocation itself is
+    /// covered in `db_source_grants`.
+    fn empty_registry(dir: &Path) -> crate::db_source_grants::Registry {
+        std::sync::Arc::new(tokio::sync::RwLock::new(
+            duduclaw_agent::registry::AgentRegistry::new(dir.join("agents")),
+        ))
+    }
+
     fn config_text(dir: &Path) -> String {
         std::fs::read_to_string(dir.join("config.toml")).unwrap_or_default()
     }
@@ -859,7 +910,7 @@ mod tests {
             "[settings]\nfoo = 1\n\n[db_sources.a]\ndriver = \"sqlite\"\nurl = \"/tmp/a\"\nallowed_tables = [\"t\"]\n\n[db_sources.b]\ndriver = \"sqlite\"\nurl = \"/tmp/b\"\nallowed_tables = [\"t\"]\n",
         )
         .unwrap();
-        let out = frame_payload(&remove(dir.path(), json!({ "name": "a" })).await);
+        let out = frame_payload(&remove(&empty_registry(dir.path()), dir.path(), json!({ "name": "a" })).await);
         assert!(out.to_string().contains("\"success\":true"), "{out}");
         let loaded = duduclaw_db::load_db_sources(dir.path()).await;
         assert_eq!(loaded.names(), vec!["b".to_string()]);
@@ -869,7 +920,8 @@ mod tests {
     #[tokio::test]
     async fn remove_reports_a_missing_source() {
         let dir = tempfile::tempdir().unwrap();
-        let out = frame_payload(&remove(dir.path(), json!({ "name": "nope" })).await);
+        let out =
+            frame_payload(&remove(&empty_registry(dir.path()), dir.path(), json!({ "name": "nope" })).await);
         assert!(out.to_string().contains("不存在"), "{out}");
     }
 
@@ -988,13 +1040,22 @@ mod tests {
     #[tokio::test]
     async fn unknown_method_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let out = frame_payload(&dispatch(dir.path(), "db_sources.drop_everything", json!({})).await);
+        let out = frame_payload(
+            &dispatch(
+                &empty_registry(dir.path()),
+                dir.path(),
+                "db_sources.drop_everything",
+                json!({}),
+            )
+            .await,
+        );
         assert!(out.to_string().contains("Unknown db_sources method"), "{out}");
     }
 
     #[test]
     fn methods_list_matches_the_dispatcher() {
-        assert_eq!(METHODS.len(), 5);
+        // Five source-management methods + the two WP-A grant methods.
+        assert_eq!(METHODS.len(), 7);
         for m in METHODS {
             assert!(m.starts_with("db_sources."), "{m}");
         }
