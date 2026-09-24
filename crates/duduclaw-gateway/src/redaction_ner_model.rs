@@ -238,8 +238,20 @@ mod tests {
         *g = JobSlot::default();
     }
 
+    /// Serialize every test in this module: they all mutate the ONE
+    /// process-global slot, and cargo runs tests on parallel threads, so
+    /// without this a neighbour's `reset()` can land between a test's
+    /// `cancel()` and its read-back (CI ubuntu 2026-09-24: `error` was
+    /// `None` at the unwrap). Poison-tolerant so one failure does not
+    /// cascade into every other test in the module.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn status_on_a_clean_home_is_absent_with_a_reason() {
+        let _serial = serial();
         reset();
         let tmp = TempDir::new().unwrap();
         let s = status(tmp.path());
@@ -255,6 +267,7 @@ mod tests {
 
     #[test]
     fn status_carries_the_telemetry_contract_fields() {
+        let _serial = serial();
         reset();
         let tmp = TempDir::new().unwrap();
         let s = status(tmp.path());
@@ -277,6 +290,7 @@ mod tests {
 
     #[test]
     fn a_recorded_failure_shows_as_error_not_absent() {
+        let _serial = serial();
         reset();
         let tmp = TempDir::new().unwrap();
         lock().error = Some("下載中斷".into());
@@ -288,6 +302,7 @@ mod tests {
 
     #[test]
     fn a_running_job_outranks_a_stale_error() {
+        let _serial = serial();
         reset();
         let tmp = TempDir::new().unwrap();
         {
@@ -309,6 +324,7 @@ mod tests {
 
     #[test]
     fn cancel_with_no_job_is_a_no_op_not_an_error() {
+        let _serial = serial();
         reset();
         let r = cancel().unwrap();
         assert_eq!(r["cancelled"], json!(false));
@@ -316,6 +332,7 @@ mod tests {
 
     #[test]
     fn cancel_marks_the_slot_and_records_why() {
+        let _serial = serial();
         reset();
         {
             let mut g = lock();
@@ -332,6 +349,7 @@ mod tests {
 
     #[test]
     fn remove_is_refused_while_a_download_runs() {
+        let _serial = serial();
         reset();
         let tmp = TempDir::new().unwrap();
         {
@@ -345,6 +363,7 @@ mod tests {
 
     #[test]
     fn remove_on_a_clean_home_succeeds_and_asks_for_a_reload() {
+        let _serial = serial();
         reset();
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(model_dir(tmp.path())).unwrap();
@@ -357,6 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_is_idempotent_while_a_job_is_live() {
+        let _serial = serial();
         reset();
         let tmp = TempDir::new().unwrap();
         {
@@ -370,6 +390,7 @@ mod tests {
 
     #[test]
     fn model_dir_is_under_models_not_redaction() {
+        let _serial = serial();
         let p = model_dir(Path::new("/h"));
         assert!(p.ends_with("models/privacy-filter"), "{p:?}");
     }
