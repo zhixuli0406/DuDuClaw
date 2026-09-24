@@ -14,6 +14,7 @@ import {
   type RuntimeProvider,
   type AgentOdooOverride,
   type ChannelStatus,
+  type DbSourceSummary,
 } from '@/lib/api';
 import { AddChannelDialog } from '@/components/channels/AddChannelDialog';
 import { ModelSelect } from '@/components/shared/ModelSelect';
@@ -64,6 +65,7 @@ import {
   SettingsCard,
   SettingsRow,
   SettingsSaveState,
+  Checkbox,
   type SettingsNavGroup,
   type SettingsSaveStatus,
 } from '@/components/mds';
@@ -83,6 +85,7 @@ import {
 } from './defaults';
 import { ToolPolicyEditor, MountTable, KvTable, EnvTable } from './editors';
 import { RowText, RowNumber, RowSwitch, RowSelect, FieldBlock } from './form-rows';
+import { buildDbSourceCapabilityRows, toggleDbSourceCapability } from './dbSourceCapability';
 
 /**
  * W2-8 — client-side mirror of the gateway's `notify_governance::QuietWindow::
@@ -350,6 +353,13 @@ export function EditAgentPage() {
   // the agent already has an allowlist or Progent policy.
   const [showAdvancedTools, setShowAdvancedTools] = useState(false);
 
+  // DB — configured read-only SQL data sources, for the "可使用的資料庫來源"
+  // checkbox list. `null` means either "not loaded yet" or "the operator
+  // isn't an admin" (`db_sources.list` is admin-only server-side) — both
+  // render as "hide the field entirely", never an error banner (WP-C).
+  const [dbSourceOptions, setDbSourceOptions] = useState<DbSourceSummary[] | null>(null);
+  const [dbSourceOptionsLoaded, setDbSourceOptionsLoaded] = useState(false);
+
   // OW — v1.39 OS-native [os_watch] form. Prefilled from agents.inspect
   // (`os_watch`) alongside caps; only written when the operator edits it, so an
   // untouched tab never clobbers the agent's existing paths.
@@ -613,6 +623,30 @@ export function EditAgentPage() {
     return () => { cancelled = true; };
   }, [tab, agent, capsLoaded]);
 
+  // DB — load the configured source list once the 工具與權限 tab opens, for the
+  // "可使用的資料庫來源" checkbox list. Independent of the caps prefill above
+  // (a different RPC, admin-gated, and one whose failure means "hide the
+  // field" rather than "leave it at defaults").
+  useEffect(() => {
+    if (tab !== 'tools' || dbSourceOptionsLoaded) return;
+    let cancelled = false;
+    api.dbSources.list().then((res) => {
+      if (cancelled) return;
+      // Defensive: never let a malformed/unexpected payload turn into
+      // `undefined` here — that would read as "loaded" (only `null` means
+      // "hide the field") and crash the row builder below.
+      setDbSourceOptions(Array.isArray(res?.sources) ? res.sources : []);
+      setDbSourceOptionsLoaded(true);
+    }).catch(() => {
+      if (cancelled) return;
+      // Non-admin (or any other failure) — hide the field entirely, no
+      // error banner (WP-C: this is an optional field, not core to the tab).
+      setDbSourceOptions(null);
+      setDbSourceOptionsLoaded(true);
+    });
+    return () => { cancelled = true; };
+  }, [tab, dbSourceOptionsLoaded]);
+
   const updateCap = useCallback(<K extends keyof typeof DEFAULT_CAPABILITIES>(key: K, value: (typeof DEFAULT_CAPABILITIES)[K]) => {
     setCapsDirty(true);
     markSectionEdit();
@@ -755,6 +789,7 @@ export function EditAgentPage() {
           allowed_tools: caps.allowed_tools,
           denied_tools: caps.denied_tools,
           wiki_visible_to: caps.wiki_visible_to,
+          db_sources: caps.db_sources,
           native_sandbox: caps.native_sandbox,
           policy: caps.policy,
           os_native: caps.os_native,
@@ -1263,6 +1298,48 @@ export function EditAgentPage() {
               onClearAllowlist={() => updateCap('allowed_tools', [])}
             />
           </SettingsSection>
+
+          {/* DB — read-only SQL data sources this agent may use. Deny-by-
+              default server-side; a source not ticked here is invisible to
+              this agent even though it's configured. Hidden entirely (no
+              error banner) for a non-admin operator, since `db_sources.list`
+              is admin-only and a permission error here isn't this tab's
+              business to report. */}
+          {dbSourceOptions !== null && (() => {
+            const dbSourceRows = buildDbSourceCapabilityRows(dbSourceOptions, caps.db_sources);
+            return (
+              <SettingsSection title={t('agents.cap.dbSources')} description={t('agents.cap.dbSources.hint')}>
+                <SettingsCard>
+                  {dbSourceRows.length === 0 ? (
+                    <p className="px-4 py-4 text-center text-xs text-muted-foreground">
+                      {t('agents.cap.dbSources.empty')}
+                    </p>
+                  ) : (
+                    dbSourceRows.map((row) => (
+                      <label
+                        key={row.id}
+                        className="flex cursor-pointer items-center gap-3 px-4 py-3 hover:bg-surface-hover"
+                      >
+                        <Checkbox
+                          checked={row.checked}
+                          onCheckedChange={() => updateCap('db_sources', toggleDbSourceCapability(caps.db_sources, row.id))}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-sm text-foreground">{row.label}</span>
+                          <code className="mt-0.5 block font-mono text-xs text-muted-foreground">{row.id}</code>
+                        </span>
+                        {row.missing && (
+                          <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                            {t('agents.cap.dbSources.gone')}
+                          </span>
+                        )}
+                      </label>
+                    ))
+                  )}
+                </SettingsCard>
+              </SettingsSection>
+            );
+          })()}
 
           <SettingsSection title={t('agents.edit.capabilities')} description={t('agents.cap.desc')}>
             <button

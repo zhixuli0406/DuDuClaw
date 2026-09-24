@@ -13,11 +13,28 @@ import {
   type OdooStatus,
   type DbSourceSummary,
   type DbSourceLoadError,
+  type DbSourceGrantsListResult,
 } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
-import { Badge, Button, Select, SelectTrigger, SelectValue, SelectContent, SelectItem, Checkbox, CrossLink } from '@/components/mds';
+import {
+  Badge,
+  Button,
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+  Checkbox,
+  CrossLink,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/mds';
 import { ConfirmDialog } from '@/components/settings/controls';
 import { describeCustomSourceReadIn, buildSystemRows, buildEgressPatch, unattributedEgressEntries, type SystemRow } from './redactionSystems';
+import { countGrantsForSource, grantedAgentsForSource, buildStaleDbSourceEntries, resolveAgentDisplayName } from './dbSourceGrants';
+import { DbSourceAgentPicker } from './DbSourceAgentPicker';
 import { RedactionSourceWizard, type WizardTarget, type WizardSourceType } from './RedactionSourceWizard';
 
 const REDACTION_RESTORE: ReadonlyArray<RedactionRestoreArgs> = ['deny', 'restore', 'passthrough'];
@@ -141,19 +158,67 @@ export function RedactionSystemsCard({
   const [dbSources, setDbSources] = useState<DbSourceSummary[]>([]);
   const [dbSourceErrors, setDbSourceErrors] = useState<DbSourceLoadError[]>([]);
   const [otherOpen, setOtherOpen] = useState(false);
+  // Who can use each db source — `null` means "not loaded yet" or "the
+  // operator isn't an admin" (`db_sources.grants.list` is admin-only), both
+  // of which hide the badges/notice entirely rather than showing an error.
+  const [grantsResult, setGrantsResult] = useState<DbSourceGrantsListResult | null>(null);
 
   const loadOdoo = () => { api.odoo.status().then(setOdooStatus).catch(() => {}); };
   const loadDbSources = () => {
     api.dbSources.list().then((res) => { setDbSources(res.sources); setDbSourceErrors(res.errors); }).catch(() => {});
   };
-  useEffect(() => { loadOdoo(); loadDbSources(); }, []);
+  const loadGrants = () => {
+    api.dbSources.grants.list().then((res) => {
+      // Defensive: a malformed/unexpected payload must never masquerade as a
+      // loaded result — every consumer below indexes `.sources`/`.agents`/
+      // `.stale` directly.
+      if (!res || !Array.isArray(res.sources) || !Array.isArray(res.agents)) {
+        setGrantsResult(null);
+        return;
+      }
+      setGrantsResult({
+        sources: res.sources,
+        agents: res.agents,
+        stale: res.stale ?? {},
+        errors: Array.isArray(res.errors) ? res.errors : [],
+      });
+    }).catch(() => setGrantsResult(null));
+  };
+  useEffect(() => { loadOdoo(); loadDbSources(); loadGrants(); }, []);
 
   const [wizardTarget, setWizardTarget] = useState<WizardTarget | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ kind: 'db' | 'custom'; name: string; label: string } | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [grantDialogTarget, setGrantDialogTarget] = useState<DbSourceSummary | null>(null);
+  const [grantDialogSelected, setGrantDialogSelected] = useState<string[]>([]);
+  const [grantDialogSaving, setGrantDialogSaving] = useState(false);
+  const [grantDialogError, setGrantDialogError] = useState<string | null>(null);
+
+  const openGrantDialog = (db: DbSourceSummary) => {
+    setGrantDialogTarget(db);
+    setGrantDialogSelected(grantedAgentsForSource(grantsResult?.sources ?? [], db.name));
+    setGrantDialogError(null);
+  };
+
+  const saveGrantDialog = async () => {
+    if (!grantDialogTarget) return;
+    setGrantDialogSaving(true);
+    setGrantDialogError(null);
+    try {
+      await api.dbSources.grants.set({ name: grantDialogTarget.name, agents: grantDialogSelected });
+      toast.success(intl.formatMessage({ id: 'redaction.savedLive' }));
+      loadGrants();
+      setGrantDialogTarget(null);
+    } catch (e) {
+      setGrantDialogError(t('redaction.systems.db.grants.saveFailed', { message: formatError(e) }) as string);
+    } finally {
+      setGrantDialogSaving(false);
+    }
+  };
 
   const rows = buildSystemRows(fieldRules, dataSources, dbSources, toolEgress, odooStatus?.connected ?? false);
   const otherEgress = unattributedEgressEntries(toolEgress, dataSources);
+  const staleGrantEntries = grantsResult ? buildStaleDbSourceEntries(grantsResult.stale) : [];
 
   const handleEgressChange = async (keys: string[], next: RedactionEgressRule) => {
     try {
@@ -180,8 +245,15 @@ export function RedactionSystemsCard({
         if (res.warning) { toast.error(res.warning); return; }
         await onReload();
       } else {
-        await api.dbSources.remove(deleteTarget.name);
+        const removed = await api.dbSources.remove(deleteTarget.name);
         loadDbSources();
+        loadGrants(); // removing a source auto-revokes every agent's grant to it
+        if (removed.revoke_failed && removed.revoke_failed.length > 0) {
+          const names = removed.revoke_failed
+            .map((id) => resolveAgentDisplayName(grantsResult?.agents ?? [], id))
+            .join('、');
+          toast.error(t('redaction.systems.db.grants.revokeFailed', { names }) as string);
+        }
       }
       setDeleteTarget(null);
       toast.success(intl.formatMessage({ id: 'redaction.savedLive' }));
@@ -232,6 +304,7 @@ export function RedactionSystemsCard({
           <SystemRowView
             key={i}
             row={row}
+            grantsResult={grantsResult}
             onEditDb={(db) => setWizardTarget({ mode: 'edit', type: 'db', row: db })}
             onEditCustom={(s) => setWizardTarget({ mode: 'edit', type: 'custom', row: s })}
             onDeleteDb={(db) => setDeleteTarget({ kind: 'db', name: db.name, label: db.label })}
@@ -239,9 +312,34 @@ export function RedactionSystemsCard({
             onEgressChange={handleEgressChange}
             onJumpToRules={onJumpToRules}
             onGoToIntegrations={() => navigate('/manage/integrations?tab=odoo')}
+            onOpenGrants={openGrantDialog}
           />
         ))}
       </div>
+
+      {grantsResult && grantsResult.errors.length > 0 && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          {t('redaction.systems.db.grants.loadErrors', {
+            count: grantsResult.errors.length,
+            names: grantsResult.errors.map((e) => e.name).join('、'),
+          })}
+        </p>
+      )}
+
+      {staleGrantEntries.length > 0 && grantsResult && (
+        <p className="mt-2 text-xs text-warning">
+          {t('redaction.systems.db.grants.staleNotice', { count: staleGrantEntries.length })}
+          {'　'}
+          {staleGrantEntries
+            .map((entry) =>
+              t('redaction.systems.db.grants.staleNotice.item', {
+                agent: resolveAgentDisplayName(grantsResult.agents, entry.agentId),
+                ids: entry.ids.join('、'),
+              }),
+            )
+            .join('；')}
+        </p>
+      )}
 
       {otherEgress.length > 0 && (
         <div className="mt-3 rounded-lg border border-surface-border">
@@ -281,8 +379,11 @@ export function RedactionSystemsCard({
           toolEgress={toolEgress}
           existingSourceNames={dataSources.map((s) => s.name)}
           existingDbNames={dbSources.map((db) => db.name)}
+          grantAgents={grantsResult?.agents ?? []}
+          grantSources={grantsResult?.sources ?? []}
           onClose={() => setWizardTarget(null)}
           onSaved={handleWizardSaved}
+          onGrantsSaved={loadGrants}
         />
       )}
 
@@ -294,12 +395,43 @@ export function RedactionSystemsCard({
         title={t('redaction.dataSources.deleteConfirm.title')}
         message={t('redaction.dataSources.deleteConfirm.message', { name: deleteTarget?.name ?? '' }) as string}
       />
+
+      {grantDialogTarget && (
+        <Dialog open onOpenChange={(o) => { if (!o) setGrantDialogTarget(null); }}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>
+                {t('redaction.systems.db.grants.dialog.title', { label: grantDialogTarget.label || grantDialogTarget.name })}
+              </DialogTitle>
+            </DialogHeader>
+            <div className="space-y-3">
+              <DbSourceAgentPicker
+                agents={grantsResult?.agents ?? []}
+                selected={grantDialogSelected}
+                onChange={setGrantDialogSelected}
+                disabled={grantDialogSaving}
+              />
+              <p className="text-xs text-muted-foreground">{t('redaction.systems.db.grants.dialog.hint')}</p>
+              {grantDialogError && <p className="text-xs text-destructive">{grantDialogError}</p>}
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <Button variant="outline" size="sm" onClick={() => setGrantDialogTarget(null)}>
+                {intl.formatMessage({ id: 'common.cancel' })}
+              </Button>
+              <Button variant="brand" size="sm" onClick={() => void saveGrantDialog()} disabled={grantDialogSaving}>
+                {grantDialogSaving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   );
 }
 
 function SystemRowView({
   row,
+  grantsResult,
   onEditDb,
   onEditCustom,
   onDeleteDb,
@@ -307,8 +439,12 @@ function SystemRowView({
   onEgressChange,
   onJumpToRules,
   onGoToIntegrations,
+  onOpenGrants,
 }: {
   row: SystemRow;
+  /** `null` hides the grant badge entirely (not loaded yet, or the operator
+   *  isn't an admin — same fail-quiet convention as `dbSources`/`dbSourceErrors`). */
+  grantsResult: DbSourceGrantsListResult | null;
   onEditDb: (db: DbSourceSummary) => void;
   onEditCustom: (s: RedactionDataSource) => void;
   onDeleteDb: (db: DbSourceSummary) => void;
@@ -316,6 +452,7 @@ function SystemRowView({
   onEgressChange: (keys: string[], next: RedactionEgressRule) => void;
   onJumpToRules: (source: string, label: string) => void;
   onGoToIntegrations: () => void;
+  onOpenGrants: (db: DbSourceSummary) => void;
 }) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
@@ -366,6 +503,7 @@ function SystemRowView({
 
   if (row.kind === 'db') {
     const label = row.db.label || row.db.name;
+    const grantCount = grantsResult ? countGrantsForSource(grantsResult.sources, row.db.name) : null;
     return (
       <div className="rounded-lg border border-surface-border bg-card p-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -373,6 +511,19 @@ function SystemRowView({
             <span className="text-sm font-medium text-foreground">{label}</span>
             <Badge variant="secondary">{row.db.driver}</Badge>
             <RuleCountChip count={row.ruleCount} onClick={() => onJumpToRules('duduclaw_db', label)} />
+            {grantCount !== null && (
+              <button type="button" onClick={() => onOpenGrants(row.db)} className="inline-flex">
+                <Badge
+                  className={cn(
+                    'cursor-pointer',
+                    grantCount === 0 ? 'bg-warning/15 text-warning' : 'bg-brand/10 text-brand hover:bg-brand/20',
+                  )}
+                  variant="secondary"
+                >
+                  {t(grantCount === 0 ? 'redaction.systems.db.grants.badge.none' : 'redaction.systems.db.grants.badge', { count: grantCount })}
+                </Badge>
+              </button>
+            )}
           </div>
           <div className="flex shrink-0 items-center gap-1">
             <Button variant="ghost" size="xs" onClick={() => onEditDb(row.db)}>{intl.formatMessage({ id: 'common.edit' })}</Button>

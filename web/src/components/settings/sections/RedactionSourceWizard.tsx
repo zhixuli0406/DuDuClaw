@@ -21,6 +21,8 @@ import {
   type RedactionEgressRule,
   type RedactionRestoreArgs,
   type RedactionDryRunResult,
+  type DbSourceGrantAgent,
+  type DbSourceGrantSource,
 } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
@@ -44,6 +46,7 @@ import {
 import { FieldBlock } from '@/pages/agent-form/form-rows';
 import { SecretSourceField } from '@/components/shared/SecretSourceField';
 import { RedactionTokenInput, KvRowEditor } from './RedactionTokenInput';
+import { DbSourceAgentPicker } from './DbSourceAgentPicker';
 import {
   emptyDataSourceForm,
   dataSourceToFormState,
@@ -70,6 +73,7 @@ import {
   canProceedDbStep2,
   customSourceSmokeTestParams,
 } from './redactionSystems';
+import { grantedAgentsForSource } from './dbSourceGrants';
 
 // ── "新增資料來源" wizard (canvas screen 10, §15.2) ──────────────────────
 //
@@ -147,8 +151,11 @@ export function RedactionSourceWizard({
   toolEgress,
   existingSourceNames,
   existingDbNames,
+  grantAgents,
+  grantSources,
   onClose,
   onSaved,
+  onGrantsSaved,
 }: {
   open: boolean;
   target: WizardTarget;
@@ -163,11 +170,21 @@ export function RedactionSourceWizard({
   /** Every already-saved `db_sources` name, same purpose as above for the
    *  database wizard type. */
   existingDbNames: readonly string[];
+  /** Every AI employee selectable in the db-source step 4 "誰能使用" picker,
+   *  and each configured source's current grant list — both come from one
+   *  `db_sources.grants.list` call the caller already made for the systems
+   *  card's own badges, so the wizard doesn't fetch it a second time. Empty
+   *  arrays render the picker's own empty state — never an error banner. */
+  grantAgents: readonly DbSourceGrantAgent[];
+  grantSources: readonly DbSourceGrantSource[];
   onClose: () => void;
   /** Called after a successful save, before `onClose` — the caller reloads
    *  `redaction.get` / `db_sources.list` and (for a fresh custom source)
    *  may want to jump the field-rules card's filter to it. */
   onSaved: (saved: { type: WizardSourceType; name: string; label: string }) => void;
+  /** Called once the db-source grant write finishes (success or failure) so
+   *  the caller can refresh its own `grants.list`-derived badges. */
+  onGrantsSaved?: () => void;
 }) {
   const intl = useIntl();
   const navigate = useNavigate();
@@ -184,6 +201,10 @@ export function RedactionSourceWizard({
   const [dbForm, setDbForm] = useState<DbSourceFormState>(emptyDbSourceForm());
   const [dbTesting, setDbTesting] = useState(false);
   const [dbTestResult, setDbTestResult] = useState<DbSourceTestResult | null>(null);
+  // Step 4 (db sources) — which AI employees may use this source. Prefilled
+  // from `grantSources` when editing; starts empty (deny-by-default) when
+  // creating.
+  const [dbGrantSelected, setDbGrantSelected] = useState<string[]>([]);
 
   const [customForm, setCustomForm] = useState<DataSourceFormState>(emptyDataSourceForm());
   const [customSample, setCustomSample] = useState('');
@@ -209,6 +230,7 @@ export function RedactionSourceWizard({
       setStep(2);
       setSourceType('db');
       setDbForm(dbSourceToFormState(target.row));
+      setDbGrantSelected(grantedAgentsForSource(grantSources, target.row.name));
     } else if (target.mode === 'edit' && target.type === 'custom') {
       setStep(2);
       setSourceType('custom');
@@ -224,9 +246,11 @@ export function RedactionSourceWizard({
       setCustomForm(emptyDataSourceForm());
       setEgressPolicy('deny');
       setEgressAudit(false);
+      setDbGrantSelected([]);
     }
-    // `toolEgress` intentionally excluded — it should only seed the form the
-    // moment the dialog opens, not re-sync while the operator is mid-edit.
+    // `toolEgress`/`grantSources` intentionally excluded — they should only
+    // seed the form the moment the dialog opens, not re-sync while the
+    // operator is mid-edit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, target]);
 
@@ -298,13 +322,27 @@ export function RedactionSourceWizard({
     if (sourceType === 'db') {
       if (!dbForm.label.trim() || Object.keys(dbErrors).length > 0) return;
       setSaving(true);
+      const name = dbForm.name.trim();
+      const label = dbForm.label.trim() || name;
       try {
         await api.dbSources.upsert(formStateToDbSourceUpsert(dbForm));
-        toast.success(intl.formatMessage({ id: 'redaction.savedLive' }));
-        onSaved({ type: 'db', name: dbForm.name.trim(), label: dbForm.label.trim() || dbForm.name.trim() });
-        onClose();
       } catch (e) {
         setSaveError(formatError(e));
+        setSaving(false);
+        return;
+      }
+      // The source itself is saved from here — a grants failure below must
+      // never look like the whole save failed (WP-C: "consider the source
+      // itself saved").
+      onSaved({ type: 'db', name, label });
+      try {
+        await api.dbSources.grants.set({ name, agents: dbGrantSelected });
+        toast.success(intl.formatMessage({ id: 'redaction.savedLive' }));
+        onGrantsSaved?.();
+        onClose();
+      } catch (e) {
+        setSaveError(t('redaction.wizard.step4.db.grantsSaveFailed', { message: formatError(e) }));
+        onGrantsSaved?.();
       } finally {
         setSaving(false);
       }
@@ -663,9 +701,14 @@ export function RedactionSourceWizard({
             <div className="space-y-3.5">
               {sourceType === 'db' ? (
                 <>
-                  <FieldBlock label={t('redaction.wizard.step4.prompt')}>
-                    <p className="rounded-lg bg-muted/50 px-3 py-2.5 text-sm text-muted-foreground">{t('redaction.systems.notApplicable')}</p>
-                    <p className="mt-1 text-xs text-muted-foreground">{t('redaction.wizard.step4.dbHint')}</p>
+                  <FieldBlock label={t('redaction.wizard.step4.db.prompt')}>
+                    <DbSourceAgentPicker
+                      agents={grantAgents}
+                      selected={dbGrantSelected}
+                      onChange={setDbGrantSelected}
+                    />
+                    <p className="mt-1.5 text-xs text-muted-foreground">{t('redaction.wizard.step4.db.grantsHint')}</p>
+                    <p className="mt-1 text-xs italic text-muted-foreground">{t('redaction.wizard.step4.dbHint')}</p>
                   </FieldBlock>
                   {attempted && (!dbForm.label.trim() || Object.keys(dbErrors).length > 0) && (
                     <FormErrorBanner

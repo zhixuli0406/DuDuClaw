@@ -122,6 +122,7 @@ export const DEFAULT_CAPABILITIES: Required<Omit<AgentCapabilities, 'computer_us
   allowed_tools: [],
   denied_tools: [],
   wiki_visible_to: [],
+  db_sources: [],
   native_sandbox: false,
   policy: [],
   os_native: false,

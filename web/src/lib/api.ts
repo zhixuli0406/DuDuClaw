@@ -2151,6 +2151,58 @@ export interface DbSourceTestResult {
   tables: DbSourceTable[];
 }
 
+// ── Per-source AI-employee grants (`db_sources.grants.*`) ──
+// A configured source is deny-by-default: an AI employee can only reach it
+// once its id appears in that agent's own `capabilities.db_sources`. These
+// two RPCs are the "who can use this source" side of that same relation,
+// read/written from the source's point of view instead of the agent's —
+// used by the redaction settings wizard/card so an operator never has to
+// hand-edit an agent's config to grant one.
+
+/** One configured source's current grant list, as `db_sources.grants.list`
+ *  returns it. */
+export interface DbSourceGrantSource {
+  name: string;
+  label: string;
+  /** Agent ids currently allowed to use this source. */
+  agents: string[];
+}
+
+/** One selectable AI employee in a grants picker. A narrower, dedicated
+ *  shape rather than reusing `AgentInfo` — this comes back from an
+ *  admin-only RPC whose only job is listing grant candidates. */
+export interface DbSourceGrantAgent {
+  id: string;
+  display_name: string;
+  role: string;
+  status: string;
+  archived: boolean;
+}
+
+export interface DbSourceGrantsListResult {
+  sources: DbSourceGrantSource[];
+  agents: DbSourceGrantAgent[];
+  /** Agent id → db source ids that agent's own `capabilities.db_sources`
+   *  still references but which no longer match any configured source
+   *  (renamed or removed after the grant was made). Informational only —
+   *  there is no fix-it action here; the fix path is that agent's own
+   *  settings page. */
+  stale: Record<string, string[]>;
+  /** `[db_sources.<name>]` blocks that failed to load — same shape and
+   *  meaning as `db_sources.list`'s `errors`, surfaced here too since this
+   *  RPC reads the same config independently. A non-empty list here is not
+   *  "no sources": `sources`/`agents` still carry whatever loaded fine. */
+  errors: DbSourceLoadError[];
+}
+
+export interface DbSourceGrantsSetResult {
+  ok: true;
+  name: string;
+  added: string[];
+  removed: string[];
+  unchanged: string[];
+}
+
 export interface McpServerDef {
   command: string;
   args: string[];
@@ -3231,6 +3283,12 @@ export interface AgentCapabilities {
   codrive?: boolean;
   /** How much the autonomous goal loop may drive this agent on its own. */
   autonomy_level?: AutonomyLevel;
+  /** Read-only SQL data sources (`db_sources.*` MCP tools, WP-D §13.7) this
+   *  agent may use — deny-by-default: an id absent here is invisible to the
+   *  agent even though the source is configured. `agents.update` replaces
+   *  the set wholesale (`[]` revokes all); the server rejects any id not in
+   *  the currently configured source list. */
+  db_sources?: string[];
 }
 
 /** v1.39 — top-level `[os_watch]` table (gated by `capabilities.os_native`).
@@ -6218,10 +6276,28 @@ export const api = {
       client.call('db_sources.remove', { name }) as Promise<{
         success: boolean;
         name: string;
+        /** Agent ids whose grant to this source was revoked as a side effect
+         *  of removing it (their `capabilities.db_sources` no longer lists
+         *  it — nothing left for them to lose access to). */
+        revoked_from: string[];
+        /** Agent ids the revoke could NOT be written for (e.g. that agent's
+         *  own config failed to save) — only present when non-empty. Those
+         *  agents still had `revoked_from` intended for them, but their
+         *  `capabilities.db_sources` may still list the now-deleted source. */
+        revoke_failed?: string[];
       }>,
     /** Tables and columns the source exposes, for a table/column picker. */
     tables: (name: string) =>
       client.call('db_sources.tables', { name }) as Promise<{ tables: DbSourceTable[] }>,
+    /** Which AI employees may use each configured source — the source-side
+     *  view of the same deny-by-default relation `agents.update
+     *  capabilities.db_sources` writes from the agent side. Admin only. */
+    grants: {
+      list: () => client.call('db_sources.grants.list') as Promise<DbSourceGrantsListResult>,
+      /** Replace the full set of agents allowed to use one source. */
+      set: (params: { name: string; agents: string[] }) =>
+        client.call('db_sources.grants.set', { ...params }) as Promise<DbSourceGrantsSetResult>,
+    },
   },
   identity: {
     configGet: () =>
