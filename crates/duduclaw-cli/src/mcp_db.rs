@@ -87,7 +87,10 @@ async fn resolve_granted(
         .any(|g| g.trim().eq_ignore_ascii_case(source))
     {
         return Err(format!(
-            "此代理沒有資料來源「{source}」的授權。已授權的來源：{}。如需存取，請在 agent.toml 的 [capabilities] db_sources 加入該名稱。",
+            "此代理沒有資料來源「{source}」的授權。已授權的來源：{}。\
+             如需開通，有三條合法途徑：① 儀表板 設定 → 去識別化 → 資料來源精靈第 4 步「授權 AI 員工」；\
+             ② 儀表板 AI 員工設定頁的「能力」分頁；\
+             ③ 呼叫 agent_update 工具並帶 db_sources_add 參數（僅限依委派政策有權編輯該員工的呼叫者）。",
             render_list(&grants)
         ));
     }
@@ -135,7 +138,11 @@ pub async fn handle_db_sources(home_dir: &Path, agent_id: &str) -> Value {
     let grants = granted_sources(home_dir, agent_id);
     if grants.is_empty() {
         return db_error(
-            "此代理沒有任何資料庫來源授權。請在 agent.toml 設定 [capabilities] db_sources = [\"<資料來源名稱>\"]。",
+            "此代理沒有任何資料庫來源授權（預設全部拒絕，沒有授權就看不到任何來源）。\
+             開通方式有三條：① 儀表板 設定 → 去識別化 → 資料來源精靈第 4 步「授權 AI 員工」；\
+             ② 儀表板 AI 員工設定頁的「能力」分頁；\
+             ③ 呼叫 agent_update 工具並帶 db_sources_add 參數（僅限依委派政策有權編輯該員工的呼叫者）。\
+             授權會寫入該員工的 [capabilities] db_sources。",
         );
     }
     let loaded: LoadedDbSources = duduclaw_db::load_db_sources(home_dir).await;

@@ -527,7 +527,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "agent_update",
-        description: "Update one or more fields of an existing agent's configuration (agent.toml). Supports identity, model, budget, heartbeat, and container fields. Uses atomic write for safety.",
+        description: "Update one or more fields of an existing agent's configuration (agent.toml). Supports identity, model, budget, heartbeat, container, and database-source-grant fields. Uses atomic write for safety.",
         params: &[
             ParamDef { name: "agent_id", description: "Agent name to update", required: true },
             ParamDef { name: "display_name", description: "New display name", required: false },
@@ -543,6 +543,9 @@ const TOOLS: &[ToolDef] = &[
             ParamDef { name: "max_concurrent", description: "Max concurrent container tasks", required: false },
             ParamDef { name: "heartbeat_enabled", description: "Enable/disable heartbeat (true/false)", required: false },
             ParamDef { name: "heartbeat_cron", description: "Heartbeat cron expression", required: false },
+            ParamDef { name: "db_sources", description: "REPLACE this agent's authorized read-only database sources with this comma-separated list of source ids (e.g. \"crm_pg,hr\"); an empty string \"\" revokes every grant. An id is the `[db_sources.<id>]` key from config.toml — the same id shown in the dashboard 設定 → 去識別化 →「外部系統與資料來源」card, NOT the card's display label. Unknown ids are rejected and the error lists the configured ids; nothing is written in that case. Grants are deny-by-default: an agent with no grant cannot even list the sources, let alone query them.", required: false },
+            ParamDef { name: "db_sources_add", description: "GRANT these database source ids on top of what the agent already holds, as a comma-separated list. Idempotent: an id the agent already has is reported as unchanged, never duplicated. Same id vocabulary and same validation as db_sources (ids come from `[db_sources.<id>]` / the 設定 → 去識別化 →「外部系統與資料來源」card; unknown ids are rejected with the configured ids listed). This is the parameter to use for a request like 「把客戶 CRM 資料庫開給小美」.", required: false },
+            ParamDef { name: "db_sources_remove", description: "REVOKE these database source ids from the agent, as a comma-separated list. Unlike db_sources / db_sources_add this is NOT checked against config.toml, so it also works for a source that no longer exists there — a stale grant left behind after the operator deleted the `[db_sources.<id>]` block can still be revoked by naming it. Removing an id the agent does not currently hold is not an error — it is reported as unchanged. When several of db_sources / db_sources_add / db_sources_remove are sent in one call they are applied in that order (replace, then add, then remove).", required: false },
         ],
     },
     ToolDef {
@@ -5241,6 +5244,116 @@ async fn spawn_ephemeral_with_ctx(
 /// policy escape hatch; changing your *own* `reports_to` still additionally
 /// needs the placement check below, which is the half this front gate does not
 /// cover.
+/// Render a source-id list the way it reads in `agent.toml`.
+fn render_db_source_list(ids: &[String]) -> String {
+    format!(
+        "[{}]",
+        ids.iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The refusal text for an id that is not a configured `[db_sources.<id>]`.
+///
+/// Lists the configured **ids only** — never a driver, a URL, an
+/// `allowed_tables` entry, or a loader's raw error text. A caller that
+/// mistypes a source name needs the vocabulary, not the customer's connection
+/// details.
+fn db_source_unknown_message(wanted: &str, loaded: &duduclaw_db::LoadedDbSources) -> String {
+    let shown = duduclaw_core::truncate_chars(wanted.trim(), 64);
+    // "configured but broken" and "no such source" are different problems, and
+    // telling them apart saves an operator from renaming a source that is
+    // really just misconfigured.
+    if loaded
+        .errors
+        .iter()
+        .any(|e| e.name.trim().eq_ignore_ascii_case(wanted.trim()))
+    {
+        return format!(
+            "資料來源「{shown}」的設定目前有誤而無法載入，未做任何變更。\
+             請先到儀表板 設定 → 去識別化 →「外部系統與資料來源」修正該來源，再回來授權。"
+        );
+    }
+    let configured = loaded.names();
+    if configured.is_empty() {
+        format!(
+            "資料來源「{shown}」不存在，而且目前尚未設定任何資料來源，未做任何變更。\
+             請先到儀表板 設定 → 去識別化 →「外部系統與資料來源」新增資料來源，再回來授權。"
+        )
+    } else {
+        format!(
+            "資料來源「{shown}」不存在，未做任何變更。目前已設定的資料來源 id：{}。\
+             請填 [db_sources.<id>] 的 id（儀表板 設定 → 去識別化 →「外部系統與資料來源」卡片上的 id），不是顯示名稱。",
+            configured.join("、")
+        )
+    }
+}
+
+/// Parse the comma-separated `db_sources_remove` parameter.
+///
+/// Deliberately NOT validated against `config.toml`, unlike its grant-side
+/// siblings. Revocation only ever *reduces* authority, and the case that most
+/// needs it is precisely the one config lookup cannot serve: an operator
+/// deleted `[db_sources.old]` while an agent still held `"old"`, and that
+/// stale grant must stay revocable. The id is compared against the agent's own
+/// held list and never sent anywhere, so nothing is at risk.
+///
+/// What is still enforced is shape — the same character rules as a
+/// `[db_sources.<id>]` key ([`duduclaw_db::config::is_valid_source_name`],
+/// applied case-insensitively so `CRM` is accepted like everywhere else) — so
+/// arbitrary caller text cannot reach the change log or the audit row.
+fn parse_db_source_removals(raw: &str) -> std::result::Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let id = part.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if !duduclaw_db::config::is_valid_source_name(&id.to_ascii_lowercase()) {
+            let shown = duduclaw_core::truncate_chars(id, 64);
+            return Err(format!(
+                "「{shown}」不是合法的資料來源 id，未做任何變更。\
+                 資料來源 id 只允許英文字母、數字與底線（最長 64 字元）。"
+            ));
+        }
+        // Exact, case-insensitive dedupe — never a substring test.
+        if !out.iter().any(|existing: &String| existing.eq_ignore_ascii_case(id)) {
+            out.push(id.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Canonicalize one comma-separated `db_sources*` parameter into configured
+/// source ids, or explain which entry could not be honoured.
+///
+/// Trims, drops empty entries, de-duplicates keeping first-seen order, and
+/// rewrites every entry to the exact `[db_sources.<id>]` key it matched — so a
+/// caller that types `CRM` stores `crm` and the grant compares equal wherever
+/// it is read. Matching goes through [`duduclaw_db::LoadedDbSources::get`]
+/// (exact, trimmed, ASCII-case-insensitive), never a substring test.
+fn canonicalize_db_source_ids(
+    raw: &str,
+    loaded: &duduclaw_db::LoadedDbSources,
+) -> std::result::Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let wanted = part.trim();
+        if wanted.is_empty() {
+            continue;
+        }
+        let Some(entry) = loaded.get(wanted) else {
+            return Err(db_source_unknown_message(wanted, loaded));
+        };
+        if !out.iter().any(|existing| existing == &entry.name) {
+            out.push(entry.name.clone());
+        }
+    }
+    Ok(out)
+}
+
 async fn handle_agent_update(params: &Value, home_dir: &Path, caller: &str) -> Value {
     let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
     if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
@@ -5256,8 +5369,18 @@ async fn handle_agent_update(params: &Value, home_dir: &Path, caller: &str) -> V
     // `agent_not_visible_error`).
     // The audit `path_kind` still distinguishes a re-parenting attempt from an
     // ordinary settings edit, so widening the gate does not blur the log.
+    // Three labels, most-sensitive-first: re-parenting moves org authority,
+    // a database grant hands an agent a customer datastore, everything else is
+    // an ordinary settings edit. The label lands in the audit `path_kind`, so
+    // keeping them distinct is what lets "who opened the CRM to whom" be
+    // greppable after the fact.
+    let touches_db_sources = ["db_sources", "db_sources_add", "db_sources_remove"]
+        .iter()
+        .any(|k| params.get(*k).and_then(|v| v.as_str()).is_some());
     let subject_what = if params.get("reports_to").and_then(|v| v.as_str()).is_some() {
         "調整組織從屬"
+    } else if touches_db_sources {
+        "調整資料庫來源授權"
     } else {
         "調整 AI 員工設定"
     };
@@ -5425,9 +5548,170 @@ async fn handle_agent_update(params: &Value, home_dir: &Path, caller: &str) -> V
         changes.push(format!("heartbeat.cron = \"{v}\""));
     }
 
+    // -- Capability fields: read-only database source grants (WP-B) --
+    //
+    // `[capabilities] db_sources` is deny-by-default: an agent with no grant
+    // cannot even list the configured sources, let alone query one. Until now
+    // the only way to open a source was hand-editing agent.toml, so a manager
+    // could not say 「把客戶 CRM 資料庫開給小美」 and have it happen. These three
+    // params are the conversational route to the same authority the dashboard
+    // writes, behind the `check_org_subject_allowed` front gate this handler
+    // already applied (you may only edit yourself or your own subtree).
+    //
+    // Fail-closed on the granting side: every id named by `db_sources` /
+    // `db_sources_add` is validated against the configured
+    // `[db_sources.<id>]` blocks BEFORE `config.capabilities.db_sources` is
+    // touched, so a call naming one good and one bad id writes nothing at all.
+    // `db_sources_remove` is shape-checked only — revocation reduces authority
+    // and must keep working for a source config no longer declares.
+    let mut db_sources_after: Option<Vec<String>> = None;
+    let mut db_sources_added: Vec<String> = Vec::new();
+    let mut db_sources_removed: Vec<String> = Vec::new();
+    if touches_db_sources {
+        let loaded = duduclaw_db::load_db_sources(home_dir).await;
+        // A config.toml that does not parse degrades to "no sources
+        // configured", which would turn every id into a bogus "does not
+        // exist". Refuse loudly instead of guessing.
+        if loaded.errors.iter().any(|e| e.name == "config.toml") {
+            return serde_json::json!({
+                "content": [{"type": "text", "text":
+                    "Error: 無法讀取 config.toml 的資料來源設定，未做任何變更。請先修正 config.toml 後再授權資料庫來源。"}],
+                "isError": true
+            });
+        }
+
+        // Validate up front — nothing is written on error.
+        let parse_param = |key: &str| -> std::result::Result<Option<Vec<String>>, String> {
+            match params.get(key).and_then(|v| v.as_str()) {
+                Some(raw) => canonicalize_db_source_ids(raw, &loaded).map(Some),
+                None => Ok(None),
+            }
+        };
+        let replace_ids = match parse_param("db_sources") {
+            Ok(v) => v,
+            Err(msg) => {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Error: {msg}")}],
+                    "isError": true
+                });
+            }
+        };
+        let add_ids = match parse_param("db_sources_add") {
+            Ok(v) => v,
+            Err(msg) => {
+                return serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Error: {msg}")}],
+                    "isError": true
+                });
+            }
+        };
+        // Revocation is intentionally config-free — see
+        // `parse_db_source_removals`.
+        let remove_ids = match params.get("db_sources_remove").and_then(|v| v.as_str()) {
+            Some(raw) => match parse_db_source_removals(raw) {
+                Ok(ids) => Some(ids),
+                Err(msg) => {
+                    return serde_json::json!({
+                        "content": [{"type": "text", "text": format!("Error: {msg}")}],
+                        "isError": true
+                    });
+                }
+            },
+            None => None,
+        };
+
+        let before = config.capabilities.db_sources.clone();
+        let mut current = before.clone();
+
+        // Precedence: replace, then add, then remove.
+        if let Some(ids) = replace_ids {
+            changes.push(format!(
+                "capabilities.db_sources = {}",
+                render_db_source_list(&ids)
+            ));
+            current = ids;
+        }
+
+        let mut newly_added: Vec<String> = Vec::new();
+        let mut already_held: Vec<String> = Vec::new();
+        for id in add_ids.unwrap_or_default() {
+            // Exact (trimmed, case-insensitive) equality — never substring.
+            if current
+                .iter()
+                .any(|held| held.trim().eq_ignore_ascii_case(&id))
+            {
+                already_held.push(id);
+            } else {
+                current.push(id.clone());
+                newly_added.push(id);
+            }
+        }
+        if !newly_added.is_empty() {
+            changes.push(format!(
+                "capabilities.db_sources += {}",
+                render_db_source_list(&newly_added)
+            ));
+        }
+        if !already_held.is_empty() {
+            changes.push(format!(
+                "capabilities.db_sources 未變更（已持有：{}）",
+                already_held.join("、")
+            ));
+        }
+
+        let mut dropped: Vec<String> = Vec::new();
+        let mut not_held: Vec<String> = Vec::new();
+        for id in remove_ids.unwrap_or_default() {
+            let len_before = current.len();
+            current.retain(|held| !held.trim().eq_ignore_ascii_case(&id));
+            if current.len() == len_before {
+                not_held.push(id);
+            } else {
+                dropped.push(id);
+            }
+        }
+        if !dropped.is_empty() {
+            changes.push(format!(
+                "capabilities.db_sources -= {}",
+                render_db_source_list(&dropped)
+            ));
+        }
+        if !not_held.is_empty() {
+            changes.push(format!(
+                "capabilities.db_sources 未變更（未持有：{}）",
+                not_held.join("、")
+            ));
+        }
+
+        // Audit fields describe the NET effect against the pre-call list, so a
+        // replace that happens to drop two sources is recorded as two
+        // revocations rather than as an opaque "= [...]".
+        db_sources_added = current
+            .iter()
+            .filter(|id| {
+                !before
+                    .iter()
+                    .any(|old| old.trim().eq_ignore_ascii_case(id.trim()))
+            })
+            .cloned()
+            .collect();
+        db_sources_removed = before
+            .iter()
+            .filter(|id| {
+                !current
+                    .iter()
+                    .any(|new| new.trim().eq_ignore_ascii_case(id.trim()))
+            })
+            .cloned()
+            .collect();
+
+        config.capabilities.db_sources = current.clone();
+        db_sources_after = Some(current);
+    }
+
     if changes.is_empty() {
         return serde_json::json!({
-            "content": [{"type": "text", "text": "Error: no valid fields to update. Supported fields: display_name, role, status, trigger, icon, reports_to, model, fallback_model, api_mode, budget_cents, max_concurrent, heartbeat_enabled, heartbeat_cron"}],
+            "content": [{"type": "text", "text": "Error: no valid fields to update. Supported fields: display_name, role, status, trigger, icon, reports_to, model, fallback_model, api_mode, budget_cents, max_concurrent, heartbeat_enabled, heartbeat_cron, db_sources, db_sources_add, db_sources_remove"}],
             "isError": true
         });
     }
@@ -5506,9 +5790,43 @@ async fn handle_agent_update(params: &Value, home_dir: &Path, caller: &str) -> V
     }
     changes.extend(soul_sync_changes);
 
+    // Audit: a database grant hands an agent read access to a customer
+    // datastore, so it gets its own row rather than living only inside the
+    // generic `agent_update` tool-call record (whose params_summary does not
+    // carry the resulting list). Written after the commit, so the log records
+    // what is actually on disk.
+    let db_summary = match &db_sources_after {
+        Some(after) => {
+            let resulting = if after.is_empty() {
+                "（無）".to_string()
+            } else {
+                after.join("、")
+            };
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir,
+                caller,
+                "db_sources_grant_changed",
+                &format!(
+                    "{subject_what}: '{caller}' -> '{agent_id}' now grants [{}]",
+                    after.join(", ")
+                ),
+                true,
+                &[
+                    ("agent", serde_json::json!(agent_id)),
+                    ("added", serde_json::json!(db_sources_added)),
+                    ("removed", serde_json::json!(db_sources_removed)),
+                    ("resulting", serde_json::json!(after)),
+                    ("path_kind", serde_json::json!(subject_what)),
+                ],
+            );
+            format!("\n\n目前資料庫來源授權：{resulting}")
+        }
+        None => String::new(),
+    };
+
     serde_json::json!({
         "content": [{"type": "text", "text": format!(
-            "Agent '{agent_id}' updated successfully.\n\nChanges:\n{}",
+            "Agent '{agent_id}' updated successfully.\n\nChanges:\n{}{db_summary}",
             changes.iter().map(|c| format!("  • {c}")).collect::<Vec<_>>().join("\n")
         )}]
     })
@@ -10485,6 +10803,35 @@ pub(crate) fn resolve_audit_agent(fallback: impl FnOnce() -> String) -> String {
     }
 }
 
+/// Which agent is actually acting behind `caller_client_id`?
+///
+/// Every agent the gateway spawns authenticates with ONE shared MCP key whose
+/// client_id is [`duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID`]
+/// ("gateway-internal"), while the agent it is running for arrives separately
+/// as `DUDUCLAW_AGENT_ID` → `default_agent`. A handler that treats the
+/// client_id as an agent name therefore looks up `agents/gateway-internal/…`,
+/// finds nothing, and denies everything — which is exactly how the native
+/// `db_*` tools shipped broken in 1.64.0: `agent_update db_sources_add=crm`
+/// wrote the grant to `agents/main/agent.toml`, the dispatch gate (which
+/// already does this mapping, `mcp_dispatch.rs` §3.6) passed, and then
+/// `db_sources` answered 「此代理沒有任何資料庫來源授權」. `mcp_dispatch`'s own
+/// `gate_agent` is the same fix one layer up.
+///
+/// Mapping is by **exact** equality on the internal client_id (plus the legacy
+/// empty-client_id stdio case) — never a prefix or substring test. Any other
+/// client_id is an external client and is returned unchanged: an external
+/// caller must NEVER inherit the process's default agent, or one API key would
+/// read every internal agent's grants, files and recordings.
+fn acting_agent_id<'a>(caller_client_id: &'a str, default_agent: &'a str) -> &'a str {
+    if caller_client_id.is_empty()
+        || caller_client_id == duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID
+    {
+        default_agent
+    } else {
+        caller_client_id
+    }
+}
+
 pub(crate) async fn handle_tools_call(
     id: &Value,
     params: &Value,
@@ -10728,7 +11075,17 @@ pub(crate) async fn handle_tools_call(
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir).await,
         "evolution_status" => handle_evolution_status_tool(&arguments, home_dir, default_agent).await,
-        "capability_request" => handle_capability_request(&arguments, home_dir, caller_client_id).await,
+        // The grant subject IS an agent directory name (`agents/<id>`), so the
+        // internal client_id must resolve to the acting agent or every request
+        // is filed against a non-existent `agents/gateway-internal`.
+        "capability_request" => {
+            handle_capability_request(
+                &arguments,
+                home_dir,
+                acting_agent_id(caller_client_id, default_agent),
+            )
+            .await
+        }
         "audit_trail_query" => handle_audit_trail_query(&arguments, home_dir, caller_client_id, caller_is_admin).await,
         "reliability_summary" => handle_reliability_summary(&arguments, home_dir, caller_client_id, caller_is_admin).await,
         // Channel settings tools
@@ -10868,14 +11225,11 @@ pub(crate) async fn handle_tools_call(
         // per-agent `[capabilities] db_sources` grant are enforced upstream in
         // mcp_dispatch; the specific source name is checked inside each
         // handler. Source ownership follows the CALLER (same rationale as
-        // os_watch_status): an internal stdio caller may present an empty
-        // client_id, in which case the process's default agent is the caller.
+        // os_watch_status): a gateway-spawned agent presents the shared
+        // internal client_id (or, legacy stdio, an empty one), in which case
+        // the process's default agent is the caller — see `acting_agent_id`.
         "db_sources" | "db_tables" | "db_select" | "db_query" => {
-            let db_agent = if caller_client_id.is_empty() {
-                default_agent
-            } else {
-                caller_client_id
-            };
+            let db_agent = acting_agent_id(caller_client_id, default_agent);
             match tool_name {
                 "db_sources" => crate::mcp_db::handle_db_sources(home_dir, db_agent).await,
                 "db_tables" => {
@@ -10894,11 +11248,7 @@ pub(crate) async fn handle_tools_call(
         // process's default agent is the caller. Getting this wrong would let
         // one agent read another agent's attachments.
         "file_read" | "csv_read" | "xlsx_read" => {
-            let files_agent = if caller_client_id.is_empty() {
-                default_agent
-            } else {
-                caller_client_id
-            };
+            let files_agent = acting_agent_id(caller_client_id, default_agent);
             match tool_name {
                 "file_read" => {
                     crate::mcp_files::handle_file_read(&arguments, home_dir, files_agent)
@@ -10921,11 +11271,7 @@ pub(crate) async fn handle_tools_call(
             // agent's watched paths (or wrongly report "no watch"). Internal
             // stdio callers may present an empty client_id → fall back to the
             // default agent so single-agent setups keep working.
-            let watch_agent = if caller_client_id.is_empty() {
-                default_agent
-            } else {
-                caller_client_id
-            };
+            let watch_agent = acting_agent_id(caller_client_id, default_agent);
             handle_os_watch_status(home_dir, watch_agent).await
         }
         "os_open" => handle_os_open(&arguments).await,
@@ -10955,7 +11301,16 @@ pub(crate) async fn handle_tools_call(
         "os_backup_create" => crate::mcp_os_ops::handle_os_backup_create(home_dir).await,
         "os_power" => crate::mcp_os_ops::handle_os_power(&arguments).await,
         "os_factory_reset" => {
-            crate::mcp_os_ops::handle_os_factory_reset(&arguments, home_dir, caller_client_id).await
+            // Not an authorization input — the value is only the requester
+            // shown on the approval card — but "gateway-internal" is never a
+            // real requester, so resolve it to the acting agent for honest
+            // attribution on an irreversible action.
+            crate::mcp_os_ops::handle_os_factory_reset(
+                &arguments,
+                home_dir,
+                acting_agent_id(caller_client_id, default_agent),
+            )
+            .await
         }
         "os_doctor_repair" => crate::mcp_os_ops::handle_os_doctor_repair(home_dir).await,
         "os_display_get" => crate::mcp_os_ops::handle_os_display_get().await,
@@ -10969,11 +11324,7 @@ pub(crate) async fn handle_tools_call(
         // may present an empty client_id → fall back to the default agent.
         "browser_record_start" | "browser_record_stop" | "desktop_record_start"
         | "desktop_record_stop" | "skill_from_recording" => {
-            let rec_agent = if caller_client_id.is_empty() {
-                default_agent
-            } else {
-                caller_client_id
-            };
+            let rec_agent = acting_agent_id(caller_client_id, default_agent);
             match tool_name {
                 "browser_record_start" => {
                     crate::mcp_recording::handle_browser_record_start(&arguments, home_dir, rec_agent).await
@@ -18461,6 +18812,328 @@ department = ""
         assert_eq!(read_cfg("mkt-rep").agent.icon, "🔓");
     }
 
+    // ── WP-B: conversational database-source grants via agent_update ──────
+    //
+    // Chat route for 「把客戶 CRM 資料庫開給小美」. The grant list is
+    // deny-by-default, so these tests pin both directions: what a legitimate
+    // grant writes, and that an unknown id writes nothing at all.
+
+    /// `delegation_home()` plus a `config.toml` declaring two real sources.
+    fn db_grant_home() -> TempDir {
+        let tmp = delegation_home();
+        fs::write(
+            tmp.path().join("config.toml"),
+            "[db_sources.crm]\n\
+             label = \"客戶 CRM\"\n\
+             driver = \"sqlite\"\n\
+             url = \"/tmp/duduclaw-test-crm.sqlite\"\n\
+             allowed_tables = [\"customers\"]\n\
+             \n\
+             [db_sources.hr]\n\
+             driver = \"sqlite\"\n\
+             url = \"/tmp/duduclaw-test-hr.sqlite\"\n\
+             allowed_tables = [\"*\"]\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn read_db_grants(home: &std::path::Path, agent: &str) -> Vec<String> {
+        let path = home.join("agents").join(agent).join("agent.toml");
+        let cfg: duduclaw_core::types::AgentConfig =
+            toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        cfg.capabilities.db_sources
+    }
+
+    fn update_text(res: &serde_json::Value) -> String {
+        res["content"][0]["text"].as_str().unwrap_or("").to_string()
+    }
+
+    /// `db_sources` REPLACES the list, and the success text names the result.
+    #[tokio::test]
+    async fn agent_update_db_sources_replaces_the_grant_list() {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "crm, hr" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["crm", "hr"]);
+
+        let text = update_text(&res);
+        assert!(text.contains("capabilities.db_sources = [\"crm\", \"hr\"]"), "{text}");
+        assert!(text.contains("目前資料庫來源授權：crm、hr"), "{text}");
+
+        // A second replace with one id drops the other — replace, not merge.
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "hr" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["hr"]);
+
+        // The grant change gets its own audit row on top of the generic
+        // tool-call record written by the dispatch layer.
+        let audit = fs::read_to_string(home.join("tool_calls.jsonl")).expect("audit row written");
+        assert!(audit.contains("db_sources_grant_changed"), "{audit}");
+        assert!(audit.contains("調整資料庫來源授權"), "{audit}");
+    }
+
+    /// `db_sources_add` appends and is idempotent; ids are canonicalized to the
+    /// configured `[db_sources.<id>]` key.
+    #[tokio::test]
+    async fn agent_update_db_sources_add_is_idempotent() {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "CRM" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["crm"], "id canonicalized");
+
+        // Same id again: not an error, not duplicated, reported as unchanged.
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "crm,crm" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["crm"]);
+        let text = update_text(&res);
+        assert!(text.contains("未變更（已持有：crm）"), "{text}");
+
+        // Adding a second source keeps the first.
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "hr" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["crm", "hr"]);
+        assert!(update_text(&res).contains("capabilities.db_sources += [\"hr\"]"));
+    }
+
+    /// Removing an id the agent does not hold is reported, not refused.
+    #[tokio::test]
+    async fn agent_update_db_sources_remove_ignores_unheld_ids() {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+
+        handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "crm" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources_remove": "hr, crm" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+        assert!(read_db_grants(home, "sales-rep").is_empty());
+
+        let text = update_text(&res);
+        assert!(text.contains("未變更（未持有：hr）"), "{text}");
+        assert!(text.contains("capabilities.db_sources -= [\"crm\"]"), "{text}");
+        assert!(text.contains("目前資料庫來源授權：（無）"), "{text}");
+    }
+
+    /// Revocation is config-free on purpose: a grant the operator has since
+    /// deleted from `config.toml` is exactly the one that must stay revocable,
+    /// and the id never leaves the agent's own held list.
+    #[tokio::test]
+    async fn agent_update_db_sources_remove_clears_a_stale_unconfigured_grant() {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+        let path = home.join("agents").join("sales-rep").join("agent.toml");
+
+        // Hand-seeded state: "old" was granted back when config declared it.
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            original.replace(
+                "[capabilities]\n",
+                "[capabilities]\ndb_sources = [\"old\", \"crm\"]\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["old", "crm"]);
+
+        // Granting "old" is still refused (config has no such source)...
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "old" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_eq!(res["isError"], true, "{res}");
+
+        // ...but revoking it succeeds.
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources_remove": "old" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["crm"]);
+        assert!(update_text(&res).contains("capabilities.db_sources -= [\"old\"]"));
+
+        // Shape is still enforced, so caller text cannot reach the change log.
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources_remove": "../../etc/passwd" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_eq!(res["isError"], true, "{res}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["crm"]);
+    }
+
+    /// All three params in one call apply replace → add → remove, in that order.
+    #[tokio::test]
+    async fn agent_update_db_sources_precedence_is_replace_add_remove() {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+
+        handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "hr" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+
+        // replace → ["crm"], add → ["crm","hr"], remove → ["hr"].
+        let res = handle_agent_update(
+            &serde_json::json!({
+                "agent_id": "sales-rep",
+                "db_sources": "crm",
+                "db_sources_add": "hr",
+                "db_sources_remove": "crm",
+            }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["hr"]);
+    }
+
+    /// An unknown id is refused with the configured ids listed, and nothing is
+    /// written — not even the good half of the same call.
+    #[tokio::test]
+    async fn agent_update_db_sources_rejects_unknown_id_without_writing() {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+        let before = fs::read_to_string(home.join("agents").join("sales-rep").join("agent.toml")).unwrap();
+
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "crm,payroll" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_eq!(res["isError"], true, "{res}");
+
+        let text = update_text(&res);
+        assert!(text.contains("payroll"), "{text}");
+        assert!(text.contains("crm"), "configured ids must be listed: {text}");
+        assert!(text.contains("hr"), "configured ids must be listed: {text}");
+        // Ids only — never the source's connection string.
+        assert!(!text.contains("duduclaw-test-crm.sqlite"), "{text}");
+
+        let after = fs::read_to_string(home.join("agents").join("sales-rep").join("agent.toml")).unwrap();
+        assert_eq!(before, after, "a rejected grant must not rewrite agent.toml");
+
+        // Same rule on the replace param.
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "nope" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_eq!(res["isError"], true, "{res}");
+        assert!(read_db_grants(home, "sales-rep").is_empty());
+    }
+
+    /// An empty string revokes everything.
+    #[tokio::test]
+    async fn agent_update_db_sources_empty_string_revokes_all() {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+
+        handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "crm,hr" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_eq!(read_db_grants(home, "sales-rep").len(), 2);
+
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+        assert!(read_db_grants(home, "sales-rep").is_empty());
+
+        // An empty list is skipped on serialize, so the key disappears again.
+        let raw = fs::read_to_string(home.join("agents").join("sales-rep").join("agent.toml")).unwrap();
+        assert!(!raw.contains("db_sources"), "{raw}");
+        assert!(update_text(&res).contains("目前資料庫來源授權：（無）"));
+    }
+
+    /// A grant edit must not cost the agent its other settings: the sections
+    /// `agent_update` does not touch survive the rewrite with their values
+    /// intact (`[runtime]` is the R2-unified section that used to be dropped).
+    #[tokio::test]
+    async fn agent_update_db_sources_preserves_unrelated_sections() {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+        let path = home.join("agents").join("sales-rep").join("agent.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            format!("{original}\n[runtime]\npty_pool_enabled = true\nworker_managed = true\n"),
+        )
+        .unwrap();
+
+        let res = handle_agent_update(
+            &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "crm" }),
+            home,
+            "sales-lead",
+        )
+        .await;
+        assert_ne!(res["isError"], true, "{res}");
+
+        let cfg: duduclaw_core::types::AgentConfig =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.capabilities.db_sources, vec!["crm"]);
+        assert_eq!(cfg.runtime.pty_pool_enabled, Some(true));
+        assert_eq!(cfg.runtime.worker_managed, Some(true));
+        // ...and the ordinary typed sections are untouched too.
+        assert_eq!(cfg.agent.reports_to, "sales-lead");
+        assert_eq!(cfg.cultural_context.locale, "zh-TW");
+        assert_eq!(cfg.budget.monthly_limit_cents, 1000);
+    }
+
     /// WP21 collateral fix: `agent_remove` used to take no `caller` at all, so
     /// any agent could delete any other agent's node by id. It now goes
     /// through the exact same `check_org_subject_allowed` gate as the
@@ -24612,6 +25285,101 @@ mod audit_input_and_jitrl_tests {
         assert!(text.contains("Canvas cleared"), "got: {text}");
         let cur = store.current("agnes").await.unwrap().expect("tombstone");
         assert_eq!(cur.html, "");
+    }
+
+    // ── Internal-key agent attribution (1.64.0 regression) ────────────────
+    //
+    // Every gateway-spawned agent authenticates with the ONE shared internal
+    // MCP key, so `caller_client_id` is "gateway-internal" for all of them and
+    // the acting agent only arrives as `default_agent`. Handlers that treat
+    // the client_id as an agent directory name therefore denied everything.
+
+    #[test]
+    fn acting_agent_id_maps_only_internal_and_empty() {
+        // Internal key and the legacy empty stdio client_id → acting agent.
+        assert_eq!(
+            acting_agent_id(
+                duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID,
+                "main"
+            ),
+            "main"
+        );
+        assert_eq!(acting_agent_id("", "main"), "main");
+        // Everything else is returned verbatim — an external client must never
+        // inherit the process's default agent.
+        assert_eq!(acting_agent_id("some-external", "main"), "some-external");
+        // Exact equality, never a prefix/substring match.
+        assert_eq!(
+            acting_agent_id("gateway-internal-evil", "main"),
+            "gateway-internal-evil"
+        );
+        assert_eq!(acting_agent_id("gateway", "main"), "gateway");
+    }
+
+    /// End-to-end through the REAL `handle_tools_call` dispatch: the grant
+    /// `agent_update` writes to `agents/main/agent.toml` must be the grant
+    /// `db_sources` reads back when the caller is the internal key.
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_tools_resolve_the_internal_key_to_the_default_agent() {
+        let tmp = TempDir::new();
+        let home = tmp.path();
+        fs::write(
+            home.join("config.toml"),
+            "[db_sources.crm]\nlabel = \"客戶 CRM\"\ndriver = \"sqlite\"\n\
+             url = \"/tmp/duduclaw-test-crm.sqlite\"\nallowed_tables = [\"customers\"]\n",
+        )
+        .unwrap();
+        let agent_dir = home.join("agents").join("main");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("agent.toml"),
+            "[capabilities]\ndb_sources = [\"crm\"]\n",
+        )
+        .unwrap();
+
+        let memory = SqliteMemoryEngine::new(&home.join("memory.db")).expect("memory engine");
+        let odoo: OdooState = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::default());
+        let ns = crate::mcp_namespace::NamespaceContext {
+            write_namespace: "internal/main".to_string(),
+            read_namespaces: vec!["internal/main".to_string()],
+        };
+        let quota = crate::mcp_memory_quota::DailyQuota::new();
+        let http = reqwest::Client::new();
+        let params = serde_json::json!({ "name": "db_sources", "arguments": {} });
+
+        let call = async |client_id: &str| {
+            handle_tools_call(
+                &serde_json::json!(1),
+                &params,
+                home,
+                &http,
+                &memory,
+                "main",
+                &odoo,
+                &ns,
+                &quota,
+                client_id,
+                true,
+            )
+            .await
+        };
+
+        // The internal key acts as `main`, so `main`'s grant is honoured.
+        let res = call(duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID).await;
+        let text = res["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("crm"), "internal key must act as main: {res}");
+        assert!(
+            !text.contains("沒有任何資料庫來源授權"),
+            "the 1.64.0 regression: {res}"
+        );
+
+        // An external client id does NOT inherit the default agent.
+        let res = call("some-external").await;
+        let text = res["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("沒有任何資料庫來源授權"),
+            "an external client must not inherit main's grants: {res}"
+        );
     }
 
     /// Caller identity is validated before any I/O (path-traversal guard).

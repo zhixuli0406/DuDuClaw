@@ -860,9 +860,11 @@ impl McpDispatcher {
         if DB_SOURCE_TOOLS.contains(&tool_name) && agent_gate.db_sources.is_empty() {
             duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
             let msg = format!(
-                "工具「{tool_name}」需要資料庫來源授權，但此代理沒有任何授權。請在 agent.toml \
-                 設定 [capabilities] db_sources = [\"<資料來源名稱>\"]（名稱對應 config.toml 的 \
-                 [db_sources.<名稱>]）後再使用。"
+                "工具「{tool_name}」需要資料庫來源授權，但此代理沒有任何授權（預設全部拒絕）。\
+                 開通方式有三條：① 儀表板 設定 → 去識別化 → 資料來源精靈第 4 步「授權 AI 員工」；\
+                 ② 儀表板 AI 員工設定頁的「能力」分頁；\
+                 ③ 呼叫 agent_update 工具並帶 db_sources_add 參數（僅限依委派政策有權編輯該員工的呼叫者）。\
+                 授權會寫入該員工的 [capabilities] db_sources（名稱對應 config.toml 的 [db_sources.<名稱>]）。"
             );
             self.audit_dispatch_denial(tool_name, &params_owned, "db_sources_capability_missing", &msg);
             return jsonrpc_error(id, -32003, &msg);
