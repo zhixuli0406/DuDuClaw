@@ -180,6 +180,244 @@ category = "DB_FIELD"
 
 ---
 
+## 自訂規則:你自己的識別碼,不必寫正規表示式
+
+資料來源告訴去識別化一個欄位*在哪裡*,自訂規則告訴它一個值*長什麼樣子*:公司內部才有、任何內建規則集都不可能知道的識別碼,像是員工編號、內部專案代號、客戶代碼、合約字首。
+
+2026-09 之前,五個內建規則集(`general`／`taiwan_strict`／`taiwan_minimal`／`financial`／`developer`)是一份固定清單,只能勾選,不能擴充。自訂規則集檔案技術上在開機時就會被解析,但產品裡沒有任何介面能建立一份——你只能手寫 TOML,不然就是沒有自訂規則。
+
+### 一條規則 = 一個資料類型名稱 + 一種辨識方式
+
+每條規則帶一個你自己輸入的**資料類型名稱**(`員工編號`、`Employee ID`,最長 32 個字元)和恰好一種比對方式:
+
+- **關鍵字清單**:零語法路線。一行貼一個詞,每個至少兩個字元。ASCII 詞邊界做整詞比對,CJK 做子字串比對,一律不分大小寫(跟 `keyword` 規則種類一直以來的語意相同)。
+- **樣式**:正規表示式,認樣態而不是認清單。
+
+每條規則還有一個**啟用**開關,規則可以先擱著不刪。`enabled` 是規則規格新增的欄位,對*每一種*規則種類都生效——`regex`、`keyword`、`identity`、`json_path` 或 `db_field` 規則只要 `enabled = false`,就在引擎編譯階段被跳過,不是在比對階段才過濾掉。沒填就是 `true`,所以你現有的規則不會有任何變化。
+
+### 放在哪裡
+
+自訂規則是一份**規則集檔案**,不是內嵌的 `[redaction.rules.*]` 項目——操作者的心智模型是「再多一套規則集」,規則集檔案本來就會出現在你勾選的規則集清單裡:
+
+```toml
+# ~/.duduclaw/redaction/profiles/custom.toml
+[meta]
+name = "我的規則"
+description = "在儀表板建立的自訂規則"
+version = "1"
+
+[meta.labels]                        # category id → what a human sees
+CUSTOM_EMPLOYEE_ID = "員工編號"
+CUSTOM_01 = "內部專案代號"
+
+[rules.employee_id]
+type = "regex"
+pattern = 'EMP-\d{4}-\d{4}'
+category = "CUSTOM_EMPLOYEE_ID"
+priority = 60
+enabled = true
+```
+
+有兩件事值得講清楚。
+
+**`[meta.labels]` 是新的。** 一個 token 類別依構造本來就長得像機器碼(`[A-Z0-9_]{1,32}`),所以一份自創類別的規則集需要一個地方寫清楚這些類別代表什麼。全 ASCII 的資料類型名稱會變成 `CUSTOM_<SLUG>`;沒有任何 ASCII 字母的名稱,像「內部專案代號」,會拿下一個沒用過的兩位數編號變成 `CUSTOM_NN`,可讀的名稱就記在這裡。`redaction.get` 會把目前所有已列出規則集的對照表合併成 `category_labels` 回傳;dashboard 解析一個類別時,先查這份對照表,查不到再查自己內建的翻譯,最後才退回原始 id。
+
+**優先順序 60** 把自訂規則排在預設區間(50)之上——你自己的員工編號規則會贏過通用的連續數字規則——也排在精確的內建規則(100)之下,所以身分證字號這類樣態遇到重疊時還是內建規則贏。
+
+寫入會經過 advisory 檔案鎖與「暫存檔 + 原子 rename」,規則集名稱如果還沒列在 `config.toml [redaction] profiles` 裡就會自動補上,而且立即重建現行管線——跟 `redaction.update` 用的是同一套熱重載,不用重啟 gateway。
+
+### 用範例產生樣式
+
+不會寫正規表示式的話,貼 2 到 5 個真實值(`EMP-2024-0133`、`EMP-2025-0007`),外加最多 3 個反例——長得像但*不該*被遮的東西——`redaction.suggest_pattern` 會幫你把樣式寫出來。
+
+系統依序嘗試三種引擎,回應會告訴你是哪一種答的:
+
+1. **本機推論**,如果本機後端真的連得上。
+2. **雲端輔助模型**,走帳號輪替器。
+3. **啟發式**,完全不用模型:把每個範例拆成數字/大寫字母/小寫字母的連續片段與字面分隔符,要求所有範例共用同一種形狀,產出 `\d{4}`、`[A-Z]{2,4}`、跳脫過的分隔符。嚴格比對對不齊範例的話,會再放寬一輪,把每段英數字元連續片段一律當成 `[A-Za-z0-9]` 重試。
+
+不管是哪個引擎產生的,樣式**在回傳前都必須通過驗證**:每個範例都要能完整命中(錨定比對),沒有一個反例可以在任何位置命中。反例檢查刻意不做錨定——因為實際引擎是用搜尋而不是錨定比對,所以一個只在反例*內部*觸發的樣式一樣會把它遮起來。模型第一次答案沒通過驗證,會拿到剛好一次重試機會,並把沒過的檢查項當回饋帶進去;再失敗就換下一個引擎。要是沒有一個引擎能產出通過驗證的樣式,回應就是 `pattern: null`、`all_ok: false`——誠實回報查無,絕不亂編一個。
+
+你貼進去的範例值只會進到 prompt 裡,不會去別的地方:絕不寫進 log 或稽核紀錄。在 prompt 內部,這些值會用 XML 分隔符包起來,並明確標示成資料而不是指令。這支 RPC 每位操作者每分鐘限 10 次呼叫。
+
+### 匯入規則包
+
+`redaction.profiles.import` 接收一份 TOML 規則包(貼上或上傳),落地成第二份自訂規則集,存在 `~/.duduclaw/redaction/profiles/<slug>.toml`——這是給要把同一套規則佈署給很多個客戶的整合商用的路徑。
+
+磁碟上的 slug 是 `[a-z0-9_-]{1,40}`,依三個步驟決定:明確指定的 `name` 參數;沒有指定就用 `[meta] name` 轉出的 ASCII slug(前提是這個 slug 還沒被用掉);兩者都不行,就用 `pack_<正規化後的 [meta] name 做 SHA-256、取前 8 碼十六進位>`。台灣的規則包通常會走到最後一步——像「製造業客戶包」完全沒有 ASCII 字元可以轉 slug——而且這個結果是決定性的,所以重新匯入同一份規則包會覆蓋上次建立的規則集,而不是疊出第二份。這整套推導完全不影響人類看得懂的 `[meta] name`:它照樣是 dashboard 各處顯示的規則集標籤,只有檔名被改造成機器可讀的形式。**明確指定**的 `name` 如果不合法或跟內建規則集撞名,算錯誤(是你自己打的,你可以改);自動推導出來的 slug 則絕不會卡死,因為匯入對話框根本沒有名稱欄位可以拒絕。
+
+規則逐條驗證,壞掉的規則會**連同原因與它的 `[rules.<id>]` 表頭所在行號一起被跳過**,不會讓整份匯入失敗:樣式編譯不過、關鍵字不到兩個字元、不合法的規則 id、不合法的類別,都算。卡片自己不擁有的規則種類(`json_path`、`db_field`、`identity`)會實際拿現行引擎選項去編譯它們來驗證,所以一條會毒化下一次重載的規則在這裡就會被攔下來,不會先落到磁碟上。一份**零條**可用規則的規則包算錯誤,不是空規則集——在 dashboard 列出一套什麼都不遮的規則集,會比直接拒絕更糟。
+
+帶 `dry_run: true` 可以拿到完整報告——名稱、匯入筆數、逐條規則的跳過原因、涵蓋的類別——什麼都不會寫入。
+
+`redaction.profiles.remove` 會刪除一份自訂規則集檔案,把它從 `[redaction] profiles` 移除並重載。內建規則集一律拒絕:它們是編譯進 binary 裡的,沒有檔案可刪,悄悄把它從清單拿掉,看起來會像刪除成功了,但其實不是。
+
+### Fail-closed 讀取
+
+如果 `custom.toml` 存在但讀不出來或解析不了,`redaction.custom_rules.list` 會回傳**錯誤**,絕不會退化成一份空清單。操作者看到「你沒有任何規則」,會以為自己的規則被刪了,但事實上規則還好好在磁碟上,是整條管線被同一個解析失敗給毒化了。
+
+### 存檔前先試跑規則
+
+精靈的最後一步,會拿你剛建好的規則跑一次樣本——**在**任何東西被寫入之前。`redaction.dry_run` 為此多了兩個選填參數:
+
+- **`sample_text`**:用一段白話文字取代 `sample_json`。它在內部會包成一個 JSON 字串值(就是 `JSON.stringify(text)`),所以樣本走的還是跟真實工具結果一樣的管線路徑。兩者都給的話,`sample_json` 優先。
+- **`draft_rules`**:一組 `{ id, label?, category, kind, keywords?, pattern? }` 陣列,驗證邏輯跟儲存(upsert)用的是同一套程式碼(所以預覽絕不可能放行一個存檔會拒絕的東西)。它們會被編譯成一份候選規則集,**只為這一次呼叫**存在,疊在現行設定的內嵌規則之上——草稿如果跟既有規則共用同一個 id,就會蓋過它,這正是「預覽一次編輯」的意思。什麼都不會寫進任何地方:候選管線在這次呼叫回傳後就丟棄,已儲存的規則集不受影響。
+
+草稿產生的命中,`rule_id` 會帶草稿自己的 `id`,方便 UI 統計「這條規則 · N 處」。其他一切——內建規則集、欄位規則——回報方式跟以前完全一樣。一份無效的草稿會讓整次呼叫報錯,絕不會只跑一部分:一次預覽如果悄悄丟掉一條規則,回報的涵蓋範圍就會跟存檔後的規則集實際能做到的不一樣。
+
+### RPC
+
+| 方法 | 參數 | 回傳 |
+|---|---|---|
+| `redaction.custom_rules.list` | — | `{ rules: [{ id, category, label, kind, keywords, pattern, example, enabled }] }` |
+| `redaction.custom_rules.upsert` | `{ id?, label, category?, kind, keywords?, pattern?, enabled? }` | 儲存後的那一列,加上熱重載回傳的 `applied`／`warning` |
+| `redaction.custom_rules.remove` | `{ id }` | `{ ok, removed, applied, warning }` |
+| `redaction.custom_rules.set_enabled` | `{ id, enabled }` | 更新後的那一列 |
+| `redaction.suggest_pattern` | `{ examples: [2..5], counter_examples?: [0..3] }` | `{ pattern, engine, checks: [{ value, kind, matched, ok }], all_ok }` |
+| `redaction.profiles.import` | `{ toml, name?, dry_run? }` | `{ name, imported, skipped: [{ rule_id, line?, reason }], categories, dry_run }` |
+| `redaction.profiles.remove` | `{ name }` | `{ ok, removed, applied, warning }` |
+| `redaction.dry_run`(擴充)| `{ sample_json? \| sample_text?, tool?, args?, draft_rules? }` | `{ hits: [{ pointer, rule_id, category, token }], token_count, restored_ok }` |
+
+這七個 RPC 全都跟 `redaction.*` 其他 RPC 一樣,擋在同一道 admin 權限門後:每一個都在改動決定「什麼東西會離開這套部署」的規則集。
+
+清單裡每一列的 **example** 欄位值得說明一下。關鍵字規則,它就是第一個關鍵字——一個你自己輸入、看了就認得的真實值。樣式規則,它是**從樣式合成出來的**,不是從表單記下來的:`EMP-\d{4}-\d{4}` 會呈現成 `EMP-0000-0000`(字面文字原樣保留,字元類別取一個代表字元,重複次數取最小值、沒有上限就取 4,交替分支取第一個分支,錨點不呈現任何東西)。你貼進精靈裡的值刻意不存在任何地方,所以能顯示的只有重建出來的結果。合成失敗的情況——樣式展開會超過 128 個字元,或者根本解析不了——這一列就直接顯示樣式本身,誠實勝過假裝正確。
+
+---
+
+## AI 智慧偵測(OpenAI Privacy Filter)
+
+上面每一種規則認的都是「樣態」:身分證字號、信用卡卡號、API 金鑰、你指名的欄位。姓名、地址、生日、帳號這些東西沒有樣態可言。在這之前,唯一抓得到它們的方法,就是知道它們躺在哪個資料庫欄位裡——這招在你自己的 ERP 上有效,碰到貼上來的信件串、多出一個意外欄位的試算表、或是一則聊天訊息,就完全沒轍。
+
+`ai_pii` 規則集(「AI 智慧偵測」)補上這一塊。它跑的是 [OpenAI 的 Privacy Filter](https://huggingface.co/openai/privacy-filter)——一個 1.5B 參數(50M 啟用)的雙向 token 分類器,Apache-2.0 授權——**在本機**跑,透過 ONNX Runtime。什麼都不會送出去:沒有 API、沒有遙測、推論當下完全沒有網路連線。
+
+### 偵測什麼
+
+八個標籤,對應到去識別化的類別,所以模型命中跟同種類的正規表示式命中會 token 化成一模一樣的東西(模型找到的 `EMAIL` 跟 `general` 規則集正規表示式找到的 `EMAIL` 是同一個類別,所以一條指名 `EMAIL` 的來源篩選規則,兩邊都涵蓋):
+
+| 模型標籤 | 類別 | |
+|---|---|---|
+| `private_person` | `PERSON` | 姓名 |
+| `private_address` | `ADDRESS` | 街道地址 |
+| `private_email` | `EMAIL` | |
+| `private_phone` | `PHONE` | |
+| `private_url` | `URL` | |
+| `private_date` | `DATE` | 生日與其他個人日期 |
+| `account_number` | `ACCOUNT_NUMBER` | 銀行/客戶帳號 |
+| `secret` | `SECRET` | 密碼、金鑰、token |
+
+### 它不是什麼
+
+**它不是去識別化保證,一定會漏掉東西。** model card 自己都說這是資料最小化的元件,不是合規控管,我們自己實測的結果也一樣。在我們 25 句 zh-TW 句子、119 個 span 的測試裡:
+
+| | 召回率 |
+|---|---|
+| 整體 | **79.8%**(不要求標籤正確的話是 89.1%) |
+| 電話、email | 100% |
+| 地址 | 88% |
+| URL | 83% |
+| **人名** | **72%**(不看標籤是否正確則 76%) |
+| 日期 | 58% |
+| 帳號 | 60%(不看標籤是否正確則 100%——台灣的銀行帳號常被標成 `private_phone`,但兩種標籤都會被遮,資料還是遮住了) |
+| 長篇多語言文件(3K 字) | 88.0% / 95.1%,零誤判 |
+
+誤判率是 5.5%(110 個裡 6 個),全部都是 span 往回多吃了一個中文欄位標籤,像是「出生日期」——是多遮了,不是漏了。另外還有兩個我們測試中觀察到的已知行為:一個人名緊接著一個日期,有時會合併成一個 span(日期還是有被涵蓋,只是標籤變成 `private_person`);email 的 span 有時會把前面那個空白也吃進去。
+
+其他人在更難的語料(網路爬蟲、病歷、法律文件)上做的獨立基準測試,召回率落在 10% 到 38% 之間。**差距幾乎全部出在召回率上**,這正是這個規則集優先順序訂在 30——排在所有樣式規則之下——的原因,也是為什麼你應該讓 `general`／`taiwan_strict` 跟它一起開著。它是第二層防護,不是取代品。
+
+### 安裝模型
+
+release 版的執行檔本身既沒帶模型,也沒帶 ONNX Runtime。第一次勾選「AI 智慧偵測」時,卡片會跳出下載模型的提示:
+
+| 檔案 | 大小 | 來源 |
+|---|---|---|
+| 模型(6 個檔案) | 約 945 MB,主要是 `onnx/model_q4.onnx_data` | Hugging Face `openai/privacy-filter`,釘死在一個 commit |
+| ONNX Runtime | 依平台 7–75 MB | Microsoft 官方 GitHub release,版本對應 `ort` 目標版本(1.24.2) |
+
+每個檔案的 URL、位元組長度、SHA-256 都寫死在執行檔裡。下載會先串流進 `<name>.part`,支援用 HTTP `Range` 標頭續傳,雜湊驗證過了才會 rename 到正式路徑——所以只要檔案出現在最終路徑上,它就一定是驗證過的檔案。雜湊對不上就刪掉下載到一半的檔案,整個安裝算失敗,不存在「裝了大半個模型」這種狀態。`installed.json` 這個標記檔最後才寫,裡面記著版本;所以裝到一半算**未安裝**,不是「壞掉的安裝」。
+
+```
+~/.duduclaw/models/privacy-filter/     config.json, tokenizer.json, tokenizer_config.json,
+                                       viterbi_calibration.json, onnx/model_q4.onnx(+_data),
+                                       installed.json
+~/.duduclaw/lib/onnxruntime/1.24.2/    libonnxruntime.dylib | libonnxruntime.so | onnxruntime.dll
+```
+
+**平台支援。** macOS(Apple Silicon)、Linux(x86-64 與 arm64)、Windows(x64 與 arm64)。**Intel 版 macOS 不支援**:Microsoft 在 ONNX Runtime 1.24 沒有發布 `osx-x86_64` 版本,沒有東西可以老實裝上去。卡片會如實說明,規則會 fail closed,不會裝樣子。
+
+### 效能與記憶體
+
+在一台 10 核心 Apple Silicon 機器上實測,ONNX Runtime CPU、4 條 intra-op 執行緒、`q4` 圖:
+
+- 一般 zh-TW 句子 **63–161 毫秒**;長文件約每 1,000 字 214 毫秒。
+- 載入期間常駐記憶體約 **1.1–1.7 GB**。`idle_unload_minutes`(預設 10 分鐘)沒有推論就會把 session 卸載,下次用到再重新載入,閒置時的部署可以把記憶體要回來。
+- 如果機器記憶體不夠,權重被換出到硬碟,單一句子可能要花**幾秒**而不是幾毫秒。要嘛給它足夠的記憶體空間,要嘛就把這個規則集關掉。
+
+結果依文字內容快取(256 筆,LRU),這件事比聽起來重要:一條 `ner` 規則會編譯成**每個標籤各一條**規則,八條共用同一份快取,所以一輪對話只花一次推論,不是八次。
+
+### 設定
+
+在「偵測規則集」裡勾選「AI 智慧偵測」,或者自己手動加規則集:
+
+```toml
+[redaction]
+profiles = ["taiwan_strict", "ai_pii"]     # keep the pattern rules on
+
+[redaction.ner]                            # every key optional
+threads = 4                 # ONNX Runtime intra-op threads
+idle_unload_minutes = 10    # 0 disables unloading
+min_chars = 24              # shorter text never reaches the model
+max_chars = 32000           # longer text is chunked on paragraph boundaries
+cache_entries = 256
+# model_dir = "/some/other/place"          # default: <home>/models/privacy-filter
+```
+
+你也可以自己寫一條規則,把要偵測的標籤縮小範圍:
+
+```toml
+[redaction.rules.names_only]
+type = "ner"
+category = "PII"            # unused: each match is categorised by its label
+labels = ["private_person", "private_address"]
+priority = 30
+```
+
+`min_chars` 和 `max_chars` 都可以逐條規則覆寫。標籤打錯是載入錯誤,不是規則被跳過。
+
+### Fail-closed 行為
+
+跟整條管線的其他部分一致:**跑不動的規則,絕不能看起來像跑得動。**
+
+- 勾了規則集但沒裝模型,`ner` 規則就會編譯失敗,連帶整個 `RedactionManager` 都建不起來——gateway 進入[毒化狀態](#儀表板),`duduclaw mcp-server` 會拒絕啟動,不會在規則集根本沒在跑的情況下,還把工具結果送出去。存檔前卡片會先警告你。
+- 在不支援的平台上,或是編譯時沒開 `ner` 這個 feature 的版本上,結果一樣。規則種類本身在任何地方都還是能被*解析*的,所以一份規則集在不同版本之間仍然是可攜的;它只是在跑不動的地方拒絕編譯。
+- 移除模型(`redaction.model.remove`)會立刻重建管線,所以狀態是馬上可見的,不會潛伏到下次重啟才發作。
+
+### 稽核模型命中
+
+`AuditEvent::Redact` 現在會記錄是哪個引擎找到每一個 span:
+
+```json
+{"ts":"2026-09-24T…","event":"redact","rule_id":"ai_pii","category":"PERSON",
+ "token":"<REDACT:PERSON:…>","engine":"ner",
+ "model_revision":"7ffa9a043d54d1be65afb281eddf0ffbe629385b"}
+```
+
+`engine` 對每一種決定性比對器都是 `"rule"`,模型命中則是 `"ner"`;`model_revision` 只有模型命中才會出現。這次發布之前寫下的稽核紀錄沒有 `engine` 欄位,讀回來一律當作 `"rule"`。
+
+### RPC
+
+| 方法 | 參數 | 回傳 |
+|---|---|---|
+| `redaction.model.status` | — | `{ installed, model_revision, ort_version, size_bytes, state, progress, error, avg_latency_ms, p50_latency_ms, calls, last_used_at, platform_supported, reason }` |
+| `redaction.model.install` | — | `{ started, installed }`——冪等;下載中再呼叫一次會回傳 `started: false` |
+| `redaction.model.cancel` | — | `{ cancelled }`——下載到一半的檔案會保留,下次安裝從中斷處續傳 |
+| `redaction.model.remove` | — | `{ removed }`——刪掉模型,保留 ONNX Runtime 函式庫 |
+
+`state` 是 `absent`／`downloading`／`ready`／`loaded`／`error` 其中之一。`avg_latency_ms` 和 `p50_latency_ms` 來自最近 100 次真實推論的滾動視窗,第一次推論之前是 `null`——絕不是用估算值充數。`redaction.get` 的 `available_profiles[]` 裡,任何帶 `ner` 規則的規則集都會標 `requires_model: true`,所以匯入規則包裡如果用到 `ner`,一樣會跳出跟 `ai_pii` 一樣的下載提示。
+
+以上四個 RPC 全都跟 `redaction.*` 其他 RPC 一樣,擋在同一道 admin 權限門後。
+
+---
+
 ## 儀表板
 
 **設定 → 去識別化**,原本分開的「外部系統」與「資料來源」兩張卡已合併成一張「外部系統與資料來源」:

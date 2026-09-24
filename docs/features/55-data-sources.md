@@ -180,6 +180,244 @@ Two limits are stated plainly rather than glossed over. The `Bash` check is a fi
 
 ---
 
+## Custom rules: your own identifiers, no regex required
+
+A data source tells redaction where a field *is*. Custom rules tell it what a value *looks like* — for the identifiers that only exist inside your company and that no built-in profile could possibly know: an employee number, an internal project codename, a customer code, a contract prefix.
+
+Before 2026-09 the five built-in profiles (`general` / `taiwan_strict` / `taiwan_minimal` / `financial` / `developer`) were a fixed list you could tick but not extend. A custom profile file was technically resolved at boot, but nothing in the product could create one — you hand-wrote TOML or you had no custom rules.
+
+### One rule = a data-type name + a way to recognise it
+
+Each rule carries a **data-type name** you type yourself (`員工編號`, `Employee ID`, anything up to 32 characters) and exactly one matcher:
+
+- **Keyword list** — the zero-syntax route. Paste the terms, one per line; each must be at least two characters. Matching is whole-word for ASCII-edged terms and substring for CJK, case-insensitive either way (the same semantics the `keyword` rule kind has always had).
+- **Pattern** — a regular expression, for a shape rather than a list.
+
+Every rule also has an **enabled** flag, so a rule can be parked without being deleted. `enabled` is a new field on the rule spec itself and applies to *every* rule kind — a `regex`, `keyword`, `identity`, `json_path` or `db_field` rule with `enabled = false` is skipped at engine compile time, not filtered at match time. Absent means `true`, so nothing you already have changes.
+
+### Where they live
+
+Custom rules are a **profile file**, not inline `[redaction.rules.*]` entries — the operator's mental model is "one more rule set", and profile files already show up in the profile list you tick:
+
+```toml
+# ~/.duduclaw/redaction/profiles/custom.toml
+[meta]
+name = "我的規則"
+description = "在儀表板建立的自訂規則"
+version = "1"
+
+[meta.labels]                        # category id → what a human sees
+CUSTOM_EMPLOYEE_ID = "員工編號"
+CUSTOM_01 = "內部專案代號"
+
+[rules.employee_id]
+type = "regex"
+pattern = 'EMP-\d{4}-\d{4}'
+category = "CUSTOM_EMPLOYEE_ID"
+priority = 60
+enabled = true
+```
+
+Two things are worth spelling out.
+
+**`[meta.labels]` is new.** A token category is machine-shaped by construction (`[A-Z0-9_]{1,32}`), so a profile that invents its own categories needs somewhere to say what they mean. An ASCII data-type name becomes `CUSTOM_<SLUG>`; a name with no ASCII letters — `內部專案代號` — becomes `CUSTOM_NN` with the next free two-digit counter, and the readable name is recorded here. `redaction.get` returns the merged map across every currently-listed profile as `category_labels`; the dashboard resolves a category by checking that map first, then its own translations, then falling back to the raw id.
+
+**Priority 60** puts a custom rule above the default band (50) — your own employee-id rule beats a generic digit-run rule — and below the precise built-ins (100), so a national-ID pattern still wins an overlap.
+
+Writes go through an advisory file lock and a temp-file-plus-atomic-rename, the profile name is added to `config.toml [redaction] profiles` if it isn't already there, and the live pipeline is rebuilt immediately — the same hot reload `redaction.update` uses, no gateway restart.
+
+### Generating a pattern from examples
+
+If you can't write a regex, paste 2–5 real values instead (`EMP-2024-0133`, `EMP-2025-0007`) plus up to 3 counter-examples — things that look similar but must *not* be masked — and `redaction.suggest_pattern` writes the pattern for you.
+
+Three engines are tried in order, and the response says which one answered:
+
+1. **Local inference**, if a local backend is actually reachable.
+2. **The cloud utility model**, through the account rotator.
+3. **A heuristic** with no model at all: split each example into runs of digits / upper-case / lower-case letters and literal separators, require the examples to share that shape, and emit `\d{4}`, `[A-Z]{2,4}`, escaped separators. If the strict pass can't align the examples, a looser pass treats every alphanumeric run as `[A-Za-z0-9]` and tries again.
+
+Whatever produced it, the pattern **must pass verification before it is returned**: every example has to match it in full (anchored), and no counter-example may match it anywhere. The counter-example check is deliberately unanchored — the live engine searches rather than anchoring, so a pattern that fires *inside* a counter-example would still redact it. A model whose first answer fails verification gets exactly one retry, carrying the failed checks as feedback; if it fails again the chain falls through to the next engine. When no engine produces a pattern that survives verification, the answer is `pattern: null` and `all_ok: false` — an honest empty result, never an invented one.
+
+The example values you paste go into the prompt and nowhere else: they are never written to a log or to the audit trail. Inside the prompt they are wrapped in XML delimiters and explicitly labelled as data rather than instructions. The RPC is rate-limited to 10 calls per minute per operator.
+
+### Importing a rule pack
+
+`redaction.profiles.import` takes a TOML rule pack (pasted or uploaded) and lands it as a second custom profile at `~/.duduclaw/redaction/profiles/<slug>.toml` — the route for an integrator deploying the same rules to many customers.
+
+The on-disk slug is `[a-z0-9_-]{1,40}` and is resolved in three steps: an explicit `name` parameter; an ASCII slug of `[meta] name` when that is free; otherwise `pack_<first 8 hex of SHA-256 of the normalised `[meta] name`>`. That last step is what a Taiwanese pack normally takes — `製造業客戶包` has no ASCII to slug — and it is deterministic, so re-importing the same pack overwrites the profile it created last time instead of piling up a second copy. The human-readable `[meta] name` is untouched by any of this: it stays the profile's label everywhere the dashboard shows it, and only the file name is machine-shaped. An **explicit** `name` that is invalid or collides with a built-in is an error (you typed it, so you can fix it); an auto-derived one never dead-ends, because the import dialog has no name field to refuse to.
+
+Rules are validated one at a time, and a bad rule is **skipped with a reason and the line its `[rules.<id>]` header sits on** rather than taking the whole import down: a pattern that doesn't compile, a keyword shorter than two characters, an illegal rule id, an illegal category. Rule kinds the card doesn't own (`json_path`, `db_field`, `identity`) are proven by actually compiling them against the live engine options, so a rule that would poison the next reload is caught here instead of landing on disk. A pack with **zero** usable rules is an error, not an empty profile — listing a rule set in the dashboard that redacts nothing would be worse than refusing.
+
+Pass `dry_run: true` to get the whole report — name, imported count, per-rule skip reasons, the categories covered — without writing anything.
+
+`redaction.profiles.remove` deletes a custom profile file, drops it from `[redaction] profiles` and reloads. Built-ins are refused: they're compiled into the binary, there is no file to delete, and silently unlisting one would look like a delete that worked.
+
+### Fail-closed reading
+
+If `custom.toml` exists but cannot be read or parsed, `redaction.custom_rules.list` returns an **error**. It never degrades to an empty list. An operator looking at "you have no rules" would conclude their rules were deleted, when in fact they are still on disk and the whole pipeline is poisoned by the same parse failure.
+
+### Trying a rule before you save it
+
+The wizard's last step runs the rule you just built against a sample — **before** anything is written. `redaction.dry_run` grew two optional parameters for that:
+
+- **`sample_text`** — plain prose instead of `sample_json`. It's wrapped as a JSON string value internally (exactly `JSON.stringify(text)`), so the sample still travels the same path through the pipeline as a real tool result. `sample_json` wins if both are given.
+- **`draft_rules`** — an array of `{ id, label?, category, kind, keywords?, pattern? }`, validated by the very same code that validates an upsert (so a preview can never pass something the save would reject). They are compiled into a candidate rule set **for that one call**, layered on top of the live config's inline rules so a draft sharing an id with an existing rule shadows it — which is what previewing an *edit* means. Nothing is written anywhere: the candidate pipeline is dropped when the call returns, and the saved rule set is untouched.
+
+Hits produced by a draft carry the draft's own `id` as `rule_id`, so the UI can count "this rule · N hits". Everything else — built-in profiles, field rules — reports exactly as it did before. An invalid draft is an error for the whole call, never a partial run: a preview that quietly dropped a rule would report coverage the saved rule set is not going to deliver.
+
+### RPCs
+
+| Method | Params | Returns |
+|---|---|---|
+| `redaction.custom_rules.list` | — | `{ rules: [{ id, category, label, kind, keywords, pattern, example, enabled }] }` |
+| `redaction.custom_rules.upsert` | `{ id?, label, category?, kind, keywords?, pattern?, enabled? }` | the saved row, plus `applied` / `warning` from the hot reload |
+| `redaction.custom_rules.remove` | `{ id }` | `{ ok, removed, applied, warning }` |
+| `redaction.custom_rules.set_enabled` | `{ id, enabled }` | the updated row |
+| `redaction.suggest_pattern` | `{ examples: [2..5], counter_examples?: [0..3] }` | `{ pattern, engine, checks: [{ value, kind, matched, ok }], all_ok }` |
+| `redaction.profiles.import` | `{ toml, name?, dry_run? }` | `{ name, imported, skipped: [{ rule_id, line?, reason }], categories, dry_run }` |
+| `redaction.profiles.remove` | `{ name }` | `{ ok, removed, applied, warning }` |
+| `redaction.dry_run` *(extended)* | `{ sample_json? \| sample_text?, tool?, args?, draft_rules? }` | `{ hits: [{ pointer, rule_id, category, token }], token_count, restored_ok }` |
+
+All seven sit behind the same admin gate as the rest of `redaction.*`: every one of them edits the rule set that decides what leaves the deployment.
+
+The **example** field on a list row deserves a note. For a keyword rule it is the first keyword — a real value you typed and will recognise. For a pattern rule it is **synthesised from the pattern**, not remembered from the form: `EMP-\d{4}-\d{4}` renders as `EMP-0000-0000` (literals verbatim, a character class contributes one representative character, a repetition contributes its minimum count or 4 when unbounded, an alternation its first branch, anchors nothing). The values you pasted into the wizard are deliberately not stored anywhere, so there is nothing to show but a reconstruction. When synthesis declines — a pattern that would expand past 128 characters, or one that doesn't parse — the row shows the pattern itself, which is honest rather than wrong.
+
+---
+
+## AI detection (OpenAI Privacy Filter)
+
+Every rule kind above matches a *shape*: a national ID, a credit-card number, an API key, a column you named. Names, street addresses, birthdays and account numbers have no shape. Before this, the only way to catch them was to know the exact database column they lived in — which works for your own ERP and does nothing for a pasted email thread, an uploaded spreadsheet with an unexpected column, or a chat message.
+
+The `ai_pii` profile ("AI 智慧偵測") closes that. It runs [OpenAI's Privacy Filter](https://huggingface.co/openai/privacy-filter) — a 1.5B-parameter (50M active) bidirectional token classifier, Apache-2.0 — **locally**, through ONNX Runtime. Nothing is sent anywhere: no API, no telemetry, no network at inference time.
+
+### What it detects
+
+Eight labels, mapped onto redaction categories so a model hit and a regex hit of the same kind tokenise identically (an `EMAIL` found by the model and one found by `general`'s regex are the same category, so a source filter naming `EMAIL` covers both):
+
+| Model label | Category | |
+|---|---|---|
+| `private_person` | `PERSON` | names |
+| `private_address` | `ADDRESS` | street addresses |
+| `private_email` | `EMAIL` | |
+| `private_phone` | `PHONE` | |
+| `private_url` | `URL` | |
+| `private_date` | `DATE` | birthdays and other personal dates |
+| `account_number` | `ACCOUNT_NUMBER` | bank / customer account numbers |
+| `secret` | `SECRET` | passwords, keys, tokens |
+
+### What it is not
+
+**It is not an anonymisation guarantee, and it will miss things.** The model card calls it a data-minimisation component, not a compliance control, and our own measurements agree. On 25 zh-TW sentences carrying 119 spans:
+
+| | recall |
+|---|---|
+| overall | **79.8%** (89.1% if you don't require the right label) |
+| phone, email | 100% |
+| address | 88% |
+| URL | 83% |
+| **person names** | **72%** (76% ignoring label) |
+| date | 58% |
+| account number | 60% (100% ignoring label — Taiwanese bank accounts are frequently labelled `private_phone`; both are redacted, so the data is still masked) |
+| long mixed-language document (3K chars) | 88.0% / 95.1%, zero false positives |
+
+False positives ran at 5.5% (6 of 110), all of them a span reaching backwards to swallow a Chinese field label such as `出生日期` — over-masking, not a leak. Two other known behaviours, both visible in our tests: a name immediately followed by a date can merge into one span (the date is still covered, just labelled `private_person`), and an email span can include the leading space.
+
+Independent benchmarks on harder corpora (web crawl, medical records, legal documents) report recall between 10% and 38%. **The gap is almost entirely recall**, which is exactly why this profile is priority 30 — below every pattern rule — and why you should keep `general` / `taiwan_strict` switched on alongside it. It is a second layer, not a replacement.
+
+### Installing the model
+
+The release binary carries neither the model nor ONNX Runtime. The first time you tick 「AI 智慧偵測」 the card offers a download:
+
+| artefact | size | source |
+|---|---|---|
+| model (6 files) | ~945 MB, dominated by `onnx/model_q4.onnx_data` | Hugging Face `openai/privacy-filter`, pinned to one commit |
+| ONNX Runtime | 7–75 MB depending on platform | Microsoft's official GitHub release for the version `ort` targets (1.24.2) |
+
+Every file is pinned with its URL, byte length and SHA-256 in the binary. Downloads stream to `<name>.part`, resume with an HTTP `Range` header, are hashed, and only then renamed into place — so a file at its final path is always a verified file. A hash mismatch deletes the partial download and fails the whole install; there is no "most of the model". An `installed.json` marker is written last and names the revision, so a partial install reads as **not installed** rather than as a broken one.
+
+```
+~/.duduclaw/models/privacy-filter/     config.json, tokenizer.json, tokenizer_config.json,
+                                       viterbi_calibration.json, onnx/model_q4.onnx(+_data),
+                                       installed.json
+~/.duduclaw/lib/onnxruntime/1.24.2/    libonnxruntime.dylib | libonnxruntime.so | onnxruntime.dll
+```
+
+**Platform support.** macOS (Apple Silicon), Linux (x86-64 and arm64), Windows (x64 and arm64). **macOS on Intel is not supported**: Microsoft publishes no `osx-x86_64` build at ONNX Runtime 1.24, so there is nothing honest to install. The card says so, and the rule fails closed rather than pretending.
+
+### Performance and memory
+
+Measured on a 10-core Apple Silicon machine, ONNX Runtime CPU, 4 intra-op threads, the `q4` graph:
+
+- **63–161 ms** for a typical zh-TW sentence; ~214 ms per 1,000 characters on long documents.
+- **~1.1–1.7 GB** resident while loaded. The session unloads after `idle_unload_minutes` (default 10) with no inference and reloads on the next one, so an idle deployment gets the memory back.
+- If the machine is short on RAM and the weights get paged out, a single sentence can take **seconds** instead of milliseconds. Give it headroom or leave the profile off.
+
+Results are cached by text (256 entries, LRU), which matters more than it sounds: one `ner` rule compiles into one rule *per label*, and the eight of them share the cache, so a turn costs one inference rather than eight.
+
+### Configuring
+
+Tick 「AI 智慧偵測」 in 偵測規則集, or add the profile by hand:
+
+```toml
+[redaction]
+profiles = ["taiwan_strict", "ai_pii"]     # keep the pattern rules on
+
+[redaction.ner]                            # every key optional
+threads = 4                 # ONNX Runtime intra-op threads
+idle_unload_minutes = 10    # 0 disables unloading
+min_chars = 24              # shorter text never reaches the model
+max_chars = 32000           # longer text is chunked on paragraph boundaries
+cache_entries = 256
+# model_dir = "/some/other/place"          # default: <home>/models/privacy-filter
+```
+
+A rule of your own can narrow the labels:
+
+```toml
+[redaction.rules.names_only]
+type = "ner"
+category = "PII"            # unused: each match is categorised by its label
+labels = ["private_person", "private_address"]
+priority = 30
+```
+
+`min_chars` and `max_chars` can be overridden per rule. An unknown label is a load error, not a skipped rule.
+
+### Fail-closed behaviour
+
+Consistent with the rest of the pipeline: **a rule that cannot work must not look like one that does.**
+
+- Ticking the profile with no model installed makes the `ner` rule fail to compile, which fails the whole `RedactionManager` — the gateway enters the [poison state](#the-dashboard) and `duduclaw mcp-server` refuses to start rather than serving tool results under a rule set that isn't running. The card warns before you save.
+- The same happens on an unsupported platform, or in a build compiled without the `ner` feature. The rule kind still *parses* everywhere, so a profile stays portable across builds; it just refuses to compile where it cannot run.
+- Removing the model (`redaction.model.remove`) rebuilds the pipeline immediately, so the state is visible rather than latent until the next restart.
+
+### Auditing model hits
+
+`AuditEvent::Redact` now records which engine found each span:
+
+```json
+{"ts":"2026-09-24T…","event":"redact","rule_id":"ai_pii","category":"PERSON",
+ "token":"<REDACT:PERSON:…>","engine":"ner",
+ "model_revision":"7ffa9a043d54d1be65afb281eddf0ffbe629385b"}
+```
+
+`engine` is `"rule"` for every deterministic matcher and `"ner"` for the model; `model_revision` is present only for model hits. Audit lines written before this release have no `engine` field and read back as `"rule"`.
+
+### RPCs
+
+| Method | Params | Returns |
+|---|---|---|
+| `redaction.model.status` | — | `{ installed, model_revision, ort_version, size_bytes, state, progress, error, avg_latency_ms, p50_latency_ms, calls, last_used_at, platform_supported, reason }` |
+| `redaction.model.install` | — | `{ started, installed }` — idempotent; a second call while downloading returns `started: false` |
+| `redaction.model.cancel` | — | `{ cancelled }` — partial downloads are kept so the next install resumes |
+| `redaction.model.remove` | — | `{ removed }` — deletes the model, keeps the ONNX Runtime library |
+
+`state` is one of `absent` / `downloading` / `ready` / `loaded` / `error`. `avg_latency_ms` and `p50_latency_ms` come from a rolling window of the last 100 real inferences and are `null` before the first one — never an estimate. `available_profiles[]` on `redaction.get` carries `requires_model: true` for any profile holding a `ner` rule, so an imported rule pack that uses one gets the same download prompt as `ai_pii`.
+
+All four sit behind the same admin gate as the rest of `redaction.*`.
+
+---
+
 ## The dashboard
 
 **設定 → 去識別化** now shows the previously separate "外部系統" and "資料來源" cards merged into one, "外部系統與資料來源":
@@ -267,6 +505,7 @@ A channel attachment needs no `db_sources` grant and no connection string — th
 - **The registry describes shape, not semantics.** A `record_paths` or `table_arg` typo doesn't quietly under-protect a column — a wrong entry either fails to load (fail-closed) or matches nothing, which `試跑` will show you as zero hits.
 - **`db_query` only exists where an operator explicitly said `allowed_tables = ["*"]`.** There is no partial or best-effort enforcement of an allowlist against arbitrary SQL — the design refuses the whole tool rather than pretend to filter it.
 - **A pool is opened per call**, not cached — the right trade for a tool an agent calls a handful of times per turn, and it means a credential rotation or a config edit takes effect immediately, with no gateway restart.
+- **AI detection misses things, by measurement, not by hedging.** ~80% recall on zh-TW overall and ~72% on person names, worse on corpora that look nothing like ours. Keep the pattern profiles on; treat `ai_pii` as a second layer over them, never as the thing that makes a deployment compliant. It also costs ~1.1–1.7 GB of RAM while loaded and 60–160 ms per sentence, and it does not exist at all on Intel macOS.
 - **The data-file guard is a nudge, not a sandbox.** Its `Bash` check is a filename heuristic — a command that builds its path dynamically (`python -c "open(chr(99)+...)"`) walks straight past it — and on a Windows host with no `bash` on `PATH` the hook simply doesn't run, since it's a shell script and Claude Code treats a failed hook command as allow. Neither limit is discovered later; both are stated in the hook's own source. What actually keeps a local file's column values inside redaction's reach is the MCP tool surface (`file_read` / `csv_read` / `xlsx_read`), not the guard sitting in front of it.
 
 ---
