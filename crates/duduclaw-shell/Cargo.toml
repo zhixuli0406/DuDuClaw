@@ -1,6 +1,6 @@
 [package]
 name = "duduclaw-shell"
-version = "1.65.0"
+version = "1.65.1"
 edition = "2021"
 publish = false
 

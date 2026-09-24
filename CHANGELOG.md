@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.65.1] - 2026-09-24 — 資料庫來源授權三路（儀表板×AI 員工頁×聊天）與內部 key 身分修復
+
 ### Added
 - **資料庫來源授權不用再手改 agent.toml：儀表板兩處＋跟 AI 員工說一句就能開**：哪些 AI 員工可以用哪個資料庫（`agent.toml [capabilities] db_sources`，預設拒絕）以前只能手動編輯檔案。現在三條路都通，且都不需要重啟 gateway（授權是每次工具呼叫時重新讀取的）：① **設定 → 去識別化 → 外部系統與資料來源**：資料庫類型的精靈第 4 步改為「哪些 AI 員工可以使用這個資料庫」勾選清單（原本只顯示寫回「不適用」），已設定的資料庫列上多一個「N 位 AI 員工可用」徽章，點開就能改；② **AI 員工設定頁 → 能力**：新增「可使用的資料庫來源」勾選清單，勾選中但已不存在於設定的來源會標示出來讓你取消，不會被默默丟掉；③ **對 AI 員工說**「把客戶 CRM 資料庫開給小美」：MCP 工具 `agent_update` 新增 `db_sources`（整份取代，空字串＝全部撤銷）／`db_sources_add`／`db_sources_remove`（同一次呼叫依「取代→新增→撤銷」順序套用），誰能改誰仍由既有的委派政策決定（自己與 `reports_to` 子樹），每次變更寫入稽核紀錄 `db_sources_grant_changed`（呼叫者、對象、新增、撤銷、結果清單）。**驗證一律 fail-closed**：`db_sources`／`db_sources_add` 與儀表板寫入的每個來源 id 都必須是 `config.toml [db_sources.<id>]` 已設定的來源，不存在就整筆拒絕並列出可用 id（只列 id，不含連線字串），什麼都不寫；`db_sources_remove` 刻意**不**對照設定，所以操作者刪掉來源後留在 AI 員工身上的殘留授權仍可點名撤銷。新增兩支管理員 RPC：`db_sources.grants.list`（每個來源被哪些 AI 員工持有、全部 AI 員工清單、以及 `stale` 列出引用了已不存在來源的 AI 員工，絕不靜默吞掉）與 `db_sources.grants.set`（一次設定某個來源的持有者集合，回 `added`／`removed`／`unchanged`）；`agents.update` 的 `capabilities.db_sources` 支援整份取代；`agents.inspect` 一律回 `capabilities.db_sources` 陣列；`db_sources.remove` 刪來源時順手撤銷所有 AI 員工的授權並回 `revoked_from`。每次授權變更會在活動紀錄留一筆 `db_source_grant_changed`。工具端被拒的提示文字改為指向這三條路，不再叫使用者手改檔案。**已知限制**：授權在下一個對話回合生效（每回合重新啟動 CLI）；若開了預設關閉的 `[runtime] pty_pool_enabled`，長駐 REPL 的工具清單要等該 session 回收後才會看到新工具。
 
