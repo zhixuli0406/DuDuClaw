@@ -348,18 +348,30 @@ pub struct RouterConfig {
     pub fast_keywords: Vec<String>,
 
     /// Enable post-hoc (cascade) confidence: after a local tier answers, the
-    /// mean token logprob is Platt-scaled into an acceptance probability and
+    /// mean token logprob is mapped through a logistic
+    /// `g = sigmoid(alpha * p̄ + beta)` into an acceptance score and
     /// low-confidence answers escalate to the next tier instead of being
     /// returned. Zero LLM cost — the logprob signal comes with the response.
+    ///
+    /// Honest status of the defaults: `alpha`/`beta` have NOT been fitted on
+    /// outcome labels. With alpha 4.0, beta -2.0 and threshold 0.5,
+    /// `g >= 0.5` holds exactly when `p̄ >= 0.5`, i.e. mean logprob
+    /// `>= ln 0.5 ≈ -0.69`, so the shipped gate is a fixed logprob cutoff in
+    /// logistic clothing. It only becomes a calibrated probability once the
+    /// map is fitted on `(p̄, outcome)` pairs (Platt, or isotonic regression
+    /// as UCCI does, which assumes only monotonicity; the threshold then
+    /// follows from the cost of escalating). No such fitting exists yet, and
+    /// the gateway does not persist `(p̄, g, accepted)` next to outcomes.
     /// (Cascade Routing arXiv:2410.10347; UCCI arXiv:2605.18796)
     #[serde(default)]
     pub post_hoc_enabled: bool,
 
-    /// Platt scaling slope: g = sigmoid(alpha * p̄ + beta), p̄ = exp(mean logprob).
+    /// Logistic slope: g = sigmoid(alpha * p̄ + beta), p̄ = exp(mean logprob).
+    /// Unfitted default (see `post_hoc_enabled`).
     #[serde(default = "default_post_hoc_alpha")]
     pub post_hoc_alpha: f32,
 
-    /// Platt scaling intercept.
+    /// Logistic intercept. Unfitted default (see `post_hoc_enabled`).
     #[serde(default = "default_post_hoc_beta")]
     pub post_hoc_beta: f32,
 

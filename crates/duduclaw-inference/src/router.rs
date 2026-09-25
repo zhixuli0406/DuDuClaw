@@ -61,21 +61,28 @@ pub struct RoutingDecision {
 /// Post-hoc confidence of a locally generated answer.
 ///
 /// Derived from the free logprob signal: `p̄ = exp(mean token logprob)` is
-/// Platt-scaled into an acceptance probability `g = sigmoid(alpha * p̄ + beta)`.
+/// mapped through a logistic `g = sigmoid(alpha * p̄ + beta)`.
 /// `accepted` is `g >= post_hoc_accept_threshold` — a rejected answer escalates
 /// to the next tier (LocalFast → LocalStrong → Cloud API).
+///
+/// `g` is a calibrated probability only after `alpha`/`beta` are fitted on
+/// outcome labels; with the shipped defaults it is a fixed cutoff at mean
+/// logprob `>= ln 0.5` (see `RouterConfig::post_hoc_enabled`).
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct PostHocAssessment {
     /// Geometric-mean token probability: exp(mean token logprob), in (0, 1].
     pub p_bar: f32,
-    /// Platt-scaled acceptance probability g = sigmoid(alpha * p̄ + beta).
+    /// Logistic acceptance score g = sigmoid(alpha * p̄ + beta) (unfitted by default).
     pub g: f32,
     /// Whether the answer clears the acceptance threshold.
     pub accepted: bool,
 }
 
 impl PostHocAssessment {
-    /// Calibration inputs as `(p̄, g, accepted)` — for downstream logging.
+    /// Calibration inputs as `(p̄, g, accepted)` — intended for downstream
+    /// logging next to outcome labels so `alpha`/`beta` can be fitted.
+    /// Status 2026-09: no production consumer; the gateway does not persist
+    /// these (see `InferenceEngine::assess_response`).
     pub fn as_tuple(&self) -> (f32, f32, bool) {
         (self.p_bar, self.g, self.accepted)
     }
@@ -217,7 +224,7 @@ impl ConfidenceRouter {
     ///
     /// Returns `None` when post-hoc routing is disabled or the backend did not
     /// return logprobs — the caller must then accept the answer as today
-    /// (fail-safe). Otherwise returns the Platt-scaled assessment; callers
+    /// (fail-safe). Otherwise returns the logistic-mapped assessment; callers
     /// escalate to the next tier when `accepted` is false.
     pub fn evaluate_post_hoc(&self, mean_logprob: Option<f32>) -> Option<PostHocAssessment> {
         if !self.config.post_hoc_enabled {
@@ -227,7 +234,7 @@ impl ConfidenceRouter {
         Some(self.assess_post_hoc(mean_logprob))
     }
 
-    /// Platt-scaled acceptance rule (pure math, always computable):
+    /// Logistic acceptance rule (pure math, always computable):
     /// `p̄ = exp(mean_logprob)`, `g = sigmoid(alpha * p̄ + beta)`,
     /// `accepted = g >= post_hoc_accept_threshold`.
     pub fn assess_post_hoc(&self, mean_logprob: f32) -> PostHocAssessment {
@@ -382,7 +389,7 @@ mod tests {
         assert!(sigmoid(-10.0) < 1e-4);
         assert!((sigmoid(2.0) + sigmoid(-2.0) - 1.0).abs() < 1e-6);
 
-        // Platt rule with defaults alpha=4, beta=-2:
+        // Logistic rule with defaults alpha=4, beta=-2:
         // perfect answer (mean logprob 0 → p̄=1) → g = sigmoid(2) ≈ 0.8808.
         let router = ConfidenceRouter::new(post_hoc_config());
         let a = router.assess_post_hoc(0.0);

@@ -198,8 +198,8 @@ impl InferenceEngine {
     /// `Ok(None)` if the router decided to escalate to Cloud API.
     ///
     /// **Calibrated cascade** (when `router.post_hoc_enabled`): after a local
-    /// tier answers, the mean token logprob is Platt-scaled into an acceptance
-    /// probability `g`; a rejected answer escalates LocalFast → LocalStrong →
+    /// tier answers, the mean token logprob is logistic-mapped into an acceptance
+    /// score `g`; a rejected answer escalates LocalFast → LocalStrong →
     /// Cloud API instead of being returned. When post-hoc is disabled or the
     /// backend returns no logprobs, behaviour is identical to the legacy path.
     pub async fn route_and_generate(
@@ -266,7 +266,10 @@ impl InferenceEngine {
     /// no router is configured, post-hoc is disabled, or the backend returned
     /// no logprobs — callers should then treat the answer as accepted.
     ///
-    /// Exposed so the gateway can log calibration inputs alongside outcomes.
+    /// Intended for gateway calibration logging alongside outcomes. Status
+    /// 2026-09: the gateway has no caller — `(p̄, g, accepted)` is never
+    /// persisted next to an outcome label, so `post_hoc_alpha`/`beta` remain
+    /// unfitted defaults (a fixed `ln 0.5` mean-logprob cutoff). Not scheduled.
     pub fn assess_response(
         &self,
         response: &InferenceResponse,
