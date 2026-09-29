@@ -12,6 +12,22 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+
+/// `true` when a `try_lock_exclusive` failure means "another handle holds the
+/// lock" (the lease owner is alive) rather than a real I/O error.
+///
+/// Unix reports contention as `EWOULDBLOCK`, which `std` maps to
+/// `ErrorKind::WouldBlock`. Windows reports `ERROR_LOCK_VIOLATION`, which
+/// `std` leaves as an uncategorised OS error — matching on `WouldBlock`
+/// alone made every live lease look like an I/O failure on Windows
+/// (2026-09-29: the four `ccr_delivery_lease_*` / `*_revocation_*` tests
+/// failed only on the Windows CI leg). `fs2::lock_contended_error()` is the
+/// platform-correct comparison point.
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || (error.raw_os_error().is_some()
+            && error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -720,7 +736,7 @@ impl CausalStore {
                     // different live lease forces rollback, removing it here
                     // would make this orphan impossible to prove dead later.
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if is_lock_contended(&error) => {}
                 Err(error) => return Err(error.into()),
             }
         }

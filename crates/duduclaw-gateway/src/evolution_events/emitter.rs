@@ -495,6 +495,14 @@ impl EvolutionEventEmitter {
                 // reported by the default Tokio panic hook.
                 let _ = h.await;
             }
+            // `tokio::fs::File::write_all` resolves once the bytes are in
+            // tokio's own buffer, not once the kernel has them — the blocking
+            // `write(2)` runs afterwards on the blocking pool. A reader that
+            // opens the file right after the join can therefore still see an
+            // empty file (2026-09-29: the two `*_flushes_cold_directory_emit`
+            // tests failed only on the loaded ubuntu CI runner). This method
+            // is the documented durability point, so drain that buffer here.
+            let _ = self.logger.flush().await;
         };
         let _ = tokio::time::timeout(timeout, join_all).await;
     }
