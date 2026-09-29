@@ -35,6 +35,10 @@ COPY crates/ crates/
 # and duduclaw-cli (docs_cmd) against docs/README.md.
 # Missing either path → "No such file or directory" at compile time.
 COPY templates/ templates/
+# duduclaw-gateway embeds synthetic fixtures via include_str!("../../../fixtures/…")
+# (CCR / causal / decision-twin lines, 2026-09); the lib does not compile without
+# this tree — the v1.66.0 tag build failed exactly here.
+COPY fixtures/ fixtures/
 COPY docs/README.md docs/README.md
 # Copy pre-built frontend assets for dashboard embedding
 COPY --from=frontend-builder /build/crates/duduclaw-dashboard/dist/ crates/duduclaw-dashboard/dist/
