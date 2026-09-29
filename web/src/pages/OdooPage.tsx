@@ -67,8 +67,11 @@ export function OdooPage() {
     webhookSecret: false,
   });
 
-  // Polling / Webhook — defaults match OdooConfig::default() in config.rs
-  const [pollEnabled, setPollEnabled] = useState(true);
+  // Polling / Webhook — defaults match OdooConfig::default() in config.rs.
+  // G4 (2026-09 feature audit): polling now really runs a background task
+  // against the customer's ERP, so an unconfigured install must render the
+  // switch OFF. It used to default ON while nothing consumed the setting.
+  const [pollEnabled, setPollEnabled] = useState(false);
   const [pollInterval, setPollInterval] = useState('60');
   const [pollModels, setPollModels] = useState('crm.lead,sale.order');
   const [webhookEnabled, setWebhookEnabled] = useState(false);
@@ -123,7 +126,7 @@ export function OdooPage() {
         setProtocol(configRes.protocol ?? 'jsonrpc');
         setAuthMethod(configRes.auth_method ?? 'api_key');
         setUsername(configRes.username ?? '');
-        setPollEnabled(configRes.poll_enabled ?? true);
+        setPollEnabled(configRes.poll_enabled ?? false);
         setPollInterval(String(configRes.poll_interval_seconds ?? 60));
         setPollModels((configRes.poll_models ?? []).join(','));
         setWebhookEnabled(configRes.webhook_enabled ?? false);

@@ -44,13 +44,11 @@ export const AUTONOMY_LEVELS: ReadonlyArray<AutonomyLevel> = [
 /** RT — runtime form defaults. `agents.inspect` now returns the `[runtime]`
  *  block (only keys present in agent.toml), so the Edit page prefills these
  *  from `agent.runtime` when available and falls back to these defaults
- *  otherwise. A partial update is still written only when the operator (or the
- *  PTY-pool OAuth default-enable) touches the tab. */
+ *  otherwise. A partial update is still written only when the operator
+ *  touches the tab. */
 export const DEFAULT_RUNTIME: Required<Omit<AgentRuntime, 'fallback'>> & { fallback: string } = {
   provider: 'claude',
   fallback: '',
-  pty_pool_enabled: false,
-  worker_managed: false,
 };
 
 /** EVO — advanced evolution form defaults (write-only tab). */
@@ -60,15 +58,7 @@ export const DEFAULT_EVOLUTION_ADVANCED: {
   skill_synthesis_threshold: number;
   skill_synthesis_cooldown_hours: number;
   skill_trial_ttl: number;
-  skill_graduation_enabled: boolean;
   skill_graduation_min_lift: number;
-  skill_recommendation_enabled: boolean;
-  skill_recommendation_threshold: number;
-  curiosity_enabled: boolean;
-  curiosity_threshold: number;
-  curiosity_max_daily: number;
-  skill_behavior_monitor_enabled: boolean;
-  skill_behavior_drift_threshold: number;
 } = {
   external_factors: {
     user_feedback: true,
@@ -81,31 +71,15 @@ export const DEFAULT_EVOLUTION_ADVANCED: {
   skill_synthesis_threshold: 3,
   skill_synthesis_cooldown_hours: 24,
   skill_trial_ttl: 7,
-  skill_graduation_enabled: false,
   skill_graduation_min_lift: 0.1,
-  skill_recommendation_enabled: false,
-  skill_recommendation_threshold: 0.6,
-  curiosity_enabled: false,
-  curiosity_threshold: 0.5,
-  curiosity_max_daily: 3,
-  skill_behavior_monitor_enabled: false,
-  skill_behavior_drift_threshold: 0.3,
 };
 
 /** CT — advanced container form defaults (write-only tab). */
 export const DEFAULT_CONTAINER_ADVANCED: {
-  worktree_enabled: boolean;
-  worktree_auto_merge: boolean;
-  worktree_cleanup_on_exit: boolean;
-  worktree_copy_files: string[];
   additional_mounts: ContainerMount[];
   cmd: string[];
   env: ContainerEnvVar[];
 } = {
-  worktree_enabled: false,
-  worktree_auto_merge: false,
-  worktree_cleanup_on_exit: true,
-  worktree_copy_files: [],
   additional_mounts: [],
   cmd: [],
   env: [],

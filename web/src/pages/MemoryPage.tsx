@@ -5,11 +5,9 @@ import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import {
   api,
-  type EvolutionVersion,
   type EvolutionStagnationSignal,
   type EvolutionStagnationSnapshot,
   type EvolutionTelemetrySummary,
-  type EvolutionConsolidation,
   type PlaybookEntry,
   type RuleStatusKey,
   type KeyFactEntry,
@@ -340,8 +338,6 @@ interface EvolutionAgent {
   skill_auto_activate: boolean;
   skill_security_scan: boolean;
   max_silence_hours: number;
-  max_gvu_generations: number;
-  observation_period_hours: number;
 }
 
 function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
@@ -351,9 +347,8 @@ function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
   const [mode, setMode] = useState('');
   const [enabled, setEnabled] = useState(false);
   const [gvuEnabledCount, setGvuEnabledCount] = useState(0);
-  const [totalVersions, setTotalVersions] = useState(0);
-  const [lastAppliedAt, setLastAppliedAt] = useState<string | null>(null);
-  const [versions, setVersions] = useState<ReadonlyArray<EvolutionVersion>>([]);
+  const [totalRounds, setTotalRounds] = useState(0);
+  const [appliedRounds, setAppliedRounds] = useState(0);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -366,19 +361,13 @@ function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
       toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
       return null;
     };
-    Promise.all([
-      api.evolution.status().catch(onFailure),
-      // Superset of `.history` (adds the WP0.4 ExpiredNoData status + the
-      // low-data alert flag); same optional-agent/limit contract.
-      api.evolution.versions(undefined, 20).catch(onFailure),
-    ]).then(([status, history]) => {
+    api.evolution.status().catch(onFailure).then((status) => {
       setAgents(status?.agents ?? []);
       setMode(status?.mode ?? '');
       setEnabled(status?.enabled ?? false);
       setGvuEnabledCount(status?.gvu_enabled_count ?? 0);
-      setTotalVersions(status?.total_versions ?? 0);
-      setLastAppliedAt(status?.last_applied_at ?? null);
-      setVersions(history?.versions ?? []);
+      setTotalRounds(status?.total_rounds ?? 0);
+      setAppliedRounds(status?.applied_rounds ?? 0);
     }).finally(() => setLoading(false));
   }, [intl]);
 
@@ -399,13 +388,12 @@ function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
             <span className="text-xs text-muted-foreground">
               {gvuEnabledCount}/{agents.length} {intl.formatMessage({ id: 'evolution.agentsEnabled' })}
             </span>
-            {totalVersions > 0 && (
-              <span className="text-xs text-muted-foreground">· {totalVersions} versions</span>
-            )}
-            {lastAppliedAt && (
-              <span className="flex items-center gap-1 font-mono text-xs tabular-nums text-muted-foreground">
-                <ClockIcon className="size-3" />
-                {timeAgo(lastAppliedAt)}
+            {totalRounds > 0 && (
+              <span className="text-xs text-muted-foreground">
+                · {intl.formatMessage(
+                  { id: 'evolution.rounds' },
+                  { applied: appliedRounds, total: totalRounds },
+                )}
               </span>
             )}
           </CardContent>
@@ -434,9 +422,7 @@ function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
                     enabled={agent.skill_security_scan}
                   />
                 </div>
-                <div className="grid grid-cols-3 gap-2 border-t border-surface-border pt-3">
-                  <Metric value={String(agent.max_gvu_generations)} label={intl.formatMessage({ id: 'evolution.maxGenerations' })} />
-                  <Metric value={`${agent.observation_period_hours}h`} label={intl.formatMessage({ id: 'evolution.observationPeriod' })} />
+                <div className="grid grid-cols-1 gap-2 border-t border-surface-border pt-3">
                   <Metric value={`${agent.max_silence_hours}h`} label={intl.formatMessage({ id: 'evolution.maxSilence' })} />
                 </div>
               </CardContent>
@@ -455,34 +441,7 @@ function EvolutionView({ selectedAgent }: { selectedAgent: string }) {
         </div>
       )}
 
-      {agents.length > 0 && (
-        <section className="space-y-2">
-          <h2 className="flex items-center gap-2 text-sm font-medium text-foreground">
-            <GitBranchIcon className="size-4 text-brand" />
-            {intl.formatMessage({ id: 'evolution.engine' })}
-          </h2>
-          {versions.length === 0 ? (
-            <CollectionPageState
-              state="empty"
-              icon={GitBranchIcon}
-              title={intl.formatMessage({ id: 'evolution.noHistory' })}
-            />
-          ) : (
-            <div className="space-y-2">
-              {versions.map((v) => (
-                <EvolutionVersionCard key={v.version_id} version={v} />
-              ))}
-            </div>
-          )}
-        </section>
-      )}
-
-      {selectedAgent && (
-        <>
-          <ConsolidationsCard agentId={selectedAgent} />
-          <PlaybookCard agentId={selectedAgent} />
-        </>
-      )}
+      {selectedAgent && <PlaybookCard agentId={selectedAgent} />}
     </div>
   );
 }
@@ -635,69 +594,6 @@ function TelemetryCard({ agentId }: { agentId: string }) {
         )}
       </CardContent>
     </Card>
-  );
-}
-
-// ── Consolidation audit trail (WP0.2) ────────────────────────
-
-function ConsolidationsCard({ agentId }: { agentId: string }) {
-  const intl = useIntl();
-  const [records, setRecords] = useState<ReadonlyArray<EvolutionConsolidation>>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let alive = true;
-    setLoading(true);
-    api.evolution.consolidations(agentId, 10).then((res) => {
-      if (alive) setRecords(res?.consolidations ?? []);
-    }).catch((e) => {
-      console.warn('[api]', e);
-      if (alive) setRecords([]);
-    }).finally(() => { if (alive) setLoading(false); });
-    return () => { alive = false; };
-  }, [agentId]);
-
-  // Quiet when there is nothing to audit — no consolidation has ever been
-  // needed for this agent, which is the common (and healthy) case.
-  if (!loading && records.length === 0) return null;
-
-  const outcomeBadgeClass = (outcome: string) => {
-    if (outcome === 'applied') return 'bg-success/15 text-success';
-    if (outcome === 'attempted') return 'bg-info/15 text-info';
-    return 'bg-destructive/10 text-destructive';
-  };
-
-  return (
-    <section className="space-y-2">
-      <h2 className="text-sm font-medium text-foreground">
-        {intl.formatMessage({ id: 'evolution.consolidations.title' })}
-      </h2>
-      {loading ? (
-        <Skeleton className="h-16 w-full" />
-      ) : (
-        <div className="space-y-1.5">
-          {records.map((r) => (
-            <Card key={r.id} data-size="sm">
-              <CardContent className="flex flex-wrap items-center justify-between gap-2">
-                <Badge variant="secondary" className={outcomeBadgeClass(r.outcome)}>
-                  {intl.formatMessage({
-                    id: `evolution.consolidations.outcome.${r.outcome}`,
-                    defaultMessage: r.outcome,
-                  })}
-                </Badge>
-                <span className="font-mono text-xs tabular-nums text-muted-foreground">
-                  {r.from_bytes}B → {r.to_bytes ?? '—'}B
-                </span>
-                <span className="flex items-center gap-1 font-mono text-xs tabular-nums text-muted-foreground">
-                  <ClockIcon className="size-3" />
-                  {timeAgo(r.attempted_at)}
-                </span>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
-      )}
-    </section>
   );
 }
 
@@ -952,94 +848,6 @@ function Metric({ value, label }: { value: string; label: string }) {
       <p className="font-mono text-lg font-medium tabular-nums text-foreground">{value}</p>
       <p className="text-xs text-muted-foreground">{label}</p>
     </div>
-  );
-}
-
-function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
-  const intl = useIntl();
-
-  const statusLabel = (() => {
-    switch (version.status) {
-      case 'Confirmed': return intl.formatMessage({ id: 'evolution.status.confirmed' });
-      case 'RolledBack': return intl.formatMessage({ id: 'evolution.status.rolledBack' });
-      case 'Observing': return intl.formatMessage({ id: 'evolution.status.observing' });
-      // WP0.4: the observation window closed without enough traffic to judge
-      // pass/fail — deliberately NOT phrased as pass or fail (user-facing
-      // copy, never the internal `ExpiredNoData` term).
-      case 'ExpiredNoData': return intl.formatMessage({ id: 'evolution.status.expiredNoData' });
-      default: return version.status;
-    }
-  })();
-  const statusClass: Record<string, string> = {
-    Confirmed: 'bg-success/15 text-success',
-    RolledBack: 'bg-destructive/10 text-destructive',
-    Observing: 'bg-warning/15 text-warning',
-    ExpiredNoData: 'bg-muted text-muted-foreground',
-  };
-
-  const renderDelta = (pre: number, post: number | undefined, invert = false) => {
-    if (post === undefined || post === null) {
-      return <span className="text-muted-foreground">{pre.toFixed(2)}</span>;
-    }
-    const delta = post - pre;
-    const good = invert ? delta < 0 : delta > 0;
-    const color = Math.abs(delta) < 1e-6
-      ? 'text-muted-foreground'
-      : good ? 'text-success' : 'text-destructive';
-    return (
-      <span>
-        <span className="text-muted-foreground">{pre.toFixed(2)}</span>
-        <span className="mx-1 text-muted-foreground">→</span>
-        <span className={color}>{post.toFixed(2)}</span>
-      </span>
-    );
-  };
-
-  return (
-    <Card data-size="sm">
-      <CardContent className="space-y-2">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <ActorAvatar actorType="agent" size="xs" name={version.agent_id} />
-            <span className="text-sm font-medium text-brand">{version.agent_id}</span>
-            <Badge variant="secondary" className={statusClass[version.status]}>{statusLabel}</Badge>
-            <span className="font-mono text-xs text-muted-foreground">{version.soul_hash.slice(0, 8)}</span>
-          </div>
-          <span className="flex items-center gap-1 font-mono text-xs tabular-nums text-muted-foreground">
-            <ClockIcon className="size-3" />
-            {timeAgo(version.applied_at)}
-          </span>
-        </div>
-        {version.soul_summary && (
-          <p className="whitespace-pre-wrap text-sm text-foreground">{version.soul_summary}</p>
-        )}
-        {version.status === 'ExpiredNoData' && version.low_data_alert_sent && (
-          <p className="text-xs text-muted-foreground">
-            {intl.formatMessage({ id: 'evolution.version.lowDataAlert' })}
-          </p>
-        )}
-        <div className="grid grid-cols-3 gap-2 border-t border-surface-border pt-2 text-xs">
-          <div>
-            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'evolution.metric.feedback' })}</p>
-            <p className="font-mono">
-              {renderDelta(version.pre_metrics.positive_feedback_ratio, version.post_metrics?.positive_feedback_ratio)}
-            </p>
-          </div>
-          <div>
-            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'evolution.metric.error' })}</p>
-            <p className="font-mono">
-              {renderDelta(version.pre_metrics.prediction_error, version.post_metrics?.prediction_error, true)}
-            </p>
-          </div>
-          <div>
-            <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'evolution.metric.corrections' })}</p>
-            <p className="font-mono">
-              {renderDelta(version.pre_metrics.user_correction_rate, version.post_metrics?.user_correction_rate, true)}
-            </p>
-          </div>
-        </div>
-      </CardContent>
-    </Card>
   );
 }
 

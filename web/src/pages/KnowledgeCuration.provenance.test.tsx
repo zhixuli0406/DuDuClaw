@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
-import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
 import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { ProvenancePanel } from './KnowledgeCuration';
@@ -26,8 +26,11 @@ const EDGE: MemoryGraphEdge = {
 };
 
 function WikiTrustProbe() {
-  const [params] = useSearchParams();
-  return <div>wikitrust-probe:{params.get('tab')}</div>;
+  // G2 (2026-09 feature audit): the wiki-trust page used to be a `?tab=`
+  // panel inside the Governance shell. It is a route of its own now, so the
+  // probe reports the path rather than a query param.
+  const { pathname } = useLocation();
+  return <div>wikitrust-probe:{pathname}</div>;
 }
 
 beforeEach(() => {
@@ -52,7 +55,7 @@ describe('ProvenancePanel', () => {
                 <ProvenancePanel agentId="agent-1" edge={EDGE} onClose={vi.fn()} onOpenHistory={vi.fn()} />
               }
             />
-            <Route path="/manage/governance" element={<WikiTrustProbe />} />
+            <Route path="/manage/wiki-trust" element={<WikiTrustProbe />} />
           </Routes>
         </MemoryRouter>
       </IntlProvider>,
@@ -62,7 +65,7 @@ describe('ProvenancePanel', () => {
     await user.click(link);
 
     await waitFor(() => {
-      expect(screen.getByText('wikitrust-probe:wikiTrust')).toBeInTheDocument();
+      expect(screen.getByText('wikitrust-probe:/manage/wiki-trust')).toBeInTheDocument();
     });
   });
 });

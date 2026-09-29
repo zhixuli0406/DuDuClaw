@@ -98,13 +98,10 @@ export interface AgentDetail extends AgentInfo {
   os_watch?: OsWatchConfig | null;
   /** [runtime] block — returned by agents.inspect so the runtime editor can
    *  prefill existing values. Emits ONLY keys present in agent.toml, so an
-   *  absent `pty_pool_enabled` (vs. an explicit `false`) is meaningful: it
-   *  gates the one-time PTY-pool OAuth default-enable materialization. */
+   *  absent key means "never written" rather than a materialized default. */
   runtime?: {
     provider?: string;
     fallback?: string;
-    pty_pool_enabled?: boolean;
-    worker_managed?: boolean;
   };
   /** [research] table — returned by agents.inspect so the automation tab's
    *  self-study toggle can prefill the agent's own value (belief loop ×
@@ -264,6 +261,16 @@ export interface SystemStatus {
    * closed, matches the hook's own fail-closed default).
    */
   is_appliance?: boolean;
+  /**
+   * 2026-09-29 audit (X1): `config.toml [decision] enabled`. `false` means the
+   * operator retired the decision-twin line — every `/api/decision/*` route
+   * already answers 404 — so the dashboard hides the Decision Lab nav row and
+   * system card, and the page itself says who turned it off. Absent on older
+   * gateways → treat as `true` (fail OPEN on purpose: this is presentation of
+   * an operator preference, not access control, and the real gate is the
+   * gateway's own 404 middleware). Read through `useDecisionEnabled`.
+   */
+  decision_enabled?: boolean;
 }
 
 /** Response of `system.autostart.status` / `system.autostart.set` — the
@@ -1110,6 +1117,12 @@ export interface TickScreenCounts {
 export interface TicksSourcesResult {
   enabled: boolean;
   allow_command_sources: boolean;
+  /**
+   * Named knob bundle from `config.toml [tick] preset`, or `null` when none is
+   * configured (every per-source default is then the historical one).
+   * Read-only on the dashboard — the config file owns it.
+   */
+  preset: 'conservative' | 'aggressive' | null;
   sources: TickSourceStatus[];
   screen: TickScreenCounts;
 }
@@ -1168,13 +1181,6 @@ export interface ForkDetail {
   winner: string | null;
   promoted: boolean;
   branches: ForkBranch[];
-}
-
-export interface EvolutionMetrics {
-  positive_feedback_ratio: number;
-  prediction_error: number;
-  user_correction_rate: number;
-  contract_violations: number;
 }
 
 /** Tri-state hardware fit for one quant (`localmodels.*`). */
@@ -1666,6 +1672,26 @@ export interface TaskArtifacts {
   inferred_count: number;
 }
 
+/** Task-scoped team stages. Unknown usage stays null, never zero. */
+export interface TaskRoleTurn {
+  timestamp: string;
+  round: number;
+  role: 'planner' | 'executor' | 'verifier' | 'utility';
+  runtime: string;
+  provider: string;
+  request_model: string | null;
+  response_model: string | null;
+  runtime_used: string | null;
+  failover: boolean;
+  outcome: 'completed' | 'empty' | 'failed' | 'skipped';
+  observation_fidelity: string;
+  usage_input_tokens: number | null;
+  usage_output_tokens: number | null;
+  usage_cache_read_tokens: number | null;
+}
+
+export interface TaskRoleTurns { turns: TaskRoleTurn[] }
+
 /** `tasks.timeline` — one goal task's whole loop story. */
 export interface GoalTimeline {
   task: TaskInfo;
@@ -1687,21 +1713,6 @@ export interface GoalTimeline {
     ended_at: string;
     step_count: number;
   }>;
-}
-
-export interface EvolutionVersion {
-  version_id: string;
-  agent_id: string;
-  soul_summary: string;
-  soul_hash: string;
-  applied_at: string;
-  observation_end: string;
-  status: string;
-  /** WP0.4: was the one-time "insufficient observation data" alert already
-   *  sent for this version? Only meaningful when `status === 'ExpiredNoData'`. */
-  low_data_alert_sent?: boolean;
-  pre_metrics: EvolutionMetrics;
-  post_metrics: EvolutionMetrics | null;
 }
 
 /** One AVO §2.4 stagnation signal — `kind` selects which of the optional
@@ -1732,16 +1743,6 @@ export interface EvolutionTelemetrySummary {
   total: number;
   /** stage ("verify" | "apply") -> layer/gate name -> rejection count. */
   by_stage_layer: Record<string, Record<string, number>>;
-}
-
-export interface EvolutionConsolidation {
-  id: string;
-  agent_id: string;
-  attempted_at: string;
-  outcome: string;
-  from_bytes: number;
-  to_bytes: number | null;
-  detail: string | null;
 }
 
 /** §C.9 outward status vocabulary for an experience rule (經驗法則). */
@@ -2418,8 +2419,6 @@ export interface AgentUpdateParams {
   cognitive_memory?: boolean;
   max_active_skills?: number;
   max_silence_hours?: number;
-  max_gvu_generations?: number;
-  observation_period_hours?: number;
   skill_token_budget?: number;
   // Proactive ([proactive] section, nested object). Includes G.8 extras
   // (token_budget_per_check / timezone / max_turns) accepted by the backend.
@@ -2545,8 +2544,6 @@ export interface AgentRuntime {
   provider?: RuntimeProvider;
   /** A provider name, or '' to clear. Must be a valid provider when non-empty. */
   fallback?: string;
-  pty_pool_enabled?: boolean;
-  worker_managed?: boolean;
 }
 
 /** Result of `runtime.detect` — which AI backends are installed + Claude OAuth. */
@@ -3009,18 +3006,7 @@ export interface AgentEvolutionAdvanced {
   skill_synthesis_cooldown_hours?: number;
   skill_trial_ttl?: number;
   // Skill graduation
-  skill_graduation_enabled?: boolean;
   skill_graduation_min_lift?: number;
-  // Skill recommendation
-  skill_recommendation_enabled?: boolean;
-  skill_recommendation_threshold?: number;
-  // Curiosity
-  curiosity_enabled?: boolean;
-  curiosity_threshold?: number;
-  curiosity_max_daily?: number;
-  // Behavior monitor
-  skill_behavior_monitor_enabled?: boolean;
-  skill_behavior_drift_threshold?: number;
 }
 
 // ── CT: per-agent advanced [container] ──────────────────────────
@@ -3040,10 +3026,6 @@ export interface ContainerEnvVar {
  *  optional. Mount host paths matching the gateway blocked-pattern list
  *  (e.g. `.ssh`, `.env`) are rejected server-side. */
 export interface AgentContainerAdvanced {
-  worktree_enabled?: boolean;
-  worktree_auto_merge?: boolean;
-  worktree_cleanup_on_exit?: boolean;
-  worktree_copy_files?: string[];
   additional_mounts?: ContainerMount[];
   cmd?: string[];
   env?: ContainerEnvVar[];
@@ -3100,12 +3082,7 @@ export interface InferenceConfig {
   generation?: InferenceGeneration;
   router?: InferenceRouter;
   openai_compat?: InferenceOpenAiCompat;
-  exo?: InferenceBackendSection;
   llamafile?: InferenceBackendSection;
-  mlx?: InferenceBackendSection;
-  mistralrs?: InferenceBackendSection;
-  llmlingua?: InferenceBackendSection;
-  streaming_llm?: InferenceBackendSection;
   embedding?: InferenceBackendSection;
   [key: string]: unknown;
 }
@@ -3122,12 +3099,7 @@ export interface InferenceUpdate {
   generation?: InferenceGeneration;
   router?: InferenceRouter;
   openai_compat?: InferenceOpenAiCompat;
-  exo?: InferenceBackendSection;
   llamafile?: InferenceBackendSection;
-  mlx?: InferenceBackendSection;
-  mistralrs?: InferenceBackendSection;
-  llmlingua?: InferenceBackendSection;
-  streaming_llm?: InferenceBackendSection;
   embedding?: InferenceBackendSection;
 }
 
@@ -3960,6 +3932,11 @@ export interface BuiltinToolEntry {
   category: string;
   /** `mcp` for DuDuClaw MCP tools, `claude` for native Claude Code tools. */
   kind: string;
+  /** T5 (2026-09-29): a deprecated alias of a merged entry point. Still
+   *  callable and still in `tools/list`, but the picker must not offer it as a
+   *  new choice — it only stays visible when already selected. Removal target
+   *  v1.68.0; see `docs/guides/deprecations.md`. */
+  deprecated?: boolean;
 }
 
 // ── SKS: global [skill_synthesis] auto-run (W19-P1) ─────────────
@@ -4032,12 +4009,20 @@ export type McpScope =
   | 'files:read'
   | 'admin';
 
-/** All known MCP scopes — mirrors the shared canonical list
- *  (`duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS`, read by both the gateway's
- *  `KNOWN_MCP_SCOPES` validator and `duduclaw-cli::mcp_auth::Scope`). Was a
- *  10-entry list that had drifted from the real scopes (2026-08 audit) —
- *  dashboard operators could not grant 12 of them without hand-editing
- *  config.toml. */
+/** All MCP scopes offered in the key-creation picker — mirrors the shared
+ *  canonical list (`duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS`, read by both
+ *  the gateway's `KNOWN_MCP_SCOPES` validator and `duduclaw-cli::mcp_auth::Scope`)
+ *  minus the internal-only scopes. Was a 10-entry list that had drifted from
+ *  the real scopes (2026-08 audit) — dashboard operators could not grant 12 of
+ *  them without hand-editing config.toml.
+ *
+ *  Deliberately NOT offered: `team:handoff` (2026-09-28). It gates the
+ *  Team-as-Agent `team_handoff` tool, is excluded from
+ *  `EXTERNALLY_GRANTABLE_SCOPES` (so an external key carrying it still cannot
+ *  call the tool), and every internal caller already reaches the tool through
+ *  the `admin`-scoped `gateway-internal` key — a checkbox for it would grant
+ *  nothing. The validator still accepts the string, so a hand-written
+ *  config.toml entry keeps working. */
 export const MCP_SCOPES: ReadonlyArray<McpScope> = [
   'memory:read',
   'memory:write',
@@ -4344,49 +4329,6 @@ export interface KillswitchUpdate {
   safety_words?: Partial<KillswitchSafetyWords>;
   defensive_prompt?: Partial<KillswitchDefensivePrompt>;
   audit?: Partial<KillswitchAudit>;
-}
-
-// ── GOV: governance policies (policies/*.yaml) ──────────────────
-
-export type GovPolicyType = 'rate' | 'permission' | 'quota' | 'lifecycle';
-
-/** Valid `rate` policy resources — mirrors gateway `GOV_RATE_RESOURCES`. */
-export const GOV_RATE_RESOURCES = ['mcp_calls', 'memory_writes', 'wiki_writes', 'message_sends'] as const;
-export type GovRateResource = (typeof GOV_RATE_RESOURCES)[number];
-
-/** Valid `rate` violation actions — mirrors gateway `GOV_ACTIONS`. */
-export const GOV_ACTIONS = ['reject', 'warn', 'throttle'] as const;
-export type GovAction = (typeof GOV_ACTIONS)[number];
-
-export const GOV_POLICY_TYPES = ['rate', 'permission', 'quota', 'lifecycle'] as const;
-
-/** A governance policy. The shape is a discriminated union on `policy_type`,
- *  but the backend stores/returns a flat object — we keep it flat with all
- *  per-type fields optional. `scope` is read-only (added by `governance.list`):
- *  "global" or an agent id. `agent_id` is "*" (global) or a valid agent id. */
-export interface GovPolicy {
-  policy_type: GovPolicyType;
-  policy_id: string;
-  agent_id: string;
-  scope?: string;
-  // rate
-  resource?: GovRateResource;
-  limit?: number;
-  window_seconds?: number;
-  action_on_violation?: GovAction;
-  // permission
-  allowed_scopes?: string[];
-  denied_scopes?: string[];
-  requires_approval?: string[];
-  // quota
-  daily_token_budget?: number;
-  max_concurrent_tasks?: number;
-  max_memory_entries?: number;
-  reset_cron?: string;
-  // lifecycle
-  max_idle_hours?: number;
-  health_check_interval_seconds?: number;
-  auto_suspend_on_violation_count?: number;
 }
 
 // ── SCP: wiki namespace policy (.scope.toml) ────────────────────
@@ -5752,8 +5694,10 @@ export const api = {
         mode: string;
         total_agents: number;
         gvu_enabled_count: number;
-        total_versions: number;
-        last_applied_at: string | null;
+        /** AEE rounds recorded in the experiment log (all agents). */
+        total_rounds: number;
+        /** Of those, rounds that committed playbook deltas. */
+        applied_rounds: number;
         agents: Array<{
           agent_id: string;
           gvu_enabled: boolean;
@@ -5761,19 +5705,7 @@ export const api = {
           skill_auto_activate: boolean;
           skill_security_scan: boolean;
           max_silence_hours: number;
-          max_gvu_generations: number;
-          observation_period_hours: number;
         }>;
-      }>,
-    history: (agentId?: string, limit = 20) =>
-      client.call('evolution.history', { agent_id: agentId ?? '', limit }) as Promise<{
-        versions: EvolutionVersion[];
-      }>,
-    /** Superset of `history`: same optional `agent_id`/`limit` scoping, plus
-     *  the WP0.4 `ExpiredNoData` status and the one-time low-data alert flag. */
-    versions: (agentId?: string, limit = 20) =>
-      client.call('evolution.versions', { agent_id: agentId ?? '', limit }) as Promise<{
-        versions: EvolutionVersion[];
       }>,
     /** AVO §2.4 stagnation detector snapshot. Empty `agentId` scopes to every
      *  registered agent (one snapshot per agent, in registry order). */
@@ -5781,14 +5713,9 @@ export const api = {
       client.call('evolution.stagnation', { agent_id: agentId ?? '' }) as Promise<{
         snapshots: EvolutionStagnationSnapshot[];
       }>,
-    /** WP0.6 Verifier/Updater rejection distribution over a trailing window. */
+    /** WP0.6 Verifier rejection distribution over a trailing window. */
     telemetry: (agentId?: string, days = 7) =>
       client.call('evolution.telemetry', { agent_id: agentId ?? '', days }) as Promise<EvolutionTelemetrySummary>,
-    /** WP0.2 consolidation (whole-SOUL.md-rewrite) attempt audit trail. */
-    consolidations: (agentId?: string, limit = 20) =>
-      client.call('evolution.consolidations', { agent_id: agentId ?? '', limit }) as Promise<{
-        consolidations: EvolutionConsolidation[];
-      }>,
   },
   /** Playbook — gene-shaped experience entries the AEE evolution loop writes
    *  instead of rewriting SOUL.md (TODO-evolution-v3-2026-08.md §Phase 1). */
@@ -5874,6 +5801,9 @@ export const api = {
         // Structured [memory] novelty_gate for the memory-dedup-gate toggle
         // (absent ⇒ true, matching the gateway's fail-closed default).
         novelty_gate_enabled?: boolean;
+        // Structured [miniapp] enabled for the Telegram Mini App toggle (S20;
+        // absent ⇒ false, matching `miniapp::enabled`'s opt-in default).
+        miniapp_enabled?: boolean;
         // Structured [notify] daily_digest for the daily-digest toggle
         // (W2-8; absent ⇒ false/"09:00", matching `DigestConfig::default()`).
         daily_digest_enabled?: boolean;
@@ -5991,8 +5921,9 @@ export const api = {
       client.call('security.audit_log', { limit }) as Promise<{ events: AuditEvent[] }>,
     status: () =>
       client.call('security.status') as Promise<{
-        credential_proxy: { active: boolean; vault_backend: string; injected_secrets: number };
-        mount_guard: { rules: Array<{ path: string; access: string }> };
+        // G2 (2026-09 feature audit): `credential_proxy` / `mount_guard`
+        // removed — their Rust modules were deleted and the values measured
+        // something other than what the names claimed.
         rbac: Array<{
           agent_id: string; role: string;
           tool_use: boolean; web_access: boolean;
@@ -6331,6 +6262,17 @@ export const api = {
         account?: string;
         detail: string;
       }>,
+    /**
+     * Flip `config.toml [integrations] google_workspace` — the master gate
+     * that decides whether the 19 Google tools reach agents at all. Separate
+     * from the credential itself: a credential can test green while the gate
+     * is shut, which is exactly the dead end this control exists to remove.
+     */
+    setIntegration: (enabled: boolean) =>
+      client.call('google.integration.set', { enabled }) as Promise<{
+        enabled: boolean;
+        changed: boolean;
+      }>,
   },
   mcp: {
     list: () =>
@@ -6439,6 +6381,8 @@ export const api = {
     // I-2b: the deliverables a task produced — the 「產物」tab. Read-only.
     artifacts: (taskId: string, limit?: number) =>
       client.call('tasks.artifacts', limit ? { task_id: taskId, limit } : { task_id: taskId }) as Promise<TaskArtifacts>,
+    roleTurns: (taskId: string) =>
+      client.call('tasks.role_turns', { task_id: taskId }) as Promise<TaskRoleTurns>,
     // Iterative Kanban: per-agent + board flow metrics. Non-admins pass an
     // agent_id and see only that agent's slice.
     flowMetrics: (agentId?: string) =>
@@ -6814,27 +6758,6 @@ export const api = {
         changes: string[];
         message: string;
       }>,
-  },
-  governance: {
-    /** List policies. Omit agent_id for global + every per-agent file. */
-    list: (agentId?: string) =>
-      client.call('governance.list', agentId ? { agent_id: agentId } : {}) as Promise<{
-        policies: GovPolicy[];
-      }>,
-    /** Create or replace a policy (matched by policy_id within its scope). */
-    upsert: (policy: GovPolicy) =>
-      client.call('governance.upsert', { ...policy }) as Promise<{
-        success: boolean;
-        scope: string;
-        policy_id: string;
-        created: boolean;
-        message: string;
-      }>,
-    remove: (policyId: string, agentId?: string) =>
-      client.call('governance.remove', {
-        policy_id: policyId,
-        ...(agentId ? { agent_id: agentId } : {}),
-      }) as Promise<{ success: boolean; removed: string }>,
   },
   wikiScope: {
     get: () =>

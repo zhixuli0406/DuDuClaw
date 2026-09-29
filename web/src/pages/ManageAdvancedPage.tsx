@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { ChevronRight, Settings } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
+import { useDecisionEnabled } from '@/hooks/useDecisionEnabled';
 import { filterVisible } from '@/lib/nav-visibility';
 import { manageAdvancedNav } from '@/components/layout/nav-model';
 import { Empty } from '@/components/mds';
@@ -20,7 +21,11 @@ export function ManageAdvancedPage() {
   const intl = useIntl();
   const role = useAuthStore((s) => s.user?.role);
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
-  const items = filterVisible(manageAdvancedNav, role, isPersonal);
+  // Same operator kill switches the rail honours (today: Decision Lab), so the
+  // index and the rail can never disagree about which surfaces exist.
+  const items = filterVisible(manageAdvancedNav, role, isPersonal, {
+    decisionEnabled: useDecisionEnabled(),
+  });
 
   if (items.length === 0) {
     return (

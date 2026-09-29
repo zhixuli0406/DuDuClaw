@@ -43,6 +43,7 @@ import { isVisible } from '@/lib/nav-visibility';
 import { isTauri } from '@/lib/gateway-picker';
 import { useForksExist } from '@/hooks/useForksExist';
 import { useIsAppliance } from '@/hooks/useIsAppliance';
+import { useDecisionEnabled } from '@/hooks/useDecisionEnabled';
 import { CharacterAvatar } from '@/components/character';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useSystemStore } from '@/stores/system-store';
@@ -242,6 +243,8 @@ export function CommandPalette() {
   const forksExist = useForksExist(hasMinRole(user?.role, 'manager'));
   // Progressive disclosure for /device (WP-C) — same signal the Sidebar uses.
   const isAppliance = useIsAppliance(hasMinRole(user?.role, 'admin'));
+  // Operator kill switch for the Decision Lab row — same signal the rail uses.
+  const decisionEnabled = useDecisionEnabled();
   const setTheme = useThemeStore((s) => s.setTheme);
   const setLocale = useLocaleStore((s) => s.setLocale);
 
@@ -349,6 +352,9 @@ export function CommandPalette() {
       isDesktop: isTauri(),
       agentCount: agents.length,
       isAppliance,
+      // X1 (2026-09-29): ⌘K must not offer a page whose whole HTTP surface the
+      // operator turned off — the palette is the one way into `/manage/*` rows.
+      decisionEnabled,
     };
     const navCommands: Command[] = navSources
       .filter(({ item }) => isVisible(item, user?.role, isPersonal, visibilityCtx))
@@ -450,7 +456,7 @@ export function CommandPalette() {
         }];
 
     return [...navCommands, ...manageCommands, ...agentCommands, ...taskCommands, ...themeActions, ...localeActions, ...logoutAction];
-  }, [t, user?.role, hasOperatorAccess, forksExist, isAppliance, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout]);
+  }, [t, user?.role, hasOperatorAccess, forksExist, isAppliance, decisionEnabled, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout]);
 
   // Empty query → recent routes first, then all commands in natural order.
   const results = useMemo<ScoredCommand[]>(() => {

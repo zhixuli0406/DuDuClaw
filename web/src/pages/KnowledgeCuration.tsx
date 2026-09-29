@@ -320,7 +320,7 @@ export function ProvenancePanel({
         <div className="flex justify-end">
           <CrossLink
             label={intl.formatMessage({ id: 'crosslink.provenance.wikiTrustLink' })}
-            onClick={() => navigate('/manage/governance?tab=wikiTrust')}
+            onClick={() => navigate('/manage/wiki-trust')}
           />
         </div>
 

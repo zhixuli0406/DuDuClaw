@@ -70,7 +70,11 @@ describe('<AutomationTab> acceptance judge (dispatch.judge, WP-6B)', () => {
     );
   });
 
-  it('reflects a saved evaluator_only mode from system.config', async () => {
+  // T5/O12 (feature audit 2026-09-29): `evaluator_only` / `human_only` are
+  // deprecated. The gateway still parses and honours them, so a deployment
+  // already on one must keep seeing its own value — marked as deprecated —
+  // rather than have the picker silently show a mode that is not on disk.
+  it('reflects a saved evaluator_only mode from system.config, labelled deprecated', async () => {
     configMock.mockResolvedValue(configWithJudge('evaluator_only'));
     renderWithProviders(<AutomationTab />);
 
@@ -80,9 +84,10 @@ describe('<AutomationTab> acceptance judge (dispatch.judge, WP-6B)', () => {
         'Quick mode: a lighter first-pass check only, review is more lenient — good for low-risk routine tasks'
       )
     );
+    expect(trigger).toHaveTextContent('deprecated');
   });
 
-  it('lists all four judge modes and lets the user switch between them', async () => {
+  it('offers only the two supported judge modes and lets the user switch between them', async () => {
     const user = userEvent.setup();
     renderWithProviders(<AutomationTab />);
     await waitFor(() => expect(configMock).toHaveBeenCalled());
@@ -98,49 +103,50 @@ describe('<AutomationTab> acceptance judge (dispatch.judge, WP-6B)', () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole('option', {
-        name: 'Quick mode: a lighter first-pass check only, review is more lenient — good for low-risk routine tasks',
-      })
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole('option', {
         name: 'External judge: hand the decision to your own program, configured in config.toml',
       })
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole('option', {
-        name: 'Always human review: every finished item waits for your personal confirmation',
-      })
-    ).toBeInTheDocument();
+    // The two deprecated modes are no longer offered as a new choice.
+    expect(screen.queryByRole('option', { name: /Quick mode/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Always human review/ })).not.toBeInTheDocument();
 
     await user.click(
       screen.getByRole('option', {
-        name: 'Always human review: every finished item waits for your personal confirmation',
+        name: 'External judge: hand the decision to your own program, configured in config.toml',
       })
     );
     await waitFor(() =>
       expect(trigger).toHaveTextContent(
-        'Always human review: every finished item waits for your personal confirmation'
+        'External judge: hand the decision to your own program, configured in config.toml'
       )
     );
   });
 
-  it('shows a risk callout only in quick (evaluator_only) mode', async () => {
+  it('keeps a deprecated saved mode selectable in the list instead of dropping it', async () => {
     const user = userEvent.setup();
+    configMock.mockResolvedValue(configWithJudge('human_only'));
+    renderWithProviders(<AutomationTab />);
+    await waitFor(() => expect(configMock).toHaveBeenCalled());
+
+    await user.click(await screen.findByRole('combobox', { name: 'Acceptance judge' }));
+    await screen.findByRole('listbox');
+    expect(screen.getByRole('option', { name: /Always human review.*deprecated/ })).toBeInTheDocument();
+    // …and the other deprecated mode, which is NOT the saved value, stays out.
+    expect(screen.queryByRole('option', { name: /Quick mode/ })).not.toBeInTheDocument();
+  });
+
+  it('shows a risk callout only in quick (evaluator_only) mode', async () => {
+    // Default (mav): no risk callout, no external-command hint.
     renderWithProviders(<AutomationTab />);
     await waitFor(() => expect(configMock).toHaveBeenCalled());
     await screen.findByRole('combobox', { name: 'Acceptance judge' });
-
-    // Default (mav): no risk callout, no external-command hint.
     expect(screen.queryByText(/Risk: Quick mode/)).not.toBeInTheDocument();
     expect(screen.queryByText(/judge_command/)).not.toBeInTheDocument();
+  });
 
-    await user.click(screen.getByRole('combobox', { name: 'Acceptance judge' }));
-    await screen.findByRole('listbox');
-    await user.click(
-      screen.getByRole('option', {
-        name: 'Quick mode: a lighter first-pass check only, review is more lenient — good for low-risk routine tasks',
-      })
-    );
+  it('still shows the quick-mode risk callout for a deployment saved on evaluator_only', async () => {
+    configMock.mockResolvedValue(configWithJudge('evaluator_only'));
+    renderWithProviders(<AutomationTab />);
     expect(await screen.findByText(/Risk: Quick mode/)).toBeInTheDocument();
   });
 

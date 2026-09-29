@@ -25,7 +25,7 @@ import type {
  *  - This module intentionally has ZERO runtime code — it is a pure type
  *    contract. The actual gate/confirm/approve logic each card enforces
  *    lives in the card component itself and always goes through the same
- *    gated `api.device.*` / `api.approvals.*` calls DevicePage/ApprovalsPage
+ *    gated `api.device.*` / `api.approvals.*` calls DevicePage/the inbox
  *    use (see coding convention #4 in CLAUDE.md: UI never invents its own
  *    authority — it only triggers the existing gate).
  *

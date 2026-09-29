@@ -63,8 +63,8 @@ describe('MemoryPage', () => {
             mode: 'prediction_driven',
             total_agents: 1,
             gvu_enabled_count: 1,
-            total_versions: 0,
-            last_applied_at: null,
+            total_rounds: 0,
+            applied_rounds: 0,
             agents: [{
               agent_id: 'agent-a',
               gvu_enabled: true,
@@ -72,20 +72,14 @@ describe('MemoryPage', () => {
               skill_auto_activate: true,
               skill_security_scan: true,
               max_silence_hours: 12,
-              max_gvu_generations: 3,
-              observation_period_hours: 24,
             }],
           });
-        case 'evolution.versions':
-          return Promise.resolve({ versions: [] });
         case 'evolution.stagnation':
           return Promise.resolve({
             snapshots: [{ agent_id: 'agent-a', is_stagnant: false, signals: [], summary: null, checked_at: '' }],
           });
         case 'evolution.telemetry':
           return Promise.resolve({ agent_id: 'agent-a', days: 7, total: 0, by_stage_layer: {} });
-        case 'evolution.consolidations':
-          return Promise.resolve({ consolidations: [] });
         case 'playbook.list':
           return Promise.resolve({ agent_id: 'agent-a', entries: [] });
         default:
@@ -116,15 +110,11 @@ describe('MemoryPage', () => {
         case 'agents.list':
           return Promise.resolve({ agents: [{ name: 'agent-a', display_name: 'Agent A' }] });
         case 'evolution.status':
-          return Promise.resolve({ enabled: true, mode: 'prediction_driven', total_agents: 1, gvu_enabled_count: 1, total_versions: 0, last_applied_at: null, agents: [] });
-        case 'evolution.versions':
-          return Promise.resolve({ versions: [] });
+          return Promise.resolve({ enabled: true, mode: 'prediction_driven', total_agents: 1, gvu_enabled_count: 1, total_rounds: 0, applied_rounds: 0, agents: [] });
         case 'evolution.stagnation':
           return Promise.resolve({ snapshots: [] });
         case 'evolution.telemetry':
           return Promise.resolve({ agent_id: 'agent-a', days: 7, total: 0, by_stage_layer: {} });
-        case 'evolution.consolidations':
-          return Promise.resolve({ consolidations: [] });
         case 'playbook.list':
           return Promise.resolve({
             agent_id: 'agent-a',
@@ -183,15 +173,11 @@ describe('MemoryPage', () => {
         case 'agents.list':
           return Promise.resolve({ agents: [{ name: 'agent-a', display_name: 'Agent A' }] });
         case 'evolution.status':
-          return Promise.resolve({ enabled: true, mode: 'prediction_driven', total_agents: 1, gvu_enabled_count: 1, total_versions: 0, last_applied_at: null, agents: [] });
-        case 'evolution.versions':
-          return Promise.resolve({ versions: [] });
+          return Promise.resolve({ enabled: true, mode: 'prediction_driven', total_agents: 1, gvu_enabled_count: 1, total_rounds: 0, applied_rounds: 0, agents: [] });
         case 'evolution.stagnation':
           return Promise.resolve({ snapshots: [] });
         case 'evolution.telemetry':
           return Promise.resolve({ agent_id: 'agent-a', days: 7, total: 0, by_stage_layer: {} });
-        case 'evolution.consolidations':
-          return Promise.resolve({ consolidations: [] });
         case 'playbook.list':
           return Promise.resolve({
             agent_id: 'agent-a',

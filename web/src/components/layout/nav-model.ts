@@ -25,7 +25,6 @@ import {
   FlaskConical,
   Activity,
   Shield,
-  Scale,
   KeyRound,
   Settings,
   FileText,
@@ -50,6 +49,8 @@ import {
   ShieldCheck,
   HardDrive,
   Bot,
+  GitBranch,
+  Database,
 } from 'lucide-react';
 import type { UserRole } from '@/stores/auth-store';
 import type { Gated } from '@/lib/nav-visibility';
@@ -633,7 +634,26 @@ export const manageAdvancedNav: NavItem[] = [
   // a finding is closer to `analytics.*`'s bar than the credential-rotation
   // surfaces above it.
   { to: '/manage/secaudit', icon: ShieldCheck, label: 'manage.secaudit', desc: 'manage.secaudit.desc', minRole: 'manager', newIn: '1.62.0' },
-  { to: '/manage/governance', icon: Scale, label: 'manage.governance', desc: 'manage.governance.desc', minRole: 'admin', enterprise: true },
+  // Causal Curation / Decision Lab / CCR Dashboard (2026-09) — three
+  // admin-only evidence/audit surfaces that previously had NO sidebar entry
+  // at all, only a card on `/app/system`'s own launcher page (code review
+  // finding: a page with no nav-model row cannot carry a `newIn` badge
+  // anywhere). Grouped with 安全／安全審計 above: all three are read-mostly
+  // inspection tools over evidence the system already collected, not
+  // day-to-day operational surfaces.
+  { to: '/app/system/causal', icon: GitBranch, label: 'causalCuration.title', desc: 'causalCuration.desc', minRole: 'admin', newIn: '1.66.0' },
+  // `requiresFeature: 'decision'` (2026-09-29 audit X1): `config.toml
+  // [decision] enabled = false` already 404s the whole `/api/decision/*`
+  // surface, so this row disappears with it instead of pointing at a page that
+  // could only fail. Fail-open — an older gateway that reports no
+  // `decision_enabled` keeps the row (see `nav-visibility.ts`).
+  { to: '/app/system/decision-lab', icon: FlaskConical, label: 'decisionLab.title', desc: 'decisionLab.cardDescription', minRole: 'admin', newIn: '1.66.0', requiresFeature: 'decision' },
+  { to: '/app/system/ccr', icon: Database, label: 'ccrDashboard.title', desc: 'ccrDashboard.cardDescription', minRole: 'admin', newIn: '1.66.0' },
+  // G2 (2026-09 feature audit): was `/manage/governance` (Governance +
+  // Wiki trust tabs). The Governance Layer had no enforcer — the crate
+  // behind it was removed in b0639b96 — so the row now points straight at
+  // the tab that was real. `/manage/governance` redirects here.
+  { to: '/manage/wiki-trust', icon: Shield, label: 'wikiTrust.title', desc: 'wikiTrust.navDesc', minRole: 'admin', enterprise: true },
   { to: '/manage/users', icon: Users, label: 'manage.users', desc: 'manage.users.desc', minRole: 'admin', enterprise: true },
   // Departments are an org grouping — an Enterprise concept. Personal is a
   // single-owner form factor with no departments, so this page (and the

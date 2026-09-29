@@ -172,6 +172,7 @@ export function TickSourcesCard() {
 
   const sources = data?.sources ?? [];
   const screen = data?.screen;
+  const preset = data?.preset ?? null;
 
   return (
     <Card>
@@ -183,6 +184,16 @@ export function TickSourcesCard() {
               {intl.formatMessage({ id: 'autopilot.monitor.title' })}
             </CardTitle>
             <CardDescription>{intl.formatMessage({ id: 'autopilot.monitor.subtitle' })}</CardDescription>
+            {preset && (
+              <div className="mt-2 flex items-center gap-2">
+                <Badge variant="secondary">
+                  {intl.formatMessage({ id: `autopilot.monitor.preset.${preset}` })}
+                </Badge>
+                <span className="text-xs text-muted-foreground">
+                  {intl.formatMessage({ id: 'autopilot.monitor.preset.hint' })}
+                </span>
+              </div>
+            )}
           </div>
           <Button
             variant="ghost"

@@ -57,6 +57,24 @@ describe('nav-visibility (dashboard-redesign WP11-T11.1)', () => {
     expect(isVisible(device, 'admin', true, { isAppliance: false })).toBe(false);
   });
 
+  // X1 (2026-09-29 audit) — the one deliberately fail-OPEN gate: an operator
+  // kill switch read out of `system.status`. Only an explicit `false` hides the
+  // surface, so a gateway too old to report the field (or a status that has not
+  // landed yet) keeps showing a feature that is in fact live.
+  it('requiresFeature "decision" fails OPEN and hides only on an explicit false', () => {
+    const lab: Gated = { requiresFeature: 'decision' };
+    expect(isVisible(lab, 'admin', false)).toBe(true); // no ctx at all
+    expect(isVisible(lab, 'admin', false, {})).toBe(true); // field absent
+    expect(isVisible(lab, 'admin', false, { decisionEnabled: undefined })).toBe(true);
+    expect(isVisible(lab, 'admin', false, { decisionEnabled: true })).toBe(true);
+    expect(isVisible(lab, 'admin', false, { decisionEnabled: false })).toBe(false);
+    // Same on Personal — this is an operator preference, not an edition split.
+    expect(isVisible(lab, 'admin', true, { decisionEnabled: false })).toBe(false);
+    expect(isVisible(lab, 'admin', true, { decisionEnabled: true })).toBe(true);
+    // An untagged item is never touched by the switch.
+    expect(isVisible({}, 'admin', false, { decisionEnabled: false })).toBe(true);
+  });
+
   it('filterVisible applies every gate together', () => {
     const items: Gated[] = [
       { minRole: 'admin' },

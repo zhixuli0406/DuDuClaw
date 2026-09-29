@@ -130,3 +130,39 @@ describe('OdooPage per-agent override summary — unblock_models edit path', () 
     ).toBeInTheDocument();
   });
 });
+
+/**
+ * G4 (2026-09 feature audit): the polling switch now really starts a
+ * background task against the customer's ERP. Before the poller existed the
+ * form defaulted it to ON, which was harmless only because nothing consumed
+ * the setting — so this pins the default to OFF from the UI side, matching
+ * `OdooConfig::default()` and `odoo.configure`'s own absent-param default.
+ */
+describe('OdooPage polling default', () => {
+  it('renders the polling switch OFF when the backend has no value for it', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'odoo.config') {
+        // A config that predates the polling keys entirely.
+        return Promise.resolve({ url: '', db: '', protocol: 'jsonrpc' });
+      }
+      return Promise.resolve({ connected: false, agents: [] });
+    });
+    renderWithProviders(<OdooPage />);
+
+    const toggle = await screen.findByRole('switch', { name: 'Enable polling sync' });
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
+  });
+
+  it('still reflects an explicitly enabled backend value', async () => {
+    mockWsClient.call.mockImplementation((method: string) => {
+      if (method === 'odoo.config') {
+        return Promise.resolve({ url: '', db: '', poll_enabled: true });
+      }
+      return Promise.resolve({ connected: false, agents: [] });
+    });
+    renderWithProviders(<OdooPage />);
+
+    const toggle = await screen.findByRole('switch', { name: 'Enable polling sync' });
+    expect(toggle).toHaveAttribute('aria-checked', 'true');
+  });
+});

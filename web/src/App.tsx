@@ -38,7 +38,7 @@ const WidgetsPage = lazyPage(() => import('./pages/WidgetsPage'), 'WidgetsPage')
 const WidgetComposerPage = lazyPage(() => import('./pages/WidgetComposerPage'), 'WidgetComposerPage');
 const IntegrationsPage = lazyPage(() => import('./pages/IntegrationsPage'), 'IntegrationsPage');
 const BillingShell = lazyPage(() => import('./pages/BillingShell'), 'BillingShell');
-const GovernanceShell = lazyPage(() => import('./pages/GovernanceShell'), 'GovernanceShell');
+const WikiTrustPage = lazyPage(() => import('./pages/WikiTrustPage'), 'WikiTrustPage');
 const LicenseShell = lazyPage(() => import('./pages/LicenseShell'), 'LicenseShell');
 const WebChatPage = lazyPage(() => import('./pages/WebChatPage'), 'WebChatPage');
 // O-2 (`DESIGN-agent-os-native-apps-2026-08.md` §6.3) — the conversational
@@ -69,7 +69,6 @@ const ChannelsPage = lazyPage(() => import('./pages/ChannelsPage'), 'ChannelsPag
 const AccountsPage = lazyPage(() => import('./pages/AccountsPage'), 'AccountsPage');
 const SecurityPage = lazyPage(() => import('./pages/SecurityPage'), 'SecurityPage');
 const SecauditPage = lazyPage(() => import('./pages/SecauditPage'), 'SecauditPage');
-const GovernancePage = lazyPage(() => import('./pages/GovernancePage'), 'GovernancePage');
 const ReliabilityPage = lazyPage(() => import('./pages/ReliabilityPage'), 'ReliabilityPage');
 const SettingsPage = lazyPage(() => import('./pages/SettingsPage'), 'SettingsPage');
 const InferencePage = lazyPage(() => import('./pages/InferencePage'), 'InferencePage');
@@ -84,6 +83,9 @@ const WelcomePage = lazyPage(() => import('./pages/WelcomePage'), 'WelcomePage')
 const LauncherPage = lazyPage(() => import('./pages/LauncherPage'), 'LauncherPage');
 // N-3 (§5 WP N-3) — the 系統設定 app's own `/app/system` settings-hub home.
 const SystemHomePage = lazyPage(() => import('./pages/SystemHomePage'), 'SystemHomePage');
+const CausalCurationPage = lazyPage(() => import('./pages/CausalCurationPage'), 'CausalCurationPage');
+const DecisionLabPage = lazyPage(() => import('./pages/DecisionLabPage'), 'DecisionLabPage');
+const CcrDashboardPage = lazyPage(() => import('./pages/CcrDashboardPage'), 'CcrDashboardPage');
 // v2 redesign lazy placeholder pages (T1.5) — replaced in place by later waves.
 const TaskDetailPage = lazyPage(() => import('./pages/TaskDetailPage'), 'TaskDetailPage');
 const SkillNewPage = lazyPage(() => import('./pages/SkillNewPage'), 'SkillNewPage');
@@ -320,6 +322,9 @@ export function App() {
                   <Route path="updates" element={<SystemUpdatePage />} />
                   <Route path="accounts" element={<AccountsPage />} />
                   <Route path="security" element={<SecurityPage />} />
+                  <Route path="causal" element={<CausalCurationPage />} />
+                  <Route path="decision-lab" element={<DecisionLabPage />} />
+                  <Route path="ccr" element={<CcrDashboardPage />} />
                   <Route path="settings" element={<SettingsPage />} />
                 </Route>
                 <Route element={<RoleGuard minRole="manager" />}>
@@ -403,7 +408,14 @@ export function App() {
                       under D9) stay reachable on purpose — see the guard's own
                       note. */}
                   <Route element={<EditionGuard enterprise />}>
-                    <Route path="governance" element={<GovernanceShell />} />
+                    {/* G2 (2026-09 feature audit): the Governance Layer
+                        (policies/*.yaml, zero enforcer since the
+                        `duduclaw-governance` crate was removed in b0639b96)
+                        is gone. The shell's only remaining tab was Wiki
+                        trust, so it is now a page of its own and the old
+                        path redirects to it — bookmarks keep working. */}
+                    <Route path="wiki-trust" element={<WikiTrustPage />} />
+                    <Route path="governance" element={<Navigate to="/manage/wiki-trust" replace />} />
                     <Route path="users" element={<UsersPage />} />
                     <Route path="departments" element={<DepartmentsPage />} />
                     <Route path="distributors" element={<DistributorsPage />} />
@@ -440,7 +452,7 @@ export function App() {
                   `/app/system/license` instead of bouncing through the
                   now-also-redirecting `/manage/license`. */}
               <Route path="partner" element={<Navigate to="/app/system/license" replace />} />
-              <Route path="wiki-trust" element={<Navigate to="/manage/governance?tab=wikiTrust" replace />} />
+              <Route path="wiki-trust" element={<Navigate to="/manage/wiki-trust" replace />} />
               <Route element={<RoleGuard minRole="manager" />}>
                 <Route path="billing" element={<BillingPage />} />
                 {/* 授權 relocated to `/app/system/license` (N-3) — this legacy
@@ -465,7 +477,10 @@ export function App() {
                     canonical routes above, so neither can be used to walk around
                     the other. */}
                 <Route element={<EditionGuard enterprise />}>
-                  <Route path="governance" element={<GovernancePage />} />
+                  {/* G2: the legacy alias used to render the bare
+                      `GovernancePage` (C-9 — it never had the Wiki trust
+                      tab). Both now land on the same canonical page. */}
+                  <Route path="governance" element={<Navigate to="/manage/wiki-trust" replace />} />
                   <Route path="users" element={<UsersPage />} />
                 </Route>
               </Route>

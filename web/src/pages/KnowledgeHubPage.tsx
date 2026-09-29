@@ -661,7 +661,7 @@ function HealthView({ agentId }: { agentId: string }) {
         <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'wiki.health.trustScoreHint' })}</p>
         <CrossLink
           label={intl.formatMessage({ id: 'wiki.health.trustScoreLink' })}
-          onClick={() => navigate('/manage/governance?tab=wikiTrust')}
+          onClick={() => navigate('/manage/wiki-trust')}
         />
       </div>
 

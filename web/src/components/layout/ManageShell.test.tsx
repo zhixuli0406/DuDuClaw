@@ -123,7 +123,7 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
   it('hides enterprise-only items on the personal edition', () => {
     useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
     renderManage('/manage/billing');
-    expect(screen.queryByRole('link', { name: en['manage.governance'] })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: en['wikiTrust.title'] })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.users'] })).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: en['manage.departments'] })).not.toBeInTheDocument();
     // Non-gated items in the same sub-list stay visible.
@@ -185,7 +185,13 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
       // 2026-08 §3.1).
       en['manage.security'],
       en['manage.secaudit'],
-      en['manage.governance'],
+      // 2026-09 evidence/audit surfaces (Causal Curation, Decision Lab, CCR
+      // Store) ride with 安全／安全審計: read-mostly inspection over evidence
+      // the system already collected, admin-only, all three `newIn: 1.66.0`.
+      en['causalCuration.title'],
+      en['decisionLab.title'],
+      en['ccrDashboard.title'],
+      en['wikiTrust.title'],
       en['manage.users'],
       en['manage.departments'],
       // 維運 — 低頻・低重要; 可靠性 and 模型用量 stay adjacent (§2-14).
@@ -205,6 +211,35 @@ describe('ManageShell (five-row rail, 2026-08-04 D18)', () => {
       // catch-all last.
       en['manage.system'],
     ]);
+  });
+
+  // X1 落日條款 (2026-09-29 audit): `config.toml [decision] enabled = false`
+  // already 404s every `/api/decision/*` route, so the rail row goes with it
+  // rather than pointing at a page that can only fail. Fail-open — the field
+  // absent (an older gateway, or a status that has not landed) keeps the row,
+  // which is why every other test in this file still sees it.
+  it('drops the Decision Lab row when the operator disabled it, and keeps it otherwise', () => {
+    useSystemStore.setState({
+      status: { edition_profile: 'enterprise', decision_enabled: false } as never,
+    });
+    const { unmount } = renderManage('/manage/billing');
+    expect(screen.queryByRole('link', { name: en['decisionLab.title'] })).not.toBeInTheDocument();
+    // Its two neighbours in the same cluster are untouched.
+    expect(screen.getByRole('link', { name: en['causalCuration.title'] })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: en['ccrDashboard.title'] })).toBeInTheDocument();
+    unmount();
+
+    useSystemStore.setState({
+      status: { edition_profile: 'enterprise', decision_enabled: true } as never,
+    });
+    const second = renderManage('/manage/billing');
+    expect(screen.getByRole('link', { name: en['decisionLab.title'] })).toBeInTheDocument();
+    second.unmount();
+
+    // Field absent ⇒ visible (fail-open), byte-identical to pre-X1 behaviour.
+    useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
+    renderManage('/manage/billing');
+    expect(screen.getByRole('link', { name: en['decisionLab.title'] })).toBeInTheDocument();
   });
 
   it('redirects bare /manage to the first surface the viewer can see', () => {

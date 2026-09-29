@@ -61,6 +61,20 @@ export interface Gated {
    * gate is the gateway's own `require_appliance!()`, fail-closed).
    */
   readonly requiresData?: 'forks' | 'org' | 'appliance';
+  /**
+   * Hidden while the operator has switched the named feature OFF in
+   * `config.toml`. `'decision'` = `[decision] enabled = false`, which already
+   * 404s every `/api/decision/*` route — leaving the nav row visible would
+   * advertise a page that can only fail.
+   *
+   * Unlike every gate above, this one fails **OPEN**: an unknown state (older
+   * gateway with no `decision_enabled` field, or `system.status` not fetched
+   * yet) keeps the surface visible, so a missing field can never make a live
+   * feature disappear. That is the right default because this is presentation
+   * of an operator preference, not access control — the gateway's own 404
+   * middleware is the real gate.
+   */
+  readonly requiresFeature?: 'decision';
 }
 
 /** Minimum AI-employee headcount before the org chart earns a nav slot (D6). */
@@ -83,6 +97,11 @@ export interface VisibilityContext {
    *  appliance image (fail-closed: undefined/unresolved counts as false,
    *  same default-hidden posture as `forksExist`/`agentCount`). */
   readonly isAppliance?: boolean;
+  /** `config.toml [decision] enabled`, as `system.status` reported it. Only
+   *  `false` hides a `requiresFeature: 'decision'` surface; `undefined` (older
+   *  gateway, or status not loaded yet) keeps it visible — see
+   *  `Gated.requiresFeature`, the one deliberately fail-open gate here. */
+  readonly decisionEnabled?: boolean;
 }
 
 export function isVisible(
@@ -102,6 +121,8 @@ export function isVisible(
   if (item.requiresData === 'forks' && !ctx?.forksExist) return false;
   if (item.requiresData === 'org' && (ctx?.agentCount ?? 0) < ORG_CHART_MIN_AGENTS) return false;
   if (item.requiresData === 'appliance' && !ctx?.isAppliance) return false;
+  // Operator kill switch — fail OPEN: only an explicit `false` hides the row.
+  if (item.requiresFeature === 'decision' && ctx?.decisionEnabled === false) return false;
   return true;
 }
 

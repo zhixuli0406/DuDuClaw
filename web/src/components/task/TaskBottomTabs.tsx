@@ -9,6 +9,7 @@ import {
   FileDiff,
   FolderOpen,
   Package,
+  UsersRound,
 } from 'lucide-react';
 import {
   Tabs,
@@ -25,6 +26,7 @@ import type { AssigneeOption } from './AssigneePopover';
 import { TaskChangesList } from './TaskChangesPanel';
 import { TaskArtifactsList } from './TaskArtifactsPanel';
 import { TaskFilesPanel } from './TaskFilesPanel';
+import { TaskRolesPanel } from './TaskRolesPanel';
 import { useTaskArtifacts, useTaskChanges } from './useTaskEvidence';
 
 /**
@@ -91,7 +93,7 @@ function Ago({ ts }: { ts: string }) {
   return <span className="font-mono text-xs tabular-nums text-muted-foreground">{timeAgo(ts)}</span>;
 }
 
-type BottomTab = 'artifacts' | 'files' | 'changes' | 'process';
+type BottomTab = 'artifacts' | 'files' | 'changes' | 'process' | 'roles';
 
 export function TaskBottomTabs({
   taskId,
@@ -128,8 +130,10 @@ export function TaskBottomTabs({
   // fetched only once the user actually opens it, then kept mounted (see
   // `keepMounted` below) so a later switch away and back never re-fetches.
   const [filesVisited, setFilesVisited] = useState(false);
+  const [rolesVisited, setRolesVisited] = useState(false);
   useEffect(() => {
     if (tab === 'files') setFilesVisited(true);
+    if (tab === 'roles') setRolesVisited(true);
   }, [tab]);
 
   const artifactsState = useTaskArtifacts(taskId);
@@ -201,6 +205,12 @@ export function TaskBottomTabs({
           {intl.formatMessage({ id: 'tasks.tab.process' })}
           {count(merged.length)}
         </TabsTab>
+        {taskId && (
+          <TabsTab value="roles" className="shrink-0">
+            <UsersRound />
+            {intl.formatMessage({ id: 'tasks.tab.roles' })}
+          </TabsTab>
+        )}
       </TabsList>
 
       {/* keepMounted on every panel: switching tabs must never unmount one —
@@ -235,6 +245,12 @@ export function TaskBottomTabs({
             loading={changesState.loading}
             error={changesState.error}
           />
+        </TabsPanel>
+      )}
+
+      {taskId && (
+        <TabsPanel value="roles" keepMounted>
+          {rolesVisited && <TaskRolesPanel taskId={taskId} />}
         </TabsPanel>
       )}
 

@@ -129,6 +129,12 @@ export function RedactionAiDetectionRow({
               <Badge className="bg-brand/10 text-brand">{t('redaction.aiDetect.chip.localModel')}</Badge>
             </span>
             <span className="mt-1 block text-xs text-muted-foreground">{t('redaction.aiDetect.desc')}</span>
+            {/* K4 (2026-09-29 feature audit): the measured limits belong next
+                to the description, where an operator reads them BEFORE ticking
+                the box — not only inside the expanded warning below, which
+                appears after the decision has already been made. Numbers come
+                from docs/features/55-data-sources.md, not from a hedge. */}
+            <span className="mt-1 block text-xs text-warning">{t('redaction.aiDetect.limits')}</span>
           </span>
         </label>
 

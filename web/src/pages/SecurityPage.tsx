@@ -35,8 +35,6 @@ import {
 import { cn } from '@/lib/utils';
 import {
   Shield,
-  Lock,
-  ShieldCheck,
   Users,
   AlertTriangle,
   FileWarning,
@@ -45,8 +43,14 @@ import {
 } from 'lucide-react';
 
 interface SecurityStatus {
-  credential_proxy: { active: boolean; vault_backend: string; injected_secrets: number };
-  mount_guard: { rules: Array<{ path: string; access: string }> };
+  // G2 (2026-09 feature audit): `credential_proxy` and `mount_guard` were
+  // removed. The `duduclaw-security::credential_proxy` / `mount_guard`
+  // modules behind those names were deleted (zero callers), and the numbers
+  // the RPC returned described something else entirely — the "injected
+  // secrets" count was the *gateway's own* env vars matching API_KEY/TOKEN/
+  // SECRET, which the v1.61 spawn-env allowlist scrubs out of agent spawns,
+  // and the "mount guard rules" were the first agent's container mounts
+  // rendered as if they were a global policy.
   rbac: Array<{
     agent_id: string; role: string;
     tool_use: boolean; web_access: boolean;
@@ -113,18 +117,6 @@ export function SecurityPage() {
           label={intl.formatMessage({ id: 'security.concurrent' })}
           value={status?.rate_limiter?.concurrent_requests ?? 5}
         />
-        {!isPersonal && (
-          <>
-            <KpiCell
-              label={intl.formatMessage({ id: 'security.injectedSecrets' })}
-              value={status?.credential_proxy?.injected_secrets ?? 0}
-            />
-            <KpiCell
-              label={intl.formatMessage({ id: 'security.mountGuard.title' })}
-              value={status?.mount_guard?.rules?.length ?? 0}
-            />
-          </>
-        )}
       </div>
 
       {/* Credential hygiene (WP-K) — visible to every edition. The 2026-08-15
@@ -166,42 +158,9 @@ export function SecurityPage() {
               onViewFull={() => navigate('/manage/logs?source=security')}
             />
 
-            {/* Credential Proxy */}
-            <SecurityCard
-              icon={Lock}
-              title={intl.formatMessage({ id: 'security.credentialProxy.title' })}
-              description={intl.formatMessage({ id: 'security.credentialProxy.desc' })}
-            >
-              <div className="space-y-3">
-                <StatusRow
-                  label={intl.formatMessage({ id: 'security.proxyStatus' })}
-                  status={status?.credential_proxy?.active ? 'active' : 'inactive'}
-                />
-                <StatusRow
-                  label={intl.formatMessage({ id: 'security.vaultBackend' })}
-                  value={status?.credential_proxy?.vault_backend ?? '—'}
-                />
-              </div>
-            </SecurityCard>
-
-            {/* Mount Guard */}
-            <SecurityCard
-              icon={ShieldCheck}
-              title={intl.formatMessage({ id: 'security.mountGuard.title' })}
-              description={intl.formatMessage({ id: 'security.mountGuard.desc' })}
-            >
-              <div className="space-y-2">
-                {status?.mount_guard?.rules && status.mount_guard.rules.length > 0 ? (
-                  status.mount_guard.rules.map((rule) => (
-                    <RuleRow key={rule.path} path={rule.path} access={rule.access} />
-                  ))
-                ) : (
-                  <p className="py-2 text-center text-sm text-muted-foreground">
-                    {intl.formatMessage({ id: 'common.noData' })}
-                  </p>
-                )}
-              </div>
-            </SecurityCard>
+            {/* G2 (2026-09 feature audit): the Credential Proxy and Mount
+                Guard cards were removed — see the `SecurityStatus` comment
+                above for what the numbers behind them actually measured. */}
 
             {/* RBAC */}
             <SecurityCard
@@ -210,18 +169,12 @@ export function SecurityPage() {
               description={intl.formatMessage({ id: 'security.rbac.desc' })}
               className="lg:col-span-2"
             >
-              {/* UX audit §2-12 — this table is a read-only mirror; the actual
-                  editable "which actions require approval" policy lives on the
-                  Governance page, on an unrelated nav branch with no link back. */}
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-muted/40 px-3 py-2">
-                <p className="text-xs text-muted-foreground">
-                  {intl.formatMessage({ id: 'security.rbac.editHint' })}
-                </p>
-                <CrossLink
-                  label={intl.formatMessage({ id: 'security.rbac.editLink' })}
-                  onClick={() => navigate('/manage/governance?tab=governance')}
-                />
-              </div>
+              {/* G2 (2026-09 feature audit): the cross-link that used to sit
+                  here pointed at the Governance page, whose policies had no
+                  enforcer at all — it promised an edit surface that changed
+                  nothing. Governance is gone; the real "which actions require
+                  approval" setting is `agent.toml [capabilities]
+                  approval_required_tools`, edited per AI employee. */}
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -617,49 +570,5 @@ function SecurityCard({
   );
 }
 
-function StatusRow({
-  label,
-  status,
-  value,
-}: {
-  label: string;
-  status?: string;
-  value?: string;
-}) {
-  const intl = useIntl();
-  return (
-    <div className="flex items-center justify-between text-sm">
-      <span className="text-muted-foreground">{label}</span>
-      {status === 'active' ? (
-        <Badge variant="secondary" className="bg-success/15 text-success">
-          <Shield className="size-3" />
-          {intl.formatMessage({ id: 'security.active' })}
-        </Badge>
-      ) : status === 'inactive' ? (
-        <Badge variant="outline">{intl.formatMessage({ id: 'security.inactive' })}</Badge>
-      ) : (
-        <span className="font-mono text-sm font-medium text-foreground">
-          {value}
-        </span>
-      )}
-    </div>
-  );
-}
-
-function RuleRow({ path, access }: { path: string; access: string }) {
-  const accessBadge: Record<string, { variant: 'secondary' | 'destructive'; className?: string }> = {
-    rw: { variant: 'secondary', className: 'bg-success/15 text-success' },
-    ro: { variant: 'secondary', className: 'bg-warning/15 text-warning' },
-    deny: { variant: 'destructive' },
-  };
-  const badge = accessBadge[access] ?? { variant: 'secondary' as const };
-
-  return (
-    <div className="flex items-center justify-between text-sm">
-      <code className="rounded bg-muted px-2 py-0.5 font-mono text-xs text-foreground">
-        {path}
-      </code>
-      <Badge variant={badge.variant} className={badge.className}>{access}</Badge>
-    </div>
-  );
-}
+// G2 (2026-09 feature audit): `StatusRow` and `RuleRow` were removed with the
+// Credential Proxy and Mount Guard cards — they had no other call site.

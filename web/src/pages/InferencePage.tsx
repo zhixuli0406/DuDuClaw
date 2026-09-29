@@ -99,12 +99,10 @@ export function InferencePage() {
   const [ocApiKeySet, setOcApiKeySet] = useState(false);
 
   // Generic flat backend sections — stored as string maps for editing.
-  const [exo, setExo] = useState<Record<string, string>>({});
+  // G8 (2026-09 feature audit): the `llmlingua` / `streaming_llm` sections were
+  // removed — the three-strategy compressor they configured left the inference
+  // crate in v1.33, so the dashboard was writing keys nothing reads.
   const [llamafile, setLlamafile] = useState<Record<string, string>>({});
-  const [mlx, setMlx] = useState<Record<string, string>>({});
-  const [mistralrs, setMistralrs] = useState<Record<string, string>>({});
-  const [llmlingua, setLlmlingua] = useState<Record<string, string>>({});
-  const [streamingLlm, setStreamingLlm] = useState<Record<string, string>>({});
   const [embedding, setEmbedding] = useState<Record<string, string>>({});
 
   const toStrMap = (section: unknown): Record<string, string> => {
@@ -136,12 +134,7 @@ export function InferencePage() {
       setOc({ base_url: ocIn.base_url ?? '', model: ocIn.model ?? '' });
       setOcApiKeySet(Boolean(ocIn.api_key_set));
       setOcApiKey('');
-      setExo(toStrMap(res.exo));
       setLlamafile(toStrMap(res.llamafile));
-      setMlx(toStrMap(res.mlx));
-      setMistralrs(toStrMap(res.mistralrs));
-      setLlmlingua(toStrMap(res.llmlingua));
-      setStreamingLlm(toStrMap(res.streaming_llm));
       setEmbedding(toStrMap(res.embedding));
     } catch (e) {
       console.warn('[api]', e);
@@ -200,12 +193,7 @@ export function InferencePage() {
           // Write-only: only send api_key when the operator typed one.
           ...(ocApiKey !== '' ? { api_key: ocApiKey } : {}),
         },
-        exo: coerceMap(exo),
         llamafile: coerceMap(llamafile),
-        mlx: coerceMap(mlx),
-        mistralrs: coerceMap(mistralrs),
-        llmlingua: coerceMap(llmlingua),
-        streaming_llm: coerceMap(streamingLlm),
         embedding: coerceMap(embedding),
       };
       await api.inference.update(payload);
@@ -357,12 +345,7 @@ export function InferencePage() {
           </SettingsSection>
 
           {/* Generic flat backend sections */}
-          <BackendSection title="exo" map={exo} set={setExo} />
           <BackendSection title="llamafile" map={llamafile} set={setLlamafile} />
-          <BackendSection title="mlx" map={mlx} set={setMlx} />
-          <BackendSection title="mistralrs" map={mistralrs} set={setMistralrs} />
-          <BackendSection title="llmlingua" map={llmlingua} set={setLlmlingua} />
-          <BackendSection title="streaming_llm" map={streamingLlm} set={setStreamingLlm} />
           <BackendSection title="embedding" map={embedding} set={setEmbedding} />
         </div>
       )}

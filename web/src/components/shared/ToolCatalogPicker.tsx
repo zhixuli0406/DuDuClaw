@@ -79,14 +79,19 @@ export function ToolCatalogPicker({ triggerLabel, selected, onChange }: ToolCata
   // the catalog's original ordering.
   const groups = useMemo(() => {
     const q = query.trim().toLowerCase();
+    // T5 (2026-09-29): deprecated aliases of merged entry points are not
+    // offered as a NEW choice, but one that is already in this agent's
+    // allow/deny list stays visible — hiding a selected entry would make the
+    // list look shorter than the config actually is.
+    const offered = tools.filter((e) => !e.deprecated || selectedSet.has(e.qualified));
     const filtered = q
-      ? tools.filter(
+      ? offered.filter(
           (e) =>
             e.name.toLowerCase().includes(q) ||
             e.qualified.toLowerCase().includes(q) ||
             e.description.toLowerCase().includes(q),
         )
-      : tools;
+      : offered;
     const byCat = new Map<string, BuiltinToolEntry[]>();
     for (const e of filtered) {
       const arr = byCat.get(e.category) ?? [];
@@ -94,7 +99,7 @@ export function ToolCatalogPicker({ triggerLabel, selected, onChange }: ToolCata
       byCat.set(e.category, arr);
     }
     return Array.from(byCat.entries());
-  }, [tools, query]);
+  }, [tools, query, selectedSet]);
 
   const toggle = (qualified: string) => {
     if (selectedSet.has(qualified)) {

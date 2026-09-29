@@ -9,10 +9,9 @@ import { cn } from '@/lib/utils';
 import type { ApprovalRequestArtifact } from './artifact-types';
 import { ArtifactShell } from './ArtifactShell';
 
-/** Same fallback-to-"其他操作" lookup `ApprovalsPage` uses for an unknown
- *  backend `kind` — duplicated here (not imported) because `ApprovalsPage`
- *  is itself a legacy bookmark alias slated for deletion (see its own doc
- *  comment); this card should not depend on a page on its way out. */
+/** Fallback-to-"其他操作" lookup for an unknown backend `kind`. (The legacy
+ *  `ApprovalsPage` this was copied from was deleted in 2026-09; `/approvals`
+ *  redirects to `/inbox`.) */
 function kindLabel(intl: ReturnType<typeof useIntl>, kind: ApprovalKind): string {
   const id = `approvals.kind.${kind}`;
   const fallback = intl.formatMessage({ id: 'approvals.kind.unknown' });
@@ -23,7 +22,7 @@ function kindLabel(intl: ReturnType<typeof useIntl>, kind: ApprovalKind): string
 type CardStatus = 'idle' | 'busy' | 'approved' | 'denied';
 
 /**
- * 不可逆審批卡 — the inline twin of `ApprovalsPage`'s per-item card (and the
+ * 不可逆審批卡 — the inline twin of the inbox's per-item card (and the
  * `ApprovalModal` browser-action popup), for an `ApprovalItem` an agent
  * reply attaches directly to the conversation instead of making the user go
  * to `/inbox` to decide it. Approve/reject call the SAME `approvals.decide`

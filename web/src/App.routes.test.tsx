@@ -182,6 +182,46 @@ describe('App routes — /app/:appId/* deep-link seam (N-1)', () => {
 // now redirect to the NEW canonical route instead of rendering the page
 // directly, query string preserved.
 describe('App routes — 系統設定 app relocation (N-3)', () => {
+  it('the causal curation page is reachable by admins', async () => {
+    renderAppAt('/app/system/causal');
+    await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/app/system/causal'));
+    expect(await screen.findByText(en['causalCuration.title'])).toBeInTheDocument();
+  });
+
+  it('the causal curation page is gated from employees', async () => {
+    setRole('employee');
+    await expectLandsOn('/app/system/causal', '/');
+  });
+
+  it('the Decision Lab route is reachable by admins and gated from employees', async () => {
+    renderAppAt('/app/system/decision-lab');
+    await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/app/system/decision-lab'));
+    expect(await screen.findByText('Decision Lab')).toBeInTheDocument();
+  });
+
+  it('the Decision Lab route redirects employees', async () => {
+    setRole('employee');
+    await expectLandsOn('/app/system/decision-lab', '/');
+  });
+
+  it('the Decision Lab review deep link stays admin-only', async () => {
+    setRole('employee');
+    renderAppAt('/app/system/decision-lab?approval_id=123e4567-e89b-42d3-a456-426614174000');
+    await waitFor(() => expect(screen.getByTestId('loc').textContent).toBe('/'));
+    expect(screen.queryByText('Human inspection of one synthetic run')).not.toBeInTheDocument();
+  });
+
+  it('the CCR dashboard route is reachable by admins and gated from employees', async () => {
+    renderAppAt('/app/system/ccr');
+    await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/app/system/ccr'));
+    expect(await screen.findByText('Reversible Context Store & Audit')).toBeInTheDocument();
+  });
+
+  it('the CCR dashboard route redirects employees', async () => {
+    setRole('employee');
+    await expectLandsOn('/app/system/ccr', '/');
+  });
+
   it('/device → /app/system/device', async () => {
     await expectLandsOn('/device', '/app/system/device');
   });

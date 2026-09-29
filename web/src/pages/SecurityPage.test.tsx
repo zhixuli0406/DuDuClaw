@@ -100,19 +100,21 @@ describe('SecurityPage', () => {
 
   // D9 (09-edition-split-features.md §4) — the organisation-scale cards have
   // no single-owner counterpart and stay off the page entirely.
-  it('enterprise: renders the RBAC / credential proxy / mount guard cards', async () => {
+  // G2 (2026-09 feature audit): the credential-proxy and mount-guard cards
+  // were removed — their Rust modules were deleted and the numbers measured
+  // something other than what the labels claimed. What stays organisation-
+  // scale on this page is the RBAC matrix.
+  it('enterprise: renders the RBAC card and no removed credential/mount cards', async () => {
     mockWsClient.call.mockResolvedValue(SECURITY_RESPONSE);
     renderWithProviders(<SecurityPage />);
     expect(await screen.findByText('Role permissions')).toBeInTheDocument();
-    expect(screen.getByText('Credential proxy')).toBeInTheDocument();
-    // "Mount guard" also labels its own KPI cell above the card, so two hits
-    // is the correct (not duplicated-by-mistake) count on this edition.
-    expect(screen.getAllByText('Mount guard').length).toBe(2);
+    expect(screen.queryByText('Credential proxy')).not.toBeInTheDocument();
+    expect(screen.queryByText('Mount guard')).not.toBeInTheDocument();
     // Kill switch is unfolded by default on this edition.
     expect(screen.getByText('Kill Switch')).toBeInTheDocument();
   });
 
-  it('personal: hides RBAC / credential proxy / mount guard, folds audit log + kill switch', async () => {
+  it('personal: hides RBAC, folds audit log + kill switch', async () => {
     const user = userEvent.setup();
     useSystemStore.setState({ status: { edition_profile: 'personal' } as never });
     mockWsClient.call.mockResolvedValue(SECURITY_RESPONSE);

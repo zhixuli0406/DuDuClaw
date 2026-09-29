@@ -99,6 +99,9 @@ export function SystemTab() {
   const [originDraft, setOriginDraft] = useState('');
   // [memory] novelty_gate — B1 write-time memory dedup gate (default: on).
   const [noveltyGate, setNoveltyGate] = useState(true);
+  // S20: `[miniapp] enabled` — the Telegram Mini App approval screen. Default
+  // off; before 2026-09 it had no dashboard surface at all.
+  const [miniappEnabled, setMiniappEnabled] = useState(false);
   // [notify] daily_digest / daily_digest_at — W2-8 daily-digest toggle
   // (default: off, matching `notify_digest::DigestConfig::default()`).
   const [dailyDigest, setDailyDigest] = useState(false);
@@ -152,6 +155,9 @@ export function SystemTab() {
       setOrigins(Array.isArray(ao) ? (ao.filter((v) => typeof v === 'string') as string[]) : []);
       // novelty_gate_enabled comes back structured too (not parsed from TOML).
       setNoveltyGate(res.novelty_gate_enabled ?? true);
+      // miniapp_enabled likewise; an older gateway omits it ⇒ off (the
+      // same fail-closed default `miniapp::enabled` uses).
+      setMiniappEnabled(res.miniapp_enabled ?? false);
       // daily_digest_enabled / daily_digest_at come back structured too.
       setDailyDigest(res.daily_digest_enabled ?? false);
       setDailyDigestAt(res.daily_digest_at ?? '09:00');
@@ -206,6 +212,7 @@ export function SystemTab() {
       // Empty array = loopback-only (the default). Hot-applied server-side.
       payload.allowed_origins = origins;
       payload.novelty_gate_enabled = noveltyGate;
+      payload.miniapp_enabled = miniappEnabled;
       payload.daily_digest = dailyDigest;
       // An empty native time input must not be sent as "" — the gateway
       // rejects an unparseable daily_digest_at outright (fail-closed).
@@ -438,6 +445,19 @@ export function SystemTab() {
             description={intl.formatMessage({ id: 'settings.system.noveltyGate.help' })}
             checked={noveltyGate}
             onChange={setNoveltyGate}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
+      {/* S20 — Telegram Mini App approval screen. Off by default; needs an
+          https dashboard URL to render a button at all. */}
+      <SettingsSection title={intl.formatMessage({ id: 'settings.system.miniapp' })}>
+        <SettingsCard>
+          <RowSwitch
+            label={intl.formatMessage({ id: 'settings.system.miniapp.enabled' })}
+            description={intl.formatMessage({ id: 'settings.system.miniapp.enabled.help' })}
+            checked={miniappEnabled}
+            onChange={setMiniappEnabled}
           />
         </SettingsCard>
       </SettingsSection>

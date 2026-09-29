@@ -3,6 +3,7 @@ import { useIntl } from 'react-intl';
 import { SettingsIcon } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
+import { useDecisionEnabled } from '@/hooks/useDecisionEnabled';
 import { hasMinRole } from '@/lib/roles';
 import { filterVisible } from '@/lib/nav-visibility';
 import { cn } from '@/lib/utils';
@@ -73,12 +74,14 @@ export function ManageShell() {
   const location = useLocation();
   const role = useAuthStore((s) => s.user?.role);
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
+  // Operator kill switches that hide a rail row (today: Decision Lab).
+  const navCtx = { decisionEnabled: useDecisionEnabled() };
 
   // Fail-closed at the shell boundary: no manager+ → never render management.
   if (!hasMinRole(role, 'manager')) return <Navigate to="/" replace />;
 
-  const visible = filterVisible(manageNav, role, isPersonal);
-  const advanced = filterVisible(manageAdvancedNav, role, isPersonal);
+  const visible = filterVisible(manageNav, role, isPersonal, navCtx);
+  const advanced = filterVisible(manageAdvancedNav, role, isPersonal, navCtx);
 
   // Bare /manage → land on the first surface the viewer can actually see.
   if (location.pathname === '/manage' || location.pathname === '/manage/') {

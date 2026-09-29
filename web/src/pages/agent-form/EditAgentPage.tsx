@@ -471,7 +471,7 @@ export function EditAgentPage() {
         fallback: currentFallback,
         api_mode: (agent.model?.api_mode ?? 'cli') as 'cli' | 'direct' | 'auto',
         local_model: localModel,
-        local_backend: agent.model?.local?.backend ?? 'llama_cpp',
+        local_backend: agent.model?.local?.backend ?? 'openai_compat',
         local_context_length: agent.model?.local?.context_length ?? 4096,
         local_gpu_layers: agent.model?.local?.gpu_layers ?? -1,
         prefer_local: preferLocal,
@@ -518,8 +518,6 @@ export function EditAgentPage() {
       setRuntime({
         provider: (rt?.provider as RuntimeProvider) ?? DEFAULT_RUNTIME.provider,
         fallback: rt?.fallback ?? DEFAULT_RUNTIME.fallback,
-        pty_pool_enabled: rt?.pty_pool_enabled ?? DEFAULT_RUNTIME.pty_pool_enabled,
-        worker_managed: rt?.worker_managed ?? DEFAULT_RUNTIME.worker_managed,
       });
       setRuntimeDirty(false);
       setEvoAdv(DEFAULT_EVOLUTION_ADVANCED);
@@ -827,8 +825,6 @@ export function EditAgentPage() {
         submitForm.runtime = {
           provider: runtime.provider,
           fallback: runtime.fallback,
-          pty_pool_enabled: runtime.pty_pool_enabled,
-          worker_managed: runtime.worker_managed,
         };
       }
 
@@ -840,15 +836,7 @@ export function EditAgentPage() {
           skill_synthesis_threshold: evoAdv.skill_synthesis_threshold,
           skill_synthesis_cooldown_hours: evoAdv.skill_synthesis_cooldown_hours,
           skill_trial_ttl: evoAdv.skill_trial_ttl,
-          skill_graduation_enabled: evoAdv.skill_graduation_enabled,
           skill_graduation_min_lift: evoAdv.skill_graduation_min_lift,
-          skill_recommendation_enabled: evoAdv.skill_recommendation_enabled,
-          skill_recommendation_threshold: evoAdv.skill_recommendation_threshold,
-          curiosity_enabled: evoAdv.curiosity_enabled,
-          curiosity_threshold: evoAdv.curiosity_threshold,
-          curiosity_max_daily: evoAdv.curiosity_max_daily,
-          skill_behavior_monitor_enabled: evoAdv.skill_behavior_monitor_enabled,
-          skill_behavior_drift_threshold: evoAdv.skill_behavior_drift_threshold,
         };
       }
 
@@ -856,10 +844,6 @@ export function EditAgentPage() {
       // empty key (backend rejects them).
       if (ctAdvDirty) {
         submitForm.container_advanced = {
-          worktree_enabled: ctAdv.worktree_enabled,
-          worktree_auto_merge: ctAdv.worktree_auto_merge,
-          worktree_cleanup_on_exit: ctAdv.worktree_cleanup_on_exit,
-          worktree_copy_files: ctAdv.worktree_copy_files,
           additional_mounts: ctAdv.additional_mounts.filter(
             (m) => m.host.trim() !== '' && m.container.trim() !== ''
           ),
@@ -1031,15 +1015,6 @@ export function EditAgentPage() {
     };
   }, []);
 
-  // WP10 (2026-08-04 field incident): the former "Change 3c" effect silently
-  // wrote `pty_pool_enabled = true` + `worker_managed = true` into agent.toml
-  // the moment an OAuth user merely OPENED this page — autosave persisted it
-  // without any interaction. That contradicted the documented default (PTY pool
-  // off; the Anthropic `claude -p` OAuth block that motivated it was paused on
-  // 2026-06-15 and never took effect), and it put production installs on the
-  // interactive REPL path, where a contended single OAuth account stalls.
-  // The toggles remain available above for deliberate opt-in.
-
   if (loading) {
     return (
       <div className="flex items-center justify-center py-20" role="status" aria-live="polite">
@@ -1090,8 +1065,6 @@ export function EditAgentPage() {
     ...providerOptions,
   ];
   const localBackendOptions: SelectOption[] = [
-    { value: 'llama_cpp', label: intl.formatMessage({ id: 'agents.backend.llamaCpp' }), raw: 'llama_cpp' },
-    { value: 'mistral_rs', label: intl.formatMessage({ id: 'agents.backend.mistralRs' }), raw: 'mistral_rs' },
     { value: 'openai_compat', label: intl.formatMessage({ id: 'agents.backend.openaiCompat' }), raw: 'openai_compat' },
   ];
   const expressivenessOptions: SelectOption[] = [
@@ -1212,30 +1185,7 @@ export function EditAgentPage() {
 
           <SettingsSection title={t('agents.evo.skillGraduation')}>
             <SettingsCard>
-              <RowSwitch label={t('agents.evo.enabled')} checked={evoAdv.skill_graduation_enabled} onChange={(v) => updateEvoAdv('skill_graduation_enabled', v)} />
               <RowNumber label={t('agents.evo.minLift')} description="0.0-1.0" value={evoAdv.skill_graduation_min_lift} min={0} max={1} step={0.05} onChange={(v) => updateEvoAdv('skill_graduation_min_lift', v)} />
-            </SettingsCard>
-          </SettingsSection>
-
-          <SettingsSection title={t('agents.evo.skillRecommendation')}>
-            <SettingsCard>
-              <RowSwitch label={t('agents.evo.enabled')} checked={evoAdv.skill_recommendation_enabled} onChange={(v) => updateEvoAdv('skill_recommendation_enabled', v)} />
-              <RowNumber label={t('agents.evo.threshold')} description="0.0-1.0" value={evoAdv.skill_recommendation_threshold} min={0} max={1} step={0.05} onChange={(v) => updateEvoAdv('skill_recommendation_threshold', v)} />
-            </SettingsCard>
-          </SettingsSection>
-
-          <SettingsSection title={t('agents.evo.curiosity')}>
-            <SettingsCard>
-              <RowSwitch label={t('agents.evo.enabled')} checked={evoAdv.curiosity_enabled} onChange={(v) => updateEvoAdv('curiosity_enabled', v)} />
-              <RowNumber label={t('agents.evo.threshold')} description="0.0-1.0" value={evoAdv.curiosity_threshold} min={0} max={1} step={0.05} onChange={(v) => updateEvoAdv('curiosity_threshold', v)} />
-              <RowNumber label={t('agents.evo.maxDaily')} value={evoAdv.curiosity_max_daily} min={0} onChange={(v) => updateEvoAdv('curiosity_max_daily', v)} />
-            </SettingsCard>
-          </SettingsSection>
-
-          <SettingsSection title={t('agents.evo.behaviorMonitor')}>
-            <SettingsCard>
-              <RowSwitch label={t('agents.evo.enabled')} checked={evoAdv.skill_behavior_monitor_enabled} onChange={(v) => updateEvoAdv('skill_behavior_monitor_enabled', v)} />
-              <RowNumber label={t('agents.evo.driftThreshold')} description="0.0-1.0" value={evoAdv.skill_behavior_drift_threshold} min={0} max={1} step={0.05} onChange={(v) => updateEvoAdv('skill_behavior_drift_threshold', v)} />
             </SettingsCard>
           </SettingsSection>
 
@@ -1632,7 +1582,7 @@ export function EditAgentPage() {
             </SettingsCard>
             {usesLocalModel && (
               <SettingsCard>
-                <RowSelect label={t('agents.edit.inferenceBackend')} value={form.local_backend ?? 'llama_cpp'} onChange={(v) => updateField('local_backend', v)} options={localBackendOptions} />
+                <RowSelect label={t('agents.edit.inferenceBackend')} value={form.local_backend ?? 'openai_compat'} onChange={(v) => updateField('local_backend', v)} options={localBackendOptions} />
                 <RowNumber label={t('agents.edit.contextLength')} value={form.local_context_length ?? 4096} min={512} onChange={(v) => updateField('local_context_length', v)} />
                 <RowNumber label={t('agents.edit.gpuLayers')} value={form.local_gpu_layers ?? -1} min={-1} onChange={(v) => updateField('local_gpu_layers', v)} />
               </SettingsCard>
@@ -1655,13 +1605,6 @@ export function EditAgentPage() {
             </FieldBlock>
           </SettingsSection>
 
-          <SettingsSection title={t('agents.runtime.ptyTitle')} description={t('agents.runtime.pty.hint')}>
-            <SettingsCard>
-              <RowSwitch label={t('agents.runtime.ptyPoolEnabled')} checked={runtime.pty_pool_enabled} onChange={(v) => updateRuntime('pty_pool_enabled', v)} />
-              <RowSwitch label={t('agents.runtime.workerManaged')} checked={runtime.worker_managed} onChange={(v) => updateRuntime('worker_managed', v)} />
-            </SettingsCard>
-          </SettingsSection>
-
           <SettingsSection title={t('settings.container')}>
             <SettingsCard>
               <RowSwitch label={t('agents.edit.sandbox')} description={t('agents.edit.sandbox.help')} checked={form.sandbox_enabled ?? false} onChange={(v) => updateField('sandbox_enabled', v)} />
@@ -1670,12 +1613,7 @@ export function EditAgentPage() {
                 <DurationField seconds={Math.round((form.timeout_ms ?? 1800000) / 1000)} onChange={(s) => updateField('timeout_ms', s * 1000)} units={['sec', 'min', 'hour']} min={0} />
               </SettingsRow>
               <RowNumber label={t('agents.edit.maxConcurrent')} description={t('agents.edit.maxConcurrent.help')} value={form.max_concurrent ?? 1} min={1} max={10} onChange={(v) => updateField('max_concurrent', v)} />
-              <RowSwitch label={t('agents.container.worktreeEnabled')} checked={ctAdv.worktree_enabled} onChange={(v) => updateCtAdv('worktree_enabled', v)} />
-              <RowSwitch label={t('agents.container.worktreeCleanup')} checked={ctAdv.worktree_cleanup_on_exit} onChange={(v) => updateCtAdv('worktree_cleanup_on_exit', v)} />
             </SettingsCard>
-            <FieldBlock label={t('agents.container.worktreeCopyFiles')} description={t('agents.container.worktreeCopyFiles.hint')}>
-              <ChipEditor values={ctAdv.worktree_copy_files} onChange={(v) => updateCtAdv('worktree_copy_files', v)} placeholder=".env" addLabel={t('common.add')} />
-            </FieldBlock>
             <FieldBlock label={t('agents.container.cmd')} description={t('agents.container.cmd.hint')}>
               <ChipEditor values={ctAdv.cmd} onChange={(v) => updateCtAdv('cmd', v)} placeholder="bash" addLabel={t('common.add')} />
             </FieldBlock>
@@ -1685,7 +1623,6 @@ export function EditAgentPage() {
           <DangerZone title={t('agents.container.danger.title')} description={t('agents.container.danger.desc')}>
             <SettingsCard>
               <RowSwitch label={t('agents.edit.networkAccess')} description={t('agents.edit.networkAccess.help')} checked={form.network_access ?? false} onChange={guardDanger(t('agents.edit.networkAccess'), (v) => updateField('network_access', v), 'agents.edit.dangerConfirm.networkAccess')} />
-              <RowSwitch label={t('agents.container.worktreeAutoMerge')} description={t('agents.container.worktreeAutoMerge.help')} checked={ctAdv.worktree_auto_merge} onChange={guardDanger(t('agents.container.worktreeAutoMerge'), (v) => updateCtAdv('worktree_auto_merge', v))} />
             </SettingsCard>
             <MountTable mounts={ctAdv.additional_mounts} onChange={(v) => updateCtAdv('additional_mounts', v)} />
           </DangerZone>
@@ -1777,8 +1714,6 @@ export function EditAgentPage() {
                   either: a stale `cognitive_memory = false` still sitting in an
                   agent.toml is IGNORED at read time (and logs one deprecation
                   warning), not rewritten. Nothing here needs to migrate it. */}
-              <RowNumber label={t('agents.adv.maxGvuGenerations')} value={form.max_gvu_generations ?? 3} min={0} onChange={(v) => updateField('max_gvu_generations', v)} />
-              <RowNumber label={t('agents.adv.observationHours')} value={form.observation_period_hours ?? 24} min={0} step={0.5} onChange={(v) => updateField('observation_period_hours', v)} />
             </SettingsCard>
           </SettingsSection>
 

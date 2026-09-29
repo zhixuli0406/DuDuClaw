@@ -1,5 +1,8 @@
 import { useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
+import { useNavigate } from 'react-router';
+import { useAuthStore } from '@/stores/auth-store';
+import { hasMinRole } from '@/lib/roles';
 import {
   ShieldCheck,
   ShieldAlert,
@@ -42,6 +45,7 @@ import { ConfirmDialog } from '@/components/settings/controls';
 import { parseSkillCreatePayload, type SkillCreatePayload } from '@/components/skills/skill-create-payload';
 import { formatTimeSaved } from '@/components/skills/status-meta';
 import { OpenInChannelButton } from './OpenInChannelButton';
+import { pilotReviewDeepLink } from '@/lib/decision-review-link';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
 
@@ -80,6 +84,7 @@ const DESCRIBED_KINDS = new Set([
   'strategic_plan',
   'agent_hire',
   'wiki_ingest',
+  'support_pilot_review',
 ]);
 
 /** D1/D2: `true` when there is an actual narrative or risk point to show —
@@ -213,6 +218,7 @@ function GenericApprovalView({
   onReject: () => void;
 }) {
   const intl = useIntl();
+  const navigate = useNavigate();
   const t = (id: string) => intl.formatMessage({ id });
 
   const [spotCheck, setSpotCheck] = useState(false);
@@ -222,6 +228,15 @@ function GenericApprovalView({
   const facts = extractPlanFacts(approval.payload);
   const described = DESCRIBED_KINDS.has(approval.kind);
   const kindDesc = described ? t(`approval.plan.kind.${approval.kind}`) : t('approval.plan.kind.unknown');
+  const reviewLink = approval.kind === 'support_pilot_review'
+    ? pilotReviewDeepLink(approval.payload, approval.id) : null;
+  // The Decision Lab deep link is admin-only (`RoleGuard minRole="admin"` on
+  // `/app/system/decision-lab`), but this panel itself renders in `/inbox`
+  // for every authenticated role. A non-admin reviewer who clicked it would
+  // be silently bounced back to `/` by RoleGuard — so a non-admin sees a
+  // plain-language note instead of a dead-end button.
+  const currentUser = useAuthStore((s) => s.user);
+  const isAdminReviewer = hasMinRole(currentUser?.role, 'admin');
 
   // TTL countdown. Prefers the server-computed `expires_at` epoch;
   // falls back to `created_at + ttl_seconds` for older cached responses that
@@ -262,6 +277,17 @@ function GenericApprovalView({
           )}
         </div>
       </Section>
+
+      {reviewLink && <div className="space-y-1 rounded-lg border p-3">
+        {isAdminReviewer ? (
+          <>
+            <Button variant="outline" onClick={() => navigate(reviewLink)}>{t('decisionLab.openExactReview')}</Button>
+            <p className="text-xs text-muted-foreground">{t('decisionLab.reviewBeforeDeciding')}</p>
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">{t('approval.reviewLink.adminOnly')}</p>
+        )}
+      </div>}
 
       {/* W2-3 reverse handoff (E8): jump back to where this decision card
           was actually pushed. Renders nothing when unresolvable. */}

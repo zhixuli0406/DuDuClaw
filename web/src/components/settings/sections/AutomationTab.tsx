@@ -29,7 +29,13 @@ const RESUME_ON_RESTART_OPTIONS = ['pause', 'auto'] as const;
 // An unknown string is rejected by the gateway (falls back to "mav" — the
 // strongest of the four — with a warning), so this list must stay in sync
 // with `JudgeMode::from_config_str`.
-const JUDGE_MODES = ['mav', 'evaluator_only', 'external', 'human_only'] as const;
+const JUDGE_MODES = ['mav', 'external'] as const;
+// T5/O12 (feature audit 2026-09-29): still accepted by the gateway and still
+// parsed byte-identically, but no longer offered as a new choice. A deployment
+// already on one keeps seeing it in the picker — marked 已棄用 — so the value
+// is never silently rewritten behind the operator's back. Removal: v1.68.0
+// (docs/guides/deprecations.md).
+const DEPRECATED_JUDGE_MODES: readonly string[] = ['evaluator_only', 'human_only'];
 
 /** Extract the body of a top-level TOML `[section]` from the masked config
  *  string (up to the next `[` header or EOF). Section-scoped so a common key
@@ -247,9 +253,22 @@ export function AutomationTab() {
   const resumeOnRestartOptions: SelectOption[] = RESUME_ON_RESTART_OPTIONS.map((v) => ({
     value: v, label: intl.formatMessage({ id: `settings.automation.resumeOnRestart.${v}` }), raw: v,
   }));
-  const judgeModeOptions: SelectOption[] = JUDGE_MODES.map((v) => ({
-    value: v, label: intl.formatMessage({ id: `settings.automation.judgeMode.${v}` }), raw: v,
-  }));
+  const judgeModeOptions: SelectOption[] = [
+    ...JUDGE_MODES.map((v) => ({
+      value: v as string,
+      label: intl.formatMessage({ id: `settings.automation.judgeMode.${v}` }),
+      raw: v as string,
+    })),
+    // Keep a saved-but-deprecated value visible (labelled) instead of letting
+    // the select fall back to a different mode than what is actually on disk.
+    ...(DEPRECATED_JUDGE_MODES.includes(judgeMode)
+      ? [{
+          value: judgeMode,
+          label: `${intl.formatMessage({ id: `settings.automation.judgeMode.${judgeMode}` })}（${intl.formatMessage({ id: 'settings.automation.judgeMode.deprecated' })}）`,
+          raw: judgeMode,
+        }]
+      : []),
+  ];
 
   return (
     <div className="space-y-8">

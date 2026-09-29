@@ -154,3 +154,39 @@ describe('<SystemTab> daily digest ([notify] daily_digest)', () => {
     expect(lastCall[0].daily_digest_at).toBe('20:15');
   });
 });
+
+// S20: `[miniapp] enabled` had no dashboard surface at all until 2026-09
+// (`grep miniapp web/src` was empty), so the Telegram Mini App was only
+// reachable by hand-editing config.toml. Default stays off.
+describe('<SystemTab> Telegram mini app ([miniapp] enabled)', () => {
+  it('defaults the toggle to off when the field is absent from system.config', async () => {
+    renderWithProviders(<SystemTab />);
+    await waitFor(() =>
+      expect(screen.getByRole('switch', { name: 'Approve inside Telegram' })).not.toBeChecked(),
+    );
+  });
+
+  it('reflects a saved on state from system.config', async () => {
+    configMock.mockResolvedValue({ config: '', allowed_origins: [], miniapp_enabled: true });
+    renderWithProviders(<SystemTab />);
+    await waitFor(() =>
+      expect(screen.getByRole('switch', { name: 'Approve inside Telegram' })).toBeChecked(),
+    );
+  });
+
+  it('sends the toggled value in the update_config payload on save', async () => {
+    renderWithProviders(<SystemTab />);
+    await waitFor(() => expect(screen.getByText('dash.example.com')).toBeInTheDocument());
+
+    const toggle = screen.getByRole('switch', { name: 'Approve inside Telegram' });
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalled());
+    const lastCall = updateConfigMock.mock.calls.at(-1) as [{ miniapp_enabled: boolean }];
+    expect(lastCall[0].miniapp_enabled).toBe(true);
+  });
+});

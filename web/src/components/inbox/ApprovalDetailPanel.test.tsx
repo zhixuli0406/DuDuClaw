@@ -1,6 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
-import { screen, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { screen, fireEvent, render } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
+import { IntlProvider } from 'react-intl';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
+import en from '@/i18n/en.json';
+import { useAuthStore } from '@/stores/auth-store';
 
 // The panel imports decideApproval → api-custom-skills → ws-client. Stub the
 // socket so the module graph loads without a live connection.
@@ -124,6 +128,73 @@ describe('<ApprovalDetailPanel> generic (U2 redesign)', () => {
     // Confirming in the dialog runs the approval exactly once.
     fireEvent.click(screen.getByText('Confirm approve'));
     expect(onApprove).toHaveBeenCalledTimes(1);
+  });
+});
+
+function ReviewLocation() {
+  const location = useLocation();
+  return <span data-testid="review-location">{location.pathname + location.search}</span>;
+}
+
+describe('<ApprovalDetailPanel> synthetic run inspection', () => {
+  const exactPayload = {
+    tenant_id: 'tenant-a', acl: 'private', snapshot_id: 'synthetic-support-47-35',
+    scenario_id: 'dashboard-synthetic-baseline-two-agents-47-35', replay_hash: 'a'.repeat(64),
+  };
+  const approvalId = '123e4567-e89b-42d3-a456-426614174000';
+
+  // The Decision Lab deep link this describe block exercises is admin-only
+  // (`RoleGuard minRole="admin"` on `/app/system/decision-lab`), so these
+  // tests must set an explicit role each time rather than rely on the auth
+  // store's default `user: null` — restored afterwards so it doesn't leak
+  // into unrelated describe blocks in this file.
+  afterEach(() => {
+    useAuthStore.setState({ user: null });
+  });
+
+  function setReviewerRole(role: 'admin' | 'manager' | 'employee') {
+    useAuthStore.setState({
+      user: { id: 'reviewer-1', email: 'reviewer@example.com', display_name: 'Reviewer', role, status: 'active' },
+    });
+  }
+
+  it('offers a same-origin exact-run link without deciding the approval (admin reviewer)', () => {
+    setReviewerRole('admin');
+    const onApprove = vi.fn();
+    render(<IntlProvider messages={en} locale="en" defaultLocale="en">
+      <MemoryRouter initialEntries={['/inbox']}><Routes>
+        <Route path="/inbox" element={<ApprovalDetailPanel approval={genericApproval({
+          id: approvalId, kind: 'support_pilot_review', payload: exactPayload,
+        })} onApprove={onApprove} onReject={vi.fn()} />} />
+        <Route path="/app/system/decision-lab" element={<ReviewLocation />} />
+      </Routes></MemoryRouter>
+    </IntlProvider>);
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect exact run in Decision Lab' }));
+    expect(screen.getByTestId('review-location')).toHaveTextContent(/^\/app\/system\/decision-lab\?/);
+    expect(screen.getByTestId('review-location')).toHaveTextContent('expected_hash=' + 'a'.repeat(64));
+    expect(onApprove).not.toHaveBeenCalled();
+  });
+
+  // Regression (review_misc.md task 2 / W3-5): the deep link used to render
+  // unconditionally for every role even though `/app/system/decision-lab`
+  // itself is `RoleGuard minRole="admin"` — a non-admin reviewer clicking it
+  // was silently bounced back to `/` with no explanation. A non-admin now
+  // sees a plain-language note instead of a dead-end button.
+  it('shows an admin-only note instead of a dead-end link for a non-admin reviewer', () => {
+    setReviewerRole('employee');
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval({
+      id: approvalId, kind: 'support_pilot_review', payload: exactPayload,
+    })} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: 'Inspect exact run in Decision Lab' })).not.toBeInTheDocument();
+    expect(screen.getByText('Requires an administrator to review in Decision Lab.')).toBeInTheDocument();
+  });
+
+  it('shows no deep link for a malformed broker payload', () => {
+    setReviewerRole('admin');
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval({
+      id: approvalId, kind: 'support_pilot_review', payload: { ...exactPayload, replay_hash: 'bad' },
+    })} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: 'Inspect exact run in Decision Lab' })).not.toBeInTheDocument();
   });
 });
 
