@@ -116,7 +116,17 @@ RUN set -eu; \
 # /usr/local/bin. NOTE: `XAI_API_KEY` auth is NOT baked in here — it is
 # supplied at container **runtime** via env / agent.toml, same as the other
 # CLIs (ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY).
-RUN curl -fsSL https://x.ai/cli/install.sh | bash && \
+# Same fetch → validate → retry discipline as the agy step above (a third-party
+# installer endpoint must not be able to fail a five-hour image build silently).
+RUN set -eu; \
+    for attempt in 1 2 3 4 5; do \
+      if curl -fsSL --retry 3 -o /tmp/grok-install.sh https://x.ai/cli/install.sh \
+         && head -c 2 /tmp/grok-install.sh | grep -q '^#!'; then break; fi; \
+      echo "grok install script fetch/validation failed (attempt $attempt/5)" >&2; \
+      if [ "$attempt" = 5 ]; then echo "ERROR: https://x.ai/cli/install.sh did not return a shell script" >&2; head -c 300 /tmp/grok-install.sh >&2 || true; exit 1; fi; \
+      sleep $((attempt * 20)); \
+    done && \
+    bash /tmp/grok-install.sh && rm -f /tmp/grok-install.sh && \
     install -m 0755 "$HOME/.grok/bin/grok" /usr/local/bin/grok && \
     grok --version
 
